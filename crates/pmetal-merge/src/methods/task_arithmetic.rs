@@ -58,16 +58,17 @@ impl MergeMethod for TaskArithmeticMerge {
         // Helper to get weight for model i
         let get_weight = |i: usize| -> f32 {
             // Priority: per-model weight -> global weight -> 1.0
-            params
-                .get(i)
-                .and_then(|p| p.weight)
-                .or(global_params.weight)
-                .unwrap_or(1.0)
+            if let Some(p) = params.get(i) {
+                if p.weight.is_some() {
+                    return p.weight();
+                }
+            }
+            global_params.weight()
         };
 
         // Helper to get lambda (scaling factor)
         // Priority: global lambda -> 1.0
-        let lambda = global_params.lambda.unwrap_or(1.0);
+        let lambda = global_params.lambda();
 
         // Accumulate weighted task vectors
         let mut accumulated_task_vector = mlx_rs::ops::zeros_like(base)?;

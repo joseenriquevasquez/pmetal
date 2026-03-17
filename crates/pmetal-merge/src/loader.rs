@@ -389,6 +389,26 @@ impl ZeroCopyLoader {
         &self.path
     }
 
+    /// Advise the OS that this mmap will be read sequentially.
+    ///
+    /// Calling this before a sequential scan improves prefetch behaviour and reduces
+    /// page-fault overhead on large models.  Silently ignores errors — the hint is
+    /// best-effort and non-critical.
+    pub fn advise_sequential(&self) {
+        for (_, mmap) in &self.mmaps {
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+        }
+    }
+
+    /// Reset the mmap advice to the OS default (normal).
+    ///
+    /// Call after completing the sequential scan so cached pages can be evicted.
+    pub fn advise_dontneed(&self) {
+        for (_, mmap) in &self.mmaps {
+            let _ = mmap.advise(memmap2::Advice::Normal);
+        }
+    }
+
     /// Check if all tensors are in a format suitable for direct GPU access.
     ///
     /// Returns true if all tensors are f32 or f16 (no bf16 conversion needed).

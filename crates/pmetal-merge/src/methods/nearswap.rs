@@ -288,7 +288,7 @@ mod tests {
 
         let params = vec![MergeParameters::default(), MergeParameters::default()];
         let global = MergeParameters {
-            lambda: Some(0.0),
+            lambda: Some(0.0_f32.into()),
             ..Default::default()
         };
 
@@ -321,7 +321,7 @@ mod tests {
 
         let params = vec![MergeParameters::default(), MergeParameters::default()];
         let global = MergeParameters {
-            lambda: Some(0.5),
+            lambda: Some(0.5_f32.into()),
             ..Default::default()
         };
 

@@ -398,11 +398,11 @@ mod tests {
         // Give high weight to t2
         let params = vec![
             MergeParameters {
-                weight: Some(0.1),
+                weight: Some(0.1_f32.into()),
                 ..Default::default()
             },
             MergeParameters {
-                weight: Some(0.9),
+                weight: Some(0.9_f32.into()),
                 ..Default::default()
             },
         ];
@@ -428,11 +428,11 @@ mod tests {
         // User weights should be ignored
         let params = vec![
             MergeParameters {
-                weight: Some(0.01),
+                weight: Some(0.01_f32.into()),
                 ..Default::default()
             },
             MergeParameters {
-                weight: Some(0.99),
+                weight: Some(0.99_f32.into()),
                 ..Default::default()
             },
         ];

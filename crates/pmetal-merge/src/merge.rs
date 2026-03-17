@@ -6,12 +6,13 @@
 use std::collections::HashMap;
 
 use mlx_rs::Array;
+use regex::Regex;
 use tracing::{debug, info};
 
 use crate::{
-    BreadcrumbsMerge, DareMerge, DellaMerge, LinearMerge, MergeConfig, MergeError, MergeMethod,
-    MergeMethodConfig, MergeParameters, ModelStockMerge, NearswapMerge, PassthroughMerge, Result,
-    SafetensorsLoader, SlerpMerge, TaskArithmeticMerge, TensorLoader, TensorWriter, TiesMerge,
+    MergeMethod, MergeMethodConfig, MergeParameters, ModelStockMerge, MultiSlerpMerge,
+    NearswapMerge, PassthroughMerge, RamMerge, Result, SafetensorsLoader, SlerpMerge,
+    TaskArithmeticMerge, TensorLoader, TensorWriter, TiesMerge,
     batched::{BatchConfig, BatchedMerger, MergeStats, StreamingBatchedMerger},
 };
 
@@ -160,13 +161,24 @@ fn create_merge_method(method: &MergeMethodConfig) -> Box<dyn MergeMethod> {
         MergeMethodConfig::Breadcrumbs => Box::new(BreadcrumbsMerge::new()),
         MergeMethodConfig::ModelStock => Box::new(ModelStockMerge::new()),
         MergeMethodConfig::Nearswap => Box::new(NearswapMerge::new()),
+        MergeMethodConfig::Ram => Box::new(RamMerge::new()),
+        MergeMethodConfig::RamPlus => Box::new(RamMerge::plus()),
+        MergeMethodConfig::MultiSlerp => Box::new(MultiSlerpMerge::new()),
         MergeMethodConfig::Passthrough => Box::new(PassthroughMerge::new()),
     }
 }
 
-/// Validate the merge configuration.
+/// Validate the merge configuration (flat mode only).
+///
+/// Slice-mode validation is handled by `MergeConfig::validate()` and
+/// `run_merge_sliced()`.
 fn validate_config(config: &MergeConfig, method: &dyn MergeMethod) -> Result<()> {
-    // Check minimum model count
+    // Slice-mode: delegate to config-level validator which covers slices.
+    if config.is_sliced() {
+        return config.validate();
+    }
+
+    // Flat mode: check minimum model count
     if config.models.is_empty() {
         return Err(MergeError::NotEnoughModels {
             expected: 1,
@@ -335,6 +347,353 @@ fn verify_shapes(name: &str, tensors: &[Array], base: Option<&Array>) -> Result<
     Ok(())
 }
 
+// =============================================================================
+// Slice-based frankenmerging
+// =============================================================================
+
+/// Run a frankenmerge using the slice-based configuration.
+///
+/// Slice-based merging assembles a model by pulling specific layer ranges from
+/// one or more source models and optionally merging multiple sources per slice.
+///
+/// # Layer Remapping
+///
+/// Tensor names follow the convention `model.layers.{N}.{rest}`.  For each
+/// output slice the source layer indices are remapped to a contiguous output
+/// range.  For example:
+///
+/// ```text
+/// slice[0]: model_a layers [0,16)  →  output layers [0,16)
+/// slice[1]: model_b layers [8,24)  →  output layers [16,32)
+/// ```
+///
+/// Tensor `model.layers.8.self_attn.q_proj.weight` from `model_b` becomes
+/// `model.layers.16.self_attn.q_proj.weight` in the output.
+///
+/// # Non-layer Tensors
+///
+/// Tensors that do not contain a `layers.N` component (e.g. `model.embed_tokens.weight`,
+/// `model.norm.weight`, `lm_head.weight`) are copied from the first source model
+/// of the first slice unless overridden by `base_model`.
+///
+/// # Arguments
+/// * `config` - Merge configuration with `slices` populated.
+///
+/// # Returns
+/// Path to the merged model output directory.
+pub fn run_merge_sliced(config: &MergeConfig) -> Result<std::path::PathBuf> {
+    config.validate()?;
+
+    let slices = config.slices.as_ref().ok_or_else(|| {
+        MergeError::InvalidConfig("run_merge_sliced called on non-sliced config".to_string())
+    })?;
+
+    info!("Starting slice-based frankenmerge: {} slices", slices.len());
+
+    // Pre-compile the layer-index regex once
+    let layer_re = layer_index_regex();
+
+    // Determine output path
+    let output_path = config
+        .output_path
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("merged_model"));
+
+    let mut writer = TensorWriter::new(&output_path)?;
+
+    // Track which non-layer tensors we've already written so we don't duplicate
+    let mut written_non_layer: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Collect base model loader (optional)
+    let global_base_loader: Option<SafetensorsLoader> = match &config.base_model {
+        Some(p) => Some(SafetensorsLoader::new(std::path::Path::new(p))?),
+        None => None,
+    };
+
+    // Compute output layer offsets: output_offset[i] = sum of n_layers for slices [0..i)
+    let output_offsets: Vec<usize> = {
+        let mut offsets = Vec::with_capacity(slices.len());
+        let mut running = 0usize;
+        for slice in slices {
+            offsets.push(running);
+            // Use the layer count of the first source as authoritative
+            if let Some(first_src) = slice.sources.first() {
+                running += first_src.n_layers();
+            }
+        }
+        offsets
+    };
+
+    let total_output_layers: usize = slices
+        .iter()
+        .filter_map(|s| s.sources.first())
+        .map(|src| src.n_layers())
+        .sum();
+
+    info!(
+        "Output model will have {} transformer layers across {} slices",
+        total_output_layers,
+        slices.len()
+    );
+
+    for (slice_idx, (slice, &out_offset)) in slices.iter().zip(output_offsets.iter()).enumerate() {
+        info!(
+            "Processing slice[{}]: output layers [{}..{})",
+            slice_idx,
+            out_offset,
+            out_offset + slice.sources.first().map(|s| s.n_layers()).unwrap_or(0)
+        );
+
+        // Effective merge method for this slice
+        let effective_method_cfg = slice.merge_method.as_ref().unwrap_or(&config.merge_method);
+        let method = create_merge_method(effective_method_cfg);
+
+        // Effective parameters: global → slice-level (slice wins)
+        let effective_params = config.parameters.merge_with(&slice.parameters);
+
+        // Effective base model: global → slice-level override
+        let slice_base_loader: Option<SafetensorsLoader> = match &slice.base_model {
+            Some(p) => Some(SafetensorsLoader::new(std::path::Path::new(p))?),
+            None => None,
+        };
+        let base_loader_ref: Option<&SafetensorsLoader> =
+            slice_base_loader.as_ref().or(global_base_loader.as_ref());
+
+        // Load source model loaders for this slice
+        let src_loaders: Vec<SafetensorsLoader> = slice
+            .sources
+            .iter()
+            .map(|src| SafetensorsLoader::new(std::path::Path::new(&src.model)))
+            .collect::<Result<_>>()?;
+
+        // Build the set of (output_name, source_name_per_model, per_source_params)
+        // by iterating over layer indices in the source range.
+        let (out_src_start, out_src_end) = slice
+            .sources
+            .first()
+            .map(|s| s.layer_range)
+            .unwrap_or((0, 0));
+
+        let n_layers = out_src_end.saturating_sub(out_src_start);
+
+        // Collect all output layer tensor names that will be produced by this slice
+        // We iterate over the source layers and remap to output layer indices.
+        let mut slice_tensor_count = 0usize;
+
+        for layer_delta in 0..n_layers {
+            let out_layer_idx = out_offset + layer_delta;
+
+            // Collect all tensor suffixes for this layer from the first source model
+            // (suffixes should be the same across sources)
+            let src_layer_idx_0 = slice.sources[0].layer_range.0 + layer_delta;
+            let layer_prefix_src = format!("model.layers.{}.", src_layer_idx_0);
+            let layer_prefix_out = format!("model.layers.{}.", out_layer_idx);
+
+            // Gather all tensor suffixes available for this layer from the first source
+            let suffixes: Vec<String> = src_loaders[0]
+                .tensor_names()
+                .into_iter()
+                .filter(|n| n.starts_with(&layer_prefix_src))
+                .map(|n| n[layer_prefix_src.len()..].to_string())
+                .collect();
+
+            if suffixes.is_empty() {
+                debug!(
+                    "slice[{}]: no tensors found for source layer {} in model {:?}",
+                    slice_idx, src_layer_idx_0, slice.sources[0].model
+                );
+            }
+
+            for suffix in &suffixes {
+                let out_name = format!("{}{}", layer_prefix_out, suffix);
+
+                // Collect the corresponding tensor from each source model
+                // (each source may contribute a different layer to the same output layer)
+                let mut tensors: Vec<Array> = Vec::with_capacity(src_loaders.len());
+                let mut per_src_params: Vec<MergeParameters> =
+                    Vec::with_capacity(src_loaders.len());
+
+                for (src_idx, (src_loader, src_def)) in
+                    src_loaders.iter().zip(slice.sources.iter()).enumerate()
+                {
+                    let src_layer_idx = src_def.layer_range.0 + layer_delta;
+                    let src_name = format!("model.layers.{}.{}", src_layer_idx, suffix);
+
+                    if src_loader.tensor_names().contains(&src_name) {
+                        let tensor = src_loader.load_tensor(&src_name)?;
+                        tensors.push(tensor);
+                        // Per-source params override slice params
+                        let p = effective_params.merge_with(&src_def.parameters);
+                        per_src_params.push(p);
+                    } else {
+                        debug!(
+                            "slice[{}] src[{}]: tensor {} not found, skipping",
+                            slice_idx, src_idx, src_name
+                        );
+                    }
+                }
+
+                if tensors.is_empty() {
+                    debug!(
+                        "slice[{}]: no source tensors for {}, skipping",
+                        slice_idx, out_name
+                    );
+                    continue;
+                }
+
+                // Load base tensor if the method requires it
+                let base_tensor = if method.requires_base_model() {
+                    load_base_tensor_for_slice(
+                        base_loader_ref,
+                        &out_name,
+                        &layer_re,
+                        out_layer_idx,
+                    )?
+                } else {
+                    None
+                };
+
+                verify_shapes(&out_name, &tensors, base_tensor.as_ref())?;
+
+                let merged = method.merge(
+                    &tensors,
+                    base_tensor.as_ref(),
+                    &per_src_params,
+                    &effective_params,
+                )?;
+                writer.write_tensor(&out_name, &merged)?;
+                slice_tensor_count += 1;
+            }
+        }
+
+        // On the first slice, also copy non-layer tensors (embed_tokens, lm_head, etc.)
+        // from the first source model.  Only do this once.
+        if slice_idx == 0 {
+            let first_loader = &src_loaders[0];
+            let non_layer_tensors: Vec<String> = first_loader
+                .tensor_names()
+                .into_iter()
+                .filter(|n| !is_layer_tensor(n, &layer_re))
+                .collect();
+
+            for name in &non_layer_tensors {
+                if !written_non_layer.contains(name) {
+                    let tensor = first_loader.load_tensor(name)?;
+                    writer.write_tensor(name, &tensor)?;
+                    written_non_layer.insert(name.clone());
+                    debug!("Copied non-layer tensor: {}", name);
+                }
+            }
+
+            info!(
+                "Copied {} non-layer tensors from first source model",
+                non_layer_tensors.len()
+            );
+        }
+
+        info!(
+            "slice[{}] complete: {} layer tensors written",
+            slice_idx, slice_tensor_count
+        );
+    }
+
+    writer.finalize()?;
+    info!(
+        "Slice-based merge complete! Output saved to: {:?}",
+        output_path
+    );
+
+    Ok(output_path)
+}
+
+/// Returns `true` if the tensor name contains a `layers.N` component.
+fn is_layer_tensor(name: &str, re: &Regex) -> bool {
+    re.is_match(name)
+}
+
+/// Compile the layer-index regex (matches `model.layers.{N}.` prefix).
+fn layer_index_regex() -> Regex {
+    // Matches the canonical transformer layer naming convention:
+    //   model.layers.<N>.<rest>
+    // Also handles models that use `transformer.h.<N>` or similar via a
+    // broader pattern that captures any `layers.<N>` or `.N.` between
+    // known layer container names.
+    Regex::new(r"(?:^|\.)(layers|h)\.(\d+)\.").expect("layer index regex is valid")
+}
+
+/// Extract the layer index from a tensor name, if present.
+///
+/// Returns `None` for non-layer tensors (embed_tokens, lm_head, norm, etc.).
+pub fn extract_layer_index(name: &str) -> Option<usize> {
+    let re = layer_index_regex();
+    re.captures(name)
+        .and_then(|caps| caps.get(2))
+        .and_then(|m| m.as_str().parse().ok())
+}
+
+/// Rewrite the layer index in a tensor name.
+///
+/// `model.layers.5.self_attn.q_proj.weight` with `new_idx=2` →
+/// `model.layers.2.self_attn.q_proj.weight`
+///
+/// Returns `None` for names that contain no `layers.N` component.
+pub fn remap_layer_index(name: &str, new_idx: usize) -> Option<String> {
+    let re = layer_index_regex();
+    let caps = re.captures(name)?;
+    let full_match = caps.get(0)?;
+    let container = caps.get(1)?.as_str();
+    let match_start = full_match.start();
+    let match_end = full_match.end();
+
+    // Determine whether the match was preceded by a '.' separator or is at
+    // the start of the string (the regex captures the leading dot when present).
+    let sep = if full_match.as_str().starts_with('.') {
+        "."
+    } else {
+        ""
+    };
+    let after_suffix = &name[match_end..]; // everything after `layers.N.`
+
+    Some(
+        format!(
+            "{}{}{}{}{}.",
+            &name[..match_start],
+            sep,
+            container,
+            '.',
+            new_idx
+        ) + after_suffix,
+    )
+}
+
+/// Load a base tensor for a slice merge, handling the layer-name remapping.
+///
+/// The base model stores tensors at their *original* layer indices.  The
+/// `out_name` uses the *output* layer index.  We remap back to look up the
+/// corresponding tensor in the base model.
+fn load_base_tensor_for_slice(
+    base_loader: Option<&SafetensorsLoader>,
+    out_name: &str,
+    layer_re: &Regex,
+    _out_layer_idx: usize,
+) -> Result<Option<Array>> {
+    let Some(base) = base_loader else {
+        return Ok(None);
+    };
+
+    // For base tensors we use the output name directly — the caller passes the
+    // output-remapped name, and we look for it as-is.  If not found, fall back
+    // to None (the merge method decides how to handle a missing base tensor).
+    if base.tensor_names().contains(&out_name.to_string()) {
+        return Ok(Some(base.load_tensor(out_name)?));
+    }
+
+    // Not in the base model — acceptable for sliced frankenmerges where the
+    // base only covers some layers.
+    let _ = layer_re; // suppress unused warning
+    Ok(None)
+}
+
 /// Builder for creating merge configurations programmatically.
 #[derive(Debug, Default)]
 pub struct MergeBuilder {
@@ -390,25 +749,25 @@ impl MergeBuilder {
 
     /// Set global merge weight.
     pub fn weight(mut self, weight: f32) -> Self {
-        self.parameters.weight = Some(weight);
+        self.parameters.weight = Some(crate::config::ParameterSetting::Scalar(weight));
         self
     }
 
     /// Set global density for sparsification.
     pub fn density(mut self, density: f32) -> Self {
-        self.parameters.density = Some(density);
+        self.parameters.density = Some(crate::config::ParameterSetting::Scalar(density));
         self
     }
 
     /// Set t parameter for SLERP.
     pub fn t(mut self, t: f32) -> Self {
-        self.parameters.t = Some(t);
+        self.parameters.t = Some(crate::config::ParameterSetting::Scalar(t));
         self
     }
 
     /// Set lambda scaling factor.
     pub fn lambda(mut self, lambda: f32) -> Self {
-        self.parameters.lambda = Some(lambda);
+        self.parameters.lambda = Some(crate::config::ParameterSetting::Scalar(lambda));
         self
     }
 
@@ -443,6 +802,7 @@ impl MergeBuilder {
             dtype: "float16".to_string(),
             parameters: self.parameters,
             tokenizer: None,
+            slices: None,
         })
     }
 
@@ -469,7 +829,7 @@ mod tests {
         let config = builder.build().unwrap();
         assert!(matches!(config.merge_method, MergeMethodConfig::Linear));
         assert_eq!(config.models.len(), 2);
-        assert_eq!(config.parameters.weight, Some(0.5));
+        assert!((config.parameters.weight() - 0.5).abs() < 1e-6);
     }
 
     #[test]

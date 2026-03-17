@@ -143,12 +143,11 @@ impl MergeMethod for SlerpMerge {
             )));
         }
 
-        // Get t from first model's params or global
+        // Get t from first model's params, falling back to global
         let t = params
             .first()
-            .and_then(|p| p.t)
-            .or(global_params.t)
-            .unwrap_or(0.5);
+            .and_then(|p| p.t.as_ref().map(|v| v.resolve_or("", 0.5)))
+            .unwrap_or_else(|| global_params.t());
 
         if !(0.0..=1.0).contains(&t) {
             return Err(MergeError::InvalidConfig(format!(

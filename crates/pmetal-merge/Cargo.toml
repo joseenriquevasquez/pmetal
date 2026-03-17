@@ -28,6 +28,8 @@ hf-hub = { workspace = true }
 half = { workspace = true }
 zerocopy = { workspace = true }
 memmap2 = { workspace = true }
+ndarray = { workspace = true }
+regex = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

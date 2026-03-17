@@ -412,13 +412,13 @@ mod tests {
         let t1 = Array::from_slice(&[2.0_f32, 3.0, 4.0], &[3]);
 
         let params = vec![MergeParameters {
-            weight: Some(1.0),
-            density: Some(0.5),
+            weight: Some(1.0_f32.into()),
+            density: Some(0.5_f32.into()),
             ..Default::default()
         }];
 
         let global = MergeParameters {
-            lambda: Some(0.0),
+            lambda: Some(0.0_f32.into()),
             ..Default::default()
         };
 
@@ -442,12 +442,12 @@ mod tests {
         let t1 = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
 
         let params = vec![MergeParameters {
-            weight: Some(1.0),
-            density: Some(1.0),
+            weight: Some(1.0_f32.into()),
+            density: Some(1.0_f32.into()),
             ..Default::default()
         }];
         let global = MergeParameters {
-            lambda: Some(1.0),
+            lambda: Some(1.0_f32.into()),
             ..Default::default()
         };
 
@@ -474,12 +474,12 @@ mod tests {
         let t1 = Array::from_slice(&[5.0_f32, 6.0, 7.0], &[3]);
 
         let params = vec![MergeParameters {
-            weight: Some(1.0),
-            density: Some(0.0),
+            weight: Some(1.0_f32.into()),
+            density: Some(0.0_f32.into()),
             ..Default::default()
         }];
         let global = MergeParameters {
-            lambda: Some(1.0),
+            lambda: Some(1.0_f32.into()),
             ..Default::default()
         };
 
@@ -518,12 +518,12 @@ mod tests {
         let t1 = Array::from_slice(&[1.0_f32, 0.5, 2.0, 0.1, 0.8, 0.3, 1.5, 0.6], &[8]);
 
         let params = vec![MergeParameters {
-            weight: Some(1.0),
-            density: Some(0.5),
+            weight: Some(1.0_f32.into()),
+            density: Some(0.5_f32.into()),
             ..Default::default()
         }];
         let global = MergeParameters {
-            lambda: Some(1.0),
+            lambda: Some(1.0_f32.into()),
             ..Default::default()
         };
 
@@ -548,12 +548,12 @@ mod tests {
         let t1 = Array::from_slice(&[0.1_f32, 5.0, 0.2, 4.0, 0.3, 3.0, 0.4, 2.0], &[8]);
 
         let params = vec![MergeParameters {
-            weight: Some(1.0),
-            density: Some(0.5),
+            weight: Some(1.0_f32.into()),
+            density: Some(0.5_f32.into()),
             ..Default::default()
         }];
         let global = MergeParameters {
-            lambda: Some(1.0),
+            lambda: Some(1.0_f32.into()),
             ..Default::default()
         };
 

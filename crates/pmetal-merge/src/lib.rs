@@ -50,6 +50,7 @@ mod error;
 pub mod fp8_merge;
 pub mod gpu_merge;
 mod loader;
+pub mod lora_merge;
 mod merge;
 pub mod methods;
 mod sparsify;
@@ -64,11 +65,12 @@ pub use fp8_merge::{
 };
 pub use gpu_merge::{GpuMergeConfig, GpuMerger};
 pub use loader::*;
+pub use lora_merge::{AccurateMergeConfig, LoraMergeStats, streaming_lora_merge};
 pub use merge::*;
 pub use sparsify::*;
 
 /// Re-export merge methods for convenience
 pub use methods::{
-    BreadcrumbsMerge, DareMerge, DellaMerge, LinearMerge, MergeMethod, ModelStockMerge,
-    NearswapMerge, PassthroughMerge, SlerpMerge, SouperMerge, TaskArithmeticMerge, TiesMerge,
+    ModelStockMerge, MultiSlerpMerge, NearswapMerge, PassthroughMerge, RamMerge, SlerpMerge,
+    SouperMerge, TaskArithmeticMerge, TiesMerge,
 };

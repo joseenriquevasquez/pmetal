@@ -94,11 +94,11 @@ mod tests {
 
         let params = vec![
             MergeParameters {
-                weight: Some(1.0),
+                weight: Some(1.0_f32.into()),
                 ..Default::default()
             },
             MergeParameters {
-                weight: Some(1.0),
+                weight: Some(1.0_f32.into()),
                 ..Default::default()
             },
         ];
@@ -126,11 +126,11 @@ mod tests {
 
         let params = vec![
             MergeParameters {
-                weight: Some(0.75),
+                weight: Some(0.75_f32.into()),
                 ..Default::default()
             },
             MergeParameters {
-                weight: Some(0.25),
+                weight: Some(0.25_f32.into()),
                 ..Default::default()
             },
         ];
