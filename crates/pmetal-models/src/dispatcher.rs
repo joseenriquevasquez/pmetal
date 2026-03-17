@@ -4,7 +4,10 @@
 //! eliminating the need for hardcoded model types in application code.
 
 use crate::architectures::*;
-use crate::loader::{load_generic_weights, load_nemotron_weights, load_qwen3_next_weights};
+use crate::loader::{
+    load_bert_weights, load_falcon_h1_weights, load_generic_weights, load_nemotron_weights,
+    load_qwen3_next_weights, load_weights,
+};
 use crate::traits::{CausalLMModel, ModelConfig};
 use mlx_rs::{
     Array,
@@ -34,7 +37,10 @@ pub enum ModelArchitecture {
     StarCoder2,
     RecurrentGemma,
     Jamba,
+    FalconH1,
     Flux,
+    /// BERT / RoBERTa / DistilBERT encoder-only model.
+    Bert,
 }
 
 impl std::fmt::Display for ModelArchitecture {
@@ -57,7 +63,9 @@ impl std::fmt::Display for ModelArchitecture {
             Self::StarCoder2 => write!(f, "StarCoder2"),
             Self::RecurrentGemma => write!(f, "RecurrentGemma"),
             Self::Jamba => write!(f, "Jamba"),
+            Self::FalconH1 => write!(f, "Falcon H1"),
             Self::Flux => write!(f, "Flux"),
+            Self::Bert => write!(f, "BERT"),
         }
     }
 }
@@ -83,7 +91,9 @@ impl ModelArchitecture {
             "starcoder2" | "starcoder-2" => Some(Self::StarCoder2),
             "recurrentgemma" | "recurrent-gemma" | "griffin" => Some(Self::RecurrentGemma),
             "jamba" | "jamba-1.5" => Some(Self::Jamba),
+            "falcon_h1" | "falconh1" | "falcon-h1" => Some(Self::FalconH1),
             "flux" | "flux-1" | "flux.1" => Some(Self::Flux),
+            "bert" | "roberta" | "distilbert" | "xlm-roberta" | "xlm_roberta" => Some(Self::Bert),
             _ => None,
         }
     }
@@ -148,8 +158,15 @@ impl ModelArchitecture {
             if lower.contains("jamba") {
                 return Some(Self::Jamba);
             }
+            if lower.contains("falconh1") || lower.contains("falcon_h1") || lower.contains("falcon-h1") {
+                return Some(Self::FalconH1);
+            }
             if lower.contains("flux") {
                 return Some(Self::Flux);
+            }
+            // Check BERT family after other checks to avoid false positives
+            if lower.contains("bert") {
+                return Some(Self::Bert);
             }
         }
         None
@@ -204,7 +221,9 @@ pub enum DynamicModel {
     StarCoder2(StarCoder2Model),
     RecurrentGemma(RecurrentGemmaModel),
     Jamba(JambaModel),
+    FalconH1(FalconH1ForCausalLM),
     Flux(FluxDiT),
+    Bert(BertForEmbedding),
 }
 
 impl std::fmt::Debug for DynamicModel {
@@ -227,7 +246,9 @@ impl std::fmt::Debug for DynamicModel {
             Self::StarCoder2(_) => write!(f, "DynamicModel::StarCoder2"),
             Self::RecurrentGemma(_) => write!(f, "DynamicModel::RecurrentGemma"),
             Self::Jamba(_) => write!(f, "DynamicModel::Jamba"),
+            Self::FalconH1(_) => write!(f, "DynamicModel::FalconH1"),
             Self::Flux(_) => write!(f, "DynamicModel::Flux"),
+            Self::Bert(_) => write!(f, "DynamicModel::Bert"),
         }
     }
 }
@@ -436,9 +457,34 @@ impl DynamicModel {
                 ModuleParametersExt::eval(&model)?;
                 Ok(Self::Jamba(model))
             }
+            ModelArchitecture::FalconH1 => {
+                let config: FalconH1Config = serde_json::from_str(&config_content)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let mut model = FalconH1ForCausalLM::new(config)?;
+                let weights = crate::loader::load_weights(model_dir)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                load_falcon_h1_weights(&mut model, &weights)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                ModuleParametersExt::eval(&model)?;
+                Ok(Self::FalconH1(model))
+            }
             ModelArchitecture::Flux => Err(Exception::custom(
                 "Flux models are diffusion pipelines, not causal language models. Load them via pmetal_models::pipelines::FluxPipeline instead of DynamicModel::load.",
             )),
+            ModelArchitecture::Bert => {
+                let config: BertConfig = serde_json::from_str(&config_content)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let mut model = BertForEmbedding::new(config)?;
+                // Load weights using the HF→PMetal name remapper.  HuggingFace BERT
+                // checkpoints use paths like `bert.encoder.layer.0.attention.self.query.*`
+                // which differ from PMetal's `model.layers.0.attention.query.*`.
+                let weights = load_weights(model_dir)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                load_bert_weights(&mut model, &weights)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                ModuleParametersExt::eval(&model)?;
+                Ok(Self::Bert(model))
+            }
         }
     }
 
@@ -461,9 +507,13 @@ impl DynamicModel {
             Self::StarCoder2(m) => m.forward(input_ids, mask, None),
             Self::RecurrentGemma(m) => m.forward(input_ids),
             Self::Jamba(m) => m.forward(input_ids),
+            Self::FalconH1(m) => m.forward(input_ids, mask),
             Self::Flux(_) => Err(Exception::custom(
                 "Flux is not a CausalLM and does not support standard forward(input_ids, mask)",
             )),
+            // BERT encoder: forward returns hidden states [batch, seq, hidden], not logits.
+            // Use EmbeddingTrainer::encode() / pmetal_models::pooling::pool() for embeddings.
+            Self::Bert(m) => BertForEmbedding::forward(m, input_ids, mask),
         }
     }
 
@@ -490,7 +540,7 @@ impl DynamicModel {
             Self::Phi4(m) => m.forward_with_cache(input_ids, mask, cache),
             // Hybrid recurrent+attention models require both a KV cache and a
             // Mamba/GDN state cache. Use `forward_with_hybrid_cache` instead.
-            Self::NemotronH(_) | Self::Qwen3Next(_) => Err(Exception::custom(
+            Self::NemotronH(_) | Self::Qwen3Next(_) | Self::FalconH1(_) => Err(Exception::custom(
                 "Hybrid architecture requires both KV and Mamba caches. \
                  Use DynamicModel::forward_with_hybrid_cache with both \
                  create_cache() and create_mamba_cache().",
@@ -501,6 +551,8 @@ impl DynamicModel {
             Self::Flux(_) => Err(Exception::custom(
                 "Flux is not a CausalLM and does not support forward_with_cache.",
             )),
+            // BERT is encoder-only (no autoregressive cache) — delegate to standard forward.
+            Self::Bert(m) => BertForEmbedding::forward(m, input_ids, mask),
         }
     }
 
@@ -585,7 +637,15 @@ impl DynamicModel {
                 m.config.num_key_value_heads as usize,
                 (m.config.hidden_size / m.config.num_attention_heads) as usize,
             )),
+            Self::FalconH1(m) => KVCache::new(KVCacheConfig::new(
+                m.config().num_hidden_layers() as usize,
+                max_seq_len,
+                m.config().num_kv_heads() as usize,
+                m.config().head_dim() as usize,
+            )),
             Self::Flux(_) => KVCache::new(KVCacheConfig::new(0, 0, 0, 0)),
+            // BERT is encoder-only with no autoregressive KV cache.
+            Self::Bert(_) => KVCache::new(KVCacheConfig::new(0, 0, 0, 0)),
         }
     }
 
@@ -593,6 +653,8 @@ impl DynamicModel {
         match self {
             Self::NemotronH(m) => Some(MambaCache::new(m.config().num_hidden_layers() as usize)),
             Self::Qwen3Next(m) => Some(MambaCache::new(m.config().num_hidden_layers() as usize)),
+            // FalconH1: every layer has Mamba, so the cache covers all layers.
+            Self::FalconH1(m) => Some(MambaCache::new(m.config().num_hidden_layers() as usize)),
             _ => None,
         }
     }
@@ -607,6 +669,7 @@ impl DynamicModel {
         match self {
             Self::NemotronH(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
             Self::Qwen3Next(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
+            Self::FalconH1(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
             _ => self.forward_with_cache(input_ids, mask, kv_cache),
         }
     }
@@ -630,7 +693,9 @@ impl DynamicModel {
             Self::StarCoder2(_) => ModelArchitecture::StarCoder2,
             Self::RecurrentGemma(_) => ModelArchitecture::RecurrentGemma,
             Self::Jamba(_) => ModelArchitecture::Jamba,
+            Self::FalconH1(_) => ModelArchitecture::FalconH1,
             Self::Flux(_) => ModelArchitecture::Flux,
+            Self::Bert(_) => ModelArchitecture::Bert,
         }
     }
 
@@ -653,7 +718,9 @@ impl DynamicModel {
             Self::StarCoder2(m) => m.config.vocab_size,
             Self::RecurrentGemma(m) => m.config.vocab_size,
             Self::Jamba(m) => m.config.vocab_size,
+            Self::FalconH1(m) => m.config().vocab_size(),
             Self::Flux(_) => 0,
+            Self::Bert(m) => m.config().vocab_size as i32,
         }
     }
 
@@ -676,7 +743,9 @@ impl DynamicModel {
             Self::StarCoder2(m) => m.config.hidden_size,
             Self::RecurrentGemma(m) => m.config.hidden_size,
             Self::Jamba(m) => m.config.hidden_size,
+            Self::FalconH1(m) => m.config().hidden_size(),
             Self::Flux(m) => m.pos_embedder.dim as i32,
+            Self::Bert(m) => m.config().hidden_size as i32,
         }
     }
 
@@ -699,7 +768,9 @@ impl DynamicModel {
             Self::StarCoder2(m) => ModuleParametersExt::eval(m),
             Self::RecurrentGemma(m) => ModuleParametersExt::eval(m),
             Self::Jamba(m) => ModuleParametersExt::eval(m),
+            Self::FalconH1(m) => ModuleParametersExt::eval(m),
             Self::Flux(m) => ModuleParametersExt::eval(m),
+            Self::Bert(m) => ModuleParametersExt::eval(m),
         }
     }
 }
@@ -724,7 +795,9 @@ impl ModuleParameters for DynamicModel {
             Self::StarCoder2(m) => m.parameters(),
             Self::RecurrentGemma(m) => m.parameters(),
             Self::Jamba(m) => m.parameters(),
+            Self::FalconH1(m) => m.parameters(),
             Self::Flux(m) => m.parameters(),
+            Self::Bert(m) => m.parameters(),
         }
     }
 
@@ -747,7 +820,9 @@ impl ModuleParameters for DynamicModel {
             Self::StarCoder2(m) => m.trainable_parameters(),
             Self::RecurrentGemma(m) => m.trainable_parameters(),
             Self::Jamba(m) => m.trainable_parameters(),
+            Self::FalconH1(m) => m.trainable_parameters(),
             Self::Flux(m) => m.trainable_parameters(),
+            Self::Bert(m) => m.trainable_parameters(),
         }
     }
 
@@ -770,7 +845,9 @@ impl ModuleParameters for DynamicModel {
             Self::StarCoder2(m) => m.parameters_mut(),
             Self::RecurrentGemma(m) => m.parameters_mut(),
             Self::Jamba(m) => m.parameters_mut(),
+            Self::FalconH1(m) => m.parameters_mut(),
             Self::Flux(m) => m.parameters_mut(),
+            Self::Bert(m) => m.parameters_mut(),
         }
     }
 
@@ -793,7 +870,9 @@ impl ModuleParameters for DynamicModel {
             Self::StarCoder2(m) => m.num_parameters(),
             Self::RecurrentGemma(m) => m.num_parameters(),
             Self::Jamba(m) => m.num_parameters(),
+            Self::FalconH1(m) => m.num_parameters(),
             Self::Flux(m) => m.num_parameters(),
+            Self::Bert(m) => m.num_parameters(),
         }
     }
 
@@ -816,7 +895,9 @@ impl ModuleParameters for DynamicModel {
             Self::StarCoder2(m) => m.freeze_parameters(recurse),
             Self::RecurrentGemma(m) => m.freeze_parameters(recurse),
             Self::Jamba(m) => m.freeze_parameters(recurse),
+            Self::FalconH1(m) => m.freeze_parameters(recurse),
             Self::Flux(m) => m.freeze_parameters(recurse),
+            Self::Bert(m) => m.freeze_parameters(recurse),
         }
     }
 
@@ -839,7 +920,9 @@ impl ModuleParameters for DynamicModel {
             Self::StarCoder2(m) => m.unfreeze_parameters(recurse),
             Self::RecurrentGemma(m) => m.unfreeze_parameters(recurse),
             Self::Jamba(m) => m.unfreeze_parameters(recurse),
+            Self::FalconH1(m) => m.unfreeze_parameters(recurse),
             Self::Flux(m) => m.unfreeze_parameters(recurse),
+            Self::Bert(m) => m.unfreeze_parameters(recurse),
         }
     }
 
@@ -862,7 +945,9 @@ impl ModuleParameters for DynamicModel {
             Self::StarCoder2(m) => m.all_frozen(),
             Self::RecurrentGemma(m) => m.all_frozen(),
             Self::Jamba(m) => m.all_frozen(),
+            Self::FalconH1(m) => m.all_frozen(),
             Self::Flux(m) => m.all_frozen(),
+            Self::Bert(m) => m.all_frozen(),
         }
     }
 
@@ -885,7 +970,9 @@ impl ModuleParameters for DynamicModel {
             Self::StarCoder2(m) => m.any_frozen(),
             Self::RecurrentGemma(m) => m.any_frozen(),
             Self::Jamba(m) => m.any_frozen(),
+            Self::FalconH1(m) => m.any_frozen(),
             Self::Flux(m) => m.any_frozen(),
+            Self::Bert(m) => m.any_frozen(),
         }
     }
 }

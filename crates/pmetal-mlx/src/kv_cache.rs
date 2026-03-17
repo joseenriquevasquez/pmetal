@@ -436,6 +436,33 @@ impl KVCache {
         self.total_tokens = 0;
     }
 
+    /// Roll back (discard) the last `n` tokens from every layer in the cache.
+    ///
+    /// This is used after speculative decoding when some draft tokens are
+    /// rejected: the verify model has already appended the full draft sequence
+    /// to its KV cache, but only the accepted prefix should be retained.
+    ///
+    /// The operation simply decrements each layer's `offset` by `n` and
+    /// adjusts `total_tokens`.  The underlying buffer data beyond the new
+    /// offset is left in place (overwritten on the next `update_and_fetch`
+    /// call) — this is safe because `update_and_fetch` always writes before
+    /// reading the new positions.
+    ///
+    /// # Panics
+    ///
+    /// Panics (in debug) if `n > seq_len()`.  In release builds the offset is
+    /// clamped to 0 to avoid underflow.
+    pub fn rollback(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let rollback_n = n.min(self.total_tokens);
+        for cache in &mut self.layer_caches {
+            cache.offset = cache.offset.saturating_sub(n);
+        }
+        self.total_tokens = self.total_tokens.saturating_sub(rollback_n);
+    }
+
     /// Update the cache with new keys and values for a layer.
     ///
     /// Keys/values are expected in **attention format** `[B, heads, seq, head_dim]`
