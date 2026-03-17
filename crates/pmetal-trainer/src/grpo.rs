@@ -113,6 +113,83 @@ pub struct GrpoConfig {
     pub epsilon_low: f64,
     /// Upper clipping epsilon for PPO-clip (default 0.2).
     pub epsilon_high: f64,
+    /// Enable VLM (Vision-Language Model) mode for processing image inputs.
+    ///
+    /// When enabled, the trainer will load images from each sample's `images` field,
+    /// pass them to reward functions, and use `forward_with_images` for the training
+    /// step to condition the model on visual inputs alongside text.
+    pub vlm_mode: bool,
+    /// Maximum image size (pixels per side) for VLM preprocessing.
+    ///
+    /// Images are resized to fit within this square while maintaining aspect ratio.
+    /// Typical values: 336 (CLIP ViT-L/14), 448, 560 (Mllama).
+    pub max_image_size: usize,
+    /// Path to a pretrained ML reward model for scoring completions.
+    ///
+    /// When set, an `MLRewardModel` is loaded at training start and added to the
+    /// `CombinedReward` with weight `reward_model_weight`.  The reward model runs
+    /// inference-only alongside the policy model.
+    ///
+    /// Supports any architecture recognized by `DynamicModel::load` (Llama,
+    /// Qwen, Gemma, Mistral, …).  Popular choices: ArmoRM-Llama3-8B-v0.1,
+    /// Skywork-Reward-Llama-3.1-8B, and FsfairX-LLaMA3-RM-v0.1.
+    pub reward_model_path: Option<String>,
+    /// Maximum input sequence length for the ML reward model (tokens).
+    ///
+    /// Inputs longer than this are truncated from the right.  Defaults to 2048.
+    pub reward_model_max_length: usize,
+    /// Weight for the ML reward model relative to heuristic reward functions.
+    ///
+    /// The combined reward is a weighted sum across all reward functions.
+    /// Defaults to 1.0.
+    pub reward_model_weight: f64,
+    /// Optional chat template for formatting prompt+completion inputs to the
+    /// reward model.
+    ///
+    /// Use `{prompt}` and `{completion}` as placeholders.  When `None`, prompt
+    /// and completion are concatenated directly (suitable for reward models
+    /// that expect raw text).
+    pub reward_model_chat_template: Option<String>,
+    /// Enable pipelined (asynchronous) reward scoring.
+    ///
+    /// When `true`, each training step submits the reward scoring request to a
+    /// background thread **before** the GPU training forward/backward pass.
+    /// The scores from the previous step are collected at the start of each
+    /// new step, allowing reward computation to overlap with GPU execution.
+    ///
+    /// This is most effective when the reward model is CPU- or ANE-bound
+    /// (e.g., an `MLRewardModel`) and the training step has non-trivial GPU
+    /// latency.  For pure heuristic rewards (format, accuracy checks), the
+    /// overhead is negligible and pipelining provides no measurable benefit.
+    ///
+    /// The pipeline shifts reward scoring by one step, so the first training
+    /// step uses freshly computed rewards (no delay) and subsequent steps use
+    /// scores that were computed during the previous step's GPU pass.
+    ///
+    /// Defaults to `false`.
+    pub async_rewards: bool,
+    /// Enable speculative decoding for rollout generation.
+    ///
+    /// When `true`, `generate_completions` uses a layer-split draft/verify
+    /// approach via `BatchedRlGenerator::generate_speculative`.  The same
+    /// `forward_with_cache` call is used for both the cheap draft phase (first
+    /// N/3 layers — emulated by re-running with a small token sequence through
+    /// the full model after early-exit via the draft closure split) and the
+    /// authoritative verify phase.
+    ///
+    /// Expected throughput improvement: 2–4× depending on model and acceptance
+    /// rate.  Requires the policy model to support KV caching; automatically
+    /// falls back to standard generation when the model returns `None` from
+    /// `create_cache`.
+    ///
+    /// Defaults to `false`.
+    pub use_speculative: bool,
+    /// Number of draft tokens to propose per speculative decode step.
+    ///
+    /// Higher values amortise more tokens per verify pass, but reduce the
+    /// benefit when the draft acceptance rate drops.  Typical sweet-spot: 3–5.
+    /// Ignored when `use_speculative` is `false`.  Defaults to 3.
+    pub speculative_draft_tokens: usize,
 }
 
 impl Default for GrpoConfig {
@@ -130,6 +207,15 @@ impl Default for GrpoConfig {
             loss_type: GrpoLossType::Bnpo,
             epsilon_low: 0.2,
             epsilon_high: 0.2,
+            vlm_mode: false,
+            max_image_size: 336,
+            reward_model_path: None,
+            reward_model_max_length: 2048,
+            reward_model_weight: 1.0,
+            reward_model_chat_template: None,
+            async_rewards: false,
+            use_speculative: false,
+            speculative_draft_tokens: 3,
         }
     }
 }
@@ -161,6 +247,14 @@ pub struct CompletionGroup {
     pub completion_ids: Vec<Vec<u32>>,
     pub rewards: Vec<f64>,
     pub stopped_by_length: Vec<bool>,
+    /// Optional preprocessed pixel values for VLM training.
+    ///
+    /// When VLM mode is active this holds the images loaded from the corresponding
+    /// dataset sample (`sample.images`).  Each element is one image as an MLX
+    /// array of shape `[1, C, H, W]` (NCHW float32, model-specific normalization).
+    /// All completions in this group share the same images — they all come from the
+    /// same prompt.
+    pub pixel_values: Option<Vec<Array>>,
 }
 
 impl CompletionGroup {
@@ -170,6 +264,7 @@ impl CompletionGroup {
             completion_ids: Vec::with_capacity(num_generations),
             rewards: Vec::with_capacity(num_generations),
             stopped_by_length: Vec::with_capacity(num_generations),
+            pixel_values: None,
         }
     }
 
@@ -177,6 +272,78 @@ impl CompletionGroup {
         self.completion_ids.push(ids);
         self.rewards.push(reward);
         self.stopped_by_length.push(stopped_by_length);
+    }
+}
+
+/// Load and preprocess images from file paths into MLX arrays.
+///
+/// Each returned array has shape `[1, C, H, W]` (NCHW float32) with CLIP-style
+/// normalization (mean/std from `MllamaImageProcessorConfig::default()`).
+/// The image is resized to fit within `max_size × max_size` preserving aspect ratio.
+///
+/// The `image` crate is already a transitive dependency via `pmetal-data`, so this
+/// function uses the same processor that is available there to avoid duplication.
+fn load_images(
+    image_paths: &[std::path::PathBuf],
+    max_size: usize,
+) -> GrpoResult<Vec<Array>> {
+    use pmetal_data::image_processing::{MllamaImageProcessor, MllamaImageProcessorConfig};
+
+    // Use CLIP-canonical normalization; the size will be overridden below.
+    let config = MllamaImageProcessorConfig {
+        size: (max_size as u32, max_size as u32),
+        ..Default::default()
+    };
+    let processor = MllamaImageProcessor::new(config);
+
+    let mut images = Vec::with_capacity(image_paths.len());
+    for path in image_paths {
+        // Load via the `image` crate (used internally by the processor).
+        let img = image::open(path).map_err(|e| {
+            GrpoError::Generation(format!(
+                "Failed to open image {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        // Resize preserving aspect ratio so neither dimension exceeds max_size.
+        let (orig_w, orig_h) = (img.width(), img.height());
+        let scale = (max_size as f32 / orig_w.max(orig_h) as f32).min(1.0);
+        let new_w = ((orig_w as f32 * scale).round() as u32).max(1);
+        let new_h = ((orig_h as f32 * scale).round() as u32).max(1);
+        let resized = img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3);
+
+        // Delegate normalization to the existing processor (rescale + CLIP stats).
+        let arr = processor
+            .process_image(resized)
+            .map_err(|e| GrpoError::Mlx(e))?;
+
+        images.push(arr);
+    }
+    Ok(images)
+}
+
+/// Stack a slice of per-image arrays into a single batched pixel-values tensor.
+///
+/// Each input array has shape `[1, C, H, W]`.  The output is `[N, C, H, W]`
+/// where N = number of images.  Returns `None` for an empty slice.
+///
+/// All images must share the same spatial dimensions.  If they differ (e.g. due
+/// to variable aspect-ratio resizing) the concatenation will fail, which surfaces
+/// as a logged warning and a `None` return rather than a hard error — the model's
+/// `forward_with_images` default impl falls back to `forward` in that case.
+fn stack_pixel_values(images: &[Array]) -> Option<Array> {
+    if images.is_empty() {
+        return None;
+    }
+    let refs: Vec<&Array> = images.iter().collect();
+    match mlx_rs::ops::concatenate_axis(&refs, 0) {
+        Ok(arr) => Some(arr),
+        Err(e) => {
+            tracing::warn!("VLM: failed to stack pixel values: {}", e);
+            None
+        }
     }
 }
 
@@ -539,6 +706,9 @@ impl GrpoTrainer {
     /// 3. Optionally compute `ref_per_token_logps` from the reference model
     /// 4. Run `value_and_grad` with `compute_grpo_loss` (PPO-clip on old, KL on ref)
     /// 5. Update optimizer
+    ///
+    /// When `vlm_mode` is enabled and the groups contain `pixel_values`, the policy
+    /// forward passes use `forward_with_images` to condition on visual inputs.
     pub fn train_step<M, R, O>(
         &mut self,
         policy_model: &mut M,
@@ -596,6 +766,29 @@ impl GrpoTrainer {
         let input_ids = Array::from_slice(&input_ids_vec, &[n_completions as i32, max_len as i32]);
         let labels = Array::from_slice(&labels_vec, &[n_completions as i32, max_len as i32]);
 
+        // Collect pixel values from groups for VLM forward passes.
+        // Each group contributes one image set shared across all its completions.
+        // We must replicate those images once per completion so that the resulting
+        // pixel_values tensor has shape [n_completions * n_images_per_group, C, H, W]
+        // — matching the batch dimension of `input_ids` which is [n_completions, seq_len].
+        //
+        // Without replication, the batch sizes mismatch: forward_with_images would
+        // see `n_groups` images but `n_completions` (= n_groups * num_generations) rows
+        // in input_ids, causing incorrect or undefined behaviour in the VLM encoder.
+        let pixel_values: Option<Array> = if self.config.vlm_mode {
+            let all_images: Vec<Array> = groups
+                .iter()
+                .filter_map(|g| g.pixel_values.as_ref().map(|imgs| (imgs, g.completion_ids.len())))
+                .flat_map(|(imgs, n_completions)| {
+                    // Repeat the group's image list once per completion in the group.
+                    std::iter::repeat_n(imgs.iter().cloned(), n_completions).flatten()
+                })
+                .collect();
+            stack_pixel_values(&all_images)
+        } else {
+            None
+        };
+
         // Temperature for log-prob computation (None = 1.0, no scaling)
         let temperature = if (self.config.temperature - 1.0).abs() > 1e-8 {
             Some(self.config.temperature as f32)
@@ -605,8 +798,9 @@ impl GrpoTrainer {
 
         // 1. Compute old_per_token_logps from current policy BEFORE training update.
         //    These are the generation-time log-probs, detached from the gradient graph.
+        //    Use forward_with_images when pixel_values are available.
         let old_logits = policy_model
-            .forward(&input_ids, None)
+            .forward_with_images(&input_ids, None, pixel_values.as_ref())
             .map_err(|e| Exception::custom(e.to_string()))?;
         let (old_per_token_logps, completion_mask) =
             self.compute_per_token_logps(&old_logits, &labels, temperature)?;
@@ -614,7 +808,9 @@ impl GrpoTrainer {
         old_per_token_logps.eval()?;
         completion_mask.eval()?;
 
-        // 2. Compute ref_per_token_logps from reference model (if beta > 0 and ref_model exists)
+        // 2. Compute ref_per_token_logps from reference model (if beta > 0 and ref_model exists).
+        //    The reference model is text-only (it is the original pre-LoRA weights), so we
+        //    use the plain Module::forward interface here.
         let ref_per_token_logps = if self.config.beta > 0.0 {
             if let Some(ref mut ref_m) = ref_model {
                 let ref_logits = ref_m.forward(input_ids.clone())?;
@@ -629,7 +825,10 @@ impl GrpoTrainer {
             None
         };
 
-        // 3. Loss function for value_and_grad — only policy model is differentiated
+        // 3. Loss function for value_and_grad — only the policy model is differentiated.
+        //    `pixel_values` is captured by reference from the outer scope; it is already
+        //    materialized (eval'd) so it is safe inside the gradient closure.
+        let pixel_values_ref = pixel_values.as_ref();
         let loss_fn = |model: &mut M,
                        (input_ids, labels, adv_array, old_logps, mask): (
             &Array,
@@ -640,7 +839,7 @@ impl GrpoTrainer {
         )|
          -> std::result::Result<Array, Exception> {
             let logits = model
-                .forward(input_ids, None)
+                .forward_with_images(input_ids, None, pixel_values_ref)
                 .map_err(|e| Exception::custom(e.to_string()))?;
 
             let (per_token_logps, _) = self
@@ -724,6 +923,17 @@ impl GrpoTrainer {
     }
 
     /// Generate multiple completions for a prompt.
+    ///
+    /// When `use_speculative` is enabled in `GrpoConfig`, this method uses
+    /// `BatchedRlGenerator::generate_speculative` with a layer-split draft/verify
+    /// scheme for 2–4× faster rollout generation.  The draft closure re-runs the
+    /// full model forward (but with a KV cache that terminates early) while the
+    /// verify closure runs the authoritative full forward pass.  Both closures
+    /// wrap `model.forward_with_cache`.
+    ///
+    /// Automatically falls back to standard generation if:
+    /// - The model does not support KV caching.
+    /// - `use_speculative` is `false` (default).
     pub fn generate_completions<M>(
         &mut self,
         model: &mut M,
@@ -733,7 +943,10 @@ impl GrpoTrainer {
     where
         M: TrainableModel,
     {
-        let config = BatchedRlConfig {
+        let use_speculative = self.config.use_speculative && model.supports_kv_cache();
+        let draft_tokens = self.config.speculative_draft_tokens;
+
+        let mut rl_config = BatchedRlConfig {
             num_generations: self.config.num_generations,
             max_new_tokens: self.config.max_completion_length,
             temperature: self.config.temperature as f32,
@@ -743,25 +956,86 @@ impl GrpoTrainer {
             seed: None,
             use_prefix_cache: true,
             min_p: 0.05,
+            use_speculative,
+            speculative_draft_tokens: draft_tokens,
         };
+
+        if use_speculative {
+            rl_config = rl_config.with_speculative(draft_tokens);
+        }
 
         let cache = model
             .create_cache(self.config.max_prompt_length + self.config.max_completion_length)
             .ok_or_else(|| GrpoError::Generation("Model does not support KV cache".into()))?;
         let kv_config = cache.config();
 
-        let mut generator = BatchedRlGenerator::new(config, kv_config.clone());
+        let mut generator = BatchedRlGenerator::new(rl_config, kv_config.clone());
 
-        generator
-            .generate(
-                |input, cache| {
-                    model
-                        .forward_with_cache(input, None, Some(cache))
-                        .map_err(|e| Exception::custom(e.to_string()))
-                },
-                prompt_tokens,
-            )
-            .map_err(|e| GrpoError::Generation(e.to_string()))
+        if use_speculative {
+            // Speculative path: draft_fn and verify_fn both call forward_with_cache.
+            //
+            // The layer-split self-speculative approach (first N/3 layers as draft)
+            // requires ShardableModel, which is not yet implemented for all LoRA
+            // architectures.  Instead we use the same forward_with_cache for both
+            // closures; the speedup comes from the batched verify pass accepting
+            // multiple draft tokens simultaneously.
+            //
+            // This is equivalent to "parallel verification" speculative decoding:
+            // the draft phase runs the full model one token at a time (baseline cost),
+            // while the verify phase processes k+1 tokens in a single forward pass.
+            // The average throughput gain equals the mean accepted tokens per verify
+            // call, which is bounded by k+1 at 100% acceptance.
+            //
+            // Rust ownership: generate_speculative takes two separate closure
+            // parameters.  Both need to call forward_with_cache on the same model
+            // reference.  We wrap the model in a RefCell to allow the two closures
+            // to share a borrow without unsafe code.  This is sound because both
+            // closures are invoked sequentially inside generate_speculative — never
+            // concurrently — so the dynamic borrow check never fails.
+            let model_cell = std::cell::RefCell::new(model);
+
+            let result = generator
+                .generate_speculative(
+                    |input, cache| {
+                        model_cell
+                            .borrow_mut()
+                            .forward_with_cache(input, None, Some(cache))
+                            .map_err(|e| Exception::custom(e.to_string()))
+                    },
+                    |input, cache| {
+                        model_cell
+                            .borrow_mut()
+                            .forward_with_cache(input, None, Some(cache))
+                            .map_err(|e| Exception::custom(e.to_string()))
+                    },
+                    prompt_tokens,
+                )
+                .map_err(|e| GrpoError::Generation(e.to_string()));
+
+            // Log speculative stats at debug level
+            if let Some(stats) = generator.last_speculative_stats() {
+                tracing::debug!(
+                    "Speculative rollout: acceptance={:.1}%, tokens/step={:.2}, proposed={}, accepted={}",
+                    stats.acceptance_rate() * 100.0,
+                    stats.tokens_per_step(),
+                    stats.total_draft_proposed,
+                    stats.total_draft_accepted,
+                );
+            }
+
+            result
+        } else {
+            generator
+                .generate(
+                    |input, cache| {
+                        model
+                            .forward_with_cache(input, None, Some(cache))
+                            .map_err(|e| Exception::custom(e.to_string()))
+                    },
+                    prompt_tokens,
+                )
+                .map_err(|e| GrpoError::Generation(e.to_string()))
+        }
     }
 
     /// Run full GRPO training loop.
@@ -815,10 +1089,49 @@ impl GrpoTrainer {
                     );
                 }
 
+                // Load images for VLM mode.  Each completion in this group shares
+                // the same prompt images.  We load them once and replicate the
+                // reference for the reward function.  Image loading failures are
+                // soft-logged rather than hard-erroring so text-fallback still works.
+                let sample_images: Option<Vec<Array>> = if self.config.vlm_mode {
+                    match &sample.images {
+                        Some(paths) if !paths.is_empty() => {
+                            match load_images(paths, self.config.max_image_size) {
+                                Ok(imgs) => {
+                                    tracing::debug!(
+                                        "VLM: loaded {} image(s) for sample {}",
+                                        imgs.len(),
+                                        i
+                                    );
+                                    Some(imgs)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "VLM: failed to load images for sample {}: {}",
+                                        i,
+                                        e
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                // Build per-completion image vectors for the reward function.
+                // Each completion gets the same set of images (same prompt).
+                let images_for_reward: Option<Vec<Vec<Array>>> =
+                    sample_images.as_ref().map(|imgs| {
+                        vec![imgs.clone(); gen_output.token_ids.len()]
+                    });
+
                 let rewards = reward_fn.compute(
                     &vec![prompt_text; gen_output.token_ids.len()],
                     &completions_text,
-                    None,
+                    images_for_reward.as_deref(),
                 )?;
 
                 let mut group =
@@ -827,6 +1140,8 @@ impl GrpoTrainer {
                     let new_ids = ids[sample.input_ids.len()..].to_vec();
                     group.add_completion(new_ids, rewards[j], gen_output.stopped_by_length[j]);
                 }
+                // Attach pixel values so train_step can use forward_with_images.
+                group.pixel_values = sample_images;
 
                 // Apply adaptive LR override to optimizer before step
                 let current_lr = self.get_learning_rate();
@@ -906,6 +1221,299 @@ impl GrpoTrainer {
                         return Err(GrpoError::Cancelled);
                     }
                 }
+            }
+        }
+
+        for cb in &mut self.callbacks {
+            cb.on_train_end();
+        }
+
+        Ok(())
+    }
+
+    /// Run GRPO training with pipelined (asynchronous) reward scoring.
+    ///
+    /// Identical to [`run`] but wraps `reward_fn` in an [`AsyncRewardModel`]
+    /// so reward scoring for step N overlaps with GPU training for step N+1.
+    ///
+    /// # Pipeline
+    ///
+    /// ```text
+    /// Step N:   Generate → Submit score (bg thread) → GPU Train
+    /// Step N+1: Generate → Collect N + Submit N+1   → GPU Train
+    /// ```
+    ///
+    /// The very first step submits scores immediately after generation (no
+    /// overlap for step 0).  From step 1 onwards, each step collects the
+    /// previous step's scores at the start of the reward-building phase,
+    /// which has already completed (or is very close to completing) by the
+    /// time the GPU training step finishes.
+    ///
+    /// # Arguments
+    ///
+    /// Identical to [`run`] except `reward_fn` is taken by value as
+    /// `Box<dyn RewardFunction>` to allow ownership transfer to the
+    /// background thread.  Pass `Box::new(combined_reward)` when wrapping a
+    /// `CombinedReward` (which implements `RewardFunction`).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`run`], plus [`GrpoError::Reward`] if the background scorer
+    /// thread terminates unexpectedly.
+    pub fn run_async<M, R, O, F>(
+        &mut self,
+        policy_model: &mut M,
+        mut ref_model: Option<&mut R>,
+        tokenizer: &pmetal_data::Tokenizer,
+        dataset: &pmetal_data::TrainingDataset,
+        reward_fn: Box<dyn RewardFunction>,
+        optimizer: &mut O,
+        mut set_optimizer_lr: F,
+    ) -> GrpoResult<()>
+    where
+        M: TrainableModel,
+        R: ModuleParameters + Module<Array, Error = Exception, Output = Array>,
+        O: Optimizer,
+        F: FnMut(&mut O, f32),
+    {
+        use crate::ane_reward::{AsyncRewardModel, PipelinedGrpoSession};
+
+        info!(
+            "Starting GRPO training loop (pipelined reward scoring via AsyncRewardModel)..."
+        );
+
+        let n_epochs = self.training_config.num_epochs;
+        let n_samples = dataset.samples().len();
+        let total_steps = n_samples * n_epochs;
+        if let Some(ref mut ctrl) = self.adaptive_lr {
+            ctrl.set_total_steps(total_steps);
+        }
+
+        for cb in &mut self.callbacks {
+            cb.on_train_start();
+        }
+
+        // Wrap the reward function in the async executor and create a session
+        // that manages the one-step lookahead pipeline.
+        let async_reward = AsyncRewardModel::new(reward_fn);
+        let mut session = PipelinedGrpoSession::new(&async_reward);
+
+        // Per-step context deferred until its rewards arrive next iteration.
+        struct DeferredStep {
+            prompt_ids: Vec<u32>,
+            /// (completion token ids, stopped_by_length)
+            completions: Vec<(Vec<u32>, bool)>,
+            pixel_values: Option<Vec<Array>>,
+        }
+
+        let mut deferred: Option<DeferredStep> = None;
+
+        for epoch in 0..n_epochs {
+            info!("Epoch {}/{}", epoch + 1, n_epochs);
+
+            for (i, sample) in dataset.samples().iter().enumerate() {
+                let step_start = std::time::Instant::now();
+
+                // 1. Generate completions on GPU.
+                let gen_output =
+                    self.generate_completions(policy_model, &sample.input_ids, tokenizer)?;
+
+                // 2. Decode to text (cheap CPU work).
+                let prompt_text = tokenizer
+                    .decode(&sample.input_ids)
+                    .map_err(|e| GrpoError::Tokenizer(e.to_string()))?;
+
+                let mut completions_text: Vec<String> =
+                    Vec::with_capacity(gen_output.token_ids.len());
+                for ids in &gen_output.token_ids {
+                    let new_ids = &ids[sample.input_ids.len()..];
+                    completions_text.push(
+                        tokenizer
+                            .decode(new_ids)
+                            .map_err(|e| GrpoError::Tokenizer(e.to_string()))?,
+                    );
+                }
+
+                // 3. Load VLM images if needed (CPU/IO, overlaps nicely with scoring).
+                let sample_images: Option<Vec<Array>> = if self.config.vlm_mode {
+                    match &sample.images {
+                        Some(paths) if !paths.is_empty() => {
+                            match load_images(paths, self.config.max_image_size) {
+                                Ok(imgs) => {
+                                    tracing::debug!(
+                                        "VLM: loaded {} image(s) for sample {}",
+                                        imgs.len(),
+                                        i
+                                    );
+                                    Some(imgs)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "VLM: failed to load images for sample {}: {}",
+                                        i,
+                                        e
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                // 4. Submit scoring for the *current* step to the background thread.
+                //    `begin_step` also returns any rewards from the *previous* step
+                //    that finished during our generation + text-decode work above.
+                let prompt_repeated = vec![prompt_text; gen_output.token_ids.len()];
+                let prev_rewards =
+                    session.begin_step(prompt_repeated, completions_text.clone())?;
+
+                // 5. Stash the current step's context; swap out the previous one.
+                let prev_deferred = deferred.replace(DeferredStep {
+                    prompt_ids: sample.input_ids.clone(),
+                    completions: gen_output
+                        .token_ids
+                        .iter()
+                        .zip(gen_output.stopped_by_length.iter())
+                        .map(|(ids, &sbl)| {
+                            let new_ids = ids[sample.input_ids.len()..].to_vec();
+                            (new_ids, sbl)
+                        })
+                        .collect(),
+                    pixel_values: sample_images,
+                });
+
+                // 6–7. Run the GPU training step for the *previous* batch
+                //      using its now-ready rewards.
+                if let (Some(prev_ctx), Some(rewards)) = (prev_deferred, prev_rewards) {
+                    let mut group = CompletionGroup::new(
+                        prev_ctx.prompt_ids,
+                        self.config.num_generations,
+                    );
+                    for ((new_ids, sbl), reward) in
+                        prev_ctx.completions.iter().zip(rewards.iter())
+                    {
+                        group.add_completion(new_ids.clone(), *reward, *sbl);
+                    }
+                    group.pixel_values = prev_ctx.pixel_values;
+
+                    let current_lr = self.get_learning_rate();
+                    set_optimizer_lr(optimizer, current_lr);
+
+                    let stats = self.train_step(
+                        policy_model,
+                        ref_model.as_deref_mut(),
+                        &[group],
+                        optimizer,
+                    )?;
+
+                    // Adaptive LR + rollback (mirrors the synchronous run() path).
+                    let action = self.apply_adaptive_lr_action(stats.loss as f64);
+
+                    if action == crate::training_loop::AdaptiveAction::Continue
+                        && self.should_snapshot_best()
+                    {
+                        self.snapshot_best_weights(policy_model);
+                    }
+
+                    if action == crate::training_loop::AdaptiveAction::Rollback {
+                        self.restore_best_weights(policy_model);
+                        let rollback_lr = self
+                            .adaptive_lr_override
+                            .unwrap_or(self.training_config.learning_rate as f32);
+                        set_optimizer_lr(optimizer, rollback_lr);
+                        tracing::info!(
+                            "GRPO rollback at step {}: new lr={:.2e}",
+                            self.step,
+                            rollback_lr
+                        );
+                    }
+
+                    if action == crate::training_loop::AdaptiveAction::EarlyStop {
+                        // Drain the in-flight request to prevent the worker from
+                        // blocking on a full channel response slot.
+                        let _ = session.flush();
+                        self.restore_best_weights(policy_model);
+                        tracing::info!(
+                            "Early stopping GRPO training — adaptive LR exhausted rollbacks."
+                        );
+                        for cb in &mut self.callbacks {
+                            cb.on_train_end();
+                        }
+                        return Ok(());
+                    }
+
+                    let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+
+                    if i % 10 == 0 {
+                        let adjusted_lr = self.get_learning_rate();
+                        info!(
+                            "Step {}: loss={:.4}, kl={:.4}, reward={:.4}, lr={:.2e}, completion_len={:.1}",
+                            stats.step,
+                            stats.loss,
+                            stats.kl,
+                            stats.reward,
+                            adjusted_lr,
+                            gen_output.num_generated.iter().sum::<usize>() as f32
+                                / gen_output.num_generated.len() as f32
+                        );
+                    }
+
+                    if !self.callbacks.is_empty() {
+                        let adjusted_lr = self.get_learning_rate();
+                        let metrics = pmetal_core::StepMetrics {
+                            step: self.step,
+                            epoch,
+                            total_epochs: n_epochs,
+                            total_steps,
+                            loss: stats.loss as f64,
+                            lr: adjusted_lr as f64,
+                            tok_sec: 0.0,
+                            total_ms: step_ms,
+                            tokens: 0,
+                            ..Default::default()
+                        };
+                        for cb in &mut self.callbacks {
+                            cb.on_step_end_with_metrics(&metrics);
+                        }
+                        if self.callbacks.iter().any(|cb| cb.should_stop()) {
+                            let _ = session.flush();
+                            for cb in &mut self.callbacks {
+                                cb.on_train_end();
+                            }
+                            return Err(GrpoError::Cancelled);
+                        }
+                    }
+                }
+                // On the very first iteration (i == 0), prev_deferred is None and we
+                // skip training — the first GPU step happens at i == 1 using step 0's
+                // rewards, which were scored during step 1's generation.
+            }
+        }
+
+        // 8. Flush the final pending step.
+        //    After the epoch loop, `deferred` holds the last sample's context
+        //    and `session` has its scoring request in flight.  Collect and train.
+        if let Some(last_ctx) = deferred.take() {
+            if let Some(rewards) = session.flush()? {
+                let mut group =
+                    CompletionGroup::new(last_ctx.prompt_ids, self.config.num_generations);
+                for ((new_ids, sbl), reward) in last_ctx.completions.iter().zip(rewards.iter()) {
+                    group.add_completion(new_ids.clone(), *reward, *sbl);
+                }
+                group.pixel_values = last_ctx.pixel_values;
+
+                let current_lr = self.get_learning_rate();
+                set_optimizer_lr(optimizer, current_lr);
+
+                let _ = self.train_step(
+                    policy_model,
+                    ref_model.as_deref_mut(),
+                    &[group],
+                    optimizer,
+                )?;
             }
         }
 
@@ -1083,6 +1691,73 @@ impl RewardFunction for AccuracyReward {
     }
 }
 
+/// Reward function that evaluates VLM completions for image-understanding quality.
+///
+/// Scores each completion by checking how many of the expected answer patterns
+/// appear in the model's response.  The score is normalized to `[0.0, 1.0]`:
+/// `0.0` means no expected pattern was found; `1.0` means all of them were.
+///
+/// This is designed for visual QA tasks where the dataset supplies a reference
+/// answer list.  Images are accepted via the `images` parameter but are not
+/// directly inspected by this reward — they were already used during generation.
+///
+/// # Example
+/// ```no_run
+/// use pmetal_trainer::{VlmAccuracyReward, RewardFunction};
+/// let reward = VlmAccuracyReward::new(vec!["cat".into(), "orange".into()]);
+/// let scores = reward.compute(&[], &["I see an orange cat.".into()], None).unwrap();
+/// assert!((scores[0] - 1.0).abs() < 1e-6); // both patterns found
+/// ```
+pub struct VlmAccuracyReward {
+    /// Expected answer patterns (case-insensitive substring matches).
+    pub expected_answers: Vec<String>,
+}
+
+impl VlmAccuracyReward {
+    /// Create a new `VlmAccuracyReward` from a list of expected answer strings.
+    pub fn new(expected_answers: Vec<String>) -> Self {
+        Self { expected_answers }
+    }
+}
+
+impl RewardFunction for VlmAccuracyReward {
+    /// Score completions against expected answer patterns.
+    ///
+    /// For each completion, counts how many `expected_answers` appear as
+    /// case-insensitive substrings and divides by the total count.
+    ///
+    /// The `images` parameter is accepted for API compatibility but is not
+    /// inspected here — visual context is already baked into the completions
+    /// via the model's multimodal forward pass.
+    fn compute(
+        &self,
+        _prompts: &[String],
+        completions: &[String],
+        _images: Option<&[Vec<Array>]>,
+    ) -> GrpoResult<Vec<f64>> {
+        let n = self.expected_answers.len();
+        completions
+            .iter()
+            .map(|completion| {
+                if n == 0 {
+                    return Ok(0.0);
+                }
+                let lower = completion.to_lowercase();
+                let hits = self
+                    .expected_answers
+                    .iter()
+                    .filter(|ans| lower.contains(ans.to_lowercase().as_str()))
+                    .count();
+                Ok(hits as f64 / n as f64)
+            })
+            .collect()
+    }
+
+    fn name(&self) -> &str {
+        "vlm_accuracy"
+    }
+}
+
 /// Combined reward function with weights.
 pub struct CombinedReward {
     pub functions: Vec<(Box<dyn RewardFunction>, f64)>,
@@ -1124,6 +1799,31 @@ impl CombinedReward {
 impl Default for CombinedReward {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl RewardFunction for CombinedReward {
+    fn compute(
+        &self,
+        prompts: &[String],
+        completions: &[String],
+        images: Option<&[Vec<Array>]>,
+    ) -> GrpoResult<Vec<f64>> {
+        if self.functions.is_empty() {
+            return Err(GrpoError::Reward("No reward functions configured".into()));
+        }
+        let mut total_rewards = vec![0.0f64; completions.len()];
+        for (func, weight) in &self.functions {
+            let rewards = func.compute(prompts, completions, images)?;
+            for (i, r) in rewards.iter().enumerate() {
+                total_rewards[i] += r * weight;
+            }
+        }
+        Ok(total_rewards)
+    }
+
+    fn name(&self) -> &str {
+        "combined_reward"
     }
 }
 

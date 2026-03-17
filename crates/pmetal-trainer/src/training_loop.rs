@@ -265,6 +265,204 @@ fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
     Ok(loss)
 }
 
+/// Shared helper: compute CCE loss from hidden states + lm_head weight.
+///
+/// Both the standard and packed CCE steps call this after obtaining hidden states.
+/// `hidden_states` must already be shifted/reshaped as appropriate.
+/// `labels` must already be shifted and flattened to [n_tokens].
+fn compute_cce_loss(
+    hidden_states: &Array,
+    lm_head_weight: &Array,
+    labels: &Array,
+) -> std::result::Result<Array, Exception> {
+    use pmetal_mlx::kernels::cut_cross_entropy::cut_cross_entropy_loss;
+
+    // Flatten hidden states to [n_tokens, hidden_dim]
+    let hidden_dim = hidden_states.dim(-1);
+    let n_tokens = hidden_states.size() as i32 / hidden_dim;
+    let flat_hidden = hidden_states.reshape(&[n_tokens, hidden_dim])?;
+
+    cut_cross_entropy_loss(&flat_hidden, lm_head_weight, labels, -100)
+        .map_err(|e| Exception::custom(e.to_string()))
+}
+
+/// Training step using Cut Cross-Entropy (avoids materializing the full logits tensor).
+///
+/// Falls back to standard cross-entropy when the model does not implement
+/// `forward_hidden()` / `lm_head_weight()`, ensuring backward compatibility.
+fn jit_training_step_cce<M: TrainableModel, O: Optimizer>(
+    state: &mut (M, O),
+    (input_ids, labels): (&Array, &Array),
+    neftune_alpha: Option<f32>,
+) -> std::result::Result<Array, Exception> {
+    let (model, optimizer) = state;
+
+    // Fetch the LM head weight once.  This both serves as a capability probe and
+    // provides the weight to capture into the closure, avoiding a second call inside
+    // the gradient computation graph where calling lm_head_weight() again would clone
+    // the array a second time unnecessarily.
+    let lm_weight_cached = model.lm_head_weight();
+    let has_cce_support = lm_weight_cached.is_some();
+
+    if has_cce_support && neftune_alpha.is_none() {
+        let cached_weight = lm_weight_cached.expect("checked above");
+        // CCE path: compute loss from hidden states without full logits.
+        let loss_fn = |model: &mut M,
+                       (input_ids, labels): (&Array, &Array)|
+         -> std::result::Result<Array, Exception> {
+            let hidden_opt = model.forward_hidden(input_ids, None);
+
+            match hidden_opt {
+                Some(Ok(hidden_states)) => {
+                    let seq_len = hidden_states.dim(1);
+
+                    // Shift: hidden[:-1] predicts labels[1:]
+                    let shift_hidden = hidden_states.index((.., ..seq_len - 1, ..));
+                    let shift_labels = labels.index((.., 1..));
+                    let flat_labels = shift_labels.reshape(&[-1])?;
+
+                    compute_cce_loss(&shift_hidden, &cached_weight, &flat_labels)
+                }
+                _ => {
+                    // Unexpected failure in hidden forward — fall through to standard CE.
+                    let logits = model
+                        .forward(input_ids, None)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    let seq_len = logits.dim(1);
+                    let vocab_size = logits.dim(2);
+                    let shift_logits = logits.index((.., ..seq_len - 1, ..));
+                    let shift_labels = labels.index((.., 1..));
+                    let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
+                    let flat_labels = shift_labels.reshape(&[-1])?;
+                    let ce = CrossEntropy::new()
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
+                    let ignore_val = Array::from_int(-100_i32).as_dtype(flat_labels.dtype())?;
+                    let ignore_mask = flat_labels.ne(&ignore_val)?;
+                    let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
+                    let masked_loss = per_token_loss.multiply(&ignore_mask_f32)?;
+                    let valid_count = ignore_mask_f32.sum(None)?;
+                    let safe_count =
+                        mlx_rs::ops::maximum(&valid_count, &Array::from_f32(1.0))?;
+                    masked_loss.sum(None)?.divide(&safe_count)
+                }
+            }
+        };
+
+        let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
+        let (loss, grads) = loss_and_grad_fn(model, (input_ids, labels))?;
+        optimizer.update(model, grads)?;
+        Ok(loss)
+    } else {
+        // NEFTune active or model doesn't support CCE — use standard path.
+        jit_training_step_inner(state, (input_ids, labels), neftune_alpha)
+    }
+}
+
+/// Packed-sequence training step using Cut Cross-Entropy.
+///
+/// Mirrors `jit_training_step_packed` but feeds hidden states through CCE
+/// to avoid materializing the full logits tensor.  Falls back to standard
+/// cross-entropy when the model does not implement `forward_hidden_with_positions()`.
+fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
+    state: &mut (M, O),
+    packed_batch: &PackedTrainingBatch,
+    max_grad_norm: f32,
+) -> std::result::Result<Array, Exception> {
+    let (model, optimizer) = state;
+
+    let total_tokens = packed_batch.total_tokens as i32;
+    let input_ids_2d = packed_batch.input_ids.reshape(&[1, total_tokens])?;
+    let labels_2d = packed_batch.labels.reshape(&[1, total_tokens])?;
+    let position_ids = packed_batch.position_ids.clone();
+    let attn_mask = packed_batch.attention_mask()?;
+    let attn_mask_4d = attn_mask.reshape(&[1, 1, total_tokens, total_tokens])?;
+
+    // Fetch the LM head weight once — serves as capability probe and provides
+    // the cached weight to capture into the closure (avoids a second call inside
+    // the gradient graph).
+    let lm_weight_cached = model.lm_head_weight();
+    let has_cce_support = lm_weight_cached.is_some();
+
+    if has_cce_support {
+        let cached_weight = lm_weight_cached.expect("checked above");
+        let loss_fn = |model: &mut M,
+                       (input_ids, labels, mask, pos_ids): (
+            &Array,
+            &Array,
+            &Array,
+            &Array,
+        )|
+         -> std::result::Result<Array, Exception> {
+            let hidden_opt = model.forward_hidden_with_positions(input_ids, Some(mask), pos_ids);
+
+            match hidden_opt {
+                Some(Ok(hidden_states)) => {
+                    let seq_len = hidden_states.dim(1);
+                    let shift_hidden = hidden_states.index((.., ..seq_len - 1, ..));
+                    let shift_labels = labels.index((.., 1..));
+                    let flat_labels = shift_labels.reshape(&[-1])?;
+
+                    compute_cce_loss(&shift_hidden, &cached_weight, &flat_labels)
+                }
+                _ => {
+                    // Fall back to standard cross-entropy
+                    let logits = model
+                        .forward_with_positions(input_ids, Some(mask), pos_ids)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    let seq_len = logits.dim(1);
+                    let vocab_size = logits.dim(2);
+                    let shift_logits = logits.index((.., ..seq_len - 1, ..));
+                    let shift_labels = labels.index((.., 1..));
+                    let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
+                    let flat_labels = shift_labels.reshape(&[-1])?;
+                    let ce = CrossEntropy::new()
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
+                    let ignore_idx = if flat_labels.dtype() == mlx_rs::Dtype::Int64 {
+                        Array::from_slice(&[-100_i64], &[1])
+                    } else {
+                        Array::from_slice(&[-100_i32], &[1])
+                    };
+                    let ignore_mask = flat_labels.ne(&ignore_idx)?;
+                    let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
+                    let masked_loss = per_token_loss.multiply(&ignore_mask_f32)?;
+                    let valid_count = ignore_mask_f32.sum(None)?;
+                    let safe_count =
+                        mlx_rs::ops::maximum(&valid_count, &Array::from_f32(1.0))?;
+                    masked_loss.sum(None)?.divide(&safe_count)
+                }
+            }
+        };
+
+        let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
+        let (loss, mut grads) =
+            loss_and_grad_fn(model, (&input_ids_2d, &labels_2d, &attn_mask_4d, &position_ids))?;
+
+        // Gradient clipping (same as jit_training_step_packed)
+        if max_grad_norm > 0.0 {
+            let eps = Array::from_slice(&[1e-6_f32], &[1]);
+            let mut sq_sum = Array::from_slice(&[0.0_f32], &[1]);
+            for grad in grads.values() {
+                sq_sum = sq_sum.add(&grad.square()?.sum(None)?)?;
+            }
+            let norm = sq_sum.sqrt()?;
+            let max_norm_arr = Array::from_slice(&[max_grad_norm], &[1]);
+            let norm_clamped = mlx_rs::ops::maximum(&norm, &max_norm_arr)?;
+            let scale = max_norm_arr.divide(&norm_clamped.add(&eps)?)?;
+            for grad in grads.values_mut() {
+                *grad = grad.multiply(&scale)?;
+            }
+        }
+
+        optimizer.update(model, grads)?;
+        Ok(loss)
+    } else {
+        // Model doesn't support CCE — use standard packed step.
+        jit_training_step_packed(state, packed_batch, max_grad_norm)
+    }
+}
+
 /// Evaluate all accumulated losses plus model params and optimizer states.
 ///
 /// A single consolidated eval prevents the computation graph from growing
@@ -366,6 +564,16 @@ pub struct TrainingLoopConfig {
     /// Recommended value: 16.0.  `None` disables LoRA+ (default).
     pub loraplus_lr_ratio: Option<f32>,
 
+    /// Use Cut Cross-Entropy for memory-efficient loss computation.
+    ///
+    /// When enabled, the training loop computes the cross-entropy loss directly from
+    /// hidden states without materializing the full logits tensor.  This reduces memory
+    /// by up to 37x for large vocabularies (e.g., 150K tokens in Qwen3.5).
+    ///
+    /// Requires the model to implement `forward_hidden()` and `lm_head_weight()`.
+    /// Falls back to standard cross-entropy silently when the model does not support it.
+    pub use_cut_cross_entropy: bool,
+
     /// Distributed training configuration.
     /// When set, gradients are synchronized across multiple nodes after each
     /// accumulation cycle, enabling data-parallel training over a home cluster.
@@ -391,6 +599,7 @@ impl Default for TrainingLoopConfig {
             use_metal_fused_optimizer: false,
             neftune_noise_alpha: None,
             loraplus_lr_ratio: None,
+            use_cut_cross_entropy: false,
             #[cfg(feature = "distributed")]
             distributed: None,
         }
@@ -983,46 +1192,92 @@ impl TrainingLoop {
     }
 
     /// Compute loss and gradients for text-only training.
+    ///
+    /// When `use_cut_cross_entropy` is set and the model supports it, computes the
+    /// loss directly from hidden states (CCE path) without materialising the full
+    /// [batch, seq, vocab] logits tensor.  Falls back to standard cross-entropy
+    /// when NEFTune is active or the model does not implement the CCE methods.
     fn compute_text_loss_and_grads<M: TrainableModel>(
         &self,
         model: &mut M,
         batch: &TrainingBatch,
     ) -> Result<(Array, FlattenedModuleParam)> {
         let neftune_alpha = self.config.neftune_noise_alpha;
-
-        // Define loss function for autodiff.
-        // When NEFTune is enabled, use forward_noised which injects uniform embedding
-        // noise U(-mag, mag) with mag = alpha / sqrt(seq_len * embed_dim).
-        let loss_fn = |model: &mut M,
-                       (input_ids, labels): (&Array, &Array)|
-         -> std::result::Result<Array, Exception> {
-            let logits = if let Some(alpha) = neftune_alpha {
-                model
-                    .forward_noised(input_ids, None, alpha)
-                    .map_err(|e| Exception::custom(e.to_string()))?
-            } else {
-                model
-                    .forward(input_ids, None)
-                    .map_err(|e| Exception::custom(e.to_string()))?
-            };
-            Self::compute_loss(&logits, labels).map_err(|e| Exception::custom(e.to_string()))
-        };
-
-        // Create value_and_grad function
-        let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-
-        // Optionally enable Metal FlashAttention for forward pass
-        let (loss, grads) = if self.metal_fa_available {
-            let result = with_training_mode(|| {
-                loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))
-                    .map_err(|e| pmetal_mlx::error::MlxError::from(e))
-            });
-            result.map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
+        // Fetch the LM head weight once — serves as capability probe and avoids
+        // a second call to lm_head_weight() inside the gradient closure.
+        let lm_weight_cached = if self.config.use_cut_cross_entropy && neftune_alpha.is_none() {
+            model.lm_head_weight()
         } else {
-            loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))?
+            None
         };
+        let use_cce = lm_weight_cached.is_some();
 
-        Ok((loss, grads))
+        if use_cce {
+            let cached_weight = lm_weight_cached.expect("checked above");
+            // CCE path: forward hidden states, then compute loss without logits.
+            let loss_fn = |model: &mut M,
+                           (input_ids, labels): (&Array, &Array)|
+             -> std::result::Result<Array, Exception> {
+                let hidden_opt = model.forward_hidden(input_ids, None);
+                match hidden_opt {
+                    Some(Ok(hidden_states)) => {
+                        let seq_len = hidden_states.dim(1);
+                        let shift_hidden = hidden_states.index((.., ..seq_len - 1, ..));
+                        let shift_labels = labels.index((.., 1..));
+                        let flat_labels = shift_labels.reshape(&[-1])?;
+                        compute_cce_loss(&shift_hidden, &cached_weight, &flat_labels)
+                    }
+                    _ => {
+                        // CCE unavailable at runtime — fall back to standard CE.
+                        let logits = model
+                            .forward(input_ids, None)
+                            .map_err(|e| Exception::custom(e.to_string()))?;
+                        Self::compute_loss(&logits, labels)
+                            .map_err(|e| Exception::custom(e.to_string()))
+                    }
+                }
+            };
+
+            let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
+            let (loss, grads) = if self.metal_fa_available {
+                let result = with_training_mode(|| {
+                    loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))
+                        .map_err(|e| pmetal_mlx::error::MlxError::from(e))
+                });
+                result.map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
+            } else {
+                loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))?
+            };
+            Ok((loss, grads))
+        } else {
+            // Standard path: forward through lm_head, compute cross-entropy.
+            let loss_fn = |model: &mut M,
+                           (input_ids, labels): (&Array, &Array)|
+             -> std::result::Result<Array, Exception> {
+                let logits = if let Some(alpha) = neftune_alpha {
+                    model
+                        .forward_noised(input_ids, None, alpha)
+                        .map_err(|e| Exception::custom(e.to_string()))?
+                } else {
+                    model
+                        .forward(input_ids, None)
+                        .map_err(|e| Exception::custom(e.to_string()))?
+                };
+                Self::compute_loss(&logits, labels).map_err(|e| Exception::custom(e.to_string()))
+            };
+
+            let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
+            let (loss, grads) = if self.metal_fa_available {
+                let result = with_training_mode(|| {
+                    loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))
+                        .map_err(|e| pmetal_mlx::error::MlxError::from(e))
+                });
+                result.map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
+            } else {
+                loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))?
+            };
+            Ok((loss, grads))
+        }
     }
 
     /// Compute loss and gradients for VLM (Vision-Language Model) training.
@@ -1874,11 +2129,19 @@ impl TrainingLoop {
         );
 
         // Run ONE uncompiled training step
-        let warmup_loss = jit_training_step_inner(
-            &mut state,
-            (&warmup_batch.input_ids, &warmup_batch.labels),
-            self.config.neftune_noise_alpha,
-        )?;
+        let warmup_loss = if self.config.use_cut_cross_entropy {
+            jit_training_step_cce(
+                &mut state,
+                (&warmup_batch.input_ids, &warmup_batch.labels),
+                self.config.neftune_noise_alpha,
+            )?
+        } else {
+            jit_training_step_inner(
+                &mut state,
+                (&warmup_batch.input_ids, &warmup_batch.labels),
+                self.config.neftune_noise_alpha,
+            )?
+        };
         warmup_loss.eval()?;
         let warmup_loss_val = warmup_loss.item::<f32>();
 
@@ -1984,11 +2247,19 @@ impl TrainingLoop {
                 // Execute fused training step (forward + backward + optimizer update)
                 // DEFERRED EVAL: Loss remains a lazy Array, no GPU-CPU sync here
                 // MLX's lazy evaluation automatically fuses operations when not evaluated
-                let loss = jit_training_step_inner(
-                    &mut state,
-                    (&batch.input_ids, &batch.labels),
-                    self.config.neftune_noise_alpha,
-                )?;
+                let loss = if self.config.use_cut_cross_entropy {
+                    jit_training_step_cce(
+                        &mut state,
+                        (&batch.input_ids, &batch.labels),
+                        self.config.neftune_noise_alpha,
+                    )?
+                } else {
+                    jit_training_step_inner(
+                        &mut state,
+                        (&batch.input_ids, &batch.labels),
+                        self.config.neftune_noise_alpha,
+                    )?
+                };
                 accumulated_losses.push(loss);
 
                 // Update step counters (these are just integers, no GPU involvement)
@@ -2275,11 +2546,19 @@ impl TrainingLoop {
         );
 
         // Run ONE uncompiled training step for warmup
-        let warmup_loss = jit_training_step_inner(
-            &mut state,
-            (&warmup_batch.input_ids, &warmup_batch.labels),
-            self.config.neftune_noise_alpha,
-        )?;
+        let warmup_loss = if self.config.use_cut_cross_entropy {
+            jit_training_step_cce(
+                &mut state,
+                (&warmup_batch.input_ids, &warmup_batch.labels),
+                self.config.neftune_noise_alpha,
+            )?
+        } else {
+            jit_training_step_inner(
+                &mut state,
+                (&warmup_batch.input_ids, &warmup_batch.labels),
+                self.config.neftune_noise_alpha,
+            )?
+        };
         warmup_loss.eval()?;
         let warmup_loss_val = warmup_loss.item::<f32>();
 
@@ -2351,8 +2630,18 @@ impl TrainingLoop {
                     .checked_mul(batch.seq_len)
                     .unwrap_or(usize::MAX);
 
-                // Execute JIT-compiled training step
-                let loss = compiled_step(&mut state, (&batch.input_ids, &batch.labels))?;
+                // Execute JIT-compiled training step.
+                // When CCE is enabled, bypass compile_with_state (which requires a plain fn pointer)
+                // and use the CCE step directly — compile_with_state cannot capture neftune_alpha.
+                let loss = if self.config.use_cut_cross_entropy {
+                    jit_training_step_cce(
+                        &mut state,
+                        (&batch.input_ids, &batch.labels),
+                        self.config.neftune_noise_alpha,
+                    )?
+                } else {
+                    compiled_step(&mut state, (&batch.input_ids, &batch.labels))?
+                };
 
                 // Update step counters
                 self.step += 1;
@@ -2572,7 +2861,11 @@ impl TrainingLoop {
 
         // Execute warmup step - this initializes optimizer momentum/velocity buffers
         let max_grad_norm = self.config.training.max_grad_norm as f32;
-        let warmup_loss = jit_training_step_packed(&mut state, &warmup_batch, max_grad_norm)?;
+        let warmup_loss = if self.config.use_cut_cross_entropy {
+            jit_training_step_packed_cce(&mut state, &warmup_batch, max_grad_norm)?
+        } else {
+            jit_training_step_packed(&mut state, &warmup_batch, max_grad_norm)?
+        };
         warmup_loss.eval()?;
         let warmup_loss_val: f32 = warmup_loss.item();
 
@@ -2630,7 +2923,11 @@ impl TrainingLoop {
 
                 // Execute packed training step (forward + backward + optimizer update)
                 // DEFERRED EVAL: Loss remains a lazy Array, no GPU-CPU sync here
-                let loss = jit_training_step_packed(&mut state, &packed_batch, max_grad_norm)?;
+                let loss = if self.config.use_cut_cross_entropy {
+                    jit_training_step_packed_cce(&mut state, &packed_batch, max_grad_norm)?
+                } else {
+                    jit_training_step_packed(&mut state, &packed_batch, max_grad_norm)?
+                };
                 accumulated_losses.push(loss);
 
                 // Update step counters

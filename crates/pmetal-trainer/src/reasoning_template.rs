@@ -26,6 +26,7 @@ impl MathReasoningTemplate {
             loss_type: GrpoLossType::Bnpo,
             epsilon_low: 0.2,
             epsilon_high: 0.2,
+            ..Default::default()
         }
     }
 
@@ -60,6 +61,7 @@ impl CodeReasoningTemplate {
             loss_type: GrpoLossType::DrGrpo, // Use detailed reward for code
             epsilon_low: 0.2,
             epsilon_high: 0.2,
+            ..Default::default()
         }
     }
 

@@ -477,6 +477,8 @@ pub enum PyModelArchitecture {
     StarCoder2,
     RecurrentGemma,
     Jamba,
+    FalconH1,
+    Bert,
     Flux,
 }
 
@@ -500,6 +502,8 @@ impl From<pmetal_models::ModelArchitecture> for PyModelArchitecture {
             pmetal_models::ModelArchitecture::StarCoder2 => Self::StarCoder2,
             pmetal_models::ModelArchitecture::RecurrentGemma => Self::RecurrentGemma,
             pmetal_models::ModelArchitecture::Jamba => Self::Jamba,
+            pmetal_models::ModelArchitecture::FalconH1 => Self::FalconH1,
+            pmetal_models::ModelArchitecture::Bert => Self::Bert,
             pmetal_models::ModelArchitecture::Flux => Self::Flux,
         }
     }
