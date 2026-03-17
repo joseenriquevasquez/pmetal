@@ -4549,7 +4549,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "pmetal-core",
  "pmetal-data",
@@ -4573,7 +4573,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-cli"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4619,7 +4619,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-core"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "secrecy",
  "serde",
@@ -4631,7 +4631,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-data"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "arrow",
  "image 0.25.10",
@@ -4649,7 +4649,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-distill"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "bitcode",
  "criterion",
@@ -4674,7 +4674,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-distributed"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4701,7 +4701,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-gguf"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "byteorder",
  "half",
@@ -4714,7 +4714,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-hub"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -4734,7 +4734,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-lora"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "criterion",
  "half",
@@ -4754,7 +4754,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-merge"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "criterion",
  "half",
@@ -4779,7 +4779,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-metal"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "block2",
  "cc",
@@ -4806,7 +4806,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mhc"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "approx",
  "criterion",
@@ -4829,7 +4829,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mlx"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "half",
  "num-traits",
@@ -4884,7 +4884,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-models"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "json5",
  "objc2",
@@ -4906,7 +4906,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-py"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "pmetal",
  "pmetal-core",
@@ -4926,7 +4926,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-serve"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "axum",
@@ -4952,7 +4952,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-trainer"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "chrono",
  "indicatif",
@@ -4979,7 +4979,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-vocoder"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "criterion",
  "half",

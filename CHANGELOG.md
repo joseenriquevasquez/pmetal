@@ -5,6 +5,44 @@ All notable changes to PMetal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.8] - 2026-03-17
+
+### Added
+
+- **Distributed training** (`pmetal-trainer`): Data-parallel gradient synchronization across Apple Silicon clusters via `DistributedGradientSync`. Flatten/all-reduce(Mean)/scatter pipeline with optional gradient compression (fp16, top-k sparsity). Integrated at all 4 training loop sites (run, run_metal_fused, run_jit_compiled, run_packed) with loss sync, epoch barriers, and rank-0-only checkpointing. Feature-gated behind `distributed`
+- **Pipeline-parallel inference** (`pmetal-distributed`): Layer-range pipeline parallelism enabling models larger than single-device memory. `ShardableModel` trait decomposes forward pass into embed/apply_layer/normalize/lm_head stages. `PipelineGenerationLoop` for end-to-end autoregressive generation with `StreamMultiplexer` for concurrent request routing
+- **Activation transport**: Length-prefixed wire format for hidden state transfer between pipeline stages with fp16 compression codec. `TransportReceiver::recv_vec` for dynamic-size message reception
+- **Topology-aware layer assignment**: Proportional (RAM-based) and bandwidth-aware (exhaustive search for 2-3 nodes) solvers with automatic strategy selection based on cluster topology
+- **Weight cache**: LRU eviction with reference counting to prevent in-use eviction, per-layer loading, and prefetch support for pipeline stages
+- **OpenAI-compatible inference server** (`pmetal-serve`): Drop-in local inference backend with `POST /v1/chat/completions` (streaming SSE and non-streaming), `POST /v1/completions`, `GET /v1/models`, `GET /v1/metrics`, `GET /health`. Chat template auto-detection, stop token collection, and greedy sampling
+- **Serving metrics**: Per-request timing (`RequestMetrics`) with first-token latency, total latency, and tok/s. `ServingMetrics` atomic aggregation exposed via `/v1/metrics` endpoint
+- **SSE streaming**: Token-by-token Server-Sent Events with role announcement, per-token content deltas, finish_reason, and `[DONE]` sentinel per OpenAI spec
+- **Speculative decoding** (`pmetal-models`): Layer-split draft+verify decoder via `SpeculativeDecoder<M: ShardableModel>`. Draft phase uses early layers (default: num_layers/3) for N-token proposals, verify phase runs full model with accept/reject on consecutive matches. `SpeculativeStats` tracks acceptance rate and tokens-per-step
+- **f64-accurate LoRA merge** (`pmetal-merge`): Streaming f64 matmul via ndarray for bit-accurate delta computation. Row-by-row fused base+delta+downcast, tiled low-memory path (512-row chunks), bias merging, fan_in_fan_out transpose, overflow clamping before dtype downcast
+- **RAM/RAM+ merge method**: Reinforced Agent Merging with unique/shared parameter classification and adaptive tensor-local lambda rescaling
+- **Multi-SLERP merge method**: Barycentric spherical interpolation for 3+ models with iterative pairwise SLERP and weight renormalization
+- **Frankenmerging config**: `OutputSlice`/`InputSlice` layer-range-based merging with per-slice merge methods, base models, and parameters. `run_merge_sliced()` execution engine with tensor name remapping
+- **`ParameterSetting`**: Scalar or conditional (tensor-name filtered) merge parameters enabling per-tensor-type weight variation (attention vs mlp layers)
+- **TVD distillation loss**: Total Variation Distance (`0.5 * Σ|P_teacher - P_student|`), bounded [0,1], symmetric proper distance metric
+- **Hinge ranking distillation loss**: Pairwise margin-based ranking preservation over top-k teacher tokens with configurable margin
+- **Logistic ranking distillation loss**: Softplus-based smooth ranking loss with better gradient flow than hinge, operates on logits for numerical stability
+- **CLI `--distributed-peers`, `--distributed-auto`, `--compression-strategy`**: Distributed training flags behind `distributed` feature
+- **CLI `pmetal serve --model <path> --port 8080`**: Inference server command behind `serve` feature
+- **CLI `--accurate` and `--low-memory`**: Flags for f64 LoRA merge path
+
+### Fixed
+
+- **Alignment violation in distributed gradient sync**: `sync_gradients` and `sync_loss` previously created `Vec<u8>` buffers with align-1, but the ring backend requires align-4 for f32 operations. Fixed by reinterpreting the `Vec<f32>` buffer directly via aligned pointer cast
+- **Double-framing deadlock in activation transport**: `serialize()` embedded its own length prefix AND `TransportSender::send()` added another, causing `recv_activation` to misparse messages. Removed embedded prefix; transport layer handles all framing
+- **Double EMA on `running_loss` in distributed mode**: Distributed sync block re-applied EMA that `train_step` already applied, causing doubly-decayed loss values for the adaptive LR controller. Removed manual EMA update in distributed block
+- **Zero weights in bandwidth-aware layer assignment**: 3+-node fallback computed `(ram / 1M) * (bw / 1M)` which produced zero for small values, causing NaN proportions. Added `.max(1)` guards
+- **`argpartition` panic on ranking losses**: `k.min(vocab - 1)` could underflow when vocab=0. Added `.max(0)` guard
+
+### Changed
+
+- **DataLoader sharding**: `rank` and `world_size` fields for modular-arithmetic data partitioning across distributed nodes
+- **Merge config system**: `ParameterSetting` type propagated to CLI merge parameter construction, supporting both scalar and conditional forms
+
 ## [0.3.7] - 2026-03-16
 
 ### Added
