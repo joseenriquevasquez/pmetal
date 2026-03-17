@@ -1,0 +1,45 @@
+[package]
+name = "pmetal-serve"
+description = "OpenAI-compatible inference server for PMetal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+pmetal-core = { workspace = true }
+pmetal-models = { workspace = true }
+pmetal-data = { workspace = true }
+pmetal-mlx = { workspace = true }
+mlx-rs = { workspace = true }
+tokenizers = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+axum = { version = "0.8", features = ["json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+futures = "0.3"
+tokio-stream = "0.1"
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
