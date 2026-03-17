@@ -70,8 +70,8 @@ pub use config::{
 pub use distill::{DistillLossOutput, Distiller, DistillerBuilder, run_distillation};
 pub use error::{DistillError, Result};
 pub use losses::{
-    DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, MseLoss,
-    SoftCrossEntropyLoss, is_gpu_available,
+    DistillLoss, HiddenStateLoss, HingeRankingLoss, JensenShannonLoss, KlDivergenceLoss,
+    LogisticRankingLoss, MseLoss, SoftCrossEntropyLoss, TvdLoss, is_gpu_available,
 };
 pub use offline::{LogitCache, LogitCompressor};
 pub use reasoning::RationaleLoss;

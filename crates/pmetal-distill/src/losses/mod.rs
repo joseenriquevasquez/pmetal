@@ -32,16 +32,22 @@
 use std::ops::Neg;
 
 pub mod hidden_state;
+mod hinge_ranking;
 mod jensen_shannon;
 mod kl_divergence;
+mod logistic_ranking;
 mod mse;
 mod soft_cross_entropy;
+mod tvd;
 
 pub use hidden_state::HiddenStateLoss;
+pub use hinge_ranking::HingeRankingLoss;
 pub use jensen_shannon::JensenShannonLoss;
 pub use kl_divergence::KlDivergenceLoss;
+pub use logistic_ranking::LogisticRankingLoss;
 pub use mse::MseLoss;
 pub use soft_cross_entropy::SoftCrossEntropyLoss;
+pub use tvd::TvdLoss;
 
 use crate::Result;
 use mlx_rs::Array;
