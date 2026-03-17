@@ -59,19 +59,19 @@ let logits = model.forward(&input_ids, None)?;
 
 ## Architecture Support
 
+The following architectures are supported via `DynamicLoraModel` (auto-detection + loading):
+
 | Architecture | LoRA | QLoRA | Notes |
 |--------------|------|-------|-------|
-| Llama (2/3/3.x/4) | Yes | Yes | Includes Granite, Cohere, StarCoder2 (Llama-based) |
-| Qwen (2/2.5/3) | Yes | Yes | Shared Qwen3 LoRA implementation |
-| Qwen 3.5 (Next) | Yes | No | Hybrid GDN + Attention |
-| Mistral (7B/8x7B) | Yes | Yes | |
-| Gemma (2/3) | Yes | Yes | |
-| Phi (3/4) | Yes | No | |
-| DeepSeek (V3) | Yes | No | Uses generic LoRA path |
-| GPT-OSS | Yes | No | Uses generic LoRA path |
-| NemotronH | Yes | No | Uses generic LoRA path |
-| Jamba | Yes | No | Uses generic LoRA path |
-| RecurrentGemma | Yes | No | Uses generic LoRA path |
+| Llama (2, 3, 3.1, 3.2, 3.3) | Yes | Yes | Gradient checkpointing supported |
+| Qwen 2 (2, 2.5) | Yes | — | Uses Qwen3 LoRA implementation internally |
+| Qwen 3 | Yes | Yes | Gradient checkpointing supported |
+| Qwen 3.5 (Next) | Yes | — | Hybrid GDN + Attention, nested text_config |
+| Mistral (7B, Mixtral 8x7B) | Yes | Yes | Sliding window attention |
+| Gemma (2, 3) | Yes | Yes | GeGLU activation, special RMSNorm |
+| Phi (3, 3.5) | Yes | — | Partial RoPE, fused gate_up |
+
+Architectures not listed (Llama 4, Qwen3MoE, DeepSeek, Phi4, Cohere, Granite, NemotronH, StarCoder2, RecurrentGemma, Jamba) return `DynamicLoraError::NotImplemented`. The `generic_lora` module provides reusable LoRA attention and MLP components for building custom LoRA models for these architectures.
 
 ## Configuration
 

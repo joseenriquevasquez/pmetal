@@ -70,12 +70,12 @@ fn main() {
 | `mlx` | `pmetal-mlx` | yes | MLX backend (KV cache, RoPE, ops) |
 | `models` | `pmetal-models` | yes | LLM architectures (Llama, Qwen, DeepSeek, ...) |
 | `lora` | `pmetal-lora` | yes | LoRA/QLoRA training |
-| `trainer` | `pmetal-trainer` | yes | Training loops (SFT, DPO, GRPO, DAPO) |
-| `easy` | all training/inference | yes | High-level builder API |
-| `ane` | ANE integration | yes | Apple Neural Engine direct programming |
-| `data` | `pmetal-data` | no | Dataset loading and preprocessing |
-| `distill` | `pmetal-distill` | no | Knowledge distillation (cross-vocab) |
-| `merge` | `pmetal-merge` | no | Model merging (SLERP, TIES, DARE, ModelStock) |
+| `trainer` | `pmetal-trainer` | yes | Training loops (SFT, DPO, SimPO, ORPO, KTO, GRPO, DAPO, PPO, GSPO, Online DPO, Diffusion) — enables `data` + `distill` |
+| `easy` | (multiple) | yes | High-level builder API — enables `trainer` + `hub` + `data` |
+| `ane` | `pmetal-metal` | yes | Apple Neural Engine direct programming |
+| `data` | `pmetal-data` | yes* | Dataset loading and preprocessing (*enabled via `easy`/`trainer`) |
+| `distill` | `pmetal-distill` | yes* | Knowledge distillation incl. TAID (*enabled via `trainer`) |
+| `merge` | `pmetal-merge` | no | Model merging (14 strategies: Linear, SLERP, TIES, DARE, DELLA, ModelStock, etc.) |
 | `vocoder` | `pmetal-vocoder` | no | BigVGAN neural vocoder |
 | `distributed` | `pmetal-distributed` | no | Distributed training (mDNS, Ring All-Reduce) |
 | `mhc` | `pmetal-mhc` | no | Manifold-Constrained Hyper-Connections |

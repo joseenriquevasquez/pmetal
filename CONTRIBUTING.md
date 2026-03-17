@@ -45,7 +45,7 @@ bun tauri dev
 Before reporting a bug:
 1. Check existing issues to avoid duplicates
 2. Collect relevant information:
-   - macOS version and Apple Silicon chip (M1, M2, M3, M4, etc.)
+   - macOS version and Apple Silicon chip (M1, M2, M3, M4, M5, etc.)
    - Rust version (`rustc --version`)
    - Steps to reproduce
    - Expected vs actual behavior
@@ -109,21 +109,24 @@ When contributing Metal kernels:
 
 ```
 crates/
-├── pmetal-core/       # Core types, traits, configurations
-├── pmetal-metal/      # Metal GPU kernels
-├── pmetal-mlx/        # MLX backend integration
-├── pmetal-models/     # LLM architectures
-├── pmetal-lora/       # LoRA/QLoRA implementations
-├── pmetal-trainer/    # Training loops
-├── pmetal-data/       # Dataset processing
-├── pmetal-hub/        # HuggingFace Hub integration
-├── pmetal-distill/    # Knowledge distillation
-├── pmetal-merge/      # Model merging algorithms
-├── pmetal-gguf/       # GGUF format support
-├── pmetal-mhc/        # Manifold-Constrained Hyper-Connections
-├── pmetal-distributed/# Distributed training
-├── pmetal-vocoder/    # BigVGAN vocoder
-└── pmetal-cli/        # Command-line interface
+├── pmetal-core/        # Core types, traits, configurations
+├── pmetal-metal/       # Metal GPU kernels + ANE runtime
+├── pmetal-mlx/         # MLX backend integration
+├── pmetal-models/      # LLM architectures
+├── pmetal-lora/        # LoRA/QLoRA implementations
+├── pmetal-trainer/     # Training loops (SFT, DPO, GRPO, etc.)
+├── pmetal-data/        # Dataset processing, chat templates
+├── pmetal-hub/         # HuggingFace Hub integration
+├── pmetal-distill/     # Knowledge distillation (incl. TAID)
+├── pmetal-merge/       # Model merging algorithms (14 strategies)
+├── pmetal-gguf/        # GGUF format with imatrix quantization
+├── pmetal-mhc/         # Manifold-Constrained Hyper-Connections
+├── pmetal-distributed/ # Distributed training (mDNS, Ring All-Reduce)
+├── pmetal-vocoder/     # BigVGAN vocoder
+├── pmetal-serve/       # OpenAI-compatible inference server
+├── pmetal-py/          # Python bindings (maturin/PyO3)
+├── pmetal-cli/         # Command-line interface + TUI
+└── pmetal-gui/         # Desktop GUI (Tauri + Svelte)
 ```
 
 ### Adding a New Model Architecture

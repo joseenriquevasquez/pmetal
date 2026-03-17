@@ -11,17 +11,30 @@ This crate provides utilities for merging multiple fine-tuned models into a sing
 | Method | Description | Best For |
 |--------|-------------|----------|
 | **Linear** | Weighted averaging | Simple blending |
-| **SLERP** | Spherical interpolation | Smooth transitions |
-| **TIES** | Task arithmetic + sparsification | Multi-task merging |
-| **DARE** | Random pruning + rescaling | Reducing interference |
-| **DELLA** | Adaptive magnitude pruning | Quality preservation |
-| **Model Stock** | Geometric interpolation | Robust averaging |
+| **SLERP** | Spherical interpolation | Smooth transitions between 2 models |
+| **Multi-SLERP** | Multi-model spherical interpolation | Smooth blending of 3+ models |
+| **TIES** | Task arithmetic + sparsification + sign consensus | Multi-task merging |
+| **DARE (TIES)** | Random pruning + rescaling (TIES variant) | Reducing interference |
+| **DARE (Linear)** | Random pruning + rescaling (linear variant) | Reducing interference |
+| **Task Arithmetic** | Direct task vector addition | Combining capabilities |
+| **DELLA** | Adaptive magnitude-based pruning | Quality preservation |
+| **DELLA (Linear)** | Adaptive magnitude pruning (linear variant) | Quality preservation |
+| **Breadcrumbs** | Breadcrumbs merge strategy | Preserving training trajectory |
+| **Model Stock** | Geometric interpolation based on task vector similarity | Robust averaging |
+| **Nearswap** | Near-swap merge strategy | Layer-level blending |
+| **Passthrough** | Layer passthrough composition | Frankenstein merging |
+| **RAM** | RAM merge strategy | Robust merging |
+| **RAM+** | Enhanced RAM merge | Improved robustness |
 
 ## Features
 
 - **Lazy Loading**: Stream weights without loading full models
 - **Memory Efficient**: Process layer-by-layer for large models
 - **Multiple Formats**: SafeTensors, PyTorch, GGUF support
+- **GPU-Accelerated Merging**: Metal-based merge operations for large models
+- **FP8-Aware Merging**: Merge with FP8 quantization for memory efficiency
+- **Async Merge Pipeline**: Double-buffered streaming merge for large models
+- **LoRA Merge**: Fuse LoRA adapters into base weights (standard and accurate modes)
 - **Configurable**: Fine-grained control over merge parameters
 
 ## Usage
@@ -84,7 +97,7 @@ let config = MergeConfig {
 Simple weighted average: `merged = w1*m1 + w2*m2 + ...`
 
 ### SLERP
-Spherical linear interpolation for smooth blending between two models.
+Spherical linear interpolation for smooth blending between two models. Parameter `t` controls interpolation (0.0 = model A, 1.0 = model B).
 
 ### TIES
 Task Arithmetic with Interference Elimination:
@@ -97,19 +110,34 @@ Task Arithmetic with Interference Elimination:
 Drop And REscale:
 1. Randomly drop weights with probability p
 2. Rescale remaining weights by 1/(1-p)
-3. Reduces interference between models
+3. Reduces interference between models. Available in TIES and Linear variants.
+
+### Task Arithmetic
+Direct task vector addition: `merged = base + w1*(m1-base) + w2*(m2-base) + ...`
+
+### DELLA
+Adaptive magnitude-based pruning. Prunes weights based on their magnitude relative to the base model, preserving important changes.
+
+### Model Stock
+Geometric interpolation using task vector similarity. Computes merge weights based on geometric properties of the fine-tuning directions.
+
+### Passthrough
+Layer passthrough composition — select layers from different models to build a "Frankenstein" model.
 
 ## Modules
 
 | Module | Description |
 |--------|-------------|
-| `linear` | Linear/weighted averaging |
-| `slerp` | Spherical interpolation |
-| `ties` | TIES merging |
-| `dare` | DARE pruning |
-| `della` | DELLA adaptive pruning |
-| `model_stock` | Geometric merging |
-| `config` | Configuration types |
+| `methods` | All merge strategy implementations |
+| `config` | Configuration types and method enum |
+| `async_merge` | Async double-buffered merge pipeline |
+| `batched` | Batched tensor merging |
+| `consensus` | Sparsification and sign consensus |
+| `fp8_merge` | FP8 quantization-aware merging |
+| `gpu_merge` | GPU-accelerated merging |
+| `loader` | Model weight loading |
+| `lora_merge` | LoRA adapter merging (standard + accurate) |
+| `sparsify` | Sparsification utilities |
 
 ## License
 

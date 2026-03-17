@@ -70,7 +70,7 @@ cache.clear()?;
 |--------|-------------|
 | `download` | Model downloading |
 | `cache` | Local cache management |
-| `upload` | Model uploading (planned) |
+| `upload` | Model uploading |
 
 ## License
 

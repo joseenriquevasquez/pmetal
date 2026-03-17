@@ -8,29 +8,44 @@ This crate provides implementations of popular LLM architectures optimized for A
 
 ## Supported Architectures
 
-| Family | Variants | Status |
-|--------|----------|--------|
-| **Llama** | 2, 3, 3.1, 3.2, 3.3, 4 | Production |
-| **Qwen** | 2, 2.5, 3, 3-MoE, 3.5 (Next) | Production |
-| **DeepSeek** | V3, V3.2, V3.2-Speciale | Production |
-| **Mistral** | 7B, 8x7B (MoE) | Production |
-| **Gemma** | 2, 3 | Production |
-| **Phi** | 3, 4 | Production |
-| **GPT-OSS** | 20B, 120B | Production |
-| **Granite** | 3.0, 3.1 | Production |
-| **Cohere** | Command R | Production |
-| **NemotronH** | Hybrid (Mamba+Attention) | Production |
-| **StarCoder2** | 3B, 7B, 15B | Production |
-| **RecurrentGemma** | Griffin | Production |
-| **Jamba** | 1.5 | Production |
+### Dispatched Models (via `DynamicModel`)
 
-### Vision Models
+These architectures are wired into the `ModelArchitecture` dispatcher and can be loaded automatically from `config.json`:
 
-| Family | Variants | Status |
-|--------|----------|--------|
-| **Pixtral** | 12B | Inference |
-| **Qwen2-VL** | 2B, 7B | Inference |
-| **MLlama** | 3.2-Vision | Inference |
+| Architecture | Family | Variants |
+|-------------|--------|----------|
+| `Llama` | Llama | 2, 3, 3.1, 3.2, 3.3 |
+| `Llama4` | Llama 4 | Scout, Maverick |
+| `Qwen2` | Qwen | 2, 2.5 |
+| `Qwen3` | Qwen | 3 |
+| `Qwen3MoE` | Qwen | 3-MoE |
+| `Qwen3Next` | Qwen | 3.5 (Next) |
+| `DeepSeek` | DeepSeek | V3, V3.2, V3.2-Speciale |
+| `Mistral` | Mistral | 7B, Mixtral 8x7B (MoE) |
+| `Gemma` | Gemma | 2, 3 |
+| `Phi` | Phi | 3, 3.5 |
+| `Phi4` | Phi | 4 |
+| `Cohere` | Cohere | Command R |
+| `Granite` | Granite | 3.0, 3.1, Hybrid MoE |
+| `NemotronH` | NemotronH | Hybrid (Mamba+Attention) |
+| `StarCoder2` | StarCoder2 | 3B, 7B, 15B |
+| `RecurrentGemma` | RecurrentGemma | Griffin |
+| `Jamba` | Jamba | 1.5 |
+| `Flux` | Flux | 1-dev, 1-schnell (diffusion) |
+
+### Architecture Modules (Not Dispatched)
+
+These have implementations but are not wired into `DynamicModel` — use their types directly:
+
+| Module | Family | Notes |
+|--------|--------|-------|
+| `gpt_oss` | GPT-OSS | 20B, 120B MoE |
+| `pixtral` | Pixtral | 12B vision-language |
+| `qwen2_vl` | Qwen2-VL | 2B, 7B vision-language |
+| `mllama` | MLlama | 3.2-Vision |
+| `clip` | CLIP | ViT-L/14 vision encoder |
+| `whisper` | Whisper | Base, Small, Medium, Large |
+| `t5` | T5 | Encoder-decoder |
 
 ## Features
 

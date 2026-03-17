@@ -46,11 +46,11 @@ Mel Spectrogram → Conv1d → [AMP Blocks × N] → Conv1d → Audio Waveform
 ## Usage
 
 ```rust
-use pmetal_vocoder::{BigVGANGenerator, VocoderConfig};
+use pmetal_vocoder::{BigVGAN, BigVGANConfig};
 
 // Load vocoder
-let config = VocoderConfig::default();
-let vocoder = BigVGANGenerator::new(config)?;
+let config = BigVGANConfig::default();
+let vocoder = BigVGAN::new(config)?;
 
 // Convert mel spectrogram to audio
 let mel = /* mel spectrogram [batch, mel_bins, frames] */;

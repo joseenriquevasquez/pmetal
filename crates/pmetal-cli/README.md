@@ -167,10 +167,17 @@ Use `--dapo` for Decoupled Clip and Dynamic Sampling Policy Optimization.
 
 | Command | Description |
 |---------|-------------|
+| `search` | Search HuggingFace Hub with memory fit estimation |
 | `download` | Download model from HuggingFace |
+| `merge` | Merge two or more models (12 strategies) |
+| `quantize` | Quantize model to GGUF (13 format options) |
+| `fuse` | Fuse LoRA adapter weights into base model |
+| `eval` | Evaluate model perplexity on a dataset |
+| `serve` | OpenAI-compatible inference server (feature-gated: `serve`) |
+| `tui` | Full TUI control center with 9 tabs (feature-gated: `dashboard`) |
+| `info` | Show device info (GPU, ANE, bandwidth, NAX) |
 | `memory` | Show memory usage and capacity |
-| `quantize` | Quantize model to GGUF (Dynamic 2.0) |
-| `ollama` | Export trained model for Ollama |
+| `ollama` | Ollama integration (`modelfile`, `create`, `templates`) |
 | `init` | Generate sample config file |
 
 ## Environment Variables

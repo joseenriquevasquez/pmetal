@@ -63,6 +63,15 @@ if let Some(ckpt) = checkpoint_mgr.latest()? {
 trainer.train_with_checkpoints(&dataloader, &checkpoint_mgr, save_every: 500)?;
 ```
 
+## Optimizers
+
+| Optimizer | Description |
+|-----------|-------------|
+| **AdamW Groups** | AdamW with per-parameter-group learning rates |
+| **Adam 8-bit** | Memory-efficient 8-bit Adam optimizer |
+| **Schedule-Free** | Optimizer without learning rate schedules |
+| **Metal Fused** | GPU-accelerated AdamW parameter updates |
+
 ## Learning Rate Schedulers
 
 | Scheduler | Description |
@@ -70,7 +79,9 @@ trainer.train_with_checkpoints(&dataloader, &checkpoint_mgr, save_every: 500)?;
 | Constant | Fixed learning rate |
 | Linear | Linear warmup and decay |
 | Cosine | Cosine annealing |
+| Cosine with Restarts | Cosine with periodic warm restarts |
 | Polynomial | Polynomial decay |
+| WSD | Warmup-Stable-Decay schedule |
 
 ## Modules
 
@@ -83,7 +94,7 @@ trainer.train_with_checkpoints(&dataloader, &checkpoint_mgr, save_every: 500)?;
 | `grpo` | Group Relative Policy Optimization |
 | `gspo` | Group Sequence Policy Optimization |
 | `dapo` | Decoupled Clip and Dynamic Sampling PO |
-| `ane_training` | ANE training loop (`AneTrainingLoop` + `DynamicAneTrainer`) |
+| `ane_training` | ANE training loop (feature-gated: `ane`) |
 | `ppo` | Proximal Policy Optimization |
 | `orpo` | Odds Ratio Preference Optimization |
 | `simpo` | Simple Preference Optimization |
@@ -91,10 +102,17 @@ trainer.train_with_checkpoints(&dataloader, &checkpoint_mgr, save_every: 500)?;
 | `online_dpo` | Online DPO with sampling |
 | `distillation` | Knowledge distillation orchestration |
 | `diffusion` | Diffusion-based training |
+| `adamw_groups` | AdamW with parameter groups |
+| `adam8bit` | 8-bit Adam optimizer |
+| `schedule_free` | Schedule-free optimizer |
+| `metal_fused` | Metal-accelerated optimizer |
+| `adaptive_lr` | EMA-based adaptive learning rate control |
 | `checkpoint` | Checkpoint save/load |
+| `checkpointing` | Gradient checkpointing |
 | `scheduler` | Learning rate schedulers |
 | `callbacks` | Training callbacks (`MetricsJsonCallback`, `StepMetrics`) |
 | `param_groups` | Per-layer learning rates |
+| `distributed_bridge` | Distributed training sync (feature-gated: `distributed`) |
 
 ## Configuration
 

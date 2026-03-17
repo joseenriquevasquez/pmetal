@@ -13,16 +13,21 @@ This crate provides knowledge distillation utilities for training smaller studen
 | **KL Divergence** | Standard KL distance | O(vocab) |
 | **Jensen-Shannon** | Symmetric divergence | O(vocab) |
 | **Soft Cross-Entropy** | Temperature-scaled CE | O(1) |
+| **TVD** | Total Variation Distance | O(vocab) |
+| **Hinge Ranking** | Margin-based ranking loss | O(vocab) |
+| **Logistic Ranking** | Logistic ranking loss | O(vocab) |
 | **Hidden State MSE** | Layer alignment | O(hidden) |
 | **Hidden State Cosine** | Direction alignment | O(hidden) |
+| **Hidden State L1** | L1 layer alignment | O(hidden) |
 
 ## Features
 
+- **TAID**: Temporally Adaptive Interpolated Distillation (ICLR 2025 SOTA) — `TaidDistiller` with configurable schedules
 - **Online Softmax**: O(1) memory per token via streaming computation
 - **Fused Operations**: Temperature scaling + softmax + loss in one kernel
-- **Cross-Vocabulary Distillation**: Sparse top-k alignment for teacher/student vocab mismatch (e.g. Qwen3 → Qwen3.5)
+- **Cross-Vocabulary Distillation**: Sparse top-k alignment for teacher/student vocab mismatch (e.g. Qwen3 to Qwen3.5)
 - **Progressive Distillation**: Temperature annealing schedules
-- **Offline Distillation**: Compressed logit caching for large teachers
+- **Offline Distillation**: Compressed logit caching for large teachers (`LogitCache`, `LogitCompressor`)
 - **Layer Matching**: Align intermediate representations
 - **Reasoning-Aware**: Rationale distillation with weighted reasoning tokens
 
@@ -85,11 +90,10 @@ The distillation losses are optimized for Apple Silicon:
 
 | Module | Description |
 |--------|-------------|
-| `losses` | Loss function implementations |
-| `distiller` | Main distillation trainer |
-| `config` | Configuration types |
-| `schedule` | Temperature scheduling |
-| `offline` | Logit caching for offline distillation |
+| `losses` | Loss function implementations (KL, JS, Soft CE, MSE, Cosine, L1, TVD, Hinge, Logistic) |
+| `taid` | Temporally Adaptive Interpolated Distillation (ICLR 2025 SOTA) |
+| `reasoning` | Rationale distillation for reasoning models |
+| Config/Builder | `DistillConfig`, `DistillerBuilder`, distillation method types |
 
 ## Configuration
 

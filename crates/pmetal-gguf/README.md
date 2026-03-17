@@ -36,13 +36,13 @@ for (name, tensor) in gguf.tensors() {
 ### Dequantizing Tensors
 
 ```rust
-use pmetal_gguf::{GgufContent, dequantize};
+use pmetal_gguf::{GgufContent, dequant};
 
 let gguf = GgufContent::from_file("model-q4.gguf")?;
 
 // Dequantize a specific tensor
 let weights = gguf.get_tensor("model.layers.0.self_attn.q_proj.weight")?;
-let fp32_weights = dequantize(&weights)?;
+let fp32_weights = dequant::dequantize(&weights)?;
 ```
 
 ### Converting to GGUF
@@ -80,9 +80,13 @@ writer.finish()?;
 | Module | Description |
 |--------|-------------|
 | `reader` | GGUF file parsing |
-| `writer` | GGUF file creation |
+| `quantize` | GGUF file creation and quantization |
 | `dequant` | Tensor dequantization |
-| `metadata` | Metadata handling |
+| `dynamic` | Dynamic quantization |
+| `imatrix` | Importance matrix support |
+| `k_quants` | K-quant implementations |
+| `iq_quants` | IQ-quant implementations |
+| `vec_dot` | Vectorized dot product kernels |
 
 ## License
 
