@@ -28,6 +28,8 @@ struct FusedLoraParams {
     uint out_features;    // Output dimension (D_out)
     uint rank;            // LoRA rank (R)
     float scale;          // LoRA scaling factor (alpha / rank)
+    float lr_scale_a;     // LoRA+ gradient scale for dA (1.0 = standard LoRA)
+    float lr_scale_b;     // LoRA+ gradient scale for dB (loraplus_lr_ratio = LoRA+)
 };
 
 // Tile sizes optimized for Apple Silicon
@@ -285,7 +287,7 @@ kernel void fused_lora_backward_ab(
             acc += xa_val * dy_val;
         }
 
-        dB[out_idx * params.rank + rank_idx] = half(params.scale * acc);
+        dB[out_idx * params.rank + rank_idx] = half(params.scale * acc * params.lr_scale_b);
     }
 }
 
@@ -390,7 +392,7 @@ kernel void fused_lora_backward_a(
 
     // Write result (only lane 0 holds the accumulated value).
     if (simd_lane_id == 0) {
-        dA[rank_idx * params.in_features + in_idx] = half(params.scale * acc);
+        dA[rank_idx * params.in_features + in_idx] = half(params.scale * acc * params.lr_scale_a);
     }
 }
 

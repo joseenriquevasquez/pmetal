@@ -61,6 +61,34 @@ pub struct FusedTrainingConfig {
     pub scale: f32,
     /// Whether to use Metal fused kernels (when available).
     pub use_metal: bool,
+    /// LoRA+ learning rate ratio for B matrices (Hayou et al., ICML 2024).
+    ///
+    /// When set, dB gradients are pre-scaled by this factor in the backward kernel
+    /// (dA is left at 1.0), so the optimizer applies the same base LR to both while
+    /// achieving the differential LR effect at zero optimizer overhead.
+    /// Recommended value from the paper: 16.0.  `None` disables LoRA+ (default).
+    pub loraplus_lr_ratio: Option<f32>,
+    /// Whether LoRA+ scaling is applied at the kernel level (true) or at the
+    /// optimizer level (false).
+    ///
+    /// # Critical correctness invariant
+    ///
+    /// When Metal fused kernels are active **and** `loraplus_lr_ratio` is set,
+    /// the backward kernel pre-scales dB by the ratio before returning gradients
+    /// to the host.  If the optimizer *also* applies LoRA+ routing (e.g. via
+    /// `AdamWGroups` with separate B-matrix groups), the effective scaling
+    /// becomes `ratio²`, which explodes training.
+    ///
+    /// Set `kernel_loraplus = true` when constructing the optimizer to indicate
+    /// that gradient scaling is already handled here; the optimizer must then
+    /// apply the **same base LR** to all LoRA parameters.
+    ///
+    /// This field is set automatically by `FusedTrainingConfig::with_loraplus`
+    /// when `use_metal = true`.  When the Metal path is unavailable the MLX
+    /// fallback scales gradients manually in `backward_lora` and this flag is
+    /// `false`, meaning the optimizer's LoRA+ routing (if any) is the only
+    /// place scaling is applied.
+    pub kernel_loraplus: bool,
 }
 
 impl FusedTrainingConfig {
@@ -72,12 +100,40 @@ impl FusedTrainingConfig {
             rank,
             scale: alpha / rank as f32,
             use_metal: true, // Prefer Metal when available
+            loraplus_lr_ratio: None,
+            kernel_loraplus: false,
         }
     }
 
     /// Disable Metal acceleration (use pure MLX).
     pub fn with_mlx_only(mut self) -> Self {
         self.use_metal = false;
+        // When Metal is disabled the kernel cannot apply LoRA+, so if LoRA+ was
+        // requested it will be handled by the MLX backward path instead.
+        self.kernel_loraplus = false;
+        self
+    }
+
+    /// Enable LoRA+ differential learning rates.
+    ///
+    /// Sets the B-matrix gradient scaling ratio.  A ratio of 16.0 is recommended
+    /// by the LoRA+ paper.  Setting this to 1.0 is equivalent to standard LoRA.
+    ///
+    /// When Metal fused kernels are available (`use_metal = true`), the scaling is
+    /// applied inside the backward kernel and `kernel_loraplus` is set to `true`.
+    /// Callers must **not** also configure the optimizer with LoRA+ routing, or the
+    /// scaling will be applied twice (ratio²).
+    ///
+    /// When Metal is not available (or disabled via `with_mlx_only`), `kernel_loraplus`
+    /// is `false` and the MLX fallback path applies scaling directly to gradients;
+    /// the optimizer should *also* not apply LoRA+ in that case, since the gradient
+    /// already contains the scaled value.
+    pub fn with_loraplus(mut self, lr_ratio: f32) -> Self {
+        self.loraplus_lr_ratio = Some(lr_ratio);
+        // Mark that LoRA+ is handled at the kernel/gradient level, not the
+        // optimizer level.  This prevents double-scaling regardless of which
+        // execution path (Metal kernel or MLX fallback) is active.
+        self.kernel_loraplus = self.use_metal;
         self
     }
 }
@@ -296,55 +352,80 @@ impl FusedLoraTrainer {
     ) -> Result<(Array, Array), FusedTrainingError> {
         #[cfg(feature = "metal-fused")]
         if let Some(ctx) = &self.metal_ctx {
-            let batch_size = x.dim(0) as usize;
-            let config = FusedLoraConfig::new(
-                batch_size,
-                self.config.in_features,
-                self.config.out_features,
-                self.config.rank,
-                self.config.scale,
-            );
-            let fused =
-                FusedLora::new(ctx.clone(), config).map_err(pmetal_metal::MetalError::from)?;
+            // Guard: the fused_lora_backward_a kernel stages a B column of
+            // out_features floats per SIMD group into threadgroup memory.
+            // With TILE_M=4 SIMD groups the required size is:
+            //   4 * out_features * sizeof(float)
+            // Metal's threadgroup memory limit is 32 KB, giving a maximum
+            // out_features of 2048.  Larger layers must use the MLX path.
+            const METAL_TG_MEM_LIMIT: usize = 32 * 1024;
+            const TILE_M_BWD_A: usize = 4;
+            let backward_a_tg_mem = TILE_M_BWD_A * self.config.out_features * std::mem::size_of::<f32>();
+            let can_use_metal_backward = backward_a_tg_mem <= METAL_TG_MEM_LIMIT;
 
-            grad_output.eval()?;
-            x.eval()?;
-            intermediate.eval()?;
-            lora_b.eval()?;
+            if can_use_metal_backward {
+                let batch_size = x.dim(0) as usize;
+                let lr_ratio = self.config.loraplus_lr_ratio.unwrap_or(1.0);
+                let config = FusedLoraConfig::new(
+                    batch_size,
+                    self.config.in_features,
+                    self.config.out_features,
+                    self.config.rank,
+                    self.config.scale,
+                )
+                .with_loraplus(1.0, lr_ratio);
+                let fused =
+                    FusedLora::new(ctx.clone(), config).map_err(pmetal_metal::MetalError::from)?;
 
-            unsafe {
-                let dy_view = metal_buffer_from_ptr(
-                    ctx,
-                    grad_output.as_slice::<f16>().as_ptr() as *mut f16,
-                    grad_output.size(),
-                )?;
-                let x_view =
-                    metal_buffer_from_ptr(ctx, x.as_slice::<f16>().as_ptr() as *mut f16, x.size())?;
-                let inter_view = metal_buffer_from_ptr(
-                    ctx,
-                    intermediate.as_slice::<f16>().as_ptr() as *mut f16,
-                    intermediate.size(),
-                )?;
-                let b_view = metal_buffer_from_ptr(
-                    ctx,
-                    lora_b.as_slice::<f16>().as_ptr() as *mut f16,
-                    lora_b.size(),
-                )?;
+                grad_output.eval()?;
+                x.eval()?;
+                intermediate.eval()?;
+                lora_b.eval()?;
 
-                let (grad_a_buf, grad_b_buf) = fused
-                    .backward_ab(&dy_view, &x_view, &inter_view, &b_view)
-                    .map_err(pmetal_metal::MetalError::from)?;
+                unsafe {
+                    let dy_view = metal_buffer_from_ptr(
+                        ctx,
+                        grad_output.as_slice::<f16>().as_ptr() as *mut f16,
+                        grad_output.size(),
+                    )?;
+                    let x_view = metal_buffer_from_ptr(
+                        ctx,
+                        x.as_slice::<f16>().as_ptr() as *mut f16,
+                        x.size(),
+                    )?;
+                    let inter_view = metal_buffer_from_ptr(
+                        ctx,
+                        intermediate.as_slice::<f16>().as_ptr() as *mut f16,
+                        intermediate.size(),
+                    )?;
+                    let b_view = metal_buffer_from_ptr(
+                        ctx,
+                        lora_b.as_slice::<f16>().as_ptr() as *mut f16,
+                        lora_b.size(),
+                    )?;
 
-                let grad_a = Array::from_slice(
-                    &grad_a_buf.to_vec()?,
-                    &[self.config.rank as i32, self.config.in_features as i32],
+                    let (grad_a_buf, grad_b_buf) = fused
+                        .backward_ab(&dy_view, &x_view, &inter_view, &b_view)
+                        .map_err(pmetal_metal::MetalError::from)?;
+
+                    let grad_a = Array::from_slice(
+                        &grad_a_buf.to_vec()?,
+                        &[self.config.rank as i32, self.config.in_features as i32],
+                    );
+                    let grad_b = Array::from_slice(
+                        &grad_b_buf.to_vec()?,
+                        &[self.config.out_features as i32, self.config.rank as i32],
+                    );
+
+                    return Ok((grad_a, grad_b));
+                }
+            } else {
+                warn!(
+                    "fused_lora_backward: out_features={} exceeds Metal threadgroup memory limit \
+                     for backward_a kernel (need {} bytes, limit is {} bytes). \
+                     Falling back to MLX for LoRA backward pass.",
+                    self.config.out_features, backward_a_tg_mem, METAL_TG_MEM_LIMIT
                 );
-                let grad_b = Array::from_slice(
-                    &grad_b_buf.to_vec()?,
-                    &[self.config.out_features as i32, self.config.rank as i32],
-                );
-
-                return Ok((grad_a, grad_b));
             }
         }
 
@@ -355,6 +436,12 @@ impl FusedLoraTrainer {
         // dY.T @ xA: [out_features, batch] @ [batch, rank] = [out_features, rank]
         let grad_b = grad_output.t().matmul(intermediate)?;
         let grad_b = grad_b.multiply(&scale_arr)?;
+        // Apply LoRA+ scaling to dB in the MLX fallback path.
+        let grad_b = if let Some(ratio) = self.config.loraplus_lr_ratio {
+            grad_b.multiply(&Array::from_f32(ratio))?
+        } else {
+            grad_b
+        };
 
         // dA = scale * (dY @ B).T @ x
         // dY @ B: [batch, out_features] @ [out_features, rank] = [batch, rank]
@@ -362,6 +449,7 @@ impl FusedLoraTrainer {
         let dy_b = grad_output.matmul(lora_b)?;
         let grad_a = dy_b.t().matmul(x)?;
         let grad_a = grad_a.multiply(&scale_arr)?;
+        // lr_scale_a is always 1.0 in standard LoRA+, so no multiplication needed.
 
         Ok((grad_a, grad_b))
     }

@@ -58,6 +58,18 @@ pub struct FusedLoraConfig {
 
     /// LoRA scaling factor (typically alpha / rank).
     pub scale: f32,
+
+    /// LoRA+ gradient scale for the A matrix (default 1.0).
+    ///
+    /// When `None`, defaults to 1.0 (standard LoRA behavior, no differential LR).
+    pub lr_scale_a: Option<f32>,
+
+    /// LoRA+ gradient scale for the B matrix (default 1.0).
+    ///
+    /// Set this to `loraplus_lr_ratio` (e.g. 16.0) to apply LoRA+ differential
+    /// learning rates directly in the backward kernel, at zero optimizer overhead.
+    /// When `None`, defaults to 1.0 (standard LoRA behavior).
+    pub lr_scale_b: Option<f32>,
 }
 
 impl FusedLoraConfig {
@@ -83,7 +95,24 @@ impl FusedLoraConfig {
             out_features,
             rank,
             scale,
+            lr_scale_a: None,
+            lr_scale_b: None,
         }
+    }
+
+    /// Set LoRA+ gradient scales for differential learning rates.
+    ///
+    /// This applies LoRA+ (Hayou et al., ICML 2024) gradient scaling directly in the
+    /// backward kernel. The kernel multiplies dA by `lr_scale_a` and dB by `lr_scale_b`
+    /// at write time, so the optimizer sees pre-scaled gradients and applies the same
+    /// base learning rate to both matrices.
+    ///
+    /// The standard LoRA+ setting uses `lr_scale_a = 1.0` and
+    /// `lr_scale_b = loraplus_lr_ratio` (recommended: 16.0).
+    pub fn with_loraplus(mut self, lr_scale_a: f32, lr_scale_b: f32) -> Self {
+        self.lr_scale_a = Some(lr_scale_a);
+        self.lr_scale_b = Some(lr_scale_b);
+        self
     }
 
     /// Validate the configuration.
@@ -140,6 +169,10 @@ impl FusedLoraConfig {
 }
 
 /// Parameters passed to the Metal kernel.
+///
+/// Layout must exactly match the `FusedLoraParams` struct in `fused_lora.metal`.
+/// Fields are appended to the end — adding new fields here without matching the
+/// shader will silently produce wrong results, so keep both in sync.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct FusedLoraParams {
@@ -148,6 +181,10 @@ struct FusedLoraParams {
     out_features: u32,
     rank: u32,
     scale: f32,
+    /// LoRA+ gradient scale for dA. Applied at write time in the backward kernel.
+    lr_scale_a: f32,
+    /// LoRA+ gradient scale for dB. Applied at write time in the backward kernel.
+    lr_scale_b: f32,
 }
 
 impl From<&FusedLoraConfig> for FusedLoraParams {
@@ -158,6 +195,8 @@ impl From<&FusedLoraConfig> for FusedLoraParams {
             out_features: config.out_features as u32,
             rank: config.rank as u32,
             scale: config.scale,
+            lr_scale_a: config.lr_scale_a.unwrap_or(1.0),
+            lr_scale_b: config.lr_scale_b.unwrap_or(1.0),
         }
     }
 }
@@ -584,7 +623,44 @@ impl FusedLora {
         }
 
         // Second kernel: compute dA
+        //
+        // The `fused_lora_backward_a` kernel stages an entire B column
+        // (out_features floats) per SIMD group into threadgroup memory.
+        // With TILE_M = 4 SIMD groups, the required allocation is:
+        //   TILE_M * out_features * sizeof(float)
+        //
+        // Metal's per-threadgroup memory limit is 32 KB.  For out_features ≤ 2048
+        // the kernel is safe (4 * 2048 * 4 = 32 KB exactly).  Larger models
+        // (e.g. hidden_size=4096) would need 64 KB and must fall back to the
+        // pure-MLX backward path (called by the outer `backward_lora`).
         {
+            const TILE_M_BWD_A: usize = 4;
+            const TILE_K: usize = 32;
+            /// Metal threadgroup memory limit in bytes (hardware spec).
+            const METAL_TG_MEM_LIMIT: usize = 32 * 1024;
+
+            let tg_mem_size =
+                TILE_M_BWD_A * self.config.out_features * std::mem::size_of::<f32>();
+
+            if tg_mem_size > METAL_TG_MEM_LIMIT {
+                // out_features too large for the backward_a kernel's threadgroup
+                // memory budget.  Fall back to an MLX-level dA computation so
+                // that dB (already written above) remains correct.
+                //
+                // dA = scale * (dY @ B).T @ x  [rank, in_features]
+                // We reconstruct this using the buffers we have access to via
+                // their device-side pointers.  Rather than re-running through
+                // MLX here (we don't have Array handles), we return a
+                // FeatureTooLarge error so the caller (`backward_lora`) can
+                // detect it and re-run the whole backward in MLX.
+                return Err(MetalError::InvalidConfig(format!(
+                    "fused_lora_backward_a: out_features={} requires {} bytes of threadgroup \
+                     memory, exceeding the Metal limit of {} bytes. \
+                     Use the MLX fallback path (disable Metal for this layer or reduce out_features).",
+                    self.config.out_features, tg_mem_size, METAL_TG_MEM_LIMIT
+                )));
+            }
+
             let function_name = "fused_lora_backward_a";
             let pipeline = {
                 let mut cache = self.ctx.pipeline_cache_mut();
@@ -611,20 +687,21 @@ impl FusedLora {
                 let params = FusedLoraParams::from(&self.config);
                 let params_ptr = NonNull::from(&params).cast();
                 encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 4);
-            }
 
-            const TILE_K: usize = 32;
-            const TILE_M: usize = 32;
+                // Allocate dynamic threadgroup memory for B column staging:
+                // [TILE_M][out_features] floats.  Validated above to fit within 32 KB.
+                encoder.setThreadgroupMemoryLength_atIndex(tg_mem_size, 0);
+            }
 
             let grid_size = MTLSize {
                 width: self.config.in_features.div_ceil(TILE_K),
-                height: self.config.rank.div_ceil(TILE_M),
+                height: self.config.rank.div_ceil(TILE_M_BWD_A),
                 depth: 1,
             };
 
             let threadgroup_size = MTLSize {
                 width: 32,
-                height: 4,
+                height: TILE_M_BWD_A,
                 depth: 1,
             };
 

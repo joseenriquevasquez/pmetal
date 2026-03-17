@@ -200,4 +200,51 @@ pub trait TrainableModel: ModuleParameters {
         // Override in concrete model types that expose the embedding layer.
         self.forward(input_ids, mask)
     }
+
+    /// Forward pass returning hidden states BEFORE the lm_head projection.
+    ///
+    /// Used by Cut Cross-Entropy (CCE) to avoid materializing the full [batch, seq,
+    /// vocab_size] logits tensor. For large vocabularies (e.g., 150K Qwen tokens),
+    /// this saves up to 37x peak memory during the loss computation.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [batch, seq_len]
+    /// * `mask`      - Optional attention mask
+    ///
+    /// # Returns
+    /// `Some(Ok(hidden_states))` of shape [batch, seq_len, hidden_dim] when the model
+    /// supports this path, or `None` when it does not (triggers standard CE fallback).
+    fn forward_hidden(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Option<Result<Array, LoraError>> {
+        let _ = (input_ids, mask);
+        None
+    }
+
+    /// Forward pass returning hidden states with explicit position IDs (packed sequences).
+    ///
+    /// Same as `forward_hidden` but supplies position IDs that reset at packed-sequence
+    /// boundaries, enabling correct RoPE embeddings for packed training.
+    fn forward_hidden_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        position_ids: &Array,
+    ) -> Option<Result<Array, LoraError>> {
+        let _ = (input_ids, mask, position_ids);
+        None
+    }
+
+    /// Return the LM head weight matrix [vocab_size, hidden_dim].
+    ///
+    /// For models with a separate `lm_head` linear layer this returns that weight.
+    /// For models with tied embeddings it returns the embedding weight (which serves
+    /// as the LM head when transposed).
+    ///
+    /// Returns `None` if the model does not expose its LM head (triggers CCE fallback).
+    fn lm_head_weight(&self) -> Option<Array> {
+        None
+    }
 }
