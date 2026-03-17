@@ -51,6 +51,7 @@ crossterm = { version = "0.28", features = ["event-stream"], optional = true }
 futures = { version = "0.3", optional = true }
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
 libc = "0.2"
+pmetal-serve = { workspace = true, optional = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 
@@ -58,6 +59,8 @@ sha2 = { workspace = true }
 default = ["ane", "dashboard"]
 ane = ["pmetal-trainer/ane", "pmetal-models/ane"]
 dashboard = ["dep:ratatui", "dep:crossterm", "dep:futures", "dep:tokio-util"]
+distributed = ["pmetal-trainer/distributed"]
+serve = ["dep:pmetal-serve"]
 
 [build-dependencies]
 flate2 = "1"

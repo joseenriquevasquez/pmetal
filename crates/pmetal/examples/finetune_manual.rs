@@ -84,6 +84,7 @@ async fn main() -> BoxResult<()> {
         seed: 42,
         pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
         drop_last: false,
+        ..Default::default()
     };
 
     let loop_config = TrainingLoopConfig {

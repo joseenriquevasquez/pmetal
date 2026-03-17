@@ -16,6 +16,7 @@ members = [
     "crates/pmetal-distill",
     "crates/pmetal-distributed",
     "crates/pmetal-mhc",
+    "crates/pmetal-serve",
     "crates/pmetal",
     "crates/pmetal-cli",
     "crates/pmetal-py",
@@ -47,6 +48,7 @@ pmetal-merge = { path = "crates/pmetal-merge", version = "0.3.7" }
 pmetal-distill = { path = "crates/pmetal-distill", version = "0.3.7" }
 pmetal-mhc = { path = "crates/pmetal-mhc", version = "0.3.7" }
 pmetal-distributed = { path = "crates/pmetal-distributed", version = "0.3.7" }
+pmetal-serve = { path = "crates/pmetal-serve", version = "0.3.7" }
 
 # MLX bindings - pmetal-maintained fork (unblocks crates.io publishing)
 mlx-rs = { version = "0.25.7", package = "pmetal-mlx-rs", features = ["safetensors"] }

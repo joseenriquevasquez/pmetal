@@ -297,6 +297,24 @@ enum Commands {
         #[cfg(feature = "ane")]
         #[arg(long)]
         no_ane: bool,
+
+        /// Distributed training: comma-separated peer addresses (ip:port).
+        /// All nodes in the cluster must specify the same peer list.
+        /// Set PMETAL_RANK=N env var to specify this node's rank (0-indexed).
+        #[cfg(feature = "distributed")]
+        #[arg(long, value_delimiter = ',')]
+        distributed_peers: Option<Vec<String>>,
+
+        /// Distributed training: enable automatic mDNS peer discovery.
+        /// Finds other pmetal nodes on the local network automatically.
+        #[cfg(feature = "distributed")]
+        #[arg(long)]
+        distributed_auto: bool,
+
+        /// Gradient compression strategy for distributed training (none, topk, fp16, random).
+        #[cfg(feature = "distributed")]
+        #[arg(long, default_value = "none")]
+        compression_strategy: Option<String>,
     },
 
     /// Run inference with a model
@@ -509,6 +527,18 @@ enum Commands {
         /// LoRA rank (default: auto-detect from adapter)
         #[arg(long)]
         rank: Option<usize>,
+
+        /// Use f64-accurate LoRA merge (reads adapter_config.json, performs B@A in f64,
+        /// writes merged weights in the original storage dtype).
+        /// More numerically accurate than the default f32 path.
+        #[arg(long, default_value_t = false)]
+        accurate: bool,
+
+        /// Use tiled low-memory mode with the --accurate path.
+        /// Limits peak f64 allocation to tile_size rows of B at a time.
+        /// Only has effect when --accurate is also set.
+        #[arg(long, default_value_t = false)]
+        low_memory: bool,
     },
 
     /// Quantize a model to GGUF format (supports Dynamic 2.0)
@@ -674,6 +704,30 @@ enum Commands {
         /// Path to write JSONL metrics log (for TUI dashboard)
         #[arg(long)]
         log_metrics: Option<String>,
+    },
+
+    /// Start an OpenAI-compatible inference server
+    #[cfg(feature = "serve")]
+    Serve {
+        /// Model ID or path
+        #[arg(short, long)]
+        model: String,
+
+        /// LoRA adapter path (optional)
+        #[arg(long)]
+        lora: Option<String>,
+
+        /// Port to listen on
+        #[arg(short, long, default_value = "8080")]
+        port: u16,
+
+        /// Host to bind to
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+
+        /// Maximum sequence length for KV cache
+        #[arg(long, default_value = "4096")]
+        max_seq_len: usize,
     },
 
     /// Dataset utilities for preparing and analyzing training data
@@ -1528,6 +1582,12 @@ async fn tokio_main() -> anyhow::Result<()> {
             seed,
             #[cfg(feature = "ane")]
             no_ane,
+            #[cfg(feature = "distributed")]
+            distributed_peers,
+            #[cfg(feature = "distributed")]
+            distributed_auto,
+            #[cfg(feature = "distributed")]
+            compression_strategy,
         } => {
             // Optimizations enabled by default (invert no_* flags)
             let use_metal_flash_attention = !no_flash_attention;
@@ -1536,6 +1596,28 @@ async fn tokio_main() -> anyhow::Result<()> {
             let use_sequence_packing = !no_sequence_packing;
             let use_jit_compilation = !no_jit_compilation;
             let gradient_checkpointing = !no_gradient_checkpointing;
+
+            // Build distributed config if requested
+            #[cfg(feature = "distributed")]
+            let dist_config = {
+                let has_peers = distributed_peers.as_ref().is_some_and(|p| !p.is_empty());
+                if has_peers || distributed_auto {
+                    let compression = match compression_strategy.as_deref() {
+                        Some("topk") => pmetal_core::DistributedCompression::TopK,
+                        Some("fp16") => pmetal_core::DistributedCompression::Fp16,
+                        Some("random") => pmetal_core::DistributedCompression::Random,
+                        _ => pmetal_core::DistributedCompression::None,
+                    };
+                    Some(pmetal_core::DistributedTrainingConfig {
+                        peers: distributed_peers.unwrap_or_default(),
+                        auto_discover: distributed_auto,
+                        compression,
+                        ..Default::default()
+                    })
+                } else {
+                    None
+                }
+            };
 
             run_training(
                 config,
@@ -1574,8 +1656,23 @@ async fn tokio_main() -> anyhow::Result<()> {
                 !no_ane,
                 #[cfg(not(feature = "ane"))]
                 false,
+                #[cfg(feature = "distributed")]
+                dist_config,
+                #[cfg(not(feature = "distributed"))]
+                None,
             )
             .await?;
+        }
+
+        #[cfg(feature = "serve")]
+        Commands::Serve {
+            model,
+            lora,
+            port,
+            host,
+            max_seq_len,
+        } => {
+            run_serve(model, lora, port, host, max_seq_len).await?;
         }
 
         Commands::Infer {
@@ -1734,8 +1831,14 @@ async fn tokio_main() -> anyhow::Result<()> {
             output,
             alpha,
             rank,
+            accurate,
+            low_memory,
         } => {
-            run_fuse(&model, &lora, &output, alpha, rank).await?;
+            if accurate {
+                run_fuse_accurate(&model, &lora, &output, low_memory).await?;
+            } else {
+                run_fuse(&model, &lora, &output, alpha, rank).await?;
+            }
         }
 
         Commands::Quantize {
@@ -2485,6 +2588,81 @@ async fn run_fuse(
     Ok(())
 }
 
+/// Fuse LoRA weights using the f64-accurate streaming merge path.
+///
+/// Reads `adapter_config.json` from the adapter directory, resolves the base
+/// model (single-file or sharded), and writes the merged safetensors to
+/// `output_path`.  Non-weight files (tokenizer, config.json, etc.) are copied
+/// verbatim.
+async fn run_fuse_accurate(
+    model_path: &str,
+    lora_path: &str,
+    output_path: &str,
+    low_memory: bool,
+) -> anyhow::Result<()> {
+    use pmetal_merge::{AccurateMergeConfig, streaming_lora_merge};
+
+    println!("  PMetal LoRA Fuse (f64-accurate path)");
+    println!("========================================");
+
+    // Resolve model path (could be HF ID or local path)
+    let model_dir: PathBuf = if model_path.contains('/') && !PathBuf::from(model_path).exists() {
+        tracing::info!("Resolving HuggingFace model: {}", model_path);
+        pmetal_hub::download_model(model_path, None, None).await?
+    } else {
+        PathBuf::from(model_path)
+    };
+
+    // The adapter path must be a directory containing adapter_config.json.
+    let adapter_dir: PathBuf = if std::path::Path::new(lora_path).is_dir() {
+        PathBuf::from(lora_path)
+    } else {
+        // If given a file, use the parent directory.
+        std::path::Path::new(lora_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf()
+    };
+
+    println!("Base model:   {}", model_dir.display());
+    println!("LoRA adapter: {}", adapter_dir.display());
+    println!("Output:       {output_path}");
+    if low_memory {
+        println!("Mode:         low-memory (tiled, 512 rows/tile)");
+    } else {
+        println!("Mode:         standard (full-matrix f64)");
+    }
+    println!();
+
+    let mut config = AccurateMergeConfig::new(&model_dir, &adapter_dir, PathBuf::from(output_path));
+    if low_memory {
+        config = config.with_low_memory(512);
+    }
+
+    print!("Merging... ");
+    let stats = streaming_lora_merge(&config)
+        .map_err(|e| anyhow::anyhow!("f64-accurate LoRA merge failed: {e}"))?;
+
+    println!("done");
+    println!();
+    println!("Tensors merged:  {}", stats.tensors_merged);
+    println!("Tensors copied:  {}", stats.tensors_copied);
+    println!(
+        "Bytes written:   {:.2} GB",
+        stats.bytes_written as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+    println!("Elapsed:         {:.1}ms", stats.elapsed_ms);
+    println!();
+    println!("========================================");
+    println!("Fused model saved to: {output_path}");
+    println!();
+    println!("Next steps:");
+    println!("  Inference:  pmetal infer -m {output_path} -p \"Your prompt\"");
+    println!("  Quantize:   pmetal quantize -m {output_path} -o {output_path}.gguf");
+
+    Ok(())
+}
+
 /// Run knowledge distillation.
 #[allow(clippy::too_many_arguments)]
 async fn run_distillation_cli(
@@ -2679,6 +2857,7 @@ async fn run_distillation_cli(
             seed,
             pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
             drop_last: false,
+            ..Default::default()
         },
         use_metal_flash_attention: true,
         log_every: 1,
@@ -2997,6 +3176,7 @@ async fn run_grpo_cli(
             seed,
             pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
             drop_last: false,
+            ..Default::default()
         },
         use_metal_flash_attention,
         log_every: 1,
@@ -3124,6 +3304,7 @@ async fn run_training(
     weight_decay: f64,
     seed: u64,
     ane: bool,
+    #[allow(unused_variables)] distributed_config: Option<pmetal_core::DistributedTrainingConfig>,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "ane"))]
     if ane {
@@ -3579,6 +3760,7 @@ async fn run_training(
         seed: config.training.seed,
         pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
         drop_last: false,
+        ..Default::default()
     };
 
     // Create training loop config
@@ -3594,13 +3776,12 @@ async fn run_training(
         gradient_checkpointing,
         gradient_checkpointing_layers,
         embedding_lr,
-        // Eager evaluation: forces immediate GPU computation after each step.
-        // Prevents Metal resource exhaustion from deferred evaluation graph buildup.
-        // Essential for models without true gradient checkpointing (e.g., Qwen3.5 hybrid).
         eager_evaluation: true,
         use_metal_fused_optimizer,
         loraplus_lr_ratio: None,
         neftune_noise_alpha: None,
+        #[cfg(feature = "distributed")]
+        distributed: distributed_config.clone(),
     };
 
     // Calculate total steps for progress bar
@@ -3698,6 +3879,14 @@ async fn run_training(
 
         // Create training loop
         let mut training_loop = TrainingLoop::new(training_loop_config);
+
+        // Set up distributed gradient sync if configured
+        #[cfg(feature = "distributed")]
+        if let Some(ref dist_cfg) = distributed_config {
+            let ctx = pmetal_trainer::create_distributed_context(dist_cfg).await?;
+            let sync = pmetal_trainer::DistributedGradientSync::new(ctx, dist_cfg);
+            training_loop.set_distributed(sync);
+        }
 
         // Wire metrics callback into training loop for step-level dispatch
         if let Some(cb) = metrics_callback.take() {
@@ -3827,6 +4016,14 @@ async fn run_training(
 
         // Create training loop
         let mut training_loop = TrainingLoop::new(training_loop_config);
+
+        // Set up distributed gradient sync if configured
+        #[cfg(feature = "distributed")]
+        if let Some(ref dist_cfg) = distributed_config {
+            let ctx = pmetal_trainer::create_distributed_context(dist_cfg).await?;
+            let sync = pmetal_trainer::DistributedGradientSync::new(ctx, dist_cfg);
+            training_loop.set_distributed(sync);
+        }
 
         // Wire metrics callback into training loop for step-level dispatch
         if let Some(cb) = metrics_callback.take() {
@@ -8382,18 +8579,18 @@ async fn run_merge_command(
             MergeModelConfig {
                 model: path_a.to_string_lossy().to_string(),
                 parameters: MergeParameters {
-                    weight: Some(weight_a),
-                    density: Some(density),
-                    t: Some(t),
+                    weight: Some(pmetal_merge::ParameterSetting::Scalar(weight_a)),
+                    density: Some(pmetal_merge::ParameterSetting::Scalar(density)),
+                    t: Some(pmetal_merge::ParameterSetting::Scalar(t)),
                     ..Default::default()
                 },
             },
             MergeModelConfig {
                 model: path_b.to_string_lossy().to_string(),
                 parameters: MergeParameters {
-                    weight: Some(weight_b),
-                    density: Some(density),
-                    t: Some(1.0 - t),
+                    weight: Some(pmetal_merge::ParameterSetting::Scalar(weight_b)),
+                    density: Some(pmetal_merge::ParameterSetting::Scalar(density)),
+                    t: Some(pmetal_merge::ParameterSetting::Scalar(1.0 - t)),
                     ..Default::default()
                 },
             },
@@ -8405,6 +8602,7 @@ async fn run_merge_command(
         tokenizer: Some(TokenizerConfig {
             source: "first".to_string(),
         }),
+        slices: None,
     };
 
     println!("Running merge...");
@@ -8578,6 +8776,64 @@ async fn run_eval(
         println!("Average NLL:       {:.4}", avg_nll);
         println!("Perplexity:        {:.2}", perplexity);
     }
+
+    Ok(())
+}
+
+/// Start the OpenAI-compatible inference server.
+#[cfg(feature = "serve")]
+async fn run_serve(
+    model_id: String,
+    lora_path: Option<String>,
+    port: u16,
+    host: String,
+    max_seq_len: usize,
+) -> anyhow::Result<()> {
+    use pmetal_models::dispatcher::DynamicModel;
+    use pmetal_serve::{InferenceEngine, ServeConfig};
+
+    // Resolve model path
+    let model_path = if model_id.contains('/') && !PathBuf::from(&model_id).exists() {
+        tracing::info!("Downloading model from HuggingFace: {}", model_id);
+        pmetal_hub::download_model(&model_id, None, None).await?
+    } else {
+        PathBuf::from(&model_id)
+    };
+
+    // Load model config
+    let config_text = std::fs::read_to_string(model_path.join("config.json"))?;
+    let config_json: serde_json::Value = serde_json::from_str(&config_text)?;
+
+    // Load tokenizer
+    tracing::info!("Loading tokenizer...");
+    let tokenizer = tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json"))
+        .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
+
+    // Load model
+    tracing::info!("Loading model from {:?}...", model_path);
+    let mut model = DynamicModel::from_config(&config_json, &model_path)?;
+
+    // Apply LoRA adapter if specified
+    if let Some(ref lora) = lora_path {
+        let lora_dir = PathBuf::from(lora);
+        tracing::info!("Applying LoRA adapter from {:?}", lora_dir);
+        model.load_lora_adapter(&lora_dir)?;
+    }
+
+    tracing::info!("Model loaded successfully");
+
+    // Create inference engine
+    let engine =
+        InferenceEngine::new(model, tokenizer, model_id.clone(), &model_path, max_seq_len)?;
+
+    // Start server
+    let config = ServeConfig {
+        port,
+        host,
+        ..Default::default()
+    };
+
+    pmetal_serve::server::run_server(engine, config).await?;
 
     Ok(())
 }

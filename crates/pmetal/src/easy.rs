@@ -388,6 +388,7 @@ impl FinetuneBuilder {
             seed: 42,
             pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
             drop_last: false,
+            ..Default::default()
         };
 
         let training_loop_config = TrainingLoopConfig {

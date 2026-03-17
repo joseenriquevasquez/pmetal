@@ -297,6 +297,7 @@ impl PyDataLoaderConfig {
             seed,
             pad_token_id,
             drop_last,
+            ..Default::default()
         })
     }
 

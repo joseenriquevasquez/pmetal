@@ -542,6 +542,7 @@ async fn run_training_direct(
         parse_arg(&spec.args, "--weight-decay", 0.01f64)?,
         parse_arg(&spec.args, "--seed", 42u64)?,
         !has_flag(&spec.args, "--no-ane"),
+        None, // distributed_config
     )
     .await
 }
