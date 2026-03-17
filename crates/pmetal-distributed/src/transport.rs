@@ -92,6 +92,46 @@ impl TransportReceiver {
 
         Ok(())
     }
+
+    /// Receive a dynamically-sized message, returning the data as a `Vec<u8>`.
+    ///
+    /// Reads the 4-byte length prefix, allocates a buffer, and reads the payload.
+    /// This is useful when the caller does not know the message size in advance
+    /// (e.g. activation messages with variable tensor shapes).
+    pub async fn recv_vec(&mut self) -> Result<Vec<u8>> {
+        const MAX_MSG_BYTES: usize = 512 * 1024 * 1024;
+        const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+        let mut len_buf = [0u8; 4];
+        timeout(READ_TIMEOUT, self.stream.read_exact(&mut len_buf))
+            .await
+            .map_err(|_| {
+                DistributedError::Protocol(
+                    "Timed out waiting for message length prefix (60s)".to_string(),
+                )
+            })??;
+        let len = u32::from_le_bytes(len_buf) as usize;
+
+        if len > MAX_MSG_BYTES {
+            return Err(DistributedError::Protocol(format!(
+                "Message size {} bytes exceeds maximum {} bytes",
+                len, MAX_MSG_BYTES
+            ))
+            .into());
+        }
+
+        let mut buf = vec![0u8; len];
+        timeout(READ_TIMEOUT, self.stream.read_exact(&mut buf))
+            .await
+            .map_err(|_| {
+                DistributedError::Protocol(format!(
+                    "Timed out waiting for {} bytes of payload (60s)",
+                    len
+                ))
+            })??;
+
+        Ok(buf)
+    }
 }
 
 /// TCP transport for ring communication.

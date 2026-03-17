@@ -58,7 +58,10 @@ pub mod pipelines;
 pub mod registry;
 pub mod rl_generation;
 pub mod sampling;
+pub mod shard;
+pub mod speculative;
 pub mod traits;
+pub mod weight_cache;
 pub mod weight_format;
 
 // Re-exports for convenience
@@ -69,5 +72,6 @@ pub use registry::*;
 pub use rl_generation::{
     BatchedGenerationOutput, BatchedRlConfig, BatchedRlGenerator, generate_rl_completions,
 };
+pub use speculative::{SpeculativeConfig, SpeculativeDecoder, SpeculativeStats};
 pub use traits::{CausalLMModel, LoraCapable, ModelConfig, Quantizable, QuantizationType};
 pub use weight_format::{GgufModelConfig, WeightFormat, WeightFormatError, WeightLoader};

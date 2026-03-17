@@ -108,7 +108,16 @@ pub mod health;
 pub mod metrics;
 pub mod namespace;
 
+// Pipeline inference modules
+pub mod activation_codec;
+pub mod activation_transport;
+pub mod layer_assignment;
+pub mod pipeline;
+pub mod solver;
+
 // Re-exports for convenience
+pub use activation_codec::ActivationCodec;
+pub use activation_transport::{ActivationMessage, DtypeTag};
 pub use auto::{AutoDiscoveryBackend, AutoDiscoveryConfig};
 pub use collective::{AllReduceStrategy, BroadcastStrategy, CollectiveConfig, ReduceStrategy};
 pub use compression::{CompressionStrategy, GradientCompressor, QuantizationType};
@@ -117,8 +126,12 @@ pub use election::{ElectionConfig, ElectionEvent, ElectionManager, ElectionState
 pub use error::{DistributedError, DistributedResult};
 pub use health::{HealthConfig, HealthEvent, HealthMonitor, HealthStatus, HealthSummary};
 pub use identity::NodeIdentity;
+pub use layer_assignment::{assign_layers_bandwidth_aware, assign_layers_proportional};
 pub use metrics::{DistributedMetrics, MetricsSnapshot, SharedMetrics};
 pub use namespace::NetworkNamespace;
+pub use pipeline::{
+    PipelineGenerationLoop, PipelineStageConfig, PipelineStageRuntime, StreamMultiplexer,
+};
 pub use ring::RingBackend;
 pub use topology::{ClusterTopology, ConnectionProfile, NodeProfile, SharedTopology};
 // ReduceOp is already public via `pub enum ReduceOp` at module level
