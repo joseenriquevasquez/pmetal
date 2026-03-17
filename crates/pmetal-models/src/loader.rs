@@ -9,7 +9,11 @@ use std::path::Path;
 pub use mlx_rs::module::ModuleParametersExt;
 use mlx_rs::{Array, module::ModuleParameters, nn};
 
+use crate::architectures::bert::BertForEmbedding;
 use crate::architectures::clip::CLIPTextModel;
+use crate::architectures::falcon_h1::{
+    FalconH1ForCausalLM, load_falcon_h1_weights as load_falcon_h1,
+};
 use crate::architectures::flux::FluxDiT;
 use crate::architectures::gemma::GemmaForCausalLM;
 use crate::architectures::llama::{LlamaConfig, LlamaForCausalLM};
@@ -831,6 +835,14 @@ pub fn load_nemotron_weights(
     load_nemotron(model, &weights).map_err(|e| LoadError::SafeTensors(format!("{:?}", e)))
 }
 
+/// Load weights for FalconH1 models from a HuggingFace safetensors directory.
+pub fn load_falcon_h1_weights(
+    model: &mut FalconH1ForCausalLM,
+    weights: &std::collections::HashMap<String, mlx_rs::Array>,
+) -> Result<(), LoadError> {
+    load_falcon_h1(model, weights).map_err(|e| LoadError::SafeTensors(format!("{:?}", e)))
+}
+
 /// Load weights for Qwen3Next models with sanitization.
 ///
 /// Handles expert weight stacking, (1+w) RMSNorm offset, and conv1d transposition.
@@ -1336,4 +1348,108 @@ fn load_group_norm_weight(
         norm.bias = mlx_rs::module::Param::new(Some(b.clone()));
     }
     Ok(())
+}
+
+/// Load weights for BERT/RoBERTa/DistilBERT models from a HuggingFace checkpoint.
+///
+/// HuggingFace BERT checkpoints use a different naming convention than PMetal's
+/// internal parameter paths.  This function maps HF names to PMetal names before
+/// loading, so standard `model.safetensors` files from the HF Hub work without
+/// any prior conversion.
+///
+/// ## Name mapping
+///
+/// | HuggingFace key pattern               | PMetal parameter path                |
+/// |---------------------------------------|--------------------------------------|
+/// | `bert.embeddings.*`                   | `model.embeddings.*`                 |
+/// | `bert.encoder.layer.{i}.*`            | `model.layers.{i}.*`                 |
+/// | `attention.self.query`                | `attention.query`                    |
+/// | `attention.self.key`                  | `attention.key`                      |
+/// | `attention.self.value`                | `attention.value`                    |
+/// | `attention.output.dense`              | `attention_output.dense`             |
+/// | `intermediate.dense`                  | `intermediate.dense`                 |
+/// | `output.dense` (FFN)                  | `output.dense`                       |
+/// | `LayerNorm` (any position)            | `layer_norm`                         |
+/// | `embeddings.position_ids`             | skipped (buffer, not a parameter)    |
+/// | `pooler.*`                            | skipped (not part of BertForEmbedding)|
+///
+/// Both `bert.` prefixed keys (standard BERT / RoBERTa) and bare keys (some
+/// fine-tuned checkpoints that strip the top-level prefix) are handled.
+pub fn load_bert_weights(
+    model: &mut BertForEmbedding,
+    weights: &HashMap<String, Array>,
+) -> Result<(), LoadError> {
+    let mut params = model.parameters_mut().flatten();
+    let mut matched: usize = 0;
+
+    for (hf_name, weight) in weights {
+        // Skip non-parameter buffers and the optional pooler head (not part of
+        // BertForEmbedding which is embeddings-only).
+        if hf_name.ends_with("position_ids")
+            || hf_name.starts_with("pooler.")
+            || hf_name.starts_with("bert.pooler.")
+        {
+            continue;
+        }
+
+        // Map the HF key to the PMetal parameter path.
+        let pmetal_name = remap_bert_weight_name(hf_name);
+
+        if let Some(param) = params.get_mut(&*pmetal_name) {
+            **param = weight.clone();
+            matched += 1;
+        }
+        // Silently skip keys that don't have a corresponding PMetal parameter
+        // (e.g. cls.predictions.*, cls.seq_relationship.* from MLM/NSP heads).
+    }
+
+    if matched == 0 {
+        return Err(LoadError::SafeTensors(
+            "BERT weight loading: no parameters matched. \
+             Verify that the checkpoint is a BERT/RoBERTa model."
+                .into(),
+        ));
+    }
+
+    tracing::info!("BERT weight loading: {matched} parameters loaded successfully");
+    Ok(())
+}
+
+/// Map a single HuggingFace BERT weight name to the corresponding PMetal
+/// parameter path.
+///
+/// Called once per key in the safetensors file; cheap string manipulation only.
+fn remap_bert_weight_name(hf_name: &str) -> String {
+    // 1. Strip the top-level `bert.` prefix emitted by the standard HF BERT
+    //    implementation (not present in some fine-tuned variants).
+    let name = hf_name
+        .strip_prefix("bert.")
+        .unwrap_or(hf_name);
+
+    // 2. Remap `encoder.layer.{i}` → `layers.{i}` (drop "encoder." wrapper).
+    let name = if let Some(rest) = name.strip_prefix("encoder.layer.") {
+        // rest = "{i}.{...}"  e.g. "0.attention.self.query.weight"
+        format!("layers.{rest}")
+    } else {
+        name.to_string()
+    };
+
+    // 3. Remap attention sub-structure:
+    //    `attention.self.query`  → `attention.query`
+    //    `attention.self.key`    → `attention.key`
+    //    `attention.self.value`  → `attention.value`
+    //    `attention.output.dense` → `attention_output.dense`
+    let name = name
+        .replace("attention.self.query", "attention.query")
+        .replace("attention.self.key", "attention.key")
+        .replace("attention.self.value", "attention.value")
+        .replace("attention.output.dense", "attention_output.dense")
+        .replace("attention.output.LayerNorm", "attention_output.layer_norm");
+
+    // 4. Remap LayerNorm everywhere: `LayerNorm` → `layer_norm`.
+    //    This covers `embeddings.LayerNorm`, `output.LayerNorm`, etc.
+    let name = name.replace("LayerNorm", "layer_norm");
+
+    // 5. Prepend `model.` to match `BertForEmbedding { model: BertModel }`.
+    format!("model.{name}")
 }

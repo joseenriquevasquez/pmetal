@@ -3,9 +3,11 @@
 pub mod utils;
 pub use utils::create_causal_mask;
 
+pub mod bert;
 pub mod clip;
 pub mod cohere;
 pub mod deepseek;
+pub mod falcon_h1;
 pub mod flux;
 pub mod gemma;
 pub mod gpt_oss;
@@ -29,9 +31,11 @@ pub mod t5;
 pub mod vae;
 pub mod whisper;
 
+pub use bert::*;
 pub use clip::*;
 pub use cohere::*;
 pub use deepseek::*;
+pub use falcon_h1::*;
 pub use flux::*;
 pub use gemma::*;
 pub use gpt_oss::*;

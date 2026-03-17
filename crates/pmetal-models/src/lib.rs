@@ -50,6 +50,7 @@
 
 pub mod architectures;
 pub mod dispatcher;
+pub mod pooling;
 pub mod generation;
 pub mod loader;
 pub mod moe;
