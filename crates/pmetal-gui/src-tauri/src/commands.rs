@@ -1181,7 +1181,7 @@ pub async fn merge_models(
             .map(|model| pmetal::merge::ModelConfig {
                 model: model.model,
                 parameters: pmetal::merge::MergeParameters {
-                    weight: Some(model.weight as f32),
+                    weight: Some(pmetal::merge::ParameterSetting::Scalar(model.weight as f32)),
                     ..Default::default()
                 },
             })
@@ -1802,6 +1802,7 @@ async fn run_qlora_training_in_process(
             seed: 42,
             pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
             drop_last: false,
+            ..Default::default()
         },
         use_metal_flash_attention: config.flash_attention.unwrap_or(true),
         log_every: config.logging_steps.unwrap_or(10) as usize,
@@ -1987,6 +1988,7 @@ async fn run_distillation_in_process(
             seed: 42,
             pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
             drop_last: false,
+            ..Default::default()
         },
         use_metal_flash_attention: true,
         log_every: 1,
