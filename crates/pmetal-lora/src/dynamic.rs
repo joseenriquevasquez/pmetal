@@ -45,20 +45,25 @@ use crate::{
 ///
 /// # Supported Architectures
 ///
-/// - Llama (2, 3, 3.1, 3.2, 3.3, 4)
-/// - Mistral (7B) - with sliding window attention
-/// - Qwen3 (3, 3.5) - with gradient checkpointing support
-/// - Gemma (2B, 7B) / Gemma2 (2B, 9B, 27B) - with GeGLU and special RMSNorm
-/// - Phi (3, 3.5, 4) - with partial RoPE and fused gate_up
+/// - Llama (2, 3, 3.1, 3.2, 3.3) — gradient checkpointing supported
+/// - Qwen2 (2, 2.5) — uses Qwen3 LoRA implementation internally
+/// - Qwen3 — gradient checkpointing supported
+/// - Qwen3Next (3.5) — hybrid architecture with nested `text_config` handling
+/// - Gemma (2, 3) — GeGLU activation, special RMSNorm
+/// - Mistral (7B, Mixtral 8x7B) — sliding window attention support
+/// - Phi (3, 3.5) — partial RoPE, fused gate_up projection
+///
+/// Architectures not listed (Llama 4, Qwen3MoE, DeepSeek, Phi4, etc.) return
+/// `DynamicLoraError::NotImplemented`.
 ///
 /// # Architecture-Specific Features
 ///
-/// | Feature | Llama | Mistral | Qwen3 | Gemma | Phi |
-/// |---------|-------|---------|-------|-------|-----|
-/// | LoRA Training | Yes | Yes | Yes | Yes | Yes |
-/// | QLoRA | Yes | Planned | Yes | Planned | Planned |
-/// | Gradient Checkpointing | Yes | Yes | Yes | Yes | Yes |
-/// | Packed Sequences | Yes | Yes | Yes | Yes | Yes |
+/// | Feature | Llama | Mistral | Qwen3 | Gemma | Phi | Qwen3Next |
+/// |---------|-------|---------|-------|-------|-----|-----------|
+/// | LoRA Training | Yes | Yes | Yes | Yes | Yes | Yes |
+/// | QLoRA | Yes | Yes | Yes | Yes | — | — |
+/// | Gradient Checkpointing | Yes | Yes | Yes | Yes | Yes | Yes |
+/// | Packed Sequences | Yes | Yes | Yes | Yes | Yes | Yes |
 pub enum DynamicLoraModel {
     /// Llama family with LoRA adapters (supports gradient checkpointing).
     Llama(LlamaLoraForCausalLM),
@@ -643,6 +648,48 @@ impl TrainableModel for DynamicLoraModel {
             Self::Gemma(_) => true,
             Self::Phi(_) => true,
             Self::Qwen3Next(_) => true,
+        }
+    }
+
+    fn forward_hidden(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Option<Result<Array, LoraError>> {
+        match self {
+            Self::Llama(m) => m.forward_hidden(input_ids, mask),
+            Self::Mistral(m) => m.forward_hidden(input_ids, mask),
+            Self::Qwen3(m) => m.forward_hidden(input_ids, mask),
+            Self::Gemma(m) => m.forward_hidden(input_ids, mask),
+            Self::Phi(m) => m.forward_hidden(input_ids, mask),
+            Self::Qwen3Next(m) => m.forward_hidden(input_ids, mask),
+        }
+    }
+
+    fn forward_hidden_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        position_ids: &Array,
+    ) -> Option<Result<Array, LoraError>> {
+        match self {
+            Self::Llama(m) => m.forward_hidden_with_positions(input_ids, mask, position_ids),
+            Self::Mistral(m) => m.forward_hidden_with_positions(input_ids, mask, position_ids),
+            Self::Qwen3(m) => m.forward_hidden_with_positions(input_ids, mask, position_ids),
+            Self::Gemma(m) => m.forward_hidden_with_positions(input_ids, mask, position_ids),
+            Self::Phi(m) => m.forward_hidden_with_positions(input_ids, mask, position_ids),
+            Self::Qwen3Next(m) => m.forward_hidden_with_positions(input_ids, mask, position_ids),
+        }
+    }
+
+    fn lm_head_weight(&self) -> Option<Array> {
+        match self {
+            Self::Llama(m) => m.lm_head_weight(),
+            Self::Mistral(m) => m.lm_head_weight(),
+            Self::Qwen3(m) => m.lm_head_weight(),
+            Self::Gemma(m) => m.lm_head_weight(),
+            Self::Phi(m) => m.lm_head_weight(),
+            Self::Qwen3Next(m) => m.lm_head_weight(),
         }
     }
 }

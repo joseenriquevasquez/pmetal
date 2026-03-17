@@ -661,6 +661,22 @@ impl PhiLoraForCausalLM {
         self.forward_with_checkpoint(input_ids, mask, checkpoint_config.as_ref())
     }
 
+    /// Forward pass returning hidden states before lm_head, for Cut Cross-Entropy.
+    pub fn forward_hidden_states(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array, LoraError> {
+        let checkpoint_config = self.checkpoint_config.clone();
+        self.model
+            .forward_with_checkpoint(input_ids, mask, checkpoint_config.as_ref())
+    }
+
+    /// Get the LM head weight for Cut Cross-Entropy.
+    pub fn get_lm_head_weight(&self) -> Option<Array> {
+        Some(self.lm_head.weight.value.clone())
+    }
+
     /// Forward pass with optional gradient checkpointing.
     pub fn forward_with_checkpoint(
         &mut self,
@@ -1344,6 +1360,18 @@ impl crate::TrainableModel for PhiLoraForCausalLM {
 
     fn supports_kv_cache(&self) -> bool {
         true
+    }
+
+    fn forward_hidden(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Option<Result<Array, LoraError>> {
+        Some(PhiLoraForCausalLM::forward_hidden_states(self, input_ids, mask))
+    }
+
+    fn lm_head_weight(&self) -> Option<Array> {
+        PhiLoraForCausalLM::get_lm_head_weight(self)
     }
 }
 

@@ -596,6 +596,24 @@ impl MistralLoraForCausalLM {
         }
     }
 
+    /// Forward pass returning hidden states before lm_head, for Cut Cross-Entropy.
+    pub fn forward_hidden_states(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array, LoraError> {
+        self.model.forward(input_ids, mask)
+    }
+
+    /// Get the LM head weight for Cut Cross-Entropy.
+    pub fn get_lm_head_weight(&self) -> Option<Array> {
+        if let Some(ref lm_head) = self.lm_head {
+            Some(lm_head.weight.value.clone())
+        } else {
+            Some(self.model.embed_tokens.weight.value.clone())
+        }
+    }
+
     /// Forward pass with KV cache for efficient inference.
     ///
     /// KV caching provides O(n) complexity per token instead of O(n²),
@@ -1258,6 +1276,27 @@ impl TrainableModel for MistralLoraForCausalLM {
 
     fn supports_gradient_checkpointing(&self) -> bool {
         true
+    }
+
+    fn forward_hidden(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Option<Result<Array, LoraError>> {
+        Some(MistralLoraForCausalLM::forward_hidden_states(self, input_ids, mask))
+    }
+
+    fn forward_hidden_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        position_ids: &Array,
+    ) -> Option<Result<Array, LoraError>> {
+        Some(self.model.forward_with_positions(input_ids, mask, position_ids))
+    }
+
+    fn lm_head_weight(&self) -> Option<Array> {
+        MistralLoraForCausalLM::get_lm_head_weight(self)
     }
 }
 

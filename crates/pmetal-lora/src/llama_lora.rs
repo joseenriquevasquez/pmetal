@@ -16,7 +16,10 @@ use mlx_rs::{
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
-use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    rope::{apply_rope, apply_rope_with_positions},
+};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::llama::LlamaConfig;
 
@@ -191,6 +194,89 @@ impl LlamaLoraAttention {
             .reshape(&[batch, seq_len, -1])?;
 
         // Output projection
+        self.o_proj.forward(&output).map_err(LoraError::from)
+    }
+
+    /// Forward pass with explicit position IDs for packed sequence training.
+    ///
+    /// Identical to `forward` except RoPE is applied with `apply_rope_with_positions`
+    /// so that each token uses its own position index (which resets at packed-sequence
+    /// boundaries). This is required for correct RoPE embeddings during packed training.
+    pub fn forward_with_positions(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        position_ids: &Array,
+    ) -> Result<Array, LoraError> {
+        let shape = x.shape();
+        let batch = shape[0];
+        let seq_len = shape[1];
+
+        let queries = self.q_proj.forward(x)?;
+        let keys = self.k_proj.forward(x)?;
+        let values = self.v_proj.forward(x)?;
+
+        let queries = queries
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let keys = keys
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let values = values
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+
+        // Apply RoPE with explicit position IDs so packed sequences get correct positions.
+        let rope_dims = self.rope.dimensions;
+        let rope_base = self.rope.base;
+        let rope_scale = self.rope.scale;
+        let rope_traditional = self.rope.traditional;
+        let queries = apply_rope_with_positions(
+            &queries,
+            position_ids,
+            rope_dims,
+            rope_traditional,
+            rope_base,
+            rope_scale,
+        )?;
+        let keys = apply_rope_with_positions(
+            &keys,
+            position_ids,
+            rope_dims,
+            rope_traditional,
+            rope_base,
+            rope_scale,
+        )?;
+
+        let keys = if self.n_kv_heads < self.n_heads {
+            let repeats = self.n_heads / self.n_kv_heads;
+            expand_kv_heads(&keys, repeats)?
+        } else {
+            keys
+        };
+        let values = if self.n_kv_heads < self.n_heads {
+            let repeats = self.n_heads / self.n_kv_heads;
+            expand_kv_heads(&values, repeats)?
+        } else {
+            values
+        };
+
+        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2])?)?;
+        let scores = scores.multiply(Array::from_f32(self.scale))?;
+
+        let scores = if let Some(m) = mask {
+            scores.add(m)?
+        } else {
+            scores
+        };
+
+        let weights = mlx_rs::ops::softmax_axis(&scores, -1, None)?;
+        let output = weights.matmul(&values)?;
+
+        let output = output
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[batch, seq_len, -1])?;
+
         self.o_proj.forward(&output).map_err(LoraError::from)
     }
 
@@ -430,6 +516,22 @@ impl LlamaLoraDecoderLayer {
         Ok(h.add(&mlp_out)?)
     }
 
+    /// Forward pass with explicit position IDs for packed sequence training.
+    pub fn forward_with_positions(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        position_ids: &Array,
+    ) -> Result<Array, LoraError> {
+        let normed = mlx_rs::module::Module::forward(&mut self.input_layernorm, x)?;
+        let attn_out = self.self_attn.forward_with_positions(&normed, mask, position_ids)?;
+        let h = x.add(&attn_out)?;
+
+        let normed = mlx_rs::module::Module::forward(&mut self.post_attention_layernorm, &h)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        Ok(h.add(&mlp_out)?)
+    }
+
     /// Get number of trainable parameters.
     pub fn num_trainable_params(&self) -> usize {
         self.self_attn.num_trainable_params() + self.mlp.num_trainable_params()
@@ -626,6 +728,27 @@ impl LlamaLoraModel {
         )?)
     }
 
+    /// Forward pass with explicit position IDs for packed sequence training.
+    ///
+    /// Produces hidden states `[batch, seq_len, hidden_dim]` using position-aware
+    /// RoPE so that token positions reset correctly at packed-sequence boundaries.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        position_ids: &Array,
+    ) -> Result<Array, LoraError> {
+        let mut hidden_states = mlx_rs::module::Module::forward(&mut self.embed_tokens, input_ids)?;
+
+        // The caller provides a pre-built block-diagonal attention mask for packed sequences;
+        // do not auto-generate a causal mask here.
+        for layer in &mut self.layers {
+            hidden_states = layer.forward_with_positions(&hidden_states, mask, position_ids)?;
+        }
+
+        Ok(mlx_rs::module::Module::forward(&mut self.norm, &hidden_states)?)
+    }
+
     /// Get number of trainable parameters.
     pub fn num_trainable_params(&self) -> usize {
         self.layers.iter().map(|l| l.num_trainable_params()).sum()
@@ -720,6 +843,46 @@ impl LlamaLoraForCausalLM {
         } else {
             // Tie weights: use embedding weight transposed
             Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
+        }
+    }
+
+    /// Forward pass returning hidden states before lm_head, for Cut Cross-Entropy.
+    ///
+    /// Returns `[batch, seq_len, hidden_dim]` without applying the lm_head projection,
+    /// allowing the CCE loss to avoid materializing the full logits tensor.
+    pub fn forward_hidden_states(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array, LoraError> {
+        let checkpoint_config = self.checkpoint_config.clone();
+        self.model
+            .forward_with_checkpoint(input_ids, mask, checkpoint_config.as_ref())
+    }
+
+    /// Forward pass returning hidden states with explicit position IDs, for CCE + packed training.
+    ///
+    /// Uses `LlamaLoraModel::forward_with_positions` which applies RoPE with per-token
+    /// position indices so that sequence-boundary resets are respected in packed batches.
+    pub fn forward_hidden_states_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        position_ids: &Array,
+    ) -> Result<Array, LoraError> {
+        self.model
+            .forward_with_positions(input_ids, mask, position_ids)
+    }
+
+    /// Get the LM head weight for Cut Cross-Entropy.
+    ///
+    /// Returns `[vocab_size, hidden_dim]` — either the dedicated lm_head weight
+    /// or the embedding weight for models with tied embeddings.
+    pub fn get_lm_head_weight(&self) -> Option<Array> {
+        if let Some(ref lm_head) = self.lm_head {
+            Some(lm_head.weight.value.clone())
+        } else {
+            Some(self.model.embed_tokens.weight.value.clone())
         }
     }
 
@@ -1563,6 +1726,32 @@ impl crate::TrainableModel for LlamaLoraForCausalLM {
         noise_alpha: f32,
     ) -> Result<Array, LoraError> {
         LlamaLoraForCausalLM::forward_noised(self, input_ids, mask, noise_alpha)
+    }
+
+    fn forward_hidden(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Option<Result<Array, LoraError>> {
+        Some(LlamaLoraForCausalLM::forward_hidden_states(self, input_ids, mask))
+    }
+
+    fn forward_hidden_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        position_ids: &Array,
+    ) -> Option<Result<Array, LoraError>> {
+        Some(LlamaLoraForCausalLM::forward_hidden_states_with_positions(
+            self,
+            input_ids,
+            mask,
+            position_ids,
+        ))
+    }
+
+    fn lm_head_weight(&self) -> Option<Array> {
+        LlamaLoraForCausalLM::get_lm_head_weight(self)
     }
 
     fn forward_with_cache(

@@ -1235,6 +1235,26 @@ impl Qwen3NextLoraForCausalLM {
         }
     }
 
+    /// Forward pass returning hidden states before lm_head, for Cut Cross-Entropy.
+    pub fn forward_hidden_states(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array, LoraError> {
+        let checkpoint_config = self.checkpoint_config.clone();
+        self.model
+            .forward_with_checkpoint(input_ids, mask, checkpoint_config.as_ref())
+    }
+
+    /// Get the LM head weight for Cut Cross-Entropy.
+    pub fn get_lm_head_weight(&self) -> Option<Array> {
+        if let Some(ref lm_head) = self.lm_head {
+            Some(lm_head.weight.value.clone())
+        } else {
+            Some(self.model.embed_tokens.weight.value.clone())
+        }
+    }
+
     pub fn num_trainable_params(&self) -> usize {
         self.model.num_trainable_params()
     }
@@ -2328,6 +2348,18 @@ impl crate::TrainableModel for Qwen3NextLoraForCausalLM {
 
     fn create_cache(&self, max_seq_len: usize) -> Option<KVCache> {
         Some(Qwen3NextLoraForCausalLM::create_cache(self, max_seq_len))
+    }
+
+    fn forward_hidden(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Option<Result<Array, LoraError>> {
+        Some(Qwen3NextLoraForCausalLM::forward_hidden_states(self, input_ids, mask))
+    }
+
+    fn lm_head_weight(&self) -> Option<Array> {
+        Qwen3NextLoraForCausalLM::get_lm_head_weight(self)
     }
 }
 
