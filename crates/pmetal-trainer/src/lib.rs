@@ -95,8 +95,14 @@ pub mod sft;
 pub mod simpo;
 pub mod training_loop;
 
+#[cfg(feature = "distributed")]
+pub mod distributed_bridge;
+
 #[cfg(feature = "ane")]
 pub mod ane_training;
+#[cfg(feature = "distributed")]
+pub use distributed_bridge::{DistributedGradientSync, create_distributed_context};
+
 #[cfg(feature = "ane")]
 pub use ane_training::{AneTrainingLoop, AneTrainingLoopConfig};
 #[cfg(feature = "ane")]

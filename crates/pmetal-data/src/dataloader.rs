@@ -64,6 +64,12 @@ pub struct DataLoaderConfig {
     pub pad_token_id: u32,
     /// Whether to drop the last incomplete batch.
     pub drop_last: bool,
+    /// Distributed data sharding: this node's rank (0-indexed).
+    /// When set with `world_size > 1`, each node processes every
+    /// `world_size`-th sample starting at offset `rank`.
+    pub rank: usize,
+    /// Distributed data sharding: total number of nodes.
+    pub world_size: usize,
 }
 
 impl Default for DataLoaderConfig {
@@ -75,6 +81,8 @@ impl Default for DataLoaderConfig {
             seed: 42,
             pad_token_id: 0,
             drop_last: false,
+            rank: 0,
+            world_size: 1,
         }
     }
 }
@@ -114,8 +122,19 @@ impl DataLoader {
         let mut indices: Vec<usize> = (0..n).collect();
 
         if config.shuffle {
+            // All nodes use the same seed so they produce the same permutation,
+            // then each node takes its own shard.
             let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
             indices.shuffle(&mut rng);
+        }
+
+        // Distributed data sharding: keep every world_size-th index starting at rank
+        if config.world_size > 1 {
+            indices = indices
+                .into_iter()
+                .skip(config.rank)
+                .step_by(config.world_size)
+                .collect();
         }
 
         Self {
@@ -130,11 +149,22 @@ impl DataLoader {
     /// Reset the DataLoader for a new epoch.
     pub fn reset(&mut self, new_seed: Option<u64>) {
         self.position = 0;
+        let n = self.dataset.len();
+        let mut indices: Vec<usize> = (0..n).collect();
         if self.config.shuffle {
             let seed = new_seed.unwrap_or(self.config.seed);
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            self.indices.shuffle(&mut rng);
+            indices.shuffle(&mut rng);
         }
+        // Re-apply distributed sharding
+        if self.config.world_size > 1 {
+            indices = indices
+                .into_iter()
+                .skip(self.config.rank)
+                .step_by(self.config.world_size)
+                .collect();
+        }
+        self.indices = indices;
     }
 
     /// Get the number of batches.
@@ -335,6 +365,8 @@ pub fn create_batch_iterator(
         seed,
         pad_token_id,
         drop_last: false,
+        rank: 0,
+        world_size: 1,
     };
 
     DataLoader::new(dataset, config, None).map(|batch| (batch.input_ids, batch.labels))
@@ -458,6 +490,7 @@ mod tests {
                 seed: 42,
                 pad_token_id: 0,
                 drop_last: false,
+                ..Default::default()
             },
             None,
         );

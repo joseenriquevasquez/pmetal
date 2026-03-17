@@ -339,6 +339,70 @@ pub enum OptimizerType {
     Lion,
 }
 
+/// Compression strategy for distributed gradient synchronization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributedCompression {
+    /// No compression (full f32 gradients).
+    #[default]
+    None,
+    /// Keep top-k% gradients by magnitude (default 1%).
+    TopK,
+    /// Quantize gradients to fp16.
+    Fp16,
+    /// Random sparsification.
+    Random,
+}
+
+/// Configuration for distributed training across multiple Apple Silicon devices.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistributedTrainingConfig {
+    /// Manual peer addresses (ip:port). If empty, uses auto-discovery.
+    #[serde(default)]
+    pub peers: Vec<String>,
+
+    /// Enable mDNS auto-discovery of peers on the local network.
+    #[serde(default)]
+    pub auto_discover: bool,
+
+    /// Port for gradient synchronization (default: 52416).
+    #[serde(default = "default_gradient_port")]
+    pub gradient_port: u16,
+
+    /// Gradient compression strategy.
+    #[serde(default)]
+    pub compression: DistributedCompression,
+
+    /// Top-k ratio when using TopK compression (0.0-1.0, default 0.01 = 1%).
+    #[serde(default = "default_topk_ratio")]
+    pub topk_ratio: f32,
+
+    /// Enable error feedback for lossy compression (accumulates residuals).
+    #[serde(default = "default_true")]
+    pub error_feedback: bool,
+}
+
+impl Default for DistributedTrainingConfig {
+    fn default() -> Self {
+        Self {
+            peers: Vec::new(),
+            auto_discover: false,
+            gradient_port: default_gradient_port(),
+            compression: DistributedCompression::None,
+            topk_ratio: default_topk_ratio(),
+            error_feedback: true,
+        }
+    }
+}
+
+fn default_gradient_port() -> u16 {
+    52416
+}
+
+fn default_topk_ratio() -> f32 {
+    0.01
+}
+
 /// Dataset configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetConfig {

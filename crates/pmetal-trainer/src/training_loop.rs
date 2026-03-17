@@ -365,6 +365,12 @@ pub struct TrainingLoopConfig {
     ///
     /// Recommended value: 16.0.  `None` disables LoRA+ (default).
     pub loraplus_lr_ratio: Option<f32>,
+
+    /// Distributed training configuration.
+    /// When set, gradients are synchronized across multiple nodes after each
+    /// accumulation cycle, enabling data-parallel training over a home cluster.
+    #[cfg(feature = "distributed")]
+    pub distributed: Option<pmetal_core::DistributedTrainingConfig>,
 }
 
 impl Default for TrainingLoopConfig {
@@ -376,15 +382,17 @@ impl Default for TrainingLoopConfig {
             log_every: 10,
             checkpoint_every: 500,
             eval_every: 100,
-            use_jit_compilation: false, // Off by default until fully tested
-            use_sequence_packing: false, // Off by default, enable for variable-length datasets
-            gradient_checkpointing: false, // Off by default, enable for memory-constrained training
-            gradient_checkpointing_layers: 4, // 4 layers per block is a good default
-            embedding_lr: None,         // None = same as base learning rate
-            eager_evaluation: false,    // Off by default for throughput, enable for memory savings
-            use_metal_fused_optimizer: false, // Off by default until fully tested
-            neftune_noise_alpha: None,  // Disabled by default; set to 5.0-15.0 to enable
-            loraplus_lr_ratio: None,    // Disabled by default; set to 16.0 to enable LoRA+
+            use_jit_compilation: false,
+            use_sequence_packing: false,
+            gradient_checkpointing: false,
+            gradient_checkpointing_layers: 4,
+            embedding_lr: None,
+            eager_evaluation: false,
+            use_metal_fused_optimizer: false,
+            neftune_noise_alpha: None,
+            loraplus_lr_ratio: None,
+            #[cfg(feature = "distributed")]
+            distributed: None,
         }
     }
 }
@@ -460,6 +468,10 @@ pub struct TrainingLoop {
     /// In-memory snapshot of the best LoRA weights for rollback.
     /// LoRA params are typically a few MB, so this is cheap to hold in memory.
     pub(crate) best_lora_snapshot: Option<std::collections::HashMap<std::rc::Rc<str>, Array>>,
+    /// Distributed gradient synchronization bridge.
+    /// When present, gradients are all-reduced across nodes after each accumulation cycle.
+    #[cfg(feature = "distributed")]
+    pub(crate) distributed: Option<crate::distributed_bridge::DistributedGradientSync>,
 }
 
 impl TrainingLoop {
@@ -498,6 +510,8 @@ impl TrainingLoop {
             adaptive_lr: None,
             adaptive_lr_override: None,
             best_lora_snapshot: None,
+            #[cfg(feature = "distributed")]
+            distributed: None,
         }
     }
 
@@ -509,6 +523,15 @@ impl TrainingLoop {
     /// Enable adaptive LR control with the given config.
     pub fn enable_adaptive_lr(&mut self, config: crate::adaptive_lr::AdaptiveLrConfig) {
         self.adaptive_lr = Some(crate::adaptive_lr::AdaptiveLrController::new(config));
+    }
+
+    /// Set the distributed gradient sync bridge for multi-node training.
+    #[cfg(feature = "distributed")]
+    pub fn set_distributed(&mut self, sync: crate::distributed_bridge::DistributedGradientSync) {
+        // Also update the DataLoader config for data sharding
+        self.config.dataloader.rank = sync.rank();
+        self.config.dataloader.world_size = sync.world_size();
+        self.distributed = Some(sync);
     }
 
     /// Enable adaptive LR with control file for TUI communication.
@@ -878,6 +901,13 @@ impl TrainingLoop {
                 // Returns lazy norm Array that we only eval when logging
                 let lazy_norm = self.clip_gradients_gpu(&mut accumulated)?;
 
+                // Distributed gradient sync: all-reduce gradients across nodes
+                #[cfg(feature = "distributed")]
+                if let Some(ref mut dist) = self.distributed {
+                    tokio::runtime::Handle::current()
+                        .block_on(async { dist.sync_gradients(&mut accumulated).await })?;
+                }
+
                 // Apply with optimizer (lazy - no eval by default)
                 optimizer.update(model, accumulated)?;
 
@@ -1106,9 +1136,28 @@ impl TrainingLoop {
             ctrl.set_total_steps(computed_total_steps);
         }
 
+        // Distributed training: barrier at start
+        #[cfg(feature = "distributed")]
+        if let Some(ref dist) = self.distributed {
+            tracing::info!(
+                "Distributed training: rank={}/{}, waiting at start barrier...",
+                dist.rank(),
+                dist.world_size()
+            );
+            tokio::runtime::Handle::current().block_on(async { dist.barrier().await })?;
+        }
+
         for epoch in 0..num_epochs {
             self.epoch = epoch;
             tracing::info!("Epoch {}/{}", epoch + 1, num_epochs);
+
+            // Distributed: barrier at epoch boundary
+            #[cfg(feature = "distributed")]
+            if epoch > 0 {
+                if let Some(ref dist) = self.distributed {
+                    tokio::runtime::Handle::current().block_on(async { dist.barrier().await })?;
+                }
+            }
 
             // Create dataloader for this epoch
             let mut dataloader = DataLoader::new(
@@ -1135,7 +1184,18 @@ impl TrainingLoop {
                 optimizer.set_learning_rate(scheduled_lr);
 
                 // Training step
-                let stats = self.train_step(model, &batch, &mut optimizer)?;
+                let mut stats = self.train_step(model, &batch, &mut optimizer)?;
+
+                // Distributed: sync loss across nodes so all agree on LR decisions
+                #[cfg(feature = "distributed")]
+                if let Some(ref dist) = self.distributed {
+                    let synced = tokio::runtime::Handle::current()
+                        .block_on(async { dist.sync_loss(stats.loss).await })?;
+                    stats.loss = synced;
+                    // Note: do NOT update running_loss here — train_step already
+                    // applied EMA. We only override stats.loss so that all nodes
+                    // agree on the value fed to the adaptive LR controller.
+                }
 
                 // Feed loss to adaptive LR controller for next step
                 let action = self.apply_adaptive_lr(stats.loss as f64);
@@ -1151,8 +1211,16 @@ impl TrainingLoop {
                 // Handle early stop
                 if action == AdaptiveAction::EarlyStop {
                     self.restore_best_weights(model);
-                    if let Some(manager) = checkpoint_manager {
-                        self.save_checkpoint(model, manager, true, Some(self.running_loss))?;
+                    // Rank-0 only: save checkpoint
+                    #[cfg(feature = "distributed")]
+                    let should_checkpoint =
+                        self.distributed.as_ref().map_or(true, |d| d.is_master());
+                    #[cfg(not(feature = "distributed"))]
+                    let should_checkpoint = true;
+                    if should_checkpoint {
+                        if let Some(manager) = checkpoint_manager {
+                            self.save_checkpoint(model, manager, true, Some(self.running_loss))?;
+                        }
                     }
                     return Ok(());
                 }
@@ -1235,19 +1303,32 @@ impl TrainingLoop {
                         if metrics.loss < best_eval_loss {
                             best_eval_loss = metrics.loss;
 
-                            // Save best checkpoint
-                            if let Some(manager) = checkpoint_manager {
-                                self.save_checkpoint(model, manager, true, Some(metrics.loss))?;
+                            // Rank-0 only: save best checkpoint
+                            #[cfg(feature = "distributed")]
+                            let should_ckpt =
+                                self.distributed.as_ref().map_or(true, |d| d.is_master());
+                            #[cfg(not(feature = "distributed"))]
+                            let should_ckpt = true;
+                            if should_ckpt {
+                                if let Some(manager) = checkpoint_manager {
+                                    self.save_checkpoint(model, manager, true, Some(metrics.loss))?;
+                                }
                             }
                         }
                     }
                 }
 
-                // Regular checkpointing
+                // Regular checkpointing (rank-0 only in distributed mode)
                 if self.config.checkpoint_every > 0 && self.step % self.config.checkpoint_every == 0
                 {
-                    if let Some(manager) = checkpoint_manager {
-                        self.save_checkpoint(model, manager, false, None)?;
+                    #[cfg(feature = "distributed")]
+                    let should_ckpt = self.distributed.as_ref().map_or(true, |d| d.is_master());
+                    #[cfg(not(feature = "distributed"))]
+                    let should_ckpt = true;
+                    if should_ckpt {
+                        if let Some(manager) = checkpoint_manager {
+                            self.save_checkpoint(model, manager, false, None)?;
+                        }
                     }
                 }
 
@@ -1353,9 +1434,28 @@ impl TrainingLoop {
             ctrl.set_total_steps(computed_total_steps);
         }
 
+        // Distributed training: barrier at start of metal fused training
+        #[cfg(feature = "distributed")]
+        if let Some(ref dist) = self.distributed {
+            tracing::info!(
+                "Distributed metal-fused training: rank={}/{}, waiting at start barrier...",
+                dist.rank(),
+                dist.world_size()
+            );
+            tokio::runtime::Handle::current().block_on(async { dist.barrier().await })?;
+        }
+
         for epoch in 0..num_epochs {
             self.epoch = epoch;
             tracing::info!("Epoch {}/{}", epoch + 1, num_epochs);
+
+            // Distributed: barrier at epoch boundary
+            #[cfg(feature = "distributed")]
+            if epoch > 0 {
+                if let Some(ref dist) = self.distributed {
+                    tokio::runtime::Handle::current().block_on(async { dist.barrier().await })?;
+                }
+            }
 
             // Create dataloader for this epoch
             let mut dataloader =
@@ -1379,7 +1479,15 @@ impl TrainingLoop {
                 metal_optimizer.set_learning_rate(self.get_scheduled_lr());
 
                 // Training step with Metal optimizer
-                let stats = self.train_step_metal(model, &batch, &mut metal_optimizer)?;
+                let mut stats = self.train_step_metal(model, &batch, &mut metal_optimizer)?;
+
+                // Distributed: sync loss across nodes so all agree on LR decisions
+                #[cfg(feature = "distributed")]
+                if let Some(ref dist) = self.distributed {
+                    let synced = tokio::runtime::Handle::current()
+                        .block_on(async { dist.sync_loss(stats.loss).await })?;
+                    stats.loss = synced;
+                }
 
                 // Feed loss to adaptive LR controller for next step
                 let action = self.apply_adaptive_lr(stats.loss as f64);
@@ -1392,8 +1500,14 @@ impl TrainingLoop {
                 }
                 if action == AdaptiveAction::EarlyStop {
                     self.restore_best_weights(model);
-                    if let Some(manager) = checkpoint_manager {
-                        self.save_checkpoint(model, manager, true, Some(self.running_loss))?;
+                    #[cfg(feature = "distributed")]
+                    let should_ckpt = self.distributed.as_ref().map_or(true, |d| d.is_master());
+                    #[cfg(not(feature = "distributed"))]
+                    let should_ckpt = true;
+                    if should_ckpt {
+                        if let Some(manager) = checkpoint_manager {
+                            self.save_checkpoint(model, manager, true, Some(self.running_loss))?;
+                        }
                     }
                     return Ok(());
                 }
@@ -1466,18 +1580,31 @@ impl TrainingLoop {
 
                         if metrics.loss < best_eval_loss {
                             best_eval_loss = metrics.loss;
-                            if let Some(manager) = checkpoint_manager {
-                                self.save_checkpoint(model, manager, true, Some(metrics.loss))?;
+                            #[cfg(feature = "distributed")]
+                            let should_ckpt =
+                                self.distributed.as_ref().map_or(true, |d| d.is_master());
+                            #[cfg(not(feature = "distributed"))]
+                            let should_ckpt = true;
+                            if should_ckpt {
+                                if let Some(manager) = checkpoint_manager {
+                                    self.save_checkpoint(model, manager, true, Some(metrics.loss))?;
+                                }
                             }
                         }
                     }
                 }
 
-                // Regular checkpointing
+                // Regular checkpointing (rank-0 only in distributed mode)
                 if self.config.checkpoint_every > 0 && self.step % self.config.checkpoint_every == 0
                 {
-                    if let Some(manager) = checkpoint_manager {
-                        self.save_checkpoint(model, manager, false, None)?;
+                    #[cfg(feature = "distributed")]
+                    let should_ckpt = self.distributed.as_ref().map_or(true, |d| d.is_master());
+                    #[cfg(not(feature = "distributed"))]
+                    let should_ckpt = true;
+                    if should_ckpt {
+                        if let Some(manager) = checkpoint_manager {
+                            self.save_checkpoint(model, manager, false, None)?;
+                        }
                     }
                 }
 
@@ -1539,6 +1666,13 @@ impl TrainingLoop {
             if let Some(mut accumulated) = self.take_accumulated_gradients() {
                 // Clip gradients (lazy computation)
                 let lazy_norm = self.clip_gradients_gpu(&mut accumulated)?;
+
+                // Distributed gradient sync: all-reduce gradients across nodes
+                #[cfg(feature = "distributed")]
+                if let Some(ref mut dist) = self.distributed {
+                    tokio::runtime::Handle::current()
+                        .block_on(async { dist.sync_gradients(&mut accumulated).await })?;
+                }
 
                 // Update learning rate in Metal optimizer
                 metal_optimizer.set_learning_rate(self.get_learning_rate());
