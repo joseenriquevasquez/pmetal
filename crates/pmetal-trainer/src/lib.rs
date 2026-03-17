@@ -66,6 +66,9 @@
 pub mod adam8bit;
 pub mod adamw_groups;
 pub mod adaptive_lr;
+pub mod ane_reward;
+pub mod contrastive_loss;
+pub mod embedding_trainer;
 pub mod callbacks;
 pub mod checkpoint;
 pub mod checkpointing;
@@ -89,6 +92,8 @@ pub mod param_groups;
 pub mod ppo;
 mod preference_batch;
 pub mod reasoning_template;
+pub mod reward_model;
+pub mod rlkd;
 pub mod schedule_free;
 pub mod scheduler;
 pub mod sft;
@@ -113,6 +118,7 @@ pub use pmetal_metal::ane::dynamic_trainer::{
 pub use adam8bit::*;
 pub use adamw_groups::*;
 pub use adaptive_lr::{AdaptiveLrConfig, AdaptiveLrController, LrControlCommand, LrEvent};
+pub use ane_reward::{AsyncRewardModel, PendingRewards, PipelinedGrpoSession};
 pub use callbacks::*;
 pub use checkpoint::*;
 pub use checkpointing::*;
@@ -140,6 +146,7 @@ pub use online_dpo::{
 pub use orpo::*;
 pub use param_groups::*;
 pub use ppo::*;
+pub use rlkd::{RlkdConfig, RlkdStepStats, RlkdTrainer};
 pub use schedule_free::{
     ScheduleFreeConfig, ScheduleFreeError, ScheduleFreeOptimizer, ScheduleFreeResult,
 };
@@ -147,3 +154,7 @@ pub use scheduler::*;
 pub use sft::*;
 pub use simpo::*;
 pub use training_loop::*;
+pub use embedding_trainer::{
+    EmbeddingLossType, EmbeddingResult, EmbeddingTrainer, EmbeddingTrainerConfig,
+    EmbeddingTrainerError,
+};

@@ -34,6 +34,7 @@ tracing = { workspace = true }
 indicatif = { workspace = true }
 tokio = { workspace = true, optional = true }
 chrono = "0.4"
+image = "0.25"
 
 # Optional: TensorBoard logging
 tensorboard-rs = { version = "0.5", optional = true }
