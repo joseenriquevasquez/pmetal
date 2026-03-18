@@ -60,6 +60,21 @@ pub enum TrainingStatus {
     Cancelled,
 }
 
+/// A condensed snapshot of the hyperparameters used for a training run, embedded in
+/// `TrainingRun` so the frontend can display them without re-fetching the full config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingConfigSummary {
+    pub learning_rate: f64,
+    pub batch_size: usize,
+    pub max_seq_len: usize,
+    pub lora_rank: Option<usize>,
+    pub lora_alpha: Option<f32>,
+    pub sequence_packing: bool,
+    pub flash_attention: bool,
+    pub jit_compilation: bool,
+    pub gradient_checkpointing: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainingRun {
     pub id: String,
@@ -81,7 +96,13 @@ pub struct TrainingRun {
     pub ended_at: Option<DateTime<Utc>>,
     pub output_dir: Option<String>,
     pub error_message: Option<String>,
+    #[serde(skip_serializing)]
     pub log_lines: Vec<String>,
+    /// Human-readable description of the current setup phase (e.g. "Resolving dataset…").
+    /// Cleared (set to `None`) once training steps start arriving.
+    pub status_message: Option<String>,
+    /// Snapshot of the training hyperparameters for display in the UI.
+    pub config_summary: Option<TrainingConfigSummary>,
 }
 
 impl TrainingRun {
@@ -113,6 +134,8 @@ impl TrainingRun {
             output_dir: output_dir.map(str::to_string),
             error_message: None,
             log_lines: Vec::new(),
+            status_message: None,
+            config_summary: None,
         }
     }
 }
@@ -163,6 +186,7 @@ pub struct DistillationRun {
     pub ended_at: Option<DateTime<Utc>>,
     pub output_dir: Option<String>,
     pub error_message: Option<String>,
+    #[serde(skip_serializing)]
     pub log_lines: Vec<String>,
 }
 
@@ -239,6 +263,7 @@ pub struct GrpoRun {
     pub ended_at: Option<DateTime<Utc>>,
     pub output_dir: Option<String>,
     pub error_message: Option<String>,
+    #[serde(skip_serializing)]
     pub log_lines: Vec<String>,
 }
 

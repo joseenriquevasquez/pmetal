@@ -3,6 +3,8 @@
   import { configStore, modelsStore, deviceStore } from '$lib/stores.svelte';
   import { getSystemInfo } from '$lib/api';
   import type { SystemInfo, AppConfig } from '$lib/api';
+  import { check, type Update } from '@tauri-apps/plugin-updater';
+  import { relaunch } from '@tauri-apps/plugin-process';
 
   let config = $derived(configStore.config);
   let models = $derived(modelsStore.models);
@@ -24,6 +26,13 @@
   let saveSuccess = $state(false);
   let isSaving = $state(false);
   let showToken = $state(false);
+
+  // Update state
+  let updateAvailable = $state<Update | null>(null);
+  let checkingUpdate = $state(false);
+  let installingUpdate = $state(false);
+  let updateError = $state<string | null>(null);
+  let updateUpToDate = $state(false);
 
   // Sync local state with store when config loads
   $effect(() => {
@@ -82,6 +91,38 @@
     }
     saveError = null;
     saveSuccess = false;
+  }
+
+  async function checkForUpdate() {
+    checkingUpdate = true;
+    updateError = null;
+    updateUpToDate = false;
+    try {
+      const result = await check();
+      if (result) {
+        updateAvailable = result;
+      } else {
+        updateUpToDate = true;
+        setTimeout(() => { updateUpToDate = false; }, 5000);
+      }
+    } catch (e) {
+      updateError = e instanceof Error ? e.message : String(e);
+    } finally {
+      checkingUpdate = false;
+    }
+  }
+
+  async function installUpdate() {
+    if (!updateAvailable) return;
+    installingUpdate = true;
+    updateError = null;
+    try {
+      await updateAvailable.downloadAndInstall();
+      await relaunch();
+    } catch (e) {
+      updateError = e instanceof Error ? e.message : String(e);
+      installingUpdate = false;
+    }
   }
 
   const themes = [
@@ -229,6 +270,61 @@
       </button>
     </div>
   </form>
+
+  <!-- Updates -->
+  <div class="card">
+    <div class="card-header">
+      <h2 class="font-semibold text-surface-900 dark:text-surface-100">Updates</h2>
+    </div>
+    <div class="card-body space-y-3">
+      {#if updateAvailable}
+        <div class="p-3 rounded-lg bg-primary-50 dark:bg-primary-900/20 border border-primary-200 dark:border-primary-800">
+          <p class="text-sm font-medium text-primary-700 dark:text-primary-300">
+            Version {updateAvailable.version} is available
+          </p>
+          {#if updateAvailable.body}
+            <p class="text-xs text-primary-600 dark:text-primary-400 mt-1">{updateAvailable.body}</p>
+          {/if}
+          <button
+            class="btn-primary btn-sm mt-2"
+            onclick={installUpdate}
+            disabled={installingUpdate}
+          >
+            {#if installingUpdate}
+              <div class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+              Installing...
+            {:else}
+              Download & Install
+            {/if}
+          </button>
+        </div>
+      {:else}
+        <div class="flex items-center gap-3">
+          <button
+            class="btn-secondary btn-sm"
+            onclick={checkForUpdate}
+            disabled={checkingUpdate}
+          >
+            {#if checkingUpdate}
+              <div class="w-4 h-4 border-2 border-surface-400 border-t-transparent rounded-full animate-spin"></div>
+              Checking...
+            {:else}
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+              Check for Updates
+            {/if}
+          </button>
+          {#if updateUpToDate}
+            <span class="text-sm text-green-600 dark:text-green-400">You're up to date!</span>
+          {/if}
+        </div>
+      {/if}
+      {#if updateError}
+        <p class="text-xs text-red-600 dark:text-red-400">{updateError}</p>
+      {/if}
+    </div>
+  </div>
 
   <!-- About -->
   <div class="card">

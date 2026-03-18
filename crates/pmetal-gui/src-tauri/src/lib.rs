@@ -3,7 +3,7 @@ mod state;
 
 use commands::*;
 use state::AppState;
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -20,6 +20,14 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
         .setup(|app| {
+            #[cfg(desktop)]
+            {
+                app.handle()
+                    .plugin(tauri_plugin_updater::Builder::new().build())?;
+                app.handle()
+                    .plugin(tauri_plugin_process::init())?;
+            }
+
             let state = app.state::<AppState>();
 
             // Start the broadcast -> Tauri event forwarder
@@ -83,6 +91,13 @@ pub fn run() {
             fuse_lora,
             quantize_model,
         ])
+        .on_window_event(|_window, event| {
+            // Force-exit when the main window closes to avoid C++ mutex crashes
+            // from MLX Arrays being dropped on the wrong thread during Tauri cleanup.
+            if let WindowEvent::Destroyed = event {
+                std::process::exit(0);
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running pmetal-gui");
 }

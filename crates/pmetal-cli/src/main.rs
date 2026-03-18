@@ -1815,15 +1815,35 @@ fn main() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn tokio_main() -> anyhow::Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    // Initialize logging — suppress stderr output when running the TUI
+    // to avoid corrupting the raw terminal display.
+    let is_tui = matches!(cli.command, Commands::Tui { .. });
+    if is_tui {
+        // In TUI mode, only log to file (if PMETAL_LOG_FILE is set) or discard.
+        if let Ok(log_path) = std::env::var("PMETAL_LOG_FILE") {
+            if let Ok(file) = std::fs::File::create(&log_path) {
+                tracing_subscriber::fmt()
+                    .with_writer(std::sync::Mutex::new(file))
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::from_default_env()
+                            .add_directive(tracing::Level::INFO.into()),
+                    )
+                    .with_ansi(false)
+                    .init();
+            }
+            // If File::create fails, fall through silently — tracing is a no-op.
+        }
+        // Otherwise: no subscriber installed, tracing calls are no-ops.
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::INFO.into()),
+            )
+            .init();
+    }
 
     match cli.command {
         Commands::Train {
@@ -4946,7 +4966,10 @@ async fn run_training(
 
     // Resolve dataset source — local path or HuggingFace dataset ID
     let dataset_path_resolved = match resolve_dataset_source(&config.dataset.dataset_id) {
-        DatasetSource::Local(p) => p,
+        DatasetSource::Local(p) => {
+            // Resolve directories to a data file within (handles HF cache structure)
+            TrainingDataset::resolve_dataset_path_pub(&p)?
+        }
         DatasetSource::HuggingFace(id) => {
             tracing::info!("Downloading dataset from HuggingFace: {}", id);
             // Download the dataset repo (contains JSONL/Parquet files)

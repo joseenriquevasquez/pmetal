@@ -44,6 +44,9 @@ pub struct DashboardTab {
     pub throughput_data: Vec<u64>,
     last_read_pos: u64,
     pub paused: bool,
+    /// Current job phase (e.g. "Loading model...", "Tokenizing dataset...").
+    /// Shown in the stats panel when no metrics have arrived yet.
+    pub job_phase: Option<String>,
 }
 
 impl DashboardTab {
@@ -56,6 +59,7 @@ impl DashboardTab {
             throughput_data: Vec::new(),
             last_read_pos: 0,
             paused: false,
+            job_phase: None,
         }
     }
 
@@ -64,6 +68,10 @@ impl DashboardTab {
         // Guard against NaN/Inf corrupting chart bounds
         if !sample.loss.is_finite() || !sample.lr.is_finite() {
             return;
+        }
+        // Clear setup phase once real metrics arrive
+        if sample.step > 0 || sample.loss > 0.0 {
+            self.job_phase = None;
         }
         let step = sample.step as f64;
         self.loss_data.push((step, sample.loss));
@@ -143,6 +151,7 @@ impl DashboardTab {
         self.lr_data.clear();
         self.throughput_data.clear();
         self.last_read_pos = 0;
+        self.job_phase = None;
     }
 
     /// Set (or change) the metrics file path. Always resets state so a new
@@ -189,24 +198,40 @@ impl DashboardTab {
             .border_style(THEME.block);
 
         if self.loss_data.is_empty() {
-            Paragraph::new(vec![
-                ratatui::text::Line::from(""),
-                ratatui::text::Line::from(Span::styled(
-                    "  No active training run.",
-                    THEME.text_muted,
-                )),
-                ratatui::text::Line::from(""),
-                ratatui::text::Line::from(Span::styled(
-                    "  Start a run from the Training, Distill, or GRPO tab.",
-                    THEME.text_dim,
-                )),
-                ratatui::text::Line::from(Span::styled(
-                    "  Loss curve and metrics will appear here automatically.",
-                    THEME.text_dim,
-                )),
-            ])
-            .block(block)
-            .render(area, buf);
+            let lines = if let Some(ref phase) = self.job_phase {
+                vec![
+                    ratatui::text::Line::from(""),
+                    ratatui::text::Line::from(Span::styled(
+                        format!("  {phase}"),
+                        THEME.text_warning,
+                    )),
+                    ratatui::text::Line::from(""),
+                    ratatui::text::Line::from(Span::styled(
+                        "  Loss curve will appear once training begins.",
+                        THEME.text_dim,
+                    )),
+                ]
+            } else {
+                vec![
+                    ratatui::text::Line::from(""),
+                    ratatui::text::Line::from(Span::styled(
+                        "  No active training run.",
+                        THEME.text_muted,
+                    )),
+                    ratatui::text::Line::from(""),
+                    ratatui::text::Line::from(Span::styled(
+                        "  Start a run from the Training, Distill, or GRPO tab.",
+                        THEME.text_dim,
+                    )),
+                    ratatui::text::Line::from(Span::styled(
+                        "  Loss curve and metrics will appear here automatically.",
+                        THEME.text_dim,
+                    )),
+                ]
+            };
+            Paragraph::new(lines)
+                .block(block)
+                .render(area, buf);
             return;
         }
 
@@ -366,6 +391,16 @@ impl DashboardTab {
                         ),
                     ]))
                 },
+            ]
+        } else if let Some(ref phase) = self.job_phase {
+            vec![
+                ListItem::new(Line::from(vec![
+                    Span::styled(phase.as_str(), THEME.text_warning),
+                ])),
+                ListItem::new(""),
+                ListItem::new(Line::from(vec![
+                    Span::styled("Waiting for first metrics...", THEME.text_muted),
+                ])),
             ]
         } else {
             vec![ListItem::new(Span::styled("No data yet", THEME.text_muted))]

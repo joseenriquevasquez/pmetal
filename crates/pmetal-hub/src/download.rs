@@ -292,7 +292,7 @@ pub async fn download_dataset(
         .map_err(|e| pmetal_core::PMetalError::Hub(format!("Failed to list repo files: {e}")))?;
 
     let mut downloaded_paths = Vec::new();
-    let mut failures = Vec::new();
+    let mut data_failures = Vec::new();
 
     for sibling in &repo_info.siblings {
         let filename = sibling.rfilename.as_str();
@@ -300,31 +300,56 @@ pub async fn download_dataset(
             continue;
         }
 
-        let include = filename == "README.md"
-            || DATASET_EXTENSIONS.iter().any(|ext| filename.ends_with(ext))
+        let is_data_file = DATASET_EXTENSIONS.iter().any(|ext| filename.ends_with(ext))
             || split.is_some_and(|s| filename.contains(s));
-        if !include {
+        let is_readme = filename == "README.md";
+
+        if !is_data_file && !is_readme {
             continue;
         }
 
         match repo.get(filename).await {
             Ok(path) => downloaded_paths.push(path),
-            Err(err) => failures.push(format!("{filename}: {err}")),
+            Err(err) => {
+                if is_data_file {
+                    data_failures.push(format!("{filename}: {err}"));
+                } else {
+                    // Non-fatal: README.md may be gated or absent on some repos.
+                    tracing::warn!("Could not download {filename} for {dataset_id}: {err}");
+                }
+            }
         }
     }
 
-    if downloaded_paths.is_empty() {
+    // Count only successfully-downloaded data files (not README.md).
+    let data_files_downloaded = downloaded_paths
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n != "README.md")
+        })
+        .count();
+
+    if data_files_downloaded == 0 {
+        if !data_failures.is_empty() {
+            return Err(pmetal_core::PMetalError::Hub(format!(
+                "Dataset download incomplete for {}: {}",
+                dataset_id,
+                data_failures.into_iter().take(10).collect::<Vec<_>>().join(", ")
+            )));
+        }
         return Err(pmetal_core::PMetalError::Hub(format!(
             "No dataset files downloaded for {}",
             dataset_id
         )));
     }
 
-    if !failures.is_empty() {
+    if !data_failures.is_empty() {
         return Err(pmetal_core::PMetalError::Hub(format!(
             "Dataset download incomplete for {}: {}",
             dataset_id,
-            failures.into_iter().take(10).collect::<Vec<_>>().join(", ")
+            data_failures.into_iter().take(10).collect::<Vec<_>>().join(", ")
         )));
     }
 

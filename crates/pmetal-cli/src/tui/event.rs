@@ -49,6 +49,8 @@ pub enum AppMsg {
         adam_ms: f64,
         total_ms: f64,
     },
+    /// Status phase update from a running job (e.g. "Loading model...", "Tokenizing...").
+    JobPhase { job_id: String, phase: String },
     /// A line of stdout/stderr from a running job.
     JobOutput { job_id: String, line: String },
     /// A background job has finished.

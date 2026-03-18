@@ -250,57 +250,131 @@ impl TrainingDataset {
             return Ok(path.to_path_buf());
         }
 
-        // Try well-known names in priority order
-        const WELL_KNOWN: &[&str] = &["train.jsonl", "data.jsonl", "dataset.jsonl"];
-        for name in WELL_KNOWN {
-            let candidate = path.join(name);
-            if candidate.exists() {
-                tracing::info!("Auto-discovered dataset file: {}", candidate.display());
-                return Ok(candidate);
+        // HF cache structure: datasets--org--name/snapshots/{hash}/ — traverse into it
+        let search_dirs = Self::collect_search_dirs(path);
+
+        // Data file extensions in priority order
+        const EXTS: &[&str] = &[".jsonl", ".json", ".parquet", ".csv", ".arrow"];
+
+        // Try well-known stems first across all search dirs
+        const WELL_KNOWN_STEMS: &[&str] = &["train", "data", "dataset"];
+        for dir in &search_dirs {
+            for stem in WELL_KNOWN_STEMS {
+                for ext in EXTS {
+                    let candidate = dir.join(format!("{stem}{ext}"));
+                    if candidate.exists() {
+                        tracing::info!("Auto-discovered dataset file: {}", candidate.display());
+                        return Ok(candidate);
+                    }
+                }
             }
         }
 
-        // List any other .jsonl files as suggestions
-        let jsonl_files: Vec<String> = std::fs::read_dir(path)
-            .map_err(|e| {
-                pmetal_core::PMetalError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to read directory '{}': {}", path.display(), e),
-                ))
-            })?
+        // Fallback: find any data file across all search dirs
+        for dir in &search_dirs {
+            if let Ok(mut found) = Self::find_data_files(dir) {
+                // Prefer jsonl > json > parquet > csv
+                found.sort_by_key(|p| {
+                    let s = p.to_string_lossy();
+                    if s.ends_with(".jsonl") { 0 }
+                    else if s.ends_with(".json") { 1 }
+                    else if s.ends_with(".parquet") { 2 }
+                    else if s.ends_with(".csv") { 3 }
+                    else { 4 }
+                });
+                if let Some(best) = found.into_iter().next() {
+                    tracing::info!("Auto-discovered dataset file: {}", best.display());
+                    return Ok(best);
+                }
+            }
+        }
+
+        Err(pmetal_core::PMetalError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "'{}' is a directory with no recognized data files (.jsonl, .json, .parquet, .csv). \
+                 Pass a file path directly instead.",
+                path.display(),
+            ),
+        )))
+    }
+
+    /// Collect directories to search for data files.
+    /// Handles HF cache layout: `snapshots/{hash}/` and `data/`.
+    fn collect_search_dirs(root: &Path) -> Vec<PathBuf> {
+        let mut dirs = vec![root.to_path_buf()];
+
+        // HF cache: snapshots/{hash}/ — use the most recent snapshot
+        let snapshots = root.join("snapshots");
+        if snapshots.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(&snapshots) {
+                let mut snap_dirs: Vec<PathBuf> = rd
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.path())
+                    .collect();
+                // Sort by modification time descending (most recent first)
+                snap_dirs.sort_by(|a, b| {
+                    let t_a = a.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    let t_b = b.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    t_b.cmp(&t_a)
+                });
+                dirs.extend(snap_dirs);
+            }
+        }
+
+        // Common subdirectories
+        for sub in &["data", "train"] {
+            let d = root.join(sub);
+            if d.is_dir() {
+                dirs.push(d);
+            }
+        }
+
+        dirs
+    }
+
+    /// Find all data files in a directory (non-recursive, single level).
+    fn find_data_files(dir: &Path) -> Result<Vec<PathBuf>> {
+        let rd = std::fs::read_dir(dir).map_err(|e| {
+            pmetal_core::PMetalError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to read directory '{}': {}", dir.display(), e),
+            ))
+        })?;
+        Ok(rd
             .filter_map(|entry| {
                 let entry = entry.ok()?;
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".jsonl") {
-                    Some(name)
-                } else {
-                    None
+                let p = entry.path();
+                if p.is_file() {
+                    let name = p.file_name()?.to_string_lossy().to_lowercase();
+                    if name.ends_with(".jsonl")
+                        || name.ends_with(".json")
+                        || name.ends_with(".parquet")
+                        || name.ends_with(".csv")
+                        || name.ends_with(".arrow")
+                    {
+                        return Some(p);
+                    }
                 }
+                // Follow symlinks (HF cache uses them)
+                if entry.file_type().ok()?.is_symlink() {
+                    let real = std::fs::metadata(&p).ok()?;
+                    if real.is_file() {
+                        let name = p.file_name()?.to_string_lossy().to_lowercase();
+                        if name.ends_with(".jsonl")
+                            || name.ends_with(".json")
+                            || name.ends_with(".parquet")
+                            || name.ends_with(".csv")
+                            || name.ends_with(".arrow")
+                        {
+                            return Some(p);
+                        }
+                    }
+                }
+                None
             })
-            .collect();
-
-        if !jsonl_files.is_empty() {
-            Err(pmetal_core::PMetalError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "'{}' is a directory. No standard dataset file found (tried: {}). \
-                     Did you mean one of these? {}",
-                    path.display(),
-                    WELL_KNOWN.join(", "),
-                    jsonl_files.join(", ")
-                ),
-            )))
-        } else {
-            Err(pmetal_core::PMetalError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "'{}' is a directory with no .jsonl files. \
-                     Pass a file path instead, e.g.: {}/train.jsonl",
-                    path.display(),
-                    path.display()
-                ),
-            )))
-        }
+            .collect())
     }
 
     /// Public wrapper for resolve_dataset_path, used by CLI for HF dataset resolution.

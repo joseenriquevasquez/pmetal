@@ -3,6 +3,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { page } from '$app/stores';
   import { initializeStores, cleanupStores, configStore } from '$lib/stores.svelte';
+  import UpdateChecker from '$lib/components/UpdateChecker.svelte';
 
   let { children } = $props();
 
@@ -233,4 +234,6 @@
       {/if}
     </div>
   </main>
+
+  <UpdateChecker />
 </div>

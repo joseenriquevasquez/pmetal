@@ -88,6 +88,20 @@ export interface TrainingRun {
   ended_at: string | null;
   output_dir: string | null;
   error_message: string | null;
+  status_message: string | null;
+  config_summary: TrainingConfigSummary | null;
+}
+
+export interface TrainingConfigSummary {
+  learning_rate: number;
+  batch_size: number;
+  max_seq_len: number;
+  lora_rank: number | null;
+  lora_alpha: number | null;
+  sequence_packing: boolean;
+  flash_attention: boolean;
+  jit_compilation: boolean;
+  gradient_checkpointing: boolean;
 }
 
 export interface TrainingConfig {

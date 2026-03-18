@@ -2,9 +2,11 @@
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { modelsStore, trainingStore } from '$lib/stores.svelte';
-  import type { TrainingConfig, TrainingRun } from '$lib/api';
-  import { fuseLora } from '$lib/api';
+  import type { TrainingConfig, TrainingRun, CachedDatasetInfo } from '$lib/api';
+  import { fuseLora, listCachedDatasets } from '$lib/api';
   import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
+
+  let cachedDatasets = $state<CachedDatasetInfo[]>([]);
 
   // Training methods
   const trainingMethods = [
@@ -73,10 +75,59 @@
   // PMetal always uses LoRA; show config for all methods except bare SFT
   let isLoraMethod = $derived(selectedMethod !== 'sft');
 
-  onMount(() => {
+  // ── Live training metrics history (for charts) ──
+  interface MetricPoint { step: number; loss: number; lr: number; tokSec: number; }
+  let liveHistory = $state<MetricPoint[]>([]);
+  let liveRunId = $state<string | null>(null);
+
+  // Track the active run's metrics over time
+  $effect(() => {
+    if (activeRuns.length === 0) return;
+    const run = activeRuns[0];
+    // Reset history when a new run starts
+    if (run.id !== liveRunId) {
+      liveHistory = [];
+      liveRunId = run.id;
+    }
+    if (run.step > 0 && run.loss !== null) {
+      const last = liveHistory[liveHistory.length - 1];
+      if (!last || last.step !== run.step) {
+        liveHistory = [...liveHistory, {
+          step: run.step,
+          loss: run.loss,
+          lr: run.learning_rate ?? 0,
+          tokSec: run.tokens_per_second ?? 0,
+        }];
+      }
+    }
+  });
+
+  // SVG chart helpers
+  function lossSvgPath(points: MetricPoint[], width: number, height: number): string {
+    if (points.length < 2) return '';
+    const losses = points.map(p => p.loss);
+    const minL = Math.min(...losses);
+    const maxL = Math.max(...losses);
+    const range = maxL - minL || 0.001;
+    const pad = 4;
+    return points.map((p, i) => {
+      const x = pad + (i / (points.length - 1)) * (width - 2 * pad);
+      const y = pad + (1 - (p.loss - minL) / range) * (height - 2 * pad);
+      return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+  }
+
+  onMount(async () => {
     // Deep-link: pre-select model from query param
     const modelParam = $page.url.searchParams.get('model');
     if (modelParam) selectedModel = modelParam;
+
+    // Load cached datasets for the dropdown
+    try {
+      cachedDatasets = await listCachedDatasets();
+    } catch (e) {
+      console.error('Failed to load cached datasets:', e);
+    }
   });
 
   // Close fuse modal on Escape
@@ -171,38 +222,203 @@
     </div>
   </div>
 
-  <!-- Active training banner -->
+  <!-- Failed runs alert -->
+  {#each trainingStore.runs.filter(r => r.status === 'failed') as run}
+    <div class="p-3 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800">
+      <div class="flex items-center justify-between">
+        <div>
+          <span class="font-semibold text-red-800 dark:text-red-200 text-sm">{run.model.split('/').pop()}</span>
+          <span class="ml-2 text-xs text-red-600 dark:text-red-400">Failed</span>
+        </div>
+      </div>
+      {#if run.error_message}
+        <p class="mt-1 text-xs text-red-700 dark:text-red-300 font-mono break-all">{run.error_message}</p>
+      {/if}
+    </div>
+  {/each}
+
+  <!-- ════════════════════════════════════════════════════════════════
+       LIVE TRAINING DASHBOARD — replaces config form when training
+       ════════════════════════════════════════════════════════════════ -->
   {#if activeRuns.length > 0}
-    <div class="space-y-3">
-      {#each activeRuns as run}
-        <div class="p-4 rounded-xl bg-primary-50 dark:bg-primary-900/20 border border-primary-200 dark:border-primary-800">
-          <div class="flex items-center justify-between mb-2">
+    {@const run = activeRuns[0]}
+    <div class="space-y-4">
+      <!-- Header bar: model name, status, progress, stop button -->
+      <div class="card">
+        <div class="card-body">
+          <div class="flex items-center justify-between mb-3">
             <div>
-              <span class="font-semibold text-primary-900 dark:text-primary-100 text-sm">{run.model.split('/').pop()}</span>
-              <span class="ml-2 text-xs text-primary-700 dark:text-primary-300">{run.method.toUpperCase()} · Epoch {run.epoch}/{run.total_epochs} · Step {run.step}/{run.total_steps}</span>
+              <span class="font-bold text-lg text-surface-900 dark:text-surface-100">{run.model.split('/').pop()}</span>
+              <span class="ml-2 text-sm text-surface-500">{run.method.toUpperCase()}</span>
+              {#if run.dataset}
+                <span class="ml-2 text-xs text-surface-400">on {run.dataset.split('/').pop()}</span>
+              {/if}
             </div>
             <div class="flex items-center gap-3">
-              {#if run.loss !== null}
-                <span class="text-xs font-mono text-primary-800 dark:text-primary-200">Loss: {run.loss.toFixed(4)}</span>
+              {#if run.status_message && run.step === 0}
+                <span class="text-sm text-amber-600 dark:text-amber-400 animate-pulse">{run.status_message}</span>
+              {:else}
+                <span class="text-sm font-mono text-surface-600 dark:text-surface-300">
+                  Epoch {Math.floor(run.epoch)}/{run.total_epochs} · Step {run.step}/{run.total_steps}
+                </span>
               {/if}
-              {#if run.tokens_per_second !== null}
-                <span class="text-xs font-mono text-primary-800 dark:text-primary-200">{run.tokens_per_second.toFixed(0)} tok/s</span>
-              {/if}
-              <span class="text-xs text-primary-700 dark:text-primary-300">ETA {formatEta(run.eta_seconds)}</span>
-              <button
-                class="btn-danger btn-sm"
-                onclick={() => trainingStore.stop(run.id)}
-                aria-label="Stop training run"
-              >Stop</button>
+              <span class="text-sm text-surface-500">ETA {formatEta(run.eta_seconds)}</span>
+              <button class="btn-danger btn-sm" onclick={() => trainingStore.stop(run.id)}>Stop</button>
             </div>
           </div>
-          <div class="progress-bar">
-            <div class="progress-bar-fill" style="width: {runProgress(run.step, run.total_steps)}%"></div>
+          {#if run.step > 0 || !run.status_message}
+            <div class="progress-bar h-2">
+              <div class="progress-bar-fill" style="width: {runProgress(run.step, run.total_steps)}%"></div>
+            </div>
+          {:else}
+            <div class="progress-bar h-2 overflow-hidden">
+              <div class="progress-bar-fill animate-pulse" style="width: 100%; opacity: 0.3"></div>
+            </div>
+          {/if}
+        </div>
+      </div>
+
+      <!-- Metric cards row -->
+      <div class="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-6 gap-3">
+        <div class="card">
+          <div class="card-body p-3 text-center">
+            <p class="text-xs text-surface-500 mb-1">Loss</p>
+            <p class="text-xl font-mono font-bold text-surface-900 dark:text-surface-100">
+              {run.loss !== null ? run.loss.toFixed(4) : '--'}
+            </p>
           </div>
         </div>
-      {/each}
+        <div class="card">
+          <div class="card-body p-3 text-center">
+            <p class="text-xs text-surface-500 mb-1">Best Loss</p>
+            <p class="text-xl font-mono font-bold text-green-600 dark:text-green-400">
+              {run.best_loss !== null ? run.best_loss.toFixed(4) : '--'}
+            </p>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-body p-3 text-center">
+            <p class="text-xs text-surface-500 mb-1">Tok/s</p>
+            <p class="text-xl font-mono font-bold text-surface-900 dark:text-surface-100">
+              {run.tokens_per_second !== null ? run.tokens_per_second.toFixed(0) : '--'}
+            </p>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-body p-3 text-center">
+            <p class="text-xs text-surface-500 mb-1">Learning Rate</p>
+            <p class="text-xl font-mono font-bold text-surface-900 dark:text-surface-100">
+              {run.learning_rate !== null ? run.learning_rate.toExponential(1) : '--'}
+            </p>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-body p-3 text-center">
+            <p class="text-xs text-surface-500 mb-1">Grad Norm</p>
+            <p class="text-xl font-mono font-bold text-surface-900 dark:text-surface-100">
+              {run.grad_norm !== null ? run.grad_norm.toFixed(3) : '--'}
+            </p>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-body p-3 text-center">
+            <p class="text-xs text-surface-500 mb-1">Progress</p>
+            <p class="text-xl font-mono font-bold text-surface-900 dark:text-surface-100">
+              {run.total_steps > 0 ? Math.round(run.step / run.total_steps * 100) : 0}%
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Loss curve chart + config details -->
+      <div class="grid grid-cols-1 xl:grid-cols-3 gap-4">
+        <!-- Loss Curve (SVG) -->
+        <div class="xl:col-span-2 card">
+          <div class="card-body">
+            <p class="text-sm font-semibold text-surface-700 dark:text-surface-300 mb-2">Loss Curve</p>
+            {#if liveHistory.length >= 2}
+              <svg viewBox="0 0 600 200" class="w-full h-48" preserveAspectRatio="none">
+                <!-- Grid lines -->
+                <line x1="4" y1="4" x2="4" y2="196" stroke="currentColor" stroke-opacity="0.1" />
+                <line x1="4" y1="196" x2="596" y2="196" stroke="currentColor" stroke-opacity="0.1" />
+                <line x1="4" y1="100" x2="596" y2="100" stroke="currentColor" stroke-opacity="0.05" stroke-dasharray="4" />
+                <!-- Loss line -->
+                <path d={lossSvgPath(liveHistory, 600, 200)} fill="none" stroke="#6366f1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              <div class="flex justify-between text-xs text-surface-400 mt-1">
+                <span>Step {liveHistory[0].step}</span>
+                <span>Step {liveHistory[liveHistory.length - 1].step}</span>
+              </div>
+            {:else}
+              <div class="h-48 flex items-center justify-center text-surface-400 text-sm">
+                Waiting for training data...
+              </div>
+            {/if}
+          </div>
+        </div>
+
+        <!-- Config & run details -->
+        <div class="card">
+          <div class="card-body">
+            <p class="text-sm font-semibold text-surface-700 dark:text-surface-300 mb-3">Run Details</p>
+            <div class="space-y-2 text-xs">
+              <div class="flex justify-between">
+                <span class="text-surface-500">Model</span>
+                <span class="font-mono text-surface-700 dark:text-surface-300 truncate ml-2">{run.model}</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-surface-500">Method</span>
+                <span class="font-mono">{run.method.toUpperCase()}</span>
+              </div>
+              {#if run.dataset}
+                <div class="flex justify-between">
+                  <span class="text-surface-500">Dataset</span>
+                  <span class="font-mono truncate ml-2">{run.dataset.split('/').pop()}</span>
+                </div>
+              {/if}
+              {#if run.output_dir}
+                <div class="flex justify-between">
+                  <span class="text-surface-500">Output</span>
+                  <span class="font-mono truncate ml-2">{run.output_dir}</span>
+                </div>
+              {/if}
+              {#if run.config_summary}
+                <hr class="border-surface-200 dark:border-surface-600" />
+                <div class="flex justify-between">
+                  <span class="text-surface-500">Learning Rate</span>
+                  <span class="font-mono">{run.config_summary.learning_rate}</span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-surface-500">Batch Size</span>
+                  <span class="font-mono">{run.config_summary.batch_size}</span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-surface-500">Seq Length</span>
+                  <span class="font-mono">{run.config_summary.max_seq_len}</span>
+                </div>
+                {#if run.config_summary.lora_rank}
+                  <div class="flex justify-between">
+                    <span class="text-surface-500">LoRA</span>
+                    <span class="font-mono">r={run.config_summary.lora_rank} a={run.config_summary.lora_alpha}</span>
+                  </div>
+                {/if}
+                <div class="flex flex-wrap gap-1 mt-1">
+                  {#if run.config_summary.sequence_packing}<span class="badge badge-xs">Packing</span>{/if}
+                  {#if run.config_summary.flash_attention}<span class="badge badge-xs">FlashAttn</span>{/if}
+                  {#if run.config_summary.gradient_checkpointing}<span class="badge badge-xs">GradCkpt</span>{/if}
+                  {#if run.config_summary.jit_compilation}<span class="badge badge-xs">JIT</span>{/if}
+                </div>
+              {/if}
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
-  {/if}
+
+  {:else}
+  <!-- ════════════════════════════════════════════════════════════════
+       CONFIGURATION FORM — shown when no training is active
+       ════════════════════════════════════════════════════════════════ -->
 
   <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
     <!-- Training Form -->
@@ -248,12 +464,17 @@
               </select>
             </div>
             <div>
-              <label class="label" for="dataset">Dataset Path</label>
+              <label class="label" for="dataset">Dataset</label>
+              <select id="dataset" class="input" bind:value={datasetPath}>
+                <option value="">Select a cached dataset...</option>
+                {#each cachedDatasets as ds}
+                  <option value={ds.path}>{ds.name} ({ds.size_formatted})</option>
+                {/each}
+              </select>
               <input
-                id="dataset"
                 type="text"
-                class="input"
-                placeholder="/path/to/dataset or HuggingFace dataset ID"
+                class="input mt-2"
+                placeholder="Or enter a path / HuggingFace dataset ID"
                 bind:value={datasetPath}
               />
             </div>
@@ -541,35 +762,91 @@
         </div>
 
         <!-- Selected run detail -->
-        {#if selectedRun && (selectedRun.status === 'running' || selectedRun.status === 'completed')}
+        {#if selectedRun}
           <div class="card-footer">
-            <div class="space-y-2 text-sm">
-              <div class="grid grid-cols-2 gap-2">
-                {#if selectedRun.loss !== null}
-                  <div>
-                    <span class="text-surface-500">Loss</span>
-                    <span class="font-mono ml-2">{selectedRun.loss.toFixed(4)}</span>
+            <div class="space-y-3 text-sm">
+              <!-- Status message for setup phases -->
+              {#if selectedRun.status_message && selectedRun.step === 0}
+                <div class="text-amber-600 dark:text-amber-400 text-xs font-medium">
+                  {selectedRun.status_message}
+                </div>
+              {/if}
+
+              <!-- Error message -->
+              {#if selectedRun.error_message}
+                <div class="p-2 rounded bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 text-xs font-mono break-all">
+                  {selectedRun.error_message}
+                </div>
+              {/if}
+
+              <!-- Live metrics -->
+              {#if selectedRun.status === 'running' || selectedRun.status === 'completed'}
+                <div class="grid grid-cols-2 gap-2">
+                  {#if selectedRun.loss !== null}
+                    <div>
+                      <span class="text-surface-500">Loss</span>
+                      <span class="font-mono ml-2">{selectedRun.loss.toFixed(4)}</span>
+                    </div>
+                  {/if}
+                  {#if selectedRun.best_loss !== null}
+                    <div>
+                      <span class="text-surface-500">Best</span>
+                      <span class="font-mono ml-2 text-green-600 dark:text-green-400">{selectedRun.best_loss.toFixed(4)}</span>
+                    </div>
+                  {/if}
+                  {#if selectedRun.learning_rate !== null}
+                    <div>
+                      <span class="text-surface-500">LR</span>
+                      <span class="font-mono ml-2">{selectedRun.learning_rate.toExponential(2)}</span>
+                    </div>
+                  {/if}
+                  {#if selectedRun.tokens_per_second !== null}
+                    <div>
+                      <span class="text-surface-500">Tok/s</span>
+                      <span class="font-mono ml-2">{selectedRun.tokens_per_second.toFixed(0)}</span>
+                    </div>
+                  {/if}
+                  {#if selectedRun.grad_norm !== null}
+                    <div>
+                      <span class="text-surface-500">Grad</span>
+                      <span class="font-mono ml-2">{selectedRun.grad_norm.toFixed(3)}</span>
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+
+              <!-- Config summary -->
+              {#if selectedRun.config_summary}
+                <div class="border-t border-surface-200 dark:border-surface-600 pt-2">
+                  <p class="text-xs font-semibold text-surface-500 mb-1">Configuration</p>
+                  <div class="grid grid-cols-2 gap-1 text-xs text-surface-600 dark:text-surface-400">
+                    <div>Model: <span class="font-mono">{selectedRun.model.split('/').pop()}</span></div>
+                    <div>Method: <span class="font-mono">{selectedRun.method.toUpperCase()}</span></div>
+                    <div>LR: <span class="font-mono">{selectedRun.config_summary.learning_rate}</span></div>
+                    <div>Batch: <span class="font-mono">{selectedRun.config_summary.batch_size}</span></div>
+                    <div>Seq len: <span class="font-mono">{selectedRun.config_summary.max_seq_len}</span></div>
+                    {#if selectedRun.config_summary.lora_rank}
+                      <div>LoRA: <span class="font-mono">r={selectedRun.config_summary.lora_rank} a={selectedRun.config_summary.lora_alpha}</span></div>
+                    {/if}
+                    <div>Packing: <span class="font-mono">{selectedRun.config_summary.sequence_packing ? 'on' : 'off'}</span></div>
+                    <div>FlashAttn: <span class="font-mono">{selectedRun.config_summary.flash_attention ? 'on' : 'off'}</span></div>
+                    {#if selectedRun.config_summary.gradient_checkpointing}
+                      <div>GradCkpt: <span class="font-mono">on</span></div>
+                    {/if}
+                    {#if selectedRun.config_summary.jit_compilation}
+                      <div>JIT: <span class="font-mono">on</span></div>
+                    {/if}
                   </div>
-                {/if}
-                {#if selectedRun.best_loss !== null}
-                  <div>
-                    <span class="text-surface-500">Best</span>
-                    <span class="font-mono ml-2">{selectedRun.best_loss.toFixed(4)}</span>
-                  </div>
-                {/if}
-                {#if selectedRun.learning_rate !== null}
-                  <div>
-                    <span class="text-surface-500">LR</span>
-                    <span class="font-mono ml-2">{selectedRun.learning_rate.toExponential(2)}</span>
-                  </div>
-                {/if}
-                {#if selectedRun.tokens_per_second !== null}
-                  <div>
-                    <span class="text-surface-500">Tok/s</span>
-                    <span class="font-mono ml-2">{selectedRun.tokens_per_second.toFixed(0)}</span>
-                  </div>
-                {/if}
-              </div>
+                </div>
+              {/if}
+
+              {#if selectedRun.dataset}
+                <p class="text-xs text-surface-500 truncate">Dataset: {selectedRun.dataset}</p>
+              {/if}
+              {#if selectedRun.output_dir}
+                <p class="text-xs text-surface-500 truncate">Output: {selectedRun.output_dir}</p>
+              {/if}
+
               {#if selectedRun.status === 'running'}
                 <button
                   class="btn-danger btn-sm w-full"
@@ -579,15 +856,13 @@
                   Stop Training
                 </button>
               {/if}
-              {#if selectedRun.output_dir}
-                <p class="text-xs text-surface-500 truncate">Output: {selectedRun.output_dir}</p>
-              {/if}
             </div>
           </div>
         {/if}
       </div>
     </div>
   </div>
+  {/if}
 </div>
 
 <!-- Fuse LoRA Modal -->

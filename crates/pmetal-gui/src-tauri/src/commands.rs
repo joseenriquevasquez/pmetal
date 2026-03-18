@@ -11,7 +11,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::state::{
     AppConfig, AppEvent, AppState, CachedModel, DistillationRun, DistillationStatus, GrpoRun,
-    GrpoStatus, TrainingRun, TrainingStatus, format_downloads, format_size,
+    GrpoStatus, TrainingConfigSummary, TrainingRun, TrainingStatus, format_downloads, format_size,
 };
 
 // ---------------------------------------------------------------------------
@@ -709,6 +709,23 @@ Selected method '{}' is not library-backed here yet.",
         ));
     }
 
+    // -----------------------------------------------------------------------
+    // Pre-flight validation: resolve dataset before creating the run so that
+    // HF download errors surface immediately rather than silently after spawn.
+    // -----------------------------------------------------------------------
+    let dataset_id = config
+        .dataset
+        .clone()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError("A dataset is required for training".to_string()))?;
+
+    // Resolve HF dataset IDs to a local path (downloads if necessary).
+    // This runs synchronously relative to the caller so errors are returned
+    // to the frontend before any run record is created.
+    let resolved_dataset = resolve_dataset_path(&dataset_id)
+        .await
+        .map_err(|e| AppError(format!("Dataset not found: {e}")))?;
+
     let total_epochs = config.epochs.unwrap_or(3);
     let output_dir = config.output_dir.as_deref()
         .unwrap_or("./output")
@@ -717,17 +734,33 @@ Selected method '{}' is not library-backed here yet.",
 
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Build a config summary for display in the UI.
+    let config_summary = TrainingConfigSummary {
+        learning_rate: config.learning_rate.unwrap_or(2e-4),
+        batch_size: config.batch_size.unwrap_or(4) as usize,
+        max_seq_len: config.max_seq_len.unwrap_or(2048) as usize,
+        lora_rank: config.lora_rank.map(|r| r as usize),
+        lora_alpha: config.lora_alpha.map(|a| a as f32),
+        sequence_packing: config.sequence_packing.unwrap_or(true),
+        flash_attention: config.flash_attention.unwrap_or(true),
+        jit_compilation: config.jit_compilation.unwrap_or(false),
+        gradient_checkpointing: config.gradient_checkpointing.unwrap_or(false),
+    };
+
     let mut run = TrainingRun::new(
         &config.model,
         &config.method,
-        config.dataset.as_deref(),
+        Some(&dataset_id),
         Some(&output_dir),
         total_epochs,
     );
     run.status = TrainingStatus::Running;
+    run.status_message = Some("Starting…".to_string());
+    run.config_summary = Some(config_summary);
     let run_id = run.id.clone();
 
-    // Register cancellation flag
+    // Register cancellation flag before creating the run so the flag is always
+    // present when the run record is visible to the frontend.
     state.cancel_flags.write().await.insert(run_id.clone(), cancel_flag.clone());
 
     state.create_training_run(run).await;
@@ -740,6 +773,15 @@ Selected method '{}' is not library-backed here yet.",
     tokio::spawn(async move {
         let _ = tokio::fs::create_dir_all(&output_dir).await;
         let _ = tokio::fs::write(&metrics_path, "").await;
+
+        // Emit a "loading model" status before the expensive model load.
+        {
+            let mut runs = state_arc.write().await;
+            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id_task) {
+                run.status_message = Some("Loading model…".to_string());
+                let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
+            }
+        }
 
         let watcher_state = state_arc.clone();
         let watcher_event_tx = event_tx.clone();
@@ -758,16 +800,35 @@ Selected method '{}' is not library-backed here yet.",
         });
 
         let result = if config.method == "qlora" || config.load_in_4bit == Some(true) {
+            // Update status before entering the blocking QLoRA setup path.
+            {
+                let mut runs = state_arc.write().await;
+                if let Some(run) = runs.iter_mut().find(|r| r.id == run_id_task) {
+                    run.status_message = Some("Quantising model (QLoRA)…".to_string());
+                    let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
+                }
+            }
             run_qlora_training_in_process(
                 &config,
+                resolved_dataset.clone(),
                 &metrics_path,
                 cancel_flag.clone(),
             )
             .await
         } else {
+            // Update status to reflect tokenisation / dataset loading.
+            {
+                let mut runs = state_arc.write().await;
+                if let Some(run) = runs.iter_mut().find(|r| r.id == run_id_task) {
+                    run.status_message = Some("Loading dataset and tokenising…".to_string());
+                    let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
+                }
+            }
+
             let mut builder = easy::finetune(
                 config.model.clone(),
-                config.dataset.clone().unwrap_or_default(),
+                // Pass the already-resolved local path so the easy API doesn't re-download.
+                resolved_dataset.to_string_lossy().into_owned(),
             )
             .epochs(config.epochs.unwrap_or(3) as usize)
             .learning_rate(config.learning_rate.unwrap_or(2e-4))
@@ -794,12 +855,30 @@ Selected method '{}' is not library-backed here yet.",
                 builder = builder.embedding_lr(eval as f32);
             }
 
+            // Update status to "Training…" just before we hand off to the training loop.
+            {
+                let mut runs = state_arc.write().await;
+                if let Some(run) = runs.iter_mut().find(|r| r.id == run_id_task) {
+                    run.status_message = Some("Training…".to_string());
+                    let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
+                }
+            }
+
             builder
                 .run()
                 .await
                 .map(|_| ())
                 .map_err(|e| AppError(e.to_string()))
         };
+
+        // Clear the status message on success so the UI can show step progress.
+        if result.is_ok() {
+            let mut runs = state_arc.write().await;
+            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id_task) {
+                run.status_message = None;
+                let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
+            }
+        }
 
         let success = result.is_ok();
         let error = result.err().map(|e| e.to_string());
@@ -1333,17 +1412,23 @@ async fn finalize_training_run(
     success: bool,
     error: Option<String>,
 ) {
+    // Signal the metrics watcher to exit before updating state.
+    cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+
     let mut runs = state_arc.write().await;
     if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-        run.status = if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            TrainingStatus::Cancelled
-        } else if success {
-            TrainingStatus::Completed
-        } else {
-            TrainingStatus::Failed
-        };
+        // Preserve Cancelled if already set by cancel_training_run(); only
+        // override status when the run ended naturally (success or failure).
+        if run.status != TrainingStatus::Cancelled {
+            run.status = if success {
+                TrainingStatus::Completed
+            } else {
+                TrainingStatus::Failed
+            };
+        }
         run.ended_at = Some(Utc::now());
         run.error_message = error;
+        run.status_message = None;
         let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
         let _ = event_tx.send(AppEvent::TrainingStopped {
             run_id: run_id.to_string(),
@@ -1471,15 +1556,18 @@ async fn finalize_distillation_run(
     success: bool,
     error: Option<String>,
 ) {
+    // Signal the metrics watcher to exit before updating state.
+    cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+
     let mut runs = state_arc.write().await;
     if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-        run.status = if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            DistillationStatus::Cancelled
-        } else if success {
-            DistillationStatus::Completed
-        } else {
-            DistillationStatus::Failed
-        };
+        if run.status != DistillationStatus::Cancelled {
+            run.status = if success {
+                DistillationStatus::Completed
+            } else {
+                DistillationStatus::Failed
+            };
+        }
         run.ended_at = Some(Utc::now());
         run.error_message = error;
         let _ = event_tx.send(AppEvent::DistillationUpdate { run: run.clone() });
@@ -1615,15 +1703,18 @@ async fn finalize_grpo_run(
     success: bool,
     error: Option<String>,
 ) {
+    // Signal the metrics watcher to exit before updating state.
+    cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+
     let mut runs = state_arc.write().await;
     if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-        run.status = if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            GrpoStatus::Cancelled
-        } else if success {
-            GrpoStatus::Completed
-        } else {
-            GrpoStatus::Failed
-        };
+        if run.status != GrpoStatus::Cancelled {
+            run.status = if success {
+                GrpoStatus::Completed
+            } else {
+                GrpoStatus::Failed
+            };
+        }
         run.ended_at = Some(Utc::now());
         run.error_message = error;
         let _ = event_tx.send(AppEvent::GrpoUpdate { run: run.clone() });
@@ -1645,7 +1736,11 @@ async fn resolve_model_path(model_id: &str) -> Result<PathBuf> {
 
 async fn resolve_dataset_path(dataset_id: &str) -> Result<PathBuf> {
     match pmetal::data::resolve_dataset_source(dataset_id) {
-        pmetal::data::DatasetSource::Local(path) => Ok(path),
+        pmetal::data::DatasetSource::Local(path) => {
+            // Resolve directories to a data file within (handles HF cache structure)
+            pmetal::data::TrainingDataset::resolve_dataset_path_pub(&path)
+                .map_err(|e| AppError(e.to_string()))
+        }
         pmetal::data::DatasetSource::HuggingFace(id) => {
             let dir = pmetal::hub::download_dataset(&id, None, None, None)
                 .await
@@ -1666,17 +1761,13 @@ async fn resolve_dataset_path(dataset_id: &str) -> Result<PathBuf> {
 
 async fn run_qlora_training_in_process(
     config: &TrainingConfig,
+    dataset_path: PathBuf,
     metrics_path: &PathBuf,
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     use pmetal::lora::TrainableModel;
 
     let model_path = resolve_model_path(&config.model).await?;
-    let dataset_id = config
-        .dataset
-        .as_deref()
-        .ok_or_else(|| AppError("Dataset is required for training".to_string()))?;
-    let dataset_path = resolve_dataset_path(dataset_id).await?;
     let output_dir = config
         .output_dir
         .clone()
@@ -2506,8 +2597,10 @@ async fn search_hf_models_inner(
 ) -> Result<Vec<HubSearchResult>> {
     let client = reqwest::Client::new();
 
+    // When query is empty (trending), sort by trending score; otherwise sort by downloads for search
+    let sort = if query.is_empty() { "trending" } else { "downloads" };
     let mut url = format!(
-        "https://huggingface.co/api/models?filter=text-generation&sort=downloads&limit={}",
+        "https://huggingface.co/api/models?filter=text-generation&sort={sort}&limit={}",
         limit
     );
     if !query.is_empty() {
@@ -2516,7 +2609,7 @@ async fn search_hf_models_inner(
 
     let mut req = client
         .get(&url)
-        .header("User-Agent", "pmetal-gui/0.3.6");
+        .header("User-Agent", concat!("pmetal-gui/", env!("CARGO_PKG_VERSION")));
 
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {}", t));
@@ -2561,8 +2654,9 @@ async fn search_hf_datasets_inner(
 ) -> Result<Vec<DatasetSearchResult>> {
     let client = reqwest::Client::new();
 
+    let sort = if query.is_empty() { "trending" } else { "downloads" };
     let mut url = format!(
-        "https://huggingface.co/api/datasets?sort=downloads&limit={}",
+        "https://huggingface.co/api/datasets?sort={sort}&limit={}",
         limit
     );
     if !query.is_empty() {
@@ -2571,7 +2665,7 @@ async fn search_hf_datasets_inner(
 
     let mut req = client
         .get(&url)
-        .header("User-Agent", "pmetal-gui/0.3.6");
+        .header("User-Agent", concat!("pmetal-gui/", env!("CARGO_PKG_VERSION")));
 
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {}", t));
@@ -2629,8 +2723,20 @@ fn apply_metrics_to_training(
     m: &serde_json::Value,
     started_at: chrono::DateTime<Utc>,
 ) {
+    // Handle the train_start event (emitted before first step)
+    if m["event"].as_str() == Some("train_start") {
+        run.status_message = Some("Training started, waiting for first step...".to_string());
+        return;
+    }
+
+    // Clear the setup status message once real metrics arrive
+    if run.status_message.is_some() {
+        run.status_message = None;
+    }
+
     if let Some(v) = m["step"].as_u64() { run.step = v; }
     if let Some(v) = m["total_steps"].as_u64() { run.total_steps = v; }
+    if let Some(v) = m["total_epochs"].as_u64() { run.total_epochs = v as u32; }
     if let Some(v) = m["epoch"].as_f64() { run.epoch = v as f32; }
     if let Some(v) = m["loss"].as_f64() {
         run.loss = Some(v);

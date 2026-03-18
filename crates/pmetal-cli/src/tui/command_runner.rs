@@ -100,9 +100,12 @@ impl CommandRunner {
         }
     }
 
-    /// Remove a finished job from tracking.
+    /// Remove a finished job from tracking, cancelling its token so that any
+    /// background tasks (e.g. the metrics-file poller) stop promptly.
     pub fn remove(&mut self, job_id: &str) {
-        self.jobs.remove(job_id);
+        if let Some(job) = self.jobs.remove(job_id) {
+            job.cancel.cancel();
+        }
     }
 
     /// Check if a job is being tracked.
@@ -186,6 +189,19 @@ async fn run_command(
         tokio::spawn(async move {
             poll_metrics_file(&path, &jid, tx_metrics, cancel_metrics).await;
         });
+    }
+
+    // Emit phase status for training-type jobs so the dashboard shows setup progress.
+    if matches!(
+        spec.job_type,
+        JobType::Train | JobType::Distill | JobType::Grpo
+    ) {
+        let _ = tx
+            .send(AppMsg::JobPhase {
+                job_id: job_id.to_string(),
+                phase: "Loading model and preparing dataset...".to_string(),
+            })
+            .await;
     }
 
     if let Some(result) = run_direct_command(&spec, cancel.clone()).await {

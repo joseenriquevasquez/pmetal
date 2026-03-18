@@ -268,8 +268,8 @@ impl TrainingCallback for MetricsJsonCallback {
             "timestamp": timestamp,
         }));
 
-        // Flush every 10 steps to balance I/O and data safety
-        if step % 10 == 0 {
+        // Flush frequently so TUI/GUI watchers see metrics promptly.
+        if step <= 20 || step % 5 == 0 {
             let _ = self.writer.flush();
         }
     }
@@ -295,7 +295,9 @@ impl TrainingCallback for MetricsJsonCallback {
             "timestamp": timestamp,
         }));
 
-        if metrics.step % 10 == 0 {
+        // Flush frequently so TUI/GUI watchers see metrics promptly.
+        // The first 20 steps flush every step; after that every 5 steps.
+        if metrics.step <= 20 || metrics.step % 5 == 0 {
             let _ = self.writer.flush();
         }
     }

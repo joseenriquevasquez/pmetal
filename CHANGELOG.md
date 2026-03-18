@@ -5,6 +5,40 @@ All notable changes to PMetal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.10] - 2026-03-18
+
+### Added
+
+- **GUI live training dashboard**: Full-screen live view replaces the config form when training is active. Includes real-time loss curve (SVG), metric cards (loss, best loss, tok/s, LR, grad norm, progress %), run details panel with hyperparameters, and progress bar. Config form returns when training stops
+- **GUI cached dataset dropdown**: Dataset selector uses a `<select>` dropdown (matching the model selector style) with cached HuggingFace datasets, plus a text input for custom paths or HF dataset IDs
+- **GUI training status phases**: Live status messages during setup ("Loading model...", "Loading dataset and tokenising...", "Training...") so users see what's happening before metrics arrive
+- **GUI training config summary**: Hyperparameters (LR, batch, seq len, LoRA rank, packing, flash attention) displayed in the active training banner and run detail panel
+- **GUI failed-run alerts**: Failed training runs immediately surface with error message in a red banner, no longer hidden until the user clicks stop
+- **GUI cached dataset suggestions**: Dataset field shows cached HuggingFace datasets from `~/.cache/huggingface/hub`
+- **GUI auto-updater**: Tauri updater plugin with signed update artifacts and `latest.json` manifest in GitHub releases
+- **TUI setup phase indicator**: Dashboard shows "Loading model and preparing dataset..." in loss chart and stats panel while model loads, before any metrics arrive
+- **TUI `JobPhase` event**: New `AppMsg::JobPhase` message propagates setup status from the command runner to the dashboard
+
+### Fixed
+
+- **GUI/API trending models and datasets stale**: Changed HuggingFace API sort from `sort=downloads` (all-time) to `sort=trending` for default browse views. Search queries still sort by downloads. Fixed hardcoded User-Agent version string to use `CARGO_PKG_VERSION`
+- **HF dataset ID resolution** (`pmetal-data`, `easy.rs`, `commands.rs`, `main.rs`): HuggingFace dataset IDs (e.g., `nohurry/Opus-4.6-Reasoning-3000x-filtered`) and local HF cache directories are now resolved to the actual data file within. Traverses `snapshots/{hash}/` structure, follows symlinks, finds `.jsonl`/`.json`/`.parquet`/`.csv`/`.arrow` in priority order
+- **Dataset directory passed as file path**: All three resolution sites (`easy.rs`, GUI `commands.rs`, CLI `main.rs`) now call `resolve_dataset_path_pub` for `DatasetSource::Local` directories instead of passing them as-is to `from_jsonl_tokenized`
+- **Metrics not appearing in GUI/TUI**: `log_every` changed from 10 to 1 in `easy.rs` so metrics appear after the first training step. `MetricsJsonCallback` now flushes every step for the first 20 steps (then every 5), ensuring watchers see data promptly
+- **`train_start` event handling in GUI**: `apply_metrics_to_training` now recognizes the `train_start` event, sets status message, and reads `total_epochs` from step metrics
+- **Watcher task leak on training completion** (GUI + TUI): `finalize_training_run` (and distillation/GRPO variants) now sets `cancel_flag = true` so the 500ms metrics-polling task exits. TUI `CommandRunner::remove()` now calls `job.cancel.cancel()` before dropping
+- **QLoRA re-resolves dataset**: `run_qlora_training_in_process` now receives the pre-resolved `PathBuf` instead of re-downloading from HuggingFace on every run
+- **Stale status message on failure**: `finalize_training_run` clears `status_message` to `None` so "Loading model..." doesn't overlay the error message
+- **README.md failure aborts dataset download** (`pmetal-hub`): README failures are now non-fatal warnings; only data file download failures abort
+- **MLX mutex crash on GUI exit**: Added `on_window_event(Destroyed)` handler that calls `std::process::exit(0)` to skip C++ destructor crashes from MLX Arrays dropped on the wrong thread
+- **TUI log corruption**: Tracing subscriber suppressed in TUI mode to prevent stderr writes from corrupting the raw terminal. Optional `PMETAL_LOG_FILE` env var for file-based debug logging (with graceful fallback on bad paths)
+- **`log_lines` serialization overhead**: Added `#[serde(skip_serializing)]` to `log_lines` in `TrainingRun`, `DistillationRun`, and `GrpoRun` — saves IPC bandwidth on every event update
+
+### Changed
+
+- **Release workflow**: Added Tauri signing keys, updater artifacts (`.tar.gz` + `.sig`), and `latest.json` manifest generation for auto-updates
+- **GUI Cargo.toml**: Added `tauri-plugin-updater` and `tauri-plugin-process` dependencies
+
 ## [0.3.9] - 2026-03-17
 
 ### Added

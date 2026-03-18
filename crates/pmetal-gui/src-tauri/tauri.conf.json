@@ -25,12 +25,21 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: https://ipc.localhost"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: https://ipc.localhost https://github.com https://api.github.com https://objects.githubusercontent.com"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZBQzE0RkIyNjEwRUUwMjYKUldRbTRBNWhzay9CYXRLN1pEUlExTWNXakpWa0l3RkZVTkdTZTlKTTZtZXFMaUhKNG5RUlljQ0gK",
+      "endpoints": [
+        "https://github.com/Epistates/pmetal/releases/latest/download/latest.json"
+      ]
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

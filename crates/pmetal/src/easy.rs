@@ -319,6 +319,9 @@ impl FinetuneBuilder {
         // Resolve model path (download if HuggingFace ID)
         let model_path = resolve_model_path(&self.model_id).await?;
 
+        // Resolve dataset path (download from HuggingFace Hub if necessary)
+        let dataset_path = resolve_dataset_path(&self.dataset_path).await?;
+
         // Load tokenizer (reads special_tokens_map.json and tokenizer_config.json too)
         let tokenizer = Tokenizer::from_model_dir(&model_path).map_err(|e| {
             PMetalError::ModelLoad(format!("Failed to load tokenizer from {model_path:?}: {e}"))
@@ -330,17 +333,18 @@ impl FinetuneBuilder {
 
         // Load and tokenize training dataset
         let train_dataset = TrainingDataset::from_jsonl_tokenized(
-            &self.dataset_path,
+            &dataset_path,
             &tokenizer,
             DatasetFormat::Auto,
             self.max_seq_len,
             Some(&chat_template),
         )?;
 
-        // Load evaluation dataset if provided
+        // Load evaluation dataset if provided (resolve HF ID if needed)
         let eval_dataset = if let Some(ref eval_path) = self.eval_dataset_path {
+            let resolved_eval = resolve_dataset_path(eval_path).await?;
             Some(TrainingDataset::from_jsonl_tokenized(
-                eval_path,
+                &resolved_eval,
                 &tokenizer,
                 DatasetFormat::Auto,
                 self.max_seq_len,
@@ -396,7 +400,7 @@ impl FinetuneBuilder {
             training: training_config,
             dataloader: dataloader_config,
             use_metal_flash_attention: self.flash_attention,
-            log_every: 10,
+            log_every: 1,
             checkpoint_every: 500,
             eval_every: if eval_dataset.is_some() { 100 } else { 0 },
             use_jit_compilation: false,
@@ -699,6 +703,12 @@ impl PreferenceTuneBuilder {
         } = self;
 
         let model_path = resolve_model_path(&model_id).await?;
+        // Resolve dataset path (download from HuggingFace Hub if a HF ID was provided).
+        // Convert to a String so it can be borrowed as &str by the loader functions below.
+        let dataset_path = resolve_dataset_path(&dataset_path)
+            .await?
+            .to_string_lossy()
+            .into_owned();
         let tokenizer = Tokenizer::from_model_dir(&model_path).map_err(|e| {
             PMetalError::ModelLoad(format!("Failed to load tokenizer from {model_path:?}: {e}"))
         })?;
@@ -1744,5 +1754,50 @@ async fn resolve_model_path(model_id: &str) -> Result<PathBuf> {
         Ok(path)
     } else {
         Ok(PathBuf::from(model_id))
+    }
+}
+
+/// Resolve a dataset ID to a local file path, downloading from HuggingFace Hub if necessary.
+///
+/// The resolution priority is:
+/// 1. Path exists on disk → return as-is.
+/// 2. Looks like a HF dataset ID (contains `/`, not absolute/relative) → check the HF hub cache
+///    for an already-downloaded snapshot, or download it now.
+/// 3. Anything else → return as-is and let the caller surface the I/O error.
+async fn resolve_dataset_path(dataset: &str) -> Result<PathBuf> {
+    use pmetal_data::{resolve_dataset_source, DatasetSource, TrainingDataset};
+
+    match resolve_dataset_source(dataset) {
+        DatasetSource::Local(path) => {
+            // Resolve directories to a data file within (handles HF cache structure)
+            TrainingDataset::resolve_dataset_path_pub(&path)
+                .map_err(|e| PMetalError::Training(e.to_string()))
+        }
+        DatasetSource::HuggingFace(id) => {
+            // Download the dataset repo (all data files) and find the first usable data file.
+            let repo_dir = pmetal_hub::download_dataset(&id, None, None, None)
+                .await
+                .map_err(|e| PMetalError::Hub(format!("Failed to download dataset '{id}': {e}")))?;
+
+            // Prefer a known data file (jsonl / json / parquet / csv / txt) in the snapshot.
+            if let Ok(path) = TrainingDataset::resolve_dataset_path_pub(&repo_dir) {
+                return Ok(path);
+            }
+
+            // Fall back to downloading Parquet shards explicitly (common for HF-converted datasets).
+            let parquet_paths = pmetal_hub::download_dataset_parquet(&id, "train", None, None)
+                .await
+                .map_err(|e| {
+                    PMetalError::Hub(format!(
+                        "Dataset '{id}' has no usable data files and Parquet download failed: {e}"
+                    ))
+                })?;
+
+            parquet_paths.into_iter().next().ok_or_else(|| {
+                PMetalError::Training(format!(
+                    "Dataset '{id}' was downloaded but contains no recognisable data files"
+                ))
+            })
+        }
     }
 }
