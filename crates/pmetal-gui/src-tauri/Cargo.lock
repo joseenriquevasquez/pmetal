@@ -5540,6 +5540,7 @@ dependencies = [
  "pmetal-vocoder",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

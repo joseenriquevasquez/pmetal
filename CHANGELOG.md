@@ -11,10 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **GUI live training dashboard**: Full-screen live view replaces the config form when training is active. Includes real-time loss curve (SVG), metric cards (loss, best loss, tok/s, LR, grad norm, progress %), run details panel with hyperparameters, and progress bar. Config form returns when training stops
 - **GUI cached dataset dropdown**: Dataset selector uses a `<select>` dropdown (matching the model selector style) with cached HuggingFace datasets, plus a text input for custom paths or HF dataset IDs
+- **GUI dataset column picker**: When a dataset is selected, columns are auto-detected and shown in dropdowns for text, prompt (loss masking), and format selection. Falls back to manual text input when columns can't be detected
+- **Multi-column dataset support** (`--text-columns col1,col2`): Concatenate multiple JSONL columns as training text. CLI: `--text-columns thinking,solution --column-separator "\n\n"`. GUI: ordered pill builder with add/remove/reorder. All training paths (Train, Distill, GRPO, RLKD) support column flags uniformly via shared `build_column_config` helper
+- **Custom dataset columns** (`--text-column`, `--prompt-column`, `--response-column`): CLI, GUI, TUI, and easy API support arbitrary JSONL column names via `DatasetFormat::Custom`. Prompt column enables loss masking; prompt+response columns concatenate with masking. Distill, GRPO, and RLKD commands now also accept column flags
+- **Unified `from_jsonl_tokenized`**: Merged `from_jsonl_tokenized` and `from_jsonl_tokenized_with_columns` into a single method with `columns: Option<&DatasetColumnConfig>`. All 18 call sites updated. DRY across CLI, TUI, GUI, easy API, and Python bindings
+- **Dataset statistics and seq len validation**: `DatasetStatistics` with min/max/mean/median/p95/p99 lengths, truncation count/percentage, and suggested `max_seq_len`. `validate_seq_len()` warns when >10% truncated or mean length much shorter than max_seq_len. Logged for all training paths: Train, Distill, GRPO, RLKD, and easy API
+- **`peek_dataset_columns`**: Tauri command + API function — reads first JSONL record and returns field names for the GUI column picker
 - **GUI training status phases**: Live status messages during setup ("Loading model...", "Loading dataset and tokenising...", "Training...") so users see what's happening before metrics arrive
 - **GUI training config summary**: Hyperparameters (LR, batch, seq len, LoRA rank, packing, flash attention) displayed in the active training banner and run detail panel
 - **GUI failed-run alerts**: Failed training runs immediately surface with error message in a red banner, no longer hidden until the user clicks stop
-- **GUI cached dataset suggestions**: Dataset field shows cached HuggingFace datasets from `~/.cache/huggingface/hub`
 - **GUI auto-updater**: Tauri updater plugin with signed update artifacts and `latest.json` manifest in GitHub releases
 - **TUI setup phase indicator**: Dashboard shows "Loading model and preparing dataset..." in loss chart and stats panel while model loads, before any metrics arrive
 - **TUI `JobPhase` event**: New `AppMsg::JobPhase` message propagates setup status from the command runner to the dashboard

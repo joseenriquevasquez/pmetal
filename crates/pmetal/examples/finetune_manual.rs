@@ -52,6 +52,7 @@ async fn main() -> BoxResult<()> {
         DatasetFormat::Auto,
         2048,
         Some(&chat_template),
+        None,
     )?;
     println!("Loaded {} samples", train_dataset.len());
 

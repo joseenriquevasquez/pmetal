@@ -135,6 +135,8 @@ export interface TrainingConfig {
   lr_scheduler: string | null;
   sequence_packing: boolean | null;
   resume_from: string | null;
+  prompt_column: string | null;
+  response_column: string | null;
   // DPO
   dpo_beta?: number | null;
   dpo_loss_type?: string | null;
@@ -182,6 +184,7 @@ export interface GrpoConfig {
   max_seq_len: number | null;
   output_dir: string | null;
   use_reasoning_rewards: boolean | null;
+  text_column: string | null;
 }
 
 export type DistillationStatus =
@@ -229,6 +232,7 @@ export interface DistillationConfig {
   lora_alpha: number | null;
   max_seq_len: number | null;
   output_dir: string | null;
+  text_column: string | null;
 }
 
 export interface InferenceConfig {
@@ -413,6 +417,10 @@ export async function listCachedDatasets(): Promise<CachedDatasetInfo[]> {
 
 export async function downloadDataset(datasetId: string): Promise<string> {
   return await invoke('download_dataset', { datasetId });
+}
+
+export async function peekDatasetColumns(path: string): Promise<string[]> {
+  return await invoke('peek_dataset_columns', { path });
 }
 
 // =============================================================================

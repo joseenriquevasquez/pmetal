@@ -52,6 +52,7 @@
         max_seq_len: maxSeqLen,
         output_dir: outputDir || null,
         use_reasoning_rewards: useReasoningRewards,
+        text_column: null,
       };
 
       const runId = await grpoStore.start(config);

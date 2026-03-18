@@ -108,7 +108,7 @@ struct ShareGptFormat {
 }
 
 /// Dataset format variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DatasetFormat {
     /// Simple format: {"text": "..."}
     Simple,
@@ -122,6 +122,73 @@ pub enum DatasetFormat {
     Reasoning,
     /// Auto-detect format from first line
     Auto,
+    /// Custom column extraction — use arbitrary JSON field names.
+    Custom {
+        /// Field name for the text content (or combined prompt+response).
+        text_column: String,
+        /// Multiple columns to concatenate (e.g. `["thinking", "solution"]`).
+        /// Takes precedence over `text_column` when non-empty.
+        text_columns: Option<Vec<String>>,
+        /// Separator between concatenated columns (default: `"\n\n"`).
+        column_separator: String,
+        /// Optional: field for the prompt portion (masked from loss).
+        prompt_column: Option<String>,
+        /// Optional: separate response column.
+        response_column: Option<String>,
+    },
+}
+
+/// Configuration for custom column extraction from JSONL/Parquet datasets.
+///
+/// Use this to specify which JSON fields contain the training text, and optionally
+/// which field contains the prompt (for loss masking) vs the response.
+#[derive(Debug, Clone, Default)]
+pub struct DatasetColumnConfig {
+    /// Main text/content column name. When set and differs from "text", overrides
+    /// auto-detection and uses custom column extraction.
+    pub text_column: Option<String>,
+    /// Multiple text columns to concatenate (e.g. `["thinking", "solution"]`).
+    /// Joined with `column_separator` between each. Takes precedence over `text_column`.
+    pub text_columns: Option<Vec<String>>,
+    /// Separator between concatenated columns (default: `"\n\n"`).
+    pub column_separator: Option<String>,
+    /// Prompt column (masked from loss). When set, only response tokens contribute
+    /// to the training loss.
+    pub prompt_column: Option<String>,
+    /// Response column. When set together with `prompt_column`, the full sequence
+    /// is `prompt || response` and the prompt portion receives label -100.
+    pub response_column: Option<String>,
+}
+
+/// Statistics computed over a tokenized `TrainingDataset`.
+///
+/// Includes sequence-length distribution metrics and truncation diagnostics.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DatasetStatistics {
+    /// Total number of samples in the dataset.
+    pub total_samples: usize,
+    /// Minimum token count across all samples (post-truncation).
+    pub min_length: usize,
+    /// Maximum token count across all samples (post-truncation).
+    pub max_length: usize,
+    /// Mean token count across all samples (post-truncation).
+    pub mean_length: f64,
+    /// Median token count (post-truncation).
+    pub median_length: usize,
+    /// 95th percentile token count (pre-truncation original lengths).
+    pub p95_length: usize,
+    /// 99th percentile token count (pre-truncation original lengths).
+    pub p99_length: usize,
+    /// Number of samples whose original length exceeded `max_seq_len` and were truncated.
+    pub truncated_count: usize,
+    /// Percentage of truncated samples (0.0–100.0).
+    pub truncated_pct: f64,
+    /// Suggested `max_seq_len` — next power-of-two at or above the p95 original length,
+    /// capped at the current `max_seq_len`.
+    pub suggested_max_seq_len: usize,
+    /// Column names found in the first record of the source file (populated by
+    /// `peek_columns`; empty when constructed from an already-tokenized dataset).
+    pub columns: Vec<String>,
 }
 
 /// Resolved dataset source — either a local path or HuggingFace dataset ID.
@@ -151,6 +218,11 @@ pub fn resolve_dataset_source(source: &str) -> DatasetSource {
 #[derive(Clone)]
 pub struct TrainingDataset {
     samples: Vec<Sample>,
+    /// Original token lengths before truncation, recorded during `from_jsonl_tokenized`.
+    /// Used by `compute_statistics` for accurate truncation reporting.
+    /// Empty when the dataset is constructed via `from_samples` or other paths that
+    /// don't track pre-truncation lengths.
+    original_lengths: Vec<usize>,
 }
 
 impl TrainingDataset {
@@ -158,12 +230,16 @@ impl TrainingDataset {
     pub fn new() -> Self {
         Self {
             samples: Vec::new(),
+            original_lengths: Vec::new(),
         }
     }
 
     /// Create a dataset from pre-tokenized samples.
     pub fn from_samples(samples: Vec<Sample>) -> Self {
-        Self { samples }
+        Self {
+            samples,
+            original_lengths: Vec::new(),
+        }
     }
 
     /// Load and tokenize a dataset from a JSONL file.
@@ -174,22 +250,60 @@ impl TrainingDataset {
     /// * `format` - Dataset format (or Auto to detect)
     /// * `max_length` - Maximum sequence length
     /// * `template` - Optional chat template for formatting (OpenAI/ShareGPT formats)
+    /// * `columns` - Optional custom column config; when provided with a `text_column`,
+    ///   overrides format detection and uses custom column extraction.
     pub fn from_jsonl_tokenized<P: AsRef<Path>>(
         path: P,
         tokenizer: &super::Tokenizer,
         format: DatasetFormat,
         max_length: usize,
         template: Option<&ChatTemplate>,
+        columns: Option<&DatasetColumnConfig>,
     ) -> Result<Self> {
-        let text_samples = Self::load_jsonl_text(path, format, template)?;
+        // If custom columns are specified, build a Custom format from the column config.
+        let effective_format = if let Some(col_cfg) = columns {
+            let has_multi = col_cfg.text_columns.as_ref().is_some_and(|v| !v.is_empty());
+            let has_custom_single = col_cfg.text_column.as_ref().is_some_and(|t| t != "text");
+            if has_multi || has_custom_single {
+                DatasetFormat::Custom {
+                    text_column: col_cfg
+                        .text_column
+                        .clone()
+                        .unwrap_or_else(|| "text".to_string()),
+                    text_columns: col_cfg.text_columns.clone(),
+                    column_separator: col_cfg
+                        .column_separator
+                        .clone()
+                        .unwrap_or_else(|| "\n\n".to_string()),
+                    prompt_column: col_cfg.prompt_column.clone(),
+                    response_column: col_cfg.response_column.clone(),
+                }
+            } else {
+                format
+            }
+        } else {
+            format
+        };
+
+        let text_samples = Self::load_jsonl_text(path, effective_format, template)?;
         let mut samples = Vec::with_capacity(text_samples.len());
+        let mut original_lengths = Vec::with_capacity(text_samples.len());
 
         for text_sample in text_samples {
+            let orig_len = {
+                // Encode to get the original length before truncation.
+                let ids = tokenizer.encode_with_special_tokens(&text_sample.text)?;
+                ids.len()
+            };
+            original_lengths.push(orig_len);
             let sample = Self::tokenize_sample(&text_sample, tokenizer, max_length)?;
             samples.push(sample);
         }
 
-        Ok(Self { samples })
+        Ok(Self {
+            samples,
+            original_lengths,
+        })
     }
 
     /// Load raw text samples from JSONL without tokenizing.
@@ -237,7 +351,7 @@ impl TrainingDataset {
                 first_content_seen = true;
             }
 
-            let sample = Self::parse_line(&line, detected_format, line_num, template)?;
+            let sample = Self::parse_line(&line, &detected_format, line_num, template)?;
             samples.push(sample);
         }
 
@@ -276,11 +390,17 @@ impl TrainingDataset {
                 // Prefer jsonl > json > parquet > csv
                 found.sort_by_key(|p| {
                     let s = p.to_string_lossy();
-                    if s.ends_with(".jsonl") { 0 }
-                    else if s.ends_with(".json") { 1 }
-                    else if s.ends_with(".parquet") { 2 }
-                    else if s.ends_with(".csv") { 3 }
-                    else { 4 }
+                    if s.ends_with(".jsonl") {
+                        0
+                    } else if s.ends_with(".json") {
+                        1
+                    } else if s.ends_with(".parquet") {
+                        2
+                    } else if s.ends_with(".csv") {
+                        3
+                    } else {
+                        4
+                    }
                 });
                 if let Some(best) = found.into_iter().next() {
                     tracing::info!("Auto-discovered dataset file: {}", best.display());
@@ -315,8 +435,14 @@ impl TrainingDataset {
                     .collect();
                 // Sort by modification time descending (most recent first)
                 snap_dirs.sort_by(|a, b| {
-                    let t_a = a.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    let t_b = b.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    let t_a = a
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    let t_b = b
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                     t_b.cmp(&t_a)
                 });
                 dirs.extend(snap_dirs);
@@ -409,10 +535,100 @@ impl TrainingDataset {
         }
     }
 
+    /// Parse a single JSONL line using custom column names.
+    ///
+    /// Returns `(full_text, Option<prompt_text>)` where `prompt_text` is the
+    /// portion that should be loss-masked (label = -100).
+    fn parse_custom_line(
+        line: &str,
+        text_col: &str,
+        text_cols: Option<&[String]>,
+        separator: &str,
+        prompt_col: Option<&str>,
+        response_col: Option<&str>,
+    ) -> Result<(String, Option<String>)> {
+        let obj: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+            pmetal_core::PMetalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid JSON: {}", e),
+            ))
+        })?;
+
+        // Multi-column concatenation takes precedence
+        if let Some(cols) = text_cols {
+            if !cols.is_empty() {
+                let parts: Vec<&str> = cols
+                    .iter()
+                    .filter_map(|c| {
+                        let val = obj.get(c.as_str()).and_then(|v| v.as_str());
+                        if val.is_none() {
+                            tracing::warn!(
+                                column = %c,
+                                "Column not found in JSON line; skipping (dataset may have optional columns)"
+                            );
+                        }
+                        val
+                    })
+                    .collect();
+                if parts.is_empty() {
+                    return Err(pmetal_core::PMetalError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "None of the requested columns {:?} were present in this JSON line; \
+                             check that at least one column name matches the dataset schema",
+                            cols
+                        ),
+                    )));
+                }
+                let text = parts.join(separator);
+                // If prompt_col is set, mask that portion
+                if let Some(pc) = prompt_col {
+                    let prompt = obj.get(pc).and_then(|v| v.as_str()).map(|s| s.to_string());
+                    return Ok((text, prompt));
+                }
+                return Ok((text, None));
+            }
+        }
+
+        if let (Some(pc), Some(rc)) = (prompt_col, response_col) {
+            let prompt = obj
+                .get(pc)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let response = obj
+                .get(rc)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok((format!("{}{}", prompt, response), Some(prompt)))
+        } else {
+            let text = obj
+                .get(text_col)
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    pmetal_core::PMetalError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Column '{}' not found or not a string in JSON line",
+                            text_col
+                        ),
+                    ))
+                })?
+                .to_string();
+            if let Some(pc) = prompt_col {
+                let prompt = obj.get(pc).and_then(|v| v.as_str()).map(|s| s.to_string());
+                Ok((text, prompt))
+            } else {
+                Ok((text, None))
+            }
+        }
+    }
+
     /// Parse a single JSONL line.
     fn parse_line(
         line: &str,
-        format: DatasetFormat,
+        format: &DatasetFormat,
         line_num: usize,
         template: Option<&ChatTemplate>,
     ) -> Result<TextSample> {
@@ -598,6 +814,30 @@ impl TrainingDataset {
                 // Should not reach here after detection
                 unreachable!("Auto format should be resolved before parsing")
             }
+            DatasetFormat::Custom {
+                text_column,
+                text_columns,
+                column_separator,
+                prompt_column,
+                response_column,
+            } => {
+                let (text, prompt) = Self::parse_custom_line(
+                    line,
+                    text_column,
+                    text_columns.as_deref(),
+                    column_separator,
+                    prompt_column.as_deref(),
+                    response_column.as_deref(),
+                )
+                .map_err(|e| {
+                    // Annotate with line number for better diagnostics.
+                    pmetal_core::PMetalError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Line {}: {}", line_num + 1, e),
+                    ))
+                })?;
+                Ok(TextSample { text, prompt })
+            }
         }
     }
 
@@ -667,7 +907,10 @@ impl TrainingDataset {
             samples.push(sample);
         }
 
-        Ok(Self { samples })
+        Ok(Self {
+            samples,
+            original_lengths: Vec::new(),
+        })
     }
 
     /// Load raw text samples from a Parquet file without tokenizing.
@@ -944,21 +1187,154 @@ impl TrainingDataset {
         use rand::SeedableRng;
         use rand::seq::SliceRandom;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        self.samples.shuffle(&mut rng);
+        // Build a permutation over indices and apply it to both vecs.
+        if self.original_lengths.len() == self.samples.len() && !self.original_lengths.is_empty() {
+            let mut indices: Vec<usize> = (0..self.samples.len()).collect();
+            indices.shuffle(&mut rng);
+            let new_samples: Vec<Sample> =
+                indices.iter().map(|&i| self.samples[i].clone()).collect();
+            let new_lengths: Vec<usize> =
+                indices.iter().map(|&i| self.original_lengths[i]).collect();
+            self.samples = new_samples;
+            self.original_lengths = new_lengths;
+        } else {
+            self.samples.shuffle(&mut rng);
+        }
     }
 
     /// Split the dataset into train and validation sets.
     pub fn train_val_split(mut self, val_ratio: f32, seed: u64) -> (Self, Self) {
         self.shuffle(seed);
         let val_size = (self.samples.len() as f32 * val_ratio).round() as usize;
+        let val_orig = if self.original_lengths.len() == self.samples.len() {
+            self.original_lengths
+                .split_off(self.original_lengths.len() - val_size)
+        } else {
+            Vec::new()
+        };
         let val_samples = self.samples.split_off(self.samples.len() - val_size);
 
         (
             self,
             Self {
                 samples: val_samples,
+                original_lengths: val_orig,
             },
         )
+    }
+
+    /// Compute sequence-length statistics over this dataset.
+    ///
+    /// Uses `original_lengths` (pre-truncation) when available; falls back to
+    /// the post-truncation lengths stored in `samples`.
+    ///
+    /// `max_seq_len` is used to determine which samples were truncated and to
+    /// compute `suggested_max_seq_len`.
+    pub fn compute_statistics(&self, max_seq_len: usize) -> DatasetStatistics {
+        let post_lengths: Vec<usize> = self.samples.iter().map(|s| s.input_ids.len()).collect();
+
+        // Use pre-truncation lengths for distribution stats when available.
+        let orig: &[usize] = if self.original_lengths.len() == self.samples.len()
+            && !self.original_lengths.is_empty()
+        {
+            &self.original_lengths
+        } else {
+            &post_lengths
+        };
+
+        if orig.is_empty() {
+            return DatasetStatistics {
+                total_samples: 0,
+                min_length: 0,
+                max_length: 0,
+                mean_length: 0.0,
+                median_length: 0,
+                p95_length: 0,
+                p99_length: 0,
+                truncated_count: 0,
+                truncated_pct: 0.0,
+                suggested_max_seq_len: max_seq_len,
+                columns: Vec::new(),
+            };
+        }
+
+        let total = orig.len();
+        let mut sorted = orig.to_vec();
+        sorted.sort_unstable();
+
+        let mean = orig.iter().sum::<usize>() as f64 / total as f64;
+        let median = sorted[total / 2];
+        let p95 = sorted[((total as f64 * 0.95) as usize).min(total - 1)];
+        let p99 = sorted[((total as f64 * 0.99) as usize).min(total - 1)];
+
+        let truncated = orig.iter().filter(|&&l| l > max_seq_len).count();
+
+        // Suggest the next power-of-two at or above p95, capped at max_seq_len.
+        // Guard against p95==0 (e.g. empty or all-zero-length samples) to avoid
+        // next_power_of_two(0) returning 1, which would be a nonsensical suggestion.
+        let suggested = if p95 > 0 {
+            p95.next_power_of_two().min(max_seq_len)
+        } else {
+            max_seq_len
+        };
+
+        DatasetStatistics {
+            total_samples: total,
+            min_length: *sorted.first().unwrap(),
+            max_length: *sorted.last().unwrap(),
+            mean_length: mean,
+            median_length: median,
+            p95_length: p95,
+            p99_length: p99,
+            truncated_count: truncated,
+            truncated_pct: truncated as f64 / total as f64 * 100.0,
+            suggested_max_seq_len: suggested,
+            columns: Vec::new(),
+        }
+    }
+
+    /// Validate sequence length settings and return human-readable warnings.
+    ///
+    /// Issues a warning when more than 10% of samples are truncated, and a note
+    /// when the average length is much shorter than `max_seq_len` (suggesting
+    /// that a smaller value would give faster training).
+    pub fn validate_seq_len(&self, max_seq_len: usize) -> Vec<String> {
+        let stats = self.compute_statistics(max_seq_len);
+        let mut warnings = Vec::new();
+
+        if stats.truncated_pct > 50.0 {
+            warnings.push(format!(
+                "WARNING: {:.0}% of samples truncated at max_seq_len={}. \
+                 Consider increasing to {} (dataset p95).",
+                stats.truncated_pct, max_seq_len, stats.p95_length
+            ));
+        } else if stats.truncated_pct > 10.0 {
+            warnings.push(format!(
+                "NOTE: {:.0}% of samples truncated at max_seq_len={}. \
+                 Dataset p95 length is {}.",
+                stats.truncated_pct, max_seq_len, stats.p95_length
+            ));
+        }
+
+        if stats.mean_length < max_seq_len as f64 * 0.25 {
+            warnings.push(format!(
+                "NOTE: Average sample length ({:.0}) is much shorter than max_seq_len ({}). \
+                 Consider reducing max_seq_len for faster training.",
+                stats.mean_length, max_seq_len
+            ));
+        }
+
+        warnings
+    }
+
+    /// Suggest an optimal `max_seq_len` based on actual data lengths.
+    ///
+    /// Returns a power-of-two value that covers p99 of the data without
+    /// excessive waste. Useful for display/recommendation but NOT applied
+    /// automatically — users should have full control over this setting.
+    pub fn suggested_seq_len(&self, configured: usize) -> usize {
+        let stats = self.compute_statistics(configured);
+        stats.suggested_max_seq_len
     }
 }
 
@@ -984,6 +1360,34 @@ impl<'a> IntoIterator for &'a TrainingDataset {
     fn into_iter(self) -> Self::IntoIter {
         self.samples.iter()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Free functions
+// ---------------------------------------------------------------------------
+
+/// Peek at the first record of a JSONL file and return its top-level field names.
+///
+/// Useful for populating a column-picker UI or validating column config before
+/// loading a large dataset. Returns an empty `Vec` if the file is empty or the
+/// first record is not a JSON object.
+pub fn peek_columns(path: impl AsRef<Path>) -> Result<Vec<String>> {
+    let file = File::open(path.as_ref()).map_err(pmetal_core::PMetalError::Io)?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line.map_err(pmetal_core::PMetalError::Io)?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(trimmed)
+        {
+            return Ok(obj.keys().cloned().collect());
+        }
+        // First non-empty line is not a JSON object — give up.
+        break;
+    }
+    Ok(Vec::new())
 }
 
 // ---------------------------------------------------------------------------

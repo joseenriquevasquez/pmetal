@@ -35,7 +35,9 @@
 use std::path::{Path, PathBuf};
 
 use pmetal_core::{LoraConfig, PMetalError, Result, TrainingCallback, TrainingConfig};
-use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
+use pmetal_data::{
+    DataLoaderConfig, DatasetColumnConfig, DatasetFormat, Tokenizer, TrainingDataset,
+};
 use pmetal_lora::{DynamicLoraModel, TrainableModel};
 use pmetal_mlx::Builder as _;
 use pmetal_models::{
@@ -176,6 +178,8 @@ pub struct FinetuneBuilder {
     embedding_lr: Option<f32>,
     callbacks: Vec<Box<dyn TrainingCallback>>,
     metrics_path: Option<PathBuf>,
+    /// Custom column configuration for JSONL datasets.
+    columns: Option<DatasetColumnConfig>,
 }
 
 impl FinetuneBuilder {
@@ -202,6 +206,7 @@ impl FinetuneBuilder {
             embedding_lr: None,
             callbacks: Vec::new(),
             metrics_path: None,
+            columns: None,
         }
     }
 
@@ -314,6 +319,70 @@ impl FinetuneBuilder {
         self
     }
 
+    /// Set the name of the JSONL field containing the training text.
+    ///
+    /// When set to anything other than `"text"`, the loader switches to custom
+    /// column extraction mode, bypassing format auto-detection.
+    pub fn text_column(mut self, column: impl Into<String>) -> Self {
+        let cfg = self
+            .columns
+            .get_or_insert_with(DatasetColumnConfig::default);
+        cfg.text_column = Some(column.into());
+        self
+    }
+
+    /// Set multiple JSONL columns to concatenate as the training text.
+    ///
+    /// Columns are joined with the separator (default: `"\n\n"`).
+    /// Takes precedence over `.text_column()` when non-empty.
+    /// Example: `.text_columns(["thinking", "solution"])`
+    pub fn text_columns(mut self, columns: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        let cols: Vec<String> = columns.into_iter().map(Into::into).collect();
+        let cfg = self
+            .columns
+            .get_or_insert_with(DatasetColumnConfig::default);
+        if !cols.is_empty() {
+            if cfg.text_column.is_none() {
+                cfg.text_column = Some(cols[0].clone());
+            }
+            cfg.text_columns = Some(cols);
+        }
+        self
+    }
+
+    /// Set the separator between concatenated columns (default: `"\n\n"`).
+    pub fn column_separator(mut self, separator: impl Into<String>) -> Self {
+        let cfg = self
+            .columns
+            .get_or_insert_with(DatasetColumnConfig::default);
+        cfg.column_separator = Some(separator.into());
+        self
+    }
+
+    /// Set the name of the JSONL field containing the prompt portion.
+    ///
+    /// Prompt tokens receive label -100 and do not contribute to the loss,
+    /// so only the response portion trains the model.
+    pub fn prompt_column(mut self, column: impl Into<String>) -> Self {
+        let cfg = self
+            .columns
+            .get_or_insert_with(DatasetColumnConfig::default);
+        cfg.prompt_column = Some(column.into());
+        self
+    }
+
+    /// Set the name of the JSONL field containing the response portion.
+    ///
+    /// When used together with `.prompt_column()`, the full sequence is
+    /// `prompt || response` and loss masking is applied automatically.
+    pub fn response_column(mut self, column: impl Into<String>) -> Self {
+        let cfg = self
+            .columns
+            .get_or_insert_with(DatasetColumnConfig::default);
+        cfg.response_column = Some(column.into());
+        self
+    }
+
     /// Run the fine-tuning pipeline.
     pub async fn run(self) -> Result<FinetuneResult> {
         // Resolve model path (download if HuggingFace ID)
@@ -338,7 +407,22 @@ impl FinetuneBuilder {
             DatasetFormat::Auto,
             self.max_seq_len,
             Some(&chat_template),
+            self.columns.as_ref(),
         )?;
+
+        // Compute and log sequence-length statistics for the training dataset.
+        let warnings = train_dataset.validate_seq_len(self.max_seq_len);
+        for w in &warnings {
+            tracing::warn!("{}", w);
+        }
+        let stats = train_dataset.compute_statistics(self.max_seq_len);
+        tracing::info!(
+            "Dataset statistics: {} samples, mean_len={:.0}, p95_len={}, truncated={:.1}%",
+            stats.total_samples,
+            stats.mean_length,
+            stats.p95_length,
+            stats.truncated_pct,
+        );
 
         // Load evaluation dataset if provided (resolve HF ID if needed)
         let eval_dataset = if let Some(ref eval_path) = self.eval_dataset_path {
@@ -349,6 +433,7 @@ impl FinetuneBuilder {
                 DatasetFormat::Auto,
                 self.max_seq_len,
                 Some(&chat_template),
+                self.columns.as_ref(),
             )?)
         } else {
             None
@@ -1765,7 +1850,7 @@ async fn resolve_model_path(model_id: &str) -> Result<PathBuf> {
 ///    for an already-downloaded snapshot, or download it now.
 /// 3. Anything else → return as-is and let the caller surface the I/O error.
 async fn resolve_dataset_path(dataset: &str) -> Result<PathBuf> {
-    use pmetal_data::{resolve_dataset_source, DatasetSource, TrainingDataset};
+    use pmetal_data::{DatasetSource, TrainingDataset, resolve_dataset_source};
 
     match resolve_dataset_source(dataset) {
         DatasetSource::Local(path) => {

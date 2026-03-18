@@ -336,7 +336,11 @@ pub async fn download_dataset(
             return Err(pmetal_core::PMetalError::Hub(format!(
                 "Dataset download incomplete for {}: {}",
                 dataset_id,
-                data_failures.into_iter().take(10).collect::<Vec<_>>().join(", ")
+                data_failures
+                    .into_iter()
+                    .take(10)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
         }
         return Err(pmetal_core::PMetalError::Hub(format!(
@@ -349,7 +353,11 @@ pub async fn download_dataset(
         return Err(pmetal_core::PMetalError::Hub(format!(
             "Dataset download incomplete for {}: {}",
             dataset_id,
-            data_failures.into_iter().take(10).collect::<Vec<_>>().join(", ")
+            data_failures
+                .into_iter()
+                .take(10)
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
 

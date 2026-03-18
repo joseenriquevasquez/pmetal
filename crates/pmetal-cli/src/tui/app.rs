@@ -790,8 +790,7 @@ impl App {
             } => match job_type {
                 JobType::Train => {
                     self.training.set_status_running(0, 0, 0, 0, 0.0);
-                    self.dashboard.job_phase =
-                        Some("Starting training job...".to_string());
+                    self.dashboard.job_phase = Some("Starting training job...".to_string());
                 }
                 JobType::Distill => {
                     self.distillation.status = TrainingStatus::Running {

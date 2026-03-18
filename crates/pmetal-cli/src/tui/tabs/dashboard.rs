@@ -229,9 +229,7 @@ impl DashboardTab {
                     )),
                 ]
             };
-            Paragraph::new(lines)
-                .block(block)
-                .render(area, buf);
+            Paragraph::new(lines).block(block).render(area, buf);
             return;
         }
 
@@ -394,13 +392,15 @@ impl DashboardTab {
             ]
         } else if let Some(ref phase) = self.job_phase {
             vec![
-                ListItem::new(Line::from(vec![
-                    Span::styled(phase.as_str(), THEME.text_warning),
-                ])),
+                ListItem::new(Line::from(vec![Span::styled(
+                    phase.as_str(),
+                    THEME.text_warning,
+                )])),
                 ListItem::new(""),
-                ListItem::new(Line::from(vec![
-                    Span::styled("Waiting for first metrics...", THEME.text_muted),
-                ])),
+                ListItem::new(Line::from(vec![Span::styled(
+                    "Waiting for first metrics...",
+                    THEME.text_muted,
+                )])),
             ]
         } else {
             vec![ListItem::new(Span::styled("No data yet", THEME.text_muted))]

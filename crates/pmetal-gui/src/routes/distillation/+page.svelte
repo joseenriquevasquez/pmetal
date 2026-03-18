@@ -62,6 +62,7 @@
         lora_alpha: loraAlpha,
         max_seq_len: maxSeqLen,
         output_dir: outputDir || null,
+        text_column: null,
       };
 
       const runId = await distillationStore.start(config);

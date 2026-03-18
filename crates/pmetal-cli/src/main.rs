@@ -16,8 +16,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use mlx_rs::builder::Builder;
 use pmetal_core::{DatasetConfig, LoraConfig, ModelConfig, TrainingConfig};
 use pmetal_data::{
-    DataLoaderConfig, DatasetFormat, DatasetSource, Tokenizer, TrainingDataset,
-    resolve_dataset_source,
+    DataLoaderConfig, DatasetColumnConfig, DatasetFormat, DatasetSource, Tokenizer,
+    TrainingDataset, resolve_dataset_source,
 };
 use pmetal_lora::{
     DynamicLoraModel, LlamaLoraForCausalLM, LlamaQloraForCausalLM, QLoraConfig, TrainableModel,
@@ -166,6 +166,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Fine-tune a model using LoRA/QLoRA
     Train {
@@ -299,6 +300,41 @@ enum Commands {
         /// up to 37x peak memory for large-vocabulary models (e.g. Qwen3 with 150K tokens).
         #[arg(long)]
         cut_cross_entropy: bool,
+
+        /// Custom JSONL column containing the training text.
+        ///
+        /// When set to anything other than "text", bypasses format auto-detection
+        /// and reads training data from the named field. Use with --prompt-column
+        /// and --response-column for SFT loss masking.
+        #[arg(long)]
+        text_column: Option<String>,
+
+        /// Multiple JSONL columns to concatenate as the training text.
+        ///
+        /// Comma-separated column names, e.g. `--text-columns thinking,solution`.
+        /// Takes precedence over --text-column. Columns are joined with the
+        /// separator specified by --column-separator (default: two newlines).
+        #[arg(long, value_delimiter = ',')]
+        text_columns: Option<Vec<String>>,
+
+        /// Separator inserted between columns when using --text-columns.
+        /// Default: "\n\n" (two newlines).
+        #[arg(long, default_value = "\n\n")]
+        column_separator: String,
+
+        /// Custom JSONL column containing the prompt portion (loss-masked).
+        ///
+        /// Tokens from this field receive label -100 and do not contribute to the
+        /// loss. Combine with --response-column to concatenate prompt+response.
+        #[arg(long)]
+        prompt_column: Option<String>,
+
+        /// Custom JSONL column containing the response portion.
+        ///
+        /// When provided together with --prompt-column, the full training sequence
+        /// is prompt || response with prompt tokens masked from the loss.
+        #[arg(long)]
+        response_column: Option<String>,
 
         /// Disable ANE (Apple Neural Engine) for training, falling back to GPU/MLX.
         #[cfg(feature = "ane")]
@@ -658,6 +694,26 @@ enum Commands {
         #[arg(long, default_value = "42")]
         seed: u64,
 
+        /// Custom text column name in the dataset JSONL.
+        #[arg(long)]
+        text_column: Option<String>,
+
+        /// Comma-separated list of columns to concatenate as the text field.
+        #[arg(long, value_delimiter = ',')]
+        text_columns: Option<Vec<String>>,
+
+        /// Separator used when joining multiple text columns.
+        #[arg(long, default_value = "\n\n")]
+        column_separator: String,
+
+        /// Column name for the prompt portion (enables SFT label masking).
+        #[arg(long)]
+        prompt_column: Option<String>,
+
+        /// Column name for the response portion (enables SFT label masking).
+        #[arg(long)]
+        response_column: Option<String>,
+
         /// Path to write JSONL metrics log (for TUI dashboard)
         #[arg(long)]
         log_metrics: Option<String>,
@@ -804,6 +860,26 @@ enum Commands {
         #[arg(long)]
         async_rewards: bool,
 
+        /// Custom text column name in the dataset JSONL.
+        #[arg(long)]
+        text_column: Option<String>,
+
+        /// Comma-separated list of columns to concatenate as the text field.
+        #[arg(long, value_delimiter = ',')]
+        text_columns: Option<Vec<String>>,
+
+        /// Separator used when joining multiple text columns.
+        #[arg(long, default_value = "\n\n")]
+        column_separator: String,
+
+        /// Column name for the prompt portion (enables SFT label masking).
+        #[arg(long)]
+        prompt_column: Option<String>,
+
+        /// Column name for the response portion (enables SFT label masking).
+        #[arg(long)]
+        response_column: Option<String>,
+
         /// Path to write JSONL metrics log (for TUI dashboard)
         #[arg(long)]
         log_metrics: Option<String>,
@@ -900,6 +976,26 @@ enum Commands {
         /// Disable Metal FlashAttention.
         #[arg(long)]
         no_flash_attention: bool,
+
+        /// Custom text column name in the dataset JSONL.
+        #[arg(long)]
+        text_column: Option<String>,
+
+        /// Comma-separated list of columns to concatenate as the text field.
+        #[arg(long, value_delimiter = ',')]
+        text_columns: Option<Vec<String>>,
+
+        /// Separator used when joining multiple text columns.
+        #[arg(long, default_value = "\n\n")]
+        column_separator: String,
+
+        /// Column name for the prompt portion (enables SFT label masking).
+        #[arg(long)]
+        prompt_column: Option<String>,
+
+        /// Column name for the response portion (enables SFT label masking).
+        #[arg(long)]
+        response_column: Option<String>,
 
         /// Path to write JSONL metrics log (for TUI dashboard).
         #[arg(long)]
@@ -1878,6 +1974,11 @@ async fn tokio_main() -> anyhow::Result<()> {
             weight_decay,
             seed,
             cut_cross_entropy,
+            text_column,
+            text_columns,
+            column_separator,
+            prompt_column,
+            response_column,
             #[cfg(feature = "ane")]
             no_ane,
             #[cfg(feature = "distributed")]
@@ -1959,6 +2060,11 @@ async fn tokio_main() -> anyhow::Result<()> {
                 dist_config,
                 #[cfg(not(feature = "distributed"))]
                 None,
+                text_column,
+                text_columns,
+                column_separator,
+                prompt_column,
+                response_column,
             )
             .await?;
         }
@@ -2198,6 +2304,11 @@ async fn tokio_main() -> anyhow::Result<()> {
             epochs,
             max_seq_len,
             seed,
+            text_column,
+            text_columns,
+            column_separator,
+            prompt_column,
+            response_column,
             log_metrics,
         } => {
             run_distillation_cli(
@@ -2221,6 +2332,11 @@ async fn tokio_main() -> anyhow::Result<()> {
                 log_metrics,
                 true,
                 Vec::new(),
+                text_column,
+                text_columns,
+                column_separator,
+                prompt_column,
+                response_column,
             )
             .await?;
         }
@@ -2250,6 +2366,11 @@ async fn tokio_main() -> anyhow::Result<()> {
             async_rewards,
             speculative,
             speculative_draft_tokens,
+            text_column,
+            text_columns,
+            column_separator,
+            prompt_column,
+            response_column,
             log_metrics,
         } => {
             run_grpo_cli(
@@ -2280,6 +2401,11 @@ async fn tokio_main() -> anyhow::Result<()> {
                 log_metrics,
                 true,
                 Vec::new(),
+                text_column,
+                text_columns,
+                column_separator,
+                prompt_column,
+                response_column,
             )
             .await?;
         }
@@ -2304,6 +2430,11 @@ async fn tokio_main() -> anyhow::Result<()> {
             seed,
             reasoning_rewards,
             no_flash_attention,
+            text_column,
+            text_columns,
+            column_separator,
+            prompt_column,
+            response_column,
             log_metrics,
         } => {
             run_rlkd_cli(
@@ -2329,6 +2460,11 @@ async fn tokio_main() -> anyhow::Result<()> {
                 log_metrics,
                 true,
                 Vec::new(),
+                text_column,
+                text_columns,
+                column_separator,
+                prompt_column,
+                response_column,
             )
             .await?;
         }
@@ -3602,6 +3738,11 @@ async fn run_distillation_cli(
     log_metrics: Option<String>,
     emit_console_output: bool,
     extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
+    text_column: Option<String>,
+    text_columns: Option<Vec<String>>,
+    column_separator: String,
+    prompt_column: Option<String>,
+    response_column: Option<String>,
 ) -> anyhow::Result<()> {
     use pmetal_core::LoraConfig;
     use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
@@ -3609,6 +3750,14 @@ async fn run_distillation_cli(
     use pmetal_lora::DynamicLoraModel;
     use pmetal_trainer::{DistillationTrainer, TrainingLoopConfig};
     use std::path::{Path, PathBuf};
+
+    let column_cfg = build_column_config(
+        text_column,
+        text_columns,
+        column_separator,
+        prompt_column,
+        response_column,
+    );
 
     if emit_console_output {
         println!("========================================");
@@ -3687,8 +3836,26 @@ async fn run_distillation_cli(
             DatasetFormat::Auto,
             max_seq_len,
             Some(&chat_template),
+            column_cfg.as_ref(),
         )?
     };
+    tracing::info!(
+        "Distillation dataset loaded: {} samples",
+        train_dataset.len()
+    );
+    {
+        let stats = train_dataset.compute_statistics(max_seq_len);
+        tracing::info!(
+            "Dataset: lengths mean={:.0}, p95={}, p99={}, truncated={:.1}%",
+            stats.mean_length,
+            stats.p95_length,
+            stats.p99_length,
+            stats.truncated_pct,
+        );
+        for w in &train_dataset.validate_seq_len(max_seq_len) {
+            tracing::warn!("{}", w);
+        }
+    }
 
     // 4. Load Teacher Model (Frozen)
     tracing::info!("Loading teacher model...");
@@ -3919,8 +4086,21 @@ async fn run_grpo_cli(
     _log_metrics: Option<String>,
     emit_console_output: bool,
     extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
+    text_column: Option<String>,
+    text_columns: Option<Vec<String>>,
+    column_separator: String,
+    prompt_column: Option<String>,
+    response_column: Option<String>,
 ) -> anyhow::Result<()> {
     use std::path::{Path, PathBuf};
+
+    let column_cfg = build_column_config(
+        text_column,
+        text_columns,
+        column_separator,
+        prompt_column,
+        response_column,
+    );
 
     if emit_console_output {
         println!("========================================");
@@ -3986,8 +4166,23 @@ async fn run_grpo_cli(
             DatasetFormat::Auto,
             max_seq_len,
             Some(&chat_template),
+            column_cfg.as_ref(),
         )?
     };
+    tracing::info!("GRPO dataset loaded: {} samples", dataset.len());
+    {
+        let stats = dataset.compute_statistics(max_seq_len);
+        tracing::info!(
+            "Dataset: lengths mean={:.0}, p95={}, p99={}, truncated={:.1}%",
+            stats.mean_length,
+            stats.p95_length,
+            stats.p99_length,
+            stats.truncated_pct,
+        );
+        for w in &dataset.validate_seq_len(max_seq_len) {
+            tracing::warn!("{}", w);
+        }
+    }
 
     // 4. Load Model (Trainable LoRA)
     tracing::info!("Loading model with LoRA...");
@@ -4306,8 +4501,21 @@ async fn run_rlkd_cli(
     _log_metrics: Option<String>,
     emit_console_output: bool,
     extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
+    text_column: Option<String>,
+    text_columns: Option<Vec<String>>,
+    column_separator: String,
+    prompt_column: Option<String>,
+    response_column: Option<String>,
 ) -> anyhow::Result<()> {
     use std::path::{Path, PathBuf};
+
+    let column_cfg = build_column_config(
+        text_column,
+        text_columns,
+        column_separator,
+        prompt_column,
+        response_column,
+    );
 
     if emit_console_output {
         println!("========================================");
@@ -4380,8 +4588,23 @@ async fn run_rlkd_cli(
             DatasetFormat::Auto,
             max_seq_len,
             Some(&chat_template),
+            column_cfg.as_ref(),
         )?
     };
+    tracing::info!("RLKD dataset loaded: {} samples", dataset.len());
+    {
+        let stats = dataset.compute_statistics(max_seq_len);
+        tracing::info!(
+            "Dataset: lengths mean={:.0}, p95={}, p99={}, truncated={:.1}%",
+            stats.mean_length,
+            stats.p95_length,
+            stats.p99_length,
+            stats.truncated_pct,
+        );
+        for w in &dataset.validate_seq_len(max_seq_len) {
+            tracing::warn!("{}", w);
+        }
+    }
 
     // 5. Load policy model with LoRA
     tracing::info!("Loading policy model with LoRA...");
@@ -4571,6 +4794,35 @@ async fn run_rlkd_cli(
     Ok(())
 }
 
+/// Build an optional [`DatasetColumnConfig`] from raw CLI column flags.
+///
+/// Returns `None` when no column customisation is requested, so callers can
+/// pass the result directly as `columns: Option<&DatasetColumnConfig>` without
+/// any extra logic.
+fn build_column_config(
+    text_column: Option<String>,
+    text_columns: Option<Vec<String>>,
+    column_separator: String,
+    prompt_column: Option<String>,
+    response_column: Option<String>,
+) -> Option<DatasetColumnConfig> {
+    if text_column.is_some()
+        || text_columns.is_some()
+        || prompt_column.is_some()
+        || response_column.is_some()
+    {
+        Some(DatasetColumnConfig {
+            text_column,
+            text_columns,
+            column_separator: Some(column_separator),
+            prompt_column,
+            response_column,
+        })
+    } else {
+        None
+    }
+}
+
 /// Run LoRA/QLoRA fine-tuning using the new TrainingLoop.
 #[allow(clippy::too_many_arguments)]
 async fn run_training(
@@ -4609,6 +4861,11 @@ async fn run_training(
     cut_cross_entropy: bool,
     ane: bool,
     #[allow(unused_variables)] distributed_config: Option<pmetal_core::DistributedTrainingConfig>,
+    text_column: Option<String>,
+    text_columns: Option<Vec<String>>,
+    column_separator: String,
+    prompt_column: Option<String>,
+    response_column: Option<String>,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "ane"))]
     if ane {
@@ -4990,6 +5247,15 @@ async fn run_training(
         }
     };
 
+    // Build optional column config from CLI flags.
+    let column_cfg = build_column_config(
+        text_column,
+        text_columns,
+        column_separator,
+        prompt_column,
+        response_column,
+    );
+
     // Load and tokenize training dataset — dispatch on file extension
     tracing::info!(
         "Loading training dataset: {}",
@@ -5000,32 +5266,44 @@ async fn run_training(
         .is_some_and(|ext| ext == "parquet");
     let train_dataset = if is_parquet {
         tracing::info!("Detected Parquet format");
-        // Try "text" column first, then fall back to common alternatives
-        let result = TrainingDataset::from_parquet_tokenized(
-            &dataset_path_resolved,
-            &tokenizer,
-            "text",
-            config.training.max_seq_len,
-            None,
-        );
-        match result {
-            Ok(ds) => ds,
-            Err(_) => {
-                // Try "content" column
-                TrainingDataset::from_parquet_tokenized(
-                    &dataset_path_resolved,
-                    &tokenizer,
-                    "content",
-                    config.training.max_seq_len,
-                    None,
-                )
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "Parquet file does not have a recognized column layout. \
-                     Supported: 'text' column, 'content' column, or reasoning format \
-                     (problem/thinking/solution columns)."
+        // Honour explicit text_column for parquet; otherwise try well-known names.
+        let explicit_col = column_cfg.as_ref().and_then(|c| c.text_column.as_deref());
+        let prompt_col = column_cfg.as_ref().and_then(|c| c.prompt_column.as_deref());
+        if let Some(col) = explicit_col {
+            TrainingDataset::from_parquet_tokenized(
+                &dataset_path_resolved,
+                &tokenizer,
+                col,
+                config.training.max_seq_len,
+                prompt_col,
+            )?
+        } else {
+            let result = TrainingDataset::from_parquet_tokenized(
+                &dataset_path_resolved,
+                &tokenizer,
+                "text",
+                config.training.max_seq_len,
+                None,
+            );
+            match result {
+                Ok(ds) => ds,
+                Err(_) => {
+                    // Try "content" column
+                    TrainingDataset::from_parquet_tokenized(
+                        &dataset_path_resolved,
+                        &tokenizer,
+                        "content",
+                        config.training.max_seq_len,
+                        None,
                     )
-                })?
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "Parquet file does not have a recognized column layout. \
+                         Supported: 'text' column, 'content' column, or reasoning format \
+                         (problem/thinking/solution columns)."
+                        )
+                    })?
+                }
             }
         }
     } else {
@@ -5035,9 +5313,29 @@ async fn run_training(
             DatasetFormat::Auto,
             config.training.max_seq_len,
             Some(&chat_template),
+            column_cfg.as_ref(),
         )?
     };
     tracing::info!("Training dataset loaded: {} samples", train_dataset.len());
+
+    // Log sequence-length statistics and warn on truncation.
+    {
+        let stats = train_dataset.compute_statistics(config.training.max_seq_len);
+        tracing::info!(
+            "Dataset: {} samples | lengths: mean={:.0}, median={}, p95={}, p99={}, max={} | truncated: {:.1}%",
+            stats.total_samples,
+            stats.mean_length,
+            stats.median_length,
+            stats.p95_length,
+            stats.p99_length,
+            stats.max_length,
+            stats.truncated_pct,
+        );
+        let warnings = train_dataset.validate_seq_len(config.training.max_seq_len);
+        for w in &warnings {
+            tracing::warn!("{}", w);
+        }
+    }
 
     // Load evaluation dataset if provided
     let eval_dataset = if let Some(ref eval_path) = eval_dataset_path {
@@ -5048,6 +5346,7 @@ async fn run_training(
             DatasetFormat::Auto,
             config.training.max_seq_len,
             Some(&chat_template),
+            column_cfg.as_ref(),
         )?;
         tracing::info!("Evaluation dataset loaded: {} samples", ds.len());
         Some(ds)
@@ -9982,6 +10281,7 @@ async fn run_eval(
         DatasetFormat::Auto,
         max_seq_len,
         Some(&chat_template),
+        None,
     )?;
 
     // Load model with optional LoRA

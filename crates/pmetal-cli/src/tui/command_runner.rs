@@ -560,6 +560,12 @@ async fn run_training_direct(
         has_flag(&spec.args, "--cut-cross-entropy"),
         !has_flag(&spec.args, "--no-ane"),
         None, // distributed_config
+        optional_arg(&spec.args, "--text-column"),
+        optional_arg(&spec.args, "--text-columns")
+            .map(|s| s.split(',').map(str::to_string).collect()),
+        optional_arg(&spec.args, "--column-separator").unwrap_or_else(|| "\n\n".to_string()),
+        optional_arg(&spec.args, "--prompt-column"),
+        optional_arg(&spec.args, "--response-column"),
     )
     .await
 }
@@ -600,6 +606,12 @@ async fn run_distillation_direct(
         spec.metrics_file.as_ref().map(|p| p.display().to_string()),
         false,
         callbacks,
+        optional_arg(&spec.args, "--text-column"),
+        optional_arg(&spec.args, "--text-columns")
+            .map(|s| s.split(',').map(str::to_string).collect()),
+        optional_arg(&spec.args, "--column-separator").unwrap_or_else(|| "\n\n".to_string()),
+        optional_arg(&spec.args, "--prompt-column"),
+        optional_arg(&spec.args, "--response-column"),
     )
     .await
 }
@@ -645,6 +657,12 @@ async fn run_grpo_direct(
         spec.metrics_file.as_ref().map(|p| p.display().to_string()),
         false,
         callbacks,
+        optional_arg(&spec.args, "--text-column"),
+        optional_arg(&spec.args, "--text-columns")
+            .map(|s| s.split(',').map(str::to_string).collect()),
+        optional_arg(&spec.args, "--column-separator").unwrap_or_else(|| "\n\n".to_string()),
+        optional_arg(&spec.args, "--prompt-column"),
+        optional_arg(&spec.args, "--response-column"),
     )
     .await
 }

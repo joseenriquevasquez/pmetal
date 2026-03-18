@@ -3,10 +3,13 @@
   import { page } from '$app/stores';
   import { modelsStore, trainingStore } from '$lib/stores.svelte';
   import type { TrainingConfig, TrainingRun, CachedDatasetInfo } from '$lib/api';
-  import { fuseLora, listCachedDatasets } from '$lib/api';
+  import { fuseLora, listCachedDatasets, peekDatasetColumns } from '$lib/api';
   import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
 
   let cachedDatasets = $state<CachedDatasetInfo[]>([]);
+  let datasetColumns = $state<string[]>([]);
+  let columnsLoading = $state(false);
+  let lastPeekedPath = $state('');
 
   // Training methods
   const trainingMethods = [
@@ -24,6 +27,8 @@
   let datasetPath = $state('');
   let datasetFormat = $state('auto');
   let textColumn = $state('text');
+  let selectedTextColumns = $state<string[]>([]);
+  let columnToAdd = $state('');
   let epochs = $state(3);
   let learningRate = $state(0.0002);
   let batchSize = $state(4);
@@ -102,6 +107,41 @@
     }
   });
 
+  // Fetch dataset columns when path changes, but only when the resolved path
+  // is different from the last successfully peeked path to avoid resetting the
+  // column selection on every keystroke while the user is still typing.
+  $effect(() => {
+    const path = datasetPath;
+    if (!path || path.length < 3) {
+      datasetColumns = [];
+      return;
+    }
+    if (path === lastPeekedPath) return;
+    lastPeekedPath = path;
+    columnsLoading = true;
+    peekDatasetColumns(path)
+      .then(cols => {
+        datasetColumns = cols;
+        selectedTextColumns = [];
+        columnToAdd = '';
+        // Auto-select: prefer 'text', else first column
+        if (cols.length > 0) {
+          if (cols.includes('text')) {
+            selectedTextColumns = ['text'];
+          } else if (cols.includes('content')) {
+            selectedTextColumns = ['content'];
+          } else if (cols.includes('instruction')) {
+            selectedTextColumns = ['instruction'];
+          } else if (cols.length === 1) {
+            selectedTextColumns = [cols[0]];
+          }
+        }
+        textColumn = selectedTextColumns[0] ?? 'text';
+      })
+      .catch(() => { datasetColumns = []; lastPeekedPath = ''; })
+      .finally(() => { columnsLoading = false; });
+  });
+
   // SVG chart helpers
   function lossSvgPath(points: MetricPoint[], width: number, height: number): string {
     if (points.length < 2) return '';
@@ -161,7 +201,11 @@
         load_in_4bit: selectedMethod === 'qlora' ? loadIn4bit : null,
         gradient_accumulation_steps: gradAccumSteps,
         max_seq_len: maxSeqLen,
-        text_column: textColumn || null,
+        text_column: selectedTextColumns.length > 1
+          ? selectedTextColumns.join('+')
+          : selectedTextColumns.length === 1
+            ? selectedTextColumns[0]
+            : textColumn || null,
         dataset_format: datasetFormat,
         embedding_lr: embeddingLr > 0 ? embeddingLr : null,
         jit_compilation: jitCompilation,
@@ -176,6 +220,8 @@
         lr_scheduler: lrScheduler,
         sequence_packing: sequencePacking,
         resume_from: resumeFrom || null,
+        prompt_column: null,
+        response_column: null,
       };
 
       const runId = await trainingStore.start(config);
@@ -478,20 +524,127 @@
                 bind:value={datasetPath}
               />
             </div>
-            <div class="grid grid-cols-2 gap-4">
-              <div>
-                <label class="label" for="dataset-format">Dataset Format</label>
-                <select id="dataset-format" class="input" bind:value={datasetFormat}>
-                  {#each datasetFormats as fmt}
-                    <option value={fmt}>{fmt}</option>
-                  {/each}
-                </select>
+            <!-- Column detection & selection -->
+            {#if datasetColumns.length > 0}
+              <div class="p-3 rounded-lg bg-surface-50 dark:bg-surface-800/50 border border-surface-200 dark:border-surface-700">
+                <p class="text-xs font-semibold text-surface-600 dark:text-surface-400 mb-2">
+                  Detected columns: <span class="font-mono">{datasetColumns.join(', ')}</span>
+                </p>
+
+                <!-- Ordered text column builder -->
+                <div class="mb-3">
+                  <label class="label text-xs mb-1" for="add-column">Text Columns <span class="text-surface-400">(in order)</span></label>
+                  <!-- Selected columns as reorderable pills -->
+                  {#if selectedTextColumns.length > 0}
+                    <div class="flex flex-wrap gap-1.5 mb-2">
+                      {#each selectedTextColumns as col, i}
+                        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-primary-100 dark:bg-primary-900/40 text-primary-800 dark:text-primary-200 text-xs font-mono border border-primary-200 dark:border-primary-700">
+                          {#if i > 0}
+                            <button
+                              type="button"
+                              class="hover:text-primary-500 -ml-0.5"
+                              title="Move left"
+                              onclick={() => {
+                                const arr = [...selectedTextColumns];
+                                [arr[i - 1], arr[i]] = [arr[i], arr[i - 1]];
+                                selectedTextColumns = arr;
+                                textColumn = arr[0];
+                              }}
+                            >&larr;</button>
+                          {/if}
+                          {col}
+                          {#if i < selectedTextColumns.length - 1}
+                            <button
+                              type="button"
+                              class="hover:text-primary-500"
+                              title="Move right"
+                              onclick={() => {
+                                const arr = [...selectedTextColumns];
+                                [arr[i], arr[i + 1]] = [arr[i + 1], arr[i]];
+                                selectedTextColumns = arr;
+                                textColumn = arr[0];
+                              }}
+                            >&rarr;</button>
+                          {/if}
+                          <button
+                            type="button"
+                            class="hover:text-red-500 ml-0.5"
+                            title="Remove"
+                            onclick={() => {
+                              selectedTextColumns = selectedTextColumns.filter((_, idx) => idx !== i);
+                              textColumn = selectedTextColumns[0] ?? 'text';
+                            }}
+                          >&times;</button>
+                        </span>
+                        {#if i < selectedTextColumns.length - 1}
+                          <span class="text-xs text-surface-400 self-center">+</span>
+                        {/if}
+                      {/each}
+                    </div>
+                  {/if}
+                  <!-- Add column selector -->
+                  <div class="flex gap-2">
+                    <select
+                      id="add-column"
+                      class="input text-sm flex-1"
+                      bind:value={columnToAdd}
+                    >
+                      <option value="">Add a column...</option>
+                      {#each datasetColumns.filter(c => !selectedTextColumns.includes(c)) as col}
+                        <option value={col}>{col}</option>
+                      {/each}
+                    </select>
+                    <button
+                      type="button"
+                      class="btn-primary btn-sm"
+                      disabled={!columnToAdd}
+                      onclick={() => {
+                        if (columnToAdd && !selectedTextColumns.includes(columnToAdd)) {
+                          selectedTextColumns = [...selectedTextColumns, columnToAdd];
+                          textColumn = selectedTextColumns[0];
+                          columnToAdd = '';
+                        }
+                      }}
+                    >Add</button>
+                  </div>
+                </div>
+
+                <div class="grid grid-cols-2 gap-3">
+                  <div>
+                    <label class="label text-xs" for="prompt-column">Prompt Column <span class="text-surface-400">(loss-masked)</span></label>
+                    <select id="prompt-column" class="input text-sm">
+                      <option value="">None (all tokens train)</option>
+                      {#each datasetColumns as col}
+                        <option value={col}>{col}</option>
+                      {/each}
+                    </select>
+                  </div>
+                  <div>
+                    <label class="label text-xs" for="dataset-format">Format</label>
+                    <select id="dataset-format" class="input text-sm" bind:value={datasetFormat}>
+                      {#each datasetFormats as fmt}
+                        <option value={fmt}>{fmt}</option>
+                      {/each}
+                    </select>
+                  </div>
+                </div>
               </div>
-              <div>
-                <label class="label" for="text-column">Text Column</label>
-                <input id="text-column" type="text" class="input" placeholder="text" bind:value={textColumn} />
+            {:else}
+              <div class="grid grid-cols-2 gap-4">
+                <div>
+                  <label class="label" for="dataset-format">Dataset Format</label>
+                  <select id="dataset-format" class="input" bind:value={datasetFormat}>
+                    {#each datasetFormats as fmt}
+                      <option value={fmt}>{fmt}</option>
+                    {/each}
+                  </select>
+                </div>
+                <div>
+                  <label class="label" for="text-column">Text Column</label>
+                  <input id="text-column" type="text" class="input" placeholder="text" bind:value={textColumn} />
+                </div>
               </div>
-            </div>
+            {/if}
           </div>
         </div>
 

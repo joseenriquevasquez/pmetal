@@ -215,6 +215,7 @@ impl PyTrainer {
                             pmetal_data::DatasetFormat::Auto,
                             training_config.max_seq_len,
                             Some(&chat_template),
+                            None,
                         )?;
 
                         let eval = if let Some(ref eval_path) = eval_dataset_path {
@@ -224,6 +225,7 @@ impl PyTrainer {
                                 pmetal_data::DatasetFormat::Auto,
                                 training_config.max_seq_len,
                                 Some(&chat_template),
+                                None,
                             )?)
                         } else {
                             None

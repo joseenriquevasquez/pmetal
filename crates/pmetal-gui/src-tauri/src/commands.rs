@@ -209,6 +209,8 @@ pub struct TrainingConfig {
     pub lr_scheduler: Option<String>,
     pub sequence_packing: Option<bool>,
     pub resume_from: Option<String>,
+    pub prompt_column: Option<String>,
+    pub response_column: Option<String>,
     // DPO-specific
     pub dpo_beta: Option<f64>,
     pub dpo_loss_type: Option<String>,
@@ -239,6 +241,7 @@ pub struct DistillationConfig {
     pub lora_alpha: Option<u32>,
     pub max_seq_len: Option<u32>,
     pub output_dir: Option<String>,
+    pub text_column: Option<String>,
 }
 
 /// Full GRPO config matching TS `GrpoConfig`.
@@ -257,6 +260,7 @@ pub struct GrpoConfig {
     pub max_seq_len: Option<u32>,
     pub output_dir: Option<String>,
     pub use_reasoning_rewards: Option<bool>,
+    pub text_column: Option<String>,
 }
 
 /// Inference config matching TS `InferenceConfig`.
@@ -684,6 +688,22 @@ pub async fn list_cached_datasets(
     Ok(datasets)
 }
 
+/// Peek at the first JSONL record in a file and return the available field names.
+///
+/// The frontend calls this when the dataset path changes to populate the
+/// column-picker dropdowns for `text_column`, `prompt_column`, and
+/// `response_column`.
+#[tauri::command]
+pub async fn peek_dataset_columns(path: String) -> Result<Vec<String>> {
+    let p = std::path::PathBuf::from(&path);
+    // Resolve directories (handles HF cache layout) before peeking.
+    let resolved = pmetal::data::TrainingDataset::resolve_dataset_path_pub(&p)
+        .unwrap_or(p);
+    let cols = pmetal::data::peek_columns(&resolved)
+        .map_err(|e| AppError(e.to_string()))?;
+    Ok(cols)
+}
+
 // ---------------------------------------------------------------------------
 // Training commands
 // ---------------------------------------------------------------------------
@@ -847,6 +867,23 @@ Selected method '{}' is not library-backed here yet.",
             .callback(Box::new(CancelOnFlag {
                 cancelled: cancel_flag.clone(),
             }));
+
+            // Wire custom column selection from the GUI column picker.
+            // The GUI encodes multi-column as "col1+col2+col3".
+            if let Some(ref tc) = config.text_column {
+                if tc.contains('+') {
+                    let cols: Vec<String> = tc.split('+').map(str::to_string).collect();
+                    builder = builder.text_columns(cols);
+                } else {
+                    builder = builder.text_column(tc.clone());
+                }
+            }
+            if let Some(ref pc) = config.prompt_column {
+                builder = builder.prompt_column(pc.clone());
+            }
+            if let Some(ref rc) = config.response_column {
+                builder = builder.response_column(rc.clone());
+            }
 
             if let Some(rank) = config.lora_rank {
                 builder = builder.lora(rank as usize, config.lora_alpha.unwrap_or(32) as f32);
@@ -1836,6 +1873,7 @@ async fn run_qlora_training_in_process(
             pmetal::data::DatasetFormat::Auto,
             max_seq_len,
             Some(&chat_template),
+            None,
         )
         .map_err(|e| AppError(e.to_string()))?
     };
@@ -1970,6 +2008,22 @@ async fn run_distillation_in_process(
         pmetal::data::chat_templates::detect_chat_template(&student_path, &config.student_model);
 
     let max_seq_len = config.max_seq_len.unwrap_or(1024) as usize;
+
+    // Build column config from the `+`-separated multi-column string the GUI sends.
+    let col_cfg = config.text_column.as_deref().map(|tc| {
+        if tc.contains('+') {
+            pmetal::data::DatasetColumnConfig {
+                text_columns: Some(tc.split('+').map(str::to_string).collect()),
+                ..Default::default()
+            }
+        } else {
+            pmetal::data::DatasetColumnConfig {
+                text_column: Some(tc.to_string()),
+                ..Default::default()
+            }
+        }
+    });
+
     let train_dataset = if dataset_path
         .extension()
         .is_some_and(|ext| ext == "parquet")
@@ -1998,6 +2052,7 @@ async fn run_distillation_in_process(
             pmetal::data::DatasetFormat::Auto,
             max_seq_len,
             Some(&chat_template),
+            col_cfg.as_ref(),
         )
         .map_err(|e| AppError(e.to_string()))?
     };
@@ -2166,6 +2221,22 @@ async fn run_grpo_in_process(
         pmetal::data::chat_templates::detect_chat_template(&model_path, &config.model);
 
     let max_seq_len = config.max_seq_len.unwrap_or(512) as usize;
+
+    // Build column config from the `+`-separated multi-column string the GUI sends.
+    let col_cfg = config.text_column.as_deref().map(|tc| {
+        if tc.contains('+') {
+            pmetal::data::DatasetColumnConfig {
+                text_columns: Some(tc.split('+').map(str::to_string).collect()),
+                ..Default::default()
+            }
+        } else {
+            pmetal::data::DatasetColumnConfig {
+                text_column: Some(tc.to_string()),
+                ..Default::default()
+            }
+        }
+    });
+
     let dataset = if dataset_path
         .extension()
         .is_some_and(|ext| ext == "parquet")
@@ -2194,6 +2265,7 @@ async fn run_grpo_in_process(
             pmetal::data::DatasetFormat::Auto,
             max_seq_len,
             Some(&chat_template),
+            col_cfg.as_ref(),
         )
         .map_err(|e| AppError(e.to_string()))?
     };
