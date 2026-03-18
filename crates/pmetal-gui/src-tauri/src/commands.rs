@@ -754,7 +754,8 @@ pub async fn peek_dataset_columns(path: String, limit: Option<usize>) -> Result<
     let mut sorted = token_estimates;
     sorted.sort();
     let p95 = sorted.get((sorted.len() as f64 * 0.95) as usize).copied().unwrap_or(avg);
-    let suggested = if p95 > 0 { p95.next_power_of_two() } else { 2048 };
+    // Round up to next multiple of 64 (practical for GPU alignment)
+    let suggested = if p95 > 0 { (p95 + 63) / 64 * 64 } else { 2048 };
 
     Ok(DatasetPeek {
         columns,
@@ -880,15 +881,19 @@ Selected method '{}' is not library-backed here yet.",
             .await;
         });
 
-        let result = if config.method == "qlora" || config.load_in_4bit == Some(true) {
-            // Update status before entering the blocking QLoRA setup path.
-            {
+        // Helper to emit status updates
+        macro_rules! set_phase {
+            ($msg:expr) => {{
                 let mut runs = state_arc.write().await;
                 if let Some(run) = runs.iter_mut().find(|r| r.id == run_id_task) {
-                    run.status_message = Some("Quantising model (QLoRA)…".to_string());
+                    run.status_message = Some($msg.to_string());
                     let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
                 }
-            }
+            }};
+        }
+
+        let result = if config.method == "qlora" || config.load_in_4bit == Some(true) {
+            set_phase!("Preparing QLoRA — loading and quantising model…");
             run_qlora_training_in_process(
                 &config,
                 resolved_dataset.clone(),
@@ -897,14 +902,10 @@ Selected method '{}' is not library-backed here yet.",
             )
             .await
         } else {
-            // Update status to reflect tokenisation / dataset loading.
-            {
-                let mut runs = state_arc.write().await;
-                if let Some(run) = runs.iter_mut().find(|r| r.id == run_id_task) {
-                    run.status_message = Some("Loading dataset and tokenising…".to_string());
-                    let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
-                }
-            }
+            // Wire status phases from the easy API back to the GUI
+            let status_state = state_arc.clone();
+            let status_tx = event_tx.clone();
+            let status_run_id = run_id_task.clone();
 
             let mut builder = easy::finetune(
                 config.model.clone(),
@@ -927,7 +928,16 @@ Selected method '{}' is not library-backed here yet.",
             .metrics_path(metrics_path.clone())
             .callback(Box::new(CancelOnFlag {
                 cancelled: cancel_flag.clone(),
-            }));
+            }))
+            .on_status(move |msg| {
+                // Sync status update via try_write (non-blocking)
+                if let Ok(mut runs) = status_state.try_write() {
+                    if let Some(run) = runs.iter_mut().find(|r| r.id == status_run_id) {
+                        run.status_message = Some(msg.to_string());
+                        let _ = status_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
+                    }
+                }
+            });
 
             // Wire custom column selection from the GUI column picker.
             // The GUI encodes multi-column as "col1+col2+col3".
@@ -951,15 +961,6 @@ Selected method '{}' is not library-backed here yet.",
             }
             if let Some(eval) = config.embedding_lr {
                 builder = builder.embedding_lr(eval as f32);
-            }
-
-            // Update status to "Training…" just before we hand off to the training loop.
-            {
-                let mut runs = state_arc.write().await;
-                if let Some(run) = runs.iter_mut().find(|r| r.id == run_id_task) {
-                    run.status_message = Some("Training…".to_string());
-                    let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
-                }
             }
 
             builder

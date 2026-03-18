@@ -216,30 +216,48 @@ impl TrainingTab {
             let reader = BufReader::new(file);
             for line in reader.lines().take(100).flatten() {
                 let trimmed = line.trim();
-                if trimmed.is_empty() { continue; }
-                if let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(trimmed) {
-                    let total: usize = obj.values().filter_map(|v| v.as_str()).map(|s| s.len()).sum();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(obj) =
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(trimmed)
+                {
+                    let total: usize = obj
+                        .values()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.len())
+                        .sum();
                     char_lengths.push(total / 4); // rough token estimate
                 }
             }
         }
 
-        if char_lengths.is_empty() { return; }
+        if char_lengths.is_empty() {
+            return;
+        }
 
         let avg = char_lengths.iter().sum::<usize>() / char_lengths.len();
         let max = char_lengths.iter().copied().max().unwrap_or(0);
         let mut sorted = char_lengths;
         sorted.sort();
-        let p95 = sorted.get((sorted.len() as f64 * 0.95) as usize).copied().unwrap_or(avg);
-        let suggested = if p95 > 0 { p95.next_power_of_two() } else { 2048 };
+        let p95 = sorted
+            .get((sorted.len() as f64 * 0.95) as usize)
+            .copied()
+            .unwrap_or(avg);
+        let suggested = if p95 > 0 {
+            p95.div_ceil(64) * 64
+        } else {
+            2048
+        };
 
-        let max_seq_len: usize = self.field_value("Max Seq Len")
-            .parse()
-            .unwrap_or(2048);
+        let max_seq_len: usize = self.field_value("Max Seq Len").parse().unwrap_or(2048);
 
         let info = format!(
             "~{} samples | avg ~{} tok, max ~{} tok | suggest seq_len {}",
-            sorted.len(), avg, max, suggested
+            sorted.len(),
+            avg,
+            max,
+            suggested
         );
         self.dataset_info = Some(info);
 

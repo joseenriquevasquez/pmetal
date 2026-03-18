@@ -180,6 +180,9 @@ pub struct FinetuneBuilder {
     metrics_path: Option<PathBuf>,
     /// Custom column configuration for JSONL datasets.
     columns: Option<DatasetColumnConfig>,
+    /// Optional status callback for reporting setup phases (model loading, tokenizing, etc.).
+    #[allow(clippy::type_complexity)]
+    status_fn: Option<Box<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl FinetuneBuilder {
@@ -207,7 +210,15 @@ impl FinetuneBuilder {
             callbacks: Vec::new(),
             metrics_path: None,
             columns: None,
+            status_fn: None,
         }
+    }
+
+    /// Set a callback that receives status phase messages during setup
+    /// (e.g. "Downloading model...", "Tokenizing dataset...", "Loading LoRA adapters...").
+    pub fn on_status(mut self, f: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.status_fn = Some(Box::new(f));
+        self
     }
 
     /// Set LoRA rank and alpha.
@@ -385,13 +396,22 @@ impl FinetuneBuilder {
 
     /// Run the fine-tuning pipeline.
     pub async fn run(self) -> Result<FinetuneResult> {
+        let status = |msg: &str| {
+            if let Some(ref f) = self.status_fn {
+                f(msg);
+            }
+        };
+
         // Resolve model path (download if HuggingFace ID)
+        status("Downloading model (if needed)…");
         let model_path = resolve_model_path(&self.model_id).await?;
 
         // Resolve dataset path (download from HuggingFace Hub if necessary)
+        status("Resolving dataset…");
         let dataset_path = resolve_dataset_path(&self.dataset_path).await?;
 
-        // Load tokenizer (reads special_tokens_map.json and tokenizer_config.json too)
+        // Load tokenizer
+        status("Loading tokenizer…");
         let tokenizer = Tokenizer::from_model_dir(&model_path).map_err(|e| {
             PMetalError::ModelLoad(format!("Failed to load tokenizer from {model_path:?}: {e}"))
         })?;
@@ -401,6 +421,7 @@ impl FinetuneBuilder {
             pmetal_data::chat_templates::detect_chat_template(&model_path, &self.model_id);
 
         // Load and tokenize training dataset
+        status("Tokenizing dataset…");
         let train_dataset = TrainingDataset::from_jsonl_tokenized(
             &dataset_path,
             &tokenizer,
@@ -450,6 +471,7 @@ impl FinetuneBuilder {
         };
 
         // Initialize model with LoRA adapters
+        status("Loading model and initializing LoRA adapters…");
         let model =
             DynamicLoraModel::from_pretrained(&model_path, lora_config).map_err(model_err)?;
 
@@ -516,6 +538,7 @@ impl FinetuneBuilder {
         }
 
         // Run training (sequence packing by default)
+        status("Training…");
         let model = if use_sequence_packing {
             training_loop
                 .run_packed(

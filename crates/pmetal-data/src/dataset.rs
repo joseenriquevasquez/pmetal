@@ -1269,11 +1269,10 @@ impl TrainingDataset {
 
         let truncated = orig.iter().filter(|&&l| l > max_seq_len).count();
 
-        // Suggest the next power-of-two at or above p95, capped at max_seq_len.
-        // Guard against p95==0 (e.g. empty or all-zero-length samples) to avoid
-        // next_power_of_two(0) returning 1, which would be a nonsensical suggestion.
+        // Suggest the next multiple of 64 at or above p95 (GPU-friendly alignment),
+        // capped at max_seq_len. Guard against p95==0.
         let suggested = if p95 > 0 {
-            p95.next_power_of_two().min(max_seq_len)
+            (p95.div_ceil(64) * 64).min(max_seq_len)
         } else {
             max_seq_len
         };
