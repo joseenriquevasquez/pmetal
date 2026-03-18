@@ -4904,6 +4904,7 @@ dependencies = [
  "pmetal-core",
  "pmetal-mlx-rs",
  "rand 0.10.0",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",

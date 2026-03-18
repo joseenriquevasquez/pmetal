@@ -286,18 +286,28 @@ impl TrainingDataset {
         };
 
         let text_samples = Self::load_jsonl_text(path, effective_format, template)?;
-        let mut samples = Vec::with_capacity(text_samples.len());
-        let mut original_lengths = Vec::with_capacity(text_samples.len());
+        let n_samples = text_samples.len();
 
-        for text_sample in text_samples {
-            let orig_len = {
-                // Encode to get the original length before truncation.
-                let ids = tokenizer.encode_with_special_tokens(&text_sample.text)?;
-                ids.len()
-            };
-            original_lengths.push(orig_len);
-            let sample = Self::tokenize_sample(&text_sample, tokenizer, max_length)?;
+        // Parallel tokenization with rayon — tokenizers::Tokenizer is Send+Sync
+        use rayon::prelude::*;
+
+        let results: Vec<Result<(Sample, usize)>> = text_samples
+            .into_par_iter()
+            .map(|text_sample| {
+                let orig_len = tokenizer
+                    .encode_with_special_tokens(&text_sample.text)?
+                    .len();
+                let sample = Self::tokenize_sample(&text_sample, tokenizer, max_length)?;
+                Ok((sample, orig_len))
+            })
+            .collect();
+
+        let mut samples = Vec::with_capacity(n_samples);
+        let mut original_lengths = Vec::with_capacity(n_samples);
+        for result in results {
+            let (sample, orig_len) = result?;
             samples.push(sample);
+            original_lengths.push(orig_len);
         }
 
         Ok(Self {
