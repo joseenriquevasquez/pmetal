@@ -165,6 +165,17 @@ pub type EmbeddingResult<T> = Result<T, EmbeddingTrainerError>;
 /// Works with any model that implements [`TrainableModel`] — most commonly
 /// [`pmetal_models::architectures::bert::BertForEmbedding`], but also
 /// decoder-only models used as asymmetric embedders.
+///
+/// ## Causal LM Models
+///
+/// When using a causal (decoder-only) model as the backbone, the `forward` pass
+/// returns logits `[batch, seq_len, vocab_size]` rather than hidden states
+/// `[batch, seq_len, hidden_size]`.  You must wrap the model so that its
+/// `TrainableModel::forward` returns the encoder hidden states, not logits —
+/// for example by hooking into a penultimate layer.  Failing to do so will pass
+/// logits of shape `[batch, seq, vocab]` into the pooling layer, which will pool
+/// over the vocabulary dimension instead of the hidden dimension.  The resulting
+/// embeddings will be numerically valid but semantically meaningless.
 pub struct EmbeddingTrainer {
     /// Configuration.
     pub config: EmbeddingTrainerConfig,
@@ -515,6 +526,15 @@ impl EmbeddingTrainer {
     /// Encode a batch of texts into sentence embeddings (no gradient tracking).
     ///
     /// Useful for evaluation and similarity search after training.
+    ///
+    /// ## Warning: Causal LM output shape
+    ///
+    /// This method calls `model.forward(input_ids, attention_mask)` and feeds the
+    /// result directly into the pooling layer.  If the model is a causal LM whose
+    /// `forward` returns logits `[batch, seq, vocab]` instead of hidden states
+    /// `[batch, seq, hidden]`, pooling will operate over the vocabulary dimension,
+    /// producing embeddings of size `vocab_size` instead of `hidden_size`.
+    /// Wrap causal models to return hidden states before using this method.
     pub fn encode<M: TrainableModel>(
         &self,
         model: &mut M,

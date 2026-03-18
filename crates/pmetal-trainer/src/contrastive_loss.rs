@@ -98,6 +98,15 @@ pub fn cosent_loss(
     let pos_mask = labels_f.reshape(&[-1, 1])?.multiply(&labels_f.reshape(&[1, -1])?)?;
     let neg_mask = Array::from_f32(1.0).subtract(&pos_mask)?;
 
+    // Guard: CoSENT requires at least one positive pair; if all labels are 0 the
+    // pos_logits matrix is entirely -1e9 and logsumexp(-1e9) - logsumexp(actual)
+    // overflows to +inf.  Return zero loss instead.
+    let pos_count = pos_mask.sum(None)?;
+    pos_count.eval()?;
+    if pos_count.item::<f32>() < 0.5 {
+        return Ok(Array::from_f32(0.0));
+    }
+
     // Mask out diagonal (self-similarity is always pos=1, which is trivial)
     let batch = embeddings_a.dim(0);
     let diag_mask = diagonal_zeros(batch)?;

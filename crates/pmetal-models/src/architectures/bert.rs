@@ -291,7 +291,8 @@ impl BertSelfOutput {
 pub struct BertIntermediate {
     #[param]
     pub dense: nn::Linear,
-    /// Activation function name (stored for potential future dispatch).
+    /// Activation function name. Dispatched in `forward`: relu, silu/swish, tanh,
+    /// gelu (default for any unrecognized value).
     pub act: String,
 }
 
@@ -310,8 +311,12 @@ impl BertIntermediate {
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let h = Module::forward(&mut self.dense, x)?;
-        // BERT uses GELU; fall back to GELU for any unrecognised act string
-        nn::gelu(&h)
+        match self.act.as_str() {
+            "relu" => nn::relu(&h),
+            "silu" | "swish" => nn::silu(&h),
+            "tanh" => mlx_rs::ops::tanh(&h),
+            _ => nn::gelu(&h), // "gelu" and any unrecognized value default to GELU
+        }
     }
 }
 

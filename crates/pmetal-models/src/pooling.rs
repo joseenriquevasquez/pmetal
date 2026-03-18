@@ -81,25 +81,27 @@ pub fn pool(
             masked.max_axes(&[1], false)
         }
         PoolingMode::LastToken => {
-            // Sum attention mask to get actual lengths, then index last real token
-            let lengths = attention_mask
-                .as_dtype(mlx_rs::Dtype::Int32)?
-                .sum_axes(&[1], false)?; // [batch]
-            let last_indices = lengths.subtract(&Array::from_int(1))?; // [batch]
+            // Vectorized gather: compute last non-padding position per sequence and
+            // use take_along_axis to extract in a single operation (no Python-style loop).
+            let hidden_dim = hidden_states.dim(2);
 
-            // Gather last-token embeddings using a loop (avoids gather complexity)
-            let batch_size = batch as usize;
-            let _hidden_dim = hidden_states.dim(2);
-            let mut embeddings = Vec::with_capacity(batch_size);
-            for b in 0..batch_size as i32 {
-                let seq = hidden_states.index((b, .., ..)); // [seq_len, hidden_dim]
-                let idx_arr = last_indices.index(b); // scalar
-                let idx: i32 = idx_arr.item();
-                let emb = seq.index((idx, ..)); // [hidden_dim]
-                embeddings.push(emb);
-            }
-            let refs: Vec<&Array> = embeddings.iter().collect();
-            mlx_rs::ops::stack_axis(&refs, 0) // [batch, hidden_dim]
+            // lengths [batch] → last index [batch] as Int32
+            let last_indices = attention_mask
+                .as_dtype(mlx_rs::Dtype::Int32)?
+                .sum_axes(&[1], false)? // [batch]
+                .subtract(&Array::from_int(1))?; // [batch]
+
+            // Reshape to [batch, 1, 1] then broadcast to [batch, 1, hidden_dim]
+            // so take_along_axis can gather along the sequence dimension.
+            let indices_expanded = last_indices.reshape(&[batch, 1, 1])?;
+            let indices_broadcast =
+                mlx_rs::ops::broadcast_to(&indices_expanded, &[batch, 1, hidden_dim])?;
+
+            // take_along_axis(hidden_states, indices, axis=1) → [batch, 1, hidden_dim]
+            let gathered = hidden_states.take_along_axis(&indices_broadcast, 1)?;
+
+            // Squeeze the singleton seq dimension → [batch, hidden_dim]
+            gathered.squeeze_axes(&[1])
         }
         PoolingMode::WeightedMean => {
             // Linearly increasing weights: position i gets weight (i+1)
