@@ -436,8 +436,10 @@ impl FinetuneBuilder {
         let chat_template =
             pmetal_data::chat_templates::detect_chat_template(&model_path, &self.model_id);
 
-        // Load and tokenize training dataset
-        phase_yield!("Tokenizing dataset…");
+        // Load, tokenize, load model, and start training
+        // NOTE: Everything from here is blocking — no more status updates will
+        // reach the UI until training steps start producing metrics.
+        phase_yield!("Tokenizing dataset and loading model (this may take a moment)…");
         let train_dataset = TrainingDataset::from_jsonl_tokenized(
             &dataset_path,
             &tokenizer,
