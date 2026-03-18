@@ -167,7 +167,12 @@ impl TrainingTab {
             FormField::new("Flash Attention", "Enabled", FieldKind::Toggle, "Hardware"),
             FormField::new("Fused Optimizer", "Enabled", FieldKind::Toggle, "Hardware"),
             FormField::new("JIT Compilation", "Enabled", FieldKind::Toggle, "Hardware"),
-            FormField::new("Cut Cross-Entropy", "Disabled", FieldKind::Toggle, "Hardware"),
+            FormField::new(
+                "Cut Cross-Entropy",
+                "Disabled",
+                FieldKind::Toggle,
+                "Hardware",
+            ),
             FormField::new(
                 "ANE",
                 "Auto",

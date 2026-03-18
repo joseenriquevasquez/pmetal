@@ -80,10 +80,7 @@ impl GrpoTab {
             FormField::new(
                 "Max Image Size",
                 "336",
-                FieldKind::Integer {
-                    min: 64,
-                    max: 2048,
-                },
+                FieldKind::Integer { min: 64, max: 2048 },
                 "GRPO",
             ),
             // Reward Model
@@ -100,11 +97,19 @@ impl GrpoTab {
             FormField::new(
                 "RM Weight",
                 "1.0",
-                FieldKind::Number { min: 0.0, max: 10.0 },
+                FieldKind::Number {
+                    min: 0.0,
+                    max: 10.0,
+                },
                 "Reward Model",
             ),
             FormField::new("RM Template", "", FieldKind::Text, "Reward Model"),
-            FormField::new("Async Rewards", "Disabled", FieldKind::Toggle, "Reward Model"),
+            FormField::new(
+                "Async Rewards",
+                "Disabled",
+                FieldKind::Toggle,
+                "Reward Model",
+            ),
             // Training
             FormField::new(
                 "Learning Rate",
@@ -160,7 +165,12 @@ impl GrpoTab {
             ),
             // Hardware
             FormField::new("Flash Attention", "Enabled", FieldKind::Toggle, "Hardware"),
-            FormField::new("Speculative Decoding", "Disabled", FieldKind::Toggle, "Hardware"),
+            FormField::new(
+                "Speculative Decoding",
+                "Disabled",
+                FieldKind::Toggle,
+                "Hardware",
+            ),
             FormField::new(
                 "Draft Tokens",
                 "3",
@@ -178,7 +188,10 @@ impl GrpoTab {
             FormField::new(
                 "Distill Temperature",
                 "2.0",
-                FieldKind::Number { min: 0.5, max: 10.0 },
+                FieldKind::Number {
+                    min: 0.5,
+                    max: 10.0,
+                },
                 "RLKD",
             ),
             FormField::new("Anneal Alpha", "Enabled", FieldKind::Toggle, "RLKD"),
@@ -326,7 +339,10 @@ impl GrpoTab {
                 self.field_value("Final Alpha"),
                 self.field_value("Anneal Alpha"),
             ));
-            summary.push(format!("Temperature: {}", self.field_value("Distill Temperature")));
+            summary.push(format!(
+                "Temperature: {}",
+                self.field_value("Distill Temperature")
+            ));
         }
         if self.field_value("VLM Mode") == "Enabled" {
             summary.push(format!(
@@ -428,10 +444,7 @@ impl GrpoTab {
         // RLKD fields — only emitted when Teacher Model is set
         if use_rlkd {
             args.extend(["--teacher-model".into(), teacher]);
-            args.extend([
-                "--distill-alpha".into(),
-                self.field_value("Distill Alpha"),
-            ]);
+            args.extend(["--distill-alpha".into(), self.field_value("Distill Alpha")]);
             args.extend([
                 "--distill-temperature".into(),
                 self.field_value("Distill Temperature"),
@@ -439,10 +452,7 @@ impl GrpoTab {
             if self.field_value("Anneal Alpha") == "Enabled" {
                 args.push("--anneal-alpha".into());
             }
-            args.extend([
-                "--final-alpha".into(),
-                self.field_value("Final Alpha"),
-            ]);
+            args.extend(["--final-alpha".into(), self.field_value("Final Alpha")]);
         }
 
         args

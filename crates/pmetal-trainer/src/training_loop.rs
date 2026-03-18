@@ -334,16 +334,14 @@ fn jit_training_step_cce<M: TrainableModel, O: Optimizer>(
                     let shift_labels = labels.index((.., 1..));
                     let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
                     let flat_labels = shift_labels.reshape(&[-1])?;
-                    let ce = CrossEntropy::new()
-                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    let ce = CrossEntropy::new().map_err(|e| Exception::custom(e.to_string()))?;
                     let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
                     let ignore_val = Array::from_int(-100_i32).as_dtype(flat_labels.dtype())?;
                     let ignore_mask = flat_labels.ne(&ignore_val)?;
                     let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
                     let masked_loss = per_token_loss.multiply(&ignore_mask_f32)?;
                     let valid_count = ignore_mask_f32.sum(None)?;
-                    let safe_count =
-                        mlx_rs::ops::maximum(&valid_count, &Array::from_f32(1.0))?;
+                    let safe_count = mlx_rs::ops::maximum(&valid_count, &Array::from_f32(1.0))?;
                     masked_loss.sum(None)?.divide(&safe_count)
                 }
             }
@@ -387,12 +385,7 @@ fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
     if has_cce_support {
         let cached_weight = lm_weight_cached.expect("checked above");
         let loss_fn = |model: &mut M,
-                       (input_ids, labels, mask, pos_ids): (
-            &Array,
-            &Array,
-            &Array,
-            &Array,
-        )|
+                       (input_ids, labels, mask, pos_ids): (&Array, &Array, &Array, &Array)|
          -> std::result::Result<Array, Exception> {
             let hidden_opt = model.forward_hidden_with_positions(input_ids, Some(mask), pos_ids);
 
@@ -416,8 +409,7 @@ fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
                     let shift_labels = labels.index((.., 1..));
                     let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
                     let flat_labels = shift_labels.reshape(&[-1])?;
-                    let ce = CrossEntropy::new()
-                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    let ce = CrossEntropy::new().map_err(|e| Exception::custom(e.to_string()))?;
                     let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
                     let ignore_idx = if flat_labels.dtype() == mlx_rs::Dtype::Int64 {
                         Array::from_slice(&[-100_i64], &[1])
@@ -428,16 +420,17 @@ fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
                     let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
                     let masked_loss = per_token_loss.multiply(&ignore_mask_f32)?;
                     let valid_count = ignore_mask_f32.sum(None)?;
-                    let safe_count =
-                        mlx_rs::ops::maximum(&valid_count, &Array::from_f32(1.0))?;
+                    let safe_count = mlx_rs::ops::maximum(&valid_count, &Array::from_f32(1.0))?;
                     masked_loss.sum(None)?.divide(&safe_count)
                 }
             }
         };
 
         let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-        let (loss, mut grads) =
-            loss_and_grad_fn(model, (&input_ids_2d, &labels_2d, &attn_mask_4d, &position_ids))?;
+        let (loss, mut grads) = loss_and_grad_fn(
+            model,
+            (&input_ids_2d, &labels_2d, &attn_mask_4d, &position_ids),
+        )?;
 
         // Gradient clipping (same as jit_training_step_packed)
         if max_grad_norm > 0.0 {
@@ -1468,8 +1461,7 @@ impl TrainingLoop {
                     self.restore_best_weights(model);
                     // Rank-0 only: save checkpoint
                     #[cfg(feature = "distributed")]
-                    let should_checkpoint =
-                        self.distributed.as_ref().map_or(true, |d| d.is_master());
+                    let should_checkpoint = self.distributed.as_ref().is_none_or(|d| d.is_master());
                     #[cfg(not(feature = "distributed"))]
                     let should_checkpoint = true;
                     if should_checkpoint {
@@ -1561,7 +1553,7 @@ impl TrainingLoop {
                             // Rank-0 only: save best checkpoint
                             #[cfg(feature = "distributed")]
                             let should_ckpt =
-                                self.distributed.as_ref().map_or(true, |d| d.is_master());
+                                self.distributed.as_ref().is_none_or(|d| d.is_master());
                             #[cfg(not(feature = "distributed"))]
                             let should_ckpt = true;
                             if should_ckpt {
@@ -1577,7 +1569,7 @@ impl TrainingLoop {
                 if self.config.checkpoint_every > 0 && self.step % self.config.checkpoint_every == 0
                 {
                     #[cfg(feature = "distributed")]
-                    let should_ckpt = self.distributed.as_ref().map_or(true, |d| d.is_master());
+                    let should_ckpt = self.distributed.as_ref().is_none_or(|d| d.is_master());
                     #[cfg(not(feature = "distributed"))]
                     let should_ckpt = true;
                     if should_ckpt {
@@ -1756,7 +1748,7 @@ impl TrainingLoop {
                 if action == AdaptiveAction::EarlyStop {
                     self.restore_best_weights(model);
                     #[cfg(feature = "distributed")]
-                    let should_ckpt = self.distributed.as_ref().map_or(true, |d| d.is_master());
+                    let should_ckpt = self.distributed.as_ref().is_none_or(|d| d.is_master());
                     #[cfg(not(feature = "distributed"))]
                     let should_ckpt = true;
                     if should_ckpt {
@@ -1837,7 +1829,7 @@ impl TrainingLoop {
                             best_eval_loss = metrics.loss;
                             #[cfg(feature = "distributed")]
                             let should_ckpt =
-                                self.distributed.as_ref().map_or(true, |d| d.is_master());
+                                self.distributed.as_ref().is_none_or(|d| d.is_master());
                             #[cfg(not(feature = "distributed"))]
                             let should_ckpt = true;
                             if should_ckpt {
@@ -1853,7 +1845,7 @@ impl TrainingLoop {
                 if self.config.checkpoint_every > 0 && self.step % self.config.checkpoint_every == 0
                 {
                     #[cfg(feature = "distributed")]
-                    let should_ckpt = self.distributed.as_ref().map_or(true, |d| d.is_master());
+                    let should_ckpt = self.distributed.as_ref().is_none_or(|d| d.is_master());
                     #[cfg(not(feature = "distributed"))]
                     let should_ckpt = true;
                     if should_ckpt {
