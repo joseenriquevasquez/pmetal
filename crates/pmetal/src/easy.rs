@@ -402,16 +402,32 @@ impl FinetuneBuilder {
             }
         };
 
+        // Helper: set status and briefly yield so the tokio runtime can deliver
+        // the event to the frontend before the next blocking phase.
+        // After non-Send types (MLX Arrays) are created, we can no longer yield,
+        // so we only use the yield for early phases.
+        macro_rules! phase_yield {
+            ($msg:expr) => {
+                status($msg);
+                tokio::task::yield_now().await;
+            };
+        }
+        macro_rules! phase {
+            ($msg:expr) => {
+                status($msg);
+            };
+        }
+
         // Resolve model path (uses cache if available, downloads if needed)
-        status("Resolving model…");
+        phase_yield!("Resolving model…");
         let model_path = resolve_model_path(&self.model_id).await?;
 
         // Resolve dataset path
-        status("Resolving dataset…");
+        phase_yield!("Resolving dataset…");
         let dataset_path = resolve_dataset_path(&self.dataset_path).await?;
 
         // Load tokenizer
-        status("Loading tokenizer…");
+        phase_yield!("Loading tokenizer…");
         let tokenizer = Tokenizer::from_model_dir(&model_path).map_err(|e| {
             PMetalError::ModelLoad(format!("Failed to load tokenizer from {model_path:?}: {e}"))
         })?;
@@ -421,7 +437,7 @@ impl FinetuneBuilder {
             pmetal_data::chat_templates::detect_chat_template(&model_path, &self.model_id);
 
         // Load and tokenize training dataset
-        status("Tokenizing dataset…");
+        phase_yield!("Tokenizing dataset…");
         let train_dataset = TrainingDataset::from_jsonl_tokenized(
             &dataset_path,
             &tokenizer,
@@ -471,7 +487,7 @@ impl FinetuneBuilder {
         };
 
         // Initialize model with LoRA adapters
-        status("Loading model and initializing LoRA adapters…");
+        phase!("Loading model and initializing LoRA adapters…");
         let model =
             DynamicLoraModel::from_pretrained(&model_path, lora_config).map_err(model_err)?;
 
@@ -538,7 +554,7 @@ impl FinetuneBuilder {
         }
 
         // Run training (sequence packing by default)
-        status("Training…");
+        phase!("Training…");
         let model = if use_sequence_packing {
             training_loop
                 .run_packed(
