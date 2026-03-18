@@ -3769,8 +3769,7 @@ async fn run_distillation_cli(
         loraplus_lr_ratio: None,
         neftune_noise_alpha: None,
         use_cut_cross_entropy: false,
-        #[cfg(feature = "distributed")]
-        distributed: None,
+        ..Default::default()
     };
 
     let mut trainer = DistillationTrainer::new(distiller, training_loop_config);
@@ -4159,8 +4158,7 @@ async fn run_grpo_cli(
         loraplus_lr_ratio: None,
         neftune_noise_alpha: None,
         use_cut_cross_entropy: false,
-        #[cfg(feature = "distributed")]
-        distributed: None,
+        ..Default::default()
     };
 
     let mut trainer = GrpoTrainer::new(grpo_config, training_config)?;

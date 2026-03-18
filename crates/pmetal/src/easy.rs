@@ -408,8 +408,7 @@ impl FinetuneBuilder {
             loraplus_lr_ratio: None,
             neftune_noise_alpha: None,
             use_cut_cross_entropy: false,
-            #[cfg(feature = "distributed")]
-            distributed: None,
+            ..Default::default()
         };
 
         let mut training_loop = TrainingLoop::new(training_loop_config);
