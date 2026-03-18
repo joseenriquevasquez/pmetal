@@ -294,10 +294,32 @@ impl TrainingDataset {
         let results: Vec<Result<(Sample, usize)>> = text_samples
             .into_par_iter()
             .map(|text_sample| {
-                let orig_len = tokenizer
-                    .encode_with_special_tokens(&text_sample.text)?
-                    .len();
-                let sample = Self::tokenize_sample(&text_sample, tokenizer, max_length)?;
+                // Encode once, use for both orig_len tracking and the sample
+                let mut input_ids = tokenizer.encode_with_special_tokens(&text_sample.text)?;
+                let orig_len = input_ids.len();
+
+                if input_ids.len() > max_length {
+                    input_ids.truncate(max_length);
+                }
+
+                let labels = if let Some(ref prompt) = text_sample.prompt {
+                    let prompt_ids = tokenizer.encode_with_special_tokens(prompt)?;
+                    let prompt_len = prompt_ids.len().min(input_ids.len());
+                    let mut labels: Vec<i64> = input_ids.iter().map(|&id| id as i64).collect();
+                    for label in labels.iter_mut().take(prompt_len) {
+                        *label = -100;
+                    }
+                    Some(labels)
+                } else {
+                    Some(input_ids.iter().map(|&id| id as i64).collect())
+                };
+
+                let sample = Sample {
+                    attention_mask: vec![1; input_ids.len()],
+                    input_ids,
+                    labels,
+                    images: None,
+                };
                 Ok((sample, orig_len))
             })
             .collect();

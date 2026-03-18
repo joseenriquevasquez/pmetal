@@ -51,7 +51,7 @@
   let lrScheduler = $state('cosine');
   let saveSteps = $state(500);
   let loggingSteps = $state(10);
-  let outputDir = $state('');
+  let outputDir = $state('./output');
   let resumeFrom = $state('');
   let loadIn4bit = $state(true);
 
