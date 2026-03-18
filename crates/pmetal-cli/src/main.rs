@@ -27,8 +27,8 @@ use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::ollama::{ModelfileBuilder, templates as ollama_templates};
 use pmetal_models::{DynamicModel, WeightFormat};
 use pmetal_trainer::{
-    CheckpointManager, GrpoConfig, GrpoTrainer, MetricsJsonCallback, TrainingLoop,
-    TrainingLoopConfig,
+    CheckpointManager, GrpoConfig, GrpoTrainer, MetricsJsonCallback, RlkdConfig, RlkdTrainer,
+    TrainingLoop, TrainingLoopConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -293,6 +293,13 @@ enum Commands {
         #[arg(long, default_value = "42")]
         seed: u64,
 
+        /// Use Cut Cross-Entropy for memory-efficient loss computation.
+        ///
+        /// Avoids materializing the full [batch, seq, vocab] logits tensor, saving
+        /// up to 37x peak memory for large-vocabulary models (e.g. Qwen3 with 150K tokens).
+        #[arg(long)]
+        cut_cross_entropy: bool,
+
         /// Disable ANE (Apple Neural Engine) for training, falling back to GPU/MLX.
         #[cfg(feature = "ane")]
         #[arg(long)]
@@ -541,7 +548,7 @@ enum Commands {
         low_memory: bool,
     },
 
-    /// Quantize a model to GGUF format (supports Dynamic 2.0)
+    /// Quantize a model to GGUF format (supports Dynamic 2.0 and KL-calibrated)
     Quantize {
         /// Source model path (Safetensors/HF)
         #[arg(short, long)]
@@ -562,6 +569,23 @@ enum Commands {
         /// LoRA adapter to fuse before quantizing (optional)
         #[arg(long)]
         lora: Option<String>,
+
+        /// Use KL-divergence calibration for per-tensor quantization type selection.
+        /// Tests multiple quantization types per tensor and picks the one minimizing
+        /// quality loss while meeting the threshold and optional BPW budget.
+        #[arg(long)]
+        kl_calibrate: bool,
+
+        /// Target average bits per weight for KL calibration (e.g. 4.5).
+        /// When set, the calibrator will downgrade low-impact tensors until the
+        /// budget is satisfied.
+        #[arg(long)]
+        target_bpw: Option<f32>,
+
+        /// Quality-loss threshold for KL calibration (default: 0.01).
+        /// Lower values preserve more quality; higher values allow more compression.
+        #[arg(long, default_value = "0.01")]
+        kl_threshold: f64,
     },
 
     /// Knowledge Distillation from teacher to student
@@ -701,7 +725,183 @@ enum Commands {
         #[arg(long)]
         no_flash_attention: bool,
 
+        /// Enable VLM (Vision-Language Model) mode for GRPO with image inputs.
+        ///
+        /// When set, images are loaded from each dataset sample's `images` field,
+        /// passed to reward functions, and used in forward passes via
+        /// `forward_with_images`.  Requires a multimodal dataset (JSONL with
+        /// `"images": ["/path/to/img.jpg", ...]` per sample).
+        #[arg(long)]
+        vlm: bool,
+
+        /// Maximum image size (pixels per side) for VLM preprocessing.
+        ///
+        /// Images are resized to fit within a square of this size while maintaining
+        /// aspect ratio.  336 matches CLIP ViT-L/14; 448 and 560 are common for
+        /// larger vision encoders.
+        #[arg(long, default_value = "336")]
+        max_image_size: usize,
+
+        /// Path to a pretrained ML reward model for scoring completions.
+        ///
+        /// When set, the model is loaded at training start and used alongside any
+        /// heuristic reward functions.  Accepts a local model directory or a
+        /// HuggingFace model ID (e.g. "RLHFlow/ArmoRM-Llama3-8B-v0.1").
+        ///
+        /// The reward model runs inference-only — it is not fine-tuned.
+        #[arg(long)]
+        reward_model: Option<String>,
+
+        /// Maximum input sequence length for the ML reward model (tokens).
+        ///
+        /// Inputs longer than this are truncated from the right.
+        #[arg(long, default_value = "2048")]
+        reward_model_max_length: usize,
+
+        /// Weight for the ML reward model in the combined reward.
+        ///
+        /// The final reward is a weighted sum of all reward functions.  Set to
+        /// a value less than 1.0 to blend the ML reward with heuristic rewards.
+        #[arg(long, default_value = "1.0")]
+        reward_model_weight: f64,
+
+        /// Chat template for the reward model (optional).
+        ///
+        /// Use `{prompt}` and `{completion}` as placeholders, e.g.:
+        /// `"Human: {prompt}\nAssistant: {completion}"`
+        ///
+        /// When omitted, prompt and completion are concatenated directly.
+        #[arg(long)]
+        reward_model_template: Option<String>,
+
+        /// Enable speculative decoding for faster rollout generation.
+        ///
+        /// Uses a draft/verify approach: generate `--speculative-draft-tokens` cheap
+        /// draft tokens, then verify them all in a single batched forward pass.
+        /// Expected speedup: 2–4x over standard autoregressive generation.
+        ///
+        /// Automatically disabled for models that do not support KV caching.
+        #[arg(long)]
+        speculative: bool,
+
+        /// Number of draft tokens per speculative decode step (default: 3).
+        ///
+        /// Higher values yield more throughput at high acceptance rates but increase
+        /// overhead when the draft distribution diverges from the full model.
+        /// Typical range: 2–5.  Ignored unless `--speculative` is set.
+        #[arg(long, default_value = "3")]
+        speculative_draft_tokens: usize,
+
+        /// Enable pipelined (asynchronous) reward scoring.
+        ///
+        /// When set, reward scoring for step N runs in a background thread
+        /// concurrently with GPU training for step N+1.  This is most effective
+        /// when using an ML reward model (`--reward-model`) whose inference is
+        /// CPU- or ANE-bound while the policy model trains on the GPU.
+        ///
+        /// For pure heuristic rewards (format, accuracy), the scoring is
+        /// so fast that pipelining provides negligible benefit.
+        #[arg(long)]
+        async_rewards: bool,
+
         /// Path to write JSONL metrics log (for TUI dashboard)
+        #[arg(long)]
+        log_metrics: Option<String>,
+    },
+
+    /// RLKD: Reinforcement Learning with Knowledge Distillation.
+    ///
+    /// Combines GRPO policy gradient optimization with knowledge distillation
+    /// from a teacher model in a single training loop.
+    ///
+    /// Loss formula: L = (1 - alpha) * L_grpo + alpha * L_distill
+    Rlkd {
+        /// Policy (student) model ID or local path.
+        #[arg(short, long)]
+        model: String,
+
+        /// Teacher model ID or local path (frozen, provides soft targets).
+        #[arg(long)]
+        teacher_model: String,
+
+        /// Dataset path (JSONL with prompts).
+        #[arg(short, long)]
+        dataset: String,
+
+        /// Output directory for LoRA adapter weights.
+        #[arg(short, long, default_value = "./output/rlkd")]
+        output: String,
+
+        /// Distillation blend factor: 0.0 = pure RL, 1.0 = pure distillation.
+        ///
+        /// When `--anneal-alpha` is set this is the starting value; the factor
+        /// is linearly annealed toward `--final-alpha` over training.
+        #[arg(long, default_value = "0.3")]
+        distill_alpha: f32,
+
+        /// Final alpha value when annealing (default: 0.05 = mostly RL by end).
+        #[arg(long, default_value = "0.05")]
+        final_alpha: f32,
+
+        /// Linearly anneal alpha from `--distill-alpha` toward `--final-alpha`.
+        ///
+        /// This shifts training from distillation-guided early on to RL-driven
+        /// at the end, which typically improves final task performance.
+        #[arg(long)]
+        anneal_alpha: bool,
+
+        /// Temperature for distillation soft targets (default: 2.0).
+        ///
+        /// Higher temperatures soften the teacher distribution, transferring
+        /// more information about non-dominant token probabilities.
+        #[arg(long, default_value = "2.0")]
+        distill_temperature: f32,
+
+        /// Number of completions to generate per prompt (GRPO group size).
+        #[arg(long, default_value = "8")]
+        num_generations: usize,
+
+        /// KL penalty coefficient (beta) for GRPO reference model regularization.
+        #[arg(long, default_value = "0.001")]
+        beta: f64,
+
+        /// Learning rate.
+        #[arg(long, default_value = "5e-6")]
+        learning_rate: f64,
+
+        /// Number of training epochs.
+        #[arg(long, default_value = "1")]
+        epochs: usize,
+
+        /// LoRA rank for the policy model.
+        #[arg(long, default_value = "16")]
+        lora_r: usize,
+
+        /// LoRA alpha scaling factor.
+        #[arg(long, default_value = "32")]
+        lora_alpha: f32,
+
+        /// Maximum sequence length (prompt + completion).
+        #[arg(long, default_value = "512")]
+        max_seq_len: usize,
+
+        /// Maximum completion length per generation.
+        #[arg(long, default_value = "512")]
+        max_completion_length: usize,
+
+        /// Random seed for reproducibility.
+        #[arg(long, default_value = "42")]
+        seed: u64,
+
+        /// Use reasoning-aware rewards (format + length signals).
+        #[arg(long)]
+        reasoning_rewards: bool,
+
+        /// Disable Metal FlashAttention.
+        #[arg(long)]
+        no_flash_attention: bool,
+
+        /// Path to write JSONL metrics log (for TUI dashboard).
         #[arg(long)]
         log_metrics: Option<String>,
     },
@@ -826,6 +1026,83 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// Train a sentence embedding model (BERT / encoder-only) with contrastive losses.
+    ///
+    /// Supports InfoNCE (default), triplet, CoSENT, and cosine-similarity losses.
+    /// Input data must be JSONL with pair or triplet format.
+    ///
+    /// Pair JSONL:
+    ///   {"text_a": "...", "text_b": "...", "label": 0.9}
+    ///   {"sentence1": "...", "sentence2": "..."}
+    ///   {"query": "...", "positive": "..."}
+    ///
+    /// Triplet JSONL:
+    ///   {"anchor": "...", "positive": "...", "negative": "..."}
+    #[command(name = "embed-train")]
+    EmbedTrain {
+        /// Path to the BERT / encoder model directory.
+        #[arg(short, long)]
+        model: String,
+
+        /// Path to the training dataset (JSONL pairs or triplets).
+        #[arg(short, long)]
+        dataset: String,
+
+        /// Output directory for trained model weights.
+        #[arg(short, long, default_value = "./output-embed")]
+        output: String,
+
+        /// Contrastive loss function.
+        /// Options: info_nce (default), mnrl, triplet, cosent, cosine_similarity
+        #[arg(long, default_value = "info_nce")]
+        loss: String,
+
+        /// Pooling strategy for sentence embeddings.
+        /// Options: mean (default), cls, max, last_token, weighted_mean
+        #[arg(long, default_value = "mean")]
+        pooling: String,
+
+        /// Temperature for InfoNCE / CoSENT losses.
+        #[arg(long, default_value = "0.05")]
+        temperature: f32,
+
+        /// Margin for triplet loss.
+        #[arg(long, default_value = "0.3")]
+        margin: f32,
+
+        /// Learning rate.
+        #[arg(long, default_value = "2e-5")]
+        learning_rate: f64,
+
+        /// Training batch size.
+        #[arg(long, default_value = "32")]
+        batch_size: usize,
+
+        /// Number of training epochs.
+        #[arg(long, default_value = "3")]
+        epochs: usize,
+
+        /// Maximum input sequence length.
+        #[arg(long, default_value = "512")]
+        max_seq_len: usize,
+
+        /// AdamW weight decay.
+        #[arg(long, default_value = "0.01")]
+        weight_decay: f64,
+
+        /// Disable L2 normalisation of embeddings before loss.
+        #[arg(long)]
+        no_normalize: bool,
+
+        /// Log training progress every N steps.
+        #[arg(long, default_value = "10")]
+        log_every: usize,
+
+        /// Random seed for dataset shuffling.
+        #[arg(long, default_value = "42")]
+        seed: u64,
     },
 }
 
@@ -1580,6 +1857,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             lr_schedule,
             weight_decay,
             seed,
+            cut_cross_entropy,
             #[cfg(feature = "ane")]
             no_ane,
             #[cfg(feature = "distributed")]
@@ -1652,6 +1930,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 &lr_schedule,
                 weight_decay,
                 seed,
+                cut_cross_entropy,
                 #[cfg(feature = "ane")]
                 !no_ane,
                 #[cfg(not(feature = "ane"))]
@@ -1847,16 +2126,37 @@ async fn tokio_main() -> anyhow::Result<()> {
             imatrix,
             method,
             lora,
+            kl_calibrate,
+            target_bpw,
+            kl_threshold,
         } => {
             if let Some(lora_path) = &lora {
                 // Fuse LoRA first, then quantize the fused model
                 let fused_dir = format!("{output}.fused_tmp");
                 run_fuse(&model, lora_path, &fused_dir, None, None).await?;
-                run_quantization(&fused_dir, &output, imatrix.as_deref(), method).await?;
+                run_quantization(
+                    &fused_dir,
+                    &output,
+                    imatrix.as_deref(),
+                    method,
+                    kl_calibrate,
+                    target_bpw,
+                    kl_threshold,
+                )
+                .await?;
                 // Clean up temp dir
                 let _ = std::fs::remove_dir_all(&fused_dir);
             } else {
-                run_quantization(&model, &output, imatrix.as_deref(), method).await?;
+                run_quantization(
+                    &model,
+                    &output,
+                    imatrix.as_deref(),
+                    method,
+                    kl_calibrate,
+                    target_bpw,
+                    kl_threshold,
+                )
+                .await?;
             }
         }
 
@@ -1921,6 +2221,15 @@ async fn tokio_main() -> anyhow::Result<()> {
             dapo,
             reasoning_rewards,
             no_flash_attention,
+            vlm,
+            max_image_size,
+            reward_model,
+            reward_model_max_length,
+            reward_model_weight,
+            reward_model_template,
+            async_rewards,
+            speculative,
+            speculative_draft_tokens,
             log_metrics,
         } => {
             run_grpo_cli(
@@ -1937,6 +2246,64 @@ async fn tokio_main() -> anyhow::Result<()> {
                 max_completion_length,
                 seed,
                 dapo,
+                reasoning_rewards,
+                !no_flash_attention,
+                vlm,
+                max_image_size,
+                reward_model,
+                reward_model_max_length,
+                reward_model_weight,
+                reward_model_template,
+                async_rewards,
+                speculative,
+                speculative_draft_tokens,
+                log_metrics,
+                true,
+                Vec::new(),
+            )
+            .await?;
+        }
+
+        Commands::Rlkd {
+            model,
+            teacher_model,
+            dataset,
+            output,
+            distill_alpha,
+            final_alpha,
+            anneal_alpha,
+            distill_temperature,
+            num_generations,
+            beta,
+            learning_rate,
+            epochs,
+            lora_r,
+            lora_alpha,
+            max_seq_len,
+            max_completion_length,
+            seed,
+            reasoning_rewards,
+            no_flash_attention,
+            log_metrics,
+        } => {
+            run_rlkd_cli(
+                &model,
+                &teacher_model,
+                &dataset,
+                &output,
+                distill_alpha,
+                final_alpha,
+                anneal_alpha,
+                distill_temperature,
+                num_generations,
+                beta,
+                learning_rate,
+                epochs,
+                lora_r,
+                lora_alpha,
+                max_seq_len,
+                max_completion_length,
+                seed,
                 reasoning_rewards,
                 !no_flash_attention,
                 log_metrics,
@@ -2010,8 +2377,385 @@ async fn tokio_main() -> anyhow::Result<()> {
             )
             .await?;
         }
+
+        Commands::EmbedTrain {
+            model,
+            dataset,
+            output,
+            loss,
+            pooling,
+            temperature,
+            margin,
+            learning_rate,
+            batch_size,
+            epochs,
+            max_seq_len,
+            weight_decay,
+            no_normalize,
+            log_every,
+            seed,
+        } => {
+            run_embed_train(
+                &model,
+                &dataset,
+                &output,
+                &loss,
+                &pooling,
+                temperature,
+                margin,
+                learning_rate,
+                batch_size,
+                epochs,
+                max_seq_len,
+                weight_decay,
+                !no_normalize,
+                log_every,
+                seed,
+            )
+            .await?;
+        }
     }
 
+    Ok(())
+}
+
+/// Run embedding / sentence-transformer training.
+#[allow(clippy::too_many_arguments)]
+async fn run_embed_train(
+    model_path: &str,
+    dataset_path: &str,
+    output_dir: &str,
+    loss_str: &str,
+    pooling_str: &str,
+    temperature: f32,
+    margin: f32,
+    learning_rate: f64,
+    batch_size: usize,
+    epochs: usize,
+    max_seq_len: usize,
+    weight_decay: f64,
+    normalize: bool,
+    log_every: usize,
+    seed: u64,
+) -> anyhow::Result<()> {
+    use mlx_rs::optimizers::{AdamWBuilder, Optimizer};
+    use pmetal_data::EmbeddingDataset;
+    use pmetal_models::architectures::bert::BertForEmbedding;
+    use pmetal_models::pooling::PoolingMode;
+    use pmetal_trainer::embedding_trainer::{
+        EmbeddingLossType, EmbeddingTrainer, EmbeddingTrainerConfig,
+    };
+
+    // Parse loss type
+    let loss_type = match loss_str {
+        "info_nce" | "infonce" => EmbeddingLossType::InfoNce,
+        "mnrl" | "multiple_negatives" => EmbeddingLossType::Mnrl,
+        "triplet" => EmbeddingLossType::Triplet,
+        "cosent" => EmbeddingLossType::CoSent,
+        "cosine" | "cosine_similarity" => EmbeddingLossType::CosineSimilarity,
+        other => {
+            anyhow::bail!(
+                "Unknown loss type '{}'. Choose one of: info_nce, mnrl, triplet, cosent, cosine_similarity",
+                other
+            );
+        }
+    };
+
+    // Parse pooling mode
+    let pooling_mode = match pooling_str {
+        "mean" => PoolingMode::Mean,
+        "cls" => PoolingMode::Cls,
+        "max" => PoolingMode::Max,
+        "last_token" | "last" => PoolingMode::LastToken,
+        "weighted_mean" | "weighted" => PoolingMode::WeightedMean,
+        other => {
+            anyhow::bail!(
+                "Unknown pooling mode '{}'. Choose one of: mean, cls, max, last_token, weighted_mean",
+                other
+            );
+        }
+    };
+
+    tracing::info!("Loading tokenizer from '{}'", model_path);
+    let tokenizer = Tokenizer::from_model_dir(model_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+
+    tracing::info!("Loading BERT config from '{}'", model_path);
+    let config_path = std::path::Path::new(model_path).join("config.json");
+    let config_str = std::fs::read_to_string(&config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read config.json: {}", e))?;
+    let mut model = BertForEmbedding::from_config_str(&config_str)
+        .map_err(|e| anyhow::anyhow!("Failed to build BERT model: {}", e))?;
+
+    // Load pretrained weights
+    tracing::info!("Loading weights from '{}'", model_path);
+    pmetal_models::loader::load_generic_weights(&mut model, model_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load weights: {:?}", e))?;
+
+    tracing::info!("Loading dataset from '{}'", dataset_path);
+    let dataset = EmbeddingDataset::from_jsonl(dataset_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load dataset: {}", e))?;
+    tracing::info!("Loaded {} examples ({:?})", dataset.len(),
+        match &dataset { EmbeddingDataset::Pairs(_) => "pairs", EmbeddingDataset::Triplets(_) => "triplets" });
+
+    // Build optimizer
+    let optimizer = AdamWBuilder::new(learning_rate as f32)
+        .weight_decay(weight_decay as f32)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build optimizer: {}", e))?;
+    let mut optimizer = optimizer;
+
+    // Build trainer config
+    let mut training_cfg = pmetal_core::TrainingConfig::default();
+    training_cfg.batch_size = batch_size;
+    training_cfg.num_epochs = epochs;
+
+    let config = EmbeddingTrainerConfig {
+        training: training_cfg,
+        loss_type,
+        temperature,
+        margin,
+        pooling_mode,
+        normalize,
+        max_seq_len,
+        log_every,
+        seed,
+        shuffle: true,
+    };
+
+    let trainer = EmbeddingTrainer::new(config);
+    tracing::info!(
+        "Starting embedding training: loss={}, pooling={}, T={}, batch={}, epochs={}",
+        loss_str,
+        pooling_str,
+        temperature,
+        batch_size,
+        epochs
+    );
+
+    // For BERT we can use a DynamicLoraModel-like wrapper, but since BertForEmbedding
+    // is not yet in the LoRA dispatch, we call into the trainer directly via the
+    // generic TrainableModel bound. We use a thin adapter.
+    //
+    // NOTE: BertForEmbedding implements ModuleParameters via #[derive(ModuleParameters)],
+    // but not TrainableModel (which also requires LoRA bookkeeping methods). For now,
+    // we run the training loop manually, which mirrors how EmbeddingTrainer works
+    // internally. The full TrainableModel impl for BERT (with LoRA) is a follow-on task.
+
+    tracing::info!("Running training epochs...");
+    let n_epochs = trainer.config.training.num_epochs;
+    let log_every = trainer.config.log_every;
+
+    // Manual training loop using the encode_and_loss helpers exposed by the trainer
+    // until BertForEmbedding implements TrainableModel.
+    use pmetal_models::pooling::{normalize_embeddings, pool};
+    use mlx_rs::{nn, module::ModuleParameters, transforms::eval_params};
+    use pmetal_trainer::contrastive_loss;
+
+    let actual_batch_size = trainer.config.training.batch_size;
+    let max_len = trainer.config.max_seq_len;
+    let loss_type_copy = trainer.config.loss_type;
+    let temperature_copy = trainer.config.temperature;
+    let margin_copy = trainer.config.margin;
+    let pooling_copy = trainer.config.pooling_mode;
+    let normalize_copy = trainer.config.normalize;
+
+    let mut step = 0usize;
+
+    match dataset {
+        EmbeddingDataset::Pairs(ref pairs) => {
+            let mut indices: Vec<usize> = (0..pairs.len()).collect();
+            for epoch in 0..n_epochs {
+                use rand::SeedableRng;
+                use rand::seq::SliceRandom;
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed.wrapping_add(epoch as u64));
+                indices.shuffle(&mut rng);
+
+                let n_batches = (pairs.len() + actual_batch_size - 1) / actual_batch_size;
+                for batch_idx in 0..n_batches {
+                    let start = batch_idx * actual_batch_size;
+                    let end = (start + actual_batch_size).min(pairs.len());
+                    let batch: Vec<&pmetal_data::EmbeddingPair> =
+                        indices[start..end].iter().map(|&i| &pairs[i]).collect();
+
+                    // Tokenize
+                    let pad_id = tokenizer.pad_token_id().unwrap_or(0) as i32;
+                    let mut ids_a_raw: Vec<Vec<i32>> = Vec::new();
+                    let mut ids_b_raw: Vec<Vec<i32>> = Vec::new();
+                    let mut actual_max_a = 0usize;
+                    let mut actual_max_b = 0usize;
+                    for p in &batch {
+                        let a: Vec<i32> = tokenizer.encode(&p.text_a)
+                            .unwrap_or_default()
+                            .iter().take(max_len).map(|&x| x as i32).collect();
+                        let b: Vec<i32> = tokenizer.encode(&p.text_b)
+                            .unwrap_or_default()
+                            .iter().take(max_len).map(|&x| x as i32).collect();
+                        actual_max_a = actual_max_a.max(a.len());
+                        actual_max_b = actual_max_b.max(b.len());
+                        ids_a_raw.push(a);
+                        ids_b_raw.push(b);
+                    }
+                    let bs = batch.len();
+                    let mut flat_a = vec![pad_id; bs * actual_max_a];
+                    let mut mask_a = vec![0i32; bs * actual_max_a];
+                    let mut flat_b = vec![pad_id; bs * actual_max_b];
+                    let mut mask_b = vec![0i32; bs * actual_max_b];
+                    for (i, (a, b)) in ids_a_raw.iter().zip(ids_b_raw.iter()).enumerate() {
+                        for (j, &id) in a.iter().enumerate() {
+                            flat_a[i * actual_max_a + j] = id;
+                            mask_a[i * actual_max_a + j] = 1;
+                        }
+                        for (j, &id) in b.iter().enumerate() {
+                            flat_b[i * actual_max_b + j] = id;
+                            mask_b[i * actual_max_b + j] = 1;
+                        }
+                    }
+                    let ids_a = mlx_rs::Array::from_slice(&flat_a, &[bs as i32, actual_max_a as i32]);
+                    let m_a   = mlx_rs::Array::from_slice(&mask_a, &[bs as i32, actual_max_a as i32]);
+                    let ids_b = mlx_rs::Array::from_slice(&flat_b, &[bs as i32, actual_max_b as i32]);
+                    let m_b   = mlx_rs::Array::from_slice(&mask_b, &[bs as i32, actual_max_b as i32]);
+                    let labels_data: Vec<f32> = batch.iter().map(|p| p.label.unwrap_or(1.0)).collect();
+                    let labels = mlx_rs::Array::from_slice(&labels_data, &[bs as i32]);
+
+                    let loss_fn = |m: &mut BertForEmbedding,
+                                   (ia, ma, ib, mb, lbl): (&mlx_rs::Array, &mlx_rs::Array, &mlx_rs::Array, &mlx_rs::Array, &mlx_rs::Array)|
+                     -> Result<mlx_rs::Array, mlx_rs::error::Exception> {
+                        let ha = m.forward(ia, Some(ma))?;
+                        let hb = m.forward(ib, Some(mb))?;
+                        let ea = pool(&ha, ma, pooling_copy)?;
+                        let eb = pool(&hb, mb, pooling_copy)?;
+                        let ea = if normalize_copy { normalize_embeddings(&ea)? } else { ea };
+                        let eb = if normalize_copy { normalize_embeddings(&eb)? } else { eb };
+                        match loss_type_copy {
+                            EmbeddingLossType::InfoNce | EmbeddingLossType::Mnrl =>
+                                contrastive_loss::info_nce_loss(&ea, &eb, temperature_copy),
+                            EmbeddingLossType::CoSent =>
+                                contrastive_loss::cosent_loss(&ea, &eb, lbl, temperature_copy),
+                            EmbeddingLossType::CosineSimilarity =>
+                                contrastive_loss::cosine_similarity_loss(&ea, &eb, lbl),
+                            EmbeddingLossType::Triplet =>
+                                contrastive_loss::info_nce_loss(&ea, &eb, temperature_copy),
+                        }
+                    };
+
+                    let mut lag = nn::value_and_grad(loss_fn);
+                    let (loss, grads) = lag(&mut model, (&ids_a, &m_a, &ids_b, &m_b, &labels))
+                        .map_err(|e| anyhow::anyhow!("Forward/backward error: {}", e))?;
+                    optimizer.update(&mut model, grads)
+                        .map_err(|e| anyhow::anyhow!("Optimizer error: {}", e))?;
+                    eval_params(model.trainable_parameters())
+                        .map_err(|e| anyhow::anyhow!("Eval error: {}", e))?;
+
+                    step += 1;
+                    if step % log_every == 0 {
+                        let lv: f32 = loss.item();
+                        tracing::info!("step={} loss={:.4} epoch={}/{}", step, lv, epoch + 1, n_epochs);
+                    }
+                }
+                tracing::info!("Epoch {}/{} complete", epoch + 1, n_epochs);
+            }
+        }
+        EmbeddingDataset::Triplets(ref triplets) => {
+            let mut indices: Vec<usize> = (0..triplets.len()).collect();
+            for epoch in 0..n_epochs {
+                use rand::SeedableRng;
+                use rand::seq::SliceRandom;
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed.wrapping_add(epoch as u64));
+                indices.shuffle(&mut rng);
+
+                let n_batches = (triplets.len() + actual_batch_size - 1) / actual_batch_size;
+                for batch_idx in 0..n_batches {
+                    let start = batch_idx * actual_batch_size;
+                    let end = (start + actual_batch_size).min(triplets.len());
+                    let batch: Vec<&pmetal_data::EmbeddingTriplet> =
+                        indices[start..end].iter().map(|&i| &triplets[i]).collect();
+
+                    let pad_id = tokenizer.pad_token_id().unwrap_or(0) as i32;
+                    macro_rules! tok_batch {
+                        ($texts:expr) => {{
+                            let mut raw: Vec<Vec<i32>> = Vec::new();
+                            let mut mlen = 0usize;
+                            for t in $texts.iter() {
+                                let ids: Vec<i32> = tokenizer.encode(t).unwrap_or_default()
+                                    .iter().take(max_len).map(|&x| x as i32).collect();
+                                mlen = mlen.max(ids.len());
+                                raw.push(ids);
+                            }
+                            let bs2 = $texts.len();
+                            let mut flat = vec![pad_id; bs2 * mlen];
+                            let mut msk = vec![0i32; bs2 * mlen];
+                            for (i, ids) in raw.iter().enumerate() {
+                                for (j, &id) in ids.iter().enumerate() {
+                                    flat[i * mlen + j] = id;
+                                    msk[i * mlen + j] = 1;
+                                }
+                            }
+                            let ids_arr = mlx_rs::Array::from_slice(&flat, &[bs2 as i32, mlen as i32]);
+                            let msk_arr = mlx_rs::Array::from_slice(&msk, &[bs2 as i32, mlen as i32]);
+                            (ids_arr, msk_arr)
+                        }};
+                    }
+
+                    let anchors: Vec<&str> = batch.iter().map(|t| t.anchor.as_str()).collect();
+                    let positives: Vec<&str> = batch.iter().map(|t| t.positive.as_str()).collect();
+                    let negatives: Vec<&str> = batch.iter().map(|t| t.negative.as_str()).collect();
+                    let (ids_a, m_a) = tok_batch!(anchors);
+                    let (ids_p, m_p) = tok_batch!(positives);
+                    let (ids_n, m_n) = tok_batch!(negatives);
+
+                    let loss_fn = |m: &mut BertForEmbedding,
+                                   (ia, ma, ip, mp, i_n, mn): (&mlx_rs::Array, &mlx_rs::Array, &mlx_rs::Array, &mlx_rs::Array, &mlx_rs::Array, &mlx_rs::Array)|
+                     -> Result<mlx_rs::Array, mlx_rs::error::Exception> {
+                        let ha = m.forward(ia, Some(ma))?;
+                        let hp = m.forward(ip, Some(mp))?;
+                        let hn = m.forward(i_n, Some(mn))?;
+                        let ea = pool(&ha, ma, pooling_copy)?;
+                        let ep = pool(&hp, mp, pooling_copy)?;
+                        let en = pool(&hn, mn, pooling_copy)?;
+                        let ea = if normalize_copy { normalize_embeddings(&ea)? } else { ea };
+                        let ep = if normalize_copy { normalize_embeddings(&ep)? } else { ep };
+                        let en = if normalize_copy { normalize_embeddings(&en)? } else { en };
+                        contrastive_loss::triplet_loss(&ea, &ep, &en, margin_copy)
+                    };
+
+                    let mut lag = nn::value_and_grad(loss_fn);
+                    let (loss, grads) = lag(&mut model, (&ids_a, &m_a, &ids_p, &m_p, &ids_n, &m_n))
+                        .map_err(|e| anyhow::anyhow!("Forward/backward error: {}", e))?;
+                    optimizer.update(&mut model, grads)
+                        .map_err(|e| anyhow::anyhow!("Optimizer error: {}", e))?;
+                    eval_params(model.trainable_parameters())
+                        .map_err(|e| anyhow::anyhow!("Eval error: {}", e))?;
+
+                    step += 1;
+                    if step % log_every == 0 {
+                        let lv: f32 = loss.item();
+                        tracing::info!("step={} loss={:.4} epoch={}/{}", step, lv, epoch + 1, n_epochs);
+                    }
+                }
+                tracing::info!("Epoch {}/{} complete", epoch + 1, n_epochs);
+            }
+        }
+    }
+
+    // Save trained weights
+    tracing::info!("Saving trained model to '{}'", output_dir);
+    std::fs::create_dir_all(output_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create output dir: {}", e))?;
+    let output_path = std::path::Path::new(output_dir).join("model.safetensors");
+    use mlx_rs::module::ModuleParametersExt;
+    model.save_safetensors(&output_path)
+        .map_err(|e| anyhow::anyhow!("Failed to save weights: {}", e))?;
+
+    // Copy config.json and tokenizer files so the output is a complete model directory
+    for file in &["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"] {
+        let src = std::path::Path::new(model_path).join(file);
+        if src.exists() {
+            std::fs::copy(&src, std::path::Path::new(output_dir).join(file)).ok();
+        }
+    }
+
+    tracing::info!("Embedding training complete. Model saved to '{}'", output_dir);
     Ok(())
 }
 
@@ -2227,12 +2971,17 @@ async fn run_quantization(
     output_path: &str,
     imatrix_path: Option<&str>,
     method: QuantizeMethod,
+    kl_calibrate: bool,
+    target_bpw: Option<f32>,
+    kl_threshold: f64,
 ) -> anyhow::Result<()> {
     use pmetal_gguf::{
         GgufBuilder,
-        dynamic::{DynamicQuantizationConfig, DynamicQuantizer},
+        dynamic::{
+            CalibrationMap, DynamicQuantizationConfig, DynamicQuantizer, KlCalibrationConfig,
+        },
         imatrix::IMatrix,
-        quantize::quantize, // Import the function explicitly
+        quantize::quantize,
     };
     use std::path::{Path, PathBuf};
 
@@ -2244,6 +2993,12 @@ async fn run_quantization(
     println!("Method:   {}", method.as_str());
     if let Some(imp) = imatrix_path {
         println!("IMatrix:  {}", imp);
+    }
+    if kl_calibrate {
+        println!("KL Calib: enabled (threshold={:.4})", kl_threshold);
+        if let Some(bpw) = target_bpw {
+            println!("Target BPW: {:.2}", bpw);
+        }
     }
     println!("========================================\n");
 
@@ -2281,7 +3036,7 @@ async fn run_quantization(
         DynamicQuantizer::new(config, imatrix)
     };
 
-    // 4. Load Model Weights
+    // 3. Load Model Weights
     tracing::info!("Scanning model weights from {:?}...", resolved_model_path);
     // Use the loader from pmetal_models to handle sharded safetensors
     let weights = pmetal_models::loader::load_weights(&resolved_model_path)
@@ -2289,7 +3044,7 @@ async fn run_quantization(
 
     tracing::info!("Loaded {} tensors", weights.len());
 
-    // 5. Detect Architecture
+    // 4. Detect Architecture
     let config_path = resolved_model_path.join("config.json");
     let mut architecture = "llama".to_string(); // Default fallback
 
@@ -2326,6 +3081,86 @@ async fn run_quantization(
         tracing::warn!("config.json not found, defaulting architecture to 'llama'");
     }
 
+    // 5. KL-divergence calibration pass (optional).
+    //
+    // We need f32 weight data for both calibration and quantization.  To avoid
+    // loading weights twice, we materialise all float tensors into host memory
+    // now, store them in a map, and reuse them in the quantization loop below.
+    //
+    // For models with KL calibration disabled the map stays empty and the loop
+    // uses the standard tier-based path.
+    let mut float_cache: std::collections::HashMap<String, (Vec<f32>, Vec<i32>)> =
+        std::collections::HashMap::new();
+    let calibration_map: CalibrationMap;
+
+    if kl_calibrate {
+        println!("Running KL calibration pass over {} tensors...", weights.len());
+
+        // Materialise all float tensors.
+        let mut tensor_data: Vec<(String, Vec<f32>, Vec<i32>)> = Vec::new();
+        let mut sorted_names: Vec<_> = weights.keys().cloned().collect();
+        sorted_names.sort();
+
+        for name in &sorted_names {
+            let tensor = weights
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("Tensor {} missing after key listing", name))?;
+
+            tensor
+                .eval()
+                .map_err(|e| anyhow::anyhow!("MLX eval error for {}: {}", name, e))?;
+
+            let data_f32: Vec<f32> = match tensor.dtype() {
+                pmetal_mlx::Dtype::Float32 => tensor.as_slice::<f32>().to_vec(),
+                pmetal_mlx::Dtype::Float16 | pmetal_mlx::Dtype::Bfloat16 => {
+                    let t_f32 = tensor
+                        .as_dtype(pmetal_mlx::Dtype::Float32)
+                        .map_err(|e| anyhow::anyhow!("Dtype conversion error for {}: {}", name, e))?;
+                    t_f32
+                        .eval()
+                        .map_err(|e| anyhow::anyhow!("MLX eval error for {}: {}", name, e))?;
+                    t_f32.as_slice::<f32>().to_vec()
+                }
+                _ => continue, // Non-float tensors are not quantized; skip.
+            };
+
+            let shape_i32: Vec<i32> = tensor.shape().iter().map(|&d| d as i32).collect();
+            float_cache.insert(name.clone(), (data_f32.clone(), shape_i32.clone()));
+            tensor_data.push((name.clone(), data_f32, shape_i32));
+        }
+
+        let kl_config = KlCalibrationConfig {
+            kl_threshold,
+            target_bpw,
+            ..Default::default()
+        };
+
+        calibration_map = quantizer.calibrate_all(&tensor_data, &kl_config);
+
+        // Print summary
+        let tensor_sizes: Vec<(String, usize)> = tensor_data
+            .iter()
+            .map(|(n, d, _)| (n.clone(), d.len()))
+            .collect();
+        let summary = quantizer.summarize_calibration(&calibration_map, &tensor_sizes);
+        println!(
+            "Calibration complete: {} tensors, avg KL={:.6}, worst={} ({:.6}), est. BPW={:.2}",
+            summary.total_tensors,
+            summary.avg_kl_score,
+            summary.worst_tensor,
+            summary.max_kl_score,
+            summary.estimated_bpw,
+        );
+        let mut type_vec: Vec<_> = summary.type_counts.iter().collect();
+        type_vec.sort_by_key(|(t, _)| format!("{:?}", t));
+        for (dtype, count) in type_vec {
+            println!("  {:?}: {} tensors", dtype, count);
+        }
+        println!();
+    } else {
+        calibration_map = CalibrationMap::new();
+    }
+
     // 6. Initialize GGUF Builder
     let mut builder = GgufBuilder::with_model(&architecture, "quantized-model");
 
@@ -2337,42 +3172,51 @@ async fn run_quantization(
     keys.sort();
 
     for name in keys {
-        let tensor = weights
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("Tensor {} not found in loaded weights", name))?;
-        // Skip quantization for non-F32/F16 tensors (e.g. integer indices) if any
-        // But most LLM weights are floats.
+        let shape_u64: Vec<u64>;
+        let data_f32: Vec<f32>;
 
-        let shape = tensor.shape();
-        let shape_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
+        if let Some((cached_data, cached_shape)) = float_cache.remove(name) {
+            // Reuse pre-materialised data from the calibration pass.
+            shape_u64 = cached_shape.iter().map(|&d| d as u64).collect();
+            data_f32 = cached_data;
+        } else {
+            let tensor = weights
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("Tensor {} not found in loaded weights", name))?;
 
-        // Determine target type
-        let target_type = quantizer.get_tensor_type(name, &shape_u64);
+            let shape = tensor.shape();
+            shape_u64 = shape.iter().map(|&d| d as u64).collect();
 
-        // Convert MLX array to host vector
-        // Note: This requires evaluating the array and copying data to CPU
-        // Ensure tensor is evaluated
-        tensor
-            .eval()
-            .map_err(|e| anyhow::anyhow!("MLX eval error: {}", e))?;
+            // Convert MLX array to host vector
+            tensor
+                .eval()
+                .map_err(|e| anyhow::anyhow!("MLX eval error: {}", e))?;
 
-        // We assume weights are float32 for quantization input.
-        // If they are float16/bfloat16, we convert them.
-        let data_f32: Vec<f32> = match tensor.dtype() {
-            pmetal_mlx::Dtype::Float32 => tensor.as_slice::<f32>().to_vec(),
-            pmetal_mlx::Dtype::Float16 | pmetal_mlx::Dtype::Bfloat16 => {
-                let t_f32 = tensor
-                    .as_dtype(pmetal_mlx::Dtype::Float32)
-                    .map_err(|e| anyhow::anyhow!("Dtype conversion error: {}", e))?;
-                t_f32
-                    .eval()
-                    .map_err(|e| anyhow::anyhow!("MLX eval error: {}", e))?;
-                t_f32.as_slice::<f32>().to_vec()
-            }
-            _ => {
-                tracing::warn!("Skipping non-float tensor: {}", name);
-                continue;
-            }
+            // We assume weights are float32 for quantization input.
+            // If they are float16/bfloat16, we convert them.
+            data_f32 = match tensor.dtype() {
+                pmetal_mlx::Dtype::Float32 => tensor.as_slice::<f32>().to_vec(),
+                pmetal_mlx::Dtype::Float16 | pmetal_mlx::Dtype::Bfloat16 => {
+                    let t_f32 = tensor
+                        .as_dtype(pmetal_mlx::Dtype::Float32)
+                        .map_err(|e| anyhow::anyhow!("Dtype conversion error: {}", e))?;
+                    t_f32
+                        .eval()
+                        .map_err(|e| anyhow::anyhow!("MLX eval error: {}", e))?;
+                    t_f32.as_slice::<f32>().to_vec()
+                }
+                _ => {
+                    tracing::warn!("Skipping non-float tensor: {}", name);
+                    continue;
+                }
+            };
+        }
+
+        // Determine target type — prefer calibration map when available.
+        let target_type = if calibration_map.is_empty() {
+            quantizer.get_tensor_type(name, &shape_u64)
+        } else {
+            quantizer.get_tensor_type_calibrated(name, &shape_u64, &calibration_map)
         };
 
         // Quantize
@@ -2872,6 +3716,7 @@ async fn run_distillation_cli(
         use_metal_fused_optimizer: true,
         loraplus_lr_ratio: None,
         neftune_noise_alpha: None,
+        use_cut_cross_entropy: false,
     };
 
     let mut trainer = DistillationTrainer::new(distiller, training_loop_config);
@@ -2988,6 +3833,15 @@ async fn run_grpo_cli(
     dapo: bool,
     reasoning_rewards: bool,
     use_metal_flash_attention: bool,
+    vlm_mode: bool,
+    max_image_size: usize,
+    reward_model_path: Option<String>,
+    reward_model_max_length: usize,
+    reward_model_weight: f64,
+    reward_model_template: Option<String>,
+    async_rewards: bool,
+    use_speculative: bool,
+    speculative_draft_tokens: usize,
     _log_metrics: Option<String>,
     emit_console_output: bool,
     extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
@@ -3006,6 +3860,9 @@ async fn run_grpo_cli(
         println!("LR:            {:.2e}", learning_rate);
         println!("DAPO:          {}", dapo);
         println!("Reasoning Rew: {}", reasoning_rewards);
+        if vlm_mode {
+            println!("VLM Mode:      enabled (max_image_size={})", max_image_size);
+        }
         println!("========================================\n");
     }
 
@@ -3071,6 +3928,22 @@ async fn run_grpo_cli(
     let mut grpo_config = GrpoConfig::new(num_generations).with_beta(beta);
     grpo_config.max_completion_length = max_completion_length;
     grpo_config.max_prompt_length = max_seq_len;
+    grpo_config.vlm_mode = vlm_mode;
+    grpo_config.max_image_size = max_image_size;
+    grpo_config.reward_model_path = reward_model_path.clone();
+    grpo_config.reward_model_max_length = reward_model_max_length;
+    grpo_config.reward_model_weight = reward_model_weight;
+    grpo_config.reward_model_chat_template = reward_model_template.clone();
+    grpo_config.async_rewards = async_rewards;
+    grpo_config.use_speculative = use_speculative;
+    grpo_config.speculative_draft_tokens = speculative_draft_tokens;
+
+    if use_speculative && emit_console_output {
+        println!(
+            "Speculative decoding: enabled (draft_tokens={})",
+            speculative_draft_tokens
+        );
+    }
 
     if dapo {
         grpo_config = grpo_config.for_dapo();
@@ -3157,6 +4030,49 @@ async fn run_grpo_cli(
         rewards = rewards.add(Box::new(DummyReward), 1.0);
     }
 
+    // 6b. Load ML reward model if configured.
+    if let Some(ref rm_path_str) = reward_model_path {
+        if emit_console_output {
+            println!("Loading ML reward model: {}", rm_path_str);
+        }
+        tracing::info!("Loading ML reward model from: {}", rm_path_str);
+
+        // Resolve the reward model path — download from HF if it looks like a
+        // model ID and doesn't exist locally.
+        let rm_path = if rm_path_str.contains('/')
+            && !std::path::Path::new(rm_path_str).exists()
+        {
+            pmetal_hub::download_model(rm_path_str, None, None).await?
+        } else {
+            std::path::PathBuf::from(rm_path_str)
+        };
+
+        let rm_tokenizer = pmetal_data::Tokenizer::from_model_dir(&rm_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load reward model tokenizer: {}", e))?;
+
+        let rm_config = pmetal_trainer::reward_model::RewardModelConfig {
+            model_path: rm_path_str.clone(),
+            max_length: reward_model_max_length,
+            chat_template: reward_model_template.clone(),
+            weight: reward_model_weight,
+            ..Default::default()
+        };
+
+        let ml_reward =
+            pmetal_trainer::reward_model::MLRewardModel::from_pretrained(
+                &rm_path,
+                rm_tokenizer,
+                rm_config,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to load ML reward model: {}", e))?;
+
+        rewards = rewards.add(Box::new(ml_reward), reward_model_weight);
+
+        if emit_console_output {
+            println!("ML reward model loaded (weight={:.2})", reward_model_weight);
+        }
+    }
+
     // 7. Setup Trainer
     let training_config = TrainingConfig {
         learning_rate,
@@ -3191,6 +4107,7 @@ async fn run_grpo_cli(
         use_metal_fused_optimizer: true,
         loraplus_lr_ratio: None,
         neftune_noise_alpha: None,
+        use_cut_cross_entropy: false,
     };
 
     let mut trainer = GrpoTrainer::new(grpo_config, training_config)?;
@@ -3233,19 +4150,42 @@ async fn run_grpo_cli(
     let mut ref_model = DynamicModel::load(&model_path)
         .map_err(|e| anyhow::anyhow!("Failed to load reference model: {}", e))?;
 
-    trainer
-        .run(
-            &mut model,
-            Some(&mut ref_model),
-            &tokenizer,
-            &dataset,
-            &rewards,
-            &mut optimizer,
-            |opt, lr| {
-                opt.lr = mlx_rs::array!(lr);
-            },
-        )
-        .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;
+    if async_rewards {
+        // Pipelined path: reward scoring runs in a background thread so the GPU
+        // training step can overlap with the next sample's reward computation.
+        if emit_console_output {
+            println!(
+                "Async rewards enabled — reward scoring will pipeline with GPU training."
+            );
+        }
+        trainer
+            .run_async(
+                &mut model,
+                Some(&mut ref_model),
+                &tokenizer,
+                &dataset,
+                Box::new(rewards),
+                &mut optimizer,
+                |opt, lr| {
+                    opt.lr = mlx_rs::array!(lr);
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;
+    } else {
+        trainer
+            .run(
+                &mut model,
+                Some(&mut ref_model),
+                &tokenizer,
+                &dataset,
+                &rewards,
+                &mut optimizer,
+                |opt, lr| {
+                    opt.lr = mlx_rs::array!(lr);
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;
+    }
 
     let output_dir_path = PathBuf::from(output_dir);
     std::fs::create_dir_all(&output_dir_path)?;
@@ -3262,6 +4202,296 @@ async fn run_grpo_cli(
     if emit_console_output {
         println!(
             "\nGRPO training complete! Model weights saved to: {}",
+            output_dir
+        );
+    }
+    Ok(())
+}
+
+/// Run RLKD (Reinforcement Learning with Knowledge Distillation).
+///
+/// Combines GRPO policy gradient with teacher distillation in a single backward pass.
+#[allow(clippy::too_many_arguments)]
+async fn run_rlkd_cli(
+    model_id: &str,
+    teacher_model_id: &str,
+    dataset_path: &str,
+    output_dir: &str,
+    distill_alpha: f32,
+    final_alpha: f32,
+    anneal_alpha: bool,
+    distill_temperature: f32,
+    num_generations: usize,
+    beta: f64,
+    learning_rate: f64,
+    epochs: usize,
+    lora_r: usize,
+    lora_alpha: f32,
+    max_seq_len: usize,
+    max_completion_length: usize,
+    seed: u64,
+    reasoning_rewards: bool,
+    use_metal_flash_attention: bool,
+    _log_metrics: Option<String>,
+    emit_console_output: bool,
+    extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
+) -> anyhow::Result<()> {
+    use std::path::{Path, PathBuf};
+
+    if emit_console_output {
+        println!("========================================");
+        println!("  PMetal RLKD Training");
+        println!("========================================");
+        println!("Policy model:  {}", model_id);
+        println!("Teacher model: {}", teacher_model_id);
+        println!("Dataset:       {}", dataset_path);
+        println!("Output:        {}", output_dir);
+        println!("Alpha:         {:.2} → {:.2} (anneal={})", distill_alpha, final_alpha, anneal_alpha);
+        println!("Temperature:   {:.1}", distill_temperature);
+        println!("Generations:   {}", num_generations);
+        println!("Beta:          {}", beta);
+        println!("LR:            {:.2e}", learning_rate);
+        println!("========================================\n");
+    }
+
+    // 1. Resolve and download policy model
+    tracing::info!("Resolving policy model: {}", model_id);
+    let model_path = if model_id.contains('/') && !Path::new(model_id).exists() {
+        pmetal_hub::download_model(model_id, None, None).await?
+    } else {
+        PathBuf::from(model_id)
+    };
+
+    // 2. Resolve and download teacher model
+    tracing::info!("Resolving teacher model: {}", teacher_model_id);
+    let teacher_path = if teacher_model_id.contains('/') && !Path::new(teacher_model_id).exists() {
+        pmetal_hub::download_model(teacher_model_id, None, None).await?
+    } else {
+        PathBuf::from(teacher_model_id)
+    };
+
+    // 3. Load tokenizer (policy model's tokenizer drives generation)
+    tracing::info!("Loading tokenizer...");
+    let tokenizer = Tokenizer::from_model_dir(&model_path)?;
+
+    let chat_template = pmetal_data::chat_templates::detect_chat_template(&model_path, model_id);
+
+    // 4. Load dataset
+    tracing::info!("Loading dataset: {}", dataset_path);
+    let is_parquet = std::path::Path::new(dataset_path)
+        .extension()
+        .is_some_and(|ext| ext == "parquet");
+    let dataset = if is_parquet {
+        let result = TrainingDataset::from_parquet_tokenized(
+            dataset_path,
+            &tokenizer,
+            "text",
+            max_seq_len,
+            None,
+        );
+        match result {
+            Ok(ds) => ds,
+            Err(_) => TrainingDataset::from_parquet_tokenized(
+                dataset_path,
+                &tokenizer,
+                "content",
+                max_seq_len,
+                None,
+            )?,
+        }
+    } else {
+        TrainingDataset::from_jsonl_tokenized(
+            dataset_path,
+            &tokenizer,
+            DatasetFormat::Auto,
+            max_seq_len,
+            Some(&chat_template),
+        )?
+    };
+
+    // 5. Load policy model with LoRA
+    tracing::info!("Loading policy model with LoRA...");
+    let lora_config = LoraConfig {
+        r: lora_r,
+        alpha: lora_alpha,
+        ..Default::default()
+    };
+    let mut policy_model = DynamicLoraModel::from_pretrained(&model_path, lora_config.clone())?;
+
+    // 6. Load teacher model (frozen, no LoRA)
+    tracing::info!("Loading teacher model (frozen)...");
+    let mut teacher_model = DynamicModel::load(&teacher_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load teacher model: {}", e))?;
+
+    // 7. Setup GRPO config (embedded in RLKD config)
+    let mut grpo_config = GrpoConfig::new(num_generations).with_beta(beta);
+    grpo_config.max_completion_length = max_completion_length;
+    grpo_config.max_prompt_length = max_seq_len;
+
+    // 8. Setup RLKD config
+    let training_config = TrainingConfig {
+        learning_rate,
+        batch_size: 1,
+        num_epochs: epochs,
+        max_seq_len,
+        output_dir: output_dir.to_string(),
+        ..Default::default()
+    };
+
+    let rlkd_config = RlkdConfig {
+        grpo: grpo_config,
+        training: training_config,
+        distill_alpha,
+        distill_temperature,
+        anneal_alpha,
+        final_alpha,
+        log_every: 10,
+        adaptive_lr: true,
+    };
+
+    // 9. Setup reward functions
+    let mut rewards = pmetal_trainer::CombinedReward::new();
+
+    if reasoning_rewards {
+        struct FormatReward;
+        impl pmetal_trainer::RewardFunction for FormatReward {
+            fn compute(
+                &self,
+                _prompts: &[String],
+                completions: &[String],
+                _images: Option<&[Vec<mlx_rs::Array>]>,
+            ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
+                Ok(completions
+                    .iter()
+                    .map(|c| {
+                        if c.contains("<thinking>") && c.contains("</thinking>") {
+                            1.0
+                        } else if c.contains("<thinking>") {
+                            0.5
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect())
+            }
+            fn name(&self) -> &str {
+                "format_reward"
+            }
+        }
+
+        struct LengthReward(usize);
+        impl pmetal_trainer::RewardFunction for LengthReward {
+            fn compute(
+                &self,
+                _prompts: &[String],
+                completions: &[String],
+                _images: Option<&[Vec<mlx_rs::Array>]>,
+            ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
+                Ok(completions
+                    .iter()
+                    .map(|c| {
+                        let len = c.len();
+                        if len > self.0 {
+                            -0.1
+                        } else if len < 10 {
+                            -0.5
+                        } else {
+                            0.1
+                        }
+                    })
+                    .collect())
+            }
+            fn name(&self) -> &str {
+                "length_reward"
+            }
+        }
+
+        rewards = rewards
+            .add(Box::new(FormatReward), 1.0)
+            .add(Box::new(LengthReward(max_seq_len * 2)), 0.2);
+    } else {
+        struct DummyReward;
+        impl pmetal_trainer::RewardFunction for DummyReward {
+            fn compute(
+                &self,
+                _p: &[String],
+                completions: &[String],
+                _i: Option<&[Vec<mlx_rs::Array>]>,
+            ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
+                Ok(vec![0.1; completions.len()])
+            }
+            fn name(&self) -> &str {
+                "dummy"
+            }
+        }
+        rewards = rewards.add(Box::new(DummyReward), 1.0);
+    }
+
+    // 10. Build trainer
+    let mut trainer = RlkdTrainer::new(rlkd_config)?;
+
+    if let Some(ref metrics_path) = _log_metrics {
+        let path = PathBuf::from(output_dir).join(metrics_path);
+        let callback = pmetal_trainer::MetricsJsonCallback::new(&path)?
+            .with_run_name(format!(
+                "rlkd-{}",
+                model_id.split('/').next_back().unwrap_or(model_id)
+            ));
+        trainer.add_callback(Box::new(callback));
+    }
+    for callback in extra_callbacks {
+        trainer.add_callback(callback);
+    }
+
+    {
+        let adaptive_config = pmetal_trainer::AdaptiveLrConfig::default();
+        let control_file = PathBuf::from(output_dir).join(".lr_control.json");
+        trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
+    }
+
+    // 11. Build optimizer
+    let mut optimizer = mlx_rs::optimizers::AdamWBuilder::new(learning_rate as f32)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build optimizer: {}", e))?;
+
+    // 12. Run training
+    if emit_console_output {
+        println!("Starting RLKD training loop...");
+    }
+
+    let _ = use_metal_flash_attention; // passed through GRPO config; honored by model load
+    let _ = seed; // used for dataset shuffling; plumbed via DataLoaderConfig in full impl
+
+    trainer
+        .run(
+            &mut policy_model,
+            &mut teacher_model,
+            &tokenizer,
+            &dataset,
+            &rewards,
+            &mut optimizer,
+            |opt, lr| {
+                opt.lr = mlx_rs::array!(lr);
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("RLKD training error: {}", e))?;
+
+    // 13. Save LoRA weights
+    let output_dir_path = PathBuf::from(output_dir);
+    std::fs::create_dir_all(&output_dir_path)?;
+    let final_path = output_dir_path.join("lora_weights.safetensors");
+    policy_model.save_lora_weights(&final_path)?;
+    save_adapter_config(
+        &final_path,
+        lora_config.r,
+        lora_config.alpha,
+        &lora_config.target_modules,
+        lora_config.use_rslora,
+    )?;
+
+    if emit_console_output {
+        println!(
+            "\nRLKD training complete! Model weights saved to: {}",
             output_dir
         );
     }
@@ -3303,6 +4533,7 @@ async fn run_training(
     lr_schedule: &str,
     weight_decay: f64,
     seed: u64,
+    cut_cross_entropy: bool,
     ane: bool,
     #[allow(unused_variables)] distributed_config: Option<pmetal_core::DistributedTrainingConfig>,
 ) -> anyhow::Result<()> {
@@ -3780,6 +5011,7 @@ async fn run_training(
         use_metal_fused_optimizer,
         loraplus_lr_ratio: None,
         neftune_noise_alpha: None,
+        use_cut_cross_entropy: cut_cross_entropy,
         #[cfg(feature = "distributed")]
         distributed: distributed_config.clone(),
     };

@@ -167,6 +167,7 @@ impl TrainingTab {
             FormField::new("Flash Attention", "Enabled", FieldKind::Toggle, "Hardware"),
             FormField::new("Fused Optimizer", "Enabled", FieldKind::Toggle, "Hardware"),
             FormField::new("JIT Compilation", "Enabled", FieldKind::Toggle, "Hardware"),
+            FormField::new("Cut Cross-Entropy", "Disabled", FieldKind::Toggle, "Hardware"),
             FormField::new(
                 "ANE",
                 "Auto",
@@ -414,6 +415,9 @@ impl TrainingTab {
         }
         if self.field_value("Sequence Packing") == "Disabled" {
             args.push("--no-sequence-packing".into());
+        }
+        if self.field_value("Cut Cross-Entropy") == "Enabled" {
+            args.push("--cut-cross-entropy".into());
         }
         if self.field_value("ANE") == "Disabled" {
             args.push("--no-ane".into());

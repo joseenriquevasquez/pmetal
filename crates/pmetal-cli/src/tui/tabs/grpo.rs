@@ -76,6 +76,35 @@ impl GrpoTab {
                 "GRPO",
             ),
             FormField::new("Reasoning Rewards", "Disabled", FieldKind::Toggle, "GRPO"),
+            FormField::new("VLM Mode", "Disabled", FieldKind::Toggle, "GRPO"),
+            FormField::new(
+                "Max Image Size",
+                "336",
+                FieldKind::Integer {
+                    min: 64,
+                    max: 2048,
+                },
+                "GRPO",
+            ),
+            // Reward Model
+            FormField::new("Reward Model", "", FieldKind::Text, "Reward Model"),
+            FormField::new(
+                "RM Max Length",
+                "2048",
+                FieldKind::Integer {
+                    min: 128,
+                    max: 32768,
+                },
+                "Reward Model",
+            ),
+            FormField::new(
+                "RM Weight",
+                "1.0",
+                FieldKind::Number { min: 0.0, max: 10.0 },
+                "Reward Model",
+            ),
+            FormField::new("RM Template", "", FieldKind::Text, "Reward Model"),
+            FormField::new("Async Rewards", "Disabled", FieldKind::Toggle, "Reward Model"),
             // Training
             FormField::new(
                 "Learning Rate",
@@ -131,6 +160,34 @@ impl GrpoTab {
             ),
             // Hardware
             FormField::new("Flash Attention", "Enabled", FieldKind::Toggle, "Hardware"),
+            FormField::new("Speculative Decoding", "Disabled", FieldKind::Toggle, "Hardware"),
+            FormField::new(
+                "Draft Tokens",
+                "3",
+                FieldKind::Integer { min: 1, max: 16 },
+                "Hardware",
+            ),
+            // RLKD (optional teacher distillation — leave Teacher Model blank for pure GRPO)
+            FormField::new("Teacher Model", "", FieldKind::Text, "RLKD"),
+            FormField::new(
+                "Distill Alpha",
+                "0.3",
+                FieldKind::Number { min: 0.0, max: 1.0 },
+                "RLKD",
+            ),
+            FormField::new(
+                "Distill Temperature",
+                "2.0",
+                FieldKind::Number { min: 0.5, max: 10.0 },
+                "RLKD",
+            ),
+            FormField::new("Anneal Alpha", "Enabled", FieldKind::Toggle, "RLKD"),
+            FormField::new(
+                "Final Alpha",
+                "0.05",
+                FieldKind::Number { min: 0.0, max: 1.0 },
+                "RLKD",
+            ),
             // Output
             FormField::new("Output Dir", "./output/grpo", FieldKind::Text, "Output"),
         ]
@@ -250,16 +307,44 @@ impl GrpoTab {
     }
 
     pub fn config_summary(&self) -> Vec<String> {
-        vec![
+        let teacher = self.field_value("Teacher Model");
+        let mode = if teacher.is_empty() { "GRPO" } else { "RLKD" };
+        let mut summary = vec![
+            format!("Mode:        {}", mode),
             format!("Model:       {}", self.field_value("Model")),
             format!("Dataset:     {}", self.field_value("Dataset")),
             format!("Generations: {}", self.field_value("Num Generations")),
             format!("Beta:        {}", self.field_value("Beta (KL)")),
             format!("GRPO Type:   {}", self.field_value("GRPO Type")),
             format!("LR:          {}", self.field_value("Learning Rate")),
-            String::new(),
-            "Proceed?".into(),
-        ]
+        ];
+        if !teacher.is_empty() {
+            summary.push(format!("Teacher:     {}", teacher));
+            summary.push(format!(
+                "Alpha:       {} → {} (anneal={})",
+                self.field_value("Distill Alpha"),
+                self.field_value("Final Alpha"),
+                self.field_value("Anneal Alpha"),
+            ));
+            summary.push(format!("Temperature: {}", self.field_value("Distill Temperature")));
+        }
+        if self.field_value("VLM Mode") == "Enabled" {
+            summary.push(format!(
+                "VLM:         enabled (max_img={}px)",
+                self.field_value("Max Image Size")
+            ));
+        }
+        let rm_path = self.field_value("Reward Model");
+        if !rm_path.is_empty() {
+            summary.push(format!(
+                "Reward Model: {} (weight={})",
+                rm_path,
+                self.field_value("RM Weight")
+            ));
+        }
+        summary.push(String::new());
+        summary.push("Proceed?".into());
+        summary
     }
 
     pub fn output_dir(&self) -> PathBuf {
@@ -267,7 +352,13 @@ impl GrpoTab {
     }
 
     pub fn build_cli_args(&self) -> Vec<String> {
-        let mut args = vec!["grpo".to_string()];
+        // When a teacher model is provided, switch to the RLKD subcommand which
+        // adds distillation on top of the GRPO policy gradient objective.
+        let teacher = self.field_value("Teacher Model");
+        let use_rlkd = !teacher.is_empty();
+
+        let subcommand = if use_rlkd { "rlkd" } else { "grpo" };
+        let mut args = vec![subcommand.to_string()];
 
         args.extend(["--model".into(), self.field_value("Model")]);
         args.extend(["--dataset".into(), self.field_value("Dataset")]);
@@ -298,6 +389,60 @@ impl GrpoTab {
         }
         if self.field_value("Flash Attention") == "Disabled" {
             args.push("--no-flash-attention".into());
+        }
+        if self.field_value("Speculative Decoding") == "Enabled" {
+            args.push("--speculative".into());
+            args.extend([
+                "--speculative-draft-tokens".into(),
+                self.field_value("Draft Tokens"),
+            ]);
+        }
+        if self.field_value("VLM Mode") == "Enabled" {
+            args.push("--vlm".into());
+            args.extend([
+                "--max-image-size".into(),
+                self.field_value("Max Image Size"),
+            ]);
+        }
+
+        let rm_path = self.field_value("Reward Model");
+        if !rm_path.is_empty() {
+            args.extend(["--reward-model".into(), rm_path]);
+            args.extend([
+                "--reward-model-max-length".into(),
+                self.field_value("RM Max Length"),
+            ]);
+            args.extend([
+                "--reward-model-weight".into(),
+                self.field_value("RM Weight"),
+            ]);
+            let rm_template = self.field_value("RM Template");
+            if !rm_template.is_empty() {
+                args.extend(["--reward-model-template".into(), rm_template]);
+            }
+            if self.field_value("Async Rewards") == "Enabled" {
+                args.push("--async-rewards".into());
+            }
+        }
+
+        // RLKD fields — only emitted when Teacher Model is set
+        if use_rlkd {
+            args.extend(["--teacher-model".into(), teacher]);
+            args.extend([
+                "--distill-alpha".into(),
+                self.field_value("Distill Alpha"),
+            ]);
+            args.extend([
+                "--distill-temperature".into(),
+                self.field_value("Distill Temperature"),
+            ]);
+            if self.field_value("Anneal Alpha") == "Enabled" {
+                args.push("--anneal-alpha".into());
+            }
+            args.extend([
+                "--final-alpha".into(),
+                self.field_value("Final Alpha"),
+            ]);
         }
 
         args

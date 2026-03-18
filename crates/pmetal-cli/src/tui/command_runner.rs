@@ -541,6 +541,7 @@ async fn run_training_direct(
         &optional_arg(&spec.args, "--lr-schedule").unwrap_or_else(|| "cosine".to_string()),
         parse_arg(&spec.args, "--weight-decay", 0.01f64)?,
         parse_arg(&spec.args, "--seed", 42u64)?,
+        has_flag(&spec.args, "--cut-cross-entropy"),
         !has_flag(&spec.args, "--no-ane"),
         None, // distributed_config
     )
@@ -616,6 +617,15 @@ async fn run_grpo_direct(
         grpo_type == "dapo" || has_flag(&spec.args, "--dapo"),
         has_flag(&spec.args, "--reasoning-rewards"),
         !has_flag(&spec.args, "--no-flash-attention"),
+        has_flag(&spec.args, "--vlm"),
+        parse_arg(&spec.args, "--max-image-size", 336usize)?,
+        optional_arg(&spec.args, "--reward-model"),
+        parse_arg(&spec.args, "--reward-model-max-length", 512usize)?,
+        parse_arg(&spec.args, "--reward-model-weight", 1.0f64)?,
+        optional_arg(&spec.args, "--reward-model-template"),
+        has_flag(&spec.args, "--async-rewards"),
+        has_flag(&spec.args, "--speculative"),
+        parse_arg(&spec.args, "--speculative-draft-tokens", 3usize)?,
         spec.metrics_file.as_ref().map(|p| p.display().to_string()),
         false,
         callbacks,
