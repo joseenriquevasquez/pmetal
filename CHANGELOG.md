@@ -5,6 +5,47 @@ All notable changes to PMetal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.9] - 2026-03-17
+
+### Added
+
+- **RLKD CLI command** (`pmetal rlkd`): Reinforcement Learning with Knowledge Distillation — combines GRPO policy gradient optimization with distillation from a frozen teacher model. CLI exposes `--alpha`, `--final-alpha`, `--anneal-alpha`, `--top-k-distill`, all SFT/LoRA arguments, and `MetricsJsonCallback` integration
+- **Embedding training CLI command** (`pmetal embed-train`): Sentence-transformer fine-tuning for BERT/encoder models with contrastive losses (InfoNCE, Triplet, CoSENT). Supports pair and triplet datasets, configurable pooling (CLS, Mean, LastToken), L2 normalization toggle, and automatic tokenizer/config copying to output
+- **GRPO VLM mode** (`--vlm`): Vision-Language Model support for GRPO training with image inputs. Loads images from dataset `images` field, passes to reward functions, uses `forward_with_images` for multimodal forward passes. Configurable `--max-image-size`
+- **GRPO ML reward model** (`--reward-model`): Pretrained reward model scoring during GRPO. Loads from local path or HuggingFace ID, runs inference-only alongside heuristic rewards. Configurable `--reward-model-weight`, `--reward-model-max-length`, and `--reward-model-template`
+- **GRPO speculative decoding** (`--speculative`): Draft/verify rollout generation with 2-4x throughput improvement. Configurable `--speculative-draft-tokens` (default 3). Greedy verification for correctness guarantees
+- **GRPO async reward pipelining** (`--async-rewards`): Background reward scoring concurrent with GPU training for ML reward models
+- **Cut Cross-Entropy CLI flag** (`--cut-cross-entropy`): Memory-efficient loss computation for SFT training, avoiding full [batch, seq, vocab] logit materialization
+- **KL-calibrated GGUF quantization** (`--kl-calibrate`): Per-tensor quantization type selection via NRMSE + cosine distance calibration. `--target-bpw` for budget-constrained quantization, `--kl-threshold` for quality control
+- **GRPO TUI form fields**: VLM toggle, speculative decoding, async rewards, ML reward model path, and draft tokens exposed in the interactive TUI
+- **Training TUI**: Cut Cross-Entropy toggle added to training tab form
+
+### Fixed
+
+- **Cut Cross-Entropy ignore index panic** (`pmetal-mlx`): `take_axis` with -100 (ignore index) targets caused out-of-bounds gather. Targets are now clamped to valid range before gather; loss masking handles ignored positions
+- **Cut Cross-Entropy division by zero** (`pmetal-mlx`): `n_valid=0` (all tokens ignored) caused NaN loss. Guarded with `n_valid.max(1)`
+- **Llama LoRA position IDs dropped** (`pmetal-lora`): `forward_hidden_with_positions` silently discarded position IDs, breaking packed-sequence training with non-contiguous positions. Added full position-aware path through attention, decoder layer, and model stack using `apply_rope_with_positions`
+- **lm_head weight computed twice per CCE step** (`pmetal-trainer`): Training loop called `lm_head_weight()` for probe and again inside the gradient closure. Weight is now computed once and captured into the closure
+- **GRPO VLM pixel_values not replicated per-completion** (`pmetal-trainer`): Images were stacked per-group instead of replicated per-completion, causing batch dimension mismatch. Images now repeat `n_completions` times per group
+- **GRPO `run_async` flush skips adaptive LR** (`pmetal-trainer`): Final flush step bypassed adaptive LR, rollback logic, and callbacks. Now applies the same post-step processing as the main loop
+- **CoSENT loss overflow with no positive pairs** (`pmetal-trainer`): All-zero labels caused `logsumexp(-1e9)` overflow to `+inf` and `NaN` gradients. Returns `0.0` when no positive pairs exist in the batch
+- **LastToken pooling O(batch) GPU syncs** (`pmetal-models`): Per-element `.item()` loop forced one GPU-to-CPU synchronization per batch element. Replaced with vectorized `take_along_axis` + `broadcast_to` for a single gather operation
+- **EmbeddingDataset silent empty strings** (`pmetal-data`): Missing text keys (`text_a`/`text_b`) silently produced empty-string training pairs. Now returns an explicit parse error with line number and expected key names
+- **BERT `hidden_act` always GELU** (`pmetal-models`): `BertIntermediate::forward` ignored the `hidden_act` config field. Now dispatches to `relu`, `silu`/`swish`, `tanh`, or `gelu` (default) based on config
+- **GGUF BPW budget silent non-convergence** (`pmetal-gguf`): `apply_bpw_budget` loop exhausted without warning when all tensors were at minimum quality. Emits `tracing::warn!` when target BPW is unreachable
+- **Speculative decode cross-sequence early exit** (`pmetal-models`): Outer generation loop exited when any single sequence hit `max_new_tokens`, truncating other in-progress sequences. Removed `max_generated` check; per-sequence `finished` tracking now controls termination
+- **Speculative decode O(seq_len) draft warm-up** (`pmetal-models`): Draft cache was rebuilt from full sequence prefix every step, making total cost O(seq_len^2). Draft caches are now persisted and incrementally advanced with only newly accepted tokens
+- **Fused LoRA backward threadgroup memory** (`pmetal-metal`): `fused_lora_backward_a` kernel missing threadgroup memory size check. Added allocation guard with fallback to MLX for large `out_features`
+- **LoRA+ double scaling** (`pmetal-lora`): Fused kernel and `AdamWGroups` optimizer could both apply the LoRA+ differential learning rate. Added `kernel_loraplus` flag to prevent double scaling
+- **Clippy compliance**: Fixed `field_reassign_with_default` in GGUF calibration summary, `doc_overindented_list_items` in speculative decode docs
+
+### Changed
+
+- **RLKD stats**: Documented that `grpo_component` and `distill_component` in training stats are proportional approximations (`total_loss * (1-alpha)` and `total_loss * alpha`), not true decomposed values
+- **Speculative decode bonus token**: Documented that greedy argmax for the bonus token is by design (required for speculative decoding correctness), not a sampling oversight
+- **GGUF prefix subsampling**: Expanded documentation warning that prefix subsample assumes i.i.d. weight distribution, which may not hold for structured tensors
+- **EmbeddingTrainer**: Added doc warnings that `encode` requires models returning hidden states (not logits) — causal LMs produce `[batch, vocab]` after pooling, which is nonsensical as an embedding
+
 ## [0.3.8] - 2026-03-17
 
 ### Added

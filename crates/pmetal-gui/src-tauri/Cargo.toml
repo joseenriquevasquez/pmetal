@@ -1,6 +1,6 @@
 [package]
 name = "pmetal-gui"
-version = "0.3.8"
+version = "0.3.9"
 description = "PMetal - Apple Silicon ML Training Suite"
 edition = "2021"
 
