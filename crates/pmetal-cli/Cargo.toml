@@ -46,8 +46,8 @@ tokenizers = { workspace = true }
 pmetal-metal = { workspace = true }
 walkdir = { workspace = true }
 flate2 = "1"
-ratatui = { version = "0.29", optional = true }
-crossterm = { version = "0.28", features = ["event-stream"], optional = true }
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.29", features = ["event-stream"], optional = true }
 futures = { version = "0.3", optional = true }
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
 libc = "0.2"
