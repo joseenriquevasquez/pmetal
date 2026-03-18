@@ -402,11 +402,11 @@ impl FinetuneBuilder {
             }
         };
 
-        // Resolve model path (download if HuggingFace ID)
-        status("Downloading model (if needed)…");
+        // Resolve model path (uses cache if available, downloads if needed)
+        status("Resolving model…");
         let model_path = resolve_model_path(&self.model_id).await?;
 
-        // Resolve dataset path (download from HuggingFace Hub if necessary)
+        // Resolve dataset path
         status("Resolving dataset…");
         let dataset_path = resolve_dataset_path(&self.dataset_path).await?;
 

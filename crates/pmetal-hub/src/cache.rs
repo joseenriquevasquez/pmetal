@@ -62,6 +62,97 @@ pub fn evict_model(repo_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check if a model is already cached locally and return its path.
+///
+/// Looks for `<cache_dir>/models--<org>--<name>/snapshots/<hash>/config.json`
+/// which is the HF hub cache layout. Returns the snapshot directory if found.
+/// This is a fast local-only check — no network calls.
+pub fn find_cached_model(repo_id: &str) -> Option<PathBuf> {
+    let dir_name = format!("models--{}", repo_id.replace('/', "--"));
+    let model_cache_dir = cache_dir().join(dir_name);
+    let snapshots_dir = model_cache_dir.join("snapshots");
+
+    if !snapshots_dir.is_dir() {
+        return None;
+    }
+
+    // Find the most recent snapshot that contains config.json
+    let mut snapshots: Vec<_> = std::fs::read_dir(&snapshots_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+
+    // Sort by modification time descending (most recent first)
+    snapshots.sort_by(|a, b| {
+        let t_a = a
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let t_b = b
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        t_b.cmp(&t_a)
+    });
+
+    for snap in snapshots {
+        let snap_path = snap.path();
+        // A valid model snapshot must have config.json
+        if snap_path.join("config.json").exists() {
+            return Some(snap_path);
+        }
+    }
+
+    None
+}
+
+/// Check if a dataset is already cached locally and return its path.
+///
+/// Same as `find_cached_model` but for datasets.
+pub fn find_cached_dataset(repo_id: &str) -> Option<PathBuf> {
+    let dir_name = format!("datasets--{}", repo_id.replace('/', "--"));
+    let cache_root = cache_dir();
+    let dataset_cache_dir = cache_root.join(&dir_name);
+    let snapshots_dir = dataset_cache_dir.join("snapshots");
+
+    if !snapshots_dir.is_dir() {
+        return None;
+    }
+
+    let mut snapshots: Vec<_> = std::fs::read_dir(&snapshots_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+
+    snapshots.sort_by(|a, b| {
+        let t_a = a
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let t_b = b
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        t_b.cmp(&t_a)
+    });
+
+    for snap in snapshots {
+        let snap_path = snap.path();
+        // A valid dataset snapshot should have at least one file
+        if std::fs::read_dir(&snap_path)
+            .ok()
+            .map(|rd| rd.count() > 0)
+            .unwrap_or(false)
+        {
+            return Some(snap_path);
+        }
+    }
+
+    None
+}
+
 /// Clear the model cache.
 pub fn clear_cache() -> Result<()> {
     let cache = cache_dir();

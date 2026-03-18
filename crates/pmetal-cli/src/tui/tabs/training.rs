@@ -244,11 +244,7 @@ impl TrainingTab {
             .get((sorted.len() as f64 * 0.95) as usize)
             .copied()
             .unwrap_or(avg);
-        let suggested = if p95 > 0 {
-            p95.div_ceil(64) * 64
-        } else {
-            2048
-        };
+        let suggested = if p95 > 0 { p95.div_ceil(64) * 64 } else { 2048 };
 
         let max_seq_len: usize = self.field_value("Max Seq Len").parse().unwrap_or(2048);
 

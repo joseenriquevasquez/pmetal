@@ -64,6 +64,18 @@ pub async fn download_model(
     revision: Option<&str>,
     token: Option<&SecretString>,
 ) -> Result<PathBuf> {
+    // Fast path: check local cache first (no network call)
+    if revision.is_none() {
+        if let Some(cached_path) = crate::cache::find_cached_model(model_id) {
+            tracing::info!(
+                "Model {} found in cache: {}",
+                model_id,
+                cached_path.display()
+            );
+            return Ok(cached_path);
+        }
+    }
+
     let api = build_api(token)?;
 
     let repo = match revision {
@@ -275,6 +287,18 @@ pub async fn download_dataset(
     revision: Option<&str>,
     token: Option<&SecretString>,
 ) -> Result<PathBuf> {
+    // Fast path: check local cache first (no network call)
+    if revision.is_none() {
+        if let Some(cached_path) = crate::cache::find_cached_dataset(dataset_id) {
+            tracing::info!(
+                "Dataset {} found in cache: {}",
+                dataset_id,
+                cached_path.display()
+            );
+            return Ok(cached_path);
+        }
+    }
+
     let api = build_api(token)?;
 
     let repo = match revision {
