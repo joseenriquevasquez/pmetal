@@ -67,15 +67,15 @@ pub mod adam8bit;
 pub mod adamw_groups;
 pub mod adaptive_lr;
 pub mod ane_reward;
-pub mod contrastive_loss;
-pub mod embedding_trainer;
 pub mod callbacks;
 pub mod checkpoint;
 pub mod checkpointing;
+pub mod contrastive_loss;
 pub mod dapo;
 pub mod diffusion;
 pub mod distillation;
 pub mod dpo;
+pub mod embedding_trainer;
 pub mod explicit_state_compile;
 pub mod ffi_compile;
 pub mod grpo;
@@ -136,6 +136,10 @@ pub use mlx_metal_optimizer::{
     MlxMetalOptimizerResult, is_mlx_metal_optimizer_available,
 };
 // Re-export online_dpo selectively to avoid ambiguous RewardFunction with grpo
+pub use embedding_trainer::{
+    EmbeddingLossType, EmbeddingResult, EmbeddingTrainer, EmbeddingTrainerConfig,
+    EmbeddingTrainerError,
+};
 pub use grpo::*;
 pub use kto::*;
 pub use lora_trainer::*;
@@ -154,7 +158,3 @@ pub use scheduler::*;
 pub use sft::*;
 pub use simpo::*;
 pub use training_loop::*;
-pub use embedding_trainer::{
-    EmbeddingLossType, EmbeddingResult, EmbeddingTrainer, EmbeddingTrainerConfig,
-    EmbeddingTrainerError,
-};

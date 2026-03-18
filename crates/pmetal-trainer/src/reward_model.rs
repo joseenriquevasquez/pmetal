@@ -34,7 +34,7 @@
 //! ).unwrap();
 //! ```
 
-use mlx_rs::{ops::indexing::IndexOp, Array};
+use mlx_rs::{Array, ops::indexing::IndexOp};
 use pmetal_data::Tokenizer;
 use std::path::Path;
 use std::sync::Mutex;

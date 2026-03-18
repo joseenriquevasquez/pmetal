@@ -59,10 +59,18 @@ pub struct BertConfig {
     pub model_type: Option<String>,
 }
 
-fn bert_default_max_position_embeddings() -> usize { 512 }
-fn bert_default_type_vocab_size() -> usize { 2 }
-fn bert_default_layer_norm_eps() -> f32 { 1e-12 }
-fn bert_default_hidden_act() -> String { "gelu".to_string() }
+fn bert_default_max_position_embeddings() -> usize {
+    512
+}
+fn bert_default_type_vocab_size() -> usize {
+    2
+}
+fn bert_default_layer_norm_eps() -> f32 {
+    1e-12
+}
+fn bert_default_hidden_act() -> String {
+    "gelu".to_string()
+}
 
 impl BertConfig {
     /// Compute head dimension from hidden size and number of heads.
@@ -114,12 +122,9 @@ pub struct BertEmbeddings {
 impl BertEmbeddings {
     pub fn new(config: &BertConfig) -> Result<Self, Exception> {
         let h = config.hidden_size as i32;
-        let word_embeddings =
-            nn::Embedding::new(config.vocab_size as i32, h)?;
-        let position_embeddings =
-            nn::Embedding::new(config.max_position_embeddings as i32, h)?;
-        let token_type_embeddings =
-            nn::Embedding::new(config.type_vocab_size as i32, h)?;
+        let word_embeddings = nn::Embedding::new(config.vocab_size as i32, h)?;
+        let position_embeddings = nn::Embedding::new(config.max_position_embeddings as i32, h)?;
+        let token_type_embeddings = nn::Embedding::new(config.type_vocab_size as i32, h)?;
         let layer_norm = nn::LayerNormBuilder::new(h)
             .eps(config.layer_norm_eps)
             .build()?;
@@ -156,7 +161,8 @@ impl BertEmbeddings {
         let type_emb = if let Some(tids) = token_type_ids {
             Module::forward(&mut self.token_type_embeddings, tids)?
         } else {
-            let zeros = Array::from_slice(&vec![0i32; (batch * seq_len) as usize], &[batch, seq_len]);
+            let zeros =
+                Array::from_slice(&vec![0i32; (batch * seq_len) as usize], &[batch, seq_len]);
             Module::forward(&mut self.token_type_embeddings, &zeros)?
         };
 
@@ -198,7 +204,14 @@ impl BertSelfAttention {
         let key = nn::LinearBuilder::new(h, h).build()?;
         let value = nn::LinearBuilder::new(h, h).build()?;
 
-        Ok(Self { query, key, value, num_heads, head_dim, scale })
+        Ok(Self {
+            query,
+            key,
+            value,
+            num_heads,
+            head_dim,
+            scale,
+        })
     }
 
     /// Forward pass (bidirectional — no causal mask).
@@ -238,7 +251,8 @@ impl BertSelfAttention {
             let mask_f = mask.as_dtype(scores.dtype())?;
             // 1 = keep, 0 = ignore → convert to additive: (1 - mask) * -1e9
             let inv_mask = Array::from_f32(1.0).subtract(&mask_f)?;
-            let additive = inv_mask.reshape(&[batch, 1, 1, seq_len])?
+            let additive = inv_mask
+                .reshape(&[batch, 1, 1, seq_len])?
                 .multiply(&Array::from_f32(-1e9))?;
             scores.add(&additive)?
         } else {
@@ -275,7 +289,9 @@ impl BertSelfOutput {
         let h = config.hidden_size as i32;
         Ok(Self {
             dense: nn::LinearBuilder::new(h, h).build()?,
-            layer_norm: nn::LayerNormBuilder::new(h).eps(config.layer_norm_eps).build()?,
+            layer_norm: nn::LayerNormBuilder::new(h)
+                .eps(config.layer_norm_eps)
+                .build()?,
         })
     }
 
@@ -298,11 +314,9 @@ pub struct BertIntermediate {
 
 impl BertIntermediate {
     pub fn new(config: &BertConfig) -> Result<Self, Exception> {
-        let dense = nn::LinearBuilder::new(
-            config.hidden_size as i32,
-            config.intermediate_size as i32,
-        )
-        .build()?;
+        let dense =
+            nn::LinearBuilder::new(config.hidden_size as i32, config.intermediate_size as i32)
+                .build()?;
         Ok(Self {
             dense,
             act: config.hidden_act.clone(),
@@ -335,7 +349,9 @@ impl BertOutput {
         let intermediate = config.intermediate_size as i32;
         Ok(Self {
             dense: nn::LinearBuilder::new(intermediate, h).build()?,
-            layer_norm: nn::LayerNormBuilder::new(h).eps(config.layer_norm_eps).build()?,
+            layer_norm: nn::LayerNormBuilder::new(h)
+                .eps(config.layer_norm_eps)
+                .build()?,
         })
     }
 
@@ -466,8 +482,8 @@ impl BertForEmbedding {
 
     /// Load configuration from a `config.json` string.
     pub fn from_config_str(config_str: &str) -> Result<Self, Exception> {
-        let config: BertConfig = serde_json::from_str(config_str)
-            .map_err(|e| Exception::custom(e.to_string()))?;
+        let config: BertConfig =
+            serde_json::from_str(config_str).map_err(|e| Exception::custom(e.to_string()))?;
         Self::new(config)
     }
 

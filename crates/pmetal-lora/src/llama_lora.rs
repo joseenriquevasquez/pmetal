@@ -524,7 +524,9 @@ impl LlamaLoraDecoderLayer {
         position_ids: &Array,
     ) -> Result<Array, LoraError> {
         let normed = mlx_rs::module::Module::forward(&mut self.input_layernorm, x)?;
-        let attn_out = self.self_attn.forward_with_positions(&normed, mask, position_ids)?;
+        let attn_out = self
+            .self_attn
+            .forward_with_positions(&normed, mask, position_ids)?;
         let h = x.add(&attn_out)?;
 
         let normed = mlx_rs::module::Module::forward(&mut self.post_attention_layernorm, &h)?;
@@ -746,7 +748,10 @@ impl LlamaLoraModel {
             hidden_states = layer.forward_with_positions(&hidden_states, mask, position_ids)?;
         }
 
-        Ok(mlx_rs::module::Module::forward(&mut self.norm, &hidden_states)?)
+        Ok(mlx_rs::module::Module::forward(
+            &mut self.norm,
+            &hidden_states,
+        )?)
     }
 
     /// Get number of trainable parameters.
@@ -1733,7 +1738,9 @@ impl crate::TrainableModel for LlamaLoraForCausalLM {
         input_ids: &Array,
         mask: Option<&Array>,
     ) -> Option<Result<Array, LoraError>> {
-        Some(LlamaLoraForCausalLM::forward_hidden_states(self, input_ids, mask))
+        Some(LlamaLoraForCausalLM::forward_hidden_states(
+            self, input_ids, mask,
+        ))
     }
 
     fn forward_hidden_with_positions(

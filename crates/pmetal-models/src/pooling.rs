@@ -1,11 +1,6 @@
 //! Pooling strategies for converting sequence representations to fixed-size embeddings.
 
-use mlx_rs::{
-    Array,
-    error::Exception,
-    module::Module,
-    ops::indexing::IndexOp,
-};
+use mlx_rs::{Array, error::Exception, module::Module, ops::indexing::IndexOp};
 
 /// Pooling modes for sentence embeddings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -106,14 +101,12 @@ pub fn pool(
         PoolingMode::WeightedMean => {
             // Linearly increasing weights: position i gets weight (i+1)
             let weights: Vec<f32> = (1..=seq_len).map(|i| i as f32).collect();
-            let weights = Array::from_slice(&weights, &[1, seq_len, 1])
-                .as_dtype(hidden_states.dtype())?;
+            let weights =
+                Array::from_slice(&weights, &[1, seq_len, 1]).as_dtype(hidden_states.dtype())?;
             let mask_expanded = attention_mask
                 .reshape(&[batch, seq_len, 1])?
                 .as_dtype(hidden_states.dtype())?;
-            let weighted = hidden_states
-                .multiply(&weights)?
-                .multiply(&mask_expanded)?;
+            let weighted = hidden_states.multiply(&weights)?.multiply(&mask_expanded)?;
             let sum = weighted.sum_axes(&[1], false)?;
             let weight_sum = weights.multiply(&mask_expanded)?.sum_axes(&[1], false)?;
             let weight_sum = mlx_rs::ops::maximum(&weight_sum, &Array::from_f32(1e-9))?;
@@ -130,10 +123,7 @@ pub fn pool(
 /// # Returns
 /// Unit-normalized embeddings `[batch, dim]`
 pub fn normalize_embeddings(embeddings: &Array) -> Result<Array, Exception> {
-    let norm = embeddings
-        .square()?
-        .sum_axes(&[-1], true)?
-        .sqrt()?;
+    let norm = embeddings.square()?.sum_axes(&[-1], true)?.sqrt()?;
     let norm = mlx_rs::ops::maximum(&norm, &Array::from_f32(1e-12))?;
     embeddings.divide(&norm)
 }

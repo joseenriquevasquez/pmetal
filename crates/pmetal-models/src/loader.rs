@@ -1422,9 +1422,7 @@ pub fn load_bert_weights(
 fn remap_bert_weight_name(hf_name: &str) -> String {
     // 1. Strip the top-level `bert.` prefix emitted by the standard HF BERT
     //    implementation (not present in some fine-tuned variants).
-    let name = hf_name
-        .strip_prefix("bert.")
-        .unwrap_or(hf_name);
+    let name = hf_name.strip_prefix("bert.").unwrap_or(hf_name);
 
     // 2. Remap `encoder.layer.{i}` → `layers.{i}` (drop "encoder." wrapper).
     let name = if let Some(rest) = name.strip_prefix("encoder.layer.") {

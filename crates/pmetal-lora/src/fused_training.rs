@@ -360,7 +360,8 @@ impl FusedLoraTrainer {
             // out_features of 2048.  Larger layers must use the MLX path.
             const METAL_TG_MEM_LIMIT: usize = 32 * 1024;
             const TILE_M_BWD_A: usize = 4;
-            let backward_a_tg_mem = TILE_M_BWD_A * self.config.out_features * std::mem::size_of::<f32>();
+            let backward_a_tg_mem =
+                TILE_M_BWD_A * self.config.out_features * std::mem::size_of::<f32>();
             let can_use_metal_backward = backward_a_tg_mem <= METAL_TG_MEM_LIMIT;
 
             if can_use_metal_backward {

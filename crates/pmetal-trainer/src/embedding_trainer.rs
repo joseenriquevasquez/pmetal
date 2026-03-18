@@ -30,14 +30,10 @@
 use std::collections::HashMap;
 
 use mlx_rs::{
-    Array,
-    error::Exception,
-    module::ModuleParameters,
-    nn,
-    optimizers::Optimizer,
+    Array, error::Exception, module::ModuleParameters, nn, optimizers::Optimizer,
     transforms::eval_params,
 };
-use pmetal_core::{EvalMetrics, TrainingConfig, TrainingCallback};
+use pmetal_core::{EvalMetrics, TrainingCallback, TrainingConfig};
 use pmetal_data::{EmbeddingDataset, EmbeddingPair, EmbeddingTriplet, Tokenizer};
 use pmetal_lora::TrainableModel;
 use pmetal_models::pooling::{PoolingMode, normalize_embeddings, pool};
@@ -113,12 +109,24 @@ pub struct EmbeddingTrainerConfig {
     pub seed: u64,
 }
 
-fn default_temperature() -> f32 { 0.05 }
-fn default_margin() -> f32 { 0.3 }
-fn default_true() -> bool { true }
-fn default_max_seq_len() -> usize { 512 }
-fn default_log_every() -> usize { 10 }
-fn default_seed() -> u64 { 42 }
+fn default_temperature() -> f32 {
+    0.05
+}
+fn default_margin() -> f32 {
+    0.3
+}
+fn default_true() -> bool {
+    true
+}
+fn default_max_seq_len() -> usize {
+    512
+}
+fn default_log_every() -> usize {
+    10
+}
+fn default_seed() -> u64 {
+    42
+}
 
 impl Default for EmbeddingTrainerConfig {
     fn default() -> Self {
@@ -188,7 +196,11 @@ pub struct EmbeddingTrainer {
 impl EmbeddingTrainer {
     /// Create a new trainer with the given configuration.
     pub fn new(config: EmbeddingTrainerConfig) -> Self {
-        Self { config, step: 0, callbacks: Vec::new() }
+        Self {
+            config,
+            step: 0,
+            callbacks: Vec::new(),
+        }
     }
 
     /// Register a training callback.
@@ -215,9 +227,7 @@ impl EmbeddingTrainer {
         O: Optimizer,
     {
         match dataset {
-            EmbeddingDataset::Pairs(pairs) => {
-                self.run_pairs(model, tokenizer, pairs, optimizer)
-            }
+            EmbeddingDataset::Pairs(pairs) => self.run_pairs(model, tokenizer, pairs, optimizer),
             EmbeddingDataset::Triplets(triplets) => {
                 self.run_triplets(model, tokenizer, triplets, optimizer)
             }
@@ -261,40 +271,32 @@ impl EmbeddingTrainer {
             if self.config.shuffle {
                 use rand::SeedableRng;
                 use rand::seq::SliceRandom;
-                let mut rng = rand::rngs::StdRng::seed_from_u64(
-                    self.config.seed.wrapping_add(epoch as u64),
-                );
+                let mut rng =
+                    rand::rngs::StdRng::seed_from_u64(self.config.seed.wrapping_add(epoch as u64));
                 indices.shuffle(&mut rng);
             }
 
             self.fire_epoch_start(epoch);
 
-            let n_batches = (pairs.len() + batch_size - 1) / batch_size;
+            let n_batches = pairs.len().div_ceil(batch_size);
             let mut epoch_loss = 0.0f64;
 
             for batch_idx in 0..n_batches {
                 let start = batch_idx * batch_size;
                 let end = (start + batch_size).min(pairs.len());
                 let batch_indices = &indices[start..end];
-                let batch: Vec<&EmbeddingPair> =
-                    batch_indices.iter().map(|&i| &pairs[i]).collect();
+                let batch: Vec<&EmbeddingPair> = batch_indices.iter().map(|&i| &pairs[i]).collect();
 
-                let texts_a: Vec<&str> =
-                    batch.iter().map(|p| p.text_a.as_str()).collect();
-                let texts_b: Vec<&str> =
-                    batch.iter().map(|p| p.text_b.as_str()).collect();
+                let texts_a: Vec<&str> = batch.iter().map(|p| p.text_a.as_str()).collect();
+                let texts_b: Vec<&str> = batch.iter().map(|p| p.text_b.as_str()).collect();
 
                 // Tokenize both sides (outside the autograd closure)
-                let (ids_a, mask_a) =
-                    self.tokenize_batch(tokenizer, &texts_a, max_len)?;
-                let (ids_b, mask_b) =
-                    self.tokenize_batch(tokenizer, &texts_b, max_len)?;
+                let (ids_a, mask_a) = self.tokenize_batch(tokenizer, &texts_a, max_len)?;
+                let (ids_b, mask_b) = self.tokenize_batch(tokenizer, &texts_b, max_len)?;
 
                 // Optional label array for CoSENT / cosine-similarity losses
-                let label_data: Vec<f32> =
-                    batch.iter().map(|p| p.label.unwrap_or(1.0)).collect();
-                let labels =
-                    Array::from_slice(&label_data, &[batch.len() as i32]);
+                let label_data: Vec<f32> = batch.iter().map(|p| p.label.unwrap_or(1.0)).collect();
+                let labels = Array::from_slice(&label_data, &[batch.len() as i32]);
 
                 let loss_type = self.config.loss_type;
                 let temperature = self.config.temperature;
@@ -310,35 +312,20 @@ impl EmbeddingTrainer {
                     &Array,
                 )|
                  -> Result<Array, Exception> {
-                    let emb_a = encode_inner(
-                        model,
-                        ids_a,
-                        mask_a,
-                        pooling_mode,
-                        do_normalize,
-                    )?;
-                    let emb_b = encode_inner(
-                        model,
-                        ids_b,
-                        mask_b,
-                        pooling_mode,
-                        do_normalize,
-                    )?;
+                    let emb_a = encode_inner(model, ids_a, mask_a, pooling_mode, do_normalize)?;
+                    let emb_b = encode_inner(model, ids_b, mask_b, pooling_mode, do_normalize)?;
                     compute_pair_loss(&emb_a, &emb_b, labels, loss_type, temperature)
                 };
 
                 let mut loss_and_grad = nn::value_and_grad(loss_fn);
-                let (loss, grads) = loss_and_grad(
-                    model,
-                    (&ids_a, &mask_a, &ids_b, &mask_b, &labels),
-                )
-                .map_err(EmbeddingTrainerError::Mlx)?;
+                let (loss, grads) =
+                    loss_and_grad(model, (&ids_a, &mask_a, &ids_b, &mask_b, &labels))
+                        .map_err(EmbeddingTrainerError::Mlx)?;
 
                 optimizer
                     .update(model, grads)
                     .map_err(EmbeddingTrainerError::Mlx)?;
-                eval_params(model.trainable_parameters())
-                    .map_err(EmbeddingTrainerError::Mlx)?;
+                eval_params(model.trainable_parameters()).map_err(EmbeddingTrainerError::Mlx)?;
 
                 let loss_val: f32 = loss.item();
                 epoch_loss += loss_val as f64;
@@ -358,12 +345,7 @@ impl EmbeddingTrainer {
             }
 
             let avg_loss = epoch_loss / n_batches as f64;
-            tracing::info!(
-                "epoch={}/{} avg_loss={:.4}",
-                epoch + 1,
-                n_epochs,
-                avg_loss
-            );
+            tracing::info!("epoch={}/{} avg_loss={:.4}", epoch + 1, n_epochs, avg_loss);
             self.fire_epoch_end(epoch, avg_loss as f32);
         }
 
@@ -409,15 +391,14 @@ impl EmbeddingTrainer {
             if self.config.shuffle {
                 use rand::SeedableRng;
                 use rand::seq::SliceRandom;
-                let mut rng = rand::rngs::StdRng::seed_from_u64(
-                    self.config.seed.wrapping_add(epoch as u64),
-                );
+                let mut rng =
+                    rand::rngs::StdRng::seed_from_u64(self.config.seed.wrapping_add(epoch as u64));
                 indices.shuffle(&mut rng);
             }
 
             self.fire_epoch_start(epoch);
 
-            let n_batches = (triplets.len() + batch_size - 1) / batch_size;
+            let n_batches = triplets.len().div_ceil(batch_size);
             let mut epoch_loss = 0.0f64;
 
             for batch_idx in 0..n_batches {
@@ -427,19 +408,13 @@ impl EmbeddingTrainer {
                 let batch: Vec<&EmbeddingTriplet> =
                     batch_indices.iter().map(|&i| &triplets[i]).collect();
 
-                let anchors: Vec<&str> =
-                    batch.iter().map(|t| t.anchor.as_str()).collect();
-                let positives: Vec<&str> =
-                    batch.iter().map(|t| t.positive.as_str()).collect();
-                let negatives: Vec<&str> =
-                    batch.iter().map(|t| t.negative.as_str()).collect();
+                let anchors: Vec<&str> = batch.iter().map(|t| t.anchor.as_str()).collect();
+                let positives: Vec<&str> = batch.iter().map(|t| t.positive.as_str()).collect();
+                let negatives: Vec<&str> = batch.iter().map(|t| t.negative.as_str()).collect();
 
-                let (ids_a, mask_a) =
-                    self.tokenize_batch(tokenizer, &anchors, max_len)?;
-                let (ids_p, mask_p) =
-                    self.tokenize_batch(tokenizer, &positives, max_len)?;
-                let (ids_n, mask_n) =
-                    self.tokenize_batch(tokenizer, &negatives, max_len)?;
+                let (ids_a, mask_a) = self.tokenize_batch(tokenizer, &anchors, max_len)?;
+                let (ids_p, mask_p) = self.tokenize_batch(tokenizer, &positives, max_len)?;
+                let (ids_n, mask_n) = self.tokenize_batch(tokenizer, &negatives, max_len)?;
 
                 let loss_fn = |model: &mut M,
                                (ids_a, mask_a, ids_p, mask_p, ids_n, mask_n): (
@@ -451,42 +426,21 @@ impl EmbeddingTrainer {
                     &Array,
                 )|
                  -> Result<Array, Exception> {
-                    let emb_a = encode_inner(
-                        model,
-                        ids_a,
-                        mask_a,
-                        pooling_mode,
-                        do_normalize,
-                    )?;
-                    let emb_p = encode_inner(
-                        model,
-                        ids_p,
-                        mask_p,
-                        pooling_mode,
-                        do_normalize,
-                    )?;
-                    let emb_n = encode_inner(
-                        model,
-                        ids_n,
-                        mask_n,
-                        pooling_mode,
-                        do_normalize,
-                    )?;
+                    let emb_a = encode_inner(model, ids_a, mask_a, pooling_mode, do_normalize)?;
+                    let emb_p = encode_inner(model, ids_p, mask_p, pooling_mode, do_normalize)?;
+                    let emb_n = encode_inner(model, ids_n, mask_n, pooling_mode, do_normalize)?;
                     contrastive_loss::triplet_loss(&emb_a, &emb_p, &emb_n, margin)
                 };
 
                 let mut loss_and_grad = nn::value_and_grad(loss_fn);
-                let (loss, grads) = loss_and_grad(
-                    model,
-                    (&ids_a, &mask_a, &ids_p, &mask_p, &ids_n, &mask_n),
-                )
-                .map_err(EmbeddingTrainerError::Mlx)?;
+                let (loss, grads) =
+                    loss_and_grad(model, (&ids_a, &mask_a, &ids_p, &mask_p, &ids_n, &mask_n))
+                        .map_err(EmbeddingTrainerError::Mlx)?;
 
                 optimizer
                     .update(model, grads)
                     .map_err(EmbeddingTrainerError::Mlx)?;
-                eval_params(model.trainable_parameters())
-                    .map_err(EmbeddingTrainerError::Mlx)?;
+                eval_params(model.trainable_parameters()).map_err(EmbeddingTrainerError::Mlx)?;
 
                 let loss_val: f32 = loss.item();
                 epoch_loss += loss_val as f64;
@@ -506,12 +460,7 @@ impl EmbeddingTrainer {
             }
 
             let avg_loss = epoch_loss / n_batches as f64;
-            tracing::info!(
-                "epoch={}/{} avg_loss={:.4}",
-                epoch + 1,
-                n_epochs,
-                avg_loss
-            );
+            tracing::info!("epoch={}/{} avg_loss={:.4}", epoch + 1, n_epochs, avg_loss);
             self.fire_epoch_end(epoch, avg_loss as f32);
         }
 
@@ -546,8 +495,8 @@ impl EmbeddingTrainer {
         let hidden = model
             .forward(&ids, Some(&mask))
             .map_err(|e| EmbeddingTrainerError::Mlx(Exception::custom(e.to_string())))?;
-        let emb = pool(&hidden, &mask, self.config.pooling_mode)
-            .map_err(EmbeddingTrainerError::Mlx)?;
+        let emb =
+            pool(&hidden, &mask, self.config.pooling_mode).map_err(EmbeddingTrainerError::Mlx)?;
         if self.config.normalize {
             Ok(normalize_embeddings(&emb).map_err(EmbeddingTrainerError::Mlx)?)
         } else {

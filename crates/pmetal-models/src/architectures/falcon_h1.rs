@@ -493,9 +493,9 @@ impl FalconH1Mamba {
         // Split along last axis: gate | conv_input | dt
         let split_at = &[intermediate_size, intermediate_size + conv_dim];
         let parts = mlx_rs::ops::split_sections(&projected, split_at, -1)?;
-        let gate = &parts[0];       // [B, L, intermediate_size]
+        let gate = &parts[0]; // [B, L, intermediate_size]
         let conv_input = &parts[1]; // [B, L, conv_dim]
-        let dt = &parts[2];         // [B, L, num_heads]
+        let dt = &parts[2]; // [B, L, num_heads]
 
         // Causal conv1d with optional state caching.
         // We cannot directly pass `cache` to a helper that also borrows
@@ -530,8 +530,8 @@ impl FalconH1Mamba {
         let conv_split_at = &[intermediate_size, intermediate_size + bc_size];
         let conv_parts = mlx_rs::ops::split_sections(&conv_activated, conv_split_at, -1)?;
         let hidden_states = &conv_parts[0]; // [B, L, intermediate_size]
-        let b_proj = &conv_parts[1];        // [B, L, n_groups * ssm_state_size]
-        let c_proj = &conv_parts[2];        // [B, L, n_groups * ssm_state_size]
+        let b_proj = &conv_parts[1]; // [B, L, n_groups * ssm_state_size]
+        let c_proj = &conv_parts[2]; // [B, L, n_groups * ssm_state_size]
 
         // Reshape for multi-head SSM computation
         let x_heads = hidden_states.reshape(&[batch, seq_len, num_heads, head_dim])?;
@@ -1113,7 +1113,12 @@ mod tests {
 
         let input_ids = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
         let logits = model
-            .forward_with_cache(&input_ids, None, Some(&mut kv_cache), Some(&mut mamba_cache))
+            .forward_with_cache(
+                &input_ids,
+                None,
+                Some(&mut kv_cache),
+                Some(&mut mamba_cache),
+            )
             .expect("forward_with_cache failed");
         assert_eq!(logits.shape()[0], 1);
         assert_eq!(logits.shape()[2], 512);

@@ -972,8 +972,7 @@ impl EmbeddingDataset {
     pub fn from_jsonl(path: impl AsRef<std::path::Path>) -> Result<Self> {
         use std::io::BufRead;
 
-        let file = std::fs::File::open(path.as_ref())
-            .map_err(pmetal_core::PMetalError::Io)?;
+        let file = std::fs::File::open(path.as_ref()).map_err(pmetal_core::PMetalError::Io)?;
         let reader = std::io::BufReader::new(file);
 
         let mut lines: Vec<String> = Vec::new();
@@ -989,10 +988,9 @@ impl EmbeddingDataset {
         }
 
         // Detect format from first record
-        let first: serde_json::Value = serde_json::from_str(&lines[0])
-            .map_err(|e| pmetal_core::PMetalError::Io(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-            ))?;
+        let first: serde_json::Value = serde_json::from_str(&lines[0]).map_err(|e| {
+            pmetal_core::PMetalError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?;
 
         if first.get("anchor").is_some() {
             // Triplet format
@@ -1052,7 +1050,11 @@ impl EmbeddingDataset {
                     .and_then(|v| v.as_f64())
                     .map(|l| l as f32);
 
-                pairs.push(EmbeddingPair { text_a, text_b, label });
+                pairs.push(EmbeddingPair {
+                    text_a,
+                    text_b,
+                    label,
+                });
             }
             Ok(Self::Pairs(pairs))
         }

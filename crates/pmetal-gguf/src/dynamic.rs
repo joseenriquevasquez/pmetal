@@ -553,8 +553,10 @@ impl DynamicQuantizer {
         calibration: &CalibrationMap,
         tensor_sizes: &[(String, usize)],
     ) -> CalibrationSummary {
-        let mut summary = CalibrationSummary::default();
-        summary.total_tensors = calibration.len();
+        let mut summary = CalibrationSummary {
+            total_tensors: calibration.len(),
+            ..Default::default()
+        };
 
         let mut total_kl = 0.0_f64;
         let mut total_elements = 0u64;
@@ -977,8 +979,7 @@ mod tests {
             &kl_config,
         );
         assert_eq!(
-            result.quant_type,
-            kl_config.fallback_type,
+            result.quant_type, kl_config.fallback_type,
             "Critical layer should always use fallback type"
         );
     }
@@ -1010,7 +1011,10 @@ mod tests {
             "Selected type {:?} not in candidate set",
             result.quant_type
         );
-        assert!(!result.all_scores.is_empty(), "Should have evaluated at least one candidate");
+        assert!(
+            !result.all_scores.is_empty(),
+            "Should have evaluated at least one candidate"
+        );
     }
 
     #[test]
@@ -1039,7 +1043,10 @@ mod tests {
         assert!(map.contains_key("model.lm_head.weight"));
 
         // Critical layer in map must use fallback.
-        assert_eq!(map["model.lm_head.weight"].quant_type, kl_config.fallback_type);
+        assert_eq!(
+            map["model.lm_head.weight"].quant_type,
+            kl_config.fallback_type
+        );
     }
 
     #[test]

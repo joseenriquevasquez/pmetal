@@ -1283,7 +1283,9 @@ impl TrainableModel for MistralLoraForCausalLM {
         input_ids: &Array,
         mask: Option<&Array>,
     ) -> Option<Result<Array, LoraError>> {
-        Some(MistralLoraForCausalLM::forward_hidden_states(self, input_ids, mask))
+        Some(MistralLoraForCausalLM::forward_hidden_states(
+            self, input_ids, mask,
+        ))
     }
 
     fn forward_hidden_with_positions(
@@ -1292,7 +1294,10 @@ impl TrainableModel for MistralLoraForCausalLM {
         mask: Option<&Array>,
         position_ids: &Array,
     ) -> Option<Result<Array, LoraError>> {
-        Some(self.model.forward_with_positions(input_ids, mask, position_ids))
+        Some(
+            self.model
+                .forward_with_positions(input_ids, mask, position_ids),
+        )
     }
 
     fn lm_head_weight(&self) -> Option<Array> {

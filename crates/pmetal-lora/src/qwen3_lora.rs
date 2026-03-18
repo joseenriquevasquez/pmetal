@@ -848,8 +848,12 @@ impl Qwen3LoraForCausalLM {
         position_ids: Option<&Array>,
     ) -> Result<Array, LoraError> {
         let checkpoint_config = self.checkpoint_config.clone();
-        self.model
-            .forward_with_checkpoint(input_ids, mask, position_ids, checkpoint_config.as_ref())
+        self.model.forward_with_checkpoint(
+            input_ids,
+            mask,
+            position_ids,
+            checkpoint_config.as_ref(),
+        )
     }
 
     /// Get the LM head weight for Cut Cross-Entropy.
@@ -1673,7 +1677,9 @@ impl crate::TrainableModel for Qwen3LoraForCausalLM {
         input_ids: &Array,
         mask: Option<&Array>,
     ) -> Option<Result<Array, LoraError>> {
-        Some(Qwen3LoraForCausalLM::forward_hidden_states(self, input_ids, mask, None))
+        Some(Qwen3LoraForCausalLM::forward_hidden_states(
+            self, input_ids, mask, None,
+        ))
     }
 
     fn forward_hidden_with_positions(

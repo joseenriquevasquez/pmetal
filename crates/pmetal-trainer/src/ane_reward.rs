@@ -395,8 +395,16 @@ mod tests {
         let rewards = pending.collect().unwrap();
 
         assert_eq!(rewards.len(), 2);
-        assert!((rewards[0] - 5.0).abs() < 1e-10, "expected len=5, got {}", rewards[0]);
-        assert!((rewards[1] - 6.0).abs() < 1e-10, "expected len=6, got {}", rewards[1]);
+        assert!(
+            (rewards[0] - 5.0).abs() < 1e-10,
+            "expected len=5, got {}",
+            rewards[0]
+        );
+        assert!(
+            (rewards[1] - 6.0).abs() < 1e-10,
+            "expected len=6, got {}",
+            rewards[1]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -455,7 +463,7 @@ mod tests {
         for i in 1..=5usize {
             let text = "x".repeat(i);
             let rewards = model
-                .compute(&["p".into()], &[text.clone()], None)
+                .compute(&["p".into()], std::slice::from_ref(&text), None)
                 .unwrap();
             assert!(
                 (rewards[0] - i as f64).abs() < 1e-10,
@@ -563,7 +571,9 @@ mod tests {
             std::hint::spin_loop();
         }
 
-        let rewards = result.expect("try_collect never returned a result").unwrap();
+        let rewards = result
+            .expect("try_collect never returned a result")
+            .unwrap();
         assert_eq!(rewards, vec![3.0]);
     }
 }

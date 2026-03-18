@@ -9,12 +9,7 @@
 //! All losses operate on L2-normalised embeddings `[batch, dim]`.
 //! Normalisation should be applied by the caller (use `pool::normalize_embeddings`).
 
-use mlx_rs::{
-    Array,
-    Dtype,
-    error::Exception,
-    module::Module,
-};
+use mlx_rs::{Array, Dtype, error::Exception, module::Module};
 
 // ---------------------------------------------------------------------------
 // Public loss functions
@@ -63,9 +58,7 @@ pub fn triplet_loss(
     let neg_sim = pairwise_cosine_similarity(anchors, negatives)?;
 
     // loss = max(0, margin - pos_sim + neg_sim)
-    let diff = Array::from_f32(margin)
-        .subtract(&pos_sim)?
-        .add(&neg_sim)?;
+    let diff = Array::from_f32(margin).subtract(&pos_sim)?.add(&neg_sim)?;
     let zero = Array::from_f32(0.0);
     let loss = mlx_rs::ops::maximum(&diff, &zero)?;
     loss.mean(None)
@@ -95,7 +88,9 @@ pub fn cosent_loss(
     // Cast labels to float for masking arithmetic
     let labels_f = labels.as_dtype(Dtype::Float32)?;
     // labels_f is [batch]; broadcast to [batch, batch] via outer product
-    let pos_mask = labels_f.reshape(&[-1, 1])?.multiply(&labels_f.reshape(&[1, -1])?)?;
+    let pos_mask = labels_f
+        .reshape(&[-1, 1])?
+        .multiply(&labels_f.reshape(&[1, -1])?)?;
     let neg_mask = Array::from_f32(1.0).subtract(&pos_mask)?;
 
     // Guard: CoSENT requires at least one positive pair; if all labels are 0 the
@@ -117,10 +112,14 @@ pub fn cosent_loss(
     let neg_large = Array::from_f32(-1e9_f32);
 
     let pos_logits = sim_scaled.add(
-        &Array::from_f32(1.0).subtract(&pos_mask)?.multiply(&neg_large)?,
+        &Array::from_f32(1.0)
+            .subtract(&pos_mask)?
+            .multiply(&neg_large)?,
     )?;
     let neg_logits = sim_scaled.add(
-        &Array::from_f32(1.0).subtract(&neg_mask)?.multiply(&neg_large)?,
+        &Array::from_f32(1.0)
+            .subtract(&neg_mask)?
+            .multiply(&neg_large)?,
     )?;
 
     // LogSumExp over last axis for each row

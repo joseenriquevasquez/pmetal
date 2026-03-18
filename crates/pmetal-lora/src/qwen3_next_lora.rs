@@ -2355,7 +2355,9 @@ impl crate::TrainableModel for Qwen3NextLoraForCausalLM {
         input_ids: &Array,
         mask: Option<&Array>,
     ) -> Option<Result<Array, LoraError>> {
-        Some(Qwen3NextLoraForCausalLM::forward_hidden_states(self, input_ids, mask))
+        Some(Qwen3NextLoraForCausalLM::forward_hidden_states(
+            self, input_ids, mask,
+        ))
     }
 
     fn lm_head_weight(&self) -> Option<Array> {

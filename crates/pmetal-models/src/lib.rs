@@ -50,12 +50,12 @@
 
 pub mod architectures;
 pub mod dispatcher;
-pub mod pooling;
 pub mod generation;
 pub mod loader;
 pub mod moe;
 pub mod ollama;
 pub mod pipelines;
+pub mod pooling;
 pub mod registry;
 pub mod rl_generation;
 pub mod sampling;

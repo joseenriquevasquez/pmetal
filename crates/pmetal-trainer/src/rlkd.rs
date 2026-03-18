@@ -34,13 +34,7 @@
 //! - The distillation loss uses the SAME student logits computed inside the closure,
 //!   so both objectives share one forward pass per step.
 
-use mlx_rs::{
-    Array,
-    error::Exception,
-    nn,
-    ops::indexing::IndexOp,
-    optimizers::Optimizer,
-};
+use mlx_rs::{Array, error::Exception, nn, ops::indexing::IndexOp, optimizers::Optimizer};
 use pmetal_core::{EvalMetrics, TrainingConfig};
 use pmetal_lora::TrainableModel;
 use std::time::Instant;
@@ -48,7 +42,7 @@ use tracing::info;
 
 use crate::{
     adaptive_lr::{AdaptiveLrConfig, AdaptiveLrController},
-    grpo::{CompletionGroup, CombinedReward, GrpoConfig, GrpoError, GrpoResult, GrpoTrainer},
+    grpo::{CombinedReward, CompletionGroup, GrpoConfig, GrpoError, GrpoResult, GrpoTrainer},
     training_loop::AdaptiveAction,
 };
 
@@ -63,10 +57,7 @@ use crate::{
 /// `RlkdTrainer` independent of any concrete model type.
 pub trait TeacherModel {
     /// Run a forward pass and return logits `[batch, seq, vocab]`.
-    fn forward_teacher(
-        &mut self,
-        input_ids: &Array,
-    ) -> Result<Array, Exception>;
+    fn forward_teacher(&mut self, input_ids: &Array) -> Result<Array, Exception>;
 }
 
 /// Impl for `DynamicModel` — the canonical frozen inference model type.
@@ -253,9 +244,7 @@ impl RlkdTrainer {
         config: AdaptiveLrConfig,
         control_file: std::path::PathBuf,
     ) {
-        self.adaptive_lr = Some(
-            AdaptiveLrController::new(config).with_control_file(control_file),
-        );
+        self.adaptive_lr = Some(AdaptiveLrController::new(config).with_control_file(control_file));
     }
 
     // -----------------------------------------------------------------------
@@ -394,7 +383,8 @@ impl RlkdTrainer {
         let teacher_probs = teacher_log_probs.exp()?;
 
         // Forward KL: sum_v [ p_t * (log p_t - log p_s) ]
-        let kl_per_vocab = teacher_probs.multiply(&teacher_log_probs.subtract(&student_log_probs)?)?;
+        let kl_per_vocab =
+            teacher_probs.multiply(&teacher_log_probs.subtract(&student_log_probs)?)?;
         // Sum over vocab dimension → [batch, seq-1]
         let kl_per_token = kl_per_vocab.sum_axes(&[-1], Some(false))?;
 
@@ -490,9 +480,9 @@ impl RlkdTrainer {
         let old_logits = policy
             .forward(&input_ids, None)
             .map_err(|e| GrpoError::Mlx(Exception::custom(e.to_string())))?;
-        let (old_per_token_logps, completion_mask) = self
-            .grpo_trainer
-            .compute_per_token_logps(&old_logits, &labels, temperature)?;
+        let (old_per_token_logps, completion_mask) =
+            self.grpo_trainer
+                .compute_per_token_logps(&old_logits, &labels, temperature)?;
         old_per_token_logps.eval()?;
         completion_mask.eval()?;
 
@@ -658,7 +648,11 @@ impl RlkdTrainer {
             n_epochs,
             self.total_steps,
             self.config.distill_alpha,
-            if self.config.anneal_alpha { self.config.final_alpha } else { self.config.distill_alpha },
+            if self.config.anneal_alpha {
+                self.config.final_alpha
+            } else {
+                self.config.distill_alpha
+            },
             self.config.distill_temperature,
         );
 
@@ -673,9 +667,11 @@ impl RlkdTrainer {
                 let step_start = Instant::now();
 
                 // --- Generation phase ---
-                let gen_output = self
-                    .grpo_trainer
-                    .generate_completions(policy_model, &sample.input_ids, tokenizer)?;
+                let gen_output = self.grpo_trainer.generate_completions(
+                    policy_model,
+                    &sample.input_ids,
+                    tokenizer,
+                )?;
 
                 let prompt_text = tokenizer
                     .decode(&sample.input_ids)
@@ -714,13 +710,8 @@ impl RlkdTrainer {
 
                 // --- RLKD training step ---
                 let alpha = self.current_alpha();
-                let stats = self.train_step(
-                    policy_model,
-                    teacher_model,
-                    &[group],
-                    optimizer,
-                    alpha,
-                )?;
+                let stats =
+                    self.train_step(policy_model, teacher_model, &[group], optimizer, alpha)?;
 
                 // --- Adaptive LR / rollback / early stop ---
                 let action = self.apply_adaptive_lr_action(stats.total_loss as f64);
@@ -887,30 +878,19 @@ mod tests {
         // Completion mask covers the first (and only) shifted token
         let mask = Array::from_slice(&[1.0_f32], &[1, 1]);
 
-        let loss =
-            RlkdTrainer::compute_distill_loss(&logits, &logits, &mask, 2.0).unwrap();
+        let loss = RlkdTrainer::compute_distill_loss(&logits, &logits, &mask, 2.0).unwrap();
         loss.eval().unwrap();
         let value: f32 = loss.item();
 
-        assert!(
-            value.abs() < 1e-4,
-            "KL(p||p) should be ~0, got {}",
-            value
-        );
+        assert!(value.abs() < 1e-4, "KL(p||p) should be ~0, got {}", value);
     }
 
     #[test]
     #[serial]
     fn test_distill_loss_different_distributions() {
         // KL(p || q) should be positive when distributions differ
-        let teacher = Array::from_slice(
-            &[4.0_f32, 3.0, 2.0, 1.0, 4.0, 3.0, 2.0, 1.0],
-            &[1, 2, 4],
-        );
-        let student = Array::from_slice(
-            &[1.0_f32, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0],
-            &[1, 2, 4],
-        );
+        let teacher = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0, 4.0, 3.0, 2.0, 1.0], &[1, 2, 4]);
+        let student = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0], &[1, 2, 4]);
         let mask = Array::from_slice(&[1.0_f32], &[1, 1]);
 
         let loss = RlkdTrainer::compute_distill_loss(&teacher, &student, &mask, 2.0).unwrap();
@@ -925,14 +905,8 @@ mod tests {
     #[serial]
     fn test_distill_loss_mask_zeroes_prompt_tokens() {
         // When mask is all-zero, the loss should be 0 (no completion tokens to learn from)
-        let teacher = Array::from_slice(
-            &[4.0_f32, 3.0, 2.0, 1.0, 4.0, 3.0, 2.0, 1.0],
-            &[1, 2, 4],
-        );
-        let student = Array::from_slice(
-            &[1.0_f32, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0],
-            &[1, 2, 4],
-        );
+        let teacher = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0, 4.0, 3.0, 2.0, 1.0], &[1, 2, 4]);
+        let student = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0], &[1, 2, 4]);
         // Mask is all zeros — clamp denominator floors at 1.0 so result = 0 / 1 = 0
         let mask = Array::from_slice(&[0.0_f32], &[1, 1]);
 
@@ -947,14 +921,8 @@ mod tests {
     #[serial]
     fn test_distill_loss_temperature_effect() {
         // Higher temperature softens distributions → lower KL divergence
-        let teacher = Array::from_slice(
-            &[4.0_f32, 3.0, 2.0, 1.0, 4.0, 3.0, 2.0, 1.0],
-            &[1, 2, 4],
-        );
-        let student = Array::from_slice(
-            &[1.0_f32, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0],
-            &[1, 2, 4],
-        );
+        let teacher = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0, 4.0, 3.0, 2.0, 1.0], &[1, 2, 4]);
+        let student = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0], &[1, 2, 4]);
         let mask = Array::from_slice(&[1.0_f32], &[1, 1]);
 
         let loss_t2 = RlkdTrainer::compute_distill_loss(&teacher, &student, &mask, 2.0)

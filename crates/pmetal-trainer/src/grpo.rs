@@ -283,10 +283,7 @@ impl CompletionGroup {
 ///
 /// The `image` crate is already a transitive dependency via `pmetal-data`, so this
 /// function uses the same processor that is available there to avoid duplication.
-fn load_images(
-    image_paths: &[std::path::PathBuf],
-    max_size: usize,
-) -> GrpoResult<Vec<Array>> {
+fn load_images(image_paths: &[std::path::PathBuf], max_size: usize) -> GrpoResult<Vec<Array>> {
     use pmetal_data::image_processing::{MllamaImageProcessor, MllamaImageProcessorConfig};
 
     // Use CLIP-canonical normalization; the size will be overridden below.
@@ -300,11 +297,7 @@ fn load_images(
     for path in image_paths {
         // Load via the `image` crate (used internally by the processor).
         let img = image::open(path).map_err(|e| {
-            GrpoError::Generation(format!(
-                "Failed to open image {}: {}",
-                path.display(),
-                e
-            ))
+            GrpoError::Generation(format!("Failed to open image {}: {}", path.display(), e))
         })?;
 
         // Resize preserving aspect ratio so neither dimension exceeds max_size.
@@ -778,7 +771,11 @@ impl GrpoTrainer {
         let pixel_values: Option<Array> = if self.config.vlm_mode {
             let all_images: Vec<Array> = groups
                 .iter()
-                .filter_map(|g| g.pixel_values.as_ref().map(|imgs| (imgs, g.completion_ids.len())))
+                .filter_map(|g| {
+                    g.pixel_values
+                        .as_ref()
+                        .map(|imgs| (imgs, g.completion_ids.len()))
+                })
                 .flat_map(|(imgs, n_completions)| {
                     // Repeat the group's image list once per completion in the group.
                     std::iter::repeat_n(imgs.iter().cloned(), n_completions).flatten()
@@ -1123,10 +1120,9 @@ impl GrpoTrainer {
 
                 // Build per-completion image vectors for the reward function.
                 // Each completion gets the same set of images (same prompt).
-                let images_for_reward: Option<Vec<Vec<Array>>> =
-                    sample_images.as_ref().map(|imgs| {
-                        vec![imgs.clone(); gen_output.token_ids.len()]
-                    });
+                let images_for_reward: Option<Vec<Vec<Array>>> = sample_images
+                    .as_ref()
+                    .map(|imgs| vec![imgs.clone(); gen_output.token_ids.len()]);
 
                 let rewards = reward_fn.compute(
                     &vec![prompt_text; gen_output.token_ids.len()],
@@ -1278,9 +1274,7 @@ impl GrpoTrainer {
     {
         use crate::ane_reward::{AsyncRewardModel, PipelinedGrpoSession};
 
-        info!(
-            "Starting GRPO training loop (pipelined reward scoring via AsyncRewardModel)..."
-        );
+        info!("Starting GRPO training loop (pipelined reward scoring via AsyncRewardModel)...");
 
         let n_epochs = self.training_config.num_epochs;
         let n_samples = dataset.samples().len();
@@ -1367,8 +1361,7 @@ impl GrpoTrainer {
                 //    `begin_step` also returns any rewards from the *previous* step
                 //    that finished during our generation + text-decode work above.
                 let prompt_repeated = vec![prompt_text; gen_output.token_ids.len()];
-                let prev_rewards =
-                    session.begin_step(prompt_repeated, completions_text.clone())?;
+                let prev_rewards = session.begin_step(prompt_repeated, completions_text.clone())?;
 
                 // 5. Stash the current step's context; swap out the previous one.
                 let prev_deferred = deferred.replace(DeferredStep {
@@ -1388,12 +1381,9 @@ impl GrpoTrainer {
                 // 6–7. Run the GPU training step for the *previous* batch
                 //      using its now-ready rewards.
                 if let (Some(prev_ctx), Some(rewards)) = (prev_deferred, prev_rewards) {
-                    let mut group = CompletionGroup::new(
-                        prev_ctx.prompt_ids,
-                        self.config.num_generations,
-                    );
-                    for ((new_ids, sbl), reward) in
-                        prev_ctx.completions.iter().zip(rewards.iter())
+                    let mut group =
+                        CompletionGroup::new(prev_ctx.prompt_ids, self.config.num_generations);
+                    for ((new_ids, sbl), reward) in prev_ctx.completions.iter().zip(rewards.iter())
                     {
                         group.add_completion(new_ids.clone(), *reward, *sbl);
                     }
@@ -1509,12 +1499,7 @@ impl GrpoTrainer {
                 set_optimizer_lr(optimizer, current_lr);
 
                 let flush_step_start = std::time::Instant::now();
-                let stats = self.train_step(
-                    policy_model,
-                    ref_model.as_deref_mut(),
-                    &[group],
-                    optimizer,
-                )?;
+                let stats = self.train_step(policy_model, ref_model, &[group], optimizer)?;
 
                 // Apply the same adaptive LR / rollback / callback logic as the
                 // main loop so the final step participates in divergence detection

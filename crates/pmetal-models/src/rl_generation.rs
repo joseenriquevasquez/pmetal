@@ -449,10 +449,10 @@ impl BatchedRlGenerator {
     ///
     /// ## Arguments
     ///
-    /// * `draft_fn`      — Cheap partial-model forward: `(input_ids, &mut KVCache) -> logits`.
-    ///                     Typically runs only the first N/3 transformer layers.
-    /// * `verify_fn`     — Full-model forward: `(input_ids, &mut KVCache) -> logits`.
-    ///                     The source of truth for acceptance and correction.
+    /// * `draft_fn` — Cheap partial-model forward: `(input_ids, &mut KVCache) -> logits`.
+    ///   Typically runs only the first N/3 transformer layers.
+    /// * `verify_fn` — Full-model forward: `(input_ids, &mut KVCache) -> logits`.
+    ///   The source of truth for acceptance and correction.
     /// * `prompt_tokens` — Tokenised prompt (shared across all `num_generations` sequences).
     ///
     /// ## Returns
@@ -560,8 +560,7 @@ impl BatchedRlGenerator {
                 // After verification we will roll back the draft cache to discard
                 // any positions corresponding to rejected draft tokens, keeping it
                 // exactly in sync with the accepted prefix.
-                let seed_input =
-                    Array::from_slice(&[last_tokens[seq_idx] as i32], &[1, 1]);
+                let seed_input = Array::from_slice(&[last_tokens[seq_idx] as i32], &[1, 1]);
                 let seed_logits = draft_fn(&seed_input, &mut draft_caches[seq_idx])?;
                 seed_logits.eval()?;
 
@@ -594,10 +593,8 @@ impl BatchedRlGenerator {
                 for &dt in &draft_tokens {
                     verify_input_ids.push(dt as i32);
                 }
-                let verify_arr = Array::from_slice(
-                    &verify_input_ids,
-                    &[1, verify_input_ids.len() as i32],
-                );
+                let verify_arr =
+                    Array::from_slice(&verify_input_ids, &[1, verify_input_ids.len() as i32]);
                 let verify_logits = verify_fn(&verify_arr, &mut verify_caches[seq_idx])?;
                 verify_logits.eval()?;
                 // verify_logits: [1, k+1, vocab_size]

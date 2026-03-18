@@ -639,8 +639,7 @@ impl FusedLora {
             /// Metal threadgroup memory limit in bytes (hardware spec).
             const METAL_TG_MEM_LIMIT: usize = 32 * 1024;
 
-            let tg_mem_size =
-                TILE_M_BWD_A * self.config.out_features * std::mem::size_of::<f32>();
+            let tg_mem_size = TILE_M_BWD_A * self.config.out_features * std::mem::size_of::<f32>();
 
             if tg_mem_size > METAL_TG_MEM_LIMIT {
                 // out_features too large for the backward_a kernel's threadgroup

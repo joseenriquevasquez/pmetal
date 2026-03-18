@@ -1367,7 +1367,9 @@ impl crate::TrainableModel for PhiLoraForCausalLM {
         input_ids: &Array,
         mask: Option<&Array>,
     ) -> Option<Result<Array, LoraError>> {
-        Some(PhiLoraForCausalLM::forward_hidden_states(self, input_ids, mask))
+        Some(PhiLoraForCausalLM::forward_hidden_states(
+            self, input_ids, mask,
+        ))
     }
 
     fn lm_head_weight(&self) -> Option<Array> {

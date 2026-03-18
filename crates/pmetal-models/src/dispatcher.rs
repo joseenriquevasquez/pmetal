@@ -158,7 +158,10 @@ impl ModelArchitecture {
             if lower.contains("jamba") {
                 return Some(Self::Jamba);
             }
-            if lower.contains("falconh1") || lower.contains("falcon_h1") || lower.contains("falcon-h1") {
+            if lower.contains("falconh1")
+                || lower.contains("falcon_h1")
+                || lower.contains("falcon-h1")
+            {
                 return Some(Self::FalconH1);
             }
             if lower.contains("flux") {
@@ -478,8 +481,8 @@ impl DynamicModel {
                 // Load weights using the HF→PMetal name remapper.  HuggingFace BERT
                 // checkpoints use paths like `bert.encoder.layer.0.attention.self.query.*`
                 // which differ from PMetal's `model.layers.0.attention.query.*`.
-                let weights = load_weights(model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                let weights =
+                    load_weights(model_dir).map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 load_bert_weights(&mut model, &weights)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 ModuleParametersExt::eval(&model)?;

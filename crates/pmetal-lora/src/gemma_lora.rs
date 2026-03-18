@@ -1711,7 +1711,9 @@ impl crate::TrainableModel for GemmaLoraForCausalLM {
         input_ids: &Array,
         mask: Option<&Array>,
     ) -> Option<Result<Array, LoraError>> {
-        Some(GemmaLoraForCausalLM::forward_hidden_states(self, input_ids, mask))
+        Some(GemmaLoraForCausalLM::forward_hidden_states(
+            self, input_ids, mask,
+        ))
     }
 
     fn lm_head_weight(&self) -> Option<Array> {
