@@ -43,6 +43,15 @@ reqwest = { version = "0.13", features = ["json", "rustls"], default-features = 
 pmetal = { path = "../../pmetal", features = ["full"] }
 mlx-rs = { version = "0.25.7", package = "pmetal-mlx-rs", features = ["safetensors"] }
 
+# Optimize all dependencies in dev builds — training/tokenization is CPU-bound
+# and ~10x slower without optimizations. The GUI's own code stays at opt-level 1
+# for fast recompilation.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
