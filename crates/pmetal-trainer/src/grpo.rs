@@ -1508,12 +1508,76 @@ impl GrpoTrainer {
                 let current_lr = self.get_learning_rate();
                 set_optimizer_lr(optimizer, current_lr);
 
-                let _ = self.train_step(
+                let flush_step_start = std::time::Instant::now();
+                let stats = self.train_step(
                     policy_model,
                     ref_model.as_deref_mut(),
                     &[group],
                     optimizer,
                 )?;
+
+                // Apply the same adaptive LR / rollback / callback logic as the
+                // main loop so the final step participates in divergence detection
+                // and best-weight snapshotting.
+                let action = self.apply_adaptive_lr_action(stats.loss as f64);
+
+                if action == crate::training_loop::AdaptiveAction::Continue
+                    && self.should_snapshot_best()
+                {
+                    self.snapshot_best_weights(policy_model);
+                }
+
+                if action == crate::training_loop::AdaptiveAction::Rollback {
+                    self.restore_best_weights(policy_model);
+                    let rollback_lr = self
+                        .adaptive_lr_override
+                        .unwrap_or(self.training_config.learning_rate as f32);
+                    set_optimizer_lr(optimizer, rollback_lr);
+                    tracing::info!(
+                        "GRPO rollback at flush step {}: new lr={:.2e}",
+                        self.step,
+                        rollback_lr
+                    );
+                }
+
+                if action == crate::training_loop::AdaptiveAction::EarlyStop {
+                    self.restore_best_weights(policy_model);
+                    tracing::info!(
+                        "Early stopping GRPO training at flush step — adaptive LR exhausted rollbacks."
+                    );
+                    for cb in &mut self.callbacks {
+                        cb.on_train_end();
+                    }
+                    return Ok(());
+                }
+
+                // Fire step callbacks for the flush step.
+                if !self.callbacks.is_empty() {
+                    let adjusted_lr = self.get_learning_rate();
+                    let step_ms = flush_step_start.elapsed().as_secs_f64() * 1000.0;
+                    let metrics = pmetal_core::StepMetrics {
+                        step: self.step,
+                        epoch: n_epochs.saturating_sub(1),
+                        total_epochs: n_epochs,
+                        total_steps,
+                        loss: stats.loss as f64,
+                        lr: adjusted_lr as f64,
+                        tok_sec: 0.0,
+                        total_ms: step_ms,
+                        tokens: 0,
+                        ..Default::default()
+                    };
+                    for cb in &mut self.callbacks {
+                        cb.on_step_end_with_metrics(&metrics);
+                    }
+                    // Honour cancellation from callbacks even at the flush step.
+                    if self.callbacks.iter().any(|cb| cb.should_stop()) {
+                        for cb in &mut self.callbacks {
+                            cb.on_train_end();
+                        }
+                        return Err(GrpoError::Cancelled);
+                    }
+                }
             }
         }
 

@@ -482,22 +482,28 @@ impl BatchedRlGenerator {
         // Last verified token for each sequence (seed of the next draft phase).
         let mut last_tokens: Vec<u32> = vec![0; batch_size];
 
-        // Verify-side KV caches — one per sequence.  The draft cache is
-        // re-created locally inside each speculative step.
+        // Verify-side KV caches — one per sequence.
         let mut verify_caches: Vec<KVCache> = (0..batch_size)
+            .map(|_| KVCache::new(self.kv_config.clone()))
+            .collect();
+
+        // Draft-side KV caches — one per sequence, created once and advanced
+        // incrementally rather than rebuilt from scratch each step.
+        let mut draft_caches: Vec<KVCache> = (0..batch_size)
             .map(|_| KVCache::new(self.kv_config.clone()))
             .collect();
 
         // Accumulate speculative stats across all sequences and steps.
         let mut stats = SpeculativeRlStats::default();
 
-        // ── Prefill: run full model on prompt for each sequence ─────────────
+        // ── Prefill: run full model AND draft model on prompt for each sequence ─
         let prompt_input = Array::from_slice(
             &prompt_tokens.iter().map(|&t| t as i32).collect::<Vec<_>>(),
             &[1, prompt_len as i32],
         );
 
         for seq_idx in 0..batch_size {
+            // Warm up verify cache on the prompt.
             let logits = verify_fn(&prompt_input, &mut verify_caches[seq_idx])?;
             logits.eval()?;
 
@@ -511,22 +517,22 @@ impl BatchedRlGenerator {
                 finished[seq_idx] = true;
                 stopped_by_token[seq_idx] = true;
             }
+
+            // Warm up draft cache on the same prompt so it starts in sync with
+            // the verify cache.  We discard the draft logits here — the greedy
+            // first token is authoritative from the verify model.
+            let draft_warmup = draft_fn(&prompt_input, &mut draft_caches[seq_idx])?;
+            draft_warmup.eval()?;
         }
 
         // ── Decode loop — speculative steps ─────────────────────────────────
-        // Track tokens generated so we can honour max_new_tokens.
         loop {
-            // Check budget and completion
+            // Exit when ALL sequences have finished.  Individual sequences are
+            // marked finished[i]=true by the inner per-sequence logic when they
+            // hit a stop token or exhaust max_new_tokens.  We must NOT exit on
+            // the first sequence reaching its budget — that would prematurely
+            // truncate other sequences that still have tokens to generate.
             if finished.iter().all(|&f| f) {
-                break;
-            }
-            // Safety: if every active sequence has already reached max_new_tokens we stop.
-            let max_generated = sequences
-                .iter()
-                .map(|s| s.len().saturating_sub(prompt_len))
-                .max()
-                .unwrap_or(0);
-            if max_generated >= self.config.max_new_tokens {
                 break;
             }
 
@@ -545,34 +551,24 @@ impl BatchedRlGenerator {
                 let k = num_draft.min(remaining);
 
                 // ── Draft phase ─────────────────────────────────────────────
-                // Use a fresh KV cache initialised from the current verify cache state.
-                // We clone the verify cache so that draft activations don't pollute it.
-                let mut draft_cache = KVCache::new(self.kv_config.clone());
-                // Replay the accepted prefix through the draft model to warm up the
-                // draft cache.  We only replay the full prompt once here; subsequent
-                // steps replay only the accepted tokens since the last step by building
-                // a replay input from the sequence prefix.
+                // The draft cache for this sequence is already warmed up through
+                // all previously accepted tokens (initialized during prefill,
+                // then incrementally advanced each step).  We feed `last_tokens`
+                // — the most recently accepted token — as the single-token input
+                // to advance the draft cache by one position before sampling.
                 //
-                // Implementation note: because the draft and verify models share weights
-                // (they differ only in which layers are executed), re-running the prompt
-                // through the draft model is inexpensive — it touches fewer layers and
-                // uses the KV cache for O(1) decode.  For large prompts the startup cost
-                // is amortised across all decode steps.
-                let accepted_prefix: Vec<i32> = sequences[seq_idx]
-                    .iter()
-                    .map(|&t| t as i32)
-                    .collect();
-                let prefix_arr =
-                    Array::from_slice(&accepted_prefix, &[1, accepted_prefix.len() as i32]);
-                // Warm up draft cache on full accepted prefix (cheap — only draft layers)
-                let warmup_logits = draft_fn(&prefix_arr, &mut draft_cache)?;
-                warmup_logits.eval()?;
+                // After verification we will roll back the draft cache to discard
+                // any positions corresponding to rejected draft tokens, keeping it
+                // exactly in sync with the accepted prefix.
+                let seed_input =
+                    Array::from_slice(&[last_tokens[seq_idx] as i32], &[1, 1]);
+                let seed_logits = draft_fn(&seed_input, &mut draft_caches[seq_idx])?;
+                seed_logits.eval()?;
 
-                // Greedily sample k draft tokens
+                // Greedily sample k draft tokens starting from the seed position.
                 let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
                 let mut draft_current = {
-                    // Greedy argmax at last position of warmup logits
-                    let row = warmup_logits.index((0i32, -1i32, ..));
+                    let row = seed_logits.index((0i32, 0i32, ..));
                     row.eval()?;
                     greedy_argmax_1d(&row)?
                 };
@@ -580,7 +576,7 @@ impl BatchedRlGenerator {
 
                 for _ in 1..k {
                     let input = Array::from_slice(&[draft_current as i32], &[1, 1]);
-                    let logits = draft_fn(&input, &mut draft_cache)?;
+                    let logits = draft_fn(&input, &mut draft_caches[seq_idx])?;
                     logits.eval()?;
                     let row = logits.index((0i32, 0i32, ..));
                     row.eval()?;
@@ -633,8 +629,13 @@ impl BatchedRlGenerator {
                 }
 
                 // If all k draft tokens were accepted, emit a bonus token from the
-                // verifier's prediction at position k (standard speculative-decoding
-                // correction step for greedy/zero-temperature verification).
+                // verifier's prediction at position k.  The bonus token is intentionally
+                // taken via greedy argmax (not stochastic sampling): at this boundary
+                // the verifier has already committed to a forward pass and its argmax
+                // is the unbiased correction token.  Stochastic sampling would require
+                // re-normalising the verifier's distribution after accept/reject, which
+                // is only necessary when the verifier itself uses sampling — RL rollouts
+                // use deterministic verification to keep accept/reject semantics clean.
                 if n_accepted_draft == k {
                     let bonus_row = verify_logits.index((0i32, k as i32, ..));
                     bonus_row.eval()?;
@@ -643,24 +644,52 @@ impl BatchedRlGenerator {
                 }
 
                 // ── Cache rollback ───────────────────────────────────────────
-                // The verify model ran a single forward pass over k+1 tokens
-                // (last_accepted + k draft tokens), which advanced the verify
-                // KV cache by k+1 positions.  We only keep the accepted prefix
-                // plus one correction token, so we must roll back the rejected
-                // tail.
+                // Verify cache:
+                //   The verify model ran a single forward pass over k+1 tokens
+                //   (last_accepted + k draft tokens), advancing the verify KV
+                //   cache by k+1 positions.  We only keep accepted_tokens.len()
+                //   positions, so roll back the rejected tail.
                 //
-                // accepted_tokens.len() is the number of tokens we will actually
-                // emit:
-                //   - n_accepted_draft == k  → k+1 tokens (k drafts + bonus)
-                //   - n_accepted_draft <  k  → n_accepted_draft+1 tokens (accepted + correction)
-                //
-                // The verify cache was advanced by k+1.  We need to keep exactly
-                // accepted_tokens.len() positions, so roll back the rest.
+                //   accepted_tokens.len():
+                //     n_accepted_draft == k → k+1 tokens (k drafts + bonus)
+                //     n_accepted_draft <  k → n_accepted_draft+1 tokens (accepted + correction)
                 let verify_advance = k + 1;
                 let keep_positions = accepted_tokens.len();
-                let cache_rollback = verify_advance.saturating_sub(keep_positions);
-                if cache_rollback > 0 {
-                    verify_caches[seq_idx].rollback(cache_rollback);
+                let verify_rollback = verify_advance.saturating_sub(keep_positions);
+                if verify_rollback > 0 {
+                    verify_caches[seq_idx].rollback(verify_rollback);
+                }
+
+                // Draft cache:
+                //   During the draft phase we fed the seed token plus (k-1)
+                //   additional draft tokens, advancing the draft cache by k
+                //   positions total (seed + k-1 generated = k).  We want to
+                //   keep only n_accepted_draft positions from the draft phase
+                //   and then feed the correction/bonus token so the draft cache
+                //   ends up exactly one step behind the next verify seed.
+                //
+                //   Roll back rejected positions:
+                //     draft_advance = k   (seed + k-1 generated draft tokens)
+                //     keep_draft    = n_accepted_draft
+                //     draft_rollback = k - n_accepted_draft
+                let draft_rollback = k.saturating_sub(n_accepted_draft);
+                if draft_rollback > 0 {
+                    draft_caches[seq_idx].rollback(draft_rollback);
+                }
+
+                // Feed the correction/bonus token through the draft model so
+                // its cache is aligned with the last emitted token.  This makes
+                // the next step's seed feed (the new last_tokens) the single
+                // fresh token added on top of a fully warmed-up cache.
+                //
+                // `accepted_tokens` ends with either the correction token (on
+                // partial acceptance) or the bonus token (on full acceptance).
+                // Either way, the last element is the correction/bonus token
+                // that should now be reflected in the draft cache.
+                if let Some(&correction_tok) = accepted_tokens.last() {
+                    let corr_input = Array::from_slice(&[correction_tok as i32], &[1, 1]);
+                    let corr_logits = draft_fn(&corr_input, &mut draft_caches[seq_idx])?;
+                    corr_logits.eval()?;
                 }
 
                 // Update statistics
