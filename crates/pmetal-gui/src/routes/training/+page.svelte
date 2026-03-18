@@ -723,7 +723,7 @@
             <div class="grid grid-cols-2 md:grid-cols-3 gap-4">
               <div>
                 <label class="label" for="max-seq-len">Max Seq Length</label>
-                <input id="max-seq-len" type="number" class="input" step="64" bind:value={maxSeqLen} />
+                <input id="max-seq-len" type="number" class="input" step="1" min="1" bind:value={maxSeqLen} />
                 {#if datasetSuggestedSeqLen > 0}
                   {#if maxSeqLen < datasetAvgTokens}
                     <p class="text-xs text-red-500 mt-1">

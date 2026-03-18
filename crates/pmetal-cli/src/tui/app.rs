@@ -1225,6 +1225,7 @@ impl App {
             ModalAction::SelectDataset(path) => match target {
                 Some(PendingModalTarget::TrainingDataset) => {
                     self.training.set_dataset(&path);
+                    self.training.peek_dataset(&path);
                 }
                 Some(PendingModalTarget::DistillDataset) => {
                     self.distillation.set_dataset(&path);

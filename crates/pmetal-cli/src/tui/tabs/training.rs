@@ -52,6 +52,10 @@ pub struct TrainingTab {
     pub list_state: ListState,
     pub status: TrainingStatus,
     field_idx: usize,
+    /// Dataset info message shown below the form (columns, seq len hint).
+    pub dataset_info: Option<String>,
+    /// Seq len warning/suggestion from dataset peek.
+    pub seq_len_warning: Option<String>,
 }
 
 impl TrainingTab {
@@ -61,6 +65,8 @@ impl TrainingTab {
             list_state: ListState::default().with_selected(Some(1)),
             status: TrainingStatus::Idle,
             field_idx: 0,
+            dataset_info: None,
+            seq_len_warning: None,
         }
     }
 
@@ -184,6 +190,75 @@ impl TrainingTab {
             // Output
             FormField::new("Output Dir", "./output", FieldKind::Text, "Output"),
         ]
+    }
+
+    /// Peek at the selected dataset and populate info/warnings.
+    /// Called from the app when the dataset field value changes.
+    pub fn peek_dataset(&mut self, path: &str) {
+        use pmetal_data::{TrainingDataset, peek_columns};
+        use std::io::{BufRead, BufReader};
+
+        self.dataset_info = None;
+        self.seq_len_warning = None;
+
+        let resolved = TrainingDataset::resolve_dataset_path_pub(std::path::Path::new(path))
+            .unwrap_or_else(|_| std::path::PathBuf::from(path));
+
+        // Get columns
+        let columns = peek_columns(&resolved).unwrap_or_default();
+        if !columns.is_empty() {
+            self.dataset_info = Some(format!("Columns: {}", columns.join(", ")));
+        }
+
+        // Sample first 100 rows for length estimates
+        let mut char_lengths: Vec<usize> = Vec::new();
+        if let Ok(file) = std::fs::File::open(&resolved) {
+            let reader = BufReader::new(file);
+            for line in reader.lines().take(100).flatten() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() { continue; }
+                if let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(trimmed) {
+                    let total: usize = obj.values().filter_map(|v| v.as_str()).map(|s| s.len()).sum();
+                    char_lengths.push(total / 4); // rough token estimate
+                }
+            }
+        }
+
+        if char_lengths.is_empty() { return; }
+
+        let avg = char_lengths.iter().sum::<usize>() / char_lengths.len();
+        let max = char_lengths.iter().copied().max().unwrap_or(0);
+        let mut sorted = char_lengths;
+        sorted.sort();
+        let p95 = sorted.get((sorted.len() as f64 * 0.95) as usize).copied().unwrap_or(avg);
+        let suggested = if p95 > 0 { p95.next_power_of_two() } else { 2048 };
+
+        let max_seq_len: usize = self.field_value("Max Seq Len")
+            .parse()
+            .unwrap_or(2048);
+
+        let info = format!(
+            "~{} samples | avg ~{} tok, max ~{} tok | suggest seq_len {}",
+            sorted.len(), avg, max, suggested
+        );
+        self.dataset_info = Some(info);
+
+        if max_seq_len < avg {
+            self.seq_len_warning = Some(format!(
+                "WARNING: max_seq_len {} < avg tokens {}. Most samples will be truncated.",
+                max_seq_len, avg
+            ));
+        } else if max_seq_len < suggested && max > max_seq_len {
+            self.seq_len_warning = Some(format!(
+                "Some samples may be truncated (max ~{} tok). Suggest max_seq_len {}.",
+                max, suggested
+            ));
+        } else if max_seq_len > max * 2 && max > 0 {
+            self.seq_len_warning = Some(format!(
+                "max_seq_len {} >> data max ~{} tok. Could reduce to {} for speed.",
+                max_seq_len, max, suggested
+            ));
+        }
     }
 
     pub fn is_editing(&self) -> bool {
@@ -487,6 +562,20 @@ impl TrainingTab {
             let selected = i == self.field_idx;
             items.push(ListItem::new(field.render_line(key_width, selected)));
             _flat_to_field.push(Some(i));
+        }
+
+        // Dataset info and seq len warnings
+        if let Some(ref info) = self.dataset_info {
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("  {info}"),
+                THEME.text_dim,
+            ))));
+        }
+        if let Some(ref warn) = self.seq_len_warning {
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("  {warn}"),
+                THEME.text_warning,
+            ))));
         }
 
         let list = List::new(items)

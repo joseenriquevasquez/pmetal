@@ -96,8 +96,6 @@ pub struct TrainingRun {
     pub ended_at: Option<DateTime<Utc>>,
     pub output_dir: Option<String>,
     pub error_message: Option<String>,
-    #[serde(skip_serializing)]
-    pub log_lines: Vec<String>,
     /// Human-readable description of the current setup phase (e.g. "Resolving dataset…").
     /// Cleared (set to `None`) once training steps start arriving.
     pub status_message: Option<String>,
@@ -133,7 +131,6 @@ impl TrainingRun {
             ended_at: None,
             output_dir: output_dir.map(str::to_string),
             error_message: None,
-            log_lines: Vec::new(),
             status_message: None,
             config_summary: None,
         }
@@ -186,8 +183,6 @@ pub struct DistillationRun {
     pub ended_at: Option<DateTime<Utc>>,
     pub output_dir: Option<String>,
     pub error_message: Option<String>,
-    #[serde(skip_serializing)]
-    pub log_lines: Vec<String>,
 }
 
 impl DistillationRun {
@@ -222,7 +217,6 @@ impl DistillationRun {
             ended_at: None,
             output_dir: output_dir.map(str::to_string),
             error_message: None,
-            log_lines: Vec::new(),
         }
     }
 }
@@ -263,8 +257,6 @@ pub struct GrpoRun {
     pub ended_at: Option<DateTime<Utc>>,
     pub output_dir: Option<String>,
     pub error_message: Option<String>,
-    #[serde(skip_serializing)]
-    pub log_lines: Vec<String>,
 }
 
 impl GrpoRun {
@@ -296,7 +288,6 @@ impl GrpoRun {
             ended_at: None,
             output_dir: output_dir.map(str::to_string),
             error_message: None,
-            log_lines: Vec::new(),
         }
     }
 }
