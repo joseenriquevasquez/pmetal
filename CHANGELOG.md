@@ -23,8 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **GUI auto-updater**: Tauri updater plugin with signed update artifacts and `latest.json` manifest in GitHub releases
 - **TUI setup phase indicator**: Dashboard shows "Loading model and preparing dataset..." in loss chart and stats panel while model loads, before any metrics arrive
 - **TUI `JobPhase` event**: New `AppMsg::JobPhase` message propagates setup status from the command runner to the dashboard
+- **TUI dataset peek**: Shows detected columns, estimated token lengths, and seq len warnings when a dataset is selected in the training form
+- **GUI seq len warnings**: Contextual warnings under the max seq len input — red (most samples truncated), amber (some truncated), blue (wasteful). Shows "Based on first N rows" with a "check all rows" button that scans the full dataset on the backend
+- **GUI retry button**: Completed/cancelled/failed runs show "Retry with these settings" which loads the run's config back into the form for adjustment and re-launch
+- **Easy API `on_status()` callback**: Reports granular setup phases (resolving model, resolving dataset, loading tokenizer, tokenizing dataset, loading LoRA adapters, training) — wired to GUI for real-time phase display
+- **`find_cached_model` / `find_cached_dataset`** (`pmetal-hub`): Fast local cache lookup for HF repos without network calls
 
 ### Fixed
+
+- **Cached models re-downloaded on every training start** (`pmetal-hub`): `download_model` and `download_dataset` now check the local HF cache (`~/.cache/huggingface/hub/`) before making any network calls. If a valid snapshot exists, the cached path is returned instantly. Eliminates ~10s startup latency for cached models across all consumers (CLI, TUI, GUI, easy API, Python SDK)
+- **Seq len suggestions use next-multiple-of-64** instead of next-power-of-2, producing practical values (7168 instead of 8192) for GPU-aligned training
 
 - **GUI/API trending models and datasets stale**: Changed HuggingFace API sort from `sort=downloads` (all-time) to `sort=trending` for default browse views. Search queries still sort by downloads. Fixed hardcoded User-Agent version string to use `CARGO_PKG_VERSION`
 - **HF dataset ID resolution** (`pmetal-data`, `easy.rs`, `commands.rs`, `main.rs`): HuggingFace dataset IDs (e.g., `nohurry/Opus-4.6-Reasoning-3000x-filtered`) and local HF cache directories are now resolved to the actual data file within. Traverses `snapshots/{hash}/` structure, follows symlinks, finds `.jsonl`/`.json`/`.parquet`/`.csv`/`.arrow` in priority order
@@ -37,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **README.md failure aborts dataset download** (`pmetal-hub`): README failures are now non-fatal warnings; only data file download failures abort
 - **MLX mutex crash on GUI exit**: Added `on_window_event(Destroyed)` handler that calls `std::process::exit(0)` to skip C++ destructor crashes from MLX Arrays dropped on the wrong thread
 - **TUI log corruption**: Tracing subscriber suppressed in TUI mode to prevent stderr writes from corrupting the raw terminal. Optional `PMETAL_LOG_FILE` env var for file-based debug logging (with graceful fallback on bad paths)
-- **`log_lines` serialization overhead**: Added `#[serde(skip_serializing)]` to `log_lines` in `TrainingRun`, `DistillationRun`, and `GrpoRun` — saves IPC bandwidth on every event update
+- **`log_lines` dead code removed**: Removed unused `log_lines` field from `TrainingRun`, `DistillationRun`, and `GrpoRun` GUI state structs
 
 ### Changed
 

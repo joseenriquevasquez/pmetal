@@ -535,6 +535,45 @@ impl TrainingDataset {
         }
     }
 
+    /// Extract text content from a JSON value, handling different types:
+    /// - String → return as-is
+    /// - Array of message objects (OpenAI/ShareGPT chat format) → concatenate content fields
+    /// - Other → serialize to JSON string
+    fn extract_text_from_value(val: &serde_json::Value) -> String {
+        match val {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(arr) => {
+                // Chat format: [{"role": "user", "content": "..."}, ...]
+                let mut parts = Vec::new();
+                for item in arr {
+                    if let Some(content) = item.get("content").or(item.get("value")) {
+                        if let Some(s) = content.as_str() {
+                            // Optionally prefix with role
+                            if let Some(role) = item
+                                .get("role")
+                                .or(item.get("from"))
+                                .and_then(|r| r.as_str())
+                            {
+                                parts.push(format!("{}: {}", role, s));
+                            } else {
+                                parts.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+                if parts.is_empty() {
+                    // Fallback: serialize array to string
+                    serde_json::to_string(val).unwrap_or_default()
+                } else {
+                    parts.join("\n")
+                }
+            }
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            _ => serde_json::to_string(val).unwrap_or_default(),
+        }
+    }
+
     /// Parse a single JSONL line using custom column names.
     ///
     /// Returns `(full_text, Option<prompt_text>)` where `prompt_text` is the
@@ -557,17 +596,11 @@ impl TrainingDataset {
         // Multi-column concatenation takes precedence
         if let Some(cols) = text_cols {
             if !cols.is_empty() {
-                let parts: Vec<&str> = cols
+                let parts: Vec<String> = cols
                     .iter()
                     .filter_map(|c| {
-                        let val = obj.get(c.as_str()).and_then(|v| v.as_str());
-                        if val.is_none() {
-                            tracing::warn!(
-                                column = %c,
-                                "Column not found in JSON line; skipping (dataset may have optional columns)"
-                            );
-                        }
-                        val
+                        let val = obj.get(c.as_str())?;
+                        Some(Self::extract_text_from_value(val))
                     })
                     .collect();
                 if parts.is_empty() {
@@ -605,17 +638,13 @@ impl TrainingDataset {
         } else {
             let text = obj
                 .get(text_col)
-                .and_then(|v| v.as_str())
+                .map(Self::extract_text_from_value)
                 .ok_or_else(|| {
                     pmetal_core::PMetalError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!(
-                            "Column '{}' not found or not a string in JSON line",
-                            text_col
-                        ),
+                        format!("Column '{}' not found in JSON line", text_col),
                     ))
-                })?
-                .to_string();
+                })?;
             if let Some(pc) = prompt_col {
                 let prompt = obj.get(pc).and_then(|v| v.as_str()).map(|s| s.to_string());
                 Ok((text, prompt))
