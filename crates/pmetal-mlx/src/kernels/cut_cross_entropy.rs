@@ -225,8 +225,10 @@ impl CutCrossEntropy {
         // Step 4: Apply ignore index masking
         let (masked_loss, n_valid) = self.apply_mask(&per_token_loss, targets)?;
 
-        // Step 5: Compute mean loss
-        let n_valid_arr = Array::from_int(n_valid as i32);
+        // Step 5: Compute mean loss — guard against division by zero when all tokens are
+        // ignored (n_valid == 0), which can happen with all-masked batches.
+        let safe_n_valid = n_valid.max(1);
+        let n_valid_arr = Array::from_int(safe_n_valid as i32);
         let loss = masked_loss.sum(None)?.divide(&n_valid_arr)?;
 
         // Cache for backward if needed
@@ -265,16 +267,23 @@ impl CutCrossEntropy {
         targets: &Array,
         lm_head_bias: Option<&Array>,
     ) -> Result<Array> {
-        // Gather target embeddings: W[targets, :] -> [n_tokens, hidden_dim]
-        let target_weights = lm_head_weight.take_axis(targets, 0)?;
+        // Clamp targets to valid indices before gather.
+        // Ignored positions (e.g. -100) would cause out-of-bounds access in take_axis.
+        // The `apply_mask` step zeroes out the corresponding loss values, so gathering
+        // index 0 for ignored positions is safe — those contributions are masked away.
+        let zero = Array::from_int(0_i32);
+        let safe_targets = mlx_rs::ops::maximum(targets, &zero)?;
+
+        // Gather target embeddings: W[safe_targets, :] -> [n_tokens, hidden_dim]
+        let target_weights = lm_head_weight.take_axis(&safe_targets, 0)?;
 
         // Compute dot product: sum(hidden * target_weights, axis=-1)
         let product = hidden_states.multiply(&target_weights)?;
         let mut target_logits = product.sum_axis(-1, false)?;
 
-        // Add bias if present
+        // Add bias if present (use safe_targets to avoid out-of-bounds)
         if let Some(bias) = lm_head_bias {
-            let target_bias = bias.take_axis(targets, 0)?;
+            let target_bias = bias.take_axis(&safe_targets, 0)?;
             target_logits = target_logits.add(&target_bias)?;
         }
 
@@ -491,8 +500,9 @@ impl CutCrossEntropy {
         let valid_mask = targets.ne(&ignore_arr)?;
         let valid_mask_f32 = valid_mask.as_dtype(Dtype::Float32)?.reshape(&[-1, 1])?;
 
-        // Scale by 1/n_valid
-        let n_valid = Array::from_int(output.n_valid as i32);
+        // Scale by 1/n_valid — guard against zero (all-masked batch)
+        let safe_n_valid = output.n_valid.max(1);
+        let n_valid = Array::from_int(safe_n_valid as i32);
         let grad_hidden = grad_hidden.multiply(&valid_mask_f32)?;
         grad_hidden.divide(&n_valid)
     }
