@@ -351,7 +351,7 @@ pub async fn run_training(
     // -----------------------------------------------------------------------
     emit_phase(phase_cb, TrainingPhase::ResolvingDataset);
     tokio::task::yield_now().await;
-    let dataset_path_resolved = resolve_dataset(&full_config.dataset.dataset_id).await?;
+    let dataset_path_resolved = resolve_dataset_path(&full_config.dataset.dataset_id).await?;
 
     emit_phase(phase_cb, TrainingPhase::TokenizingDataset);
     tokio::task::yield_now().await;
@@ -1394,19 +1394,20 @@ fn load_dataset(
 // ---------------------------------------------------------------------------
 
 async fn resolve_model_path(model_id: &str) -> anyhow::Result<PathBuf> {
-    if model_id.contains('/') && !PathBuf::from(model_id).exists() {
-        #[cfg(feature = "hub")]
-        {
-            Ok(pmetal_hub::download_model(model_id, None, None).await?)
-        }
-        #[cfg(not(feature = "hub"))]
-        {
+    #[cfg(feature = "hub")]
+    {
+        pmetal_hub::resolve_model_path(model_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+    #[cfg(not(feature = "hub"))]
+    {
+        if model_id.contains('/') && !PathBuf::from(model_id).exists() {
             anyhow::bail!(
                 "Model '{}' looks like a HuggingFace ID but the 'hub' feature is not enabled",
                 model_id
             );
         }
-    } else {
         Ok(PathBuf::from(model_id))
     }
 }
@@ -1415,7 +1416,9 @@ async fn resolve_model_path(model_id: &str) -> anyhow::Result<PathBuf> {
 // Helper: resolve dataset path (async, may download from HF)
 // ---------------------------------------------------------------------------
 
-async fn resolve_dataset(dataset_id: &str) -> anyhow::Result<PathBuf> {
+/// Resolve a dataset identifier to a local file path, downloading from
+/// HuggingFace Hub if it looks like a dataset ID.
+pub async fn resolve_dataset_path(dataset_id: &str) -> anyhow::Result<PathBuf> {
     match resolve_dataset_source(dataset_id) {
         DatasetSource::Local(p) => Ok(TrainingDataset::resolve_dataset_path_pub(&p)?),
         DatasetSource::HuggingFace(id) => {

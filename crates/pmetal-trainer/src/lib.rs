@@ -64,6 +64,7 @@
 #![allow(ambiguous_glob_reexports)]
 
 pub mod orchestrator;
+pub mod preference_data;
 
 pub mod adam8bit;
 pub mod adamw_groups;
@@ -164,5 +165,5 @@ pub use training_loop::*;
 // Orchestrator re-exports
 pub use orchestrator::{
     DispatchConfig, FullTrainingConfig, PhaseCallback, QLoraOrchConfig, QuantizationScheme,
-    TrainingJobConfig, TrainingPhase, TrainingResult,
+    TrainingJobConfig, TrainingPhase, TrainingResult, resolve_dataset_path,
 };
