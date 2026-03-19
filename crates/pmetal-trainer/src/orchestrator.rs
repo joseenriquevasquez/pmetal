@@ -1043,22 +1043,26 @@ async fn attempt_ane_training(
     let n_layers = get_usize("num_hidden_layers")?;
     let vocab_size = get_usize("vocab_size")?;
 
-    // ANE kernels bake seq_len into static shapes — cap to prevent large IOSurface allocs
+    // ANE kernels bake seq_len into static shapes and attention is O(seq_len²).
+    // Cap to 512 for ANE — larger values cause hardware rejection (status=0x1d)
+    // or extremely slow kernel compilation. The GPU path uses the full seq_len.
+    let ane_max_seq_len = 512;
     let max_seq_len = if full_config.training.max_seq_len == 0 {
         let model_max = config_json
             .get("max_position_embeddings")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .unwrap_or(2048);
-        let capped = model_max.min(2048);
+        let capped = model_max.min(ane_max_seq_len);
         tracing::info!(
             model_max = model_max,
             capped = capped,
-            "Auto-detected ANE seq_len from max_position_embeddings"
+            "Auto-detected ANE seq_len (capped to {})",
+            ane_max_seq_len
         );
         capped
     } else {
-        full_config.training.max_seq_len
+        full_config.training.max_seq_len.min(ane_max_seq_len)
     };
 
     // -----------------------------------------------------------------------
