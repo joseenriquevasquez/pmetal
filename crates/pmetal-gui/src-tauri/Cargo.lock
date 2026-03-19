@@ -5838,12 +5838,17 @@ dependencies = [
 name = "pmetal-trainer"
 version = "0.3.10"
 dependencies = [
+ "anyhow",
+ "arrow",
  "chrono",
+ "dirs",
  "image",
  "indicatif",
+ "parquet",
  "pmetal-core",
  "pmetal-data",
  "pmetal-distill",
+ "pmetal-hub",
  "pmetal-lora",
  "pmetal-metal",
  "pmetal-mlx",
@@ -5853,7 +5858,9 @@ dependencies = [
  "rand 0.10.0",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
