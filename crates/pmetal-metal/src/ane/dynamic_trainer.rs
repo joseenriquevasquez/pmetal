@@ -128,6 +128,27 @@ impl VocabMap {
                 }
             }
         }
+        Self::from_used(used)
+    }
+
+    /// Build a VocabMap from u32 token IDs (supports vocab > 65536).
+    ///
+    /// Use this for models like Qwen3 (vocab_size=151936) where token IDs
+    /// exceed the u16 range. After building the map, call `remap_u32` to
+    /// convert u32 IDs to compact u16 IDs for ANE consumption.
+    pub fn from_token_ids(token_ids: &[u32], full_vocab: usize) -> Self {
+        let mut used = vec![false; full_vocab];
+        for &tok in token_ids {
+            let idx = tok as usize;
+            if idx < full_vocab {
+                used[idx] = true;
+            }
+        }
+        Self::from_used(used)
+    }
+
+    fn from_used(used: Vec<bool>) -> Self {
+        let full_vocab = used.len();
         let mut full_to_compact = vec![-1i32; full_vocab];
         let mut compact_to_full = Vec::new();
         for (i, &u) in used.iter().enumerate() {
@@ -150,6 +171,28 @@ impl VocabMap {
             .iter()
             .map(|&t| {
                 let c = self.full_to_compact[t as usize];
+                debug_assert!(c >= 0, "Token {} not in VocabMap", t);
+                c as u16
+            })
+            .collect()
+    }
+
+    /// Remap u32 full-vocab token ids to compact u16 ids.
+    ///
+    /// For large-vocab models (vocab > 65536), this avoids the u16 truncation
+    /// that would corrupt token IDs if cast directly.
+    pub fn remap_u32(&self, tokens: &[u32]) -> Vec<u16> {
+        tokens
+            .iter()
+            .map(|&t| {
+                let idx = t as usize;
+                debug_assert!(
+                    idx < self.full_to_compact.len(),
+                    "Token {} out of range (vocab={})",
+                    t,
+                    self.full_to_compact.len()
+                );
+                let c = self.full_to_compact[idx];
                 debug_assert!(c >= 0, "Token {} not in VocabMap", t);
                 c as u16
             })
