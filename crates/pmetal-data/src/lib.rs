@@ -12,6 +12,7 @@
 
 pub mod chat_templates;
 pub mod collator;
+pub mod inference_config;
 pub mod dataloader;
 pub mod dataset;
 pub mod image_processing;
