@@ -1,10 +1,10 @@
-//! Fine-tune a model using manual sub-crate orchestration.
+//! Fine-tune a model using direct sub-crate orchestration.
 //!
 //! This example mirrors the CLI's training flow, giving full control over
-//! every component. For most users, the easy API (`finetune_easy.rs`) is simpler.
+//! every component.
 //!
 //! ```sh
-//! cargo run -p pmetal --example finetune_manual --features easy -- \
+//! cargo run -p pmetal --example finetune_manual -- \
 //!     --model ./path/to/model --dataset data.jsonl
 //! ```
 
