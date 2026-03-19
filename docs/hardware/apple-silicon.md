@@ -1,0 +1,73 @@
+# Apple Silicon Support
+
+Hardware detection, per-chip capabilities, M1–M5 support matrix, and ANE integration.
+
+PMetal automatically detects your Apple Silicon hardware at startup and tunes kernel parameters accordingly.
+
+## Chip Support Matrix
+
+| Chip | GPU Family | GPU Cores | BW (GB/s) | ANE TFLOPS | NAX | Notes |
+|------|-----------|-----------|-----------|------------|-----|-------|
+| M1 | Apple7 | 8 | 100 | ~11 | No | |
+| M1 Pro | Apple7 | 14 | 200 | ~11 | No | |
+| M1 Max | Apple7 | 24 | 400 | ~11 | No | |
+| M1 Ultra | Apple7 | 48 | 800 | ~22 | No | 2-die UltraFusion |
+| M2 | Apple8 | 8 | 100 | ~15 | No | |
+| M2 Pro | Apple8 | 16 | 200 | ~15 | No | |
+| M2 Max | Apple8 | 30 | 400 | ~15 | No | |
+| M2 Ultra | Apple8 | 48 | 800 | ~30 | No | 2-die UltraFusion |
+| M3 | Apple9 | 10 | 120 | 15.8 | No | Dynamic caching |
+| M3 Pro | Apple9 | 18 | 273 | 15.8 | No | |
+| M3 Max | Apple9 | 30 | 546 | 15.8 | No | |
+| M3 Ultra | Apple9 | 60 | 800 | 31.6 | No | 32 NE cores |
+| M4 | Apple9 | 10 | 120 | ~12.2 | No | Dynamic caching |
+| M4 Pro | Apple9 | 20 | 273 | 12.57 | No | |
+| M4 Max | Apple9 | 40 | 546 | 10.93 | No | |
+| M4 Ultra | Apple9 | 80 | 800 | ~24 | No | 2-die UltraFusion |
+| **M5** | **Apple10** | **10** | **120** | **~12.2** | **Yes** | NAX support |
+| **M5 Pro** | **Apple10** | **20** | **273** | **~12.3** | **Yes** | |
+| **M5 Max** | **Apple10** | **40** | **546** | **TBD** | **Yes** | |
+| **M5 Ultra** | **Apple10** | **80** | **800** | **TBD** | **Yes** | 2-die UltraFusion |
+
+ANE TFLOPS measured at FP16 via PMetal benchmarks.
+
+## Auto-Detection
+
+PMetal detects at startup:
+
+- **GPU family** (Apple7–Apple10) and architecture generation
+- **Device tier** (Base/Pro/Max/Ultra)
+- **GPU core count**
+- **ANE core count** and availability
+- **Memory bandwidth** (tier + family lookup)
+- **NAX** (M5+, Apple10)
+- **Metal features** (dynamic caching, mesh shaders)
+- **UltraFusion topology** (via `sysctl hw.packages`)
+
+Use `pmetal info` to display all detected hardware properties.
+
+## M5-Specific: NAX
+
+M5 (Apple10, arch gen 17) introduces Neural Accelerator units within GPU cores for hardware-accelerated:
+
+- GEMM (fused matrix multiply)
+- Quantized inference (FP4/FP8)
+- Scaled dot-product attention
+
+Accessed via Metal 4.0 (`-std=metal4.0`) kernels. NAX availability is checked via `DeviceProperties::has_nax()`.
+
+## ANE (Apple Neural Engine)
+
+PMetal's ANE pipeline:
+
+- **Dynamic Weight Pipeline**: 9 MIL kernels compiled once at startup
+- **Hybrid Inference**: ANE prefill + CPU decode with KV cache
+- **Power-of-2 bucketing**: Optimal kernel compilation for sequence lengths
+- **CPU RMSNorm**: f32 computation on CPU to avoid fp16 ANE overflow
+- **IOSurface Zero-Copy**: Shared memory surfaces for CPU-ANE transfer
+- **M1–M5 Compatibility**: Per-matrix blobs for M1, single-blob for M3+
+
+## See Also
+
+- [Kernel Tuning](/hardware/kernel-tuning/) — Per-tier parameter tuning
+- [pmetal info](/cli/info/) — View your hardware info

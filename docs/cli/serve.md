@@ -1,0 +1,44 @@
+# pmetal serve
+
+Start an OpenAI-compatible inference server.
+
+Start an HTTP inference server with an OpenAI-compatible API. Requires the `serve` feature flag.
+
+## Usage
+
+```bash
+pmetal serve --model <MODEL> [OPTIONS]
+```
+
+## Examples
+
+```bash
+# Start server
+pmetal serve --model Qwen/Qwen3-0.6B --port 8080
+
+# With LoRA adapter
+pmetal serve --model Qwen/Qwen3-0.6B --lora ./output/lora_weights.safetensors --port 8080
+```
+
+## API Compatibility
+
+The server exposes OpenAI-compatible endpoints:
+
+- `POST /v1/chat/completions` — Chat completions
+- `POST /v1/completions` — Text completions
+- `GET /v1/models` — List loaded models
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen3-0.6B", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+:::note
+Requires building with `--features serve`: `cargo install pmetal --features serve`
+:::
+
+## See Also
+
+- [pmetal infer](/cli/infer/) — Interactive inference
+- [Feature Flags](/configuration/feature-flags/) — Enable the serve feature

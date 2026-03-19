@@ -1,0 +1,36 @@
+# pmetal bench
+
+Benchmark training performance, generation speed, and FFI overhead.
+
+Benchmark various aspects of PMetal's performance on your hardware.
+
+## Subcommands
+
+### bench
+
+Benchmark training throughput (tokens/second, step time).
+
+```bash
+pmetal bench --model Qwen/Qwen3-0.6B --batch-size 4
+```
+
+### bench-gen
+
+Benchmark the generation loop — tokens per second, time to first token, and decode latency.
+
+```bash
+pmetal bench-gen --model Qwen/Qwen3-0.6B --prompt "Hello" --max-tokens 100
+```
+
+### bench-ffi
+
+Benchmark FFI overhead between Rust and Metal/MLX.
+
+```bash
+pmetal bench-ffi
+```
+
+## See Also
+
+- [Hardware Support](/hardware/apple-silicon/) — Hardware capabilities
+- [Kernel Tuning](/hardware/kernel-tuning/) — Per-tier optimizations
