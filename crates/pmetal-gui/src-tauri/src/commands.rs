@@ -235,6 +235,23 @@ pub struct FuseResult {
     pub model_size_bytes: u64,
 }
 
+/// A discovered LoRA adapter on disk. Matches TS `TrainedAdapter`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrainedAdapter {
+    /// Absolute path to the adapter directory.
+    pub path: String,
+    /// Human-readable name (directory basename).
+    pub name: String,
+    /// Base model this adapter was trained on (if known).
+    pub base_model: Option<String>,
+    /// LoRA rank from adapter_config.json.
+    pub rank: Option<u32>,
+    /// LoRA alpha from adapter_config.json.
+    pub alpha: Option<f32>,
+    /// Size of the weights file in bytes.
+    pub size_bytes: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Request DTOs — match api.ts invoke calls
 // ---------------------------------------------------------------------------
@@ -877,18 +894,30 @@ Selected method '{}' is not library-backed here yet.",
     let total_epochs = config.epochs.unwrap_or(3);
     // Resolve output_dir to an absolute path under the user's home directory
     // so it doesn't depend on the GUI process's working directory.
+    //
+    // Default naming: "{model_short}-{method}-{YYYYMMDD-HHMM}" so trained
+    // adapters are easily identifiable in the fuse/inference dropdowns.
     let output_dir = {
-        let raw = config.output_dir.as_deref().unwrap_or("./output");
+        let raw = config.output_dir.as_deref().unwrap_or("");
         let p = PathBuf::from(raw);
-        if p.is_absolute() {
+        let base = dirs::home_dir()
+            .map(|h| h.join("pmetal-output"))
+            .unwrap_or_else(|| PathBuf::from("./pmetal-output"));
+        let _ = std::fs::create_dir_all(&base);
+
+        if !raw.is_empty() && p.is_absolute() {
             p.to_string_lossy().to_string()
-        } else {
-            // Resolve relative to home dir, not GUI cwd
-            let base = dirs::home_dir()
-                .map(|h| h.join("pmetal-output"))
-                .unwrap_or_else(|| PathBuf::from("./output"));
-            let _ = std::fs::create_dir_all(&base);
+        } else if !raw.is_empty() && raw != "./output" {
+            // User provided a custom relative name — use it under ~/pmetal-output/
             base.join(p.file_name().unwrap_or(std::ffi::OsStr::new("output")))
+                .to_string_lossy()
+                .to_string()
+        } else {
+            // Auto-generate a descriptive name: "Qwen3-0.6B-lora-20260318-2145"
+            let model_short = config.model.rsplit('/').next().unwrap_or(&config.model);
+            let method = &config.method;
+            let ts = chrono::Local::now().format("%Y%m%d-%H%M");
+            base.join(format!("{model_short}-{method}-{ts}"))
                 .to_string_lossy()
                 .to_string()
         }
@@ -932,6 +961,22 @@ Selected method '{}' is not library-backed here yet.",
     let state_arc = state.training_runs.clone();
     let event_tx = state.event_tx.clone();
     let cancel_flags = state.cancel_flags.clone();
+
+    // Write training_info.json before spawning so the adapter scanner can
+    // find base_model + dataset even if training is still running.
+    let _ = std::fs::create_dir_all(&output_dir);
+    {
+        let info = serde_json::json!({
+            "base_model": config.model,
+            "dataset": dataset_id,
+            "method": config.method,
+            "created": chrono::Local::now().to_rfc3339(),
+        });
+        let _ = std::fs::write(
+            PathBuf::from(&output_dir).join("training_info.json"),
+            serde_json::to_string_pretty(&info).unwrap_or_default(),
+        );
+    }
 
     tokio::spawn(async move {
         let _ = tokio::fs::create_dir_all(&output_dir).await;
@@ -1032,6 +1077,7 @@ Selected method '{}' is not library-backed here yet.",
                 gradient_checkpointing_layers: config.gradient_checkpointing_layers.unwrap_or(4) as usize,
                 cut_cross_entropy: false,
                 ane: true,
+                loss_scale: 1.0,
             },
             config_path: None,
             log_metrics: Some(metrics_path.display().to_string()),
@@ -1344,6 +1390,7 @@ pub async fn start_inference(
 
     tokio::spawn(async move {
         let mut builder = easy::infer(config.model.clone())
+            .gpu() // Use Metal GPU for streaming token-by-token output
             .temperature(config.temperature.unwrap_or(0.7))
             .max_tokens(config.max_tokens.unwrap_or(1024) as usize)
             .top_k(config.top_k.unwrap_or(50) as usize)
@@ -1354,12 +1401,13 @@ pub async fn start_inference(
             builder = builder.lora(lora.clone());
         }
 
-        let prompt = match &config.system_message {
-            Some(system) if !system.is_empty() => format!("{system}\n\n{}", config.prompt),
-            _ => config.prompt.clone(),
-        };
+        if let Some(ref system) = config.system_message {
+            if !system.is_empty() {
+                builder = builder.system_message(system.clone());
+            }
+        }
 
-        let result = builder.generate_streaming(&prompt, |delta| {
+        let result = builder.generate_streaming(&config.prompt, |delta| {
             if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
                 return false;
             }
@@ -1508,6 +1556,148 @@ pub async fn fuse_lora(
         output_dir,
         model_size_bytes,
     })
+}
+
+/// Scan for trained LoRA adapters on disk.
+///
+/// Checks `~/pmetal-output/` (GUI default) for directories containing
+/// `adapter_config.json` or `lora_weights.safetensors`.
+#[tauri::command]
+pub async fn list_trained_adapters() -> Result<Vec<TrainedAdapter>> {
+    tokio::task::spawn_blocking(scan_trained_adapters)
+        .await
+        .map_err(|e| AppError(format!("scan failed: {e}")))
+}
+
+fn scan_trained_adapters() -> Vec<TrainedAdapter> {
+    let mut adapters = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // Scan roots
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join("pmetal-output"));
+    }
+
+    for root in &roots {
+        if !root.is_dir() {
+            continue;
+        }
+        // Scan up to 2 levels deep
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    try_add_adapter(&path, &mut adapters, &mut seen);
+                    // One more level
+                    if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                        for sub in sub_entries.flatten() {
+                            let sub_path = sub.path();
+                            if sub_path.is_dir() {
+                                try_add_adapter(&sub_path, &mut adapters, &mut seen);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by modification time (newest first)
+    adapters.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+    adapters
+}
+
+fn try_add_adapter(
+    dir: &Path,
+    adapters: &mut Vec<TrainedAdapter>,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) {
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    if !seen.insert(canonical) {
+        return;
+    }
+
+    let has_config = dir.join("adapter_config.json").exists();
+    let weights_file = if dir.join("lora_weights.safetensors").exists() {
+        Some(dir.join("lora_weights.safetensors"))
+    } else if dir.join("adapter_model.safetensors").exists() {
+        Some(dir.join("adapter_model.safetensors"))
+    } else {
+        None
+    };
+
+    if !has_config && weights_file.is_none() {
+        return;
+    }
+
+    let dir_name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| dir.display().to_string());
+
+    let size_bytes = weights_file
+        .as_ref()
+        .and_then(|f| f.metadata().ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    // Read adapter_config.json for rank/alpha
+    let (rank, alpha, base_model) = if has_config {
+        let cfg = std::fs::read_to_string(dir.join("adapter_config.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        let r = cfg.as_ref().and_then(|c| c["r"].as_u64()).map(|v| v as u32);
+        let a = cfg
+            .as_ref()
+            .and_then(|c| c["alpha"].as_f64().or_else(|| c["lora_alpha"].as_f64()))
+            .map(|v| v as f32);
+        let bm = cfg
+            .as_ref()
+            .and_then(|c| c["base_model"].as_str().map(String::from));
+        (r, a, bm)
+    } else {
+        (None, None, None)
+    };
+
+    // Also check training_info.json for base_model + dataset (written by TUI/GUI)
+    let training_info = std::fs::read_to_string(dir.join("training_info.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let base_model = base_model.or_else(|| {
+        training_info
+            .as_ref()
+            .and_then(|c| c["base_model"].as_str().map(String::from))
+    });
+    let dataset = training_info
+        .as_ref()
+        .and_then(|c| c["dataset"].as_str().map(String::from));
+
+    // Build a descriptive display name like TUI:
+    // - "Qwen3-0.6B-Base + my-dataset — dir_name"
+    // - "Qwen3-0.6B-Base — dir_name"
+    // - Just dir_name if no metadata
+    let display_name = match (&base_model, &dataset) {
+        (Some(bm), Some(ds)) => {
+            let model_short = bm.rsplit('/').next().unwrap_or(bm);
+            let ds_short = ds.rsplit('/').next().unwrap_or(ds);
+            format!("{model_short} + {ds_short}")
+        }
+        (Some(bm), None) => {
+            let model_short = bm.rsplit('/').next().unwrap_or(bm);
+            format!("{model_short} — {dir_name}")
+        }
+        _ => dir_name,
+    };
+
+    adapters.push(TrainedAdapter {
+        path: dir.display().to_string(),
+        name: display_name,
+        base_model,
+        rank,
+        alpha,
+        size_bytes,
+    });
 }
 
 #[tauri::command]
@@ -2127,6 +2317,7 @@ async fn run_distillation_in_process(
         "alpha": student_lora_config.alpha,
         "target_modules": student_lora_config.target_modules,
         "use_rslora": student_lora_config.use_rslora,
+        "base_model": config.student_model,
     });
     std::fs::write(
         output_dir.join("adapter_config.json"),
@@ -2293,6 +2484,7 @@ async fn run_grpo_in_process(
         "alpha": lora_config.alpha,
         "target_modules": lora_config.target_modules,
         "use_rslora": lora_config.use_rslora,
+        "base_model": config.model,
     });
     std::fs::write(
         output_dir.join("adapter_config.json"),

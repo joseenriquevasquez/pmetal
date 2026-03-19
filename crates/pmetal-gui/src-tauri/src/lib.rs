@@ -87,6 +87,8 @@ pub fn run() {
             // Inference
             start_inference,
             stop_inference,
+            // Adapters
+            list_trained_adapters,
             // Merge / Fuse / Quantize
             merge_models,
             get_merge_strategies,

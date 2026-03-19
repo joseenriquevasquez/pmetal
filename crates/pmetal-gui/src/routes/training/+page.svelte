@@ -2,8 +2,8 @@
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { modelsStore, trainingStore } from '$lib/stores.svelte';
-  import type { TrainingConfig, TrainingRun, CachedDatasetInfo } from '$lib/api';
-  import { fuseLora, listCachedDatasets, peekDatasetColumns } from '$lib/api';
+  import type { TrainingConfig, TrainingRun, CachedDatasetInfo, TrainedAdapter } from '$lib/api';
+  import { fuseLora, listCachedDatasets, listTrainedAdapters, peekDatasetColumns } from '$lib/api';
   import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
 
   let cachedDatasets = $state<CachedDatasetInfo[]>([]);
@@ -51,7 +51,7 @@
   let lrScheduler = $state('cosine');
   let saveSteps = $state(500);
   let loggingSteps = $state(10);
-  let outputDir = $state('./output');
+  let outputDir = $state('');
   let resumeFrom = $state('');
   let loadIn4bit = $state(true);
 
@@ -77,6 +77,8 @@
   let isFusing = $state(false);
   let fuseError = $state<string | null>(null);
   let fuseSuccess = $state<string | null>(null);
+  let trainedAdapters = $state<TrainedAdapter[]>([]);
+  let fuseCustomPath = $state(false);
 
   // Derived state
   let models = $derived(modelsStore.models);
@@ -270,7 +272,7 @@
       <p class="text-surface-500 dark:text-surface-400 mt-1">Fine-tune models with LoRA, QLoRA, DPO, and more</p>
     </div>
     <div class="flex gap-2">
-      <button class="btn-secondary btn-sm" aria-label="Fuse LoRA adapter into base model" onclick={() => (showFuseModal = true)}>
+      <button class="btn-secondary btn-sm" aria-label="Fuse LoRA adapter into base model" onclick={() => { showFuseModal = true; fuseCustomPath = false; fuseError = null; fuseSuccess = null; listTrainedAdapters().then(a => trainedAdapters = a).catch(() => {}); }}>
         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 14v6m-3-3h6M6 10h2a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v2a2 2 0 002 2zm10 0h2a2 2 0 002-2V6a2 2 0 00-2-2h-2a2 2 0 00-2 2v2a2 2 0 002 2zM6 20h2a2 2 0 002-2v-2a2 2 0 00-2-2H6a2 2 0 00-2 2v2a2 2 0 002 2z" />
         </svg>
@@ -774,7 +776,7 @@
               </div>
               <div>
                 <label class="label" for="output-dir">Output Directory</label>
-                <input id="output-dir" type="text" class="input" placeholder="./output" bind:value={outputDir} />
+                <input id="output-dir" type="text" class="input" placeholder="Auto: ~/pmetal-output/{model}-{method}-{date}" bind:value={outputDir} />
               </div>
             </div>
 
@@ -1119,8 +1121,33 @@
           </select>
         </div>
         <div>
-          <label class="label" for="fuse-lora">LoRA Adapter Path</label>
-          <input id="fuse-lora" type="text" class="input" placeholder="/path/to/lora/adapter" bind:value={fuseLoraPath} />
+          <label class="label" for="fuse-lora">LoRA Adapter</label>
+          {#if trainedAdapters.length > 0 && !fuseCustomPath}
+            <select id="fuse-lora" class="input" bind:value={fuseLoraPath} onchange={(e) => {
+              const val = (e.target as HTMLSelectElement).value;
+              if (val === '__custom__') { fuseCustomPath = true; fuseLoraPath = ''; return; }
+              const adapter = trainedAdapters.find(a => a.path === val);
+              if (adapter?.base_model) {
+                const match = models.find(m => m.id === adapter.base_model || m.id.endsWith('/' + adapter.base_model));
+                if (match) fuseBaseModel = match.id;
+              }
+            }}>
+              <option value="">Select trained adapter...</option>
+              {#each trainedAdapters as adapter}
+                <option value={adapter.path}>
+                  {adapter.name}{adapter.rank ? ` (r=${adapter.rank})` : ''}{adapter.base_model ? ` — ${adapter.base_model.split('/').pop()}` : ''} — {(adapter.size_bytes / 1048576).toFixed(0)} MB
+                </option>
+              {/each}
+              <option value="__custom__">Custom path...</option>
+            </select>
+          {:else}
+            <div class="flex gap-2">
+              <input id="fuse-lora" type="text" class="input flex-1" placeholder="/path/to/lora/adapter" bind:value={fuseLoraPath} />
+              {#if trainedAdapters.length > 0}
+                <button type="button" class="btn-ghost btn-sm" onclick={() => { fuseCustomPath = false; fuseLoraPath = ''; }}>List</button>
+              {/if}
+            </div>
+          {/if}
         </div>
         <div>
           <label class="label" for="fuse-output">Output Directory</label>

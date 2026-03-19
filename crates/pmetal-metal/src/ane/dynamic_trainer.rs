@@ -20,8 +20,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::mpsc;
-use std::thread;
+use std::sync::Arc;
 
 use tracing::{debug, info};
 
@@ -30,7 +29,11 @@ use crate::ane::dynamic_kernel::{self, DynamicKernelConfig, DynamicKernelOutput}
 use crate::ane::iosurface::IoSurface;
 use crate::ane::kernel::TransformerKernelConfig;
 use crate::ane::runtime::{AneModel, AneRuntime};
+use crate::buffer::{BufferUsage, MetalBuffer};
+use crate::context::MetalContext;
 use crate::error::{MetalError, Result};
+use crate::kernels::dw_gemm::{DwGemm, GPU_DW_MIN_DIM};
+use crate::kernels::fused_training::BatchedCommandBuffer;
 
 /// Configuration for the dynamic ANE trainer.
 ///
@@ -74,6 +77,14 @@ pub struct DynamicAneTrainerConfig {
     pub min_lr_ratio: f32,
     /// RMSNorm epsilon (must match ANE kernel eps). Default: 1e-6.
     pub rms_norm_eps: f32,
+    /// Loss scaling factor. Multiplies dlogits before backward and divides
+    /// gradients after accumulation, preventing fp32 underflow for small
+    /// gradient magnitudes at >350M params. Default: 1.0 (disabled).
+    pub loss_scale: f32,
+    /// Optional separate learning rate for embeddings. If `None`, uses base LR.
+    /// Embeddings benefit from lower LR to prevent divergence from sparse
+    /// token updates and magnitude drift through many layers.
+    pub embedding_lr: Option<f32>,
 }
 
 impl Default for DynamicAneTrainerConfig {
@@ -96,6 +107,8 @@ impl Default for DynamicAneTrainerConfig {
             warmup_steps: 100,
             min_lr_ratio: 0.1,
             rms_norm_eps: 1e-6,
+            loss_scale: 1.0,
+            embedding_lr: None,
         }
     }
 }
@@ -299,27 +312,34 @@ struct LayerAdamState {
 }
 
 /// Per-layer gradient accumulators.
+///
+/// Weight gradient fields (wq..w3) are `MetalBuffer<f32>` with `Shared` storage,
+/// enabling zero-copy access from both the Metal GPU (dW GEMM accumulation) and
+/// CPU (scale_inplace, sum_of_squares, adam_update via `.as_mut_slice()`).
+///
+/// RMSNorm gradient fields remain `Vec<f32>` because they are tiny (dim elements)
+/// and only written on CPU.
 struct LayerGradients {
-    wq: Vec<f32>,
-    wk: Vec<f32>,
-    wv: Vec<f32>,
-    wo: Vec<f32>,
-    w1: Vec<f32>,
-    w2: Vec<f32>,
-    w3: Vec<f32>,
+    wq: MetalBuffer<f32>,
+    wk: MetalBuffer<f32>,
+    wv: MetalBuffer<f32>,
+    wo: MetalBuffer<f32>,
+    w1: MetalBuffer<f32>,
+    w2: MetalBuffer<f32>,
+    w3: MetalBuffer<f32>,
     rms_att: Vec<f32>,
     rms_ffn: Vec<f32>,
 }
 
 impl LayerGradients {
     fn zero(&mut self) {
-        self.wq.fill(0.0);
-        self.wk.fill(0.0);
-        self.wv.fill(0.0);
-        self.wo.fill(0.0);
-        self.w1.fill(0.0);
-        self.w2.fill(0.0);
-        self.w3.fill(0.0);
+        self.wq.as_mut_slice().fill(0.0);
+        self.wk.as_mut_slice().fill(0.0);
+        self.wv.as_mut_slice().fill(0.0);
+        self.wo.as_mut_slice().fill(0.0);
+        self.w1.as_mut_slice().fill(0.0);
+        self.w2.as_mut_slice().fill(0.0);
+        self.w3.as_mut_slice().fill(0.0);
         self.rms_att.fill(0.0);
         self.rms_ffn.fill(0.0);
     }
@@ -437,10 +457,14 @@ pub struct DynamicAneTrainer {
     rms_final_adam: AdamParam,
     adam_t: usize,
     compile_count: usize,
-    /// Channel for dispatching async dW tasks to the cblas worker thread.
-    dw_sender: mpsc::Sender<Box<dyn FnOnce() + Send>>,
-    /// Worker thread handle.
-    _dw_thread: thread::JoinHandle<()>,
+    /// GPU dW GEMM dispatcher (None if dim < GPU_DW_MIN_DIM or Metal init fails).
+    gpu_dw: Option<DwGemm>,
+    /// Pre-allocated scratch buffers for activation copies (A and B operands).
+    /// Sized to max(h*s, d*s, qd*s, v*s) to fit any per-layer activation.
+    scratch_a: Option<MetalBuffer<f32>>,
+    scratch_b: Option<MetalBuffer<f32>>,
+    /// Metal context for GPU dW path.
+    metal_ctx: Option<Arc<MetalContext>>,
     /// Latest step timings.
     pub last_timings: StepTimings,
     // --- Vocab compaction state ---
@@ -452,6 +476,38 @@ pub struct DynamicAneTrainer {
     compact_embed_grad: Vec<f32>,
     /// Compact embedding Adam state.
     compact_embed_adam: AdamParam,
+}
+
+/// Encode a dW GEMM (`C += A @ B^T`) into a BatchedCommandBuffer (GPU path),
+/// or fall back to cblas GEMM (CPU path).
+///
+/// Free function to avoid borrow conflicts with `backward_layer`, which holds
+/// immutable borrows on `self.kernels` / `self.io_pool` while dispatching GEMMs.
+#[allow(clippy::too_many_arguments)]
+fn encode_dw_gemm(
+    gpu_dw: Option<&DwGemm>,
+    scratch_a: Option<&MetalBuffer<f32>>,
+    scratch_b: Option<&MetalBuffer<f32>>,
+    batch: Option<&mut BatchedCommandBuffer>,
+    a_data: &[f32],
+    b_data: &[f32],
+    c_buf: &MetalBuffer<f32>,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    if let (Some(dw), Some(sa), Some(sb), Some(batch)) = (gpu_dw, scratch_a, scratch_b, batch) {
+        // GPU path: copy activations to scratch, encode GEMM.
+        // MetalBuffer has interior mutability via unified memory (as_mut_slice_unchecked).
+        sa.as_mut_slice_unchecked()[..a_data.len()].copy_from_slice(a_data);
+        sb.as_mut_slice_unchecked()[..b_data.len()].copy_from_slice(b_data);
+        dw.queue_gemm_accum(batch, sa, sb, c_buf, m, n, k, 1.0, 1.0)
+            .unwrap();
+    } else {
+        // CPU cblas fallback
+        let c_slice = c_buf.as_mut_slice_unchecked();
+        accelerate::gemm(a_data, b_data, c_slice, m, n, k, 1.0, 1.0, false, true);
+    }
 }
 
 impl DynamicAneTrainer {
@@ -479,6 +535,46 @@ impl DynamicAneTrainer {
             seq_len: s,
             rope_theta: 1_000_000.0,
             rms_norm_eps: 1e-6,
+        };
+
+        // Try to initialize Metal GPU dW path
+        let (metal_ctx, gpu_dw, scratch_a, scratch_b) = if d >= GPU_DW_MIN_DIM {
+            match MetalContext::new() {
+                Ok(ctx) => {
+                    let ctx = Arc::new(ctx);
+                    match DwGemm::new(ctx.clone()) {
+                        Ok(dw) => {
+                            // Pre-allocate two scratch buffers sized to the largest activation
+                            let qd_val = config.n_heads * hd;
+                            let max_scratch = [d * s, h * s, qd_val * s].into_iter().max().unwrap();
+                            match (
+                                MetalBuffer::new(&ctx, max_scratch, BufferUsage::Shared),
+                                MetalBuffer::new(&ctx, max_scratch, BufferUsage::Shared),
+                            ) {
+                                (Ok(sa), Ok(sb)) => {
+                                    info!(dim = d, scratch_size = max_scratch, "GPU dW path enabled (Metal GEMM)");
+                                    (Some(ctx.clone()), Some(dw), Some(sa), Some(sb))
+                                }
+                                _ => {
+                                    info!("Scratch buffer alloc failed, falling back to cblas");
+                                    (None, None, None, None)
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            info!("GPU dW init failed, falling back to cblas: {e}");
+                            (None, None, None, None)
+                        }
+                    }
+                }
+                Err(e) => {
+                    info!("MetalContext init failed, falling back to cblas: {e}");
+                    (None, None, None, None)
+                }
+            }
+        } else {
+            info!(dim = d, threshold = GPU_DW_MIN_DIM, "dim below GPU dW threshold, using cblas");
+            (None, None, None, None)
         };
 
         let mut layer_weights = Vec::with_capacity(nl);
@@ -525,17 +621,37 @@ impl DynamicAneTrainer {
                 ffn_out: vec![0.0; d * s],
             });
 
-            layer_grads.push(LayerGradients {
-                wq: vec![0.0; qd * d],
-                wk: vec![0.0; kvd * d],
-                wv: vec![0.0; kvd * d],
-                wo: vec![0.0; d * qd],
-                w1: vec![0.0; h * d],
-                w2: vec![0.0; d * h],
-                w3: vec![0.0; h * d],
-                rms_att: vec![0.0; d],
-                rms_ffn: vec![0.0; d],
-            });
+            // Allocate gradient buffers as MetalBuffer (GPU-visible) or fallback Vec
+            let lg = if let Some(ref ctx) = metal_ctx {
+                LayerGradients {
+                    wq: MetalBuffer::zeros(ctx, qd * d, BufferUsage::Shared).unwrap(),
+                    wk: MetalBuffer::zeros(ctx, kvd * d, BufferUsage::Shared).unwrap(),
+                    wv: MetalBuffer::zeros(ctx, kvd * d, BufferUsage::Shared).unwrap(),
+                    wo: MetalBuffer::zeros(ctx, d * qd, BufferUsage::Shared).unwrap(),
+                    w1: MetalBuffer::zeros(ctx, h * d, BufferUsage::Shared).unwrap(),
+                    w2: MetalBuffer::zeros(ctx, d * h, BufferUsage::Shared).unwrap(),
+                    w3: MetalBuffer::zeros(ctx, h * d, BufferUsage::Shared).unwrap(),
+                    rms_att: vec![0.0; d],
+                    rms_ffn: vec![0.0; d],
+                }
+            } else {
+                // CPU-only fallback: create MetalBuffer from Vec (panics if no Metal,
+                // but this should never happen on Apple Silicon)
+                let fallback_ctx = MetalContext::new().expect("Metal required on Apple Silicon");
+                let fallback_ctx = Arc::new(fallback_ctx);
+                LayerGradients {
+                    wq: MetalBuffer::zeros(&fallback_ctx, qd * d, BufferUsage::Shared).unwrap(),
+                    wk: MetalBuffer::zeros(&fallback_ctx, kvd * d, BufferUsage::Shared).unwrap(),
+                    wv: MetalBuffer::zeros(&fallback_ctx, kvd * d, BufferUsage::Shared).unwrap(),
+                    wo: MetalBuffer::zeros(&fallback_ctx, d * qd, BufferUsage::Shared).unwrap(),
+                    w1: MetalBuffer::zeros(&fallback_ctx, h * d, BufferUsage::Shared).unwrap(),
+                    w2: MetalBuffer::zeros(&fallback_ctx, d * h, BufferUsage::Shared).unwrap(),
+                    w3: MetalBuffer::zeros(&fallback_ctx, h * d, BufferUsage::Shared).unwrap(),
+                    rms_att: vec![0.0; d],
+                    rms_ffn: vec![0.0; d],
+                }
+            };
+            layer_grads.push(lg);
 
             layer_adam.push(LayerAdamState {
                 wq: AdamParam::new(qd * d),
@@ -549,18 +665,6 @@ impl DynamicAneTrainer {
                 rms_ffn: AdamParam::new(d),
             });
         }
-
-        // Spawn async dW worker thread (serial queue semantics)
-        let (dw_sender, dw_receiver) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
-
-        let dw_thread = thread::Builder::new()
-            .name("ane-dw-cblas".to_string())
-            .spawn(move || {
-                while let Ok(task) = dw_receiver.recv() {
-                    task();
-                }
-            })
-            .expect("Failed to spawn dW worker thread");
 
         Self {
             config,
@@ -579,8 +683,10 @@ impl DynamicAneTrainer {
             rms_final_adam: AdamParam::new(d),
             adam_t: 0,
             compile_count: 0,
-            dw_sender,
-            _dw_thread: dw_thread,
+            gpu_dw,
+            scratch_a,
+            scratch_b,
+            metal_ctx,
             last_timings: StepTimings::default(),
             vocab_map: None,
             compact_embed: Vec::new(),
@@ -836,19 +942,7 @@ impl DynamicAneTrainer {
         }
     }
 
-    /// Dispatch an async weight gradient task to the cblas worker thread.
-    fn dispatch_dw(&self, task: Box<dyn FnOnce() + Send>) {
-        let _ = self.dw_sender.send(task);
-    }
-
-    /// Wait for all pending dW tasks to complete.
-    fn wait_dw(&self) {
-        let (done_tx, done_rx) = mpsc::channel();
-        let _ = self.dw_sender.send(Box::new(move || {
-            let _ = done_tx.send(());
-        }));
-        let _ = done_rx.recv();
-    }
+    // dispatch_dw is a free function below (encode_dw_gemm) to avoid borrow conflicts.
 
     /// Execute a single projection kernel: act @ W → output.
     #[allow(clippy::too_many_arguments)]
@@ -1002,14 +1096,21 @@ impl DynamicAneTrainer {
     /// Backward pass for a single layer using decomposed ANE kernels.
     ///
     /// Each weight-transpose projection is a separate ANE kernel dispatch.
+    /// Weight gradient GEMMs are encoded into `batch` (GPU) or run inline (CPU fallback).
     /// Results are combined on CPU via vadd.
-    fn backward_layer(&mut self, l: usize, dx: &mut [f32]) -> Result<()> {
+    fn backward_layer(
+        &mut self,
+        l: usize,
+        dx: &mut [f32],
+        batch: &mut Option<BatchedCommandBuffer>,
+    ) -> Result<()> {
         let d = self.config.dim;
         let h = self.config.hidden_dim;
         let s = self.config.seq_len;
         let qd = self.kernel_config.q_dim();
         let kvd = self.kernel_config.kv_dim();
         let score_ch = self.kernel_config.score_ch();
+        let eps = self.config.rms_norm_eps;
 
         let kernels = self
             .kernels
@@ -1019,6 +1120,11 @@ impl DynamicAneTrainer {
             .io_pool
             .as_ref()
             .ok_or_else(|| MetalError::InvalidConfig("IO pool not allocated".into()))?;
+
+        // GPU dW references (immutable borrows of Option fields)
+        let gpu_dw = self.gpu_dw.as_ref();
+        let scratch_a = self.scratch_a.as_ref();
+        let scratch_b = self.scratch_b.as_ref();
 
         // ====== FFN Backward ======
 
@@ -1032,32 +1138,12 @@ impl DynamicAneTrainer {
         let mut dsilu_raw = vec![0.0f32; h * s];
         io.ffn_bwd_w2t_out.read_f32(&mut dsilu_raw, 0, h, s);
 
-        // 2. Async dW2 = dx @ silu_out^T (on cblas worker)
-        {
-            let dy_clone = dx[..d * s].to_vec();
-            let silu_clone = self.layer_acts[l].silu_out.clone();
-            let w2_grad_ptr = self.layer_grads[l].w2.as_mut_ptr() as usize;
-            let w2_grad_len = self.layer_grads[l].w2.len();
-            let d_val = d;
-            let h_val = h;
-            let s_val = s;
-            self.dispatch_dw(Box::new(move || {
-                let w2_grad =
-                    unsafe { std::slice::from_raw_parts_mut(w2_grad_ptr as *mut f32, w2_grad_len) };
-                accelerate::gemm(
-                    &dy_clone,
-                    &silu_clone,
-                    w2_grad,
-                    d_val,
-                    h_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
-            }));
-        }
+        // 2. dW2 = dx @ silu_out^T
+        encode_dw_gemm(
+            gpu_dw, scratch_a, scratch_b, batch.as_mut(),
+            &dx[..d * s], &self.layer_acts[l].silu_out,
+            &self.layer_grads[l].w2, d, h, s,
+        );
 
         // 3. SiLU derivative on CPU
         let acts = &self.layer_acts[l];
@@ -1071,49 +1157,17 @@ impl DynamicAneTrainer {
             dh3[i] = dsilu_raw[i] * h1_val * sig;
         }
 
-        // Async dW1, dW3
-        {
-            let dh1_clone = dh1.clone();
-            let dh3_clone = dh3.clone();
-            let x2norm_clone = acts.x2norm.to_vec();
-            let w1_grad_ptr = self.layer_grads[l].w1.as_mut_ptr() as usize;
-            let w1_grad_len = self.layer_grads[l].w1.len();
-            let w3_grad_ptr = self.layer_grads[l].w3.as_mut_ptr() as usize;
-            let w3_grad_len = self.layer_grads[l].w3.len();
-            let d_val = d;
-            let h_val = h;
-            let s_val = s;
-            self.dispatch_dw(Box::new(move || {
-                let w1_grad =
-                    unsafe { std::slice::from_raw_parts_mut(w1_grad_ptr as *mut f32, w1_grad_len) };
-                accelerate::gemm(
-                    &dh1_clone,
-                    &x2norm_clone,
-                    w1_grad,
-                    h_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
-                let w3_grad =
-                    unsafe { std::slice::from_raw_parts_mut(w3_grad_ptr as *mut f32, w3_grad_len) };
-                accelerate::gemm(
-                    &dh3_clone,
-                    &x2norm_clone,
-                    w3_grad,
-                    h_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
-            }));
-        }
+        // dW1, dW3
+        encode_dw_gemm(
+            gpu_dw, scratch_a, scratch_b, batch.as_mut(),
+            &dh1, &self.layer_acts[l].x2norm,
+            &self.layer_grads[l].w1, h, d, s,
+        );
+        encode_dw_gemm(
+            gpu_dw, scratch_a, scratch_b, batch.as_mut(),
+            &dh3, &self.layer_acts[l].x2norm,
+            &self.layer_grads[l].w3, h, d, s,
+        );
 
         // 4. dh1@W1^T + dh3@W3^T → dx_ffn (fused ANE kernel)
         io.ffn_bwd_w13t_in.write_packed_f32(
@@ -1143,49 +1197,28 @@ impl DynamicAneTrainer {
             &self.layer_weights[l].rms_ffn,
             d,
             s,
-            self.config.rms_norm_eps,
+            eps,
         );
 
         // ====== Attention Backward ======
 
         // 6. Fused sdpa_bwd1: computes dA (via Wo^T) and sets up for dV/probs/dp.
-        //
-        // Surface layout: [in_ch = qd+2*kvd+d, sp = s+qd] fp32
-        //   ch [0 .. qd]:            Q activations in sp[0..s], zeros in sp[s..s+qd]
-        //   ch [qd .. qd+kvd]:       K activations in sp[0..s], zeros in sp[s..s+qd]
-        //   ch [qd+kvd .. qd+2*kvd]: V activations in sp[0..s], zeros in sp[s..s+qd]
-        //   ch [qd+2*kvd .. in_ch]:  dy activations in sp[0..s],
-        //                            Wo^T rows in sp[s..s+qd]  (wo [d,qd] row-major)
-        //
-        // wo [d, qd] row-major gives exactly the Wo^T rows needed: row `ch` of `wo`
-        // is `Wo^T[ch, 0..qd]` (output-projection weight row for input channel ch).
         let bwd1_sp = s + qd;
         let bwd1_in_ch = qd + 2 * kvd + d;
         let dy_ch_off = qd + 2 * kvd;
 
-        // Zero the entire surface once to clear stale weight-column values in the
-        // Q/K/V rows (those rows have activation data in sp[0..s] only; sp[s..s+qd]
-        // must be zero so the kernel's Wo^T matmul sees zeros there).
         io.sdpa_bwd1_in
             .zero_channel_range_f32(0, bwd1_in_ch, bwd1_sp);
 
-        // Q [qd, s] → ch 0..qd, sp[0..s]
         io.sdpa_bwd1_in
             .write_f32_strided_at(0, &acts.q, qd, s, bwd1_sp);
-
-        // K [kvd, s] → ch qd..qd+kvd, sp[0..s]
         io.sdpa_bwd1_in
             .write_f32_strided_at(qd, &acts.k, kvd, s, bwd1_sp);
-
-        // V [kvd, s] → ch qd+kvd..qd+2*kvd, sp[0..s]
         io.sdpa_bwd1_in
             .write_f32_strided_at(qd + kvd, &acts.v, kvd, s, bwd1_sp);
-
-        // dy [d, s] → ch dy_ch_off..in_ch, sp[0..s]
         io.sdpa_bwd1_in
             .write_f32_strided_at(dy_ch_off, &dx_ffn_norm, d, s, bwd1_sp);
 
-        // Wo^T = wo [d, qd] → ch dy_ch_off..in_ch, sp[s..s+qd]
         io.sdpa_bwd1_in.write_f32_at_col_offset(
             dy_ch_off,
             &self.layer_weights[l].wo,
@@ -1202,32 +1235,12 @@ impl DynamicAneTrainer {
         let mut dv = vec![0.0f32; kvd * s];
         io.sdpa_bwd1_out.read_fp16_as_f32(&mut dv, 0, kvd, s);
 
-        // Async dWo
-        {
-            let dx_clone = dx_ffn_norm.clone();
-            let attn_clone = self.layer_acts[l].attn_out.to_vec();
-            let wo_grad_ptr = self.layer_grads[l].wo.as_mut_ptr() as usize;
-            let wo_grad_len = self.layer_grads[l].wo.len();
-            let d_val = d;
-            let qd_val = qd;
-            let s_val = s;
-            self.dispatch_dw(Box::new(move || {
-                let wo_grad =
-                    unsafe { std::slice::from_raw_parts_mut(wo_grad_ptr as *mut f32, wo_grad_len) };
-                accelerate::gemm(
-                    &dx_clone,
-                    &attn_clone,
-                    wo_grad,
-                    d_val,
-                    qd_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
-            }));
-        }
+        // dWo
+        encode_dw_gemm(
+            gpu_dw, scratch_a, scratch_b, batch.as_mut(),
+            &dx_ffn_norm, &self.layer_acts[l].attn_out,
+            &self.layer_grads[l].wo, d, qd, s,
+        );
 
         // 7. SDPA backward part 2: Q, K, probs, dp → dQ, dK
         io.sdpa_bwd2_in
@@ -1246,70 +1259,22 @@ impl DynamicAneTrainer {
         io.sdpa_bwd2_out.read_fp16_as_f32(&mut dq, 0, qd, s);
         io.sdpa_bwd2_out.read_fp16_as_f32(&mut dk, qd, kvd, s);
 
-        // Async dWq, dWk, dWv
-        {
-            let dq_clone = dq.clone();
-            let dk_clone = dk.clone();
-            let dv_clone = dv.clone();
-            let xnorm_clone = self.layer_acts[l].xnorm.to_vec();
-
-            let wq_grad_ptr = self.layer_grads[l].wq.as_mut_ptr() as usize;
-            let wq_grad_len = self.layer_grads[l].wq.len();
-            let wk_grad_ptr = self.layer_grads[l].wk.as_mut_ptr() as usize;
-            let wk_grad_len = self.layer_grads[l].wk.len();
-            let wv_grad_ptr = self.layer_grads[l].wv.as_mut_ptr() as usize;
-            let wv_grad_len = self.layer_grads[l].wv.len();
-
-            let d_val = d;
-            let qd_val = qd;
-            let kvd_val = kvd;
-            let s_val = s;
-
-            self.dispatch_dw(Box::new(move || {
-                let wq_grad =
-                    unsafe { std::slice::from_raw_parts_mut(wq_grad_ptr as *mut f32, wq_grad_len) };
-                accelerate::gemm(
-                    &dq_clone,
-                    &xnorm_clone,
-                    wq_grad,
-                    qd_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
-                let wk_grad =
-                    unsafe { std::slice::from_raw_parts_mut(wk_grad_ptr as *mut f32, wk_grad_len) };
-                accelerate::gemm(
-                    &dk_clone,
-                    &xnorm_clone,
-                    wk_grad,
-                    kvd_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
-                let wv_grad =
-                    unsafe { std::slice::from_raw_parts_mut(wv_grad_ptr as *mut f32, wv_grad_len) };
-                accelerate::gemm(
-                    &dv_clone,
-                    &xnorm_clone,
-                    wv_grad,
-                    kvd_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
-            }));
-        }
+        // dWq, dWk, dWv
+        encode_dw_gemm(
+            gpu_dw, scratch_a, scratch_b, batch.as_mut(),
+            &dq, &self.layer_acts[l].xnorm,
+            &self.layer_grads[l].wq, qd, d, s,
+        );
+        encode_dw_gemm(
+            gpu_dw, scratch_a, scratch_b, batch.as_mut(),
+            &dk, &self.layer_acts[l].xnorm,
+            &self.layer_grads[l].wk, kvd, d, s,
+        );
+        encode_dw_gemm(
+            gpu_dw, scratch_a, scratch_b, batch.as_mut(),
+            &dv, &self.layer_acts[l].xnorm,
+            &self.layer_grads[l].wv, kvd, d, s,
+        );
 
         // 8. QKV backward projections (dxq, dxk, dxv)
         let mut dxq = vec![0.0f32; d * s];
@@ -1361,7 +1326,7 @@ impl DynamicAneTrainer {
             &self.layer_weights[l].rms_att,
             d,
             s,
-            self.config.rms_norm_eps,
+            eps,
         );
 
         // Final dx (residual)
@@ -1375,7 +1340,15 @@ impl DynamicAneTrainer {
     /// When vocab compaction is active, the classifier operates on the compact
     /// embedding (`compact_vocab * dim`) instead of the full one, giving ~3.5x
     /// speedup on the classifier matmul and cross-entropy.
-    pub fn train_step(&mut self, input_tokens: &[u16], target_tokens: &[u16]) -> Result<f32> {
+    ///
+    /// Weight gradient GEMMs are encoded into `batch` (GPU) or run inline (CPU).
+    /// The caller (`train_batch`) creates the batch and calls `execute()`.
+    pub fn train_step(
+        &mut self,
+        input_tokens: &[u16],
+        target_tokens: &[u16],
+        batch: &mut Option<BatchedCommandBuffer>,
+    ) -> Result<f32> {
         let d = self.config.dim;
         let s = self.config.seq_len;
 
@@ -1463,6 +1436,13 @@ impl DynamicAneTrainer {
                 accelerate::cross_entropy_loss(&mut dlogits, &logits, &compact_targets, cv, s)
             };
 
+            // Loss scaling: amplify dlogits before backward propagation to
+            // prevent fp32 underflow at >350M params. Gradients are unscaled
+            // in train_batch() after accumulation, before clipping.
+            if self.config.loss_scale != 1.0 {
+                accelerate::scale_inplace(&mut dlogits, self.config.loss_scale);
+            }
+
             // dx = compact_embed^T @ dlogits: [d, cv] @ [cv, s] → [d, s]
             let mut dx = vec![0.0f32; d * s];
             accelerate::gemm(
@@ -1478,32 +1458,20 @@ impl DynamicAneTrainer {
                 false,
             );
 
-            // Async compact embed gradient: dE = dlogits @ x_final^T: [cv, s] @ [s, d] → [cv, d]
-            {
-                let dlogits_clone = dlogits;
-                let x_final_clone = x_final;
-                let grad_ptr = self.compact_embed_grad.as_mut_ptr() as usize;
-                let grad_len = self.compact_embed_grad.len();
-                let cv_val = cv;
-                let d_val = d;
-                let s_val = s;
-                self.dispatch_dw(Box::new(move || {
-                    let grad =
-                        unsafe { std::slice::from_raw_parts_mut(grad_ptr as *mut f32, grad_len) };
-                    accelerate::gemm(
-                        &dlogits_clone,
-                        &x_final_clone,
-                        grad,
-                        cv_val,
-                        d_val,
-                        s_val,
-                        1.0,
-                        1.0,
-                        false,
-                        true,
-                    );
-                }));
-            }
+            // Compact embed gradient: dE = dlogits @ x_final^T: [cv, s] @ [s, d] → [cv, d]
+            // Stays on CPU (embed grads are Vec<f32>, not MetalBuffer — sparse update)
+            accelerate::gemm(
+                &dlogits,
+                &x_final,
+                &mut self.compact_embed_grad,
+                cv,
+                d,
+                s,
+                1.0,
+                1.0,
+                false,
+                true,
+            );
 
             (loss, dx)
         } else {
@@ -1527,6 +1495,11 @@ impl DynamicAneTrainer {
             let mut dlogits = vec![0.0f32; v * s];
             let loss = accelerate::cross_entropy_loss(&mut dlogits, &logits, target_tokens, v, s);
 
+            // Loss scaling (same as compact path)
+            if self.config.loss_scale != 1.0 {
+                accelerate::scale_inplace(&mut dlogits, self.config.loss_scale);
+            }
+
             let mut dx = vec![0.0f32; d * s];
             accelerate::gemm(
                 &self.embed_weights,
@@ -1541,33 +1514,19 @@ impl DynamicAneTrainer {
                 false,
             );
 
-            // Async embed gradient accumulation (full vocab)
-            {
-                let dlogits_clone = dlogits;
-                let x_final_clone = x_final;
-                let embed_grad_ptr = self.embed_grad.as_mut_ptr() as usize;
-                let embed_len = self.embed_grad.len();
-                let v_val = v;
-                let d_val = d;
-                let s_val = s;
-                self.dispatch_dw(Box::new(move || {
-                    let embed_grad = unsafe {
-                        std::slice::from_raw_parts_mut(embed_grad_ptr as *mut f32, embed_len)
-                    };
-                    accelerate::gemm(
-                        &dlogits_clone,
-                        &x_final_clone,
-                        embed_grad,
-                        v_val,
-                        d_val,
-                        s_val,
-                        1.0,
-                        1.0,
-                        false,
-                        true,
-                    );
-                }));
-            }
+            // Full embed gradient accumulation (stays on CPU — too large for GPU scratch)
+            accelerate::gemm(
+                &dlogits,
+                &x_final,
+                &mut self.embed_grad,
+                v,
+                d,
+                s,
+                1.0,
+                1.0,
+                false,
+                true,
+            );
 
             (loss, dx)
         };
@@ -1588,10 +1547,10 @@ impl DynamicAneTrainer {
 
         // Per-layer backward (reverse order)
         for l in (0..self.config.n_layers).rev() {
-            self.backward_layer(l, &mut dx)?;
+            self.backward_layer(l, &mut dx, batch)?;
         }
 
-        // Embedding backward
+        // Embedding backward (scatter: stays CPU, sparse op)
         let tokens_u32: Vec<u32> = input_tokens.iter().map(|&t| t as u32).collect();
         accelerate::embed_backward(&mut self.embed_grad, &dx, &tokens_u32, d, s);
 
@@ -1617,6 +1576,7 @@ impl DynamicAneTrainer {
     /// Run a complete training batch (accumulate + Adam update).
     ///
     /// No recompilation needed — weights are injected via IOSurface writes.
+    /// GPU dW GEMMs are batched per train_step and executed before gradient ops.
     pub fn train_batch(&mut self, data: &[(Vec<u16>, Vec<u16>)], max_steps: usize) -> Result<f32> {
         let use_compact = self.vocab_map.is_some();
 
@@ -1636,23 +1596,38 @@ impl DynamicAneTrainer {
         let mut total_loss = 0.0f32;
 
         for (input, target) in data.iter().take(steps) {
-            let loss = self.train_step(input, target)?;
+            // Create a BatchedCommandBuffer for this step's dW GEMMs (GPU path).
+            // CPU fallback: batch stays None, dispatch_dw runs cblas inline.
+            let mut batch = if let Some(ref ctx) = self.metal_ctx {
+                BatchedCommandBuffer::new(ctx.clone()).ok()
+            } else {
+                None
+            };
+
+            let loss = self.train_step(input, target, &mut batch)?;
             total_loss += loss;
+
+            // Execute all encoded dW GEMMs for this step (single GPU-CPU sync)
+            if let Some(b) = batch {
+                if b.dispatch_count() > 0 {
+                    b.execute()?;
+                }
+            }
         }
 
-        // Wait for all async dW tasks
-        self.wait_dw();
+        // No wait_dw() needed — each step's batch.execute() is synchronous
 
-        // Scale gradients by 1/accum_steps
-        let scale = 1.0 / steps as f32;
+        // Scale gradients: divide by accum_steps and undo loss scaling.
+        // Combined into a single scale pass for efficiency.
+        let scale = 1.0 / (steps as f32 * self.config.loss_scale);
         for lg in &mut self.layer_grads {
-            accelerate::scale_inplace(&mut lg.wq, scale);
-            accelerate::scale_inplace(&mut lg.wk, scale);
-            accelerate::scale_inplace(&mut lg.wv, scale);
-            accelerate::scale_inplace(&mut lg.wo, scale);
-            accelerate::scale_inplace(&mut lg.w1, scale);
-            accelerate::scale_inplace(&mut lg.w2, scale);
-            accelerate::scale_inplace(&mut lg.w3, scale);
+            accelerate::scale_inplace(lg.wq.as_mut_slice(), scale);
+            accelerate::scale_inplace(lg.wk.as_mut_slice(), scale);
+            accelerate::scale_inplace(lg.wv.as_mut_slice(), scale);
+            accelerate::scale_inplace(lg.wo.as_mut_slice(), scale);
+            accelerate::scale_inplace(lg.w1.as_mut_slice(), scale);
+            accelerate::scale_inplace(lg.w2.as_mut_slice(), scale);
+            accelerate::scale_inplace(lg.w3.as_mut_slice(), scale);
             accelerate::scale_inplace(&mut lg.rms_att, scale);
             accelerate::scale_inplace(&mut lg.rms_ffn, scale);
         }
@@ -1666,13 +1641,13 @@ impl DynamicAneTrainer {
         // Gradient clipping
         let mut grad_norm_sq = 0.0f32;
         for lg in &self.layer_grads {
-            grad_norm_sq += accelerate::sum_of_squares(&lg.wq);
-            grad_norm_sq += accelerate::sum_of_squares(&lg.wk);
-            grad_norm_sq += accelerate::sum_of_squares(&lg.wv);
-            grad_norm_sq += accelerate::sum_of_squares(&lg.wo);
-            grad_norm_sq += accelerate::sum_of_squares(&lg.w1);
-            grad_norm_sq += accelerate::sum_of_squares(&lg.w2);
-            grad_norm_sq += accelerate::sum_of_squares(&lg.w3);
+            grad_norm_sq += accelerate::sum_of_squares(lg.wq.as_slice());
+            grad_norm_sq += accelerate::sum_of_squares(lg.wk.as_slice());
+            grad_norm_sq += accelerate::sum_of_squares(lg.wv.as_slice());
+            grad_norm_sq += accelerate::sum_of_squares(lg.wo.as_slice());
+            grad_norm_sq += accelerate::sum_of_squares(lg.w1.as_slice());
+            grad_norm_sq += accelerate::sum_of_squares(lg.w2.as_slice());
+            grad_norm_sq += accelerate::sum_of_squares(lg.w3.as_slice());
             grad_norm_sq += accelerate::sum_of_squares(&lg.rms_att);
             grad_norm_sq += accelerate::sum_of_squares(&lg.rms_ffn);
         }
@@ -1687,13 +1662,13 @@ impl DynamicAneTrainer {
         if grad_norm > self.config.gradient_clip_norm {
             let clip_scale = self.config.gradient_clip_norm / grad_norm;
             for lg in &mut self.layer_grads {
-                accelerate::scale_inplace(&mut lg.wq, clip_scale);
-                accelerate::scale_inplace(&mut lg.wk, clip_scale);
-                accelerate::scale_inplace(&mut lg.wv, clip_scale);
-                accelerate::scale_inplace(&mut lg.wo, clip_scale);
-                accelerate::scale_inplace(&mut lg.w1, clip_scale);
-                accelerate::scale_inplace(&mut lg.w2, clip_scale);
-                accelerate::scale_inplace(&mut lg.w3, clip_scale);
+                accelerate::scale_inplace(lg.wq.as_mut_slice(), clip_scale);
+                accelerate::scale_inplace(lg.wk.as_mut_slice(), clip_scale);
+                accelerate::scale_inplace(lg.wv.as_mut_slice(), clip_scale);
+                accelerate::scale_inplace(lg.wo.as_mut_slice(), clip_scale);
+                accelerate::scale_inplace(lg.w1.as_mut_slice(), clip_scale);
+                accelerate::scale_inplace(lg.w2.as_mut_slice(), clip_scale);
+                accelerate::scale_inplace(lg.w3.as_mut_slice(), clip_scale);
                 accelerate::scale_inplace(&mut lg.rms_att, clip_scale);
                 accelerate::scale_inplace(&mut lg.rms_ffn, clip_scale);
             }
@@ -1718,7 +1693,24 @@ impl DynamicAneTrainer {
             let lg = &self.layer_grads[l];
             let la = &mut self.layer_adam[l];
 
-            macro_rules! adam {
+            // Weight gradient fields are MetalBuffer — access via as_slice()
+            macro_rules! adam_weight {
+                ($w:ident, $g:ident, $a:ident) => {
+                    accelerate::adam_update(
+                        &mut lw.$w,
+                        lg.$g.as_slice(),
+                        &mut la.$a.m,
+                        &mut la.$a.v,
+                        t,
+                        lr,
+                        b1,
+                        b2,
+                        eps,
+                    );
+                };
+            }
+            // RMSNorm gradient fields are Vec<f32>
+            macro_rules! adam_norm {
                 ($w:ident, $g:ident, $a:ident) => {
                     accelerate::adam_update(
                         &mut lw.$w,
@@ -1734,16 +1726,20 @@ impl DynamicAneTrainer {
                 };
             }
 
-            adam!(wq, wq, wq);
-            adam!(wk, wk, wk);
-            adam!(wv, wv, wv);
-            adam!(wo, wo, wo);
-            adam!(w1, w1, w1);
-            adam!(w2, w2, w2);
-            adam!(w3, w3, w3);
-            adam!(rms_att, rms_att, rms_att);
-            adam!(rms_ffn, rms_ffn, rms_ffn);
+            adam_weight!(wq, wq, wq);
+            adam_weight!(wk, wk, wk);
+            adam_weight!(wv, wv, wv);
+            adam_weight!(wo, wo, wo);
+            adam_weight!(w1, w1, w1);
+            adam_weight!(w2, w2, w2);
+            adam_weight!(w3, w3, w3);
+            adam_norm!(rms_att, rms_att, rms_att);
+            adam_norm!(rms_ffn, rms_ffn, rms_ffn);
         }
+
+        // Embedding uses a separate LR if configured (prevents divergence
+        // from sparse token updates and magnitude drift through many layers)
+        let embed_lr = self.config.embedding_lr.unwrap_or(lr);
 
         if use_compact {
             // Adam update on compact embedding, then scatter back to full
@@ -1753,7 +1749,7 @@ impl DynamicAneTrainer {
                 &mut self.compact_embed_adam.m,
                 &mut self.compact_embed_adam.v,
                 t,
-                lr,
+                embed_lr,
                 b1,
                 b2,
                 eps,
@@ -1766,7 +1762,7 @@ impl DynamicAneTrainer {
                 &mut self.embed_adam.m,
                 &mut self.embed_adam.v,
                 t,
-                lr,
+                embed_lr,
                 b1,
                 b2,
                 eps,

@@ -5,6 +5,26 @@ All notable changes to PMetal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Metal GPU backward kernels** (`dw_gemm.metal`, `dw_gemm.rs`): Tiled fp32 SGEMM kernel replaces per-layer cblas CPU worker thread for weight gradient GEMMs in ANE training. All 7 per-layer dW GEMMs are encoded into a single `BatchedCommandBuffer` for one GPU-CPU sync per step. `LayerGradients` fields migrated from `Vec<f32>` to `MetalBuffer<f32>` (shared unified memory, zero-copy CPU/GPU access). Projected 5.5x backward pass speedup at 579M params
+- **GUI adapter discovery** (`list_trained_adapters`): Scans `~/pmetal-output/` for trained LoRA adapters. Reads `adapter_config.json` + `training_info.json` for rank, alpha, base model, and dataset metadata. Displays descriptive names like "Qwen3-0.6B-Base + alpaca-cleaned r=16"
+- **GUI adapter dropdowns**: Fuse modal and inference page replace manual path entry with adapter select dropdowns. "Custom path..." fallback for arbitrary paths. Fuse modal auto-fills base model when adapter has known metadata
+- **GUI inference chat UX**: Copy button on all messages (hover reveal with checkmark feedback), regenerate button on assistant responses (re-runs same prompt with current config)
+- **GUI auto-named training output**: Default output directory is now `~/pmetal-output/{model}-{method}-{YYYYMMDD-HHMM}` instead of generic `output`. Training writes `training_info.json` with base model, dataset, and method metadata
+- **GUI chat template support**: Inference applies model-specific chat templates (ChatML, Llama3, Gemma, Nemotron, etc.) via `detect_chat_template()`. System message passed through template formatting instead of raw concatenation
+- **GUI streaming inference**: GPU (Metal) path used for inference instead of ANE, enabling real token-by-token streaming
+- **`save_adapter_config_with_base()`**: Adapter config now includes `base_model` field for adapter discovery
+
+### Fixed
+
+- **ANE inference adapter loading**: `load_lora_adapter()` now accepts both `"alpha"` and `"lora_alpha"` keys in adapter_config.json, and checks for both `lora_weights.safetensors` (pmetal) and `adapter_model.safetensors` (HF/PEFT)
+- **GUI inference chat template encoding**: Uses `encode_with_special_tokens()` for chat-template-formatted prompts so special tokens (`<|im_start|>`, `<|im_end|>`) are properly tokenized instead of split into subwords. Fixes models like Nemotron generating one token then stopping
+- **Qwen3.5 multimodal weight loading**: `load_qwen3_next_weights()` skips `model.visual.*` and other non-text weights instead of erroring, allowing text-only inference from multimodal model checkpoints
+- **NemotronH hybrid inference**: `easy.rs` streaming path now creates and passes Mamba cache for hybrid models (NemotronH). Previously passed `None`, causing recurrent layers to produce garbage after the first token
+
 ## [0.3.10] - 2026-03-18
 
 ### Added

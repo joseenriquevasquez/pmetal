@@ -862,6 +862,14 @@ pub fn load_qwen3_next_weights(
     let mut matched = 0usize;
     let mut unmatched = Vec::new();
     for (key, value) in &weights {
+        // Skip non-text weights (vision encoder, audio encoder, etc.)
+        if key.starts_with("model.visual.")
+            || key.starts_with("visual.")
+            || key.starts_with("model.audio.")
+            || key.starts_with("model.multi_modal_projector.")
+        {
+            continue;
+        }
         if let Some(param) = params.get_mut(&**key) {
             **param = value.clone();
             matched += 1;
@@ -870,10 +878,11 @@ pub fn load_qwen3_next_weights(
         }
     }
     if !unmatched.is_empty() {
-        return Err(LoadError::SafeTensors(format!(
-            "Qwen3Next weight loading found unmatched weights: {:?}",
-            &unmatched[..unmatched.len().min(20)]
-        )));
+        tracing::warn!(
+            "Qwen3Next weight loading skipped {} unmatched weights (first 10): {:?}",
+            unmatched.len(),
+            &unmatched[..unmatched.len().min(10)]
+        );
     }
 
     let missing: Vec<String> = expected_keys

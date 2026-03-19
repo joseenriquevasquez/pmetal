@@ -69,6 +69,9 @@ pub struct DispatchConfig {
     pub gradient_checkpointing_layers: usize,
     pub cut_cross_entropy: bool,
     pub ane: bool,
+    /// Loss scaling factor for ANE training. Multiplies dlogits before backward
+    /// to prevent fp32 gradient underflow at >350M params. Default: 1.0.
+    pub loss_scale: f32,
     #[cfg(feature = "distributed")]
     pub distributed: Option<pmetal_core::DistributedTrainingConfig>,
 }
@@ -85,6 +88,7 @@ impl Default for DispatchConfig {
             gradient_checkpointing_layers: 4,
             cut_cross_entropy: false,
             ane: true,
+            loss_scale: 1.0,
             #[cfg(feature = "distributed")]
             distributed: None,
         }
@@ -1181,6 +1185,11 @@ async fn attempt_ane_training(
         warmup_steps: full_config.training.warmup_steps,
         gradient_clip_norm: full_config.training.max_grad_norm as f32,
         rms_norm_eps,
+        loss_scale: config.dispatch.loss_scale,
+        embedding_lr: full_config
+            .training
+            .embedding_learning_rate
+            .map(|v| v as f32),
         ..Default::default()
     };
 
@@ -1489,12 +1498,27 @@ pub fn save_adapter_config(
     target_modules: &[String],
     use_rslora: bool,
 ) -> anyhow::Result<()> {
-    let adapter_config = serde_json::json!({
+    save_adapter_config_with_base(lora_weights_path, r, alpha, target_modules, use_rslora, None)
+}
+
+/// Save adapter_config.json with optional base_model metadata.
+pub fn save_adapter_config_with_base(
+    lora_weights_path: &Path,
+    r: usize,
+    alpha: f32,
+    target_modules: &[String],
+    use_rslora: bool,
+    base_model: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut adapter_config = serde_json::json!({
         "r": r,
         "alpha": alpha,
         "target_modules": target_modules,
         "use_rslora": use_rslora,
     });
+    if let Some(bm) = base_model {
+        adapter_config["base_model"] = serde_json::Value::String(bm.to_string());
+    }
     let config_path = lora_weights_path
         .parent()
         .unwrap_or(Path::new("."))

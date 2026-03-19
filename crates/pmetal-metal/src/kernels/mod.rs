@@ -6,6 +6,7 @@
 
 pub mod batched_lora;
 pub mod dequant;
+pub mod dw_gemm;
 pub mod flash_attention;
 pub mod fp8_training;
 pub mod fused_cross_entropy;
@@ -57,4 +58,5 @@ pub use fused_training::{
     AdamWConfig, BatchCompletionToken, BatchedCommandBuffer, FusedAdamW, FusedCrossEntropyTraining,
     FusedGradientClipping, FusedTrainingCoordinator, ParamInfo,
 };
+pub use dw_gemm::{DwGemm, ScratchPool, GPU_DW_MIN_DIM};
 pub use moe::{MoeConfig, MoeGemmOutput, MoeKernel, MoeRouting};

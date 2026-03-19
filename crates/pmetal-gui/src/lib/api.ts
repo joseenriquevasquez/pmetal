@@ -309,6 +309,15 @@ export interface FuseResult {
   model_size_bytes: number;
 }
 
+export interface TrainedAdapter {
+  path: string;
+  name: string;
+  base_model: string | null;
+  rank: number | null;
+  alpha: number | null;
+  size_bytes: number;
+}
+
 export interface DeviceInfo {
   gpu_name: string;
   arch: string;
@@ -592,6 +601,14 @@ export async function mergeModels(config: MergeConfig): Promise<string> {
 
 export async function getMergeStrategies(): Promise<MergeStrategy[]> {
   return await invoke('get_merge_strategies');
+}
+
+// =============================================================================
+// Adapters API
+// =============================================================================
+
+export async function listTrainedAdapters(): Promise<TrainedAdapter[]> {
+  return await invoke('list_trained_adapters');
 }
 
 // =============================================================================

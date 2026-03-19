@@ -120,8 +120,8 @@ impl BatchedCommandBuffer {
         self.encoder.as_ref().map(|e| e.as_ref())
     }
 
-    /// Get mutable encoder access (internal use).
-    fn encoder_mut(&mut self) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>> {
+    /// Get mutable encoder access (crate-internal use for queue_* methods).
+    pub(crate) fn encoder_mut(&mut self) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>> {
         self.encoder
             .as_ref()
             .map(|e| e.as_ref())

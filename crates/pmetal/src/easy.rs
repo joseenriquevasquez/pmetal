@@ -1008,6 +1008,7 @@ impl PreferenceTuneBuilder {
 pub struct InferBuilder {
     model_id: String,
     lora_path: Option<String>,
+    system_message: Option<String>,
     temperature: f32,
     top_k: usize,
     top_p: f32,
@@ -1025,6 +1026,7 @@ impl InferBuilder {
         Self {
             model_id,
             lora_path: None,
+            system_message: None,
             temperature: 0.7,
             top_k: 50,
             top_p: 0.9,
@@ -1041,6 +1043,12 @@ impl InferBuilder {
     /// Set path to LoRA adapter weights.
     pub fn lora(mut self, path: impl Into<String>) -> Self {
         self.lora_path = Some(path.into());
+        self
+    }
+
+    /// Set system message for chat template formatting.
+    pub fn system_message(mut self, msg: impl Into<String>) -> Self {
+        self.system_message = Some(msg.into());
         self
     }
 
@@ -1104,6 +1112,30 @@ impl InferBuilder {
     pub fn gpu(mut self) -> Self {
         self.device = Some(pmetal_core::Device::Gpu);
         self
+    }
+
+    /// Apply chat template to format the prompt for the model.
+    ///
+    /// Detects the model's chat template (ChatML, Llama3, Gemma, etc.) and wraps
+    /// the user message + optional system message in the correct format.
+    fn apply_chat_template(&self, prompt: &str, model_path: &Path) -> String {
+        use pmetal_data::chat_templates::{Message, detect_chat_template};
+
+        let template = detect_chat_template(model_path, &self.model_id);
+
+        let mut messages = Vec::new();
+        if let Some(ref sys) = self.system_message {
+            messages.push(Message::system(sys.as_str()));
+        }
+        messages.push(Message::user(prompt));
+
+        let formatted = template.apply(&messages);
+        tracing::debug!(
+            template = ?template.template_type,
+            prompt_len = formatted.text.len(),
+            "Applied chat template"
+        );
+        formatted.text
     }
 
     /// Generate text from the given prompt.
@@ -1190,12 +1222,15 @@ impl InferBuilder {
             PMetalError::ModelLoad(format!("Failed to load tokenizer from {model_path:?}: {e}"))
         })?;
 
+        // Apply chat template (handles Nemotron, Llama, ChatML, etc.)
+        let formatted_prompt = self.apply_chat_template(prompt, &model_path);
+
         if let Some(lora_path) = &self.lora_path {
             return self.generate_with_lora_streaming(
                 &model_path,
                 lora_path,
                 &tokenizer,
-                prompt,
+                &formatted_prompt,
                 &mut on_delta,
             );
         }
@@ -1206,17 +1241,20 @@ impl InferBuilder {
             model.quantize_fp8().map_err(mlx_err)?;
         }
 
-        let input_ids = tokenizer.encode(prompt)?;
+        // Use special-token-aware encoding since the chat template
+        // includes special tokens like <|im_start|>, <|im_end|>, etc.
+        let input_ids = tokenizer.encode_with_special_tokens(&formatted_prompt)?;
         let gen_config = self.build_gen_config(&tokenizer);
         let max_seq_len = input_ids.len() + self.max_tokens + 64;
         let mut cache = model.create_cache(max_seq_len);
+        let mut mamba_cache = model.create_mamba_cache();
 
         let start = std::time::Instant::now();
         let mut token_buf: Vec<u32> = Vec::new();
         let mut streamed_text = String::new();
 
         let output = generate_cached_async_streaming(
-            |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), None),
+            |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
             &input_ids,
             gen_config,
             &mut cache,
@@ -1252,12 +1290,29 @@ impl InferBuilder {
         tokenizer: &Tokenizer,
         prompt: &str,
     ) -> Result<InferResult> {
-        let lora_config = LoraConfig::default();
+        // Read adapter_config.json for the actual training config
+        let lora_dir = std::path::Path::new(lora_path);
+        let adapter_dir = if lora_dir.is_dir() { lora_dir } else { lora_dir.parent().unwrap_or(lora_dir) };
+        let lora_config = if let Ok(cfg_str) = std::fs::read_to_string(adapter_dir.join("adapter_config.json")) {
+            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
+                let r = cfg["r"].as_u64().unwrap_or(16) as usize;
+                let alpha = cfg["alpha"].as_f64()
+                    .or_else(|| cfg["lora_alpha"].as_f64())
+                    .unwrap_or(32.0) as f32;
+                tracing::info!(r, alpha, path = lora_path, "Loading LoRA adapter");
+                LoraConfig { r, alpha, ..LoraConfig::default() }
+            } else {
+                LoraConfig::default()
+            }
+        } else {
+            LoraConfig::default()
+        };
+
         let mut model =
             DynamicLoraModel::from_pretrained(model_path, lora_config).map_err(model_err)?;
         model.load_lora_weights(lora_path).map_err(model_err)?;
 
-        let input_ids = tokenizer.encode(prompt)?;
+        let input_ids = tokenizer.encode_with_special_tokens(prompt)?;
         let gen_config = self.build_gen_config(tokenizer);
 
         let max_seq_len = input_ids.len() + self.max_tokens + 64;
@@ -1301,12 +1356,32 @@ impl InferBuilder {
     where
         F: FnMut(&str) -> bool,
     {
-        let lora_config = LoraConfig::default();
+        // Read adapter_config.json for the actual training config
+        let lora_dir = std::path::Path::new(lora_path);
+        let adapter_dir = if lora_dir.is_dir() { lora_dir } else { lora_dir.parent().unwrap_or(lora_dir) };
+        let lora_config = if let Ok(cfg_str) = std::fs::read_to_string(adapter_dir.join("adapter_config.json")) {
+            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
+                let r = cfg["r"].as_u64().unwrap_or(16) as usize;
+                let alpha = cfg["alpha"].as_f64()
+                    .or_else(|| cfg["lora_alpha"].as_f64())
+                    .unwrap_or(32.0) as f32;
+                tracing::info!(r, alpha, path = lora_path, "Loading LoRA adapter from adapter_config.json");
+                LoraConfig { r, alpha, ..LoraConfig::default() }
+            } else {
+                tracing::warn!("Failed to parse adapter_config.json, using defaults");
+                LoraConfig::default()
+            }
+        } else {
+            tracing::info!(path = lora_path, "No adapter_config.json found, using default LoRA config (r=16, alpha=32)");
+            LoraConfig::default()
+        };
+
         let mut model =
             DynamicLoraModel::from_pretrained(model_path, lora_config).map_err(model_err)?;
         model.load_lora_weights(lora_path).map_err(model_err)?;
+        tracing::info!("LoRA weights loaded and applied for inference");
 
-        let input_ids = tokenizer.encode(prompt)?;
+        let input_ids = tokenizer.encode_with_special_tokens(prompt)?;
         let gen_config = self.build_gen_config(tokenizer);
 
         let max_seq_len = input_ids.len() + self.max_tokens + 64;
@@ -1487,8 +1562,9 @@ impl InferBuilder {
 
         // Check for LoRA adapter and merge if present
         let adapter_config = model_path.join("adapter_config.json");
-        let adapter_weights = model_path.join("adapter_model.safetensors");
-        if adapter_config.exists() && adapter_weights.exists() {
+        let has_adapter_weights = model_path.join("lora_weights.safetensors").exists()
+            || model_path.join("adapter_model.safetensors").exists();
+        if adapter_config.exists() && has_adapter_weights {
             engine
                 .load_lora_adapter(model_path)
                 .map_err(|e| PMetalError::ModelLoad(format!("LoRA merge failed: {e}")))?;

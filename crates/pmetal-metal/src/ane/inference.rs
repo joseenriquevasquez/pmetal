@@ -1320,13 +1320,32 @@ impl AneInferenceEngine {
         if rank == 0 {
             return Err(MetalError::InvalidConfig("LoRA rank must be > 0".into()));
         }
-        let alpha = config["lora_alpha"].as_f64().ok_or_else(|| {
-            MetalError::InvalidConfig("adapter_config.json missing 'lora_alpha'".into())
-        })? as f32;
+        let alpha = config["lora_alpha"]
+            .as_f64()
+            .or_else(|| config["alpha"].as_f64())
+            .ok_or_else(|| {
+                MetalError::InvalidConfig(
+                    "adapter_config.json missing 'lora_alpha' or 'alpha'".into(),
+                )
+            })? as f32;
         let scale = alpha / rank as f32;
 
-        // Load adapter weights
-        let adapter_path = adapter_dir.join("adapter_model.safetensors");
+        // Load adapter weights (pmetal saves as lora_weights.safetensors,
+        // PEFT/HF convention uses adapter_model.safetensors)
+        let adapter_path = {
+            let p1 = adapter_dir.join("lora_weights.safetensors");
+            let p2 = adapter_dir.join("adapter_model.safetensors");
+            if p1.exists() {
+                p1
+            } else if p2.exists() {
+                p2
+            } else {
+                return Err(MetalError::InvalidConfig(format!(
+                    "No adapter weights found in {}: expected lora_weights.safetensors or adapter_model.safetensors",
+                    adapter_dir.display()
+                )));
+            }
+        };
         let file = std::fs::File::open(&adapter_path).map_err(|e| {
             MetalError::InvalidConfig(format!("Failed to open adapter safetensors: {e}"))
         })?;

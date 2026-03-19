@@ -2,7 +2,8 @@
   import { onMount, onDestroy, tick } from 'svelte';
   import { page } from '$app/stores';
   import { modelsStore } from '$lib/stores.svelte';
-  import { startInference, stopInference, onInferenceToken, onInferenceDone, onInferenceError } from '$lib/api';
+  import { startInference, stopInference, onInferenceToken, onInferenceDone, onInferenceError, listTrainedAdapters } from '$lib/api';
+  import type { TrainedAdapter } from '$lib/api';
   import { renderMarkdown } from '$lib/utils';
   import type { UnlistenFn } from '@tauri-apps/api/event';
 
@@ -16,7 +17,20 @@
   // Model config
   let selectedModel = $state('');
   let loraPath = $state('');
+  let trainedAdapters = $state<TrainedAdapter[]>([]);
+  let loraCustomPath = $state(false);
   let systemMessage = $state('You are a helpful assistant.');
+
+  /** Human-readable label for current config. */
+  let configLabel = $derived.by(() => {
+    const model = selectedModel ? (selectedModel.split('/').pop() ?? selectedModel) : '';
+    if (!loraPath) return model;
+    const adapter = trainedAdapters.find(a => a.path === loraPath);
+    if (adapter) return adapter.name;
+    // Custom path fallback
+    const adapterShort = loraPath.split('/').pop() ?? 'LoRA';
+    return `${model} + ${adapterShort}`;
+  });
 
   // Generation params
   let temperature = $state(0.7);
@@ -47,6 +61,9 @@
     // Deep-link: pre-select model from query param
     const modelParam = $page.url.searchParams.get('model');
     if (modelParam) selectedModel = modelParam;
+
+    // Load trained adapters for the dropdown
+    listTrainedAdapters().then(a => trainedAdapters = a).catch(() => {});
   });
 
   onDestroy(() => {
@@ -183,6 +200,34 @@
     error = null;
   }
 
+  /** Copy text to clipboard with brief visual feedback. */
+  let copiedIdx = $state<number | null>(null);
+  async function copyMessage(idx: number) {
+    const msg = messages[idx];
+    if (!msg) return;
+    const text = msg.thinking ? `<think>\n${msg.thinking}\n</think>\n${msg.content}` : msg.content;
+    await navigator.clipboard.writeText(text);
+    copiedIdx = idx;
+    setTimeout(() => { if (copiedIdx === idx) copiedIdx = null; }, 1500);
+  }
+
+  /** Delete assistant response at idx and regenerate from the preceding user message. */
+  async function regenerate(idx: number) {
+    // Find the user message that preceded this assistant response
+    if (idx < 1 || messages[idx]?.role !== 'assistant') return;
+    const userMsg = messages[idx - 1];
+    if (userMsg?.role !== 'user') return;
+
+    // Remove the assistant response
+    messages = messages.slice(0, idx);
+
+    // Re-send the user's prompt
+    userInput = userMsg.content;
+    // Remove the user message too — handleSend will re-add it
+    messages = messages.slice(0, idx - 1);
+    await handleSend();
+  }
+
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -207,16 +252,35 @@
         </select>
       </div>
 
-      <!-- LoRA path -->
-      <div class="flex-1 min-w-[160px] max-w-[280px]">
-        <label for="inf-lora" class="sr-only">LoRA adapter path</label>
-        <input
-          id="inf-lora"
-          type="text"
-          class="input text-sm"
-          placeholder="LoRA adapter path (optional)"
-          bind:value={loraPath}
-        />
+      <!-- LoRA adapter -->
+      <div class="flex-1 min-w-[160px] max-w-[320px]">
+        <label for="inf-lora" class="sr-only">LoRA adapter</label>
+        {#if trainedAdapters.length > 0 && !loraCustomPath}
+          <select id="inf-lora" class="input text-sm" bind:value={loraPath} onchange={(e) => {
+            if ((e.target as HTMLSelectElement).value === '__custom__') { loraCustomPath = true; loraPath = ''; }
+          }}>
+            <option value="">No adapter (base model)</option>
+            {#each trainedAdapters as adapter}
+              <option value={adapter.path}>
+                {adapter.name}{adapter.rank ? ` r=${adapter.rank}` : ''}
+              </option>
+            {/each}
+            <option value="__custom__">Custom path...</option>
+          </select>
+        {:else}
+          <div class="flex gap-1">
+            <input
+              id="inf-lora"
+              type="text"
+              class="input text-sm flex-1"
+              placeholder="LoRA adapter path (optional)"
+              bind:value={loraPath}
+            />
+            {#if trainedAdapters.length > 0}
+              <button type="button" class="btn-ghost btn-sm text-xs" onclick={() => { loraCustomPath = false; loraPath = ''; }}>List</button>
+            {/if}
+          </div>
+        {/if}
       </div>
 
       <!-- Parameters toggle -->
@@ -309,19 +373,38 @@
           </p>
         </div>
       </div>
+    {:else if selectedModel}
+      <!-- Config badge: shows what model+adapter combo is active -->
+      <div class="flex justify-center mb-2">
+        <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-surface-100 dark:bg-surface-800 border border-surface-200 dark:border-surface-700 text-xs text-surface-500 dark:text-surface-400">
+          <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2z" /></svg>
+          {configLabel}
+        </span>
+      </div>
     {/if}
 
     {#each messages as message, idx}
       {#if message.role === 'user'}
         <!-- User message -->
-        <div class="flex justify-end" role="article" aria-label="User message">
+        <div class="group flex justify-end gap-1 items-end" role="article" aria-label="User message">
+          <button
+            class="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded text-surface-400 hover:text-surface-600 dark:hover:text-surface-300"
+            aria-label="Copy message"
+            onclick={() => copyMessage(idx)}
+          >
+            {#if copiedIdx === idx}
+              <svg class="w-3.5 h-3.5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>
+            {:else}
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+            {/if}
+          </button>
           <div class="max-w-[70%] bg-primary-600 text-white rounded-2xl rounded-tr-sm px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap">
             {message.content}
           </div>
         </div>
       {:else}
         <!-- Assistant message -->
-        <div class="flex justify-start" role="article" aria-label="Assistant message">
+        <div class="group flex justify-start gap-1 items-end" role="article" aria-label="Assistant message">
           <div class="max-w-[80%] space-y-2">
             <!-- Thinking block -->
             {#if message.thinking && showThinking}
@@ -346,6 +429,30 @@
               {/if}
             </div>
           </div>
+          <!-- Action buttons: copy + regenerate (hover reveal) -->
+          {#if !message.isStreaming}
+            <div class="flex flex-col gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+              <button
+                class="p-1 rounded text-surface-400 hover:text-surface-600 dark:hover:text-surface-300"
+                aria-label="Copy response"
+                onclick={() => copyMessage(idx)}
+              >
+                {#if copiedIdx === idx}
+                  <svg class="w-3.5 h-3.5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>
+                {:else}
+                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                {/if}
+              </button>
+              <button
+                class="p-1 rounded text-surface-400 hover:text-surface-600 dark:hover:text-surface-300"
+                aria-label="Regenerate response"
+                disabled={isGenerating}
+                onclick={() => regenerate(idx)}
+              >
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+              </button>
+            </div>
+          {/if}
         </div>
       {/if}
     {/each}
