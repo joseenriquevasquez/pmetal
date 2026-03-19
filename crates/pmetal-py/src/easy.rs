@@ -1,9 +1,15 @@
 //! Top-level easy API functions for Python.
+//!
+//! These call core SDK crates directly rather than going through the `pmetal`
+//! umbrella crate's former `easy` module.
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::error::runtime_err;
+
+// TrainableModel trait must be in scope for DynamicLoraModel methods
+use pmetal_lora::TrainableModel as _;
 
 /// Fine-tune a model with sensible defaults.
 ///
@@ -52,14 +58,36 @@ pub fn finetune<'py>(
     let result = py
         .detach(move || {
             crate::hub::shared_runtime().block_on(async {
-                let result = pmetal::easy::finetune(&model_id, &dataset_path)
-                    .lora(lora_r, lora_alpha)
-                    .epochs(epochs)
-                    .learning_rate(learning_rate)
-                    .batch_size(batch_size)
-                    .max_seq_len(max_seq_len)
-                    .output(&output)
-                    .run()
+                use pmetal_trainer::orchestrator;
+
+                let job_config = orchestrator::TrainingJobConfig {
+                    model_id: model_id.clone(),
+                    dataset: dataset_path,
+                    eval_dataset: None,
+                    output_dir: output,
+                    lora: pmetal_core::LoraConfig {
+                        r: lora_r,
+                        alpha: lora_alpha,
+                        ..Default::default()
+                    },
+                    qlora: None,
+                    training: pmetal_core::TrainingConfig {
+                        learning_rate,
+                        batch_size,
+                        num_epochs: epochs,
+                        max_seq_len,
+                        ..Default::default()
+                    },
+                    columns: None,
+                    dispatch: orchestrator::DispatchConfig::default(),
+                    config_path: None,
+                    log_metrics: None,
+                    resume: false,
+                    seed: 42,
+                    emit_console_output: false,
+                };
+
+                let result = orchestrator::run_training(job_config, None, vec![])
                     .await
                     .map_err(|e| e.to_string())?;
 
@@ -112,21 +140,124 @@ pub fn infer(
 
     py.detach(move || {
         crate::hub::shared_runtime().block_on(async {
-            let mut builder = pmetal::easy::infer(&model_id)
-                .temperature(temperature)
-                .max_tokens(max_tokens);
+            use pmetal_data::chat_templates::{Message, detect_chat_template};
+            use pmetal_data::Tokenizer;
+            use pmetal_hub::resolve_model_path;
+            use pmetal_models::{DynamicModel, GenerationConfig, generate_cached_async};
 
-            if let Some(lora_path) = lora {
-                builder = builder.lora(lora_path);
-            }
+            let model_path = resolve_model_path(&model_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let tokenizer = Tokenizer::from_model_dir(&model_path)
+                .map_err(|e| format!("Failed to load tokenizer: {e}"))?;
 
+            // Chat template
+            let template = detect_chat_template(&model_path, &model_id);
+            let mut msgs = Vec::new();
+            msgs.push(Message::user(&prompt));
+            let formatted = template.apply(&msgs).text;
+            let input_ids = tokenizer
+                .encode_with_special_tokens(&formatted)
+                .map_err(|e| e.to_string())?;
+
+            // Gen config — load model defaults, user params override
+            let defaults = pmetal_data::inference_config::load_sampling_defaults(&model_path, false);
+            let mut gen_config = if temperature < 1e-6 {
+                GenerationConfig::greedy(max_tokens)
+            } else {
+                GenerationConfig::sampling(max_tokens, temperature)
+                    .with_top_k(defaults.top_k)
+                    .with_top_p(defaults.top_p)
+                    .with_min_p(defaults.min_p)
+                    .with_repetition_penalty(defaults.repetition_penalty)
+            };
+            // Collect ALL stop tokens (multi-EOS models like Qwen3)
+            let stop_tokens = pmetal_data::inference_config::collect_all_stop_tokens(
+                &model_path,
+                &tokenizer,
+                Some(template.template_type),
+            );
+            gen_config = gen_config.with_stop_tokens(stop_tokens);
             if let Some(s) = seed {
-                builder = builder.seed(s);
+                gen_config = gen_config.with_seed(s);
             }
 
-            let result = builder.generate(&prompt).await.map_err(|e| e.to_string())?;
+            let max_seq_len = input_ids.len() + max_tokens + 64;
 
-            Ok::<_, String>(result.text)
+            if let Some(ref lora_path) = lora {
+                use pmetal_core::LoraConfig;
+                use pmetal_lora::DynamicLoraModel;
+
+                let lora_dir = std::path::Path::new(lora_path.as_str());
+                let adapter_dir = if lora_dir.is_dir() {
+                    lora_dir
+                } else {
+                    lora_dir.parent().unwrap_or(lora_dir)
+                };
+                let lora_config = if let Ok(cfg_str) =
+                    std::fs::read_to_string(adapter_dir.join("adapter_config.json"))
+                {
+                    if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
+                        let r = cfg["r"].as_u64().unwrap_or(16) as usize;
+                        let alpha = cfg["alpha"]
+                            .as_f64()
+                            .or_else(|| cfg["lora_alpha"].as_f64())
+                            .unwrap_or(32.0) as f32;
+                        LoraConfig { r, alpha, ..LoraConfig::default() }
+                    } else {
+                        LoraConfig::default()
+                    }
+                } else {
+                    LoraConfig::default()
+                };
+
+                let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config)
+                    .map_err(|e| e.to_string())?;
+                model.load_lora_weights(lora_path).map_err(|e| e.to_string())?;
+
+                let mut cache = model
+                    .create_cache(max_seq_len)
+                    .ok_or_else(|| "Model does not support KV cache".to_string())?;
+
+                let output = generate_cached_async(
+                    |input, cache| {
+                        model
+                            .forward_with_cache(input, None, Some(cache))
+                            .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
+                    },
+                    &input_ids,
+                    gen_config,
+                    &mut cache,
+                )
+                .map_err(|e| e.to_string())?;
+
+                let generated_tokens = &output.token_ids[input_ids.len()..];
+                let text = tokenizer.decode(generated_tokens).map_err(|e| e.to_string())?;
+                Ok::<_, String>(text)
+            } else {
+                let mut model = DynamicModel::load(&model_path).map_err(|e| e.to_string())?;
+                let mut cache = model.create_cache(max_seq_len);
+                let mut mamba_cache = model.create_mamba_cache();
+
+                let output = generate_cached_async(
+                    |input, cache| {
+                        model.forward_with_hybrid_cache(
+                            input,
+                            None,
+                            Some(cache),
+                            mamba_cache.as_mut(),
+                        )
+                    },
+                    &input_ids,
+                    gen_config,
+                    &mut cache,
+                )
+                .map_err(|e| e.to_string())?;
+
+                let generated_tokens = &output.token_ids[input_ids.len()..];
+                let text = tokenizer.decode(generated_tokens).map_err(|e| e.to_string())?;
+                Ok(text)
+            }
         })
     })
     .map_err(runtime_err)

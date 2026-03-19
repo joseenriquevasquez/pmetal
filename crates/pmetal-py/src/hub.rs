@@ -65,5 +65,5 @@ pub fn shared_runtime() -> &'static tokio::runtime::Runtime {
 /// Check if a string looks like a HuggingFace model ID (e.g., "org/model")
 /// rather than a local filesystem path.
 pub fn is_hf_model_id(s: &str) -> bool {
-    !s.starts_with('/') && !s.starts_with('.') && s.contains('/')
+    pmetal_hub::is_hf_id(s)
 }
