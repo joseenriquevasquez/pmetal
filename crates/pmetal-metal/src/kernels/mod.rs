@@ -13,6 +13,7 @@ pub mod fused_cross_entropy;
 pub mod fused_distill;
 pub mod fused_gdn;
 pub mod fused_lora;
+pub mod fused_moe;
 pub mod fused_merge;
 pub mod fused_norm_lora;
 pub mod fused_rope;
@@ -59,4 +60,8 @@ pub use fused_training::{
     FusedGradientClipping, FusedTrainingCoordinator, ParamInfo,
 };
 pub use dw_gemm::{DwGemm, ScratchPool, GPU_DW_MIN_DIM};
+pub use fused_moe::{
+    ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig,
+    GatherQmmSwiglu, GatherQmmSwigluConfig, StackedExpertWeights,
+};
 pub use moe::{MoeConfig, MoeGemmOutput, MoeKernel, MoeRouting};
