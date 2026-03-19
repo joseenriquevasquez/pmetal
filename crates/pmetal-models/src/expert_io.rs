@@ -19,6 +19,8 @@
 use std::fs::File;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -57,7 +59,8 @@ struct IoResult {
 pub struct ExpertIoPool {
     workers: Vec<JoinHandle<()>>,
     task_tx: mpsc::Sender<(IoWork, Arc<File>)>,
-    result_rx: mpsc::Receiver<IoResult>,
+    /// Wrapped in Mutex to make ExpertIoPool Sync (required for Arc<ExpertOffloadContext>).
+    result_rx: Mutex<mpsc::Receiver<IoResult>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -112,7 +115,7 @@ impl ExpertIoPool {
         Self {
             workers,
             task_tx,
-            result_rx,
+            result_rx: Mutex::new(result_rx),
             shutdown,
         }
     }
@@ -173,7 +176,7 @@ impl ExpertIoPool {
         // Collect all results
         let mut results: Vec<Option<Vec<u8>>> = (0..n).map(|_| None).collect();
         for _ in 0..n {
-            let result = self.result_rx.recv().map_err(|_| {
+            let result = self.result_rx.lock().unwrap().recv().map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "IO pool result channel closed")
             })?;
             match result.data {
@@ -203,9 +206,11 @@ impl Default for ExpertIoPool {
 impl Drop for ExpertIoPool {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        // Drop the sender to unblock workers waiting on recv()
-        // (We can't drop self.task_tx directly, but when ExpertIoPool is dropped,
-        // the sender is dropped automatically, closing the channel)
+        // Replace the sender with a disconnected one to close the channel.
+        // This unblocks workers waiting on recv() since they'll get RecvError.
+        let (dead_tx, _dead_rx) = mpsc::channel();
+        let _ = std::mem::replace(&mut self.task_tx, dead_tx);
+        // Now the original task_tx is dropped, closing the channel.
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
@@ -323,6 +328,83 @@ impl ExpertOffloadContext {
             .collect();
 
         self.io_pool.parallel_read(file, &offsets, expert_size)
+    }
+
+    /// Read experts directly into pre-allocated AlignedBuffers (zero-copy path).
+    ///
+    /// Each `AlignedBuffer` is filled via `pread()` directly into GPU-visible
+    /// memory. The buffers can be passed straight to the Metal encoder with
+    /// component offsets from `ExpertRecord` — no intermediate copies.
+    ///
+    /// # Arguments
+    /// * `layer_idx` - Transformer layer index
+    /// * `expert_indices` - Which experts to load
+    /// * `buffers` - Pre-acquired AlignedBuffers from ExpertBufferPool (one per expert)
+    #[cfg(unix)]
+    pub fn read_experts_aligned(
+        &self,
+        layer_idx: usize,
+        expert_indices: &[usize],
+        buffers: &mut [pmetal_metal::expert_buffer::AlignedBuffer],
+    ) -> std::io::Result<()> {
+        let file = self.file_manager.file_for_layer(layer_idx).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Layer {} has no MoE expert file", layer_idx),
+            )
+        })?;
+
+        if expert_indices.len() != buffers.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "expert_indices.len()={} != buffers.len()={}",
+                    expert_indices.len(),
+                    buffers.len()
+                ),
+            ));
+        }
+
+        let expert_size = self.file_manager.expert_size();
+        let fd = file.as_raw_fd();
+
+        // Use scoped threads for direct pread into aligned buffers
+        // (can't send &mut AlignedBuffer through channels, but scoped threads work)
+        let errors: Mutex<Vec<(usize, std::io::Error)>> = Mutex::new(Vec::new());
+
+        std::thread::scope(|s| {
+            let chunk_size = buffers.len().div_ceil(4); // 4 IO threads
+            for (chunk_idx, (buf_chunk, idx_chunk)) in buffers
+                .chunks_mut(chunk_size)
+                .zip(expert_indices.chunks(chunk_size))
+                .enumerate()
+            {
+                let errors = &errors;
+                s.spawn(move || {
+                    for (i, (buf, &eidx)) in
+                        buf_chunk.iter_mut().zip(idx_chunk.iter()).enumerate()
+                    {
+                        let offset = eidx as u64 * expert_size as u64;
+                        if let Err(e) = buf.pread(fd, offset).map_err(|e| {
+                            std::io::Error::other(e.to_string())
+                        }) {
+                            let global_idx = chunk_idx * chunk_size + i;
+                            errors.lock().unwrap().push((global_idx, e));
+                        }
+                    }
+                });
+            }
+        });
+
+        let errors = errors.into_inner().unwrap();
+        if let Some((idx, err)) = errors.into_iter().next() {
+            return Err(std::io::Error::new(
+                err.kind(),
+                format!("pread failed for expert task {}: {}", idx, err),
+            ));
+        }
+
+        Ok(())
     }
 }
 
