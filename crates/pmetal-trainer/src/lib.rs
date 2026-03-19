@@ -63,6 +63,8 @@
 #![allow(clippy::derivable_impls)]
 #![allow(ambiguous_glob_reexports)]
 
+pub mod orchestrator;
+
 pub mod adam8bit;
 pub mod adamw_groups;
 pub mod adaptive_lr;
@@ -158,3 +160,9 @@ pub use scheduler::*;
 pub use sft::*;
 pub use simpo::*;
 pub use training_loop::*;
+
+// Orchestrator re-exports
+pub use orchestrator::{
+    DispatchConfig, FullTrainingConfig, PhaseCallback, QLoraOrchConfig, QuantizationScheme,
+    TrainingJobConfig, TrainingPhase, TrainingResult,
+};

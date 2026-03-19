@@ -35,15 +35,13 @@
 use std::path::{Path, PathBuf};
 
 use pmetal_core::{LoraConfig, PMetalError, Result, TrainingCallback, TrainingConfig};
-use pmetal_data::{
-    DataLoaderConfig, DatasetColumnConfig, DatasetFormat, Tokenizer, TrainingDataset,
-};
+use pmetal_data::{DatasetColumnConfig, Tokenizer};
 use pmetal_lora::{DynamicLoraModel, TrainableModel};
 use pmetal_mlx::Builder as _;
 use pmetal_models::{
     DynamicModel, GenerationConfig, generate_cached_async, generate_cached_async_streaming,
 };
-use pmetal_trainer::{CheckpointManager, MetricsJsonCallback, TrainingLoop, TrainingLoopConfig};
+use pmetal_trainer::MetricsJsonCallback;
 
 /// Map any Display error to `PMetalError::Training`.
 fn training_err(e: impl std::fmt::Display) -> PMetalError {
@@ -395,202 +393,75 @@ impl FinetuneBuilder {
     }
 
     /// Run the fine-tuning pipeline.
+    ///
+    /// Delegates to the shared orchestrator which handles ANE, QLoRA, all
+    /// dispatch modes, adaptive LR, and checkpointing.
     pub async fn run(self) -> Result<FinetuneResult> {
-        let status = |msg: &str| {
-            if let Some(ref f) = self.status_fn {
-                f(msg);
+        use pmetal_trainer::orchestrator;
+
+        // Wire the easy API's on_status callback to the orchestrator's PhaseCallback
+        let phase_cb: Option<Box<dyn orchestrator::PhaseCallback>> = self.status_fn.map(|f| {
+            struct StatusAdapter(Box<dyn Fn(&str) + Send + Sync>);
+            impl orchestrator::PhaseCallback for StatusAdapter {
+                fn on_phase(&self, phase: &orchestrator::TrainingPhase) {
+                    (self.0)(phase.message());
+                }
             }
-        };
+            Box::new(StatusAdapter(f)) as Box<dyn orchestrator::PhaseCallback>
+        });
 
-        // Helper: set status and briefly yield so the tokio runtime can deliver
-        // the event to the frontend before the next blocking phase.
-        // After non-Send types (MLX Arrays) are created, we can no longer yield,
-        // so we only use the yield for early phases.
-        macro_rules! phase_yield {
-            ($msg:expr) => {
-                status($msg);
-                tokio::task::yield_now().await;
-            };
-        }
-        macro_rules! phase {
-            ($msg:expr) => {
-                status($msg);
-            };
-        }
-
-        // Resolve model path (uses cache if available, downloads if needed)
-        phase_yield!("Resolving model…");
-        let model_path = resolve_model_path(&self.model_id).await?;
-
-        // Resolve dataset path
-        phase_yield!("Resolving dataset…");
-        let dataset_path = resolve_dataset_path(&self.dataset_path).await?;
-
-        // Load tokenizer
-        phase_yield!("Loading tokenizer…");
-        let tokenizer = Tokenizer::from_model_dir(&model_path).map_err(|e| {
-            PMetalError::ModelLoad(format!("Failed to load tokenizer from {model_path:?}: {e}"))
-        })?;
-
-        // Detect chat template
-        let chat_template =
-            pmetal_data::chat_templates::detect_chat_template(&model_path, &self.model_id);
-
-        // Load, tokenize, load model, and start training
-        // NOTE: Everything from here is blocking — no more status updates will
-        // reach the UI until training steps start producing metrics.
-        phase_yield!("Tokenizing dataset and loading model (this may take a moment)…");
-        let train_dataset = TrainingDataset::from_jsonl_tokenized(
-            &dataset_path,
-            &tokenizer,
-            DatasetFormat::Auto,
-            self.max_seq_len,
-            Some(&chat_template),
-            self.columns.as_ref(),
-        )?;
-
-        // Compute and log sequence-length statistics for the training dataset.
-        let warnings = train_dataset.validate_seq_len(self.max_seq_len);
-        for w in &warnings {
-            tracing::warn!("{}", w);
-        }
-        let stats = train_dataset.compute_statistics(self.max_seq_len);
-        tracing::info!(
-            "Dataset statistics: {} samples, mean_len={:.0}, p95_len={}, truncated={:.1}%",
-            stats.total_samples,
-            stats.mean_length,
-            stats.p95_length,
-            stats.truncated_pct,
-        );
-
-        // Load evaluation dataset if provided (resolve HF ID if needed)
-        let eval_dataset = if let Some(ref eval_path) = self.eval_dataset_path {
-            let resolved_eval = resolve_dataset_path(eval_path).await?;
-            Some(TrainingDataset::from_jsonl_tokenized(
-                &resolved_eval,
-                &tokenizer,
-                DatasetFormat::Auto,
-                self.max_seq_len,
-                Some(&chat_template),
-                self.columns.as_ref(),
-            )?)
-        } else {
-            None
-        };
-
-        // Create LoRA config
-        let lora_config = LoraConfig {
-            r: self.lora_r,
-            alpha: self.lora_alpha,
-            dropout: self.lora_dropout,
-            use_rslora: self.use_rslora,
-            use_dora: self.use_dora,
-            ..Default::default()
-        };
-
-        // Initialize model with LoRA adapters
-        phase!("Loading model and initializing LoRA adapters…");
-        let model =
-            DynamicLoraModel::from_pretrained(&model_path, lora_config).map_err(model_err)?;
-
-        // Set up checkpoint manager
-        let output_dir = PathBuf::from(&self.output_dir);
-        let checkpoint_dir = output_dir.join("checkpoints");
-        let checkpoint_manager = CheckpointManager::new(&checkpoint_dir)
-            .map_err(training_err)?
-            .with_max_checkpoints(3);
-
-        // Build training config
-        let training_config = TrainingConfig {
-            learning_rate: self.learning_rate,
-            batch_size: self.batch_size,
-            num_epochs: self.num_epochs,
-            max_seq_len: self.max_seq_len,
-            output_dir: self.output_dir.clone(),
-            ..Default::default()
-        };
-
-        let dataloader_config = DataLoaderConfig {
-            batch_size: self.batch_size,
-            max_seq_len: self.max_seq_len,
-            shuffle: true,
+        let job_config = orchestrator::TrainingJobConfig {
+            model_id: self.model_id,
+            dataset: self.dataset_path,
+            eval_dataset: self.eval_dataset_path,
+            output_dir: self.output_dir,
+            lora: LoraConfig {
+                r: self.lora_r,
+                alpha: self.lora_alpha,
+                dropout: self.lora_dropout,
+                use_rslora: self.use_rslora,
+                use_dora: self.use_dora,
+                ..Default::default()
+            },
+            qlora: None,
+            training: TrainingConfig {
+                learning_rate: self.learning_rate,
+                batch_size: self.batch_size,
+                num_epochs: self.num_epochs,
+                max_seq_len: self.max_seq_len,
+                embedding_learning_rate: self.embedding_lr.map(|v| v as f64),
+                ..Default::default()
+            },
+            columns: self.columns,
+            dispatch: orchestrator::DispatchConfig {
+                flash_attention: self.flash_attention,
+                sequence_packing: self.sequence_packing,
+                gradient_checkpointing: self.gradient_checkpointing,
+                gradient_checkpointing_layers: self.gradient_checkpointing_layers,
+                metal_fused_optimizer: self.metal_fused_optimizer,
+                ..Default::default()
+            },
+            config_path: None,
+            log_metrics: self.metrics_path.map(|p| p.display().to_string()),
+            resume: false,
             seed: 42,
-            pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
-            drop_last: false,
-            ..Default::default()
+            emit_console_output: false,
         };
 
-        #[allow(clippy::needless_update)] // ..Default covers cfg-gated fields (e.g. distributed)
-        let training_loop_config = TrainingLoopConfig {
-            training: training_config,
-            dataloader: dataloader_config,
-            use_metal_flash_attention: self.flash_attention,
-            log_every: 1,
-            checkpoint_every: 500,
-            eval_every: if eval_dataset.is_some() { 100 } else { 0 },
-            use_jit_compilation: false,
-            use_sequence_packing: self.sequence_packing,
-            gradient_checkpointing: self.gradient_checkpointing,
-            gradient_checkpointing_layers: self.gradient_checkpointing_layers,
-            embedding_lr: self.embedding_lr,
-            eager_evaluation: false,
-            use_metal_fused_optimizer: self.metal_fused_optimizer,
-            loraplus_lr_ratio: None,
-            neftune_noise_alpha: None,
-            use_cut_cross_entropy: false,
-            ..Default::default()
-        };
-
-        let mut training_loop = TrainingLoop::new(training_loop_config);
-        let use_sequence_packing = self.sequence_packing;
-
-        if let Some(metrics_path) = &self.metrics_path {
-            let callback = MetricsJsonCallback::new(metrics_path)
-                .map_err(training_err)?
-                .with_run_name(self.model_id.replace('/', "-"));
-            training_loop.add_callback(Box::new(callback));
-        }
-
-        for callback in self.callbacks {
-            training_loop.add_callback(callback);
-        }
-
-        // Run training (sequence packing by default)
-        phase!("Training…");
-        let model = if use_sequence_packing {
-            training_loop
-                .run_packed(
-                    model,
-                    train_dataset,
-                    eval_dataset,
-                    Some(&checkpoint_manager),
-                )
-                .map_err(training_err)?
-        } else {
-            let mut model = model;
-            training_loop
-                .run(
-                    &mut model,
-                    train_dataset,
-                    eval_dataset,
-                    Some(&checkpoint_manager),
-                )
-                .map_err(training_err)?;
-            model
-        };
-
-        // Save final LoRA weights
-        let lora_weights_path = output_dir.join("lora_weights.safetensors");
-        model
-            .save_lora_weights(&lora_weights_path)
-            .map_err(training_err)?;
+        let result = orchestrator::run_training(
+            job_config,
+            phase_cb.as_deref(),
+            self.callbacks,
+        )
+        .await
+        .map_err(training_err)?;
 
         Ok(FinetuneResult {
-            final_loss: training_loop.current_loss(),
-            total_steps: training_loop.current_step(),
-            total_tokens: training_loop.total_tokens(),
-            output_dir,
-            lora_weights_path,
+            final_loss: result.final_loss,
+            total_steps: result.total_steps,
+            total_tokens: result.total_tokens,
+            output_dir: result.output_dir,
+            lora_weights_path: result.lora_weights_path,
         })
     }
 }

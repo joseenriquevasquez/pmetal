@@ -9,59 +9,25 @@ mod dashboard;
 #[cfg(feature = "dashboard")]
 mod tui;
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use mlx_rs::builder::Builder;
 use pmetal_core::{DatasetConfig, LoraConfig, ModelConfig, TrainingConfig};
 use pmetal_data::{
-    DataLoaderConfig, DatasetColumnConfig, DatasetFormat, DatasetSource, Tokenizer,
-    TrainingDataset, resolve_dataset_source,
+    DataLoaderConfig, DatasetColumnConfig, DatasetFormat, Tokenizer, TrainingDataset,
 };
-use pmetal_lora::{
-    DynamicLoraModel, LlamaLoraForCausalLM, LlamaQloraForCausalLM, QLoraConfig, TrainableModel,
-};
-use pmetal_mlx::quantization::QuantScheme;
+use pmetal_lora::{DynamicLoraModel, LlamaLoraForCausalLM, TrainableModel};
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::ollama::{ModelfileBuilder, templates as ollama_templates};
-use pmetal_models::{DynamicModel, WeightFormat};
+use pmetal_models::DynamicModel;
 use pmetal_trainer::{
-    CheckpointManager, GrpoConfig, GrpoTrainer, MetricsJsonCallback, RlkdConfig, RlkdTrainer,
-    TrainingLoop, TrainingLoopConfig,
+    GrpoConfig, GrpoTrainer, RlkdConfig, RlkdTrainer, TrainingLoopConfig,
 };
-use serde::{Deserialize, Serialize};
 
-/// Combined configuration for training.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FullTrainingConfig {
-    /// Model configuration.
-    #[serde(default)]
-    pub model: ModelConfig,
-
-    /// LoRA configuration.
-    #[serde(default)]
-    pub lora: LoraConfig,
-
-    /// Training hyperparameters.
-    #[serde(default)]
-    pub training: TrainingConfig,
-
-    /// Dataset configuration.
-    #[serde(default)]
-    pub dataset: DatasetConfig,
-}
-
-impl Default for FullTrainingConfig {
-    fn default() -> Self {
-        Self {
-            model: ModelConfig::default(),
-            lora: LoraConfig::default(),
-            training: TrainingConfig::default(),
-            dataset: DatasetConfig::default(),
-        }
-    }
-}
+/// Re-export FullTrainingConfig from orchestrator for YAML config generation.
+use pmetal_trainer::orchestrator::FullTrainingConfig;
 
 /// Quantization method for QLoRA.
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -1988,17 +1954,52 @@ async fn tokio_main() -> anyhow::Result<()> {
             #[cfg(feature = "distributed")]
             compression_strategy,
         } => {
-            // Optimizations enabled by default (invert no_* flags)
-            let use_metal_flash_attention = !no_flash_attention;
-            let fused = !no_fused;
-            let use_metal_fused_optimizer = !no_metal_fused_optimizer;
-            let use_sequence_packing = !no_sequence_packing;
-            let use_jit_compilation = !no_jit_compilation;
-            let gradient_checkpointing = !no_gradient_checkpointing;
+            use pmetal_trainer::orchestrator;
 
-            // Build distributed config if requested
+            // Parse LR schedule
+            let lr_scheduler = match lr_schedule.to_lowercase().as_str() {
+                "constant" => pmetal_core::LrSchedulerType::Constant,
+                "linear" => pmetal_core::LrSchedulerType::Linear,
+                "cosine" => pmetal_core::LrSchedulerType::Cosine,
+                "cosine_with_restarts" => pmetal_core::LrSchedulerType::CosineWithRestarts,
+                "polynomial" => pmetal_core::LrSchedulerType::Polynomial,
+                "wsd" => pmetal_core::LrSchedulerType::Wsd,
+                other => {
+                    anyhow::bail!(
+                        "Unknown lr-schedule '{}'. Valid: constant, linear, cosine, cosine_with_restarts, polynomial, wsd",
+                        other
+                    );
+                }
+            };
+
+            // Build QLoRA config if quantization is requested
+            let qlora = if !matches!(quantization, QuantizationMethod::None) {
+                Some(orchestrator::QLoraOrchConfig {
+                    scheme: match quantization {
+                        QuantizationMethod::Nf4 => orchestrator::QuantizationScheme::Nf4,
+                        QuantizationMethod::Fp4 => orchestrator::QuantizationScheme::Fp4,
+                        QuantizationMethod::Int8 => orchestrator::QuantizationScheme::Int8,
+                        QuantizationMethod::None => unreachable!(),
+                    },
+                    block_size: quant_block_size,
+                    double_quant,
+                })
+            } else {
+                None
+            };
+
+            // Build column config
+            let columns = build_column_config(
+                text_column,
+                text_columns,
+                column_separator,
+                prompt_column,
+                response_column,
+            );
+
+            // Build distributed config
             #[cfg(feature = "distributed")]
-            let dist_config = {
+            let distributed = {
                 let has_peers = distributed_peers.as_ref().is_some_and(|p| !p.is_empty());
                 if has_peers || distributed_auto {
                     let compression = match compression_strategy.as_deref() {
@@ -2018,55 +2019,55 @@ async fn tokio_main() -> anyhow::Result<()> {
                 }
             };
 
-            run_training(
-                config,
-                model,
-                dataset,
+            let job_config = orchestrator::TrainingJobConfig {
+                model_id: model.unwrap_or_default(),
+                dataset: dataset.unwrap_or_default(),
                 eval_dataset,
-                output,
-                lora_r,
-                lora_alpha,
-                learning_rate,
-                batch_size,
-                epochs,
-                max_seq_len,
-                gradient_accumulation_steps,
-                use_metal_flash_attention,
-                max_grad_norm,
-                resume,
-                quantization,
-                quant_block_size,
-                double_quant,
-                fused,
-                use_metal_fused_optimizer,
-                use_sequence_packing,
-                use_jit_compilation,
-                gradient_checkpointing,
-                gradient_checkpointing_layers,
+                output_dir: output,
+                lora: LoraConfig {
+                    r: lora_r,
+                    alpha: lora_alpha,
+                    ..Default::default()
+                },
+                qlora,
+                training: TrainingConfig {
+                    learning_rate,
+                    batch_size,
+                    num_epochs: epochs,
+                    max_seq_len,
+                    gradient_accumulation_steps,
+                    max_grad_norm,
+                    warmup_steps,
+                    weight_decay,
+                    lr_scheduler,
+                    embedding_learning_rate: embedding_lr.map(|v| v as f64),
+                    ..Default::default()
+                },
+                columns,
+                dispatch: orchestrator::DispatchConfig {
+                    flash_attention: !no_flash_attention,
+                    sequence_packing: !no_sequence_packing,
+                    jit_compilation: !no_jit_compilation,
+                    fused: !no_fused,
+                    metal_fused_optimizer: !no_metal_fused_optimizer,
+                    gradient_checkpointing: !no_gradient_checkpointing,
+                    gradient_checkpointing_layers,
+                    cut_cross_entropy,
+                    #[cfg(feature = "ane")]
+                    ane: !no_ane,
+                    #[cfg(not(feature = "ane"))]
+                    ane: false,
+                    #[cfg(feature = "distributed")]
+                    distributed,
+                },
+                config_path: config,
                 log_metrics,
-                true,
-                Vec::new(),
-                embedding_lr,
-                warmup_steps,
-                &lr_schedule,
-                weight_decay,
+                resume,
                 seed,
-                cut_cross_entropy,
-                #[cfg(feature = "ane")]
-                !no_ane,
-                #[cfg(not(feature = "ane"))]
-                false,
-                #[cfg(feature = "distributed")]
-                dist_config,
-                #[cfg(not(feature = "distributed"))]
-                None,
-                text_column,
-                text_columns,
-                column_separator,
-                prompt_column,
-                response_column,
-            )
-            .await?;
+                emit_console_output: true,
+            };
+
+            orchestrator::run_training(job_config, None, Vec::new()).await?;
         }
 
         #[cfg(feature = "serve")]
@@ -4029,11 +4030,7 @@ async fn run_distillation_cli(
     Ok(())
 }
 
-/// Save the LoRA adapter config JSON alongside a safetensors weights file.
-///
-/// Writes `adapter_config.json` into the same directory as `lora_weights_path`,
-/// recording `r`, `alpha`, `target_modules`, and `use_rslora` so inference can
-/// reconstruct the adapter without guessing.
+/// Delegate to orchestrator's save_adapter_config.
 fn save_adapter_config(
     lora_weights_path: &std::path::Path,
     r: usize,
@@ -4041,19 +4038,7 @@ fn save_adapter_config(
     target_modules: &[String],
     use_rslora: bool,
 ) -> anyhow::Result<()> {
-    let adapter_config = serde_json::json!({
-        "r": r,
-        "alpha": alpha,
-        "target_modules": target_modules,
-        "use_rslora": use_rslora,
-    });
-    let config_path = lora_weights_path
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("adapter_config.json");
-    std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
-    tracing::info!("Saved adapter config to {:?}", config_path);
-    Ok(())
+    pmetal_trainer::orchestrator::save_adapter_config(lora_weights_path, r, alpha, target_modules, use_rslora)
 }
 
 /// Run GRPO (Group Relative Policy Optimization) for reasoning models.
@@ -4829,1017 +4814,6 @@ fn build_column_config(
     } else {
         None
     }
-}
-
-/// Run LoRA/QLoRA fine-tuning using the new TrainingLoop.
-#[allow(clippy::too_many_arguments)]
-async fn run_training(
-    config_path: Option<String>,
-    model_id: Option<String>,
-    dataset_path: Option<String>,
-    eval_dataset_path: Option<String>,
-    output_dir: String,
-    lora_r: usize,
-    lora_alpha: f32,
-    learning_rate: f64,
-    batch_size: usize,
-    num_epochs: usize,
-    max_seq_len: usize,
-    gradient_accumulation_steps: usize,
-    use_metal_flash_attention: bool,
-    max_grad_norm: f64,
-    resume: bool,
-    quantization: QuantizationMethod,
-    quant_block_size: usize,
-    double_quant: bool,
-    fused: bool,
-    use_metal_fused_optimizer: bool,
-    use_sequence_packing: bool,
-    use_jit_compilation: bool,
-    gradient_checkpointing: bool,
-    gradient_checkpointing_layers: usize,
-    log_metrics: Option<String>,
-    emit_console_output: bool,
-    extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
-    embedding_lr: Option<f32>,
-    warmup_steps: usize,
-    lr_schedule: &str,
-    weight_decay: f64,
-    seed: u64,
-    cut_cross_entropy: bool,
-    ane: bool,
-    #[allow(unused_variables)] distributed_config: Option<pmetal_core::DistributedTrainingConfig>,
-    text_column: Option<String>,
-    text_columns: Option<Vec<String>>,
-    column_separator: String,
-    prompt_column: Option<String>,
-    response_column: Option<String>,
-) -> anyhow::Result<()> {
-    #[cfg(not(feature = "ane"))]
-    if ane {
-        anyhow::bail!("ANE training requires the 'ane' feature: cargo build --features ane");
-    }
-    #[cfg(feature = "ane")]
-    if ane {
-        use pmetal_trainer::{AneTrainingLoop, AneTrainingLoopConfig, DynamicAneTrainerConfig};
-
-        tracing::info!("Attempting ANE dynamic weight pipeline");
-
-        let ane_result: anyhow::Result<()> = async {
-            // Resolve model path
-            let model_name = model_id
-                .as_deref()
-                .or(config_path.as_deref())
-                .ok_or_else(|| anyhow::anyhow!("--model is required for ANE training"))?;
-            let model_path = if model_name.contains('/') && !PathBuf::from(model_name).exists() {
-                pmetal_hub::download_model(model_name, None, None).await?
-            } else {
-                PathBuf::from(model_name)
-            };
-
-            // Read model config
-            let config_text = std::fs::read_to_string(model_path.join("config.json"))?;
-            let config_json: serde_json::Value = serde_json::from_str(&config_text)?;
-
-            // Validate architecture compatibility before attempting ANE
-            if let Err(reason) = DynamicAneTrainerConfig::is_ane_compatible(&config_json) {
-                anyhow::bail!("{}", reason);
-            }
-
-            let get_usize = |key: &str| -> anyhow::Result<usize> {
-                config_json
-                    .get(key)
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                    .ok_or_else(|| anyhow::anyhow!("config.json missing '{key}'"))
-            };
-            let dim = get_usize("hidden_size")?;
-            let hidden_dim = get_usize("intermediate_size")?;
-            let n_heads = get_usize("num_attention_heads")?;
-            let n_kv_heads = config_json
-                .get("num_key_value_heads")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize)
-                .unwrap_or(n_heads);
-            let n_layers = get_usize("num_hidden_layers")?;
-            let vocab_size = get_usize("vocab_size")?;
-
-            // Auto-detect max_seq_len from model config if not specified (0)
-            let max_seq_len = if max_seq_len == 0 {
-                let model_max = config_json
-                    .get("max_position_embeddings")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                    .unwrap_or(2048);
-                // ANE kernels compile seq_len into static shapes — cap to prevent
-                // excessively large IOSurface allocations.
-                let capped = model_max.min(2048);
-                tracing::info!(
-                    model_max = model_max,
-                    capped = capped,
-                    "Auto-detected ANE seq_len from max_position_embeddings"
-                );
-                capped
-            } else {
-                max_seq_len
-            };
-
-            // Load tokenizer (with config-aware special token resolution) and dataset
-            let tokenizer = Tokenizer::from_model_dir(&model_path)?;
-            let ds_path = dataset_path
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("--dataset is required for ANE training"))?;
-            let text_samples =
-                TrainingDataset::load_jsonl_text(ds_path, DatasetFormat::Auto, None)?;
-
-            // Tokenize and prepare batches: Vec<Vec<(Vec<u16>, Vec<u16>)>>
-            // Each batch contains `gradient_accumulation_steps` examples.
-            // Each example is (input, target) where target = input shifted by 1.
-            let mut batches: Vec<Vec<(Vec<u16>, Vec<u16>)>> = Vec::new();
-            let mut current_batch: Vec<(Vec<u16>, Vec<u16>)> = Vec::new();
-
-            for sample in &text_samples {
-                let tokens = tokenizer.encode(&sample.text)?;
-                if tokens.len() < 2 {
-                    continue;
-                }
-                let len = tokens.len().min(max_seq_len + 1);
-                let input: Vec<u16> = tokens[..len - 1].iter().map(|&t| t as u16).collect();
-                let target: Vec<u16> = tokens[1..len].iter().map(|&t| t as u16).collect();
-                current_batch.push((input, target));
-
-                if current_batch.len() >= gradient_accumulation_steps.max(1) {
-                    batches.push(std::mem::take(&mut current_batch));
-                }
-            }
-            if !current_batch.is_empty() {
-                batches.push(current_batch);
-            }
-
-            if batches.is_empty() {
-                anyhow::bail!("No training examples after tokenization");
-            }
-
-            let total_batches = batches.len() * num_epochs;
-            tracing::info!(
-                examples = text_samples.len(),
-                batches = batches.len(),
-                epochs = num_epochs,
-                total_steps = total_batches,
-                "Prepared ANE training data"
-            );
-
-            // Read head_dim from config (models like Qwen3 use non-standard head_dim)
-            let head_dim = config_json
-                .get("head_dim")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
-
-            let trainer_config = DynamicAneTrainerConfig {
-                dim,
-                hidden_dim,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                n_layers,
-                vocab_size,
-                seq_len: max_seq_len,
-                learning_rate: learning_rate as f32,
-                accum_steps: gradient_accumulation_steps.max(1),
-                ..Default::default()
-            };
-
-            let loop_config = AneTrainingLoopConfig {
-                trainer: trainer_config,
-                num_batches: total_batches,
-                max_steps: total_batches,
-                log_every: 10,
-                save_every: Some(100),
-                output_dir: PathBuf::from(&output_dir),
-            };
-
-            let mut training_loop = AneTrainingLoop::new(loop_config);
-
-            // Load model weights from SafeTensors
-            tracing::info!("Loading model weights for ANE training...");
-            training_loop.load_weights_safetensors(&model_path)?;
-
-            // Install vocab compaction (scan all batch tokens, build compact map)
-            {
-                use pmetal_trainer::VocabMap;
-                let vocab_map = VocabMap::from_batches(&batches, vocab_size);
-                tracing::info!(
-                    compact_vocab = vocab_map.compact_vocab,
-                    full_vocab = vocab_size,
-                    "Vocab compaction ready"
-                );
-                training_loop.install_vocab_map(vocab_map);
-            }
-
-            // Compile dynamic ANE kernels (one-time, no recompilation ever)
-            tracing::info!("Compiling dynamic ANE kernels (one-time)...");
-            training_loop.compile_kernels()?;
-
-            // Run training
-            for epoch in 0..num_epochs {
-                tracing::info!(epoch = epoch + 1, total = num_epochs, "Starting epoch");
-                let state = training_loop.train(&batches)?;
-                tracing::info!(
-                    loss = state.loss,
-                    tokens = state.tokens_processed,
-                    tok_per_sec = format!("{:.1}", state.tokens_per_sec()),
-                    "Epoch complete"
-                );
-            }
-
-            tracing::info!("ANE training complete");
-            Ok(())
-        }
-        .await;
-
-        match ane_result {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                tracing::warn!("ANE training failed ({}), falling back to GPU training", e);
-            }
-        }
-    }
-
-    let use_qlora = !matches!(quantization, QuantizationMethod::None);
-
-    // Validate output directory to prevent path traversal attacks
-    let validated_output = validate_output_path(&output_dir, "output directory")?;
-    let output_dir = validated_output.to_string_lossy().to_string();
-
-    // Load or create configuration
-    let mut config = if let Some(ref path) = config_path {
-        let content = std::fs::read_to_string(path)?;
-        serde_yaml::from_str(&content)?
-    } else {
-        FullTrainingConfig::default()
-    };
-
-    // Override with CLI args if provided
-    if let Some(ref model) = model_id {
-        config.model.model_id = model.clone();
-    }
-    if let Some(ref ds) = dataset_path {
-        config.dataset.dataset_id = ds.clone();
-    }
-    config.lora.r = lora_r;
-    config.lora.alpha = lora_alpha;
-    config.training.learning_rate = learning_rate;
-    config.training.batch_size = batch_size;
-    config.training.num_epochs = num_epochs;
-    config.training.max_seq_len = max_seq_len;
-    config.training.gradient_accumulation_steps = gradient_accumulation_steps;
-    config.training.max_grad_norm = max_grad_norm;
-    config.training.output_dir = output_dir.clone();
-    config.training.warmup_steps = warmup_steps;
-    config.training.weight_decay = weight_decay;
-    config.training.seed = seed;
-    config.training.lr_scheduler = match lr_schedule.to_lowercase().as_str() {
-        "constant" => pmetal_core::LrSchedulerType::Constant,
-        "linear" => pmetal_core::LrSchedulerType::Linear,
-        "cosine" => pmetal_core::LrSchedulerType::Cosine,
-        "cosine_with_restarts" => pmetal_core::LrSchedulerType::CosineWithRestarts,
-        "polynomial" => pmetal_core::LrSchedulerType::Polynomial,
-        "wsd" => pmetal_core::LrSchedulerType::Wsd,
-        other => {
-            anyhow::bail!(
-                "Unknown lr-schedule '{}'. Valid options: constant, linear, cosine, cosine_with_restarts, polynomial, wsd",
-                other
-            );
-        }
-    };
-
-    // Download model if needed
-    tracing::info!("Loading model: {}", config.model.model_id);
-    let model_path =
-        if config.model.model_id.contains('/') && !PathBuf::from(&config.model.model_id).exists() {
-            // HuggingFace model ID
-            pmetal_hub::download_model(
-                &config.model.model_id,
-                config.model.revision.as_deref(),
-                None,
-            )
-            .await?
-        } else {
-            PathBuf::from(&config.model.model_id)
-        };
-
-    // Load model config (optional for GGUF - config is extracted from metadata)
-    let model_config_path = model_path.join("config.json");
-    let llama_config: Option<LlamaConfig> = if model_config_path.exists() {
-        let content = std::fs::read_to_string(&model_config_path)?;
-        Some(serde_json::from_str(&content)?)
-    } else {
-        // GGUF files don't have separate config.json
-        if WeightFormat::detect(&model_path) != Some(WeightFormat::Gguf) {
-            anyhow::bail!(
-                "Model config.json not found at {:?}. If using GGUF, pass the .gguf file directly.",
-                model_config_path
-            );
-        }
-        None
-    };
-
-    // Auto-detect max_seq_len if requested (0)
-    if config.training.max_seq_len == 0 {
-        if let Some(ref cfg) = llama_config {
-            // Llama/Qwen config uses max_position_embeddings — cap to prevent OOM
-            let model_max = cfg.max_position_embeddings as usize;
-            config.training.max_seq_len = model_max.min(8192);
-            tracing::info!(
-                "Auto-detected max_seq_len: {} (model supports {}, capped at 8192)",
-                config.training.max_seq_len,
-                model_max
-            );
-        } else {
-            // GGUF fallback
-            config.training.max_seq_len = 8192;
-            tracing::info!(
-                "Defaulting max_seq_len to {} (GGUF or unknown config)",
-                config.training.max_seq_len
-            );
-        }
-    }
-
-    // Initialize metrics callback if requested
-    let metrics_path_resolved = log_metrics.as_ref().map(|metrics_path| {
-        if metrics_path.contains('/') || metrics_path.contains('\\') {
-            PathBuf::from(metrics_path)
-        } else {
-            PathBuf::from(&output_dir).join(metrics_path)
-        }
-    });
-    let mut metrics_callback: Option<Box<dyn pmetal_core::TrainingCallback>> =
-        if let Some(ref path) = metrics_path_resolved {
-            let callback = MetricsJsonCallback::new(path)?
-                .with_run_name(format!(
-                    "{}-{}",
-                    config.model.model_id.replace('/', "-"),
-                    chrono::Utc::now().format("%Y%m%d-%H%M%S")
-                ))
-                .with_config(serde_json::json!({
-                    "model": config.model.model_id,
-                    "lora_r": lora_r,
-                    "learning_rate": learning_rate,
-                    "batch_size": batch_size,
-                    "epochs": num_epochs,
-                    "max_seq_len": config.training.max_seq_len,
-                    "gradient_accumulation_steps": gradient_accumulation_steps,
-                    "gradient_checkpointing": gradient_checkpointing,
-                    "quantization": format!("{:?}", quantization),
-                }));
-            use pmetal_core::TrainingCallback;
-            let mut cb = callback;
-            cb.on_train_start();
-            Some(Box::new(cb) as Box<dyn pmetal_core::TrainingCallback>)
-        } else {
-            None
-        };
-
-    if let Some(ref cfg) = llama_config {
-        tracing::info!(
-            "Model: {} hidden, {} layers, {} heads",
-            cfg.hidden_size,
-            cfg.num_hidden_layers,
-            cfg.num_attention_heads
-        );
-    } else {
-        tracing::info!("Model config will be extracted from GGUF metadata");
-    }
-
-    // Load tokenizer (with config-aware special token resolution)
-    tracing::info!("Loading tokenizer...");
-    let tokenizer_path = model_path.join("tokenizer.json");
-    let tokenizer = if tokenizer_path.exists() {
-        Tokenizer::from_model_dir(&model_path)?
-    } else {
-        anyhow::bail!(
-            "Tokenizer not found at {:?}. GGUF models don't bundle a tokenizer — \
-             download the source model first with: pmetal download {}",
-            tokenizer_path,
-            config.model.model_id
-        );
-    };
-
-    // Detect chat template for OpenAI/ShareGPT formatting (checks tokenizer_config.json first)
-    let chat_template =
-        pmetal_data::chat_templates::detect_chat_template(&model_path, &config.model.model_id);
-
-    // Resolve dataset source — local path or HuggingFace dataset ID
-    let dataset_path_resolved = match resolve_dataset_source(&config.dataset.dataset_id) {
-        DatasetSource::Local(p) => {
-            // Resolve directories to a data file within (handles HF cache structure)
-            TrainingDataset::resolve_dataset_path_pub(&p)?
-        }
-        DatasetSource::HuggingFace(id) => {
-            tracing::info!("Downloading dataset from HuggingFace: {}", id);
-            // Download the dataset repo (contains JSONL/Parquet files)
-            let dir = pmetal_hub::download_dataset(&id, None, None, None).await?;
-            // Try to resolve a JSONL file in the downloaded directory
-            let resolved = TrainingDataset::resolve_dataset_path_pub(&dir);
-            if let Ok(p) = resolved {
-                p
-            } else {
-                // Fall back to parquet
-                let parquet_paths =
-                    pmetal_hub::download_dataset_parquet(&id, "train", None, None).await?;
-                if parquet_paths.is_empty() {
-                    anyhow::bail!("No JSONL or Parquet files found for dataset {}", id);
-                }
-                parquet_paths[0].clone()
-            }
-        }
-    };
-
-    // Build optional column config from CLI flags.
-    let column_cfg = build_column_config(
-        text_column,
-        text_columns,
-        column_separator,
-        prompt_column,
-        response_column,
-    );
-
-    // Load and tokenize training dataset — dispatch on file extension
-    tracing::info!(
-        "Loading training dataset: {}",
-        dataset_path_resolved.display()
-    );
-    let is_parquet = dataset_path_resolved
-        .extension()
-        .is_some_and(|ext| ext == "parquet");
-    let train_dataset = if is_parquet {
-        tracing::info!("Detected Parquet format");
-        // Honour explicit text_column for parquet; otherwise try well-known names.
-        let explicit_col = column_cfg.as_ref().and_then(|c| c.text_column.as_deref());
-        let prompt_col = column_cfg.as_ref().and_then(|c| c.prompt_column.as_deref());
-        if let Some(col) = explicit_col {
-            TrainingDataset::from_parquet_tokenized(
-                &dataset_path_resolved,
-                &tokenizer,
-                col,
-                config.training.max_seq_len,
-                prompt_col,
-            )?
-        } else {
-            let result = TrainingDataset::from_parquet_tokenized(
-                &dataset_path_resolved,
-                &tokenizer,
-                "text",
-                config.training.max_seq_len,
-                None,
-            );
-            match result {
-                Ok(ds) => ds,
-                Err(_) => {
-                    // Try "content" column
-                    TrainingDataset::from_parquet_tokenized(
-                        &dataset_path_resolved,
-                        &tokenizer,
-                        "content",
-                        config.training.max_seq_len,
-                        None,
-                    )
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "Parquet file does not have a recognized column layout. \
-                         Supported: 'text' column, 'content' column, or reasoning format \
-                         (problem/thinking/solution columns)."
-                        )
-                    })?
-                }
-            }
-        }
-    } else {
-        TrainingDataset::from_jsonl_tokenized(
-            &dataset_path_resolved,
-            &tokenizer,
-            DatasetFormat::Auto,
-            config.training.max_seq_len,
-            Some(&chat_template),
-            column_cfg.as_ref(),
-        )?
-    };
-    tracing::info!("Training dataset loaded: {} samples", train_dataset.len());
-
-    // Log sequence-length statistics and warn on truncation.
-    {
-        let stats = train_dataset.compute_statistics(config.training.max_seq_len);
-        tracing::info!(
-            "Dataset: {} samples | lengths: mean={:.0}, median={}, p95={}, p99={}, max={} | truncated: {:.1}%",
-            stats.total_samples,
-            stats.mean_length,
-            stats.median_length,
-            stats.p95_length,
-            stats.p99_length,
-            stats.max_length,
-            stats.truncated_pct,
-        );
-        let warnings = train_dataset.validate_seq_len(config.training.max_seq_len);
-        for w in &warnings {
-            tracing::warn!("{}", w);
-        }
-    }
-
-    // Load evaluation dataset if provided
-    let eval_dataset = if let Some(ref eval_path) = eval_dataset_path {
-        tracing::info!("Loading evaluation dataset: {}", eval_path);
-        let ds = TrainingDataset::from_jsonl_tokenized(
-            eval_path,
-            &tokenizer,
-            DatasetFormat::Auto,
-            config.training.max_seq_len,
-            Some(&chat_template),
-            column_cfg.as_ref(),
-        )?;
-        tracing::info!("Evaluation dataset loaded: {} samples", ds.len());
-        Some(ds)
-    } else {
-        None
-    };
-
-    // Set up checkpointing
-    let checkpoint_dir = PathBuf::from(&output_dir).join("checkpoints");
-    let checkpoint_manager = CheckpointManager::new(&checkpoint_dir)?.with_max_checkpoints(3);
-
-    // Create data loader config
-    let dataloader_config = DataLoaderConfig {
-        batch_size: config.training.batch_size,
-        max_seq_len: config.training.max_seq_len,
-        shuffle: config.dataset.shuffle,
-        seed: config.training.seed,
-        pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
-        drop_last: false,
-        ..Default::default()
-    };
-
-    // Create training loop config
-    let training_loop_config = TrainingLoopConfig {
-        training: config.training.clone(),
-        dataloader: dataloader_config.clone(),
-        use_metal_flash_attention,
-        log_every: config.training.logging_steps.max(1),
-        checkpoint_every: config.training.save_steps.unwrap_or(500),
-        eval_every: if eval_dataset.is_some() { 100 } else { 0 },
-        use_jit_compilation,
-        use_sequence_packing,
-        gradient_checkpointing,
-        gradient_checkpointing_layers,
-        embedding_lr,
-        eager_evaluation: true,
-        use_metal_fused_optimizer,
-        loraplus_lr_ratio: None,
-        neftune_noise_alpha: None,
-        use_cut_cross_entropy: cut_cross_entropy,
-        #[cfg(feature = "distributed")]
-        distributed: distributed_config.clone(),
-    };
-
-    // Calculate total steps for progress bar
-    let steps_per_epoch = train_dataset.len() / config.training.batch_size;
-    let total_steps = if let Some(max) = config.training.max_steps {
-        max
-    } else {
-        steps_per_epoch * config.training.num_epochs
-    };
-
-    // Set up progress bar
-    let progress = if emit_console_output {
-        ProgressBar::new(total_steps as u64)
-    } else {
-        ProgressBar::hidden()
-    };
-    progress.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) | Loss: {msg}")
-            .expect("Stop tokens should format correctly")
-            .progress_chars("#>-"),
-    );
-
-    let mut extra_callbacks = Some(extra_callbacks);
-
-    // Run training with either LoRA or QLoRA model
-    let (final_loss, final_step, total_tokens) = if use_qlora {
-        // QLoRA path - quantized base weights
-        let quant_scheme = match quantization {
-            QuantizationMethod::Nf4 => QuantScheme::NF4,
-            QuantizationMethod::Fp4 => QuantScheme::FP4,
-            QuantizationMethod::Int8 => QuantScheme::Int8,
-            QuantizationMethod::None => unreachable!(),
-        };
-
-        let qlora_config = QLoraConfig {
-            lora: config.lora.clone(),
-            quant_scheme,
-            block_size: quant_block_size,
-            double_quant,
-            compute_in_half: true,
-        };
-
-        tracing::info!(
-            "Initializing QLoRA model with {:?} quantization...",
-            quantization
-        );
-        // QLoRA currently requires config.json (Llama-only)
-        let llama_cfg = llama_config.ok_or_else(|| {
-            anyhow::anyhow!(
-                "QLoRA requires config.json. GGUF format is only supported with standard LoRA."
-            )
-        })?;
-        let mut model = LlamaQloraForCausalLM::with_qlora_config(llama_cfg, qlora_config)?;
-
-        // Load and quantize base model weights
-        tracing::info!(
-            "Loading and quantizing base model weights from {:?}...",
-            model_path
-        );
-        model.load_and_quantize_from_dir(&model_path)?;
-
-        // Report memory savings
-        let savings = model.memory_savings();
-        let (quant_bytes, lora_bytes, total_bytes) = model.memory_usage();
-        tracing::info!(
-            "Memory usage: {:.2} MB (quantized: {:.2} MB, LoRA: {:.2} MB) - {:.1}% of full precision",
-            total_bytes as f64 / 1_000_000.0,
-            quant_bytes as f64 / 1_000_000.0,
-            lora_bytes as f64 / 1_000_000.0,
-            savings * 100.0
-        );
-
-        tracing::info!(
-            "Trainable parameters: {}",
-            format_param_count(model.num_trainable_params())
-        );
-
-        // Enable gradient checkpointing if requested
-        if gradient_checkpointing {
-            use pmetal_lora::TrainableModel;
-            if model.supports_gradient_checkpointing() {
-                model.enable_gradient_checkpointing(gradient_checkpointing_layers);
-                tracing::info!(
-                    "Gradient checkpointing enabled ({} layers per block)",
-                    gradient_checkpointing_layers
-                );
-            } else {
-                tracing::warn!(
-                    "Gradient checkpointing requested but not supported by LlamaQloraForCausalLM. \
-                     This feature is currently only supported for Qwen3 models."
-                );
-            }
-        }
-
-        // Set up distributed gradient sync if configured (before creating training
-        // loop — the async .await is not Send-compatible with TrainingLoop's Rc fields)
-        #[cfg(feature = "distributed")]
-        let distributed_sync = if let Some(ref dist_cfg) = distributed_config {
-            let ctx = pmetal_trainer::create_distributed_context(dist_cfg).await?;
-            Some(pmetal_trainer::DistributedGradientSync::new(ctx, dist_cfg))
-        } else {
-            None
-        };
-
-        // Create training loop
-        let mut training_loop = TrainingLoop::new(training_loop_config);
-
-        #[cfg(feature = "distributed")]
-        if let Some(sync) = distributed_sync {
-            training_loop.set_distributed(sync);
-        }
-
-        // Wire metrics callback into training loop for step-level dispatch
-        if let Some(cb) = metrics_callback.take() {
-            training_loop.add_callback(cb);
-        }
-        if let Some(callbacks) = extra_callbacks.take() {
-            for callback in callbacks {
-                training_loop.add_callback(callback);
-            }
-        }
-
-        // Enable adaptive LR with control file for TUI communication
-        {
-            let adaptive_config = pmetal_trainer::AdaptiveLrConfig::default();
-            let control_file = PathBuf::from(&output_dir).join(".lr_control.json");
-            training_loop.enable_adaptive_lr_with_control(adaptive_config, control_file);
-        }
-
-        // Resume from checkpoint if requested
-        if resume {
-            if let Some((lora_params, metadata)) = checkpoint_manager.load_latest()? {
-                tracing::info!("Resuming from checkpoint at step {}", metadata.step);
-                model.set_lora_parameters(&lora_params);
-                training_loop.set_step(metadata.step);
-                training_loop.set_epoch(metadata.epoch);
-            } else {
-                tracing::info!("No checkpoint found, starting fresh");
-            }
-        }
-
-        tracing::info!("Starting QLoRA training...");
-
-        if fused {
-            tracing::warn!(
-                "Fused training is not yet supported for QLoRA, using standard training"
-            );
-        }
-
-        // Run training loop
-        training_loop.run(
-            &mut model,
-            train_dataset,
-            eval_dataset,
-            Some(&checkpoint_manager),
-        )?;
-
-        progress.finish_with_message(format!("{:.4}", training_loop.current_loss()));
-
-        // Save final LoRA weights
-        let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
-        model.save_lora_weights(&final_path)?;
-        tracing::info!("Saved LoRA weights to {:?}", final_path);
-        // Save adapter config for inference (r, alpha, target_modules)
-        save_adapter_config(
-            &final_path,
-            config.lora.r,
-            config.lora.alpha,
-            &config.lora.target_modules,
-            config.lora.use_rslora,
-        )?;
-
-        // Recover metrics callback from training loop for finalization
-        let mut cbs = training_loop.take_callbacks();
-        if !cbs.is_empty() && metrics_callback.is_none() {
-            metrics_callback = Some(cbs.remove(0));
-        }
-
-        (
-            training_loop.current_loss(),
-            training_loop.current_step(),
-            training_loop.total_tokens(),
-        )
-    } else {
-        // Standard LoRA path - full precision base weights with dynamic architecture detection
-        tracing::info!("Initializing LoRA model with auto-detected architecture...");
-
-        // Detect weight format and use appropriate loader
-        let mut model = match WeightFormat::detect(&model_path) {
-            Some(WeightFormat::Gguf) => {
-                tracing::info!("Detected GGUF format, loading with dequantization...");
-                DynamicLoraModel::from_gguf(&model_path, config.lora.clone())?
-            }
-            _ => {
-                // Default to safetensors (HuggingFace format)
-                DynamicLoraModel::from_pretrained(&model_path, config.lora.clone())?
-            }
-        };
-        tracing::info!(
-            "Loaded {} model with LoRA adapters",
-            model.architecture_name()
-        );
-
-        // GDN (Gated Delta Networks) training resource guard: models like Qwen3.5
-        // use sequential recurrence that creates O(T * n_layers) allocation nodes.
-        // Without gradient checkpointing (custom_vjp not yet available in mlx-rs),
-        // this exceeds Metal's 499K buffer limit at seq_len > 512.
-        if model.architecture_name() == "Qwen3Next" && config.training.max_seq_len > 512 {
-            tracing::warn!(
-                "Qwen3.5 (GDN) training with max_seq_len={} may exceed Metal resource limits (499K buffers). \
-                 Recommended: --max-seq-len 512 or lower. Gradient checkpointing for GDN requires \
-                 custom_vjp which is not yet available in mlx-rs.",
-                config.training.max_seq_len
-            );
-        }
-
-        tracing::info!(
-            "Trainable parameters: {}",
-            format_param_count(model.num_trainable_params())
-        );
-
-        // Enable gradient checkpointing if requested
-        if gradient_checkpointing {
-            if model.supports_gradient_checkpointing() {
-                model.enable_gradient_checkpointing(gradient_checkpointing_layers);
-                tracing::info!(
-                    "Gradient checkpointing enabled ({} layers per block)",
-                    gradient_checkpointing_layers
-                );
-            } else {
-                tracing::warn!(
-                    "Gradient checkpointing requested but not supported by {} architecture. \
-                     This feature is currently only supported for Qwen3 models.",
-                    model.architecture_name()
-                );
-            }
-        }
-
-        // Set up distributed gradient sync if configured (before creating training
-        // loop — the async .await is not Send-compatible with TrainingLoop's Rc fields)
-        #[cfg(feature = "distributed")]
-        let distributed_sync = if let Some(ref dist_cfg) = distributed_config {
-            let ctx = pmetal_trainer::create_distributed_context(dist_cfg).await?;
-            Some(pmetal_trainer::DistributedGradientSync::new(ctx, dist_cfg))
-        } else {
-            None
-        };
-
-        // Create training loop
-        let mut training_loop = TrainingLoop::new(training_loop_config);
-
-        #[cfg(feature = "distributed")]
-        if let Some(sync) = distributed_sync {
-            training_loop.set_distributed(sync);
-        }
-
-        // Wire metrics callback into training loop for step-level dispatch
-        if let Some(cb) = metrics_callback.take() {
-            training_loop.add_callback(cb);
-        }
-        if let Some(callbacks) = extra_callbacks.take() {
-            for callback in callbacks {
-                training_loop.add_callback(callback);
-            }
-        }
-
-        // Enable adaptive LR with control file for TUI communication
-        {
-            let adaptive_config = pmetal_trainer::AdaptiveLrConfig::default();
-            let control_file = PathBuf::from(&output_dir).join(".lr_control.json");
-            training_loop.enable_adaptive_lr_with_control(adaptive_config, control_file);
-        }
-
-        // Resume from checkpoint if requested
-        if resume {
-            if let Some((lora_params, metadata)) = checkpoint_manager.load_latest()? {
-                tracing::info!("Resuming from checkpoint at step {}", metadata.step);
-                model.set_lora_parameters(&lora_params);
-                training_loop.set_step(metadata.step);
-                training_loop.set_epoch(metadata.epoch);
-            } else {
-                tracing::info!("No checkpoint found, starting fresh");
-            }
-        }
-
-        tracing::info!("Starting LoRA training...");
-
-        // Run training loop
-        // Priority: packed > fused > standard
-        if use_sequence_packing {
-            // Sequence packing for 2-5x throughput
-            let model = training_loop.run_packed(
-                model,
-                train_dataset.clone(),
-                eval_dataset.clone(),
-                Some(&checkpoint_manager),
-            )?;
-
-            progress.finish_with_message(format!("{:.4}", training_loop.current_loss()));
-
-            // Save final LoRA weights
-            let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
-            model.save_lora_weights(&final_path)?;
-            tracing::info!("Saved LoRA weights to {:?}", final_path);
-            save_adapter_config(
-                &final_path,
-                config.lora.r,
-                config.lora.alpha,
-                &config.lora.target_modules,
-                config.lora.use_rslora,
-            )?;
-        } else if (fused || use_jit_compilation) && config.training.gradient_accumulation_steps == 1
-        {
-            // Fused training step (combines forward/backward/optimizer)
-            // JIT compilation requires the fused training path for compile_with_state
-            let model = training_loop.run_compiled(
-                model,
-                train_dataset,
-                eval_dataset,
-                Some(&checkpoint_manager),
-            )?;
-
-            progress.finish_with_message(format!("{:.4}", training_loop.current_loss()));
-
-            // Save final LoRA weights
-            let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
-            model.save_lora_weights(&final_path)?;
-            tracing::info!("Saved LoRA weights to {:?}", final_path);
-            save_adapter_config(
-                &final_path,
-                config.lora.r,
-                config.lora.alpha,
-                &config.lora.target_modules,
-                config.lora.use_rslora,
-            )?;
-        } else if use_metal_fused_optimizer {
-            // Metal fused optimizer for maximum throughput
-            tracing::info!("Using Metal fused optimizer for training");
-            training_loop.run_metal_fused(
-                &mut model,
-                train_dataset,
-                eval_dataset,
-                Some(&checkpoint_manager),
-            )?;
-
-            progress.finish_with_message(format!("{:.4}", training_loop.current_loss()));
-
-            // Save final LoRA weights
-            let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
-            model.save_lora_weights(&final_path)?;
-            tracing::info!("Saved LoRA weights to {:?}", final_path);
-            save_adapter_config(
-                &final_path,
-                config.lora.r,
-                config.lora.alpha,
-                &config.lora.target_modules,
-                config.lora.use_rslora,
-            )?;
-        } else {
-            if (fused || use_jit_compilation) && config.training.gradient_accumulation_steps != 1 {
-                tracing::warn!(
-                    "Fused/JIT training requires gradient_accumulation_steps=1, falling back to standard training"
-                );
-            }
-            training_loop.run(
-                &mut model,
-                train_dataset,
-                eval_dataset,
-                Some(&checkpoint_manager),
-            )?;
-
-            progress.finish_with_message(format!("{:.4}", training_loop.current_loss()));
-
-            // Save final LoRA weights
-            let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
-            model.save_lora_weights(&final_path)?;
-            tracing::info!("Saved LoRA weights to {:?}", final_path);
-            save_adapter_config(
-                &final_path,
-                config.lora.r,
-                config.lora.alpha,
-                &config.lora.target_modules,
-                config.lora.use_rslora,
-            )?;
-        }
-
-        // Recover metrics callback from training loop for finalization
-        let mut cbs = training_loop.take_callbacks();
-        if !cbs.is_empty() && metrics_callback.is_none() {
-            metrics_callback = Some(cbs.remove(0));
-        }
-
-        (
-            training_loop.current_loss(),
-            training_loop.current_step(),
-            training_loop.total_tokens(),
-        )
-    };
-
-    // Finalize metrics callback
-    if let Some(ref mut callback) = metrics_callback {
-        // Write final epoch metrics
-        let mut custom = std::collections::HashMap::new();
-        custom.insert("total_tokens".to_string(), total_tokens as f64);
-        custom.insert("total_steps".to_string(), final_step as f64);
-        callback.on_epoch_end(
-            num_epochs.saturating_sub(1),
-            &pmetal_core::EvalMetrics {
-                loss: final_loss,
-                perplexity: final_loss.exp(),
-                accuracy: None,
-                custom,
-            },
-        );
-        callback.on_train_end();
-        if let Some(ref path) = metrics_path_resolved {
-            tracing::info!("Metrics saved to {:?}", path);
-        }
-    }
-
-    if emit_console_output {
-        println!("\n========================================");
-        println!("  Training Complete!");
-        println!("========================================");
-        println!("Final Loss:   {:.4}", final_loss);
-        println!("Total Steps:  {}", final_step);
-        println!("Total Tokens: {}", total_tokens);
-        println!("Output:       {}", output_dir);
-        println!("========================================");
-
-        println!("\nNext steps:");
-        println!(
-            "  Inference:  pmetal infer -m {} --lora {}/lora_weights.safetensors -p \"Your prompt\"",
-            config.model.model_id, output_dir
-        );
-        println!(
-            "  Quantize:   pmetal quantize -m {} --lora {}/lora_weights.safetensors -o model.gguf",
-            config.model.model_id, output_dir
-        );
-    }
-
-    Ok(())
 }
 
 /// Run inference with a model.
@@ -7777,111 +6751,15 @@ fn generate_sample_config(output: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Format parameter count with suffix (K, M, B).
+/// Delegate to orchestrator's format_param_count.
+#[allow(dead_code)]
 fn format_param_count(count: usize) -> String {
-    if count >= 1_000_000_000 {
-        format!("{:.2}B", count as f64 / 1_000_000_000.0)
-    } else if count >= 1_000_000 {
-        format!("{:.2}M", count as f64 / 1_000_000.0)
-    } else if count >= 1_000 {
-        format!("{:.2}K", count as f64 / 1_000.0)
-    } else {
-        format!("{}", count)
-    }
+    pmetal_trainer::orchestrator::format_param_count(count)
 }
 
-/// Validate and sanitize an output path to prevent path traversal attacks.
-///
-/// This function:
-/// 1. Rejects paths containing ".." components
-/// 2. Rejects absolute paths that escape the current working directory
-/// 3. Canonicalizes paths to resolve symlinks and normalize components
-///
-/// # Arguments
-/// * `path` - The path to validate
-/// * `context` - A description of what this path is for (used in error messages)
-///
-/// # Returns
-/// The validated and canonicalized path, or an error if validation fails.
+/// Delegate to orchestrator's validate_output_path.
 fn validate_output_path(path: &str, context: &str) -> anyhow::Result<PathBuf> {
-    let path = PathBuf::from(path);
-
-    // Check for explicit ".." components in the path
-    for component in path.components() {
-        if matches!(component, Component::ParentDir) {
-            anyhow::bail!(
-                "Path traversal detected in {}: '{}' contains '..' component. \
-                 Please use a path within the current directory.",
-                context,
-                path.display()
-            );
-        }
-    }
-
-    // Get the current working directory
-    let cwd = std::env::current_dir()?;
-
-    // Resolve the path
-    let resolved = if path.is_absolute() {
-        path.clone()
-    } else {
-        cwd.join(&path)
-    };
-
-    // Canonicalize after creating parent directories if needed
-    // For output paths, the directory may not exist yet
-    if let Some(parent) = resolved.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    // If the path itself exists, canonicalize it
-    // Otherwise, canonicalize the parent and append the filename
-    let canonical = if resolved.exists() {
-        resolved.canonicalize()?
-    } else if let Some(parent) = resolved.parent() {
-        let canonical_parent = parent.canonicalize()?;
-        if let Some(filename) = resolved.file_name() {
-            canonical_parent.join(filename)
-        } else {
-            canonical_parent
-        }
-    } else {
-        resolved
-    };
-
-    // Ensure the canonical path is under the current working directory
-    // or is a well-known safe location like /tmp or user home
-    let cwd_canonical = cwd.canonicalize()?;
-    let home_dir = dirs::home_dir();
-    let temp_dir = std::env::temp_dir().canonicalize().ok();
-
-    let is_safe = canonical.starts_with(&cwd_canonical)
-        || home_dir
-            .as_ref()
-            .map(|h| canonical.starts_with(h))
-            .unwrap_or(false)
-        || temp_dir
-            .as_ref()
-            .map(|t| canonical.starts_with(t))
-            .unwrap_or(false)
-        // macOS: /tmp symlinks to /private/tmp, but temp_dir() returns /var/folders/
-        || canonical.starts_with("/tmp")
-        || canonical.starts_with("/private/tmp");
-
-    if !is_safe {
-        anyhow::bail!(
-            "Unsafe output path for {}: '{}' resolves to '{}' which is outside \
-             the current directory, home directory, and temp directory. \
-             Please use a path within a safe location.",
-            context,
-            path.display(),
-            canonical.display()
-        );
-    }
-
-    Ok(canonical)
+    pmetal_trainer::orchestrator::validate_output_path(path, context)
 }
 
 /// Benchmark FFI overhead to compare Rust mlx-rs vs Python mlx performance.

@@ -12,7 +12,6 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::QuantizationMethod;
 use crate::tui::event::{AppMsg, CommandSpec, JobType};
 
 /// A currently running background job.
@@ -505,69 +504,113 @@ async fn run_training_direct(
     spec: &CommandSpec,
     cancel: CancellationToken,
 ) -> Result<(), anyhow::Error> {
+    use pmetal_trainer::orchestrator;
+
     let model = required_arg(&spec.args, "--model")?;
     let dataset = required_arg(&spec.args, "--dataset")?;
     let output = required_arg(&spec.args, "--output")?;
     let eval_dataset = optional_arg(&spec.args, "--eval-dataset");
-    let quantization = match optional_arg(&spec.args, "--quantization")
+
+    let quantization_str = optional_arg(&spec.args, "--quantization")
         .unwrap_or_else(|| "none".to_string())
-        .to_lowercase()
-        .as_str()
-    {
-        "nf4" => QuantizationMethod::Nf4,
-        "fp4" => QuantizationMethod::Fp4,
-        "int8" => QuantizationMethod::Int8,
-        _ => QuantizationMethod::None,
+        .to_lowercase();
+    let qlora = match quantization_str.as_str() {
+        "nf4" => Some(orchestrator::QLoraOrchConfig {
+            scheme: orchestrator::QuantizationScheme::Nf4,
+            block_size: 64,
+            double_quant: false,
+        }),
+        "fp4" => Some(orchestrator::QLoraOrchConfig {
+            scheme: orchestrator::QuantizationScheme::Fp4,
+            block_size: 64,
+            double_quant: false,
+        }),
+        "int8" => Some(orchestrator::QLoraOrchConfig {
+            scheme: orchestrator::QuantizationScheme::Int8,
+            block_size: 64,
+            double_quant: false,
+        }),
+        _ => None,
     };
 
-    let callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>> = vec![Box::new(CancelOnToken {
-        token: cancel.clone(),
-    })];
-
-    crate::run_training(
-        None,
-        Some(model),
-        Some(dataset),
-        eval_dataset,
-        output,
-        parse_arg(&spec.args, "--lora-r", 16usize)?,
-        parse_arg(&spec.args, "--lora-alpha", 32.0f32)?,
-        parse_arg(&spec.args, "--learning-rate", 2e-4f64)?,
-        parse_arg(&spec.args, "--batch-size", 1usize)?,
-        parse_arg(&spec.args, "--epochs", 1usize)?,
-        parse_arg(&spec.args, "--max-seq-len", 2048usize)?,
-        parse_arg(&spec.args, "--gradient-accumulation-steps", 4usize)?,
-        !has_flag(&spec.args, "--no-flash-attention"),
-        parse_arg(&spec.args, "--max-grad-norm", 1.0f64)?,
-        false,
-        quantization,
-        64,
-        false,
-        true,
-        !has_flag(&spec.args, "--no-metal-fused-optimizer"),
-        !has_flag(&spec.args, "--no-sequence-packing"),
-        !has_flag(&spec.args, "--no-jit-compilation"),
-        true,
-        4,
-        spec.metrics_file.as_ref().map(|p| p.display().to_string()),
-        false,
-        callbacks,
-        None,
-        parse_arg(&spec.args, "--warmup-steps", 0usize)?,
-        &optional_arg(&spec.args, "--lr-schedule").unwrap_or_else(|| "cosine".to_string()),
-        parse_arg(&spec.args, "--weight-decay", 0.01f64)?,
-        parse_arg(&spec.args, "--seed", 42u64)?,
-        has_flag(&spec.args, "--cut-cross-entropy"),
-        !has_flag(&spec.args, "--no-ane"),
-        None, // distributed_config
+    // Build column config
+    let columns = crate::build_column_config(
         optional_arg(&spec.args, "--text-column"),
         optional_arg(&spec.args, "--text-columns")
             .map(|s| s.split(',').map(str::to_string).collect()),
         optional_arg(&spec.args, "--column-separator").unwrap_or_else(|| "\n\n".to_string()),
         optional_arg(&spec.args, "--prompt-column"),
         optional_arg(&spec.args, "--response-column"),
-    )
-    .await
+    );
+
+    let callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>> = vec![Box::new(CancelOnToken {
+        token: cancel.clone(),
+    })];
+
+    let job_config = orchestrator::TrainingJobConfig {
+        model_id: model,
+        dataset,
+        eval_dataset,
+        output_dir: output,
+        lora: pmetal_core::LoraConfig {
+            r: parse_arg(&spec.args, "--lora-r", 16usize)?,
+            alpha: parse_arg(&spec.args, "--lora-alpha", 32.0f32)?,
+            ..Default::default()
+        },
+        qlora,
+        training: pmetal_core::TrainingConfig {
+            learning_rate: parse_arg(&spec.args, "--learning-rate", 2e-4f64)?,
+            batch_size: parse_arg(&spec.args, "--batch-size", 1usize)?,
+            num_epochs: parse_arg(&spec.args, "--epochs", 1usize)?,
+            max_seq_len: parse_arg(&spec.args, "--max-seq-len", 2048usize)?,
+            gradient_accumulation_steps: parse_arg(
+                &spec.args,
+                "--gradient-accumulation-steps",
+                4usize,
+            )?,
+            max_grad_norm: parse_arg(&spec.args, "--max-grad-norm", 1.0f64)?,
+            warmup_steps: parse_arg(&spec.args, "--warmup-steps", 0usize)?,
+            weight_decay: parse_arg(&spec.args, "--weight-decay", 0.01f64)?,
+            seed: parse_arg(&spec.args, "--seed", 42u64)?,
+            embedding_learning_rate: optional_arg(&spec.args, "--embedding-lr")
+                .and_then(|s| s.parse::<f64>().ok()),
+            lr_scheduler: match optional_arg(&spec.args, "--lr-schedule")
+                .unwrap_or_else(|| "cosine".to_string())
+                .to_lowercase()
+                .as_str()
+            {
+                "constant" => pmetal_core::LrSchedulerType::Constant,
+                "linear" => pmetal_core::LrSchedulerType::Linear,
+                "cosine_with_restarts" => pmetal_core::LrSchedulerType::CosineWithRestarts,
+                "polynomial" => pmetal_core::LrSchedulerType::Polynomial,
+                "wsd" => pmetal_core::LrSchedulerType::Wsd,
+                _ => pmetal_core::LrSchedulerType::Cosine,
+            },
+            ..Default::default()
+        },
+        columns,
+        dispatch: orchestrator::DispatchConfig {
+            flash_attention: !has_flag(&spec.args, "--no-flash-attention"),
+            sequence_packing: !has_flag(&spec.args, "--no-sequence-packing"),
+            jit_compilation: !has_flag(&spec.args, "--no-jit-compilation"),
+            fused: true,
+            metal_fused_optimizer: !has_flag(&spec.args, "--no-metal-fused-optimizer"),
+            gradient_checkpointing: true,
+            gradient_checkpointing_layers: 4,
+            cut_cross_entropy: has_flag(&spec.args, "--cut-cross-entropy"),
+            ane: !has_flag(&spec.args, "--no-ane"),
+            #[cfg(feature = "distributed")]
+            distributed: None,
+        },
+        config_path: None,
+        log_metrics: spec.metrics_file.as_ref().map(|p| p.display().to_string()),
+        resume: false,
+        seed: parse_arg(&spec.args, "--seed", 42u64)?,
+        emit_console_output: false,
+    };
+
+    orchestrator::run_training(job_config, None, callbacks).await?;
+    Ok(())
 }
 
 async fn run_distillation_direct(

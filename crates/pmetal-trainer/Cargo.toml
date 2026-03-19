@@ -10,10 +10,11 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["ane"]
+default = ["ane", "hub"]
 tensorboard = ["dep:tensorboard-rs"]
 ane = ["pmetal-metal/ane", "pmetal-core/ane"]
-distributed = ["dep:pmetal-distributed", "dep:tokio"]
+hub = ["dep:pmetal-hub"]
+distributed = ["dep:pmetal-distributed"]
 
 [dependencies]
 pmetal-core = { workspace = true }
@@ -24,6 +25,7 @@ pmetal-models = { workspace = true }
 pmetal-distill = { workspace = true }
 pmetal-metal = { workspace = true }
 pmetal-distributed = { workspace = true, optional = true }
+pmetal-hub = { workspace = true, optional = true }
 mlx-rs = { workspace = true }
 mlx-sys = { workspace = true }
 rand = { workspace = true }
@@ -32,8 +34,13 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 indicatif = { workspace = true }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true }
 chrono = "0.4"
+dirs = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
 image = "0.25"
 
 # Optional: TensorBoard logging
