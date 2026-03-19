@@ -7,7 +7,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! pmetal = "0.3"           # default features: core, gguf, metal, hub, mlx, models, lora, trainer, easy, ane
+//! pmetal = "0.3"           # default features: core, gguf, metal, hub, mlx, models, lora, trainer, ane
 //! pmetal = { version = "0.3", features = ["full"] }  # everything
 //! ```
 //!
@@ -18,14 +18,13 @@
 //! | `core` | [`pmetal-core`] | yes | Foundation types, configs, traits |
 //! | `gguf` | [`pmetal-gguf`] | yes | GGUF format support |
 //! | `metal` | [`pmetal-metal`] | yes | Metal GPU kernels |
-//! | `hub` | [`pmetal-hub`] | yes | HuggingFace Hub integration |
+//! | `hub` | [`pmetal-hub`] | yes | HuggingFace Hub integration + model resolution |
 //! | `mlx` | [`pmetal-mlx`] | yes | MLX backend |
 //! | `models` | [`pmetal-models`] | yes | LLM architectures |
 //! | `lora` | [`pmetal-lora`] | yes | LoRA/QLoRA training |
 //! | `trainer` | [`pmetal-trainer`] | yes | Training loops (enables `data` + `distill`) |
-//! | `easy` | (multiple) | yes | High-level builders (enables `trainer` + `hub` + `data`) |
 //! | `ane` | [`pmetal-metal`] | yes | Apple Neural Engine integration |
-//! | `data` | [`pmetal-data`] | yes* | Dataset loading (*enabled transitively via `easy`) |
+//! | `data` | [`pmetal-data`] | yes | Dataset loading |
 //! | `distill` | [`pmetal-distill`] | yes* | Knowledge distillation (*enabled transitively via `trainer`) |
 //! | `lora-metal-fused` | [`pmetal-lora`] | no | ~2x LoRA training speedup via fused Metal kernels |
 //! | `merge` | [`pmetal-merge`] | no | Model merging strategies |
@@ -34,34 +33,35 @@
 //! | `mhc` | [`pmetal-mhc`] | no | Manifold-Constrained Hyper-Connections |
 //! | `full` | (all) | no | All features |
 //!
-//! ## Easy API
+//! ## Direct SDK Usage
 //!
-//! The [`easy`] module provides high-level builders for common workflows:
+//! Use the sub-crate APIs directly for full control:
 //!
 //! ```rust,no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Fine-tune a model in one call
-//! let result = pmetal::easy::finetune("Qwen/Qwen3-0.6B", "data.jsonl")
-//!     .lora(16, 32.0)
-//!     .epochs(3)
-//!     .learning_rate(2e-4)
-//!     .output("./output")
-//!     .run()
-//!     .await?;
+//! use pmetal::hub::resolve_model_path;
+//! use pmetal::data::{Tokenizer, chat_templates::{detect_chat_template, Message}};
+//! use pmetal::models::{DynamicModel, GenerationConfig, generate_cached_async};
 //!
-//! // Run inference
-//! let result = pmetal::easy::infer("Qwen/Qwen3-0.6B")
-//!     .lora("./output/lora_weights.safetensors")
-//!     .generate("What is 2+2?")
-//!     .await?;
+//! let model_path = resolve_model_path("Qwen/Qwen3-0.6B").await?;
+//! let tokenizer = Tokenizer::from_model_dir(&model_path)?;
+//! let template = detect_chat_template(&model_path, "Qwen/Qwen3-0.6B");
+//! let formatted = template.apply(&[Message::user("What is 2+2?")]).text;
+//! let input_ids = tokenizer.encode_with_special_tokens(&formatted)?;
+//!
+//! let mut model = DynamicModel::load(&model_path)?;
+//! let mut cache = model.create_cache(input_ids.len() + 256);
+//! let gen_config = GenerationConfig::sampling(256, 0.7);
+//! let output = generate_cached_async(
+//!     |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), None),
+//!     &input_ids, gen_config, &mut cache,
+//! )?;
+//! let text = tokenizer.decode(&output.token_ids[input_ids.len()..])?;
 //! # Ok(())
 //! # }
 //! ```
 
 pub mod version;
-
-#[cfg(feature = "easy")]
-pub mod easy;
 
 // NOTE: `core` below shadows the Rust built-in `core` crate within this file.
 // Any code added here that needs `core::fmt`, `core::mem`, etc. must use `::core::`.
@@ -159,7 +159,7 @@ pub mod prelude {
 
     // Hub functions
     #[cfg(feature = "hub")]
-    pub use pmetal_hub::{download_file, download_model};
+    pub use pmetal_hub::{download_file, download_model, resolve_model_path};
 
     // Callback types (defined in core, but only useful with trainer)
     #[cfg(feature = "core")]

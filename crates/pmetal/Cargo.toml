@@ -10,7 +10,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["core", "gguf", "metal", "hub", "mlx", "models", "lora", "trainer", "easy", "ane"]
+default = ["core", "gguf", "metal", "hub", "mlx", "models", "lora", "data", "trainer", "ane"]
 
 # Foundation crates (no mlx-rs dependency)
 core = ["dep:pmetal-core"]
@@ -32,9 +32,6 @@ distill = ["dep:pmetal-distill", "core", "mlx", "metal"]
 merge = ["dep:pmetal-merge", "core", "mlx"]
 vocoder = ["dep:pmetal-vocoder", "core", "mlx"]
 
-# Easy API: high-level builders for fine-tuning and inference
-easy = ["trainer", "hub", "data", "models", "lora", "dep:tokio"]
-
 # ANE: Apple Neural Engine direct programming
 ane = ["metal", "pmetal-metal/ane", "pmetal-core/ane"]
 
@@ -42,7 +39,7 @@ ane = ["metal", "pmetal-metal/ane", "pmetal-core/ane"]
 full = [
     "core", "gguf", "metal", "hub", "distributed", "mhc",
     "mlx", "models", "lora", "data", "trainer",
-    "distill", "merge", "vocoder", "easy", "ane",
+    "distill", "merge", "vocoder", "ane",
 ]
 
 [dependencies]
@@ -60,27 +57,27 @@ pmetal-trainer = { workspace = true, optional = true }
 pmetal-distill = { workspace = true, optional = true }
 pmetal-merge = { workspace = true, optional = true }
 pmetal-vocoder = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
 mlx-rs = { workspace = true, optional = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
 
 [[example]]
 name = "device_info"
 path = "examples/device_info.rs"
 
 [[example]]
-name = "finetune_easy"
-path = "examples/finetune_easy.rs"
-required-features = ["easy"]
+name = "inference"
+path = "examples/inference.rs"
+required-features = ["hub", "data", "models"]
 
 [[example]]
-name = "inference_easy"
-path = "examples/inference_easy.rs"
-required-features = ["easy"]
+name = "inference_ane"
+path = "examples/inference_ane.rs"
+required-features = ["hub", "data", "models", "ane"]
 
 [[example]]
 name = "finetune_manual"
