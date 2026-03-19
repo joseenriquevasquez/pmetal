@@ -790,7 +790,7 @@
               </div>
               <div>
                 <label class="label" for="output-dir">Output Directory</label>
-                <input id="output-dir" type="text" class="input" placeholder="Auto: ~/pmetal-output/{model}-{method}-{date}" bind:value={outputDir} />
+                <input id="output-dir" type="text" class="input" placeholder="Auto: ~/pmetal-output/model-method-YYYYMMDD" bind:value={outputDir} />
               </div>
             </div>
 

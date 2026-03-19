@@ -4,7 +4,6 @@ use std::sync::Arc;
 use chrono::Utc;
 use mlx_rs::builder::Builder as _;
 use mlx_rs::ops;
-use pmetal::easy;
 use pmetal::prelude::TrainingCallback;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
@@ -1437,6 +1436,182 @@ pub async fn stop_grpo(state: State<'_, AppState>, run_id: String) -> Result<()>
 }
 
 // ---------------------------------------------------------------------------
+// Inference helpers
+// ---------------------------------------------------------------------------
+
+/// Run streaming inference — mirrors the logic from the former `easy::infer().generate_streaming()`.
+///
+/// Kept as a standalone async fn (not an inline async block) to match the
+/// memory layout and lifetime behaviour of the v0.3.10 `InferBuilder` method.
+async fn run_inference_streaming(
+    config: &InferenceConfig,
+    cancel_flag: &std::sync::atomic::AtomicBool,
+    app_handle: &AppHandle,
+) -> std::result::Result<(), String> {
+    use pmetal::core::LoraConfig;
+    use pmetal::data::chat_templates::{Message, detect_chat_template};
+    use pmetal::data::Tokenizer;
+    use pmetal::hub::resolve_model_path;
+    use pmetal::lora::{DynamicLoraModel, TrainableModel as _};
+    use pmetal::models::{DynamicModel, GenerationConfig, generate_cached_async_streaming};
+
+    // 1. Resolve model path (downloads from HF if needed)
+    let model_path = resolve_model_path(&config.model)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 2. Load tokenizer
+    let tokenizer = Tokenizer::from_model_dir(&model_path)
+        .map_err(|e| format!("Failed to load tokenizer: {e}"))?;
+
+    // 3. Apply chat template
+    let template = detect_chat_template(&model_path, &config.model);
+    let mut msgs = Vec::new();
+    if let Some(ref sys) = config.system_message {
+        if !sys.is_empty() {
+            msgs.push(Message::system(sys));
+        }
+    }
+    msgs.push(Message::user(&config.prompt));
+    let formatted = template.apply(&msgs).text;
+
+    // 4. Encode (special-token-aware for chat template tokens)
+    let input_ids = tokenizer
+        .encode_with_special_tokens(&formatted)
+        .map_err(|e| e.to_string())?;
+
+    // 5. Generation config — use model defaults as fallback, user overrides take precedence
+    let defaults = pmetal::data::inference_config::load_sampling_defaults(&model_path, false);
+    let max_tokens = config.max_tokens.unwrap_or(1024) as usize;
+    let temp = config.temperature.unwrap_or(defaults.temperature);
+    let mut gen_config = if temp < 1e-6 {
+        GenerationConfig::greedy(max_tokens)
+    } else {
+        GenerationConfig::sampling(max_tokens, temp)
+            .with_top_k(config.top_k.unwrap_or(defaults.top_k as u32) as usize)
+            .with_top_p(config.top_p.unwrap_or(defaults.top_p))
+            .with_min_p(defaults.min_p)
+            .with_repetition_penalty(config.repetition_penalty.unwrap_or(defaults.repetition_penalty))
+    };
+
+    // Collect ALL stop tokens (generation_config.json array, chat template EOS,
+    // tokenizer EOS, well-known special tokens) — critical for multi-EOS models like Qwen3
+    let stop_tokens = pmetal::data::inference_config::collect_all_stop_tokens(
+        &model_path,
+        &tokenizer,
+        Some(template.template_type),
+    );
+    gen_config = gen_config.with_stop_tokens(stop_tokens);
+
+    let max_seq_len = input_ids.len() + max_tokens + 64;
+
+    // 6. Branch: LoRA or standard inference
+    if let Some(ref lora_path) = config.lora_path {
+        // --- LoRA inference ---
+        let lora_dir = std::path::Path::new(lora_path.as_str());
+        let adapter_dir = if lora_dir.is_dir() {
+            lora_dir
+        } else {
+            lora_dir.parent().unwrap_or(lora_dir)
+        };
+        let lora_config =
+            if let Ok(cfg_str) = std::fs::read_to_string(adapter_dir.join("adapter_config.json")) {
+                if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
+                    let r = cfg["r"].as_u64().unwrap_or(16) as usize;
+                    let alpha = cfg["alpha"]
+                        .as_f64()
+                        .or_else(|| cfg["lora_alpha"].as_f64())
+                        .unwrap_or(32.0) as f32;
+                    LoraConfig {
+                        r,
+                        alpha,
+                        ..LoraConfig::default()
+                    }
+                } else {
+                    LoraConfig::default()
+                }
+            } else {
+                LoraConfig::default()
+            };
+
+        let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config)
+            .map_err(|e| e.to_string())?;
+        model
+            .load_lora_weights(lora_path)
+            .map_err(|e| e.to_string())?;
+
+        let mut cache = model
+            .create_cache(max_seq_len)
+            .ok_or_else(|| "Model does not support KV cache".to_string())?;
+        let mut token_buf: Vec<u32> = Vec::new();
+        let mut streamed_text = String::new();
+
+        let _ = generate_cached_async_streaming(
+            |input, cache| {
+                model
+                    .forward_with_cache(input, None, Some(cache))
+                    .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
+            },
+            &input_ids,
+            gen_config,
+            &mut cache,
+            |token_id| {
+                token_buf.push(token_id);
+                if let Ok(text) = tokenizer.decode(&token_buf) {
+                    if text.len() > streamed_text.len() {
+                        let delta = &text[streamed_text.len()..];
+                        if !delta.is_empty() {
+                            if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                                return false;
+                            }
+                            let _ = app_handle.emit("inference-token", delta);
+                        }
+                    }
+                    streamed_text = text;
+                }
+                true
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        // --- Standard inference (supports hybrid models with mamba cache) ---
+        let mut model = DynamicModel::load(&model_path).map_err(|e| e.to_string())?;
+        let mut cache = model.create_cache(max_seq_len);
+        let mut mamba_cache = model.create_mamba_cache();
+        let mut token_buf: Vec<u32> = Vec::new();
+        let mut streamed_text = String::new();
+
+        let _ = generate_cached_async_streaming(
+            |input, cache| {
+                model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
+            },
+            &input_ids,
+            gen_config,
+            &mut cache,
+            |token_id| {
+                token_buf.push(token_id);
+                if let Ok(text) = tokenizer.decode(&token_buf) {
+                    if text.len() > streamed_text.len() {
+                        let delta = &text[streamed_text.len()..];
+                        if !delta.is_empty() {
+                            if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                                return false;
+                            }
+                            let _ = app_handle.emit("inference-token", delta);
+                        }
+                    }
+                    streamed_text = text;
+                }
+                true
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Inference commands
 // ---------------------------------------------------------------------------
 
@@ -1457,40 +1632,21 @@ pub async fn start_inference(
         .insert(session_id.clone(), cancel_flag.clone());
 
     tokio::spawn(async move {
-        let mut builder = easy::infer(config.model.clone())
-            .gpu() // Use Metal GPU for streaming token-by-token output
-            .temperature(config.temperature.unwrap_or(0.7))
-            .max_tokens(config.max_tokens.unwrap_or(1024) as usize)
-            .top_k(config.top_k.unwrap_or(50) as usize)
-            .top_p(config.top_p.unwrap_or(0.9))
-            .repetition_penalty(config.repetition_penalty.unwrap_or(1.0));
-
-        if let Some(ref lora) = config.lora_path {
-            builder = builder.lora(lora.clone());
-        }
-
-        if let Some(ref system) = config.system_message {
-            if !system.is_empty() {
-                builder = builder.system_message(system.clone());
-            }
-        }
-
-        let result = builder.generate_streaming(&config.prompt, |delta| {
-            if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                return false;
-            }
-            let _ = app_handle.emit("inference-token", delta);
-            true
-        }).await;
+        let result = run_inference_streaming(
+            &config,
+            &cancel_flag,
+            &app_handle,
+        )
+        .await;
 
         match result {
-            Ok(_) => {
+            Ok(()) => {
                 let _ = app_handle.emit("inference-done", ());
             }
             Err(e) => {
                 let _ = app_handle.emit(
                     "inference-error",
-                    serde_json::json!({ "session_id": session_id_task, "error": e.to_string() }),
+                    serde_json::json!({ "session_id": session_id_task, "error": e }),
                 );
             }
         }
