@@ -757,6 +757,10 @@ fn run_qlora_path(
     tracing::info!("Starting QLoRA training...");
     emit_phase(phase_cb, TrainingPhase::Training);
 
+    for cb in &mut training_loop.callbacks {
+        cb.on_train_start();
+    }
+
     if config.dispatch.fused {
         tracing::warn!("Fused training is not yet supported for QLoRA, using standard training");
     }
@@ -895,6 +899,11 @@ fn run_lora_path(
 
     tracing::info!("Starting LoRA training...");
     emit_phase(phase_cb, TrainingPhase::Training);
+
+    // Notify all callbacks that training is starting (TrainingLoop doesn't do this)
+    for cb in &mut training_loop.callbacks {
+        cb.on_train_start();
+    }
 
     // Dispatch: packed > compiled > metal-fused > standard
     if config.dispatch.sequence_packing {
