@@ -1398,17 +1398,58 @@ async fn resolve_dataset(dataset_id: &str) -> anyhow::Result<PathBuf> {
             {
                 tracing::info!("Downloading dataset from HuggingFace: {}", id);
                 let dir = pmetal_hub::download_dataset(&id, None, None, None).await?;
+                // Try JSONL/JSON/CSV first
                 let resolved = TrainingDataset::resolve_dataset_path_pub(&dir);
                 if let Ok(p) = resolved {
-                    Ok(p)
-                } else {
-                    let parquet_paths =
-                        pmetal_hub::download_dataset_parquet(&id, "train", None, None).await?;
-                    if parquet_paths.is_empty() {
-                        anyhow::bail!("No JSONL or Parquet files found for dataset {}", id);
-                    }
-                    Ok(parquet_paths[0].clone())
+                    return Ok(p);
                 }
+                // Check for parquet files in the cached directory (no network call)
+                let mut parquet_files: Vec<_> = std::fs::read_dir(&dir)?
+                    .filter_map(|e| e.ok())
+                    .flat_map(|e| {
+                        let p = e.path();
+                        if p.is_dir() {
+                            // Recurse one level (e.g. default/train/)
+                            std::fs::read_dir(&p)
+                                .ok()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|e2| e2.ok())
+                                .flat_map(|e2| {
+                                    let p2 = e2.path();
+                                    if p2.is_dir() {
+                                        std::fs::read_dir(&p2)
+                                            .ok()
+                                            .into_iter()
+                                            .flatten()
+                                            .filter_map(|e3| e3.ok())
+                                            .map(|e3| e3.path())
+                                            .collect::<Vec<_>>()
+                                    } else {
+                                        vec![p2]
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            vec![p]
+                        }
+                    })
+                    .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+                    .collect();
+                parquet_files.sort();
+
+                if let Some(pf) = parquet_files.into_iter().next() {
+                    tracing::info!("Found parquet in cache: {}", pf.display());
+                    return Ok(pf);
+                }
+
+                // Last resort: download parquet from HF API (network call)
+                let parquet_paths =
+                    pmetal_hub::download_dataset_parquet(&id, "train", None, None).await?;
+                if parquet_paths.is_empty() {
+                    anyhow::bail!("No JSONL or Parquet files found for dataset {}", id);
+                }
+                Ok(parquet_paths[0].clone())
             }
             #[cfg(not(feature = "hub"))]
             {
