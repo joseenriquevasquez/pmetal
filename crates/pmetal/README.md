@@ -70,7 +70,7 @@ fn main() {
 | `mlx` | `pmetal-mlx` | yes | MLX backend (KV cache, RoPE, ops) |
 | `models` | `pmetal-models` | yes | LLM architectures (Llama, Qwen, DeepSeek, ...) |
 | `lora` | `pmetal-lora` | yes | LoRA/QLoRA training |
-| `trainer` | `pmetal-trainer` | yes | Training loops (SFT, DPO, SimPO, ORPO, KTO, GRPO, DAPO, PPO, GSPO, Online DPO, Diffusion) — enables `data` + `distill` |
+| `trainer` | `pmetal-trainer` | yes | Training loops (SFT, DPO, SimPO, ORPO, KTO, GRPO, DAPO, RLKD, Embedding, PPO, GSPO, Online DPO, Diffusion) — enables `data` + `distill` |
 | `easy` | (multiple) | yes | High-level builder API — enables `trainer` + `hub` + `data` |
 | `ane` | `pmetal-metal` | yes | Apple Neural Engine direct programming |
 | `data` | `pmetal-data` | yes* | Dataset loading and preprocessing (*enabled via `easy`/`trainer`) |

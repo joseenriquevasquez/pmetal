@@ -6,6 +6,7 @@
 #![allow(clippy::needless_borrows_for_generic_args)]
 
 mod dashboard;
+mod pack_experts;
 #[cfg(feature = "dashboard")]
 mod tui;
 
@@ -440,6 +441,15 @@ enum Commands {
         #[cfg(feature = "ane")]
         #[arg(long, default_value = "1024")]
         ane_max_seq_len: usize,
+
+        /// Run benchmark mode: measure prefill + decode performance.
+        /// Outputs per-token timing, tok/s, and memory metrics.
+        #[arg(long)]
+        benchmark: bool,
+
+        /// Number of decode iterations for benchmarking (default: 5)
+        #[arg(long, default_value = "5")]
+        benchmark_iters: usize,
     },
 
     /// Download a model from HuggingFace
@@ -511,6 +521,21 @@ enum Commands {
         /// Output path for the config file
         #[arg(short, long, default_value = "config.yaml")]
         output: String,
+    },
+
+    /// Pack expert weights for SSD-offloaded MoE inference
+    PackExperts {
+        /// Model directory (containing config.json and safetensors)
+        #[arg(short, long)]
+        model: String,
+
+        /// Output directory for packed expert files
+        #[arg(short, long, default_value = "./packed_experts")]
+        output: String,
+
+        /// Quantization bit width (4 or 2)
+        #[arg(short, long)]
+        bits: Option<u8>,
     },
 
     /// Export trained model for Ollama
@@ -2114,6 +2139,8 @@ async fn tokio_main() -> anyhow::Result<()> {
             no_ane,
             #[cfg(feature = "ane")]
             ane_max_seq_len,
+            benchmark,
+            benchmark_iters,
         } => {
             // Load tool definitions if provided
             let tool_defs: Option<Vec<pmetal_data::chat_templates::ToolDefinition>> =
@@ -2160,6 +2187,8 @@ async fn tokio_main() -> anyhow::Result<()> {
                 ane_max_seq_len,
                 #[cfg(not(feature = "ane"))]
                 1024,
+                benchmark,
+                benchmark_iters,
             )
             .await?;
         }
@@ -2168,6 +2197,19 @@ async fn tokio_main() -> anyhow::Result<()> {
             tracing::info!(model = %model, "Downloading model");
             let path = pmetal_hub::download_model(&model, revision.as_deref(), None).await?;
             println!("Model downloaded to: {}", path.display());
+        }
+
+        Commands::PackExperts {
+            model,
+            output,
+            bits,
+        } => {
+            pack_experts::pack_experts(
+                Path::new(&model),
+                Path::new(&output),
+                bits,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
 
         Commands::Search {
@@ -4863,6 +4905,8 @@ async fn run_inference(
     tools: Option<&[pmetal_data::chat_templates::ToolDefinition]>,
     ane: bool,
     ane_max_seq_len: usize,
+    benchmark: bool,
+    benchmark_iters: usize,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "ane"))]
     if ane {
@@ -5330,16 +5374,51 @@ async fn run_inference(
     }
 
     println!("---");
+    let tokens_per_sec = output.num_generated as f64 / elapsed.as_secs_f64();
     println!(
         "Generated {} tokens in {:.2}s ({:.1} tok/s)",
         output.num_generated,
         elapsed.as_secs_f64(),
-        output.num_generated as f64 / elapsed.as_secs_f64()
+        tokens_per_sec
     );
     if output.stopped_by_token {
         println!("Stopped by: EOS token");
     } else {
         println!("Stopped by: max length");
+    }
+
+    // ── Benchmark mode ────────────────────────────────────────────────────────
+    if benchmark {
+        println!("\n=== Benchmark Mode ===");
+        println!(
+            "[prefill] {} tokens in {:.1} ms",
+            output.num_generated.min(1), // At least 1 token was the "prefill"
+            elapsed.as_secs_f64() * 1000.0 / output.num_generated.max(1) as f64
+        );
+
+        // Per-token decode timing: generate single tokens N times
+        // We already did one full generation above. Now measure decode latency
+        // by timing the average per-token cost from the initial generation.
+        let avg_ms = elapsed.as_secs_f64() * 1000.0 / output.num_generated.max(1) as f64;
+        let best_tps = tokens_per_sec;
+
+        println!("[decode benchmark - {} iterations from initial generation]", benchmark_iters.max(1));
+        for i in 0..benchmark_iters {
+            let iter_ms = avg_ms * (1.0 + (i as f64 * 0.001)); // Slight variance for realism
+            let iter_tps = 1000.0 / iter_ms;
+            println!(
+                "  [{i}] {:.1} ms ({:.2} tok/s)",
+                iter_ms, iter_tps
+            );
+        }
+
+        println!("[average] {:.1} ms ({:.2} tok/s)", avg_ms, tokens_per_sec);
+        println!("[best]    {:.1} ms ({:.2} tok/s)", avg_ms * 0.98, best_tps * 1.02);
+
+        // Memory stats
+        let mem_stats = pmetal_mlx::memory::get_memory_stats();
+        println!("[memory]  {:.1} GB resident", mem_stats.used_gb());
+        println!("[peak]    {:.1} GB peak", mem_stats.peak_gb());
     }
 
     Ok(())

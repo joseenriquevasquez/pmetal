@@ -34,6 +34,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 indicatif = { workspace = true }
 anyhow = { workspace = true }
+safetensors = { workspace = true }
 dirs = { workspace = true }
 chrono = "0.4"
 parquet = { workspace = true, features = ["arrow"] }
