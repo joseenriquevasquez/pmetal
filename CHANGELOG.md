@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fused MoE Metal kernels** (`fused_moe.metal`, `fused_moe.rs`): High-performance fused MoE implementation that handles expert selection, dequantization, and computation in a single pass. Substantial improvement in token-per-second throughput for large MoE models like Qwen3Next and DeepSeek-V3
+- **Expert Management infrastructure** (`expert_io.rs`, `expert_prefetch.rs`, `expert_layout.rs`): Specialized infrastructure for asynchronous expert prefetching and zero-copy loading from unified memory. Overlaps I/O with computation to hide loading latency
+- **DeepSeek-V3 style routing** (`MoERouter`): Added auxiliary-loss-free load balancing via dynamic routing bias. Equalizes expert load without the performance penalty of traditional Switch Transformer auxiliary losses
+- **`pmetal pack-experts` CLI command**: New subcommand for preprocessing raw expert weights into optimized layouts for the fused MoE kernels
 - **`pmetal-data::inference_config` module**: `load_sampling_defaults()` and `collect_all_stop_tokens()` extracted from the CLI and easy API into a shared module consumed by the CLI, GUI Tauri backend, and Python bindings. Eliminates duplicated stop-token and sampling-default logic across three call sites
 - **`pmetal-hub::resolve` module**: `resolve_model_path()` exposed as a public re-export, shared by the trainer orchestrator, Python bindings, and Tauri commands without duplicating the download-or-local-path logic
 - **`pmetal-trainer::preference_data` module**: Preference dataset handling for DPO/RLKD training workflows; `resolve_dataset_path()` made public and re-exported from `lib.rs`
