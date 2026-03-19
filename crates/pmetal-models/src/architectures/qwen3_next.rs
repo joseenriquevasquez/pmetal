@@ -961,13 +961,161 @@ impl Qwen3NextSparseMoeBlock {
     /// Offloaded forward pass: routes to top-k experts whose weights are read
     /// on-demand from the packed SSD file for this layer.
     ///
-    /// Returns an explicit error until the full dequant pipeline is wired
-    /// (expert_dequant.rs + FusedMoeExpert integration).
-    fn forward_offloaded(&mut self, _x: &Array) -> Result<Array, Exception> {
-        Err(Exception::custom(
-            "Expert offloading kernel integration not yet complete. \
-             Use --no-offload or wait for the full pipeline."
-        ))
+    /// Offloaded forward pass: routes to top-k experts whose weights are
+    /// read on-demand from packed SSD files and dispatched to Metal kernels.
+    ///
+    /// Data flow: route → pread K experts → parse → GPU forward → combine
+    fn forward_offloaded(&mut self, x: &Array) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
+        let hidden = shape[shape.len() - 1];
+        let x_flat = x.reshape(&[batch_seq, hidden])?;
+
+        // ---- Routing (identical to resident path) ----
+        let gate_logits = self.gate.forward(&x_flat)?;
+        let gates = ops::softmax_axis(
+            &if gate_logits.dtype() != mlx_rs::Dtype::Float32 {
+                gate_logits.as_type::<f32>()?
+            } else {
+                gate_logits
+            },
+            -1,
+            None,
+        )?;
+
+        let k = self.top_k;
+        let neg_gates = gates.negative()?;
+        let neg_k = -k;
+        let part_indices = ops::argpartition_axis(&neg_gates, neg_k, -1)?;
+        let top_indices = part_indices.index((.., neg_k..));
+        let top_weights = gates.take_along_axis(&top_indices, -1)?;
+
+        let top_weights = if self.norm_topk_prob {
+            let weight_sum = top_weights.sum_axis(-1, Some(true))?;
+            let safe_sum = ops::maximum(&weight_sum, &Array::from_f32(1e-8))?;
+            top_weights.divide(&safe_sum)?
+        } else {
+            top_weights
+        };
+
+        // ---- Extract expert indices to CPU ----
+        let top_indices_i32 = top_indices.as_type::<i32>()?;
+        top_indices_i32.eval()?;
+        let flat_indices: Vec<i32> = top_indices_i32.as_slice().to_vec();
+        let expert_indices: Vec<usize> = flat_indices.iter().map(|&i| i as usize).collect();
+
+        // ---- Load expert weights from SSD ----
+        let ctx = self.offload_ctx.as_ref().unwrap().clone();
+        let layer_idx = self.layer_idx;
+
+        #[cfg(not(unix))]
+        return Err(Exception::custom(
+            "expert offloading requires a Unix platform (pread is not available)",
+        ));
+
+        #[cfg(unix)]
+        {
+            let expert_bufs = ctx
+                .read_experts(layer_idx, &expert_indices)
+                .map_err(|e| Exception::custom(format!("expert pread layer {layer_idx}: {e}")))?;
+
+            // ---- Parse + forward each expert via Metal dequant kernels ----
+            let metal_ctx = pmetal_metal::context::MetalContext::global()
+                .map_err(|e| Exception::custom(e.to_string()))?;
+
+            let record = &ctx.layout.record;
+            let bits = match ctx.layout.bits {
+                crate::expert_layout::PackedBits::Four => pmetal_metal::ExpertBits::Four,
+                crate::expert_layout::PackedBits::Two => pmetal_metal::ExpertBits::Two,
+            };
+
+            let fused_expert = pmetal_metal::FusedMoeExpert::new(
+                metal_ctx.clone(),
+                pmetal_metal::FusedMoeExpertConfig {
+                    hidden_dim: ctx.layout.hidden_dim as u32,
+                    intermediate_dim: ctx.layout.intermediate_dim as u32,
+                    group_size: ctx.layout.group_size as u32,
+                    bits,
+                },
+            )
+            .map_err(|e| Exception::custom(e.to_string()))?;
+
+            // Allocate scratch buffers for expert forward
+            let expert_intermediate = pmetal_metal::MetalBuffer::<f32>::new(
+                &metal_ctx,
+                ctx.layout.intermediate_dim,
+                pmetal_metal::BufferUsage::Shared,
+            )
+            .map_err(|e| Exception::custom(e.to_string()))?;
+
+            // x_flat to Metal buffer (tiny for T=1 decode)
+            let x_flat_f32 = x_flat.as_type::<f32>()?;
+            x_flat_f32.eval()?;
+            let input_buf = pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(&metal_ctx, &x_flat_f32)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+
+            // Process each expert
+            let mut expert_outputs: Vec<Vec<f32>> = Vec::with_capacity(expert_indices.len());
+
+            // Encode all K expert forwards into a single command buffer (C3: deferred dispatch).
+            // One command buffer for all experts eliminates K-1 GPU flushes.
+            let cmd_buf = fused_expert
+                .create_command_buffer()
+                .map_err(|e| Exception::custom(e.to_string()))?;
+
+            // Per-expert output buffers (needed because each expert writes to same hidden_dim)
+            let mut per_expert_out: Vec<pmetal_metal::MetalBuffer<f32>> = Vec::with_capacity(expert_bufs.len());
+            for _ in 0..expert_bufs.len() {
+                per_expert_out.push(
+                    pmetal_metal::MetalBuffer::<f32>::new(
+                        &metal_ctx,
+                        ctx.layout.hidden_dim,
+                        pmetal_metal::BufferUsage::Shared,
+                    )
+                    .map_err(|e| Exception::custom(e.to_string()))?,
+                );
+            }
+
+            for (i, raw_bytes) in expert_bufs.iter().enumerate() {
+                let weights = crate::expert_dequant::parse_expert_weights(raw_bytes, record, &metal_ctx)
+                    .map_err(|e| Exception::custom(e))?;
+
+                fused_expert
+                    .encode_into(&cmd_buf, &input_buf, &weights, &per_expert_out[i], &expert_intermediate)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+            }
+
+            // Single commit + wait for all K experts
+            fused_expert
+                .submit_and_wait(&cmd_buf)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+
+            for buf in &per_expert_out {
+                expert_outputs.push(buf.as_slice().to_vec());
+            }
+
+            // ---- Combine: weighted sum + shared expert + residual ----
+            // Build expert output tensor [batch_seq, k, hidden]
+            let all_expert_data: Vec<f32> = expert_outputs.into_iter().flatten().collect();
+            let down_out = Array::from_slice(
+                &all_expert_data,
+                &[batch_seq, k, hidden],
+            );
+
+            let shared_y = self.shared_expert.forward(&x_flat)?;
+            let shared_gate_logit = self.shared_expert_gate.forward(&x_flat)?;
+
+            let result = moe_combine_mlx(
+                &x_flat,
+                &down_out,
+                &top_weights,
+                &shared_y,
+                &shared_gate_logit,
+                k,
+                batch_seq,
+            )?;
+            result.reshape(shape)
+        }
     }
 }
 
