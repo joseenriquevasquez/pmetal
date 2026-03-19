@@ -3,7 +3,7 @@
   import { page } from '$app/stores';
   import { modelsStore, trainingStore } from '$lib/stores.svelte';
   import type { TrainingConfig, TrainingRun, CachedDatasetInfo, TrainedAdapter } from '$lib/api';
-  import { fuseLora, listCachedDatasets, listTrainedAdapters, peekDatasetColumns } from '$lib/api';
+  import { fuseLora, listCachedDatasets, listTrainedAdapters, peekDatasetColumns, getModelDefaults } from '$lib/api';
   import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
 
   let cachedDatasets = $state<CachedDatasetInfo[]>([]);
@@ -87,6 +87,20 @@
   let selectedRun = $derived(runs.find(r => r.id === selectedRunId) ?? null);
   // PMetal always uses LoRA; show config for all methods except bare SFT
   let isLoraMethod = $derived(selectedMethod !== 'sft');
+
+  // Auto-fill max seq len from model's max_position_embeddings
+  let trainingDefaultsModel = $state('');
+  $effect(() => {
+    const model = selectedModel;
+    if (!model || model === trainingDefaultsModel) return;
+    trainingDefaultsModel = model;
+    getModelDefaults(model).then((d) => {
+      if (d.max_position_embeddings != null) {
+        // Cap at model's context length, but don't exceed 4096 for training memory
+        maxSeqLen = Math.min(d.max_position_embeddings, 4096);
+      }
+    }).catch(() => {});
+  });
 
   // ── Live training metrics history (for charts) ──
   interface MetricPoint { step: number; loss: number; lr: number; tokSec: number; }

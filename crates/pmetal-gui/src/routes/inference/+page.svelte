@@ -2,8 +2,8 @@
   import { onMount, onDestroy, tick } from 'svelte';
   import { page } from '$app/stores';
   import { modelsStore } from '$lib/stores.svelte';
-  import { startInference, stopInference, onInferenceToken, onInferenceDone, onInferenceError, listTrainedAdapters } from '$lib/api';
-  import type { TrainedAdapter } from '$lib/api';
+  import { startInference, stopInference, onInferenceToken, onInferenceDone, onInferenceError, listTrainedAdapters, getModelDefaults } from '$lib/api';
+  import type { TrainedAdapter, ModelDefaults } from '$lib/api';
   import { renderMarkdown } from '$lib/utils';
   import type { UnlistenFn } from '@tauri-apps/api/event';
 
@@ -32,13 +32,28 @@
     return `${model} + ${adapterShort}`;
   });
 
-  // Generation params
+  // Generation params (auto-filled from model's generation_config.json)
   let temperature = $state(0.7);
   let topK = $state(50);
   let topP = $state(0.9);
   let maxTokens = $state(1024);
   let repetitionPenalty = $state(1.1);
   let showParams = $state(false);
+  let defaultsSource = $state(''); // which model the current defaults came from
+
+  /** Load model defaults when model selection changes. */
+  $effect(() => {
+    const model = selectedModel;
+    if (!model || model === defaultsSource) return;
+    defaultsSource = model;
+    getModelDefaults(model).then((d) => {
+      if (d.temperature != null) temperature = d.temperature;
+      if (d.top_k != null) topK = d.top_k;
+      if (d.top_p != null) topP = d.top_p;
+      if (d.max_new_tokens != null) maxTokens = d.max_new_tokens;
+      if (d.repetition_penalty != null) repetitionPenalty = d.repetition_penalty;
+    }).catch(() => {});
+  });
 
   // Chat state
   let messages = $state<ChatMessage[]>([]);

@@ -252,6 +252,23 @@ pub struct TrainedAdapter {
     pub size_bytes: u64,
 }
 
+/// Model generation/training defaults read from generation_config.json + config.json.
+/// Matches TS `ModelDefaults`.
+#[derive(Debug, Default, Serialize)]
+pub struct ModelDefaults {
+    // Generation params (from generation_config.json)
+    pub temperature: Option<f32>,
+    pub top_k: Option<u32>,
+    pub top_p: Option<f32>,
+    pub max_new_tokens: Option<u32>,
+    pub repetition_penalty: Option<f32>,
+    // Model arch info (from config.json)
+    pub max_position_embeddings: Option<u32>,
+    pub hidden_size: Option<u32>,
+    pub num_hidden_layers: Option<u32>,
+    pub vocab_size: Option<u32>,
+}
+
 // ---------------------------------------------------------------------------
 // Request DTOs — match api.ts invoke calls
 // ---------------------------------------------------------------------------
@@ -543,6 +560,57 @@ pub async fn get_model_info(
         vocab_size,
         context_length,
     }))
+}
+
+/// Read generation_config.json + config.json defaults for a model.
+///
+/// Returns recommended sampling parameters and model architecture info
+/// so the GUI can auto-fill params when a model is selected.
+#[tauri::command]
+pub async fn get_model_defaults(
+    state: State<'_, AppState>,
+    model_id: String,
+) -> Result<ModelDefaults> {
+    let model_path = {
+        let models = state.cached_models.read().await;
+        models
+            .iter()
+            .find(|m| m.id == model_id)
+            .map(|m| m.path.clone())
+            .unwrap_or_default()
+    };
+
+    if model_path.is_empty() {
+        return Ok(ModelDefaults::default());
+    }
+    let model_path = PathBuf::from(&model_path);
+
+    let mut defaults = ModelDefaults::default();
+
+    // Read generation_config.json for sampling params
+    let gen_config_path = model_path.join("generation_config.json");
+    if let Ok(content) = tokio::fs::read_to_string(&gen_config_path).await {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
+            defaults.temperature = cfg["temperature"].as_f64().map(|v| v as f32);
+            defaults.top_k = cfg["top_k"].as_u64().map(|v| v as u32);
+            defaults.top_p = cfg["top_p"].as_f64().map(|v| v as f32);
+            defaults.repetition_penalty = cfg["repetition_penalty"].as_f64().map(|v| v as f32);
+            defaults.max_new_tokens = cfg["max_new_tokens"].as_u64().map(|v| v as u32);
+        }
+    }
+
+    // Read config.json for model arch info
+    if let Some(cfg) = read_model_config_json(&model_path.to_string_lossy()).await {
+        defaults.max_position_embeddings = cfg["max_position_embeddings"]
+            .as_u64()
+            .or_else(|| cfg["max_seq_len"].as_u64())
+            .map(|v| v as u32);
+        defaults.hidden_size = cfg["hidden_size"].as_u64().map(|v| v as u32);
+        defaults.num_hidden_layers = cfg["num_hidden_layers"].as_u64().map(|v| v as u32);
+        defaults.vocab_size = cfg["vocab_size"].as_u64().map(|v| v as u32);
+    }
+
+    Ok(defaults)
 }
 
 #[tauri::command]

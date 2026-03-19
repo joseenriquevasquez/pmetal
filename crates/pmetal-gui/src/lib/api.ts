@@ -309,6 +309,18 @@ export interface FuseResult {
   model_size_bytes: number;
 }
 
+export interface ModelDefaults {
+  temperature: number | null;
+  top_k: number | null;
+  top_p: number | null;
+  max_new_tokens: number | null;
+  repetition_penalty: number | null;
+  max_position_embeddings: number | null;
+  hidden_size: number | null;
+  num_hidden_layers: number | null;
+  vocab_size: number | null;
+}
+
 export interface TrainedAdapter {
   path: string;
   name: string;
@@ -601,6 +613,14 @@ export async function mergeModels(config: MergeConfig): Promise<string> {
 
 export async function getMergeStrategies(): Promise<MergeStrategy[]> {
   return await invoke('get_merge_strategies');
+}
+
+// =============================================================================
+// Model Defaults API
+// =============================================================================
+
+export async function getModelDefaults(modelId: string): Promise<ModelDefaults> {
+  return await invoke('get_model_defaults', { modelId });
 }
 
 // =============================================================================

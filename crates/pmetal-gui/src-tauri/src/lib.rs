@@ -59,6 +59,7 @@ pub fn run() {
             // Models
             list_models,
             get_model_info,
+            get_model_defaults,
             download_model,
             delete_model,
             search_hub_models,
