@@ -94,6 +94,8 @@ pub struct ModelSpec {
     pub num_experts: Option<u64>,
     /// Number of active experts per token (MoE).
     pub active_experts: Option<u64>,
+    /// KV cache quantization bits (None = fp16, Some(8) = q8, Some(4) = q4).
+    pub kv_cache_bits: Option<u8>,
 }
 
 /// Bytes per parameter for a given quantization format.
@@ -125,21 +127,29 @@ pub fn estimate_fit(model: &ModelSpec, device: &DeviceSpec) -> FitEstimate {
 
     // --- KV cache memory ---
     // Exact formula when we have architectural details:
-    //   kv_cache = 2 * num_layers * 2 * num_kv_heads * head_dim * context_length * 2_bytes / 1e9
+    //   kv_cache = 2 * num_layers * 2 * num_kv_heads * head_dim * context_length * bytes / 1e9
     // Approximate formula (from llmfit) when we don't:
     //   kv_cache = 0.000008 * params_b * context_length
+    //
+    // KV cache bytes per element: quantized modes reduce memory 2-8x.
+    let kv_bytes_per_element: f64 = match model.kv_cache_bits {
+        Some(8) => 1.1,  // q8: ~50% reduction + scale/bias overhead
+        Some(4) => 0.6,  // q4: ~75% reduction + scale/bias overhead
+        Some(2) => 0.35, // q2: ~87% reduction + scale/bias overhead
+        _ => 2.0,        // fp16 (default)
+    };
     let kv_cache_gb = match (model.num_layers, model.num_kv_heads, model.head_dim) {
         (Some(layers), Some(kv_heads), Some(hd)) => {
-            // 2 for K and V, 2 bytes for fp16
+            // 2 for K and V, bytes per element determined by quantization mode
             let kv_bytes = 2.0
                 * layers as f64
                 * kv_heads as f64
                 * hd as f64
                 * model.context_length as f64
-                * 2.0;
+                * kv_bytes_per_element;
             kv_bytes / 1e9
         }
-        _ => 0.000008 * model.params_b * model.context_length as f64,
+        _ => 0.000008 * model.params_b * model.context_length as f64 * (kv_bytes_per_element / 2.0),
     };
 
     // --- Overhead ---
@@ -188,8 +198,15 @@ pub fn estimate_fit(model: &ModelSpec, device: &DeviceSpec) -> FitEstimate {
 
     let active_size_gb = active_params_b * bpp;
     let estimated_tps = if active_size_gb > 0.0 {
-        // 0.55 efficiency factor (kernel overhead, KV cache reads, memory controller)
-        (device.bandwidth_gbps / active_size_gb) * 0.55
+        // Context-aware efficiency: KV cache reads scale with context, reducing throughput
+        let base_efficiency = if model.is_moe { 0.50 } else { 0.60 };
+        let kv_overhead = if model.context_length > 8192 {
+            0.05 * ((model.context_length as f64 / 8192.0).log2().max(0.0))
+        } else {
+            0.0
+        };
+        let efficiency = (base_efficiency - kv_overhead).max(0.30);
+        (device.bandwidth_gbps / active_size_gb) * efficiency
     } else {
         0.0
     };
@@ -262,6 +279,26 @@ pub fn estimate_fit(model: &ModelSpec, device: &DeviceSpec) -> FitEstimate {
     if training_fit == FitLevel::TooLarge && fit_level != FitLevel::TooLarge {
         notes.push("Inference OK, but training requires more memory".to_string());
         notes.push("Try reducing max-seq-len or use a smaller model for training".to_string());
+    }
+
+    // KV cache quantization recommendations
+    if model.kv_cache_bits.is_some() {
+        let fp16_kv = match (model.num_layers, model.num_kv_heads, model.head_dim) {
+            (Some(l), Some(h), Some(d)) => {
+                2.0 * l as f64 * h as f64 * d as f64 * model.context_length as f64 * 2.0 / 1e9
+            }
+            _ => 0.000008 * model.params_b * model.context_length as f64,
+        };
+        let savings = fp16_kv - kv_cache_gb;
+        if savings > 0.1 {
+            notes.push(format!(
+                "KV cache q{}: saves {:.1} GB vs fp16",
+                model.kv_cache_bits.unwrap(),
+                savings
+            ));
+        }
+    } else if fit_level == FitLevel::Tight || fit_level == FitLevel::TooLarge {
+        notes.push("Tip: KV cache q8_0 saves ~50% KV memory at <0.4% quality loss".to_string());
     }
 
     FitEstimate {
@@ -387,6 +424,7 @@ pub fn model_spec_from_config(
         is_moe,
         num_experts,
         active_experts,
+        kv_cache_bits: None, // Set by caller based on inference config
     }
 }
 

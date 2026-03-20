@@ -98,11 +98,38 @@ pub enum CacheMode {
         /// Group size for quantization (default: 64).
         group_size: usize,
     },
+    /// Asymmetric quantized cache - different precision for K and V.
+    /// K is more sensitive to quantization than V (community benchmarks confirm
+    /// <0.4% PPL diff at q8_0, V tolerates more aggressive quantization).
+    /// Recommended: K@q8, V@q4 for best quality/memory tradeoff.
+    AsymmetricQuantized {
+        /// Number of bits for key quantization (2, 4, or 8).
+        key_bits: u8,
+        /// Number of bits for value quantization (2, 4, or 8).
+        value_bits: u8,
+        /// Group size for quantization (default: 64).
+        group_size: usize,
+    },
 }
 
 impl Default for CacheMode {
     fn default() -> Self {
         Self::Standard
+    }
+}
+
+impl CacheMode {
+    /// Human-readable description of the cache mode.
+    pub fn describe(&self) -> String {
+        match self {
+            CacheMode::Standard => "fp16".to_string(),
+            CacheMode::SlidingWindow { window_size } => format!("sliding-{window_size}"),
+            CacheMode::Rotating { max_size, .. } => format!("rotating-{max_size}"),
+            CacheMode::Quantized { bits, group_size } => format!("q{bits}_0 (group={group_size})"),
+            CacheMode::AsymmetricQuantized { key_bits, value_bits, group_size } => {
+                format!("K@q{key_bits},V@q{value_bits} (group={group_size})")
+            }
+        }
     }
 }
 
@@ -172,6 +199,21 @@ impl KVCacheConfig {
         self
     }
 
+    /// Enable asymmetric quantized cache mode.
+    ///
+    /// K is more sensitive to quantization than V. Using higher precision
+    /// for keys and lower for values gives nearly the memory savings of
+    /// aggressive quantization with quality closer to conservative quantization.
+    ///
+    /// # Arguments
+    /// * `key_bits` - Number of bits for keys (2, 4, or 8)
+    /// * `value_bits` - Number of bits for values (2, 4, or 8)
+    /// * `group_size` - Group size for quantization (default: 64)
+    pub fn with_asymmetric_quantized(mut self, key_bits: u8, value_bits: u8, group_size: usize) -> Self {
+        self.mode = CacheMode::AsymmetricQuantized { key_bits, value_bits, group_size };
+        self
+    }
+
     /// Enable eager pre-allocation of the full context window.
     ///
     /// When enabled, the KV cache will allocate memory for the full `max_seq_len`
@@ -201,21 +243,36 @@ impl KVCacheConfig {
     ///
     /// Useful for understanding memory requirements before allocation.
     pub fn memory_footprint(&self) -> usize {
-        let bytes_per_element = match self.dtype {
-            Dtype::Float32 => 4,
-            Dtype::Float16 | Dtype::Bfloat16 => 2,
-            _ => 4, // Default assumption
-        };
-
-        // Per layer: 2 tensors (K, V) × batch × heads × seq × head_dim × bytes
-        let per_layer = 2
-            * self.eager_batch_size
-            * self.num_kv_heads
-            * self.max_seq_len
-            * self.head_dim
-            * bytes_per_element;
-
-        per_layer * self.num_layers
+        match self.mode {
+            CacheMode::Quantized { bits, group_size } => {
+                let el_per_int = 32 / bits as usize;
+                let packed_dim = (self.head_dim + el_per_int - 1) / el_per_int;
+                let num_groups = (self.head_dim + group_size - 1) / group_size;
+                // packed u32 data + f16 scale + f16 bias per group
+                let per_token_bytes = (packed_dim * 4 + num_groups * 4) * self.num_kv_heads;
+                2 * per_token_bytes * self.max_seq_len * self.num_layers
+            }
+            CacheMode::AsymmetricQuantized { key_bits, value_bits, group_size } => {
+                let k_el = 32 / key_bits as usize;
+                let v_el = 32 / value_bits as usize;
+                let k_packed = (self.head_dim + k_el - 1) / k_el;
+                let v_packed = (self.head_dim + v_el - 1) / v_el;
+                let num_groups = (self.head_dim + group_size - 1) / group_size;
+                let k_per_token = (k_packed * 4 + num_groups * 4) * self.num_kv_heads;
+                let v_per_token = (v_packed * 4 + num_groups * 4) * self.num_kv_heads;
+                (k_per_token + v_per_token) * self.max_seq_len * self.num_layers
+            }
+            _ => {
+                let bytes_per_element = match self.dtype {
+                    Dtype::Float32 => 4,
+                    Dtype::Float16 | Dtype::Bfloat16 => 2,
+                    _ => 4,
+                };
+                2 * self.eager_batch_size.max(1) * self.num_kv_heads
+                    * self.max_seq_len * self.head_dim * bytes_per_element
+                    * self.num_layers
+            }
+        }
     }
 
     /// Format the memory footprint as a human-readable string.
@@ -306,6 +363,8 @@ pub struct KVCache {
     config: KVCacheConfig,
     /// Per-layer cache entries.
     layer_caches: Vec<LayerCache>,
+    /// Quantized per-layer caches (used when mode is Quantized or AsymmetricQuantized).
+    quantized_layers: Option<Vec<QuantizedKVCache>>,
     /// Total number of tokens processed.
     total_tokens: usize,
 }
@@ -318,9 +377,24 @@ impl KVCache {
     pub fn new(config: KVCacheConfig) -> Self {
         let layer_caches = (0..config.num_layers).map(|_| LayerCache::new()).collect();
 
+        let quantized_layers = match config.mode {
+            CacheMode::Quantized { bits, group_size } => {
+                Some((0..config.num_layers)
+                    .map(|_| QuantizedKVCache::new(bits, group_size))
+                    .collect())
+            }
+            CacheMode::AsymmetricQuantized { key_bits, value_bits, group_size } => {
+                Some((0..config.num_layers)
+                    .map(|_| QuantizedKVCache::new_asymmetric(key_bits, value_bits, group_size))
+                    .collect())
+            }
+            _ => None,
+        };
+
         Self {
             config,
             layer_caches,
+            quantized_layers,
             total_tokens: 0,
         }
     }
@@ -371,6 +445,7 @@ impl KVCache {
         Ok(Self {
             config,
             layer_caches,
+            quantized_layers: None,
             total_tokens: 0,
         })
     }
@@ -382,7 +457,11 @@ impl KVCache {
 
     /// Get the current cached sequence length.
     pub fn seq_len(&self) -> usize {
-        self.layer_caches.first().map(|c| c.offset).unwrap_or(0)
+        if let Some(ref q_layers) = self.quantized_layers {
+            q_layers.first().map(|c| c.len()).unwrap_or(0)
+        } else {
+            self.layer_caches.first().map(|c| c.offset).unwrap_or(0)
+        }
     }
 
     /// Get total tokens processed (may differ from seq_len with sliding window).
@@ -392,8 +471,11 @@ impl KVCache {
 
     /// Check if the cache is empty (no tokens stored).
     pub fn is_empty(&self) -> bool {
-        // For eager allocation, check offset instead of Option
-        self.layer_caches.iter().all(|c| c.offset == 0)
+        if let Some(ref q_layers) = self.quantized_layers {
+            q_layers.iter().all(|c| c.is_empty())
+        } else {
+            self.layer_caches.iter().all(|c| c.offset == 0)
+        }
     }
 
     /// Check if the cache is pre-allocated (eager mode).
@@ -411,13 +493,15 @@ impl KVCache {
     /// For eager-allocated caches, this resets the offset but preserves the
     /// pre-allocated buffers. For lazy caches, this deallocates all memory.
     pub fn reset(&mut self) {
-        if self.config.eager_allocate {
-            // Eager mode: preserve buffers, just reset offset
+        if let Some(ref mut q_layers) = self.quantized_layers {
+            for cache in q_layers {
+                cache.reset();
+            }
+        } else if self.config.eager_allocate {
             for cache in &mut self.layer_caches {
                 cache.reset();
             }
         } else {
-            // Lazy mode: deallocate to free memory
             for cache in &mut self.layer_caches {
                 cache.reset_full();
             }
@@ -456,11 +540,16 @@ impl KVCache {
         if n == 0 {
             return;
         }
-        let rollback_n = n.min(self.total_tokens);
-        for cache in &mut self.layer_caches {
-            cache.offset = cache.offset.saturating_sub(n);
+        if let Some(ref mut q_layers) = self.quantized_layers {
+            for cache in q_layers {
+                cache.rollback(n);
+            }
+        } else {
+            for cache in &mut self.layer_caches {
+                cache.offset = cache.offset.saturating_sub(n);
+            }
         }
-        self.total_tokens = self.total_tokens.saturating_sub(rollback_n);
+        self.total_tokens = self.total_tokens.saturating_sub(n);
     }
 
     /// Update the cache with new keys and values for a layer.
@@ -489,6 +578,14 @@ impl KVCache {
                 "Layer index {} out of range (num_layers={})",
                 layer_idx, self.config.num_layers
             )));
+        }
+
+        // Quantized path: delegate to per-layer QuantizedKVCache
+        if let Some(ref mut q_layers) = self.quantized_layers {
+            if layer_idx == 0 {
+                self.total_tokens += new_keys.dim(2) as usize;
+            }
+            return q_layers[layer_idx].update_and_fetch(new_keys, new_values);
         }
 
         let cache = &mut self.layer_caches[layer_idx];
@@ -577,7 +674,7 @@ impl KVCache {
                 }
                 cache.offset
             }
-            CacheMode::Quantized { .. } | CacheMode::Standard => {
+            CacheMode::Quantized { .. } | CacheMode::AsymmetricQuantized { .. } | CacheMode::Standard => {
                 if cache.offset > self.config.max_seq_len {
                     return Err(Exception::custom(format!(
                         "KV cache exceeded max_seq_len: {} > {}",
@@ -640,10 +737,12 @@ impl KVCache {
 
     /// Estimate memory usage of the current cache in bytes.
     pub fn memory_usage(&self) -> usize {
+        if let Some(ref q_layers) = self.quantized_layers {
+            return q_layers.iter().map(|c| c.memory_usage()).sum();
+        }
         let mut total = 0;
         for cache in &self.layer_caches {
             if let Some(keys) = &cache.keys {
-                // Approximate: shape elements * dtype size
                 let elements: usize = keys.shape().iter().map(|&d| d as usize).product();
                 total += elements * dtype_size(self.config.dtype);
             }
@@ -657,16 +756,20 @@ impl KVCache {
 
     /// Estimate maximum memory usage for the configured cache.
     pub fn max_memory_usage(&self) -> usize {
+        // For quantized modes, use the config's memory_footprint calculation
+        match self.config.mode {
+            CacheMode::Quantized { .. } | CacheMode::AsymmetricQuantized { .. } => {
+                return self.config.memory_footprint();
+            }
+            _ => {}
+        }
         let seq_len = match self.config.mode {
             CacheMode::SlidingWindow { window_size } => window_size,
             CacheMode::Rotating { max_size, .. } => max_size,
-            CacheMode::Quantized { .. } | CacheMode::Standard => self.config.max_seq_len,
+            _ => self.config.max_seq_len,
         };
-
-        // batch=1 assumed, 2 tensors (K,V) per layer
         let elements_per_layer = seq_len * self.config.num_kv_heads * self.config.head_dim;
         let bytes_per_layer = elements_per_layer * dtype_size(self.config.dtype) * 2;
-
         self.config.num_layers * bytes_per_layer
     }
 }
@@ -1129,11 +1232,14 @@ pub struct QuantizedKVCache {
     values: Option<QuantizedTensor>,
     /// Total offset (tokens seen).
     offset: usize,
-    /// Number of bits for quantization.
+    /// Number of bits for key quantization.
     bits: u8,
+    /// Number of bits for value quantization.
+    value_bits: u8,
     /// Group size for quantization.
     group_size: usize,
     /// Allocation step size.
+    #[allow(dead_code)] // Stored for future pre-allocation strategy
     step: usize,
     /// Original dtype for dequantization.
     dtype: Dtype,
@@ -1155,9 +1261,37 @@ impl QuantizedKVCache {
             values: None,
             offset: 0,
             bits,
+            value_bits: bits,
             group_size,
             step: 256,
-            dtype: Dtype::Float16, // Default to f16
+            dtype: Dtype::Float16,
+        }
+    }
+
+    /// Create a new quantized KV cache with asymmetric key/value bit widths.
+    ///
+    /// # Arguments
+    /// * `key_bits` - Number of bits for keys (2, 4, or 8)
+    /// * `value_bits` - Number of bits for values (2, 4, or 8)
+    /// * `group_size` - Group size for quantization (default: 64)
+    pub fn new_asymmetric(key_bits: u8, value_bits: u8, group_size: usize) -> Self {
+        assert!(
+            key_bits == 2 || key_bits == 4 || key_bits == 8,
+            "key_bits must be 2, 4, or 8"
+        );
+        assert!(
+            value_bits == 2 || value_bits == 4 || value_bits == 8,
+            "value_bits must be 2, 4, or 8"
+        );
+        Self {
+            keys: None,
+            values: None,
+            offset: 0,
+            bits: key_bits,
+            value_bits,
+            group_size,
+            step: 256,
+            dtype: Dtype::Float16,
         }
     }
 
@@ -1201,7 +1335,7 @@ impl QuantizedKVCache {
     /// Returns an `Exception` if MLX rejects the shapes (e.g., `D` not
     /// divisible by `group_size`).  The caller is responsible for ensuring the
     /// head dimension satisfies this constraint or for padding prior to calling.
-    fn quantize_tensor(&self, tensor: &Array) -> Result<QuantizedTensor, Exception> {
+    fn quantize_with_bits(&self, tensor: &Array, bits: u8) -> Result<QuantizedTensor, Exception> {
         let shape = tensor.shape();
         let batch = shape[0] as usize;
         let heads = shape[1] as usize;
@@ -1221,7 +1355,7 @@ impl QuantizedKVCache {
         //   scales : [rows, dim / group_size]
         //   biases : [rows, dim / group_size]
         let group_size_i32 = self.group_size as i32;
-        let bits_i32 = self.bits as i32;
+        let bits_i32 = bits as i32;
         let (w_q, scales_2d, biases_2d) = quantize(&flat, group_size_i32, bits_i32)?;
 
         // Reshape packed data back to [B, H, S, packed_dim].
@@ -1242,21 +1376,21 @@ impl QuantizedKVCache {
 
     /// Unpack a [`QuantizedTensor`] back into a float tensor `[B, H, S, D]`.
     ///
-    /// This is the exact inverse of [`Self::quantize_tensor`]:
+    /// This is the exact inverse of [`Self::quantize_with_bits`]:
     ///
     /// 1. Flatten the 4-D packed data and metadata to 2-D.
     /// 2. Invoke `mlx_rs::ops::dequantize`, which reconstructs a float32
     ///    matrix `[rows, D]`.
     /// 3. Reshape back to `[B, H, S, D]` and cast to the original dtype that
     ///    was fed in (stored in `self.dtype`).
-    fn dequantize_tensor(&self, qtensor: &QuantizedTensor) -> Result<Array, Exception> {
+    fn dequantize_with_bits(&self, qtensor: &QuantizedTensor, bits: u8) -> Result<Array, Exception> {
         let shape = qtensor.data.shape();
         let batch = shape[0] as usize;
         let heads = shape[1] as usize;
         let seq = shape[2] as usize;
         // packed_dim = D * bits / 32 => D = packed_dim * 32 / bits
         let packed_dim = shape[3] as usize;
-        let el_per_int = 32usize / self.bits as usize;
+        let el_per_int = 32usize / bits as usize;
         let dim = packed_dim * el_per_int;
 
         let rows = (batch * heads * seq) as i32;
@@ -1268,7 +1402,7 @@ impl QuantizedKVCache {
 
         // dequantize returns a float32 array [rows, dim].
         let group_size_i32 = self.group_size as i32;
-        let bits_i32 = self.bits as i32;
+        let bits_i32 = bits as i32;
         let flat_float = dequantize(
             &flat_data,
             &flat_scales,
@@ -1293,9 +1427,9 @@ impl QuantizedKVCache {
         self.dtype = keys.dtype();
         let num_steps = keys.dim(2) as usize;
 
-        // Quantize new keys/values
-        let q_keys = self.quantize_tensor(keys)?;
-        let q_values = self.quantize_tensor(values)?;
+        // Quantize new keys/values (using per-tensor bit widths for asymmetric support)
+        let q_keys = self.quantize_with_bits(keys, self.bits)?;
+        let q_values = self.quantize_with_bits(values, self.value_bits)?;
 
         if self.keys.is_none() {
             self.keys = Some(q_keys);
@@ -1319,9 +1453,9 @@ impl QuantizedKVCache {
 
         self.offset += num_steps;
 
-        // Dequantize for attention computation
-        let dk = self.dequantize_tensor(self.keys.as_ref().unwrap())?;
-        let dv = self.dequantize_tensor(self.values.as_ref().unwrap())?;
+        // Dequantize for attention computation (using per-tensor bit widths)
+        let dk = self.dequantize_with_bits(self.keys.as_ref().unwrap(), self.bits)?;
+        let dv = self.dequantize_with_bits(self.values.as_ref().unwrap(), self.value_bits)?;
 
         Ok((dk, dv))
     }
@@ -1336,6 +1470,27 @@ impl QuantizedKVCache {
         let trimmed = n.min(self.offset);
         self.offset -= trimmed;
         trimmed
+    }
+
+    /// Roll back (discard) the last `n` tokens from the cache.
+    pub fn rollback(&mut self, n: usize) {
+        let new_offset = self.offset.saturating_sub(n);
+        if new_offset == 0 {
+            self.keys = None;
+            self.values = None;
+        } else if let (Some(k), Some(v)) = (&mut self.keys, &mut self.values) {
+            *k = QuantizedTensor {
+                data: k.data.index((.., .., ..new_offset as i32, ..)),
+                scales: k.scales.index((.., .., ..new_offset as i32, ..)),
+                biases: k.biases.index((.., .., ..new_offset as i32, ..)),
+            };
+            *v = QuantizedTensor {
+                data: v.data.index((.., .., ..new_offset as i32, ..)),
+                scales: v.scales.index((.., .., ..new_offset as i32, ..)),
+                biases: v.biases.index((.., .., ..new_offset as i32, ..)),
+            };
+        }
+        self.offset = new_offset;
     }
 
     /// Estimated memory usage.

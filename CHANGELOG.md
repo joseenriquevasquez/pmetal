@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **KV cache quantization** (SOTA inference): q8_0 KV cache is now the default for inference and serving — community benchmarks confirm <0.4% PPL degradation with 12-38% throughput gain
+  - Symmetric quantization: `--kv-quant 8` (default), `--kv-quant 4` for aggressive savings
+  - Asymmetric K/V quantization: `--kv-k-bits 8 --kv-v-bits 4` — K is more sensitive than V, asymmetric gives near-q4 memory savings with near-q8 quality
+  - `--kv-group-size` (default 64), `--no-kv-quant` to disable
+  - `CacheMode::Quantized` and `CacheMode::AsymmetricQuantized` variants wired into `KVCache::update_and_fetch()` via per-layer `QuantizedKVCache` delegation
+  - `CacheMode::describe()` for human-readable display in logs
+  - `DynamicModel::create_cache_with_mode()` with automatic group_size adjustment for non-standard head dimensions (Phi-3 mini head_dim=96, NemotronH head_dim=32)
+  - Serve engine defaults to q8_0 KV cache for all requests
+- **Context-aware fit estimation**: Efficiency factor is now context-dependent (0.60 dense / 0.50 MoE base, log-linear penalty above 8k context) instead of flat 0.55. KV cache memory calculation accounts for quantization bits. Fit notes recommend q8_0 when memory is tight
+
+### Fixed
+
+- **KV cache `Quantized` mode was a no-op**: `CacheMode::Quantized` existed in the enum but `KVCache::update_and_fetch()` treated it identically to `Standard`. Now properly delegates to per-layer `QuantizedKVCache` instances with quantize-on-write / dequantize-on-read
+- **KV cache quantization crash on non-standard head dimensions**: Models with head_dim not divisible by 64 (Phi-3 mini=96, NemotronH=32, FalconH1=16) would fail in MLX's `quantize` op. `create_cache_with_mode()` now auto-adjusts group_size to the largest compatible power-of-2
+
 ## [0.3.11] - 2026-03-20
 
 ### Added

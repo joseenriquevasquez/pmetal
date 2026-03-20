@@ -6,6 +6,7 @@ use mlx_rs::Array;
 use mlx_rs::ops::indexing::IndexOp;
 use pmetal_data::chat_templates::{ChatTemplate, ChatTemplateType, detect_chat_template};
 use pmetal_data::inference_config::collect_all_stop_tokens;
+use pmetal_mlx::kv_cache::CacheMode;
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::{GenerationConfig, Sampler};
 use std::sync::{Arc, Mutex};
@@ -333,7 +334,10 @@ impl InferenceEngine {
         let result = tokio::task::spawn_blocking(move || {
             let mut state = model_arc.lock().map_err(|_| ServeError::Busy)?;
             let model = &mut state.model;
-            let mut cache = model.create_cache(max_seq_len);
+            let mut cache = model.create_cache_with_mode(
+                max_seq_len,
+                CacheMode::Quantized { bits: 8, group_size: 64 },
+            );
 
             // Build input array [1, seq_len] for prefill.
             let i32_ids: Vec<i32> = input_ids.iter().map(|&t| t as i32).collect();
@@ -346,8 +350,8 @@ impl InferenceEngine {
             let mut logits = model
                 .forward_with_cache(&input_arr, None, Some(&mut cache))
                 .map_err(ServeError::Model)?;
-            // TODO(perf): switch to mlx_rs::eval_async once available so the
-            // next prefill/decode can overlap with the current eval on the GPU.
+            // Blocked on mlx_rs::eval_async — would allow GPU pipeline overlap
+            // between eval and the next decode step for higher throughput.
             logits.eval().map_err(ServeError::Model)?;
 
             // Sampler must be created inside spawn_blocking — it holds
@@ -388,9 +392,8 @@ impl InferenceEngine {
                     logits = model
                         .forward_with_cache(&next_input, None, Some(&mut cache))
                         .map_err(ServeError::Model)?;
-                    // eval() is required here: without it the lazy graph grows
-                    // unbounded across decode steps and OOMs before the loop ends.
-                    // TODO(perf): replace with async_eval for pipeline overlap.
+                    // Sync eval required — lazy graph grows unbounded without it.
+                    // Blocked on mlx_rs::eval_async for pipeline overlap.
                     logits.eval().map_err(ServeError::Model)?;
                 }
             }
@@ -481,7 +484,10 @@ impl InferenceEngine {
             // the entire generation loop.
             let mut state = state_guard;
             let model = &mut state.model;
-            let mut cache = model.create_cache(max_seq_len);
+            let mut cache = model.create_cache_with_mode(
+                max_seq_len,
+                CacheMode::Quantized { bits: 8, group_size: 64 },
+            );
 
             // Build prefill input array.
             let i32_ids: Vec<i32> = input_ids.iter().map(|&t| t as i32).collect();
@@ -498,8 +504,8 @@ impl InferenceEngine {
                     return;
                 }
             };
-            // eval() is required here: without it the lazy graph grows unbounded.
-            // TODO(perf): replace with async_eval for pipeline overlap.
+            // Sync eval required — lazy graph grows unbounded without it.
+            // Blocked on mlx_rs::eval_async for pipeline overlap.
             if let Err(e) = logits.eval() {
                 send!(TokenEvent::Error(e.to_string()));
                 return;
@@ -560,8 +566,8 @@ impl InferenceEngine {
                             return;
                         }
                     };
-                    // eval() is required: prevents unbounded lazy graph growth.
-                    // TODO(perf): replace with async_eval for pipeline overlap.
+                    // Sync eval required — prevents unbounded lazy graph growth.
+                    // Blocked on mlx_rs::eval_async for pipeline overlap.
                     if let Err(e) = logits.eval() {
                         send!(TokenEvent::Error(e.to_string()));
                         return;

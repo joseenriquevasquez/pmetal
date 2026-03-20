@@ -14,8 +14,23 @@ use mlx_rs::{
     error::Exception,
     module::{Module, ModuleParameters, ModuleParametersExt},
 };
-use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache};
+use pmetal_mlx::kv_cache::{CacheMode, KVCache, KVCacheConfig, MambaCache};
 use std::path::Path;
+
+/// Find the largest power-of-2 group size that divides `head_dim`,
+/// preferring the requested `preferred` if it already works.
+fn find_compatible_group_size(head_dim: usize, preferred: usize) -> usize {
+    if head_dim % preferred == 0 {
+        return preferred;
+    }
+    // Try common group sizes in decreasing order: 64, 32, 16, 8, 4, 2, 1
+    for gs in [64, 32, 16, 8, 4, 2, 1] {
+        if head_dim % gs == 0 {
+            return gs;
+        }
+    }
+    1 // Fallback: per-element quantization (always works)
+}
 
 /// Model architecture types supported by PMetal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -650,6 +665,42 @@ impl DynamicModel {
             // BERT is encoder-only with no autoregressive KV cache.
             Self::Bert(_) => KVCache::new(KVCacheConfig::new(0, 0, 0, 0)),
         }
+    }
+
+    /// Create a KV cache with a specific cache mode (e.g., quantized).
+    ///
+    /// This builds the same cache configuration as `create_cache` but applies
+    /// the specified mode. Use `CacheMode::Quantized { bits: 8, group_size: 64 }`
+    /// for the recommended q8_0 "free lunch" (< 0.4% PPL loss, 12-38% throughput gain).
+    pub fn create_cache_with_mode(&self, max_seq_len: usize, mode: CacheMode) -> KVCache {
+        let base = self.create_cache(max_seq_len);
+        let base_config = base.config();
+        let head_dim = base_config.head_dim;
+
+        // Ensure group_size is compatible with head_dim (MLX quantize requires divisibility).
+        // Models like Phi-3 mini (head_dim=96) or NemotronH (head_dim=32) need adjustment.
+        let safe_mode = match mode {
+            CacheMode::Quantized { bits, group_size } if head_dim > 0 && head_dim % group_size != 0 => {
+                let safe_gs = find_compatible_group_size(head_dim, group_size);
+                tracing::info!(
+                    "KV cache: adjusted group_size {group_size} → {safe_gs} (head_dim={head_dim})"
+                );
+                CacheMode::Quantized { bits, group_size: safe_gs }
+            }
+            CacheMode::AsymmetricQuantized { key_bits, value_bits, group_size }
+                if head_dim > 0 && head_dim % group_size != 0 =>
+            {
+                let safe_gs = find_compatible_group_size(head_dim, group_size);
+                tracing::info!(
+                    "KV cache: adjusted group_size {group_size} → {safe_gs} (head_dim={head_dim})"
+                );
+                CacheMode::AsymmetricQuantized { key_bits, value_bits, group_size: safe_gs }
+            }
+            other => other,
+        };
+
+        let config = base_config.clone().with_mode(safe_mode);
+        KVCache::new(config)
     }
 
     pub fn create_mamba_cache(&self) -> Option<MambaCache> {

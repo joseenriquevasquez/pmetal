@@ -1066,6 +1066,7 @@ impl App {
                                 is_moe: r.tags.iter().any(|t| t == "moe"),
                                 num_experts: None,
                                 active_experts: None,
+                                kv_cache_bits: None,
                             };
                             let fit = pmetal_hub::estimate_fit(&model_spec, dev);
                             (
