@@ -182,8 +182,7 @@ impl MoERouter {
         let top_indices = if self.use_bias_balancing {
             // DeepSeek-V3 style: add bias for selection, use original scores for weights
             if let Some(ref bias) = self.routing_bias {
-                let bias_array =
-                    Array::from_slice(bias, &[self.num_experts as i32]);
+                let bias_array = Array::from_slice(bias, &[self.num_experts as i32]);
                 let biased_weights = routing_weights.add(&bias_array)?;
                 let (_, indices) = gpu_topk(&biased_weights, k)?;
                 indices
@@ -228,8 +227,7 @@ impl MoERouter {
         selected_experts.eval()?;
         let indices: Vec<i32> = selected_experts.as_slice().to_vec();
 
-        let target_load =
-            self.num_experts_per_tok as f32 / self.num_experts as f32;
+        let target_load = self.num_experts_per_tok as f32 / self.num_experts as f32;
         let total = (num_tokens * self.num_experts_per_tok) as f32;
 
         // Count actual load per expert

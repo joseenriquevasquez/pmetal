@@ -7,8 +7,8 @@
 
 use std::env;
 
-use pmetal::data::chat_templates::{Message, detect_chat_template};
 use pmetal::data::Tokenizer;
+use pmetal::data::chat_templates::{Message, detect_chat_template};
 use pmetal::hub::resolve_model_path;
 use pmetal::models::{DynamicModel, GenerationConfig, generate_cached_async};
 

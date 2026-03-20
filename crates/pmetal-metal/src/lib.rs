@@ -94,13 +94,13 @@ pub use kernels::fused_cross_entropy::{
     FusedLinearCrossEntropyOutput,
 };
 pub use kernels::fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
-pub use kernels::fused_moe::{
-    ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig,
-    GatherQmmSwiglu, GatherQmmSwigluConfig, StackedExpertWeights,
-};
 pub use kernels::fused_merge::{
     FusedMergeMetal, MergeConfig as FusedMergeConfig, TensorInfo, build_merge_config,
     build_tensor_info,
+};
+pub use kernels::fused_moe::{
+    ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig, GatherQmmSwiglu,
+    GatherQmmSwigluConfig, StackedExpertWeights,
 };
 pub use kernels::fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput};
 pub use kernels::fused_rope::{FusedRoPE, FusedRoPEConfig, RoPECache};

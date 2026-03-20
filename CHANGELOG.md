@@ -7,56 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed (MoE Leapfrog)
-
-- **qdot dequant kernels** (`fused_moe.metal`): Rewrote all 5 Metal kernels with MLX-grade qdot technique — pre-scaled activations eliminate per-nibble shifts from inner loop (~30-40% compute reduction). Thread-local x caching (`load_x4`/`load_x2`) loads x once per column, reuses across all RESULTS_PER_SG rows + gate/up projections. Balanced tree reduction for 2-bit x_sum. Register-only design (no `threadgroup float x_shared[4096]` overflow). 64-thread threadgroups (2 simdgroups x 32)
-- **Deleted combine bridge**: Removed `FusedMoeCombine` Metal kernel and MLX bridge — the 6 MLX ops are already async on GPU; the Metal side-channel added 4x `eval()` + `waitUntilCompleted` barriers making it 5-20x slower
-- **Function constant specialization**: `gather_qmm_swiglu` and `gather_dequant_matvec` use `FC_GROUP_SIZE`/`FC_BITS` Metal function constants for compile-time PSO specialization (eliminates runtime branch)
-- **Deferred GPU dispatch**: `FusedMoeExpert::encode_into()` and `GatherQmmSwiglu::encode_into()` accept external command buffers — encode all K experts in a single CMD buffer with one submit. `forward_offloaded` now encodes K experts into one command buffer instead of K separate GPU flushes
-- **Persistent IO thread pool** (`expert_io.rs`): Replaced `thread::scope`-per-call with persistent worker threads using `mpsc` channels. Workers spawned once, live until Drop. Added `read_experts_aligned()` for zero-copy pread directly into `AlignedBuffer`
-- **2MB-aligned buffer pool** (`expert_buffer.rs`): `AlignedBuffer` wraps `posix_memalign(2MB)` + `newBufferWithBytesNoCopy` for zero-copy GPU access. `ExpertBufferPool` manages `2*K` buffers for double-buffered I/O. 3.6x DMA throughput improvement
-- **Expert weight parser** (`expert_dequant.rs`): Parses raw pread bytes into `ExpertWeightBuffers` via `ExpertRecord` offsets. Safe `chunks_exact` + `from_le_bytes` conversion. Also added `encode_expert_aligned()` zero-copy path using buffer+offset dispatch
-- **Async expert prefetcher** (`expert_prefetch.rs`): `predict_and_prefetch()` spawns background IO thread and returns immediately. `try_get()` transfers buffer ownership (no clone). Gate weights stored as `Arc<Vec<f32>>` to avoid duplicating model weights
-- **Real benchmark harness**: `--benchmark` / `--benchmark-iters` on `pmetal infer` runs real per-token forward passes with GPU sync, reports mean/min/p50/p99 decode latency
-- **forward_offloaded wired end-to-end**: Full pipeline: route → pread K experts → parse → GPU dequant (single CMD buffer) → combine. Previously returned an error stub
-- **Config validation hardened**: `intermediate_dim` alignment checks added. `group_size >= pack_factor` enforced. `hidden_dim` cap removed (register-only kernels handle any dimension)
-
-## [0.3.11] - 2026-03-19
+## [0.3.11] - 2026-03-20
 
 ### Added
 
-- **Fused MoE Metal kernels** (`fused_moe.metal`, `fused_moe.rs`): High-performance fused MoE implementation that handles expert selection, dequantization, and computation in a single pass. Substantial improvement in token-per-second throughput for large MoE models like Qwen3Next and DeepSeek-V3
-- **Expert Management infrastructure** (`expert_io.rs`, `expert_prefetch.rs`, `expert_layout.rs`): Specialized infrastructure for asynchronous expert prefetching and zero-copy loading from unified memory. Overlaps I/O with computation to hide loading latency
-- **DeepSeek-V3 style routing** (`MoERouter`): Added auxiliary-loss-free load balancing via dynamic routing bias. Equalizes expert load without the performance penalty of traditional Switch Transformer auxiliary losses
-- **`pmetal pack-experts` CLI command**: New subcommand for preprocessing raw expert weights into optimized layouts for the fused MoE kernels
-- **`pmetal-data::inference_config` module**: `load_sampling_defaults()` and `collect_all_stop_tokens()` extracted from the CLI and easy API into a shared module consumed by the CLI, GUI Tauri backend, and Python bindings. Eliminates duplicated stop-token and sampling-default logic across three call sites
-- **`pmetal-hub::resolve` module**: `resolve_model_path()` exposed as a public re-export, shared by the trainer orchestrator, Python bindings, and Tauri commands without duplicating the download-or-local-path logic
-- **`pmetal-trainer::preference_data` module**: Preference dataset handling for DPO/RLKD training workflows; `resolve_dataset_path()` made public and re-exported from `lib.rs`
-- **GUI streaming inference via Tauri commands**: `run_inference_streaming()` helper uses `pmetal-data` / `pmetal-hub` / `pmetal-models` directly (replaces former `easy::infer()` builder call), enabling real token-by-token streaming with full stop-token and sampling-config support
-- **CLI `--loss-scale` flag**: Multiplies gradients during backward for ANE training at >350M params to prevent fp32 underflow; automatically unscaled before the optimizer step. Default `1.0` (no change to existing behaviour)
-- **`inference.rs` example**: Low-level inference example using `pmetal-models` / `pmetal-hub` / `pmetal-data` directly, without the easy builder API
-- **Comprehensive documentation site** (`docs/`): Getting-started, installation, hardware, models, training, CLI reference (21 commands), configuration, SDK, Python, and contributing guides
-- **Metal GPU backward kernels** (`dw_gemm.metal`, `dw_gemm.rs`): Tiled fp32 SGEMM kernel replaces per-layer cblas CPU worker thread for weight gradient GEMMs in ANE training. All 7 per-layer dW GEMMs are encoded into a single `BatchedCommandBuffer` for one GPU-CPU sync per step. `LayerGradients` fields migrated from `Vec<f32>` to `MetalBuffer<f32>` (shared unified memory, zero-copy CPU/GPU access). Projected 5.5x backward pass speedup at 579M params
-- **GUI adapter discovery** (`list_trained_adapters`): Scans `~/pmetal-output/` for trained LoRA adapters. Reads `adapter_config.json` + `training_info.json` for rank, alpha, base model, and dataset metadata. Displays descriptive names like "Qwen3-0.6B-Base + alpaca-cleaned r=16"
-- **GUI adapter dropdowns**: Fuse modal and inference page replace manual path entry with adapter select dropdowns. "Custom path..." fallback for arbitrary paths. Fuse modal auto-fills base model when adapter has known metadata
-- **GUI inference chat UX**: Copy button on all messages (hover reveal with checkmark feedback), regenerate button on assistant responses (re-runs same prompt with current config)
-- **GUI auto-named training output**: Default output directory is now `~/pmetal-output/{model}-{method}-{YYYYMMDD-HHMM}` instead of generic `output`. Training writes `training_info.json` with base model, dataset, and method metadata
-- **GUI chat template support**: Inference applies model-specific chat templates (ChatML, Llama3, Gemma, Nemotron, etc.) via `detect_chat_template()`. System message passed through template formatting instead of raw concatenation
-- **`save_adapter_config_with_base()`**: Adapter config now includes `base_model` field for adapter discovery
-
-### Removed
-
-- **`pmetal::easy` module** (breaking for direct users): The high-level `easy::finetune()` / `easy::infer()` builder API is removed from the `pmetal` umbrella crate. Callers should use `pmetal_trainer::orchestrator::run_training()` for training and the `pmetal-models` / `pmetal-hub` / `pmetal-data` crates directly for inference. The `easy` feature flag is removed from `Cargo.toml`; the `data` feature is added to the default set
-- **`inference_easy.rs` and `finetune_easy.rs` examples**: Removed alongside the easy API. Replaced by `inference.rs` and `finetune_manual.rs`
+- **Production serving engine** (`pmetal-serve`): Complete rewrite from greedy-only PoC to production-quality inference server
+  - SOTA GPU-native sampling via `pmetal_models::Sampler`: temperature, top-k, top-p, min-p, repetition/frequency/presence penalties, seeded RNG
+  - True token-by-token streaming via `tokio::sync::mpsc` channels — first byte reaches client as GPU produces it (no collect-then-emit)
+  - `spawn_blocking` generation — HTTP event loop stays responsive during prefill/decode
+  - Client disconnect detection — generation thread stops immediately when receiver drops
+  - Input validation: bounds checking on all sampling params (rejects NaN, Inf, out-of-range), max_tokens clamped to max_seq_len
+  - OpenAI API: `stop` field accepts both `"string"` and `["array"]` formats, `system_fingerprint` field in responses, request-time `created` timestamps
+  - Stop token collection via `collect_all_stop_tokens()` (merges generation_config.json + chat template + tokenizer + well-known probes)
+  - Multi-token stop strings filtered with warning (only single-token stop strings supported)
+- **qdot MoE Metal kernels** (`fused_moe.metal`): Rewrote all 5 kernels with pre-scaled activation technique — ~30-40% compute reduction, thread-local x caching, register-only design (no threadgroup shared memory overflow), 64-thread threadgroups with function constant specialization
+- **Deferred GPU dispatch**: Encode all K experts in single command buffer with one submit instead of K separate GPU flushes
+- **Persistent IO thread pool** (`expert_io.rs`): Persistent workers via mpsc channels with zero-copy aligned pread into `AlignedBuffer` (2MB posix_memalign + `newBufferWithBytesNoCopy`)
+- **Async expert prefetcher**: Background IO thread with ownership transfer via `Option::take` (no clone)
+- **Real benchmark harness**: `--benchmark` / `--benchmark-iters` on `pmetal infer` runs real per-token forward passes with GPU sync, reports mean/min/p50/p99 decode latency
+- **forward_offloaded wired end-to-end**: Full pipeline: route → pread K experts → parse → GPU dequant (single CMD buffer) → combine
 
 ### Fixed
 
-- **CLI inference helper duplication**: `load_sampling_defaults` and `collect_all_stop_tokens` were defined inline in `main.rs` (~170 loc); now delegated to `pmetal_data::inference_config`. No logic change
-- **Trainer `resolve_model_path` Hub routing**: Previously had a feature-flag branch that fell through to a local-path fallback even when the Hub feature was enabled; now unconditionally delegates to `pmetal_hub::resolve_model_path()`
-- **ANE inference adapter loading**: `load_lora_adapter()` now accepts both `"alpha"` and `"lora_alpha"` keys in adapter_config.json, and checks for both `lora_weights.safetensors` (pmetal) and `adapter_model.safetensors` (HF/PEFT)
-- **GUI inference chat template encoding**: Uses `encode_with_special_tokens()` for chat-template-formatted prompts so special tokens (`<|im_start|>`, `<|im_end|>`) are properly tokenized instead of split into subwords. Fixes models like Nemotron generating one token then stopping
-- **Qwen3.5 multimodal weight loading**: `load_qwen3_next_weights()` skips `model.visual.*` and other non-text weights instead of erroring, allowing text-only inference from multimodal model checkpoints
-- **NemotronH hybrid inference**: Streaming path now creates and passes Mamba cache for hybrid models (NemotronH). Previously passed `None`, causing recurrent layers to produce garbage after the first token
+- **GUI LoRA inference producing garbage** (`_framework` token repeated): GUI was not reading `target_modules` from adapter_config.json (all modules got rank=16 instead of only attention) and was not merging LoRA weights before inference. Now reads `target_modules`/`use_rslora`, calls `merge_lora()` + `eval_all()` matching the working CLI path
+- **GUI fuse with cached models failing**: "Fuse with remote base models is not supported" error removed — now calls `resolve_model_path()` to download/resolve, matching CLI behavior
+- **Fused model not recognized by LM Studio**: Three fixes:
+  - Safetensors metadata now uses `format: mlx` (required by LM Studio on macOS)
+  - Generates `model.safetensors.index.json` with weight map (required for model discovery)
+  - Fused weights preserve base model dtype (bf16/f16) instead of upcasting to f32 — halves output file size
+- **`adapter_config.json` missing `base_model`**: Training now saves `base_model` field in adapter config (distillation, GRPO, RLKD paths). Enables auto-detection of base model from LoRA adapter
+- **Serve security hardening**: Default bind `127.0.0.1` (was `0.0.0.0`), sanitized error responses (no internal MLX paths leaked), 2MB request body limit, removed unnecessary `unsafe impl Sync for ModelState`
+- **Serve extra forward pass**: Decode loop restructured to not run a wasted forward pass after the final token
+- **Serve SSE error handling**: `[DONE]` no longer emitted after `TokenEvent::Error` — stream ends with error event only
+- **Serve UTF-8 streaming**: Token buffer accumulates and decodes together to prevent garbled multi-byte characters at BPE boundaries
+
+### Changed
+
+- **GUI fuse modal UX**: "Cancel" becomes "Done" after successful fuse with "Fuse Another" option. Base model field is read-only, auto-detected from LoRA adapter's `adapter_config.json`
+- **GUI inference auto-select**: Selecting a LoRA adapter in inference automatically selects the matching base model (mirrors training page behavior)
+- **Deleted MoE combine bridge**: Removed `FusedMoeCombine` Metal kernel — the 6 MLX ops are already async on GPU; the Metal side-channel added sync barriers making it 5-20x slower
+- **Fused MoE Metal kernels** (`fused_moe.metal`, `fused_moe.rs`): High-performance fused MoE implementation that handles expert selection, dequantization, and computation in a single pass
+- **Expert Management infrastructure** (`expert_io.rs`, `expert_prefetch.rs`, `expert_layout.rs`): Asynchronous expert prefetching and zero-copy loading from unified memory
+- **DeepSeek-V3 style routing** (`MoERouter`): Auxiliary-loss-free load balancing via dynamic routing bias
+- **`pmetal pack-experts` CLI command**: Preprocessing raw expert weights into optimized layouts for fused MoE kernels
+- **`pmetal-data::inference_config` module**: `load_sampling_defaults()` and `collect_all_stop_tokens()` shared across CLI, GUI, and Python bindings
+- **`pmetal-hub::resolve` module**: `resolve_model_path()` shared by trainer, Python bindings, and Tauri commands
+- **GUI streaming inference**: Token-by-token streaming with full stop-token and sampling-config support
+- **CLI `--loss-scale` flag**: Gradient scaling for ANE training at >350M params
+- **Comprehensive documentation site** (`docs/`): Getting-started, installation, hardware, models, training, CLI reference (21 commands), configuration, SDK, Python, and contributing guides
+- **Metal GPU backward kernels** (`dw_gemm.metal`): Tiled fp32 SGEMM for weight gradient GEMMs in ANE training — single `BatchedCommandBuffer` per step
+- **GUI adapter discovery**: Scans `~/pmetal-output/` for trained LoRA adapters with rank, alpha, base model metadata
+- **GUI adapter dropdowns**: Fuse modal and inference page replace manual path entry with adapter select dropdowns
+- **GUI chat template support**: Model-specific chat templates via `detect_chat_template()`
+- **`save_adapter_config_with_base()`**: Adapter config now includes `base_model` field
+
+### Removed
+
+- **`pmetal::easy` module** (breaking): Removed in favor of direct `pmetal-models` / `pmetal-hub` / `pmetal-data` usage
+
+### Fixed
+
+- **GUI LoRA inference producing garbage**: GUI was not reading `target_modules` from adapter_config.json and was not merging LoRA weights before inference. Now reads `target_modules`/`use_rslora`, calls `merge_lora()` + `eval_all()`
+- **GUI fuse with cached models failing**: "Fuse with remote base models is not supported" error removed — now calls `resolve_model_path()`
+- **Fused model not recognized by LM Studio**: Safetensors metadata `format: mlx`, generates `model.safetensors.index.json`, preserves base dtype (bf16/f16) instead of upcasting to f32
+- **Serve security**: Default bind `127.0.0.1`, sanitized error responses, 2MB body limit, removed `unsafe impl Sync`
+- **Serve extra forward pass**: Decode loop no longer runs wasted forward pass after final token
+- **Serve SSE error handling**: `[DONE]` no longer emitted after errors
+- **Serve UTF-8 streaming**: Token buffering prevents garbled multi-byte characters
+- **CLI inference helper duplication**: Delegated to `pmetal_data::inference_config`
+- **ANE inference adapter loading**: Accepts both `"alpha"` and `"lora_alpha"` keys, checks both `lora_weights.safetensors` and `adapter_model.safetensors`
+- **GUI chat template encoding**: `encode_with_special_tokens()` for proper special token handling
+- **Qwen3.5 multimodal weight loading**: Skips non-text weights instead of erroring
+- **NemotronH hybrid inference**: Creates and passes Mamba cache for hybrid models
 
 ### Changed
 

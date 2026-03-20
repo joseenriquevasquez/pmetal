@@ -12,10 +12,10 @@
 
 pub mod chat_templates;
 pub mod collator;
-pub mod inference_config;
 pub mod dataloader;
 pub mod dataset;
 pub mod image_processing;
+pub mod inference_config;
 pub mod packing;
 pub mod tokenizer;
 pub mod vocab_compact;

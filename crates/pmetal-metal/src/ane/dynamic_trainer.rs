@@ -552,7 +552,11 @@ impl DynamicAneTrainer {
                                 MetalBuffer::new(&ctx, max_scratch, BufferUsage::Shared),
                             ) {
                                 (Ok(sa), Ok(sb)) => {
-                                    info!(dim = d, scratch_size = max_scratch, "GPU dW path enabled (Metal GEMM)");
+                                    info!(
+                                        dim = d,
+                                        scratch_size = max_scratch,
+                                        "GPU dW path enabled (Metal GEMM)"
+                                    );
                                     (Some(ctx.clone()), Some(dw), Some(sa), Some(sb))
                                 }
                                 _ => {
@@ -573,7 +577,11 @@ impl DynamicAneTrainer {
                 }
             }
         } else {
-            info!(dim = d, threshold = GPU_DW_MIN_DIM, "dim below GPU dW threshold, using cblas");
+            info!(
+                dim = d,
+                threshold = GPU_DW_MIN_DIM,
+                "dim below GPU dW threshold, using cblas"
+            );
             (None, None, None, None)
         };
 
@@ -1140,9 +1148,16 @@ impl DynamicAneTrainer {
 
         // 2. dW2 = dx @ silu_out^T
         encode_dw_gemm(
-            gpu_dw, scratch_a, scratch_b, batch.as_mut(),
-            &dx[..d * s], &self.layer_acts[l].silu_out,
-            &self.layer_grads[l].w2, d, h, s,
+            gpu_dw,
+            scratch_a,
+            scratch_b,
+            batch.as_mut(),
+            &dx[..d * s],
+            &self.layer_acts[l].silu_out,
+            &self.layer_grads[l].w2,
+            d,
+            h,
+            s,
         );
 
         // 3. SiLU derivative on CPU
@@ -1159,14 +1174,28 @@ impl DynamicAneTrainer {
 
         // dW1, dW3
         encode_dw_gemm(
-            gpu_dw, scratch_a, scratch_b, batch.as_mut(),
-            &dh1, &self.layer_acts[l].x2norm,
-            &self.layer_grads[l].w1, h, d, s,
+            gpu_dw,
+            scratch_a,
+            scratch_b,
+            batch.as_mut(),
+            &dh1,
+            &self.layer_acts[l].x2norm,
+            &self.layer_grads[l].w1,
+            h,
+            d,
+            s,
         );
         encode_dw_gemm(
-            gpu_dw, scratch_a, scratch_b, batch.as_mut(),
-            &dh3, &self.layer_acts[l].x2norm,
-            &self.layer_grads[l].w3, h, d, s,
+            gpu_dw,
+            scratch_a,
+            scratch_b,
+            batch.as_mut(),
+            &dh3,
+            &self.layer_acts[l].x2norm,
+            &self.layer_grads[l].w3,
+            h,
+            d,
+            s,
         );
 
         // 4. dh1@W1^T + dh3@W3^T → dx_ffn (fused ANE kernel)
@@ -1237,9 +1266,16 @@ impl DynamicAneTrainer {
 
         // dWo
         encode_dw_gemm(
-            gpu_dw, scratch_a, scratch_b, batch.as_mut(),
-            &dx_ffn_norm, &self.layer_acts[l].attn_out,
-            &self.layer_grads[l].wo, d, qd, s,
+            gpu_dw,
+            scratch_a,
+            scratch_b,
+            batch.as_mut(),
+            &dx_ffn_norm,
+            &self.layer_acts[l].attn_out,
+            &self.layer_grads[l].wo,
+            d,
+            qd,
+            s,
         );
 
         // 7. SDPA backward part 2: Q, K, probs, dp → dQ, dK
@@ -1261,19 +1297,40 @@ impl DynamicAneTrainer {
 
         // dWq, dWk, dWv
         encode_dw_gemm(
-            gpu_dw, scratch_a, scratch_b, batch.as_mut(),
-            &dq, &self.layer_acts[l].xnorm,
-            &self.layer_grads[l].wq, qd, d, s,
+            gpu_dw,
+            scratch_a,
+            scratch_b,
+            batch.as_mut(),
+            &dq,
+            &self.layer_acts[l].xnorm,
+            &self.layer_grads[l].wq,
+            qd,
+            d,
+            s,
         );
         encode_dw_gemm(
-            gpu_dw, scratch_a, scratch_b, batch.as_mut(),
-            &dk, &self.layer_acts[l].xnorm,
-            &self.layer_grads[l].wk, kvd, d, s,
+            gpu_dw,
+            scratch_a,
+            scratch_b,
+            batch.as_mut(),
+            &dk,
+            &self.layer_acts[l].xnorm,
+            &self.layer_grads[l].wk,
+            kvd,
+            d,
+            s,
         );
         encode_dw_gemm(
-            gpu_dw, scratch_a, scratch_b, batch.as_mut(),
-            &dv, &self.layer_acts[l].xnorm,
-            &self.layer_grads[l].wv, kvd, d, s,
+            gpu_dw,
+            scratch_a,
+            scratch_b,
+            batch.as_mut(),
+            &dv,
+            &self.layer_acts[l].xnorm,
+            &self.layer_grads[l].wv,
+            kvd,
+            d,
+            s,
         );
 
         // 8. QKV backward projections (dxq, dxk, dxv)

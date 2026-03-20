@@ -9,8 +9,8 @@
 
 use std::path::Path;
 
-use crate::chat_templates::ChatTemplateType;
 use crate::Tokenizer;
+use crate::chat_templates::ChatTemplateType;
 
 /// Collect all stop tokens from every available source.
 ///

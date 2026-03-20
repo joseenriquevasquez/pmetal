@@ -164,11 +164,7 @@ impl FusedMoeExpert {
         {
             let mut cache = ctx.pipeline_cache_mut();
             cache.get_or_create_pipeline(ctx.device(), "fused_gate_up_swiglu", None)?;
-            cache.get_or_create_pipeline(
-                ctx.device(),
-                config.bits.matvec_kernel_name(),
-                None,
-            )?;
+            cache.get_or_create_pipeline(ctx.device(), config.bits.matvec_kernel_name(), None)?;
         }
 
         Ok(Self { ctx, config })
@@ -647,7 +643,16 @@ impl GatherQmmSwiglu {
         output: &MetalBuffer<f32>,
     ) -> Result<()> {
         let command_buffer = self.create_command_buffer()?;
-        self.encode_into(&command_buffer, num_tokens, topk, input, expert_ids, weights, intermediate, output)?;
+        self.encode_into(
+            &command_buffer,
+            num_tokens,
+            topk,
+            input,
+            expert_ids,
+            weights,
+            intermediate,
+            output,
+        )?;
 
         command_buffer.commit();
         command_buffer.waitUntilCompleted();
@@ -677,11 +682,25 @@ impl GatherQmmSwiglu {
         let fc = Self::function_constants(&self.config);
 
         self.encode_gate_up_swiglu(
-            command_buffer, num_tokens, topk, input, expert_ids, weights, intermediate, &fc,
+            command_buffer,
+            num_tokens,
+            topk,
+            input,
+            expert_ids,
+            weights,
+            intermediate,
+            &fc,
         )?;
 
         self.encode_down(
-            command_buffer, num_tokens, topk, intermediate, expert_ids, weights, output, &fc,
+            command_buffer,
+            num_tokens,
+            topk,
+            intermediate,
+            expert_ids,
+            weights,
+            output,
+            &fc,
         )?;
 
         Ok(())
@@ -746,8 +765,7 @@ impl GatherQmmSwiglu {
         }
 
         let rows_per_tg: u32 = 8;
-        let tiles_per_token_expert =
-            self.config.intermediate_dim.div_ceil(rows_per_tg);
+        let tiles_per_token_expert = self.config.intermediate_dim.div_ceil(rows_per_tg);
         let total_threadgroups = num_tokens * topk * tiles_per_token_expert;
 
         let grid_size = objc2_metal::MTLSize {

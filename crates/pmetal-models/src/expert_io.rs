@@ -166,18 +166,19 @@ impl ExpertIoPool {
                 size,
                 result_idx: i,
             };
-            self.task_tx
-                .send((work, file.clone()))
-                .map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "IO pool shut down")
-                })?;
+            self.task_tx.send((work, file.clone())).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "IO pool shut down")
+            })?;
         }
 
         // Collect all results
         let mut results: Vec<Option<Vec<u8>>> = (0..n).map(|_| None).collect();
         for _ in 0..n {
             let result = self.result_rx.lock().unwrap().recv().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "IO pool result channel closed")
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "IO pool result channel closed",
+                )
             })?;
             match result.data {
                 Ok(data) => {
@@ -381,13 +382,13 @@ impl ExpertOffloadContext {
             {
                 let errors = &errors;
                 s.spawn(move || {
-                    for (i, (buf, &eidx)) in
-                        buf_chunk.iter_mut().zip(idx_chunk.iter()).enumerate()
+                    for (i, (buf, &eidx)) in buf_chunk.iter_mut().zip(idx_chunk.iter()).enumerate()
                     {
                         let offset = eidx as u64 * expert_size as u64;
-                        if let Err(e) = buf.pread(fd, offset).map_err(|e| {
-                            std::io::Error::other(e.to_string())
-                        }) {
+                        if let Err(e) = buf
+                            .pread(fd, offset)
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                        {
                             let global_idx = chunk_idx * chunk_size + i;
                             errors.lock().unwrap().push((global_idx, e));
                         }

@@ -31,8 +31,9 @@ use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use pmetal_mlx::{
     gather_mm,
     kernels::{
-        AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+        AttentionMaskType, FusedAttentionConfig,
         fused_moe::moe_combine_mlx,
+        fused_sdpa,
         gated_delta::gated_delta_update,
         rope::{RopeScaling, apply_rope},
     },
@@ -1051,8 +1052,9 @@ impl Qwen3NextSparseMoeBlock {
             // x_flat to Metal buffer (tiny for T=1 decode)
             let x_flat_f32 = x_flat.as_type::<f32>()?;
             x_flat_f32.eval()?;
-            let input_buf = pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(&metal_ctx, &x_flat_f32)
-                .map_err(|e| Exception::custom(e.to_string()))?;
+            let input_buf =
+                pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(&metal_ctx, &x_flat_f32)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
 
             // Process each expert
             let mut expert_outputs: Vec<Vec<f32>> = Vec::with_capacity(expert_indices.len());
@@ -1064,7 +1066,8 @@ impl Qwen3NextSparseMoeBlock {
                 .map_err(|e| Exception::custom(e.to_string()))?;
 
             // Per-expert output buffers (needed because each expert writes to same hidden_dim)
-            let mut per_expert_out: Vec<pmetal_metal::MetalBuffer<f32>> = Vec::with_capacity(expert_bufs.len());
+            let mut per_expert_out: Vec<pmetal_metal::MetalBuffer<f32>> =
+                Vec::with_capacity(expert_bufs.len());
             for _ in 0..expert_bufs.len() {
                 per_expert_out.push(
                     pmetal_metal::MetalBuffer::<f32>::new(
@@ -1077,11 +1080,18 @@ impl Qwen3NextSparseMoeBlock {
             }
 
             for (i, raw_bytes) in expert_bufs.iter().enumerate() {
-                let weights = crate::expert_dequant::parse_expert_weights(raw_bytes, record, &metal_ctx)
-                    .map_err(|e| Exception::custom(e))?;
+                let weights =
+                    crate::expert_dequant::parse_expert_weights(raw_bytes, record, &metal_ctx)
+                        .map_err(|e| Exception::custom(e))?;
 
                 fused_expert
-                    .encode_into(&cmd_buf, &input_buf, &weights, &per_expert_out[i], &expert_intermediate)
+                    .encode_into(
+                        &cmd_buf,
+                        &input_buf,
+                        &weights,
+                        &per_expert_out[i],
+                        &expert_intermediate,
+                    )
                     .map_err(|e| Exception::custom(e.to_string()))?;
             }
 
@@ -1097,10 +1107,7 @@ impl Qwen3NextSparseMoeBlock {
             // ---- Combine: weighted sum + shared expert + residual ----
             // Build expert output tensor [batch_seq, k, hidden]
             let all_expert_data: Vec<f32> = expert_outputs.into_iter().flatten().collect();
-            let down_out = Array::from_slice(
-                &all_expert_data,
-                &[batch_seq, k, hidden],
-            );
+            let down_out = Array::from_slice(&all_expert_data, &[batch_seq, k, hidden]);
 
             let shared_y = self.shared_expert.forward(&x_flat)?;
             let shared_gate_logit = self.shared_expert_gate.forward(&x_flat)?;

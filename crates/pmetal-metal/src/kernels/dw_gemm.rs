@@ -81,9 +81,24 @@ impl DwGemm {
         alpha: f32,
         beta: f32,
     ) -> Result<()> {
-        debug_assert!(a.len() >= m * k, "A buffer too small: {} < {}", a.len(), m * k);
-        debug_assert!(b.len() >= n * k, "B buffer too small: {} < {}", b.len(), n * k);
-        debug_assert!(c.len() >= m * n, "C buffer too small: {} < {}", c.len(), m * n);
+        debug_assert!(
+            a.len() >= m * k,
+            "A buffer too small: {} < {}",
+            a.len(),
+            m * k
+        );
+        debug_assert!(
+            b.len() >= n * k,
+            "B buffer too small: {} < {}",
+            b.len(),
+            n * k
+        );
+        debug_assert!(
+            c.len() >= m * n,
+            "C buffer too small: {} < {}",
+            c.len(),
+            m * n
+        );
 
         let pipeline = {
             let mut cache = self.ctx.pipeline_cache_mut();
@@ -209,9 +224,15 @@ mod tests {
         let k = 32;
 
         // Random-ish deterministic data
-        let a_data: Vec<f32> = (0..m * k).map(|i| ((i * 7 + 3) % 100) as f32 * 0.01).collect();
-        let b_data: Vec<f32> = (0..n * k).map(|i| ((i * 11 + 5) % 100) as f32 * 0.01).collect();
-        let c_init: Vec<f32> = (0..m * n).map(|i| ((i * 13 + 7) % 100) as f32 * 0.001).collect();
+        let a_data: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7 + 3) % 100) as f32 * 0.01)
+            .collect();
+        let b_data: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 11 + 5) % 100) as f32 * 0.01)
+            .collect();
+        let c_init: Vec<f32> = (0..m * n)
+            .map(|i| ((i * 13 + 7) % 100) as f32 * 0.001)
+            .collect();
 
         // ---- CPU reference: C_ref = 1.0 * A @ B^T + 1.0 * C ----
         let mut c_ref = c_init.clone();
@@ -268,8 +289,12 @@ mod tests {
         let n = 50;
         let k = 19;
 
-        let a_data: Vec<f32> = (0..m * k).map(|i| ((i * 3 + 1) % 50) as f32 * 0.02).collect();
-        let b_data: Vec<f32> = (0..n * k).map(|i| ((i * 5 + 2) % 50) as f32 * 0.02).collect();
+        let a_data: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 3 + 1) % 50) as f32 * 0.02)
+            .collect();
+        let b_data: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 5 + 2) % 50) as f32 * 0.02)
+            .collect();
         let c_init: Vec<f32> = vec![0.0; m * n];
 
         // CPU reference (beta=0 this time)

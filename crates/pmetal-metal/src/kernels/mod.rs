@@ -13,8 +13,8 @@ pub mod fused_cross_entropy;
 pub mod fused_distill;
 pub mod fused_gdn;
 pub mod fused_lora;
-pub mod fused_moe;
 pub mod fused_merge;
+pub mod fused_moe;
 pub mod fused_norm_lora;
 pub mod fused_rope;
 pub mod fused_sampler;
@@ -24,6 +24,7 @@ pub mod moe;
 
 // Re-export main types
 pub use batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
+pub use dw_gemm::{DwGemm, GPU_DW_MIN_DIM, ScratchPool};
 pub use flash_attention::{
     FlashAttention, FlashAttentionConfig, FlashAttentionOutput, FlashAttentionVarlen,
     FlashAttentionVarlenConfig, FlashAttentionVarlenOutput,
@@ -49,6 +50,10 @@ pub use fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
 pub use fused_merge::{
     FusedMergeMetal, MergeConfig, TensorInfo, build_merge_config, build_tensor_info,
 };
+pub use fused_moe::{
+    ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig, GatherQmmSwiglu,
+    GatherQmmSwigluConfig, StackedExpertWeights,
+};
 pub use fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput};
 pub use fused_rope::{FusedRoPE, FusedRoPEConfig, RoPECache};
 pub use fused_sampler::{FusedSampler, FusedSamplerConfig, SamplingParams};
@@ -58,10 +63,5 @@ pub use fused_swiglu::{
 pub use fused_training::{
     AdamWConfig, BatchCompletionToken, BatchedCommandBuffer, FusedAdamW, FusedCrossEntropyTraining,
     FusedGradientClipping, FusedTrainingCoordinator, ParamInfo,
-};
-pub use dw_gemm::{DwGemm, ScratchPool, GPU_DW_MIN_DIM};
-pub use fused_moe::{
-    ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig,
-    GatherQmmSwiglu, GatherQmmSwigluConfig, StackedExpertWeights,
 };
 pub use moe::{MoeConfig, MoeGemmOutput, MoeKernel, MoeRouting};

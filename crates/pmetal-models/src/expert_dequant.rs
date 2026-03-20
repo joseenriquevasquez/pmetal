@@ -38,9 +38,9 @@ use std::mem;
 use std::sync::Arc;
 
 use pmetal_metal::{
+    ExpertWeightBuffers,
     buffer::{BufferUsage, MetalBuffer},
     context::MetalContext,
-    ExpertWeightBuffers,
 };
 
 use crate::expert_layout::{ExpertComponent, ExpertRecord};
@@ -191,11 +191,7 @@ fn component_bytes<'a>(
 ///
 /// A mismatch indicates a corrupt or mismatched layout descriptor.
 #[inline]
-fn validate_alignment(
-    byte_len: usize,
-    elem_size: usize,
-    name: &'static str,
-) -> Result<(), String> {
+fn validate_alignment(byte_len: usize, elem_size: usize, name: &'static str) -> Result<(), String> {
     if byte_len % elem_size != 0 {
         return Err(format!(
             "expert_dequant: component '{name}' byte count ({byte_len}) is not \
@@ -224,11 +220,7 @@ mod tests {
         let mut raw = vec![0u8; total];
 
         // Fill weight components with a counting pattern (LE u32 = 0, 1, 2, …)
-        for comp in [
-            &record.gate_weight,
-            &record.up_weight,
-            &record.down_weight,
-        ] {
+        for comp in [&record.gate_weight, &record.up_weight, &record.down_weight] {
             for (i, chunk) in raw[comp.offset..comp.offset + comp.size]
                 .chunks_exact_mut(4)
                 .enumerate()
@@ -265,8 +257,8 @@ mod tests {
         let record = ExpertRecord::compute(256, 128, 64, PackedBits::Four);
         let raw = make_synthetic_raw(&record);
 
-        let buffers = parse_expert_weights(&raw, &record, &ctx)
-            .expect("parse_expert_weights should succeed");
+        let buffers =
+            parse_expert_weights(&raw, &record, &ctx).expect("parse_expert_weights should succeed");
 
         // gate_weight: [128, 256/8] = [128, 32] → 4096 u32 elements
         assert_eq!(

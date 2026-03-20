@@ -5,8 +5,8 @@
 //! and adding synchronization barriers (4x eval() + waitUntilCompleted) made the
 //! Metal path 5-20x slower than the MLX ops it replaced.
 
-use mlx_rs::error::Exception;
 use mlx_rs::Array;
+use mlx_rs::error::Exception;
 
 /// MoE combine: residual + weighted expert sum + sigmoid-gated shared expert.
 ///

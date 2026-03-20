@@ -220,8 +220,8 @@ impl AlignedBuffer {
         // We must not free it before all GPU work referencing this buffer has
         // completed; the pool's `release` / `acquire_blocking` protocol enforces
         // this by requiring callers to wait for GPU completion first.
-        let options = MTLResourceOptions::StorageModeShared
-            | MTLResourceOptions::HazardTrackingModeTracked;
+        let options =
+            MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeTracked;
 
         // SAFETY:
         // 1. `raw.as_ptr()` is non-null, 2 MB-aligned, and valid for
@@ -403,7 +403,8 @@ impl AlignedBuffer {
         }
 
         // SAFETY: `dst` is within the valid allocation as checked above.
-        let dst = unsafe { (self.raw.as_ptr() as *mut u8).add(buf_offset) } as *mut std::ffi::c_void;
+        let dst =
+            unsafe { (self.raw.as_ptr() as *mut u8).add(buf_offset) } as *mut std::ffi::c_void;
 
         let n = unsafe { sys::pread(fd, dst, byte_len, file_offset as i64) };
 
@@ -623,10 +624,7 @@ impl ExpertBufferPool {
         let mut guard = self.inner.available.lock();
         loop {
             if let Some(buf) = guard.pop_front() {
-                trace!(
-                    remaining = guard.len(),
-                    "ExpertBufferPool: buffer acquired"
-                );
+                trace!(remaining = guard.len(), "ExpertBufferPool: buffer acquired");
                 return buf;
             }
             // Queue is empty — wait for a release() notification.
@@ -677,10 +675,7 @@ impl ExpertBufferPool {
         {
             let mut guard = self.inner.available.lock();
             guard.push_back(buf);
-            trace!(
-                available = guard.len(),
-                "ExpertBufferPool: buffer released"
-            );
+            trace!(available = guard.len(), "ExpertBufferPool: buffer released");
         }
         // Wake one waiter (if any).
         self.inner.returned.notify_one();
@@ -857,8 +852,7 @@ mod tests {
         let slice = unsafe { buf.as_bytes_mut() };
         for (i, &byte) in slice[..data.len()].iter().enumerate() {
             assert_eq!(
-                byte,
-                data[i],
+                byte, data[i],
                 "mismatch at byte {i}: got {byte}, want {}",
                 data[i]
             );
@@ -881,7 +875,9 @@ mod tests {
         unsafe { buf.as_bytes_mut() }.fill(0u8);
 
         use std::os::unix::io::AsRawFd;
-        let n = buf.pread_range(tmp.as_raw_fd(), 0, 0, payload.len()).unwrap();
+        let n = buf
+            .pread_range(tmp.as_raw_fd(), 0, 0, payload.len())
+            .unwrap();
         assert_eq!(n, payload.len());
 
         let slice = unsafe { buf.as_bytes_mut() };

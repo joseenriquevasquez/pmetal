@@ -99,12 +99,20 @@ pub fn load_dpo_dataset(
         )
         .ok_or_else(|| anyhow::anyhow!("Preference row missing rejected response"))?;
 
-        let prompt_ids =
-            encode_segment(tokenizer, prompt, max_prompt_length, truncate_prompt_left, false)?;
+        let prompt_ids = encode_segment(
+            tokenizer,
+            prompt,
+            max_prompt_length,
+            truncate_prompt_left,
+            false,
+        )?;
         let chosen_ids = encode_segment(tokenizer, chosen, max_completion_length, false, true)?;
-        let rejected_ids =
-            encode_segment(tokenizer, rejected, max_completion_length, false, true)?;
-        pairs.push(dpo::PreferencePair::new(prompt_ids, chosen_ids, rejected_ids));
+        let rejected_ids = encode_segment(tokenizer, rejected, max_completion_length, false, true)?;
+        pairs.push(dpo::PreferencePair::new(
+            prompt_ids,
+            chosen_ids,
+            rejected_ids,
+        ));
     }
     Ok(pairs)
 }
@@ -148,8 +156,7 @@ pub fn load_simpo_dataset(
 
         let prompt_ids = encode_segment(tokenizer, prompt, max_prompt_length, true, false)?;
         let chosen_ids = encode_segment(tokenizer, chosen, max_completion_length, false, true)?;
-        let rejected_ids =
-            encode_segment(tokenizer, rejected, max_completion_length, false, true)?;
+        let rejected_ids = encode_segment(tokenizer, rejected, max_completion_length, false, true)?;
         pairs.push(simpo::PreferencePair::new(
             prompt_ids,
             chosen_ids,
@@ -175,9 +182,8 @@ pub fn load_kto_dataset(
     for row in rows {
         let prompt = extract_first_string(&row, &["prompt", "instruction", "input"])
             .ok_or_else(|| anyhow::anyhow!("KTO row missing prompt"))?;
-        let response =
-            extract_first_string(&row, &["completion", "response", "output", "answer"])
-                .ok_or_else(|| anyhow::anyhow!("KTO row missing response"))?;
+        let response = extract_first_string(&row, &["completion", "response", "output", "answer"])
+            .ok_or_else(|| anyhow::anyhow!("KTO row missing response"))?;
         let label = row
             .get("label")
             .or_else(|| row.get("rating"))
@@ -201,8 +207,7 @@ pub fn load_kto_dataset(
             truncate_prompt_left,
             false,
         )?;
-        let response_ids =
-            encode_segment(tokenizer, response, max_completion_length, false, true)?;
+        let response_ids = encode_segment(tokenizer, response, max_completion_length, false, true)?;
         samples.push(KtoSample::new(prompt_ids, response_ids, is_desirable));
     }
     Ok(samples)

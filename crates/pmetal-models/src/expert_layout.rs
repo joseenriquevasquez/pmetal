@@ -200,8 +200,7 @@ impl ExpertPackLayout {
     /// Save layout to JSON file.
     pub fn save(&self, base_dir: &Path) -> std::io::Result<()> {
         let path = base_dir.join("layout.json");
-        let json = serde_json::to_string_pretty(self)
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
@@ -209,8 +208,7 @@ impl ExpertPackLayout {
     pub fn load(base_dir: &Path) -> std::io::Result<Self> {
         let path = base_dir.join("layout.json");
         let json = std::fs::read_to_string(path)?;
-        serde_json::from_str(&json)
-            .map_err(std::io::Error::other)
+        serde_json::from_str(&json).map_err(std::io::Error::other)
     }
 }
 
@@ -231,7 +229,10 @@ mod tests {
 
         // Verify flash-moe reference value for this config
         let total = record.total_size();
-        assert_eq!(total, 7_077_888, "Expert size should match flash-moe's EXPERT_SIZE");
+        assert_eq!(
+            total, 7_077_888,
+            "Expert size should match flash-moe's EXPERT_SIZE"
+        );
     }
 
     #[test]
@@ -244,7 +245,11 @@ mod tests {
         // 2-bit should be ~44% smaller than 4-bit
         let four_bit = ExpertRecord::compute(4096, 1024, 64, PackedBits::Four);
         let ratio = record.total_size() as f64 / four_bit.total_size() as f64;
-        assert!(ratio < 0.6, "2-bit should be <60% of 4-bit size, got {:.1}%", ratio * 100.0);
+        assert!(
+            ratio < 0.6,
+            "2-bit should be <60% of 4-bit size, got {:.1}%",
+            ratio * 100.0
+        );
     }
 
     #[test]

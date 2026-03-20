@@ -156,11 +156,7 @@ impl ExpertPrefetcher {
     /// transferred, not cloned), and `None` for experts needing sync fallback.
     ///
     /// The returned Vec has the same length and order as `expert_indices`.
-    pub fn try_get(
-        &self,
-        layer_idx: usize,
-        expert_indices: &[usize],
-    ) -> Vec<Option<Vec<u8>>> {
+    pub fn try_get(&self, layer_idx: usize, expert_indices: &[usize]) -> Vec<Option<Vec<u8>>> {
         let mut pending = self.pending.lock().unwrap();
         let prefetch = pending.remove(&layer_idx);
 
