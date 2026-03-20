@@ -531,6 +531,7 @@ pub struct GptOssMoE {
     /// MoE layer from pmetal-mlx.
     moe_layer: MoELayer,
     /// SwiGLU limit for clamping.
+    #[allow(dead_code)] // Kept for future clamping pass; currently handled inside MoELayer
     swiglu_limit: f32,
 }
 
@@ -847,6 +848,7 @@ impl LoraLinear {
 #[derive(Debug)]
 pub struct GptOssLoraAttention {
     /// Layer index.
+    #[allow(dead_code)] // Retained for debugging and future layer-aware LoRA scheduling
     layer_idx: usize,
     /// Number of attention heads.
     n_heads: i32,
@@ -871,6 +873,7 @@ pub struct GptOssLoraAttention {
     /// Output projection with LoRA.
     pub o_proj: LoraLinear,
     /// Config reference.
+    #[allow(dead_code)] // Retained for LoRA merge/export which needs full arch config
     config: GptOssConfig,
 }
 

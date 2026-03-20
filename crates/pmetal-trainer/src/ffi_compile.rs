@@ -57,20 +57,17 @@ use crate::Result;
 ///
 /// This struct owns the model and optimizer, and provides a JIT-compiled
 /// training step that properly handles state updates.
+// Fields and methods below are part of the experimental FFI JIT compilation
+// infrastructure. The JIT path currently falls back to eager execution, so
+// these are set up but not yet consumed end-to-end.
+#[allow(dead_code)]
 pub struct CompiledTrainingStep<M, O> {
-    /// Model being trained
     model: M,
-    /// Optimizer
     optimizer: O,
-    /// Sorted parameter keys for deterministic state ordering
     param_keys: Vec<Rc<str>>,
-    /// Number of model parameters
     num_params: usize,
-    /// Number of optimizer state arrays (after warmup)
     num_opt_state: usize,
-    /// Unique ID for compiled function caching
     compile_id: usize,
-    /// Whether compilation is enabled
     compiled: bool,
 }
 
@@ -123,7 +120,7 @@ where
         })
     }
 
-    /// Extract model parameters as flat array list in deterministic order.
+    #[allow(dead_code)]
     fn extract_model_params(&self) -> Vec<Array> {
         let params = self.model.trainable_parameters().flatten();
         self.param_keys
@@ -137,7 +134,7 @@ where
             .collect()
     }
 
-    /// Update model parameters from flat array list.
+    #[allow(dead_code)]
     fn update_model_params(&mut self, arrays: &[Array]) -> Result<()> {
         let updates: FlattenedModuleParam = self
             .param_keys
@@ -150,7 +147,7 @@ where
         Ok(())
     }
 
-    /// Extract optimizer state as flat array list.
+    #[allow(dead_code)]
     fn extract_optimizer_state(&self) -> Vec<Array> {
         self.optimizer
             .updatable_states()
@@ -159,7 +156,7 @@ where
             .collect()
     }
 
-    /// Update optimizer state from flat array list.
+    #[allow(dead_code)]
     fn update_optimizer_state(&mut self, arrays: &[Array]) {
         for (state_ref, new_val) in self
             .optimizer
@@ -224,22 +221,15 @@ where
 ///
 /// This struct uses direct FFI calls to MLX's compile API, bypassing mlx-rs's
 /// `compile` function which requires the closure to be Copy.
+#[allow(dead_code)] // JIT infrastructure — fields set in constructor for future JIT path
 pub struct JitTrainingStep<F> {
-    /// Forward function: (params_map, input_ids) -> logits
     forward_fn: F,
-    /// Ordered parameter keys for state reconstruction
     param_keys: Arc<[Rc<str>]>,
-    /// Learning rate for optimizer
     learning_rate: f32,
-    /// Number of model parameters
     num_params: usize,
-    /// Number of optimizer state arrays
     num_opt_state: usize,
-    /// Optional gradient clipping threshold
     max_grad_norm: Option<f32>,
-    /// Whether to use JIT compilation
     use_jit: bool,
-    /// Compile ID for MLX caching
     compile_id: usize,
 }
 
@@ -354,11 +344,9 @@ where
 
     /// Execute training step with JIT compilation using direct FFI.
     ///
-    /// NOTE: Direct FFI JIT compilation is experimental and may cause Metal errors.
-    /// For now, this falls back to eager execution which is well-tested and stable.
-    /// The raw_ffi module provides the building blocks for future JIT support.
-    ///
-    /// TODO: Investigate Metal command buffer timing issues with FFI compilation.
+    /// NOTE: Direct FFI JIT compilation is experimental. Falls back to eager
+    /// execution due to Metal command buffer timing issues. The raw_ffi module
+    /// provides the building blocks for future JIT support.
     fn step_jit(
         &self,
         input_ids: &Array,

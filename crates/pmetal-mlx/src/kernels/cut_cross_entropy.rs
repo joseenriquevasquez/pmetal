@@ -138,6 +138,7 @@ pub struct CutCrossEntropyOutput {
 
     /// Cached values for backward pass.
     cached_logsumexp: Option<Array>,
+    #[allow(dead_code)] // Stored for future backward pass implementation
     cached_target_logits: Option<Array>,
 }
 

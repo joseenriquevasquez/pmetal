@@ -47,6 +47,7 @@ use std::collections::HashMap;
 /// By calling array_wait(current_y) BEFORE scheduling the next computation,
 /// we ensure the GPU has finished the current token and can immediately
 /// start the next one. The subsequent item() call is instant.
+#[allow(dead_code)] // Available for callers that need explicit CPU sync before the next dispatch
 #[inline]
 fn array_wait(arr: &Array) {
     // SAFETY:
@@ -550,8 +551,10 @@ pub struct Sampler {
     inv_temp: Option<Array>,
     /// Cached vocab_range array for filter operations [0, 1, 2, ..., vocab_size-1]
     /// Lazily initialized on first filter use. Avoids ~600KB allocation per filter call.
+    #[allow(dead_code)] // Used by get_vocab_range; dead only when Metal fused sampler is active
     cached_vocab_range: Option<Array>,
     /// Cached vocab size to detect when vocab_range needs regeneration
+    #[allow(dead_code)] // Paired with cached_vocab_range; both dead when Metal sampler is active
     cached_vocab_size: usize,
 }
 
@@ -591,6 +594,7 @@ impl Sampler {
 
     /// Get cached vocab_range array, creating it if needed.
     /// This avoids allocating ~600KB per filter call for large vocabularies.
+    #[allow(dead_code)] // Consumed by MLX filter path; suppressed when Metal fused sampler is active
     #[inline]
     fn get_vocab_range(&mut self, vocab_size: usize) -> &Array {
         if self.cached_vocab_size != vocab_size || self.cached_vocab_range.is_none() {
@@ -977,6 +981,7 @@ fn apply_repetition_penalty(
 /// - Uses argpartition to find the k-th largest element efficiently
 /// - Uses put_along_axis to mask out tokens below top-k
 /// - All operations stay on GPU - no CPU round-trip
+#[allow(dead_code)] // MLX sampling implementation, superseded by Metal fused sampler
 fn top_k_filter(logits: &Array, k: usize) -> Result<Array, Exception> {
     let vocab_size = logits.dim(-1) as usize;
     let k = k.min(vocab_size);
@@ -1017,6 +1022,7 @@ fn top_k_filter(logits: &Array, k: usize) -> Result<Array, Exception> {
 /// - Computes cumulative sum
 /// - Keeps tokens with cumsum > (1 - top_p) threshold
 /// - All operations stay on GPU - no CPU round-trip
+#[allow(dead_code)] // MLX sampling implementation, superseded by Metal fused sampler
 fn top_p_filter(logits: &Array, p: f32) -> Result<Array, Exception> {
     let vocab_size = logits.dim(-1) as usize;
 
@@ -1080,6 +1086,7 @@ fn top_p_filter(logits: &Array, p: f32) -> Result<Array, Exception> {
 /// min-p scales the threshold based on the model's confidence (top token probability).
 /// This helps maintain coherence at high temperatures while allowing creativity.
 /// Recommended values: 0.05-0.1
+#[allow(dead_code)] // MLX sampling implementation, superseded by Metal fused sampler
 fn min_p_filter(logits: &Array, min_p: f32) -> Result<Array, Exception> {
     let vocab_size = logits.dim(-1) as usize;
 
@@ -1213,6 +1220,7 @@ fn gpu_categorical_sample(log_probs: &Array, temperature: f32) -> Result<u32, Ex
 ///
 /// No GPU→CPU sync - stays lazy for maximum performance.
 /// Matches mlx_lm: sampler returns mx.array, not scalar.
+#[allow(dead_code)] // MLX sampling implementation, superseded by Metal fused sampler
 fn gpu_categorical_sample_array(log_probs: &Array, temperature: f32) -> Result<Array, Exception> {
     let scaled = if temperature != 1.0 && temperature > 0.0 {
         let inv_temp = Array::from_f32(1.0 / temperature);

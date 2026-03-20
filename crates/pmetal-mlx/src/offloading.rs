@@ -18,6 +18,13 @@
 //! - Embedding offloading: 20-30% reduction for large vocab models
 //! - Activation offloading: 30-40% reduction during training
 //! - Combined: Up to 60% reduction for extreme cases
+//!
+//! # Status: Not yet integrated
+//!
+//! `ActivationOffloader`, `GradientOffloader`, and `FrozenParameterManager` are fully
+//! implemented and tested but are not yet called from any training loop. Designed for
+//! memory-constrained training of large models on devices with limited unified memory.
+//! Next step: integrate into the main training loop alongside the gradient checkpoint path.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -130,7 +137,7 @@ pub struct OffloadedEmbedding {
     cpu_array: Option<Array>,
     /// Disk path (for disk offloading).
     disk_path: Option<PathBuf>,
-    /// Recently accessed indices for prefetching.
+    #[allow(dead_code)] // For future prefetch heuristics
     recent_indices: Vec<i32>,
 }
 
@@ -254,6 +261,7 @@ pub struct ActivationOffloader {
 
 /// A single offloaded activation.
 #[derive(Debug)]
+#[allow(dead_code)] // Not yet integrated module
 struct OffloadedActivation {
     target: OffloadTarget,
     array: Option<Array>,
@@ -449,6 +457,7 @@ pub struct GradientOffloader {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Not yet integrated module
 struct OffloadedGradient {
     array: Option<Array>,
     disk_path: Option<PathBuf>,
@@ -612,10 +621,9 @@ pub struct FrozenParameterManager {
 
 /// A single offloaded frozen parameter.
 #[derive(Debug)]
+#[allow(dead_code)] // Not yet integrated module
 struct OffloadedFrozenParam {
-    /// Original shape.
     shape: Vec<i32>,
-    /// Data type.
     dtype: Dtype,
     /// CPU-resident array (in unified memory but marked for CPU).
     cpu_array: Array,

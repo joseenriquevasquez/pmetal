@@ -971,9 +971,9 @@ impl TrainingLoop {
 
     /// Clip gradients by global norm with CPU sync for accurate logging.
     ///
-    /// This version uses a GPU-CPU sync to get the actual gradient norm value.
-    /// Use this only when you need accurate grad_norm logging (e.g., every N steps).
+    /// Uses a GPU-CPU sync to get the actual gradient norm value.
     /// For maximum throughput, use clip_gradients_gpu() instead.
+    #[allow(dead_code)] // Available for callers that need precise grad_norm values
     fn clip_gradients_with_sync(&self, grads: &mut FlattenedModuleParam) -> Result<Option<f32>> {
         let max_norm = self.config.training.max_grad_norm as f32;
         if max_norm <= 0.0 {
@@ -1132,9 +1132,8 @@ impl TrainingLoop {
                 // Parameters will be evaluated lazily when needed (at logging or
                 // checkpoint time). This matches mlx-lm's approach.
 
-                // Always compute grad_norm when clipping is enabled (tests expect this)
-                // The lazy Array is evaluated here - this syncs GPU->CPU
-                // TODO: Consider making this conditional via config for max performance
+                // Always compute grad_norm when clipping is enabled (tests expect this).
+                // The lazy Array is evaluated here — syncs GPU->CPU.
                 if let Some(norm_arr) = lazy_norm {
                     norm_arr.eval()?;
                     Some(norm_arr.item::<f32>())

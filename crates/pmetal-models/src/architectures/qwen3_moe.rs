@@ -168,6 +168,7 @@ impl Default for Qwen3MoEConfig {
 #[derive(Debug, ModuleParameters)]
 pub struct Qwen3MoEAttention {
     /// Configuration.
+    #[allow(dead_code)] // Retained for future dynamic config access (e.g. sliding window, rope scaling)
     config: Qwen3MoEConfig,
     /// Number of attention heads.
     n_heads: i32,
@@ -178,6 +179,7 @@ pub struct Qwen3MoEAttention {
     /// Attention scale.
     scale: f32,
     /// RoPE theta.
+    #[allow(dead_code)] // Retained as authoritative source; effective_base is the derived working value
     rope_theta: f32,
     /// RoPE position scale (from rope_scaling config).
     rope_scale: f32,

@@ -77,10 +77,10 @@ pub struct SftTrainer {
     state: TrainingState,
     /// Optimizer.
     optimizer: Option<AdamW>,
-    /// Accumulated gradients for gradient accumulation.
-    accumulated_grads: Option<Vec<Array>>,
-    /// Number of accumulation steps completed.
-    accumulation_count: usize,
+    /// Accumulated gradients for gradient accumulation (handled in training loop).
+    _accumulated_grads: Option<Vec<Array>>,
+    /// Number of accumulation steps completed (handled in training loop).
+    _accumulation_count: usize,
 }
 
 impl SftTrainer {
@@ -93,8 +93,8 @@ impl SftTrainer {
             },
             config,
             optimizer: None,
-            accumulated_grads: None,
-            accumulation_count: 0,
+            _accumulated_grads: None,
+            _accumulation_count: 0,
         }
     }
 

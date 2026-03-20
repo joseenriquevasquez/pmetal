@@ -407,6 +407,7 @@ fn gated_delta_chunk_ops(
     struct ChunkPrecomp {
         q_c: Array,            // [B, H, C, Dk]
         k_c: Array,            // [B, H, C, Dk]
+        #[allow(dead_code)]    // Precomputed for chunk attention (used in tri_inv path)
         k_c_t: Array,          // [B, H, Dk, C]
         beta_v: Array,         // [B, H, C, Dv]
         beta_gamma_row: Array, // [B, H, 1, C]

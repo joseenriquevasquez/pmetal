@@ -3,6 +3,12 @@
 //! Enables models larger than device memory on a single node by keeping
 //! only a sliding window of layer weights resident. Layers outside the
 //! window are evicted and reloaded from mmap on demand.
+//!
+//! # Status: Not yet integrated
+//!
+//! `WeightCache` needs to be wired into the model loading pipeline to enable
+//! layer-at-a-time inference for models larger than device memory. The LRU
+//! cache with refcounting is fully implemented and tested.
 
 use mlx_rs::Array;
 use std::collections::{HashMap, VecDeque};
@@ -26,6 +32,7 @@ pub struct WeightCache {
     /// when they are finished.
     references: HashMap<usize, usize>,
     /// Total number of layers in the model.
+    #[allow(dead_code)] // Kept for capacity planning and future eviction policy improvements
     num_layers: usize,
     /// Cache statistics.
     stats: CacheStats,

@@ -27,7 +27,6 @@
 #![allow(clippy::manual_range_contains)]
 #![allow(clippy::derivable_impls)]
 #![allow(clippy::arc_with_non_send_sync)]
-#![allow(dead_code)]
 
 pub mod attention;
 pub mod bridge;

@@ -1273,6 +1273,7 @@ fn load_rms_norm_weight(
     Ok(())
 }
 
+#[allow(dead_code)] // Utility for architectures that use LayerNorm (e.g. GPT-style models)
 fn load_layer_norm_weight(
     norm: &mut mlx_rs::nn::LayerNorm,
     weights: &HashMap<String, Array>,

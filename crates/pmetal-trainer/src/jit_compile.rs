@@ -72,13 +72,10 @@ pub trait StateExtractor {
 /// This wraps model and optimizer state, providing JIT-compiled training
 /// that properly tracks state changes between calls.
 pub struct CompiledTrainStep<M, O> {
-    /// Model being trained
     model: M,
-    /// Optimizer
     optimizer: O,
-    /// Cached parameter keys for deterministic ordering
+    #[allow(dead_code)] // Used by extract/update_model_params (JIT infra, not yet wired end-to-end)
     param_keys: Vec<Rc<str>>,
-    /// Whether compilation is active (false if fallback to uncompiled)
     compiled: bool,
 }
 
@@ -159,7 +156,7 @@ where
         (self.model, self.optimizer)
     }
 
-    /// Extract model parameters as flat array list.
+    #[allow(dead_code)] // JIT infrastructure, not yet wired end-to-end
     fn extract_model_params(&self) -> Vec<Array> {
         let params: FlattenedModuleParam = self
             .model
@@ -174,7 +171,7 @@ where
             .collect()
     }
 
-    /// Update model parameters from flat array list.
+    #[allow(dead_code)] // JIT infrastructure, not yet wired end-to-end
     fn update_model_params(&mut self, arrays: &[Array]) -> Result<()> {
         let updates: FlattenedModuleParam = self
             .param_keys
