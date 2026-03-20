@@ -260,11 +260,30 @@ impl TrainingDataset {
         template: Option<&ChatTemplate>,
         columns: Option<&DatasetColumnConfig>,
     ) -> Result<Self> {
-        // If custom columns are specified, build a Custom format from the column config.
+        // If custom columns are specified, build the effective format.
+        // Special case: if columns match the reasoning schema (thinking/solution +
+        // problem prompt), route to Reasoning format to get proper <think> tags and
+        // correct loss masking.
         let effective_format = if let Some(col_cfg) = columns {
             let has_multi = col_cfg.text_columns.as_ref().is_some_and(|v| !v.is_empty());
             let has_custom_single = col_cfg.text_column.as_ref().is_some_and(|t| t != "text");
-            if has_multi || has_custom_single {
+
+            // Detect reasoning-pattern columns: text includes "thinking" or "solution",
+            // prompt is "problem"
+            let is_reasoning_pattern = has_multi
+                && col_cfg.prompt_column.as_deref() == Some("problem")
+                && col_cfg
+                    .text_columns
+                    .as_ref()
+                    .is_some_and(|cols| cols.iter().any(|c| c == "thinking" || c == "solution"));
+
+            if is_reasoning_pattern {
+                tracing::info!(
+                    "Detected reasoning-pattern columns (thinking/solution + problem); \
+                     using Reasoning format for proper <think> tags and loss masking"
+                );
+                DatasetFormat::Reasoning
+            } else if has_multi || has_custom_single {
                 DatasetFormat::Custom {
                     text_column: col_cfg
                         .text_column
@@ -649,6 +668,19 @@ impl TrainingDataset {
                 // If prompt_col is set, mask that portion
                 if let Some(pc) = prompt_col {
                     let prompt = obj.get(pc).and_then(|v| v.as_str()).map(|s| s.to_string());
+                    if let Some(ref prompt_text) = prompt {
+                        // If the prompt column is NOT one of the text columns, we must
+                        // prepend it to the text so that loss masking aligns correctly.
+                        // Otherwise the first N tokens of the text get masked even though
+                        // they don't correspond to the prompt content.
+                        let prompt_is_in_text_cols = text_cols
+                            .map(|cols| cols.iter().any(|c| c.as_str() == pc))
+                            .unwrap_or(false);
+                        if !prompt_is_in_text_cols {
+                            let full_text = format!("{}{}{}", prompt_text, separator, text);
+                            return Ok((full_text, prompt));
+                        }
+                    }
                     return Ok((text, prompt));
                 }
                 return Ok((text, None));
