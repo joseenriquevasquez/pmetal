@@ -534,7 +534,7 @@ async fn run_training_direct(
     };
 
     // Build column config
-    let columns = crate::build_column_config(
+    let columns = crate::commands::build_column_config(
         optional_arg(&spec.args, "--text-column"),
         optional_arg(&spec.args, "--text-columns")
             .map(|s| s.split(',').map(str::to_string).collect()),
@@ -629,7 +629,7 @@ async fn run_distillation_direct(
         token: cancel.clone(),
     })];
 
-    crate::run_distillation_cli(
+    crate::commands::distill::run_distillation_cli(
         &teacher,
         &student,
         &dataset,
@@ -673,7 +673,7 @@ async fn run_grpo_direct(
 
     let grpo_type = optional_arg(&spec.args, "--grpo-type").unwrap_or_else(|| "bnpo".to_string());
 
-    crate::run_grpo_cli(
+    crate::commands::grpo::run_grpo_cli(
         &model,
         &dataset,
         &output,
