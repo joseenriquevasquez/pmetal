@@ -3,21 +3,28 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE*'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE*'
 
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  check:
-    name: Check & Lint
+  lint:
+    name: Lint
     runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v5
-
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -31,16 +38,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --exclude pmetal-py -- -D warnings
 
-      - name: Build
-        run: cargo build --workspace --exclude pmetal-py --release
-
   test:
     name: Test
     runs-on: macos-latest
+    needs: lint
 
     steps:
       - uses: actions/checkout@v5
-
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -49,4 +53,4 @@ jobs:
       # Single-threaded tests to avoid Metal/GPU conflicts
       # Exclude pmetal-py (needs Python dev libs not available on CI runner)
       - name: Run tests
-        run: cargo test --workspace --exclude pmetal-py --release -- --test-threads=1
+        run: cargo test --workspace --exclude pmetal-py --profile ci -- --test-threads=1
