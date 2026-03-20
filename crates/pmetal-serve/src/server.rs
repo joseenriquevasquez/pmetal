@@ -6,6 +6,7 @@ use axum::Router;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 /// Server configuration.
@@ -23,7 +24,9 @@ impl Default for ServeConfig {
     fn default() -> Self {
         Self {
             port: 8080,
-            host: "0.0.0.0".to_string(),
+            // Default to loopback only — callers that need external access should
+            // explicitly set host to "0.0.0.0" or a specific interface address.
+            host: "127.0.0.1".to_string(),
             max_concurrent: 16,
         }
     }
@@ -47,6 +50,8 @@ pub fn build_router(engine: InferenceEngine) -> Router {
         .route("/v1/completions", axum::routing::post(routes::completions))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
+        // Reject request bodies larger than 2 MiB to prevent memory exhaustion.
+        .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
         .with_state(state)
 }
 

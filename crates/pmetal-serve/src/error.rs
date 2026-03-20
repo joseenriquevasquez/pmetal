@@ -32,7 +32,27 @@ impl IntoResponse for ServeError {
                 (StatusCode::SERVICE_UNAVAILABLE, "model not loaded".into())
             }
             ServeError::Busy => (StatusCode::TOO_MANY_REQUESTS, "engine busy".into()),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            ServeError::Tokenizer(e) => {
+                tracing::error!("Tokenizer error: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "tokenizer error".to_string(),
+                )
+            }
+            ServeError::Model(e) => {
+                tracing::error!("Model error: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal model error".to_string(),
+                )
+            }
+            ServeError::Internal(msg) => {
+                tracing::error!("Internal error: {}", msg);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error".to_string(),
+                )
+            }
         };
 
         let body = serde_json::json!({
