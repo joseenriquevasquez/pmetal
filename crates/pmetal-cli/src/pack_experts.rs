@@ -33,23 +33,19 @@ use pmetal_models::expert_layout::{ExpertComponent, ExpertPackLayout, PackedBits
 ///
 /// # Arguments
 ///
-/// * `model_dir`  – HuggingFace model directory containing `config.json` and
-///                  one or more `.safetensors` files (or an index JSON).
+/// * `model_dir` – HuggingFace model directory containing `config.json` and
+///   one or more `.safetensors` files (or an index JSON).
 /// * `output_dir` – Destination directory; created if it does not exist.
-/// * `bits`       – Target bit width for weight quantization (`2` or `4`).
-///                  Defaults to `4` when `None`.  Full-precision models are
-///                  quantized on-the-fly using affine per-group quantization.
+/// * `bits` – Target bit width for weight quantization (`2` or `4`).
+///   Defaults to `4` when `None`. Full-precision models are
+///   quantized on-the-fly using affine per-group quantization.
 ///
 /// # Errors
 ///
 /// Returns an error if the model directory cannot be read, if required config
 /// keys are missing, if any tensor size mismatches the expected layout, or if
 /// the final file-size verification fails.
-pub fn pack_experts(
-    model_dir: &Path,
-    output_dir: &Path,
-    bits: Option<u8>,
-) -> Result<()> {
+pub fn pack_experts(model_dir: &Path, output_dir: &Path, bits: Option<u8>) -> Result<()> {
     let bits = match bits.unwrap_or(4) {
         4 => PackedBits::Four,
         2 => PackedBits::Two,
@@ -57,8 +53,8 @@ pub fn pack_experts(
     };
 
     // ── 1. Read config.json ───────────────────────────────────────────────────
-    let config_text = fs::read_to_string(model_dir.join("config.json"))
-        .context("Failed to read config.json")?;
+    let config_text =
+        fs::read_to_string(model_dir.join("config.json")).context("Failed to read config.json")?;
     let config: serde_json::Value =
         serde_json::from_str(&config_text).context("Failed to parse config.json")?;
 
@@ -216,8 +212,13 @@ pub fn pack_experts(
             .with_context(|| format!("set_len failed for {}", layer_path.display()))?;
 
         // Pre-load all shards needed for this layer (deduplicated).
-        let needed_shards =
-            collect_needed_shards(layer_idx, num_experts, is_prequantized, &shard_map, model_dir);
+        let needed_shards = collect_needed_shards(
+            layer_idx,
+            num_experts,
+            is_prequantized,
+            &shard_map,
+            model_dir,
+        );
         for shard_name in &needed_shards {
             if !shard_byte_cache.contains_key(shard_name) {
                 let shard_path = model_dir.join(shard_name);
@@ -234,9 +235,7 @@ pub fn pack_experts(
             let expert_base = layout.expert_offset(expert_idx);
 
             for (suffix, component) in components {
-                let key = format!(
-                    "model.layers.{layer_idx}.mlp.experts.{expert_idx}.{suffix}"
-                );
+                let key = format!("model.layers.{layer_idx}.mlp.experts.{expert_idx}.{suffix}");
                 let file_offset = (expert_base + component.offset) as u64;
 
                 let shard_name = resolve_shard(&key, &shard_map, model_dir);
@@ -272,7 +271,10 @@ pub fn pack_experts(
             .with_context(|| format!("Flush failed for {}", layer_path.display()))?;
     }
 
-    eprintln!("\r  Packed {} layers.                                      ", total);
+    eprintln!(
+        "\r  Packed {} layers.                                      ",
+        total
+    );
 
     // ── 6. Save layout.json ───────────────────────────────────────────────────
     layout
@@ -339,7 +341,15 @@ fn write_component(
         // The weight pass also writes scales and biases; the subsequent
         // `.scales` / `.biases` suffix visits are no-ops.
         if suffix.ends_with(".weight") {
-            quantize_and_write(file, &tensors, key, component, file_offset, bits, group_size)?;
+            quantize_and_write(
+                file,
+                &tensors,
+                key,
+                component,
+                file_offset,
+                bits,
+                group_size,
+            )?;
         }
         // For `.scales` / `.biases` on a non-quantized model: bytes were
         // already written by the preceding `.weight` pass — skip.
@@ -379,9 +389,7 @@ fn quantize_and_write(
 
     let shape = tv.shape();
     if shape.len() != 2 {
-        bail!(
-            "Expected 2-D weight tensor for `{weight_key}`, got shape {shape:?}"
-        );
+        bail!("Expected 2-D weight tensor for `{weight_key}`, got shape {shape:?}");
     }
     let out_dim = shape[0];
     let in_dim = shape[1];
@@ -465,9 +473,7 @@ fn quantize_and_write(
                         break;
                     }
                     let w = weights_f32[row_base + col_idx];
-                    let q = ((w - bias) / scale)
-                        .round()
-                        .clamp(0.0, max_q) as u32;
+                    let q = ((w - bias) / scale).round().clamp(0.0, max_q) as u32;
                     word |= q << (b_bit as u32 * bit_width);
                 }
                 if packed_col < packed_cols {
@@ -578,10 +584,7 @@ fn resolve_shard(
 
 /// Return `true` if the model checkpoint is already quantized (has `.scales`
 /// and `.biases` alongside expert `.weight` tensors).
-fn detect_prequantized(
-    shard_map: &HashMap<String, String>,
-    model_dir: &Path,
-) -> Result<bool> {
+fn detect_prequantized(shard_map: &HashMap<String, String>, model_dir: &Path) -> Result<bool> {
     // Fast path: scan the index map.
     if !shard_map.is_empty() {
         let found = shard_map
@@ -673,8 +676,7 @@ fn verify_output(layout: &ExpertPackLayout, output_dir: &Path) -> Result<()> {
     eprintln!(" OK");
 
     // Roundtrip layout.json.
-    let reloaded =
-        ExpertPackLayout::load(output_dir).context("Failed to reload layout.json")?;
+    let reloaded = ExpertPackLayout::load(output_dir).context("Failed to reload layout.json")?;
     if reloaded.expert_size != layout.expert_size
         || reloaded.num_experts != layout.num_experts
         || reloaded.moe_layer_indices != layout.moe_layer_indices
@@ -782,6 +784,7 @@ mod tests {
 
     #[test]
     fn test_bf16_round_trip() {
+        #[allow(clippy::approx_constant)]
         for &v in &[0.0f32, 1.0, -1.0, 3.14, -0.001, 65504.0] {
             let bf = f32_to_bf16(v);
             let recovered = f32::from_bits((bf as u32) << 16);
@@ -903,7 +906,10 @@ mod tests {
         let pf = PackedBits::Four.pack_factor(); // 8
         // Sanity: verify packing is possible with chosen dimensions.
         assert!(hidden % pf == 0, "hidden must be divisible by pack_factor");
-        assert!(inter % pf == 0, "intermediate must be divisible by pack_factor");
+        assert!(
+            inter % pf == 0,
+            "intermediate must be divisible by pack_factor"
+        );
 
         for l in 0..2usize {
             for e in 0..2usize {
@@ -971,8 +977,12 @@ mod tests {
 
         // Verify roundtrip: gate_weight bytes of expert 0 layer 0 are non-zero.
         let layer0 = fs::read(out_dir.join("layer_00.bin")).unwrap();
-        let sample = &layer0[layout.record.gate_weight.offset..layout.record.gate_weight.offset + 4];
-        assert_ne!(sample, [0u8; 4], "expert 0 gate_weight bytes should be non-zero");
+        let sample =
+            &layer0[layout.record.gate_weight.offset..layout.record.gate_weight.offset + 4];
+        assert_ne!(
+            sample, [0u8; 4],
+            "expert 0 gate_weight bytes should be non-zero"
+        );
     }
 
     /// Build a minimal valid safetensors byte stream.
@@ -990,8 +1000,8 @@ mod tests {
         let mut header: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
         header.insert("__metadata__".to_string(), serde_json::json!({}));
 
-        let mut sorted: Vec<(&String, &(Vec<usize>, safetensors::Dtype, Vec<u8>))> =
-            tensors.iter().collect();
+        type TensorEntry = (Vec<usize>, safetensors::Dtype, Vec<u8>);
+        let mut sorted: Vec<(&String, &TensorEntry)> = tensors.iter().collect();
         sorted.sort_by_key(|(k, _)| k.as_str());
 
         for (name, (shape, dtype, data)) in &sorted {
@@ -1018,8 +1028,7 @@ mod tests {
             );
         }
 
-        let header_json =
-            serde_json::to_string(&serde_json::Value::Object(header)).unwrap();
+        let header_json = serde_json::to_string(&serde_json::Value::Object(header)).unwrap();
         let header_bytes = header_json.as_bytes();
 
         let mut out = Vec::new();

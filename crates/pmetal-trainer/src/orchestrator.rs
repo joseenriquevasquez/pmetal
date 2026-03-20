@@ -1501,7 +1501,14 @@ pub fn save_adapter_config(
     target_modules: &[String],
     use_rslora: bool,
 ) -> anyhow::Result<()> {
-    save_adapter_config_with_base(lora_weights_path, r, alpha, target_modules, use_rslora, None)
+    save_adapter_config_with_base(
+        lora_weights_path,
+        r,
+        alpha,
+        target_modules,
+        use_rslora,
+        None,
+    )
 }
 
 /// Save adapter_config.json with optional base_model metadata.

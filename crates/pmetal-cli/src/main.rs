@@ -2204,12 +2204,8 @@ async fn tokio_main() -> anyhow::Result<()> {
             output,
             bits,
         } => {
-            pack_experts::pack_experts(
-                Path::new(&model),
-                Path::new(&output),
-                bits,
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            pack_experts::pack_experts(Path::new(&model), Path::new(&output), bits)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
 
         Commands::Search {
@@ -3624,9 +3620,16 @@ async fn run_fuse(
         // Compute delta = scale * (B @ A) and add to base weight
         // lora_a: [r, in_features], lora_b: [out_features, r]
         // delta: [out_features, in_features]
+        let base_dtype = base_weight.dtype();
         let delta = mlx_rs::ops::matmul(lora_b, lora_a)?;
         let scaled_delta = mlx_rs::ops::multiply(&delta, mlx_rs::array!(scale))?;
         let fused = mlx_rs::ops::add(base_weight, &scaled_delta)?;
+        // Cast back to base dtype (LoRA is f32, base is typically bf16/f16)
+        let fused = if fused.dtype() != base_dtype {
+            fused.as_dtype(base_dtype)?
+        } else {
+            fused
+        };
 
         base_weights.insert(base_key, fused);
         fused_count += 1;
@@ -3661,8 +3664,28 @@ async fn run_fuse(
     // Save fused weights as a single safetensors file
     print!("Saving fused model... ");
     let output_file = output_dir.join("model.safetensors");
-    mlx_rs::Array::save_safetensors(&base_weights, None, &output_file)
+    let metadata = std::collections::HashMap::from([("format".to_string(), "mlx".to_string())]);
+    mlx_rs::Array::save_safetensors(&base_weights, Some(&metadata), &output_file)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Generate model.safetensors.index.json (required by LM Studio and other tools)
+    let mut weight_map = serde_json::Map::new();
+    let mut total_size: u64 = 0;
+    for (key, arr) in &base_weights {
+        weight_map.insert(
+            key.clone(),
+            serde_json::Value::String("model.safetensors".to_string()),
+        );
+        total_size += arr.nbytes() as u64;
+    }
+    let index = serde_json::json!({
+        "metadata": { "total_size": total_size },
+        "weight_map": weight_map,
+    });
+    std::fs::write(
+        output_dir.join("model.safetensors.index.json"),
+        serde_json::to_string_pretty(&index)?,
+    )?;
 
     let size = std::fs::metadata(&output_file)
         .map(|m| m.len())
@@ -4058,6 +4081,7 @@ async fn run_distillation_cli(
         student_lora_config.alpha,
         &student_lora_config.target_modules,
         student_lora_config.use_rslora,
+        Some(student_id),
     )?;
 
     if emit_console_output {
@@ -4078,20 +4102,22 @@ async fn run_distillation_cli(
     Ok(())
 }
 
-/// Delegate to orchestrator's save_adapter_config.
+/// Delegate to orchestrator's save_adapter_config_with_base.
 fn save_adapter_config(
     lora_weights_path: &std::path::Path,
     r: usize,
     alpha: f32,
     target_modules: &[String],
     use_rslora: bool,
+    base_model: Option<&str>,
 ) -> anyhow::Result<()> {
-    pmetal_trainer::orchestrator::save_adapter_config(
+    pmetal_trainer::orchestrator::save_adapter_config_with_base(
         lora_weights_path,
         r,
         alpha,
         target_modules,
         use_rslora,
+        base_model,
     )
 }
 
@@ -4506,6 +4532,7 @@ async fn run_grpo_cli(
         lora_config.alpha,
         &lora_config.target_modules,
         lora_config.use_rslora,
+        Some(model_id),
     )?;
 
     if emit_console_output {
@@ -4830,6 +4857,7 @@ async fn run_rlkd_cli(
         lora_config.alpha,
         &lora_config.target_modules,
         lora_config.use_rslora,
+        Some(model_id),
     )?;
 
     if emit_console_output {
@@ -5005,7 +5033,10 @@ async fn run_inference(
     }
 
     // Load sampling defaults from model's generation_config.json
-    let defaults = pmetal_data::inference_config::load_sampling_defaults(&model_path, use_chat && !no_thinking);
+    let defaults = pmetal_data::inference_config::load_sampling_defaults(
+        &model_path,
+        use_chat && !no_thinking,
+    );
 
     // Apply CLI overrides over model defaults
     let temperature = temperature.unwrap_or(defaults.temperature);
@@ -5391,7 +5422,10 @@ async fn run_inference(
     if benchmark {
         use std::time::Instant;
 
-        println!("\n=== Benchmark Mode ({} decode iterations) ===", benchmark_iters);
+        println!(
+            "\n=== Benchmark Mode ({} decode iterations) ===",
+            benchmark_iters
+        );
 
         // Initial generation gives us TTFT (time to first token) and overall throughput.
         // Now measure per-token decode latency by running independent single-token
@@ -5404,7 +5438,10 @@ async fn run_inference(
         {
             let input = mlx_rs::Array::from_slice(&[last_token_id as i32], &[1, 1]);
             if let Ok(ref logits_w) = model.forward_with_hybrid_cache(
-                &input, None, Some(&mut cache), mamba_cache.as_mut(),
+                &input,
+                None,
+                Some(&mut cache),
+                mamba_cache.as_mut(),
             ) {
                 let _ = logits_w.eval();
             }
@@ -5416,10 +5453,15 @@ async fn run_inference(
 
             let t0 = Instant::now();
             let logits = model.forward_with_hybrid_cache(
-                &input, None, Some(&mut cache), mamba_cache.as_mut(),
+                &input,
+                None,
+                Some(&mut cache),
+                mamba_cache.as_mut(),
             );
             // Synchronize GPU to ensure timing includes all GPU work
-            if let Ok(ref l) = logits { let _ = l.eval(); }
+            if let Ok(ref l) = logits {
+                let _ = l.eval();
+            }
             let dt = t0.elapsed();
 
             let ms = dt.as_secs_f64() * 1000.0;
@@ -6101,7 +6143,8 @@ async fn run_inference_with_lora(
     }
 
     // Load sampling defaults from model's generation_config.json
-    let defaults = pmetal_data::inference_config::load_sampling_defaults(model_path, use_chat && !no_thinking);
+    let defaults =
+        pmetal_data::inference_config::load_sampling_defaults(model_path, use_chat && !no_thinking);
 
     // Apply CLI overrides over model defaults
     let temperature = temperature.unwrap_or(defaults.temperature);
@@ -9259,9 +9302,10 @@ async fn run_serve(
         PathBuf::from(&model_id)
     };
 
-    // Load tokenizer
+    // Load tokenizer — use pmetal_data::Tokenizer for config-aware special token
+    // resolution (needed by collect_all_stop_tokens inside InferenceEngine::new).
     tracing::info!("Loading tokenizer...");
-    let tokenizer = tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json"))
+    let tokenizer = pmetal_data::Tokenizer::from_model_dir(&model_path)
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
 
     // Load model

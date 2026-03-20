@@ -140,8 +140,8 @@ pub fn infer(
 
     py.detach(move || {
         crate::hub::shared_runtime().block_on(async {
-            use pmetal_data::chat_templates::{Message, detect_chat_template};
             use pmetal_data::Tokenizer;
+            use pmetal_data::chat_templates::{Message, detect_chat_template};
             use pmetal_hub::resolve_model_path;
             use pmetal_models::{DynamicModel, GenerationConfig, generate_cached_async};
 
@@ -153,15 +153,15 @@ pub fn infer(
 
             // Chat template
             let template = detect_chat_template(&model_path, &model_id);
-            let mut msgs = Vec::new();
-            msgs.push(Message::user(&prompt));
+            let msgs = vec![Message::user(&prompt)];
             let formatted = template.apply(&msgs).text;
             let input_ids = tokenizer
                 .encode_with_special_tokens(&formatted)
                 .map_err(|e| e.to_string())?;
 
             // Gen config — load model defaults, user params override
-            let defaults = pmetal_data::inference_config::load_sampling_defaults(&model_path, false);
+            let defaults =
+                pmetal_data::inference_config::load_sampling_defaults(&model_path, false);
             let mut gen_config = if temperature < 1e-6 {
                 GenerationConfig::greedy(max_tokens)
             } else {
@@ -203,7 +203,11 @@ pub fn infer(
                             .as_f64()
                             .or_else(|| cfg["lora_alpha"].as_f64())
                             .unwrap_or(32.0) as f32;
-                        LoraConfig { r, alpha, ..LoraConfig::default() }
+                        LoraConfig {
+                            r,
+                            alpha,
+                            ..LoraConfig::default()
+                        }
                     } else {
                         LoraConfig::default()
                     }
@@ -213,7 +217,9 @@ pub fn infer(
 
                 let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config)
                     .map_err(|e| e.to_string())?;
-                model.load_lora_weights(lora_path).map_err(|e| e.to_string())?;
+                model
+                    .load_lora_weights(lora_path)
+                    .map_err(|e| e.to_string())?;
 
                 let mut cache = model
                     .create_cache(max_seq_len)
@@ -232,7 +238,9 @@ pub fn infer(
                 .map_err(|e| e.to_string())?;
 
                 let generated_tokens = &output.token_ids[input_ids.len()..];
-                let text = tokenizer.decode(generated_tokens).map_err(|e| e.to_string())?;
+                let text = tokenizer
+                    .decode(generated_tokens)
+                    .map_err(|e| e.to_string())?;
                 Ok::<_, String>(text)
             } else {
                 let mut model = DynamicModel::load(&model_path).map_err(|e| e.to_string())?;
@@ -255,7 +263,9 @@ pub fn infer(
                 .map_err(|e| e.to_string())?;
 
                 let generated_tokens = &output.token_ids[input_ids.len()..];
-                let text = tokenizer.decode(generated_tokens).map_err(|e| e.to_string())?;
+                let text = tokenizer
+                    .decode(generated_tokens)
+                    .map_err(|e| e.to_string())?;
                 Ok(text)
             }
         })
