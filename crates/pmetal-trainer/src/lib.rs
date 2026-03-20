@@ -43,7 +43,6 @@
 
 // Crate-level lint configuration
 #![allow(missing_docs)]
-#![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]
@@ -66,6 +65,7 @@
 pub mod orchestrator;
 pub mod preference_data;
 
+#[cfg(feature = "experimental-trainers")]
 pub mod adam8bit;
 pub mod adamw_groups;
 pub mod adaptive_lr;
@@ -75,6 +75,7 @@ pub mod checkpoint;
 pub mod checkpointing;
 pub mod contrastive_loss;
 pub mod dapo;
+#[cfg(feature = "experimental-trainers")]
 pub mod diffusion;
 pub mod distillation;
 pub mod dpo;
@@ -84,22 +85,28 @@ pub mod ffi_compile;
 pub mod grpo;
 pub mod gspo;
 pub mod jit_compile;
+#[cfg(feature = "experimental-trainers")]
 pub mod kto;
 pub mod logprob_utils;
 pub mod lora_trainer;
 pub mod metal_fused;
 pub mod mlx_metal_optimizer;
+#[cfg(feature = "experimental-trainers")]
 pub mod online_dpo;
+#[cfg(feature = "experimental-trainers")]
 pub mod orpo;
 pub mod param_groups;
+#[cfg(feature = "experimental-trainers")]
 pub mod ppo;
 mod preference_batch;
 pub mod reasoning_template;
 pub mod reward_model;
 pub mod rlkd;
+#[cfg(feature = "experimental-trainers")]
 pub mod schedule_free;
 pub mod scheduler;
 pub mod sft;
+#[cfg(feature = "experimental-trainers")]
 pub mod simpo;
 pub mod training_loop;
 
@@ -118,6 +125,7 @@ pub use pmetal_metal::ane::dynamic_trainer::{
     DynamicAneTrainer, DynamicAneTrainerConfig, VocabMap,
 };
 
+#[cfg(feature = "experimental-trainers")]
 pub use adam8bit::*;
 pub use adamw_groups::*;
 pub use adaptive_lr::{AdaptiveLrConfig, AdaptiveLrController, LrControlCommand, LrEvent};
@@ -126,6 +134,7 @@ pub use callbacks::*;
 pub use checkpoint::*;
 pub use checkpointing::*;
 pub use dapo::*;
+#[cfg(feature = "experimental-trainers")]
 pub use diffusion::*;
 pub use distillation::*;
 pub use dpo::*;
@@ -144,21 +153,27 @@ pub use embedding_trainer::{
     EmbeddingTrainerError,
 };
 pub use grpo::*;
+#[cfg(feature = "experimental-trainers")]
 pub use kto::*;
 pub use lora_trainer::*;
+#[cfg(feature = "experimental-trainers")]
 pub use online_dpo::{
     LengthRewardFunction, OnlineDpoConfig, OnlineDpoIterationStats, OnlineDpoTrainer,
     OnlinePreferencePair, RewardFunction as OnlineRewardFunction,
 };
+#[cfg(feature = "experimental-trainers")]
 pub use orpo::*;
 pub use param_groups::*;
+#[cfg(feature = "experimental-trainers")]
 pub use ppo::*;
 pub use rlkd::{RlkdConfig, RlkdStepStats, RlkdTrainer};
+#[cfg(feature = "experimental-trainers")]
 pub use schedule_free::{
     ScheduleFreeConfig, ScheduleFreeError, ScheduleFreeOptimizer, ScheduleFreeResult,
 };
 pub use scheduler::*;
 pub use sft::*;
+#[cfg(feature = "experimental-trainers")]
 pub use simpo::*;
 pub use training_loop::*;
 

@@ -9,7 +9,9 @@ use std::io::BufRead;
 use pmetal_data::Tokenizer;
 
 use crate::dpo;
+#[cfg(feature = "experimental-trainers")]
 use crate::kto::KtoSample;
+#[cfg(feature = "experimental-trainers")]
 use crate::simpo;
 
 /// Read a JSONL file into a vector of JSON objects.
@@ -121,6 +123,7 @@ pub fn load_dpo_dataset(
 ///
 /// Same field detection as [`load_dpo_dataset`] but prompt truncation is
 /// always left-side and returns `simpo::PreferencePair`.
+#[cfg(feature = "experimental-trainers")]
 pub fn load_simpo_dataset(
     path: &str,
     tokenizer: &Tokenizer,
@@ -170,6 +173,7 @@ pub fn load_simpo_dataset(
 ///
 /// Expected fields: prompt/instruction/input, completion/response/output/answer,
 /// label/rating/chosen (bool, number, or string).
+#[cfg(feature = "experimental-trainers")]
 pub fn load_kto_dataset(
     path: &str,
     tokenizer: &Tokenizer,

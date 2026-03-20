@@ -15,6 +15,7 @@ tensorboard = ["dep:tensorboard-rs"]
 ane = ["pmetal-metal/ane", "pmetal-core/ane"]
 hub = ["dep:pmetal-hub"]
 distributed = ["dep:pmetal-distributed"]
+experimental-trainers = []
 
 [dependencies]
 pmetal-core = { workspace = true }
