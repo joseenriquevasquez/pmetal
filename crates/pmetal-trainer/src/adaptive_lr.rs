@@ -124,11 +124,25 @@ pub struct AdaptiveLrConfig {
     /// Window size for divergence trend detection.
     pub divergence_window: usize,
 
-    /// Factor to reduce LR by on divergence (0.2-0.5).
+    /// Factor to reduce LR by on divergence (0.5-0.8).
     pub divergence_factor: f64,
 
     /// Minimum slope (loss increase per step) to trigger divergence.
     pub divergence_slope_threshold: f64,
+
+    /// Number of consecutive positive-slope windows required before triggering
+    /// divergence reduction. Prevents false positives from noisy single windows.
+    /// Default: 2 (need two full windows of upward trend).
+    pub divergence_confirmation: usize,
+
+    /// Steps to wait after a divergence reduction before checking again.
+    /// Gives the reduced LR time to take effect. Default: divergence_window * 2.
+    pub divergence_cooldown_steps: usize,
+
+    /// Maximum number of divergence-triggered LR reductions.
+    /// After this many reductions, divergence detection is disabled
+    /// (plateau detection still active). Default: 4.
+    pub max_divergence_reductions: usize,
 
     /// Absolute minimum LR floor (never go below this).
     pub min_lr: f64,
@@ -174,14 +188,17 @@ impl Default for AdaptiveLrConfig {
             plateau_min_delta: 1e-4,
             plateau_max_reductions: 5,
             divergence_window: 40,
-            divergence_factor: 0.5,
+            divergence_factor: 0.7,
             divergence_slope_threshold: 0.05,
+            divergence_confirmation: 2,
+            divergence_cooldown_steps: 80, // 2x window
+            max_divergence_reductions: 4,
             min_lr: 1e-7,
             control_poll_interval: 10,
             rollback_enabled: false,
             max_rollbacks: 5,
             rollback_lr_factor: 0.5,
-            warmup_fraction: 0.1,
+            warmup_fraction: 0.15,
         }
     }
 }
@@ -196,6 +213,9 @@ impl AdaptiveLrConfig {
             plateau_factor: 0.5,
             divergence_window: 30,
             divergence_slope_threshold: 0.03, // More sensitive to divergence than SFT
+            divergence_confirmation: 2,
+            divergence_cooldown_steps: 60,
+            max_divergence_reductions: 4,
             warmup_fraction: 0.05, // Shorter grace period (distillation has stable early loss)
             ..Self::default()
         }
@@ -245,6 +265,12 @@ pub struct AdaptiveLrController {
 
     // --- Divergence detection ---
     loss_window: VecDeque<f64>,
+    /// Consecutive windows with positive slope above threshold.
+    divergence_positive_count: usize,
+    /// Steps remaining in post-divergence cooldown (skip divergence checks).
+    divergence_cooldown_remaining: usize,
+    /// Total divergence reductions applied.
+    divergence_reductions: usize,
 
     // --- LR multiplier (cumulative adaptive adjustments) ---
     /// Multiplicative factor applied to scheduled LR.
@@ -290,6 +316,9 @@ impl AdaptiveLrController {
             plateau_counter: 0,
             plateau_reductions: 0,
             loss_window: VecDeque::with_capacity(config.divergence_window + 1),
+            divergence_positive_count: 0,
+            divergence_cooldown_remaining: 0,
+            divergence_reductions: 0,
             lr_multiplier: 1.0,
             best_ema_loss: f64::MAX,
             best_ema_step: 0,
@@ -322,7 +351,8 @@ impl AdaptiveLrController {
         }
         tracing::info!(
             "Adaptive LR: grace period = {} steps ({:.0}% of {} total). \
-             Rollback: {}. Divergence window: {}, slope threshold: {:.3}.",
+             Rollback: {}. Divergence: window={}, threshold={:.3}, \
+             confirm={}, cooldown={}, max_reductions={}.",
             self.grace_period_steps,
             self.config.warmup_fraction * 100.0,
             total_steps,
@@ -333,6 +363,9 @@ impl AdaptiveLrController {
             },
             self.config.divergence_window,
             self.config.divergence_slope_threshold,
+            self.config.divergence_confirmation,
+            self.config.divergence_cooldown_steps,
+            self.config.max_divergence_reductions,
         );
     }
 
@@ -376,13 +409,30 @@ impl AdaptiveLrController {
             return (manual, LrEvent::ManualOverride { lr: manual });
         }
 
-        // 2. Update EMA loss tracking (always, even during grace period)
-        self.update_ema(loss);
+        // 2. Update EMA loss tracking (always, even during grace period).
+        // ZClip principle: exclude spike values from EMA to prevent threshold inflation.
+        // Only apply spike exclusion when we have enough samples for reliable z-score
+        // estimation (ema_step_count > 30). Early on, all losses must flow into EMA.
+        let is_spike_value =
+            if self.ema_initialized && self.warmup_samples == 0 && self.ema_step_count > 30 {
+                let z = self.compute_z_score(loss);
+                z > self.config.spike_threshold
+            } else {
+                false
+            };
+        if !is_spike_value {
+            self.update_ema(loss);
+        }
 
         // 3. Update loss window for divergence detection
         self.loss_window.push_back(loss);
         if self.loss_window.len() > self.config.divergence_window {
             self.loss_window.pop_front();
+        }
+
+        // Tick divergence cooldown
+        if self.divergence_cooldown_remaining > 0 {
+            self.divergence_cooldown_remaining -= 1;
         }
 
         // 3a. Grace period: skip all adaptive logic during early training.
@@ -441,12 +491,29 @@ impl AdaptiveLrController {
                 return (lr, event);
             }
 
-            // 4b. Divergence detection (permanent reduction, optionally with rollback)
-            if self.loss_window.len() >= self.config.divergence_window {
+            // 4b. Divergence detection (permanent reduction, optionally with rollback).
+            // Requires: window full + not in cooldown + not exhausted reductions.
+            if self.loss_window.len() >= self.config.divergence_window
+                && self.divergence_cooldown_remaining == 0
+                && self.divergence_reductions < self.config.max_divergence_reductions
+            {
                 let slope = self.compute_trend_slope();
                 if slope > self.config.divergence_slope_threshold {
+                    // Positive slope — count toward confirmation
+                    self.divergence_positive_count += 1;
+                } else {
+                    // Slope is flat/negative — reset confirmation counter
+                    self.divergence_positive_count = 0;
+                }
+
+                // Only trigger if we've seen sustained upward trend for
+                // `divergence_confirmation` consecutive full windows.
+                if self.divergence_positive_count >= self.config.divergence_confirmation {
                     let old_mult = self.lr_multiplier;
                     self.total_divergence_reductions += 1;
+                    self.divergence_reductions += 1;
+                    self.divergence_positive_count = 0;
+                    self.divergence_cooldown_remaining = self.config.divergence_cooldown_steps;
 
                     // Check rollback eligibility: enabled + have snapshot + not exhausted
                     if self.config.rollback_enabled && self.has_best_snapshot {
@@ -467,7 +534,6 @@ impl AdaptiveLrController {
                                 self.best_ema_step,
                             );
 
-                            // Reset window to prevent repeated triggers
                             self.loss_window.clear();
 
                             let lr = (scheduled_lr * self.lr_multiplier).max(self.config.min_lr);
@@ -505,15 +571,14 @@ impl AdaptiveLrController {
                         self.loss_window.clear();
                         self.plateau_counter = 0;
                         self.best_loss = self.best_ema_loss;
-                        // Reset EMA to best loss so spike/divergence detection starts fresh
                         self.loss_ema = self.best_ema_loss;
                         self.loss_ema_var = 0.0;
-                        self.warmup_samples = 10; // Brief warmup to re-stabilize EMA
+                        self.warmup_samples = 10;
 
                         return (new_lr, event);
                     }
 
-                    // No rollback — plain divergence reduction (original behavior)
+                    // No rollback — plain divergence reduction
                     self.lr_multiplier *= self.config.divergence_factor;
                     let new_lr = (scheduled_lr * self.lr_multiplier).max(self.config.min_lr);
                     let old_lr = scheduled_lr * old_mult;
@@ -526,14 +591,17 @@ impl AdaptiveLrController {
                     self.last_event = event.clone();
 
                     tracing::warn!(
-                        "Loss divergence detected (slope={slope:.4}). \
-                         Reducing LR {old_lr:.2e} → {new_lr:.2e} (multiplier: {:.3}).",
+                        "Loss divergence detected (slope={slope:.4}, confirmed over {} windows). \
+                         Reducing LR {old_lr:.2e} → {new_lr:.2e} (multiplier: {:.3}, \
+                         reduction {}/{}).",
+                        self.config.divergence_confirmation,
                         self.lr_multiplier,
+                        self.divergence_reductions,
+                        self.config.max_divergence_reductions,
                     );
 
                     // Reset window after intervention
                     self.loss_window.clear();
-                    // Reset plateau counter (we just intervened)
                     self.plateau_counter = 0;
                     self.best_loss = loss;
 
@@ -801,6 +869,9 @@ impl AdaptiveLrController {
                 self.plateau_counter = 0;
                 self.plateau_reductions = 0;
                 self.in_spike_cooldown = false;
+                self.divergence_positive_count = 0;
+                self.divergence_cooldown_remaining = 0;
+                self.divergence_reductions = 0;
                 self.best_loss = f64::MAX;
                 self.best_ema_loss = f64::MAX;
                 self.best_ema_step = 0;
@@ -931,14 +1002,20 @@ mod tests {
             divergence_window: 10,
             divergence_slope_threshold: 0.005,
             divergence_factor: 0.3,
+            divergence_confirmation: 2,
+            divergence_cooldown_steps: 0,
+            max_divergence_reductions: 4,
+            spike_threshold: 100.0, // High to prevent spike interference
             ..Default::default()
         };
         let mut ctrl = test_controller(config);
         ctrl.warmup_samples = 0;
         ctrl.ema_initialized = true;
+        ctrl.loss_ema = 5.0;
+        ctrl.loss_ema_var = 0.1;
 
-        // Feed steadily increasing losses
-        for i in 0..15 {
+        // Feed steadily increasing losses — need enough for 2 confirmation windows
+        for i in 0..30 {
             let loss = 5.0 + (i as f64) * 0.5; // Strong upward trend
             let (lr, event) = ctrl.step(i, loss, 1e-4);
             if matches!(event, LrEvent::DivergenceReduced { .. }) {
@@ -1060,6 +1137,10 @@ mod tests {
         let config = AdaptiveLrConfig {
             divergence_window: 10,
             divergence_slope_threshold: 0.005,
+            divergence_confirmation: 2,
+            divergence_cooldown_steps: 0,
+            max_divergence_reductions: 4,
+            spike_threshold: 100.0, // High to prevent spike interference
             rollback_enabled: true,
             max_rollbacks: 3,
             rollback_lr_factor: 0.5,
@@ -1068,6 +1149,8 @@ mod tests {
         let mut ctrl = test_controller(config);
         ctrl.warmup_samples = 0;
         ctrl.ema_initialized = true;
+        ctrl.loss_ema = 3.0;
+        ctrl.loss_ema_var = 0.01;
 
         // Simulate a good training phase to establish best EMA loss
         for i in 0..5 {
@@ -1079,7 +1162,7 @@ mod tests {
 
         // Feed steadily increasing losses to trigger divergence + rollback
         let mut triggered = false;
-        for i in 5..25 {
+        for i in 5..40 {
             let loss = 3.0 + (i as f64 - 5.0) * 0.5;
             let (lr, event) = ctrl.step(i, loss, 1e-4);
             if let LrEvent::RollbackTriggered { rollback_count, .. } = &event {
@@ -1098,6 +1181,9 @@ mod tests {
         let config = AdaptiveLrConfig {
             divergence_window: 5,
             divergence_slope_threshold: 0.005,
+            divergence_confirmation: 1, // Faster for test
+            divergence_cooldown_steps: 0,
+            max_divergence_reductions: 10,
             rollback_enabled: true,
             max_rollbacks: 2,
             rollback_lr_factor: 0.5,
@@ -1115,8 +1201,8 @@ mod tests {
         let mut early_stopped = false;
         let mut step = 0;
 
-        for _ in 0..10 {
-            for j in 0..10 {
+        for _ in 0..20 {
+            for j in 0..15 {
                 let loss = 2.0 + (j as f64) * 0.5;
                 let (_lr, event) = ctrl.step(step, loss, 1e-4);
                 step += 1;
@@ -1149,15 +1235,21 @@ mod tests {
             divergence_window: 10,
             divergence_slope_threshold: 0.005,
             divergence_factor: 0.3,
+            divergence_confirmation: 2,
+            divergence_cooldown_steps: 0,
+            max_divergence_reductions: 4,
+            spike_threshold: 100.0, // High to prevent spike interference
             rollback_enabled: false,
             ..Default::default()
         };
         let mut ctrl = test_controller(config);
         ctrl.warmup_samples = 0;
         ctrl.ema_initialized = true;
+        ctrl.loss_ema = 5.0;
+        ctrl.loss_ema_var = 0.1;
 
         let mut diverged = false;
-        for i in 0..15 {
+        for i in 0..30 {
             let loss = 5.0 + (i as f64) * 0.5;
             let (lr, event) = ctrl.step(i, loss, 1e-4);
             if matches!(event, LrEvent::DivergenceReduced { .. }) {
