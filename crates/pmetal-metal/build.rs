@@ -18,6 +18,9 @@ fn main() {
         return;
     }
 
+    // Verify Metal toolchain is available before attempting compilation
+    check_metal_toolchain();
+
     // Find all .metal files
     if shaders_dir.exists() {
         compile_metal_shaders(&shaders_dir, &out_dir);
@@ -39,6 +42,55 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=IOSurface");
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
         // AppleNeuralEngine.framework is loaded at runtime via dlopen, not linked here
+    }
+}
+
+/// Verify that the Metal compiler toolchain is available via xcrun.
+///
+/// Provides actionable installation instructions on failure instead of
+/// a cryptic "Failed to run Metal compiler" panic.
+fn check_metal_toolchain() {
+    // Check xcrun itself
+    let xcrun_ok = Command::new("xcrun")
+        .args(["--find", "metal"])
+        .output();
+
+    match xcrun_ok {
+        Ok(output) if output.status.success() => return, // Metal compiler found
+        Ok(_) => {
+            // xcrun exists but can't find metal
+            panic!(
+                "\n\
+                 ╔══════════════════════════════════════════════════════════════════╗\n\
+                 ║  Metal compiler not found                                       ║\n\
+                 ╚══════════════════════════════════════════════════════════════════╝\n\n\
+                 PMetal requires the Metal shader compiler to build.\n\n\
+                 To install:\n\
+                 1. Install Xcode from the App Store (or Command Line Tools):\n\
+                    xcode-select --install\n\n\
+                 2. Accept the Xcode license:\n\
+                    sudo xcodebuild -license accept\n\n\
+                 3. Download the Metal toolchain:\n\
+                    xcodebuild -downloadComponent MetalToolchain\n\n\
+                 4. Restart your terminal (or reboot) after installation.\n\n\
+                 If you have Xcode installed but metal is not found, try:\n\
+                    sudo xcode-select -s /Applications/Xcode.app/Contents/Developer\n"
+            );
+        }
+        Err(e) => {
+            // xcrun itself not found
+            panic!(
+                "\n\
+                 ╔══════════════════════════════════════════════════════════════════╗\n\
+                 ║  xcrun not found — Xcode Command Line Tools required            ║\n\
+                 ╚══════════════════════════════════════════════════════════════════╝\n\n\
+                 PMetal requires Xcode Command Line Tools to compile Metal shaders.\n\n\
+                 To install:\n\
+                    xcode-select --install\n\n\
+                 After installation, restart your terminal and try again.\n\n\
+                 Error: {e}\n"
+            );
+        }
     }
 }
 
@@ -72,7 +124,7 @@ fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path) {
 
         println!("cargo:rerun-if-changed={}", metal_file.display());
 
-        let status = Command::new("xcrun")
+        let output = Command::new("xcrun")
             .env("HOME", out_dir)
             .env("XDG_CACHE_HOME", &cache_root)
             .args([
@@ -95,11 +147,16 @@ fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path) {
                 "-o",
                 air_file.to_str().unwrap(),
             ])
-            .status()
-            .expect("Failed to run Metal compiler");
+            .output()
+            .expect("Failed to run Metal compiler (xcrun verified but execution failed)");
 
-        if !status.success() {
-            panic!("Failed to compile Metal shader: {}", metal_file.display());
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!(
+                "Failed to compile Metal shader: {}\n\n--- compiler output ---\n{}",
+                metal_file.display(),
+                stderr
+            );
         }
 
         air_files.push(air_file);
@@ -119,10 +176,14 @@ fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path) {
 
     cmd.args(["-o", metallib_file.to_str().unwrap()]);
 
-    let status = cmd.status().expect("Failed to run metallib linker");
+    let output = cmd.output().expect("Failed to run metallib linker");
 
-    if !status.success() {
-        panic!("Failed to link Metal library");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!(
+            "Failed to link Metal library\n\n--- linker output ---\n{}",
+            stderr
+        );
     }
 
     println!(

@@ -31,6 +31,9 @@ pub fn run() {
 
             let state = app.state::<AppState>();
 
+            // Log startup diagnostics for troubleshooting
+            log_startup_diagnostics();
+
             // Start the broadcast -> Tauri event forwarder
             start_event_forwarder(app.handle().clone(), &state);
 
@@ -65,6 +68,9 @@ pub fn run() {
             search_hub_models,
             get_trending_models,
             get_model_fit,
+            add_model_directory,
+            remove_model_directory,
+            list_model_directories,
             // Datasets
             search_hub_datasets,
             get_trending_datasets,
@@ -126,6 +132,42 @@ pub fn run() {
 // startup init tasks.
 // ---------------------------------------------------------------------------
 
+/// Log startup diagnostics so crash reports have context.
+fn log_startup_diagnostics() {
+    tracing::info!(
+        version = pmetal::version::VERSION,
+        arch = std::env::consts::ARCH,
+        os = std::env::consts::OS,
+        "PMetal GUI starting"
+    );
+
+    match pmetal::metal::MetalContext::global() {
+        Ok(ctx) => {
+            let props = ctx.properties();
+            tracing::info!(
+                gpu = %props.name,
+                gpu_cores = props.gpu_core_count,
+                ane_cores = props.ane_core_count,
+                bandwidth_gbps = format!("{:.1}", props.memory_bandwidth_gbps),
+                "Metal device initialized"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Metal device initialization failed — GPU features will be unavailable"
+            );
+        }
+    }
+
+    let device = pmetal::version::device_info();
+    tracing::info!(
+        total_memory_gb = format!("{:.1}", device.memory_total_gb),
+        available_memory_gb = format!("{:.1}", device.memory_available_gb),
+        "System memory"
+    );
+}
+
 struct AppStateInit {
     config: std::sync::Arc<tokio::sync::RwLock<state::AppConfig>>,
     cached_models: std::sync::Arc<tokio::sync::RwLock<Vec<state::CachedModel>>>,
@@ -143,17 +185,14 @@ impl AppStateInit {
     }
 
     async fn refresh_cached_models(&self) {
-        let cache_root = {
-            let cfg = self.config.read().await;
-            std::path::PathBuf::from(&cfg.cache_dir)
-        };
+        // Build a temporary AppState-like struct to reuse the full scanning logic
+        let app_state = AppState::new();
+        *app_state.config.write().await = self.config.read().await.clone();
+        app_state.refresh_cached_models().await;
 
-        let hub_models_dir = cache_root.join("hub");
-        let models = state::scan_hub_cache_pub(&hub_models_dir).await;
+        let models = app_state.cached_models.read().await.clone();
+        let count = models.len();
         *self.cached_models.write().await = models;
-        tracing::info!(
-            "Refreshed model cache: {} models found",
-            self.cached_models.read().await.len()
-        );
+        tracing::info!("Refreshed model cache: {count} models found");
     }
 }
