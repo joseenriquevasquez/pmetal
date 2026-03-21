@@ -1,0 +1,421 @@
+use super::*;
+use pmetal_core::LoraConfig;
+use pmetal_lora::LlamaLoraForCausalLM;
+use pmetal_models::architectures::llama::LlamaConfig;
+
+fn small_config() -> LlamaConfig {
+    LlamaConfig {
+        vocab_size: 1000,
+        hidden_size: 64,
+        intermediate_size: 128,
+        num_hidden_layers: 2,
+        num_attention_heads: 4,
+        num_key_value_heads: Some(2),
+        head_dim: None,
+        max_position_embeddings: 512,
+        rms_norm_eps: 1e-5,
+        rope_theta: 10000.0,
+        ..Default::default()
+    }
+}
+
+fn small_lora_config() -> LoraConfig {
+    LoraConfig {
+        r: 8,
+        alpha: 16.0,
+        dropout: 0.0,
+        use_rslora: false,
+        target_modules: vec![
+            "q_proj".to_string(),
+            "k_proj".to_string(),
+            "v_proj".to_string(),
+            "o_proj".to_string(),
+        ],
+        bias: pmetal_core::LoraBias::None,
+        init_lora_weights: true,
+        use_dora: false,
+        loraplus_lr_ratio: None,
+    }
+}
+
+#[test]
+fn test_training_loop_creation() {
+    let config = TrainingLoopConfig::default();
+    let training_loop = TrainingLoop::new(config);
+
+    assert_eq!(training_loop.current_step(), 0);
+    assert_eq!(training_loop.current_epoch(), 0);
+}
+
+#[test]
+fn test_learning_rate_warmup() {
+    let mut config = TrainingLoopConfig::default();
+    config.training.warmup_steps = 100;
+    config.training.max_steps = Some(1000);
+    config.training.learning_rate = 1e-4;
+    config.training.lr_scheduler = LrSchedulerType::Cosine;
+
+    let mut training_loop = TrainingLoop::new(config);
+
+    // At step 0
+    training_loop.step = 0;
+    let lr0 = training_loop.get_learning_rate();
+    assert!(lr0 < 1e-4);
+
+    // At step 50 (halfway through warmup)
+    training_loop.step = 50;
+    let lr50 = training_loop.get_learning_rate();
+    assert!((lr50 - 5e-5).abs() < 1e-8);
+
+    // At step 100 (end of warmup)
+    training_loop.step = 100;
+    let lr100 = training_loop.get_learning_rate();
+    assert!((lr100 - 1e-4).abs() < 1e-8);
+}
+
+#[test]
+fn test_gradient_accumulation_flag() {
+    let mut config = TrainingLoopConfig::default();
+    config.training.gradient_accumulation_steps = 4;
+
+    let mut training_loop = TrainingLoop::new(config);
+
+    // First 3 steps should not trigger gradient application
+    for _ in 0..3 {
+        training_loop.accumulation_step += 1;
+        assert!(!training_loop.should_apply_gradients());
+    }
+
+    // 4th step should trigger
+    training_loop.accumulation_step += 1;
+    assert!(training_loop.should_apply_gradients());
+}
+
+#[test]
+fn test_single_train_step() {
+    use mlx_rs::optimizers::Sgd;
+
+    let config = TrainingLoopConfig {
+        use_metal_flash_attention: false, // Disable for simpler test
+        ..Default::default()
+    };
+    let mut training_loop = TrainingLoop::new(config);
+
+    let mut model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let mut optimizer = Sgd::new(1e-4);
+
+    // Create a minimal batch
+    let batch = TrainingBatch {
+        input_ids: Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]),
+        labels: Array::from_slice(&[2_i64, 3, 4, 5], &[1, 4]),
+        attention_mask: Array::from_slice(&[1_i32, 1, 1, 1], &[1, 4]),
+        pixel_values: None,
+        batch_size: 1,
+        seq_len: 4,
+    };
+
+    let stats = training_loop
+        .train_step(&mut model, &batch, &mut optimizer)
+        .unwrap();
+
+    assert!(stats.loss > 0.0);
+    assert_eq!(stats.step, 1);
+    assert_eq!(training_loop.current_step(), 1);
+}
+
+#[test]
+fn test_jit_training_step() {
+    // Test the JIT-compiled training step function directly
+    use mlx_rs::optimizers::AdamW;
+
+    let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let optimizer = AdamW::new(1e-4);
+
+    let mut state = (model, optimizer);
+
+    // Create a minimal batch
+    let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+    let labels = Array::from_slice(&[2_i64, 3, 4, 5], &[1, 4]);
+
+    // Run the JIT training step
+    let loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
+    loss.eval().unwrap();
+
+    let loss_val = loss.item::<f32>();
+    assert!(loss_val > 0.0, "Loss should be positive, got {}", loss_val);
+    assert!(
+        loss_val.is_finite(),
+        "Loss should be finite, got {}",
+        loss_val
+    );
+}
+
+#[test]
+fn test_jit_training_step_multiple_steps() {
+    // Test that jit_training_step works correctly over multiple steps
+    // This verifies the training step function itself works, independent of compile_with_state
+    use mlx_rs::optimizers::AdamW;
+
+    let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let optimizer = AdamW::new(1e-4);
+
+    let mut state = (model, optimizer);
+
+    // Create test data
+    let input_ids = Array::from_slice(&[1_i32, 2, 3, 4, 5, 6, 7, 8], &[1, 8]);
+    let labels = Array::from_slice(&[2_i64, 3, 4, 5, 6, 7, 8, 9], &[1, 8]);
+
+    // Run multiple training steps
+    let mut losses = Vec::new();
+    for _ in 0..5 {
+        let loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
+        loss.eval().unwrap();
+        losses.push(loss.item::<f32>());
+    }
+
+    // All losses should be finite and positive
+    for (i, loss) in losses.iter().enumerate() {
+        assert!(
+            loss.is_finite(),
+            "Loss {} should be finite, got {}",
+            i,
+            loss
+        );
+        assert!(*loss > 0.0, "Loss {} should be positive, got {}", i, loss);
+    }
+
+    // Verify loss is changing (parameters are being updated)
+    let loss_variance: f32 =
+        losses.iter().map(|l| (l - losses[0]).powi(2)).sum::<f32>() / losses.len() as f32;
+    assert!(
+        loss_variance > 0.0,
+        "Loss should change over steps, got {:?}",
+        losses
+    );
+
+    println!("Training step losses: {:?}", losses);
+}
+
+#[test]
+fn test_jit_training_step_with_warmup() {
+    // Test the jit_training_step function with proper warmup to initialize
+    // optimizer state. This verifies state stability and correct loss reduction.
+    use mlx_rs::optimizers::AdamW;
+    use mlx_rs::utils::Updatable;
+
+    let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let optimizer = AdamW::new(1e-4);
+
+    let mut state = (model, optimizer);
+
+    // Create test data
+    let input_ids = Array::from_slice(&[1_i32, 2, 3, 4, 5, 6, 7, 8], &[1, 8]);
+    let labels = Array::from_slice(&[2_i64, 3, 4, 5, 6, 7, 8, 9], &[1, 8]);
+
+    // ========================================
+    // PHASE 1: Record state count BEFORE warmup
+    // ========================================
+    let state_count_before = state.updatable_states_len();
+    println!("State count BEFORE warmup: {}", state_count_before);
+
+    // ========================================
+    // PHASE 2: WARMUP - Run one uncompiled step
+    // ========================================
+    // This initializes optimizer momentum/velocity buffers
+    let warmup_loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
+    warmup_loss.eval().unwrap();
+    let warmup_loss_val = warmup_loss.item::<f32>();
+    println!("Warmup loss: {:.4}", warmup_loss_val);
+
+    // ========================================
+    // PHASE 3: Record state count AFTER warmup
+    // ========================================
+    let state_count_after = state.updatable_states_len();
+    println!(
+        "State count AFTER warmup: {} (delta={})",
+        state_count_after,
+        state_count_after as i64 - state_count_before as i64
+    );
+
+    // AdamW should have created momentum and velocity buffers
+    // So state count should have increased
+    assert!(
+        state_count_after >= state_count_before,
+        "State count should not decrease after warmup: {} -> {}",
+        state_count_before,
+        state_count_after
+    );
+
+    // ========================================
+    // PHASE 4: Run SECOND warmup step to verify stability
+    // ========================================
+    println!("Running second warmup step to verify state stability...");
+    let warmup2_loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
+    warmup2_loss.eval().unwrap();
+    let warmup2_loss_val = warmup2_loss.item::<f32>();
+    println!("Second warmup loss: {:.4}", warmup2_loss_val);
+
+    let state_count_after_2 = state.updatable_states_len();
+    println!(
+        "State count AFTER second warmup: {} (should be same as {})",
+        state_count_after_2, state_count_after
+    );
+
+    assert_eq!(
+        state_count_after, state_count_after_2,
+        "State count should be stable after second warmup: {} vs {}",
+        state_count_after, state_count_after_2
+    );
+
+    // ========================================
+    // PHASE 5: Use non-compiled path
+    // ========================================
+    // NOTE: compile_with_state has a known limitation in mlx-rs where it doesn't
+    // correctly handle state count changes. Even with warmup to stabilize state,
+    // the internal state tracking in compile_with_state.rs:413 fails with
+    // "attempt to subtract with overflow" because:
+    // 1. The inner closure captures state count at creation time
+    // 2. During MLX tracing, the function may see different state
+    // 3. The compiled graph expects N outputs but current state has M > N
+    //
+    // For now, we use the non-compiled jit_training_step which correctly handles
+    // state and benefits from MLX's lazy evaluation and graph fusion.
+    println!("Using non-compiled training step (mlx-rs compile_with_state limitation)");
+
+    let mut losses = vec![warmup_loss_val, warmup2_loss_val];
+    for i in 0..3 {
+        let loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
+        loss.eval().unwrap();
+        let loss_val = loss.item::<f32>();
+        losses.push(loss_val);
+        println!("Training step {}: loss={:.4}", i + 3, loss_val);
+    }
+
+    // Verify state count remains stable
+    let final_state_count = state.updatable_states_len();
+    assert_eq!(
+        state_count_after, final_state_count,
+        "State count should remain stable: {} -> {}",
+        state_count_after, final_state_count
+    );
+
+    println!("State stability verified! Losses: {:?}", losses);
+}
+
+#[test]
+fn test_eager_evaluation_config() {
+    // Test eager evaluation mode can be enabled
+    let mut config = TrainingLoopConfig::default();
+    assert!(
+        !config.eager_evaluation,
+        "Default should have eager_evaluation disabled"
+    );
+
+    config.eager_evaluation = true;
+    let training_loop = TrainingLoop::new(config);
+    assert!(
+        training_loop.config.eager_evaluation,
+        "Should preserve eager_evaluation config"
+    );
+}
+
+#[test]
+fn test_gpu_gradient_clipping() {
+    use mlx_rs::Array;
+    use std::rc::Rc;
+
+    let config = TrainingLoopConfig {
+        training: TrainingConfig {
+            max_grad_norm: 1.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let training_loop = TrainingLoop::new(config);
+
+    // Create some fake gradients
+    let grad1 = Array::from_slice(&[3.0f32, 4.0], &[2]); // norm = 5
+    let grad2 = Array::from_slice(&[0.0f32, 0.0], &[2]); // norm = 0
+    let mut grads = FlattenedModuleParam::new();
+    grads.insert(Rc::from("layer1.weight"), grad1);
+    grads.insert(Rc::from("layer2.weight"), grad2);
+
+    // Clip gradients
+    let result = training_loop.clip_gradients_gpu(&mut grads);
+    assert!(result.is_ok(), "GPU gradient clipping should succeed");
+
+    let norm_arr = result.unwrap();
+    assert!(
+        norm_arr.is_some(),
+        "Should return norm array when max_grad_norm > 0"
+    );
+
+    let norm = norm_arr.unwrap();
+    norm.eval().unwrap();
+    let norm_val = norm.item::<f32>();
+
+    // Original norm should be 5 (sqrt(3^2 + 4^2))
+    // After clipping with max_norm=1.0, gradients should be scaled
+    // The returned norm should be the original norm (5.0)
+    assert!(
+        (norm_val - 5.0).abs() < 0.01,
+        "Norm should be ~5.0, got {}",
+        norm_val
+    );
+
+    // Check that gradients were actually clipped
+    let key: Rc<str> = Rc::from("layer1.weight");
+    let clipped_grad1 = grads.get(&key).unwrap();
+    clipped_grad1.eval().unwrap();
+
+    // Gradients should be scaled by 1.0/5.0 = 0.2
+    // [3.0, 4.0] * 0.2 = [0.6, 0.8]
+    let values: [f32; 2] = clipped_grad1.as_slice().try_into().unwrap();
+    assert!(
+        (values[0] - 0.6).abs() < 0.01,
+        "First grad should be ~0.6, got {}",
+        values[0]
+    );
+    assert!(
+        (values[1] - 0.8).abs() < 0.01,
+        "Second grad should be ~0.8, got {}",
+        values[1]
+    );
+}
+
+#[test]
+fn test_learning_rate_division_by_zero_protection() {
+    // Test edge case where total_steps == warmup_steps
+    let mut config = TrainingLoopConfig::default();
+    config.training.warmup_steps = 100;
+    config.training.max_steps = Some(100); // Same as warmup!
+    config.training.learning_rate = 1e-4;
+    config.training.lr_scheduler = LrSchedulerType::Linear;
+
+    let mut training_loop = TrainingLoop::new(config);
+
+    // At step 100 (past warmup, at max_steps)
+    training_loop.step = 100;
+    let lr = training_loop.get_learning_rate();
+
+    // Should not panic or return NaN/Inf
+    assert!(lr.is_finite(), "Learning rate should be finite, got {}", lr);
+    assert!(lr >= 0.0, "Learning rate should be non-negative");
+}
+
+#[test]
+fn test_batch_token_overflow_protection() {
+    // Test that we handle potential overflow in batch_size * seq_len
+    let large_batch_size: usize = usize::MAX / 2;
+    let large_seq_len: usize = 3;
+
+    // This would overflow without checked arithmetic
+    let result = large_batch_size.checked_mul(large_seq_len);
+    assert!(result.is_none(), "Should detect potential overflow");
+
+    // With our protected version, it returns MAX
+    let protected = large_batch_size
+        .checked_mul(large_seq_len)
+        .unwrap_or(usize::MAX);
+    assert_eq!(protected, usize::MAX, "Should return MAX on overflow");
+}

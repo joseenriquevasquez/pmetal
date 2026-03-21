@@ -785,6 +785,7 @@ impl SimpoTrainer {
         logps_array.multiply(&target_mask_f32)
     }
 
+    #[allow(dead_code)] // Convenience wrapper for testing without a full trainer instance
     fn compute_loss_with_cpo_static(
         config: &SimpoConfig,
         chosen_logps: &Array,

@@ -16,7 +16,7 @@ use pmetal_data::{
     DataLoaderConfig, DatasetColumnConfig, DatasetFormat, DatasetSource, Tokenizer,
     TrainingDataset, resolve_dataset_source,
 };
-use pmetal_lora::{DynamicLoraModel, LlamaQloraForCausalLM, QLoraConfig, TrainableModel};
+use pmetal_lora::{DynamicLoraModel, DynamicQloraModel, QLoraConfig, TrainableModel};
 use pmetal_mlx::quantization::QuantScheme;
 use pmetal_models::WeightFormat;
 use pmetal_models::architectures::llama::LlamaConfig;
@@ -554,7 +554,6 @@ pub async fn run_training(
             &config,
             &full_config,
             &model_path,
-            llama_config,
             training_loop_config,
             train_dataset,
             eval_dataset,
@@ -650,7 +649,6 @@ fn run_qlora_path(
     config: &TrainingJobConfig,
     full_config: &FullTrainingConfig,
     model_path: &Path,
-    llama_config: Option<LlamaConfig>,
     training_loop_config: TrainingLoopConfig,
     train_dataset: TrainingDataset,
     eval_dataset: Option<TrainingDataset>,
@@ -682,15 +680,13 @@ fn run_qlora_path(
         qlora_cfg.scheme
     );
 
-    let llama_cfg = llama_config.ok_or_else(|| {
-        anyhow::anyhow!(
-            "QLoRA requires config.json. GGUF format is only supported with standard LoRA."
-        )
-    })?;
-    let mut model = LlamaQloraForCausalLM::with_qlora_config(llama_cfg, qlora_config)?;
+    // Detect architecture and construct the correct QLoRA model.
+    // Errors early with a clear message for unsupported architectures.
+    let mut model = DynamicQloraModel::from_model_dir(model_path, qlora_config)?;
 
     tracing::info!(
-        "Loading and quantizing base model weights from {:?}...",
+        "Loading and quantizing {} base model weights from {:?}...",
+        model.arch_name(),
         model_path
     );
     model.load_and_quantize_from_dir(model_path)?;
@@ -718,7 +714,8 @@ fn run_qlora_path(
             );
         } else {
             tracing::warn!(
-                "Gradient checkpointing requested but not supported by LlamaQloraForCausalLM."
+                "Gradient checkpointing requested but not supported by this QLoRA model ({}).",
+                model.arch_name()
             );
         }
     }

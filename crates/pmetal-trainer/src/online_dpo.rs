@@ -157,12 +157,14 @@ pub struct OnlineDpoIterationStats {
 /// updated to the current policy, creating a self-play dynamic.
 pub struct OnlineDpoTrainer {
     config: OnlineDpoConfig,
+    #[allow(dead_code)] // Needed for future distributed/checkpoint support
     training_config: TrainingConfig,
     reward_func: Arc<dyn RewardFunction>,
     step: usize,
     iteration: usize,
 }
 
+#[allow(dead_code)] // Experimental trainer — methods used internally once train() is wired
 impl OnlineDpoTrainer {
     /// Create a new Online DPO trainer.
     pub fn new(
@@ -700,13 +702,6 @@ mod tests {
 
     #[test]
     fn test_preference_pair_creation() {
-        struct FixedReward(f32);
-        impl RewardFunction for FixedReward {
-            fn score(&self, _: &Array, _: &Array) -> Result<Array, Exception> {
-                Ok(Array::from_f32(self.0))
-            }
-        }
-
         // This test just verifies the structure compiles
         // Full integration test would need a real model
         let config = OnlineDpoConfig::default();

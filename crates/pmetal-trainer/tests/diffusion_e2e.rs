@@ -1,3 +1,5 @@
+// Gate the entire file behind the feature that exposes the diffusion API.
+#![cfg(feature = "experimental-trainers")]
 //! End-to-end diffusion training integration tests.
 //!
 //! These tests verify the LLaDA-style diffusion training pipeline:

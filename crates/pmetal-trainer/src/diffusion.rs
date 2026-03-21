@@ -821,7 +821,7 @@ pub struct DiffusionSampler {
     mask_token_id: i64,
     /// Number of diffusion steps.
     num_steps: usize,
-    /// Sampling temperature.
+    /// Sampling temperature (scales logits before softmax).
     temperature: f32,
     /// Remasking strategy.
     remasking: RemaskingStrategy,
@@ -881,12 +881,18 @@ impl DiffusionSampler {
                 .forward(&x_t, None)
                 .map_err(|e| Exception::custom(e.to_string()))?;
 
-            // Get predictions and confidences via softmax directly
-            let probs = mlx_rs::ops::softmax_axis(&logits, -1, None)?;
+            // Apply temperature scaling before softmax — affects confidence
+            // magnitudes which drive the remasking strategy.
+            let scaled_logits = if (self.temperature - 1.0).abs() > 1e-6 {
+                logits.multiply(&Array::from_f32(1.0 / self.temperature))?
+            } else {
+                logits
+            };
+            let probs = mlx_rs::ops::softmax_axis(&scaled_logits, -1, None)?;
             probs.eval()?;
 
             let probs_data: Vec<f32> = probs.as_slice().to_vec();
-            let vocab_size = logits.dim(2) as usize;
+            let vocab_size = scaled_logits.dim(2) as usize;
 
             // Predict masked positions
             let mut confidences = vec![1.0_f32; total_len];

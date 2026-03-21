@@ -74,7 +74,8 @@ pub trait StateExtractor {
 pub struct CompiledTrainStep<M, O> {
     model: M,
     optimizer: O,
-    #[allow(dead_code)] // Used by extract/update_model_params (JIT infra, not yet wired end-to-end)
+    #[allow(dead_code)]
+    // Used by extract/update_model_params (JIT infra, not yet wired end-to-end)
     param_keys: Vec<Rc<str>>,
     compiled: bool,
 }
