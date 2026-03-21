@@ -561,14 +561,15 @@ mod tests {
             .score_async(vec!["p".into()], vec!["xyz".into()])
             .unwrap();
 
-        // Poll until ready (with a generous iteration budget).
+        // Poll until ready — use sleep instead of spin_loop to give the
+        // async task time to complete, especially on CI with fewer cores.
         let mut result = None;
-        for _ in 0..10_000 {
+        for _ in 0..100 {
             if let Some(r) = pending.try_collect() {
                 result = Some(r);
                 break;
             }
-            std::hint::spin_loop();
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         let rewards = result
