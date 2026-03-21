@@ -336,7 +336,12 @@ pub async fn run_training(
             .get("num_attention_heads")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        tracing::info!("Model: {} hidden, {} layers, {} heads", hidden, layers, heads);
+        tracing::info!(
+            "Model: {} hidden, {} layers, {} heads",
+            hidden,
+            layers,
+            heads
+        );
     } else {
         tracing::info!("Model config will be extracted from GGUF metadata");
     }

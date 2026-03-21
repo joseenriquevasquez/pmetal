@@ -787,7 +787,6 @@ impl DpoTrainer {
                 }
                 history.push(metrics);
             }
-
         }
 
         let eval = pmetal_core::EvalMetrics {

@@ -1218,7 +1218,6 @@ impl GrpoTrainer {
                     }
                 }
             }
-
         }
 
         for cb in &mut self.callbacks {
@@ -1482,7 +1481,6 @@ impl GrpoTrainer {
                 // skip training — the first GPU step happens at i == 1 using step 0's
                 // rewards, which were scored during step 1's generation.
             }
-
         }
 
         // 8. Flush the final pending step.
