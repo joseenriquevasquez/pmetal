@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.12] - 2026-03-20
+
 ### Added
 
+- **LoRA**: Implemented dynamic QLoRA and fused metal kernels.
 - **KV cache quantization** (SOTA inference): q8_0 KV cache is now the default for inference and serving — community benchmarks confirm <0.4% PPL degradation with 12-38% throughput gain
   - Symmetric quantization: `--kv-quant 8` (default), `--kv-quant 4` for aggressive savings
   - Asymmetric K/V quantization: `--kv-k-bits 8 --kv-v-bits 4` — K is more sensitive than V, asymmetric gives near-q4 memory savings with near-q8 quality
@@ -18,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `DynamicModel::create_cache_with_mode()` with automatic group_size adjustment for non-standard head dimensions (Phi-3 mini head_dim=96, NemotronH head_dim=32)
   - Serve engine defaults to q8_0 KV cache for all requests
 - **Context-aware fit estimation**: Efficiency factor is now context-dependent (0.60 dense / 0.50 MoE base, log-linear penalty above 8k context) instead of flat 0.55. KV cache memory calculation accounts for quantization bits. Fit notes recommend q8_0 when memory is tight
+
+### Changed
+
+- **Trainer**: Modularized training loop and configured experimental trainers.
+- **MLX**: Moved `kv_cache` to a module and updated gated delta.
+- **Style**: Formatted CLI, Hub, Models, and Serve crates.
+- **Cleanup**: Removed `easy_reference.rs`.
 
 ### Fixed
 
