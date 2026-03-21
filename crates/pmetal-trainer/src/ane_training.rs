@@ -121,6 +121,10 @@ impl AneTrainingLoop {
         let max_steps = self.config.max_steps;
 
         for (batch_idx, batch) in data.iter().enumerate().take(num_batches) {
+            if batch_idx == 0 {
+                tracing::info!("ANE training: warming up (first step initializes optimizer)...");
+            }
+
             for cb in &mut self.callbacks {
                 cb.on_step_start(batch_idx);
             }
