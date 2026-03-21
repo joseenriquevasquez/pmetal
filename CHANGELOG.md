@@ -7,11 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.12] - 2026-03-20
+## [0.3.12] - 2026-03-21
 
 ### Added
 
-- **LoRA**: Implemented dynamic QLoRA and fused metal kernels.
+- **MLX memory management**: Wire real MLX Metal memory API via `mlx_rs::memory` (published in pmetal-mlx-rs 0.25.8). Exposes `clear_cache`, `get_active_memory`, `get_peak_memory`, `get_cache_memory`, `get/set_memory_limit`, `set_cache_limit`, `set_wired_limit`, `reset_peak_memory`. The previous `clear_cache()` was a complete no-op — MLX buffer cache was never freed
+- **Memory diagnostics**: `log_memory_stats()` reports active/cache/peak/limit at model load, training start, and completion for visibility into Metal allocator state
+- **LoRA**: Implemented dynamic QLoRA and fused metal kernels
 - **KV cache quantization** (SOTA inference): q8_0 KV cache is now the default for inference and serving — community benchmarks confirm <0.4% PPL degradation with 12-38% throughput gain
   - Symmetric quantization: `--kv-quant 8` (default), `--kv-quant 4` for aggressive savings
   - Asymmetric K/V quantization: `--kv-k-bits 8 --kv-v-bits 4` — K is more sensitive than V, asymmetric gives near-q4 memory savings with near-q8 quality
@@ -24,13 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Trainer**: Modularized training loop and configured experimental trainers.
-- **MLX**: Moved `kv_cache` to a module and updated gated delta.
-- **Style**: Formatted CLI, Hub, Models, and Serve crates.
-- **Cleanup**: Removed `easy_reference.rs`.
+- **Trainer**: Modularized training loop and configured experimental trainers
+- **MLX**: Moved `kv_cache` to a module and updated gated delta
+- **Style**: Formatted CLI, Hub, Models, and Serve crates
+- **Cleanup**: Removed `easy_reference.rs`
 
 ### Fixed
 
+- **Training memory explosion (72 GB peak for 0.6B model → 23 GB)**: Three root causes identified and fixed:
+  1. Computation graphs accumulated across deferred evaluation steps. Packed and compiled training paths deferred eval for 10 steps, keeping ~10 full forward+backward graphs in memory simultaneously. Now evaluates each step immediately
+  2. Gradient accumulation kept backward graphs alive. Each micro-batch's gradient arrays held references to the entire backward computation graph until gradients were applied. Now evaluates accumulated gradients after each micro-batch
+  3. `eval_params(model.parameters())` evaluated all 600M+ frozen base model params every step. Changed to `eval_params(model.trainable_parameters())` — only LoRA adapters (~1-10M params)
+- **ANE training attempt doubled memory for LoRA/QLoRA**: The orchestrator always attempted ANE training first (loading full model weights), failed (ANE is incompatible with LoRA adapters), then loaded the GPU LoRA model — keeping both in memory. Now skips ANE entirely for LoRA/QLoRA
+- **GUI training defaults misaligned with CLI**: GUI used `batch_size=4` (CLI: 1) and `gradient_checkpointing=false` (CLI: true), causing 5-10x more memory usage for identical models. Defaults now match CLI
+- **GUI training logs silently dropped**: Tracing filter only showed `pmetal_gui` crate logs. Training progress from orchestrator, trainer, and model crates was invisible. Now shows all pmetal crate logs
+- **MLX buffer cache not freed after training**: `clear_cache()` now runs after training ends (success, error, or cancel) in both orchestrator and GUI
 - **KV cache `Quantized` mode was a no-op**: `CacheMode::Quantized` existed in the enum but `KVCache::update_and_fetch()` treated it identically to `Standard`. Now properly delegates to per-layer `QuantizedKVCache` instances with quantize-on-write / dequantize-on-read
 - **KV cache quantization crash on non-standard head dimensions**: Models with head_dim not divisible by 64 (Phi-3 mini=96, NemotronH=32, FalconH1=16) would fail in MLX's `quantize` op. `create_cache_with_mode()` now auto-adjusts group_size to the largest compatible power-of-2
 
