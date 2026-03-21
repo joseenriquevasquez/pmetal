@@ -37,6 +37,37 @@ use crate::{
     qwen3_lora::Qwen3LoraForCausalLM, qwen3_next_lora::Qwen3NextLoraForCausalLM,
 };
 
+/// Dispatch a method call uniformly across all `DynamicLoraModel` variants.
+///
+/// Every arm expands to `m.$method($args...)` where `m` is the inner model.
+/// Use this only for methods where ALL variants have identical call signatures.
+macro_rules! dispatch_lora_uniform {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            Self::Llama(m) => m.$method($($arg),*),
+            Self::Mistral(m) => m.$method($($arg),*),
+            Self::Qwen3(m) => m.$method($($arg),*),
+            Self::Gemma(m) => m.$method($($arg),*),
+            Self::Phi(m) => m.$method($($arg),*),
+            Self::Qwen3Next(m) => m.$method($($arg),*),
+        }
+    };
+}
+
+/// Map each `DynamicLoraModel` variant to its corresponding `ModelArchitecture` constant.
+macro_rules! dispatch_lora_architecture {
+    ($self:expr) => {
+        match $self {
+            Self::Llama(_) => ModelArchitecture::Llama,
+            Self::Mistral(_) => ModelArchitecture::Mistral,
+            Self::Qwen3(_) => ModelArchitecture::Qwen3,
+            Self::Gemma(_) => ModelArchitecture::Gemma,
+            Self::Phi(_) => ModelArchitecture::Phi,
+            Self::Qwen3Next(_) => ModelArchitecture::Qwen3Next,
+        }
+    };
+}
+
 /// Dynamic LoRA model container using enum dispatch.
 ///
 /// This approach uses static dispatch via enum variants rather than
@@ -358,14 +389,7 @@ impl DynamicLoraModel {
 
     /// Get the detected architecture.
     pub fn architecture(&self) -> ModelArchitecture {
-        match self {
-            Self::Llama(_) => ModelArchitecture::Llama,
-            Self::Mistral(_) => ModelArchitecture::Mistral,
-            Self::Qwen3(_) => ModelArchitecture::Qwen3,
-            Self::Gemma(_) => ModelArchitecture::Gemma,
-            Self::Phi(_) => ModelArchitecture::Phi,
-            Self::Qwen3Next(_) => ModelArchitecture::Qwen3Next,
-        }
+        dispatch_lora_architecture!(self)
     }
 
     /// Get the architecture name as a string.
@@ -382,117 +406,47 @@ impl DynamicLoraModel {
 
     /// Merge LoRA weights into base weights.
     pub fn merge_lora(&mut self) -> Result<(), LoraError> {
-        match self {
-            Self::Llama(m) => m.merge_lora(),
-            Self::Mistral(m) => m.merge_lora(),
-            Self::Qwen3(m) => m.merge_lora(),
-            Self::Gemma(m) => m.merge_lora(),
-            Self::Phi(m) => m.merge_lora(),
-            Self::Qwen3Next(m) => m.merge_lora(),
-        }
+        dispatch_lora_uniform!(self, merge_lora)
     }
 
     /// Unmerge is not supported.
     pub fn unmerge_lora(&mut self) -> Result<(), LoraError> {
-        match self {
-            Self::Llama(m) => m.unmerge_lora(),
-            Self::Mistral(m) => m.unmerge_lora(),
-            Self::Qwen3(m) => m.unmerge_lora(),
-            Self::Gemma(m) => m.unmerge_lora(),
-            Self::Phi(m) => m.unmerge_lora(),
-            Self::Qwen3Next(m) => m.unmerge_lora(),
-        }
+        dispatch_lora_uniform!(self, unmerge_lora)
     }
 }
 
 // Implement TrainableModel for DynamicLoraModel via dispatch
 impl mlx_rs::module::ModuleParameters for DynamicLoraModel {
     fn num_parameters(&self) -> usize {
-        match self {
-            Self::Llama(m) => m.num_trainable_params(),
-            Self::Mistral(m) => m.num_trainable_params(),
-            Self::Qwen3(m) => m.num_trainable_params(),
-            Self::Gemma(m) => m.num_trainable_params(),
-            Self::Phi(m) => m.num_trainable_params(),
-            Self::Qwen3Next(m) => m.num_trainable_params(),
-        }
+        dispatch_lora_uniform!(self, num_trainable_params)
     }
 
     fn parameters(&self) -> mlx_rs::module::ModuleParamRef<'_> {
-        match self {
-            Self::Llama(m) => m.parameters(),
-            Self::Mistral(m) => m.parameters(),
-            Self::Qwen3(m) => m.parameters(),
-            Self::Gemma(m) => m.parameters(),
-            Self::Phi(m) => m.parameters(),
-            Self::Qwen3Next(m) => m.parameters(),
-        }
+        dispatch_lora_uniform!(self, parameters)
     }
 
     fn parameters_mut(&mut self) -> mlx_rs::module::ModuleParamMut<'_> {
-        match self {
-            Self::Llama(m) => m.parameters_mut(),
-            Self::Mistral(m) => m.parameters_mut(),
-            Self::Qwen3(m) => m.parameters_mut(),
-            Self::Gemma(m) => m.parameters_mut(),
-            Self::Phi(m) => m.parameters_mut(),
-            Self::Qwen3Next(m) => m.parameters_mut(),
-        }
+        dispatch_lora_uniform!(self, parameters_mut)
     }
 
     fn trainable_parameters(&self) -> mlx_rs::module::ModuleParamRef<'_> {
-        match self {
-            Self::Llama(m) => m.trainable_parameters(),
-            Self::Mistral(m) => m.trainable_parameters(),
-            Self::Qwen3(m) => m.trainable_parameters(),
-            Self::Gemma(m) => m.trainable_parameters(),
-            Self::Phi(m) => m.trainable_parameters(),
-            Self::Qwen3Next(m) => m.trainable_parameters(),
-        }
+        dispatch_lora_uniform!(self, trainable_parameters)
     }
 
     fn freeze_parameters(&mut self, recursive: bool) {
-        match self {
-            Self::Llama(m) => m.freeze_parameters(recursive),
-            Self::Mistral(m) => m.freeze_parameters(recursive),
-            Self::Qwen3(m) => m.freeze_parameters(recursive),
-            Self::Gemma(m) => m.freeze_parameters(recursive),
-            Self::Phi(m) => m.freeze_parameters(recursive),
-            Self::Qwen3Next(m) => m.freeze_parameters(recursive),
-        }
+        dispatch_lora_uniform!(self, freeze_parameters, recursive)
     }
 
     fn unfreeze_parameters(&mut self, recursive: bool) {
-        match self {
-            Self::Llama(m) => m.unfreeze_parameters(recursive),
-            Self::Mistral(m) => m.unfreeze_parameters(recursive),
-            Self::Qwen3(m) => m.unfreeze_parameters(recursive),
-            Self::Gemma(m) => m.unfreeze_parameters(recursive),
-            Self::Phi(m) => m.unfreeze_parameters(recursive),
-            Self::Qwen3Next(m) => m.unfreeze_parameters(recursive),
-        }
+        dispatch_lora_uniform!(self, unfreeze_parameters, recursive)
     }
 
     fn all_frozen(&self) -> Option<bool> {
-        match self {
-            Self::Llama(m) => m.all_frozen(),
-            Self::Mistral(m) => m.all_frozen(),
-            Self::Qwen3(m) => m.all_frozen(),
-            Self::Gemma(m) => m.all_frozen(),
-            Self::Phi(m) => m.all_frozen(),
-            Self::Qwen3Next(m) => m.all_frozen(),
-        }
+        dispatch_lora_uniform!(self, all_frozen)
     }
 
     fn any_frozen(&self) -> Option<bool> {
-        match self {
-            Self::Llama(m) => m.any_frozen(),
-            Self::Mistral(m) => m.any_frozen(),
-            Self::Qwen3(m) => m.any_frozen(),
-            Self::Gemma(m) => m.any_frozen(),
-            Self::Phi(m) => m.any_frozen(),
-            Self::Qwen3Next(m) => m.any_frozen(),
-        }
+        dispatch_lora_uniform!(self, any_frozen)
     }
 }
 
@@ -526,80 +480,31 @@ impl TrainableModel for DynamicLoraModel {
     }
 
     fn num_trainable_params(&self) -> usize {
-        match self {
-            Self::Llama(m) => m.num_trainable_params(),
-            Self::Mistral(m) => m.num_trainable_params(),
-            Self::Qwen3(m) => m.num_trainable_params(),
-            Self::Gemma(m) => m.num_trainable_params(),
-            Self::Phi(m) => m.num_trainable_params(),
-            Self::Qwen3Next(m) => m.num_trainable_params(),
-        }
+        dispatch_lora_uniform!(self, num_trainable_params)
     }
 
     fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
-        match self {
-            Self::Llama(m) => m.lora_parameters(),
-            Self::Mistral(m) => m.lora_parameters(),
-            Self::Qwen3(m) => m.lora_parameters(),
-            Self::Gemma(m) => m.lora_parameters(),
-            Self::Phi(m) => m.lora_parameters(),
-            Self::Qwen3Next(m) => m.lora_parameters(),
-        }
+        dispatch_lora_uniform!(self, lora_parameters)
     }
 
     fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>) {
-        match self {
-            Self::Llama(m) => m.set_lora_parameters(params),
-            Self::Mistral(m) => m.set_lora_parameters(params),
-            Self::Qwen3(m) => m.set_lora_parameters(params),
-            Self::Gemma(m) => m.set_lora_parameters(params),
-            Self::Phi(m) => m.set_lora_parameters(params),
-            Self::Qwen3Next(m) => m.set_lora_parameters(params),
-        }
+        dispatch_lora_uniform!(self, set_lora_parameters, params)
     }
 
     fn save_lora_weights(&self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
-        match self {
-            Self::Llama(m) => m.save_lora_weights(path),
-            Self::Mistral(m) => m.save_lora_weights(path),
-            Self::Qwen3(m) => m.save_lora_weights(path),
-            Self::Gemma(m) => m.save_lora_weights(path),
-            Self::Phi(m) => m.save_lora_weights(path),
-            Self::Qwen3Next(m) => m.save_lora_weights(path),
-        }
+        dispatch_lora_uniform!(self, save_lora_weights, path)
     }
 
     fn load_lora_weights(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
-        match self {
-            Self::Llama(m) => m.load_lora_weights(path),
-            Self::Mistral(m) => m.load_lora_weights(path),
-            Self::Qwen3(m) => m.load_lora_weights(path),
-            Self::Gemma(m) => m.load_lora_weights(path),
-            Self::Phi(m) => m.load_lora_weights(path),
-            Self::Qwen3Next(m) => m.load_lora_weights(path),
-        }
+        dispatch_lora_uniform!(self, load_lora_weights, path)
     }
 
     fn enable_gradient_checkpointing(&mut self, layers_per_block: usize) {
-        match self {
-            Self::Llama(m) => m.enable_gradient_checkpointing(layers_per_block),
-            Self::Mistral(m) => m.enable_gradient_checkpointing(layers_per_block),
-            Self::Qwen3(m) => m.enable_gradient_checkpointing(layers_per_block),
-            Self::Gemma(m) => m.enable_gradient_checkpointing(layers_per_block),
-            Self::Phi(m) => m.enable_gradient_checkpointing(layers_per_block),
-            Self::Qwen3Next(m) => m.enable_gradient_checkpointing(layers_per_block),
-        }
+        dispatch_lora_uniform!(self, enable_gradient_checkpointing, layers_per_block)
     }
 
     fn disable_gradient_checkpointing(&mut self) {
-        match self {
-            Self::Llama(m) => m.disable_gradient_checkpointing(),
-            Self::Mistral(m) => m.disable_gradient_checkpointing(),
-            Self::Qwen3(m) => m.disable_gradient_checkpointing(),
-            Self::Gemma(m) => m.disable_gradient_checkpointing(),
-            Self::Phi(m) => m.disable_gradient_checkpointing(),
-            Self::Qwen3Next(m) => m.disable_gradient_checkpointing(),
-        }
+        dispatch_lora_uniform!(self, disable_gradient_checkpointing)
     }
 
     fn supports_gradient_checkpointing(&self) -> bool {
@@ -656,14 +561,7 @@ impl TrainableModel for DynamicLoraModel {
         input_ids: &Array,
         mask: Option<&Array>,
     ) -> Option<Result<Array, LoraError>> {
-        match self {
-            Self::Llama(m) => m.forward_hidden(input_ids, mask),
-            Self::Mistral(m) => m.forward_hidden(input_ids, mask),
-            Self::Qwen3(m) => m.forward_hidden(input_ids, mask),
-            Self::Gemma(m) => m.forward_hidden(input_ids, mask),
-            Self::Phi(m) => m.forward_hidden(input_ids, mask),
-            Self::Qwen3Next(m) => m.forward_hidden(input_ids, mask),
-        }
+        dispatch_lora_uniform!(self, forward_hidden, input_ids, mask)
     }
 
     fn forward_hidden_with_positions(
@@ -672,25 +570,17 @@ impl TrainableModel for DynamicLoraModel {
         mask: Option<&Array>,
         position_ids: &Array,
     ) -> Option<Result<Array, LoraError>> {
-        match self {
-            Self::Llama(m) => m.forward_hidden_with_positions(input_ids, mask, position_ids),
-            Self::Mistral(m) => m.forward_hidden_with_positions(input_ids, mask, position_ids),
-            Self::Qwen3(m) => m.forward_hidden_with_positions(input_ids, mask, position_ids),
-            Self::Gemma(m) => m.forward_hidden_with_positions(input_ids, mask, position_ids),
-            Self::Phi(m) => m.forward_hidden_with_positions(input_ids, mask, position_ids),
-            Self::Qwen3Next(m) => m.forward_hidden_with_positions(input_ids, mask, position_ids),
-        }
+        dispatch_lora_uniform!(
+            self,
+            forward_hidden_with_positions,
+            input_ids,
+            mask,
+            position_ids
+        )
     }
 
     fn lm_head_weight(&self) -> Option<Array> {
-        match self {
-            Self::Llama(m) => m.lm_head_weight(),
-            Self::Mistral(m) => m.lm_head_weight(),
-            Self::Qwen3(m) => m.lm_head_weight(),
-            Self::Gemma(m) => m.lm_head_weight(),
-            Self::Phi(m) => m.lm_head_weight(),
-            Self::Qwen3Next(m) => m.lm_head_weight(),
-        }
+        dispatch_lora_uniform!(self, lm_head_weight)
     }
 }
 
@@ -708,14 +598,7 @@ impl DynamicLoraModel {
     /// Call this after loading LoRA weights to ensure the adapter parameters
     /// are materialized on the device before running inference.
     pub fn eval_all(&mut self) -> Result<(), LoraError> {
-        match self {
-            Self::Llama(m) => m.eval_all(),
-            Self::Mistral(m) => m.eval_all(),
-            Self::Qwen3(m) => m.eval_all(),
-            Self::Gemma(m) => m.eval_all(),
-            Self::Phi(m) => m.eval_all(),
-            Self::Qwen3Next(m) => m.eval_all(),
-        }
+        dispatch_lora_uniform!(self, eval_all)
     }
 
     /// Forward with hybrid cache support (KV cache + Mamba cache).

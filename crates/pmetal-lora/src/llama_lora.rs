@@ -23,6 +23,11 @@ use pmetal_mlx::kernels::{
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::llama::LlamaConfig;
 
+use crate::lora::LoraProjection;
+use crate::lora_helpers::{
+    LoraDecoderStack, collect_lora_parameters, count_trainable_params, load_lora_weights_impl,
+    save_lora_weights_impl, set_lora_parameters as helpers_set_lora_parameters,
+};
 use crate::{LinearAdapter, LoraError, LoraLinear};
 
 /// LoRA-enabled attention layer for Llama.
@@ -760,6 +765,46 @@ impl LlamaLoraModel {
     }
 }
 
+impl LoraDecoderStack for LlamaLoraModel {
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn attn_projections(&self, layer: usize) -> Vec<&dyn LoraProjection> {
+        let l = &self.layers[layer];
+        vec![
+            &l.self_attn.q_proj,
+            &l.self_attn.k_proj,
+            &l.self_attn.v_proj,
+            &l.self_attn.o_proj,
+        ]
+    }
+
+    fn attn_projections_mut(&mut self, layer: usize) -> Vec<&mut dyn LoraProjection> {
+        let l = &mut self.layers[layer];
+        vec![
+            &mut l.self_attn.q_proj,
+            &mut l.self_attn.k_proj,
+            &mut l.self_attn.v_proj,
+            &mut l.self_attn.o_proj,
+        ]
+    }
+
+    fn mlp_projections(&self, layer: usize) -> Vec<&dyn LoraProjection> {
+        let l = &self.layers[layer];
+        vec![&l.mlp.gate_proj, &l.mlp.up_proj, &l.mlp.down_proj]
+    }
+
+    fn mlp_projections_mut(&mut self, layer: usize) -> Vec<&mut dyn LoraProjection> {
+        let l = &mut self.layers[layer];
+        vec![
+            &mut l.mlp.gate_proj,
+            &mut l.mlp.up_proj,
+            &mut l.mlp.down_proj,
+        ]
+    }
+}
+
 /// LoRA-enabled Llama model with LM head.
 #[derive(Debug)]
 pub struct LlamaLoraForCausalLM {
@@ -957,75 +1002,7 @@ impl LlamaLoraForCausalLM {
     /// Returns parameters with keys like "layers.0.self_attn.q_proj.lora_a".
     /// For DoRA layers, also includes "layers.0.self_attn.q_proj.magnitude".
     pub fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
-        let mut params = HashMap::new();
-
-        // Helper macro to insert A, B, and any extra params (magnitude for DoRA)
-        macro_rules! insert_adapter {
-            ($params:expr, $adapter:expr, $key_prefix:expr) => {
-                $params.insert(
-                    Rc::from(format!("{}.lora_a", $key_prefix)),
-                    $adapter.lora_a().clone(),
-                );
-                $params.insert(
-                    Rc::from(format!("{}.lora_b", $key_prefix)),
-                    $adapter.lora_b().clone(),
-                );
-                for (name, arr) in $adapter.extra_params() {
-                    $params.insert(Rc::from(format!("{}.{}", $key_prefix, name)), arr.clone());
-                }
-            };
-        }
-
-        for (i, layer) in self.model.layers.iter().enumerate() {
-            let prefix = format!("layers.{}", i);
-
-            // Attention adapter params (LoRA A + B + optional DoRA magnitude)
-            insert_adapter!(
-                params,
-                layer.self_attn.q_proj,
-                format!("{}.self_attn.q_proj", prefix)
-            );
-            insert_adapter!(
-                params,
-                layer.self_attn.k_proj,
-                format!("{}.self_attn.k_proj", prefix)
-            );
-            insert_adapter!(
-                params,
-                layer.self_attn.v_proj,
-                format!("{}.self_attn.v_proj", prefix)
-            );
-            insert_adapter!(
-                params,
-                layer.self_attn.o_proj,
-                format!("{}.self_attn.o_proj", prefix)
-            );
-
-            // MLP LoRA params (use accessor methods — fields are behind LinearAdapter enum)
-            for (proj_name, proj) in [
-                ("gate_proj", &layer.mlp.gate_proj),
-                ("up_proj", &layer.mlp.up_proj),
-                ("down_proj", &layer.mlp.down_proj),
-            ] {
-                let key_prefix = format!("{}.mlp.{}", prefix, proj_name);
-                params.insert(
-                    Rc::from(format!("{}.lora_a", key_prefix)),
-                    proj.lora_a().clone(),
-                );
-                params.insert(
-                    Rc::from(format!("{}.lora_b", key_prefix)),
-                    proj.lora_b().clone(),
-                );
-                for (extra_name, arr) in proj.extra_params() {
-                    params.insert(
-                        Rc::from(format!("{}.{}", key_prefix, extra_name)),
-                        arr.clone(),
-                    );
-                }
-            }
-        }
-
-        params
+        collect_lora_parameters(&self.model)
     }
 
     /// Apply gradient updates to LoRA parameters.
@@ -1088,55 +1065,7 @@ impl LlamaLoraForCausalLM {
     ///
     /// This is used by autodiff to inject parameter values before the forward pass.
     pub fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>) {
-        for (i, layer) in self.model.layers.iter_mut().enumerate() {
-            let prefix = format!("layers.{}", i);
-
-            // Attention adapter params (via accessor methods to support LinearAdapter)
-            for (proj_name, proj) in [
-                ("q_proj", &mut layer.self_attn.q_proj),
-                ("k_proj", &mut layer.self_attn.k_proj),
-                ("v_proj", &mut layer.self_attn.v_proj),
-                ("o_proj", &mut layer.self_attn.o_proj),
-            ] {
-                let a_key = format!("{}.self_attn.{}.lora_a", prefix, proj_name);
-                let b_key = format!("{}.self_attn.{}.lora_b", prefix, proj_name);
-                if let Some(value) = params.get(&Rc::from(a_key)) {
-                    *proj.lora_a_mut() = value.clone();
-                }
-                if let Some(value) = params.get(&Rc::from(b_key)) {
-                    *proj.lora_b_mut() = value.clone();
-                }
-                // Restore DoRA magnitude if present
-                for (extra_name, extra_param) in proj.extra_params_mut() {
-                    let key = format!("{}.self_attn.{}.{}", prefix, proj_name, extra_name);
-                    if let Some(value) = params.get(&Rc::from(key)) {
-                        *extra_param = value.clone();
-                    }
-                }
-            }
-
-            // MLP LoRA params (use accessor methods — fields are behind LinearAdapter enum)
-            for (proj_name, proj) in [
-                ("gate_proj", &mut layer.mlp.gate_proj),
-                ("up_proj", &mut layer.mlp.up_proj),
-                ("down_proj", &mut layer.mlp.down_proj),
-            ] {
-                let a_key = format!("{}.mlp.{}.lora_a", prefix, proj_name);
-                let b_key = format!("{}.mlp.{}.lora_b", prefix, proj_name);
-                if let Some(value) = params.get(&Rc::from(a_key)) {
-                    *proj.lora_a_mut() = value.clone();
-                }
-                if let Some(value) = params.get(&Rc::from(b_key)) {
-                    *proj.lora_b_mut() = value.clone();
-                }
-                for (extra_name, extra_param) in proj.extra_params_mut() {
-                    let key = format!("{}.mlp.{}.{}", prefix, proj_name, extra_name);
-                    if let Some(value) = params.get(&Rc::from(key)) {
-                        *extra_param = value.clone();
-                    }
-                }
-            }
-        }
+        helpers_set_lora_parameters(&mut self.model, params);
     }
 
     /// Evaluate all LoRA parameters (force computation).
@@ -1163,7 +1092,7 @@ impl LlamaLoraForCausalLM {
 
     /// Get number of trainable parameters.
     pub fn num_trainable_params(&self) -> usize {
-        self.model.num_trainable_params()
+        count_trainable_params(&self.model)
     }
 
     /// Get configuration.
@@ -1202,9 +1131,7 @@ impl LlamaLoraForCausalLM {
 
     /// Save LoRA weights to safetensors.
     pub fn save_lora_weights(&self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
-        let params = self.lora_parameters();
-        Array::save_safetensors(params, None, path)?;
-        Ok(())
+        save_lora_weights_impl(&self.model, path)
     }
 
     /// Load LoRA weights from safetensors.
@@ -1215,64 +1142,7 @@ impl LlamaLoraForCausalLM {
         &mut self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), LoraError> {
-        let path = path.as_ref();
-        let file_path = if path.is_dir() {
-            path.join("lora_weights.safetensors")
-        } else {
-            path.to_path_buf()
-        };
-        let loaded = Array::load_safetensors(&file_path)?;
-
-        for (i, layer) in self.model.layers.iter_mut().enumerate() {
-            let prefix = format!("layers.{}", i);
-
-            // Attention LoRA params (use accessor methods — LinearAdapter enum)
-            for (proj_name, proj) in [
-                ("q_proj", &mut layer.self_attn.q_proj),
-                ("k_proj", &mut layer.self_attn.k_proj),
-                ("v_proj", &mut layer.self_attn.v_proj),
-                ("o_proj", &mut layer.self_attn.o_proj),
-            ] {
-                let a_key = format!("{}.self_attn.{}.lora_a", prefix, proj_name);
-                let b_key = format!("{}.self_attn.{}.lora_b", prefix, proj_name);
-                if let Some(value) = loaded.get(a_key.as_str()) {
-                    *proj.lora_a_mut() = value.clone();
-                }
-                if let Some(value) = loaded.get(b_key.as_str()) {
-                    *proj.lora_b_mut() = value.clone();
-                }
-                for (extra_name, extra_param) in proj.extra_params_mut() {
-                    let key = format!("{}.self_attn.{}.{}", prefix, proj_name, extra_name);
-                    if let Some(value) = loaded.get(key.as_str()) {
-                        *extra_param = value.clone();
-                    }
-                }
-            }
-
-            // MLP LoRA params (use accessor methods — LinearAdapter enum)
-            for (proj_name, proj) in [
-                ("gate_proj", &mut layer.mlp.gate_proj),
-                ("up_proj", &mut layer.mlp.up_proj),
-                ("down_proj", &mut layer.mlp.down_proj),
-            ] {
-                let a_key = format!("{}.mlp.{}.lora_a", prefix, proj_name);
-                let b_key = format!("{}.mlp.{}.lora_b", prefix, proj_name);
-                if let Some(value) = loaded.get(a_key.as_str()) {
-                    *proj.lora_a_mut() = value.clone();
-                }
-                if let Some(value) = loaded.get(b_key.as_str()) {
-                    *proj.lora_b_mut() = value.clone();
-                }
-                for (extra_name, extra_param) in proj.extra_params_mut() {
-                    let key = format!("{}.mlp.{}.{}", prefix, proj_name, extra_name);
-                    if let Some(value) = loaded.get(key.as_str()) {
-                        *extra_param = value.clone();
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        load_lora_weights_impl(&mut self.model, path)
     }
 
     /// Load base model weights from a HashMap of weight tensors.
@@ -1686,98 +1556,8 @@ impl ModuleParameters for LlamaLoraForCausalLM {
     }
 }
 
-/// Implement TrainableModel for LlamaLoraForCausalLM.
-impl crate::TrainableModel for LlamaLoraForCausalLM {
-    fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
-        LlamaLoraForCausalLM::forward(self, input_ids, mask)
-    }
-
-    fn num_trainable_params(&self) -> usize {
-        LlamaLoraForCausalLM::num_trainable_params(self)
-    }
-
-    fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
-        LlamaLoraForCausalLM::lora_parameters(self)
-    }
-
-    fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>) {
-        LlamaLoraForCausalLM::set_lora_parameters(self, params)
-    }
-
-    fn save_lora_weights(&self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
-        LlamaLoraForCausalLM::save_lora_weights(self, path)
-    }
-
-    fn load_lora_weights(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
-        LlamaLoraForCausalLM::load_lora_weights(self, path)
-    }
-
-    fn enable_gradient_checkpointing(&mut self, layers_per_block: usize) {
-        LlamaLoraForCausalLM::enable_gradient_checkpointing(self, layers_per_block)
-    }
-
-    fn disable_gradient_checkpointing(&mut self) {
-        LlamaLoraForCausalLM::disable_gradient_checkpointing(self)
-    }
-
-    fn supports_gradient_checkpointing(&self) -> bool {
-        true
-    }
-
-    fn forward_noised(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-        noise_alpha: f32,
-    ) -> Result<Array, LoraError> {
-        LlamaLoraForCausalLM::forward_noised(self, input_ids, mask, noise_alpha)
-    }
-
-    fn forward_hidden(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-    ) -> Option<Result<Array, LoraError>> {
-        Some(LlamaLoraForCausalLM::forward_hidden_states(
-            self, input_ids, mask,
-        ))
-    }
-
-    fn forward_hidden_with_positions(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-        position_ids: &Array,
-    ) -> Option<Result<Array, LoraError>> {
-        Some(LlamaLoraForCausalLM::forward_hidden_states_with_positions(
-            self,
-            input_ids,
-            mask,
-            position_ids,
-        ))
-    }
-
-    fn lm_head_weight(&self) -> Option<Array> {
-        LlamaLoraForCausalLM::get_lm_head_weight(self)
-    }
-
-    fn forward_with_cache(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-        cache: Option<&mut KVCache>,
-    ) -> Result<Array, LoraError> {
-        LlamaLoraForCausalLM::forward_with_cache(self, input_ids, mask, cache)
-    }
-
-    fn create_cache(&self, max_seq_len: usize) -> Option<KVCache> {
-        Some(LlamaLoraForCausalLM::create_cache(self, max_seq_len))
-    }
-
-    fn supports_kv_cache(&self) -> bool {
-        true
-    }
-}
+// Implement TrainableModel for LlamaLoraForCausalLM via shared macro.
+crate::impl_trainable_model!(LlamaLoraForCausalLM);
 
 /// Create a causal attention mask.
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {

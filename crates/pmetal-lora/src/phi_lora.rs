@@ -32,6 +32,11 @@ use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, r
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::phi::{PhiActivation, PhiConfig};
 
+use crate::lora::LoraProjection;
+use crate::lora_helpers::{
+    LoraDecoderStack, collect_lora_parameters, count_trainable_params, load_lora_weights_impl,
+    save_lora_weights_impl, set_lora_parameters as helpers_set_lora_parameters,
+};
 use crate::{LoraError, LoraLinear};
 
 /// LoRA-enabled Phi RMS LayerNorm.
@@ -610,7 +615,48 @@ impl PhiLoraModel {
 
     /// Get number of trainable parameters.
     pub fn num_trainable_params(&self) -> usize {
-        self.layers.iter().map(|l| l.num_trainable_params()).sum()
+        count_trainable_params(self)
+    }
+}
+
+impl LoraDecoderStack for PhiLoraModel {
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    // Phi uses fused gate_up_proj instead of separate gate_proj + up_proj.
+    fn mlp_projection_names(&self) -> &[&'static str] {
+        &["gate_up_proj", "down_proj"]
+    }
+
+    fn attn_projections(&self, layer: usize) -> Vec<&dyn LoraProjection> {
+        let l = &self.layers[layer];
+        vec![
+            &l.self_attn.q_proj,
+            &l.self_attn.k_proj,
+            &l.self_attn.v_proj,
+            &l.self_attn.o_proj,
+        ]
+    }
+
+    fn attn_projections_mut(&mut self, layer: usize) -> Vec<&mut dyn LoraProjection> {
+        let l = &mut self.layers[layer];
+        vec![
+            &mut l.self_attn.q_proj,
+            &mut l.self_attn.k_proj,
+            &mut l.self_attn.v_proj,
+            &mut l.self_attn.o_proj,
+        ]
+    }
+
+    fn mlp_projections(&self, layer: usize) -> Vec<&dyn LoraProjection> {
+        let l = &self.layers[layer];
+        vec![&l.mlp.gate_up_proj, &l.mlp.down_proj]
+    }
+
+    fn mlp_projections_mut(&mut self, layer: usize) -> Vec<&mut dyn LoraProjection> {
+        let l = &mut self.layers[layer];
+        vec![&mut l.mlp.gate_up_proj, &mut l.mlp.down_proj]
     }
 }
 
@@ -675,6 +721,30 @@ impl PhiLoraForCausalLM {
     /// Get the LM head weight for Cut Cross-Entropy.
     pub fn get_lm_head_weight(&self) -> Option<Array> {
         Some(self.lm_head.weight.value.clone())
+    }
+
+    /// Forward pass with NEFTune noise injection (delegates to standard forward — Phi has no
+    /// dedicated noised path).
+    pub fn forward_noised(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        _noise_alpha: f32,
+    ) -> Result<Array, LoraError> {
+        self.forward(input_ids, mask)
+    }
+
+    /// Forward pass returning hidden states with explicit position IDs.
+    ///
+    /// Phi does not use position IDs in its forward signature; the `position_ids`
+    /// argument is accepted for API uniformity but ignored.
+    pub fn forward_hidden_states_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        _position_ids: &Array,
+    ) -> Result<Array, LoraError> {
+        self.forward_hidden_states(input_ids, mask)
     }
 
     /// Forward pass with optional gradient checkpointing.
@@ -745,135 +815,17 @@ impl PhiLoraForCausalLM {
 
     /// Get all trainable LoRA parameters.
     pub fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
-        let mut params = HashMap::new();
-
-        for (i, layer) in self.model.layers.iter().enumerate() {
-            let prefix = format!("layers.{}", i);
-
-            // Attention LoRA params
-            params.insert(
-                Rc::from(format!("{}.self_attn.q_proj.lora_a", prefix)),
-                layer.self_attn.q_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.q_proj.lora_b", prefix)),
-                layer.self_attn.q_proj.lora_b.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.k_proj.lora_a", prefix)),
-                layer.self_attn.k_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.k_proj.lora_b", prefix)),
-                layer.self_attn.k_proj.lora_b.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.v_proj.lora_a", prefix)),
-                layer.self_attn.v_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.v_proj.lora_b", prefix)),
-                layer.self_attn.v_proj.lora_b.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.o_proj.lora_a", prefix)),
-                layer.self_attn.o_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.o_proj.lora_b", prefix)),
-                layer.self_attn.o_proj.lora_b.clone(),
-            );
-
-            // MLP LoRA params (fused gate_up)
-            params.insert(
-                Rc::from(format!("{}.mlp.gate_up_proj.lora_a", prefix)),
-                layer.mlp.gate_up_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.mlp.gate_up_proj.lora_b", prefix)),
-                layer.mlp.gate_up_proj.lora_b.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.mlp.down_proj.lora_a", prefix)),
-                layer.mlp.down_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.mlp.down_proj.lora_b", prefix)),
-                layer.mlp.down_proj.lora_b.clone(),
-            );
-        }
-
-        params
+        collect_lora_parameters(&self.model)
     }
 
     /// Set LoRA parameters.
     pub fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>) {
-        for (i, layer) in self.model.layers.iter_mut().enumerate() {
-            let prefix = format!("layers.{}", i);
-
-            macro_rules! set_param {
-                ($param:expr, $key:expr) => {
-                    if let Some(value) = params.get(&Rc::from($key)) {
-                        $param = value.clone();
-                    }
-                };
-            }
-
-            set_param!(
-                layer.self_attn.q_proj.lora_a,
-                format!("{}.self_attn.q_proj.lora_a", prefix)
-            );
-            set_param!(
-                layer.self_attn.q_proj.lora_b,
-                format!("{}.self_attn.q_proj.lora_b", prefix)
-            );
-            set_param!(
-                layer.self_attn.k_proj.lora_a,
-                format!("{}.self_attn.k_proj.lora_a", prefix)
-            );
-            set_param!(
-                layer.self_attn.k_proj.lora_b,
-                format!("{}.self_attn.k_proj.lora_b", prefix)
-            );
-            set_param!(
-                layer.self_attn.v_proj.lora_a,
-                format!("{}.self_attn.v_proj.lora_a", prefix)
-            );
-            set_param!(
-                layer.self_attn.v_proj.lora_b,
-                format!("{}.self_attn.v_proj.lora_b", prefix)
-            );
-            set_param!(
-                layer.self_attn.o_proj.lora_a,
-                format!("{}.self_attn.o_proj.lora_a", prefix)
-            );
-            set_param!(
-                layer.self_attn.o_proj.lora_b,
-                format!("{}.self_attn.o_proj.lora_b", prefix)
-            );
-
-            set_param!(
-                layer.mlp.gate_up_proj.lora_a,
-                format!("{}.mlp.gate_up_proj.lora_a", prefix)
-            );
-            set_param!(
-                layer.mlp.gate_up_proj.lora_b,
-                format!("{}.mlp.gate_up_proj.lora_b", prefix)
-            );
-            set_param!(
-                layer.mlp.down_proj.lora_a,
-                format!("{}.mlp.down_proj.lora_a", prefix)
-            );
-            set_param!(
-                layer.mlp.down_proj.lora_b,
-                format!("{}.mlp.down_proj.lora_b", prefix)
-            );
-        }
+        helpers_set_lora_parameters(&mut self.model, params);
     }
 
     /// Get number of trainable parameters.
     pub fn num_trainable_params(&self) -> usize {
-        self.model.num_trainable_params()
+        count_trainable_params(&self.model)
     }
 
     /// Get configuration.
@@ -888,9 +840,7 @@ impl PhiLoraForCausalLM {
 
     /// Save LoRA weights to safetensors.
     pub fn save_lora_weights(&self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
-        let params = self.lora_parameters();
-        Array::save_safetensors(params, None, path)?;
-        Ok(())
+        save_lora_weights_impl(&self.model, path)
     }
 
     /// Load LoRA weights from safetensors.
@@ -901,77 +851,7 @@ impl PhiLoraForCausalLM {
         &mut self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), LoraError> {
-        let path = path.as_ref();
-        let file_path = if path.is_dir() {
-            path.join("lora_weights.safetensors")
-        } else {
-            path.to_path_buf()
-        };
-        let loaded = Array::load_safetensors(&file_path)?;
-
-        for (i, layer) in self.model.layers.iter_mut().enumerate() {
-            let prefix = format!("layers.{}", i);
-
-            macro_rules! load_param {
-                ($param:expr, $key:expr) => {
-                    if let Some(value) = loaded.get(&Rc::from($key) as &str) {
-                        $param = value.clone();
-                    }
-                };
-            }
-
-            load_param!(
-                layer.self_attn.q_proj.lora_a,
-                format!("{}.self_attn.q_proj.lora_a", prefix)
-            );
-            load_param!(
-                layer.self_attn.q_proj.lora_b,
-                format!("{}.self_attn.q_proj.lora_b", prefix)
-            );
-            load_param!(
-                layer.self_attn.k_proj.lora_a,
-                format!("{}.self_attn.k_proj.lora_a", prefix)
-            );
-            load_param!(
-                layer.self_attn.k_proj.lora_b,
-                format!("{}.self_attn.k_proj.lora_b", prefix)
-            );
-            load_param!(
-                layer.self_attn.v_proj.lora_a,
-                format!("{}.self_attn.v_proj.lora_a", prefix)
-            );
-            load_param!(
-                layer.self_attn.v_proj.lora_b,
-                format!("{}.self_attn.v_proj.lora_b", prefix)
-            );
-            load_param!(
-                layer.self_attn.o_proj.lora_a,
-                format!("{}.self_attn.o_proj.lora_a", prefix)
-            );
-            load_param!(
-                layer.self_attn.o_proj.lora_b,
-                format!("{}.self_attn.o_proj.lora_b", prefix)
-            );
-
-            load_param!(
-                layer.mlp.gate_up_proj.lora_a,
-                format!("{}.mlp.gate_up_proj.lora_a", prefix)
-            );
-            load_param!(
-                layer.mlp.gate_up_proj.lora_b,
-                format!("{}.mlp.gate_up_proj.lora_b", prefix)
-            );
-            load_param!(
-                layer.mlp.down_proj.lora_a,
-                format!("{}.mlp.down_proj.lora_a", prefix)
-            );
-            load_param!(
-                layer.mlp.down_proj.lora_b,
-                format!("{}.mlp.down_proj.lora_b", prefix)
-            );
-        }
-
-        Ok(())
+        load_lora_weights_impl(&mut self.model, path)
     }
 
     /// Load base model weights.
@@ -1308,74 +1188,8 @@ impl ModuleParameters for PhiLoraForCausalLM {
     }
 }
 
-impl crate::TrainableModel for PhiLoraForCausalLM {
-    fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
-        PhiLoraForCausalLM::forward(self, input_ids, mask)
-    }
-
-    fn num_trainable_params(&self) -> usize {
-        PhiLoraForCausalLM::num_trainable_params(self)
-    }
-
-    fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
-        PhiLoraForCausalLM::lora_parameters(self)
-    }
-
-    fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>) {
-        PhiLoraForCausalLM::set_lora_parameters(self, params)
-    }
-
-    fn save_lora_weights(&self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
-        PhiLoraForCausalLM::save_lora_weights(self, path)
-    }
-
-    fn load_lora_weights(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
-        PhiLoraForCausalLM::load_lora_weights(self, path)
-    }
-
-    fn enable_gradient_checkpointing(&mut self, layers_per_block: usize) {
-        PhiLoraForCausalLM::enable_gradient_checkpointing(self, layers_per_block)
-    }
-
-    fn disable_gradient_checkpointing(&mut self) {
-        PhiLoraForCausalLM::disable_gradient_checkpointing(self)
-    }
-
-    fn supports_gradient_checkpointing(&self) -> bool {
-        true
-    }
-
-    fn forward_with_cache(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-        cache: Option<&mut KVCache>,
-    ) -> Result<Array, LoraError> {
-        PhiLoraForCausalLM::forward_with_cache(self, input_ids, mask, cache)
-    }
-
-    fn create_cache(&self, max_seq_len: usize) -> Option<KVCache> {
-        Some(PhiLoraForCausalLM::create_cache(self, max_seq_len))
-    }
-
-    fn supports_kv_cache(&self) -> bool {
-        true
-    }
-
-    fn forward_hidden(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-    ) -> Option<Result<Array, LoraError>> {
-        Some(PhiLoraForCausalLM::forward_hidden_states(
-            self, input_ids, mask,
-        ))
-    }
-
-    fn lm_head_weight(&self) -> Option<Array> {
-        PhiLoraForCausalLM::get_lm_head_weight(self)
-    }
-}
+// Implement TrainableModel for PhiLoraForCausalLM via shared macro.
+crate::impl_trainable_model!(PhiLoraForCausalLM);
 
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
     let mask = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;

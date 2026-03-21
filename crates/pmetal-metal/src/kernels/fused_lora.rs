@@ -570,7 +570,15 @@ impl FusedLora {
             let function_name = "fused_lora_backward_ab";
             let pipeline = {
                 let mut cache = self.ctx.pipeline_cache_mut();
-                cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
+                let mut constants = std::collections::HashMap::new();
+                constants.insert(0, 32_u32);       // TILE_M (unused by backward_ab)
+                constants.insert(1, TILE_N as u32); // TILE_N
+                constants.insert(2, TILE_K as u32); // TILE_K
+                cache.get_or_create_specialized_pipeline(
+                    self.ctx.device(),
+                    function_name,
+                    &constants,
+                )?
             };
 
             let command_queue = self.ctx.command_queue();
@@ -663,7 +671,15 @@ impl FusedLora {
             let function_name = "fused_lora_backward_a";
             let pipeline = {
                 let mut cache = self.ctx.pipeline_cache_mut();
-                cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
+                let mut constants = std::collections::HashMap::new();
+                constants.insert(0, TILE_M_BWD_A as u32); // TILE_M
+                constants.insert(1, 32_u32);               // TILE_N (unused by backward_a)
+                constants.insert(2, TILE_K as u32);        // TILE_K
+                cache.get_or_create_specialized_pipeline(
+                    self.ctx.device(),
+                    function_name,
+                    &constants,
+                )?
             };
 
             let command_queue = self.ctx.command_queue();
@@ -729,7 +745,15 @@ impl FusedLora {
         let function_name = "fused_lora_backward_x";
         let pipeline = {
             let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
+            let mut constants = std::collections::HashMap::new();
+            constants.insert(0, TILE_M as u32);  // function_constant(0): TILE_M
+            constants.insert(1, 32_u32);         // function_constant(1): TILE_N (unused but required)
+            constants.insert(2, TILE_K as u32);  // function_constant(2): TILE_K
+            cache.get_or_create_specialized_pipeline(
+                self.ctx.device(),
+                function_name,
+                &constants,
+            )?
         };
 
         let command_queue = self.ctx.command_queue();

@@ -32,6 +32,11 @@ use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, r
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::gemma::GemmaConfig;
 
+use crate::lora::LoraProjection;
+use crate::lora_helpers::{
+    LoraDecoderStack, collect_lora_parameters, count_trainable_params, load_lora_weights_impl,
+    save_lora_weights_impl, set_lora_parameters as helpers_set_lora_parameters,
+};
 use crate::{LoraError, LoraLinear};
 
 /// Gemma-style RMSNorm with +1 offset.
@@ -786,7 +791,96 @@ impl GemmaLoraModel {
 
     /// Get number of trainable parameters.
     pub fn num_trainable_params(&self) -> usize {
-        self.layers.num_trainable_params()
+        count_trainable_params(self)
+    }
+}
+
+impl LoraDecoderStack for GemmaLoraModel {
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    // Both Gemma1 and Gemma2 use gate_proj / up_proj / down_proj (standard SwiGLU naming).
+    // The default mlp_projection_names() already returns these, so no override needed.
+
+    fn attn_projections(&self, layer: usize) -> Vec<&dyn LoraProjection> {
+        match &self.layers {
+            GemmaLoraLayers::Gemma1(layers) => {
+                let l = &layers[layer];
+                vec![
+                    &l.self_attn.q_proj,
+                    &l.self_attn.k_proj,
+                    &l.self_attn.v_proj,
+                    &l.self_attn.o_proj,
+                ]
+            }
+            GemmaLoraLayers::Gemma2(layers) => {
+                let l = &layers[layer];
+                vec![
+                    &l.self_attn.q_proj,
+                    &l.self_attn.k_proj,
+                    &l.self_attn.v_proj,
+                    &l.self_attn.o_proj,
+                ]
+            }
+        }
+    }
+
+    fn attn_projections_mut(&mut self, layer: usize) -> Vec<&mut dyn LoraProjection> {
+        match &mut self.layers {
+            GemmaLoraLayers::Gemma1(layers) => {
+                let l = &mut layers[layer];
+                vec![
+                    &mut l.self_attn.q_proj,
+                    &mut l.self_attn.k_proj,
+                    &mut l.self_attn.v_proj,
+                    &mut l.self_attn.o_proj,
+                ]
+            }
+            GemmaLoraLayers::Gemma2(layers) => {
+                let l = &mut layers[layer];
+                vec![
+                    &mut l.self_attn.q_proj,
+                    &mut l.self_attn.k_proj,
+                    &mut l.self_attn.v_proj,
+                    &mut l.self_attn.o_proj,
+                ]
+            }
+        }
+    }
+
+    fn mlp_projections(&self, layer: usize) -> Vec<&dyn LoraProjection> {
+        match &self.layers {
+            GemmaLoraLayers::Gemma1(layers) => {
+                let l = &layers[layer];
+                vec![&l.mlp.gate_proj, &l.mlp.up_proj, &l.mlp.down_proj]
+            }
+            GemmaLoraLayers::Gemma2(layers) => {
+                let l = &layers[layer];
+                vec![&l.mlp.gate_proj, &l.mlp.up_proj, &l.mlp.down_proj]
+            }
+        }
+    }
+
+    fn mlp_projections_mut(&mut self, layer: usize) -> Vec<&mut dyn LoraProjection> {
+        match &mut self.layers {
+            GemmaLoraLayers::Gemma1(layers) => {
+                let l = &mut layers[layer];
+                vec![
+                    &mut l.mlp.gate_proj,
+                    &mut l.mlp.up_proj,
+                    &mut l.mlp.down_proj,
+                ]
+            }
+            GemmaLoraLayers::Gemma2(layers) => {
+                let l = &mut layers[layer];
+                vec![
+                    &mut l.mlp.gate_proj,
+                    &mut l.mlp.up_proj,
+                    &mut l.mlp.down_proj,
+                ]
+            }
+        }
     }
 }
 
@@ -862,6 +956,30 @@ impl GemmaLoraForCausalLM {
         Some(self.model.embed_tokens.weight.value.clone())
     }
 
+    /// Forward pass with NEFTune noise injection (delegates to standard forward — Gemma has no
+    /// dedicated noised path).
+    pub fn forward_noised(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        _noise_alpha: f32,
+    ) -> Result<Array, LoraError> {
+        self.forward(input_ids, mask)
+    }
+
+    /// Forward pass returning hidden states with explicit position IDs.
+    ///
+    /// Gemma does not use position IDs in its forward signature; the `position_ids`
+    /// argument is accepted for API uniformity but ignored.
+    pub fn forward_hidden_states_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        _position_ids: &Array,
+    ) -> Result<Array, LoraError> {
+        self.forward_hidden_states(input_ids, mask)
+    }
+
     /// Forward pass with KV cache for efficient inference.
     ///
     /// KV caching provides O(n) complexity per token instead of O(n²),
@@ -934,175 +1052,17 @@ impl GemmaLoraForCausalLM {
 
     /// Get all trainable LoRA parameters.
     pub fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
-        let mut params = HashMap::new();
-
-        // Helper to add layer params
-        macro_rules! add_layer_params {
-            ($layer:expr, $i:expr) => {
-                let prefix = format!("layers.{}", $i);
-                params.insert(
-                    Rc::from(format!("{}.self_attn.q_proj.lora_a", prefix)),
-                    $layer.self_attn.q_proj.lora_a.clone(),
-                );
-                params.insert(
-                    Rc::from(format!("{}.self_attn.q_proj.lora_b", prefix)),
-                    $layer.self_attn.q_proj.lora_b.clone(),
-                );
-                params.insert(
-                    Rc::from(format!("{}.self_attn.k_proj.lora_a", prefix)),
-                    $layer.self_attn.k_proj.lora_a.clone(),
-                );
-                params.insert(
-                    Rc::from(format!("{}.self_attn.k_proj.lora_b", prefix)),
-                    $layer.self_attn.k_proj.lora_b.clone(),
-                );
-                params.insert(
-                    Rc::from(format!("{}.self_attn.v_proj.lora_a", prefix)),
-                    $layer.self_attn.v_proj.lora_a.clone(),
-                );
-                params.insert(
-                    Rc::from(format!("{}.self_attn.v_proj.lora_b", prefix)),
-                    $layer.self_attn.v_proj.lora_b.clone(),
-                );
-                params.insert(
-                    Rc::from(format!("{}.self_attn.o_proj.lora_a", prefix)),
-                    $layer.self_attn.o_proj.lora_a.clone(),
-                );
-                params.insert(
-                    Rc::from(format!("{}.self_attn.o_proj.lora_b", prefix)),
-                    $layer.self_attn.o_proj.lora_b.clone(),
-                );
-                params.insert(
-                    Rc::from(format!("{}.mlp.gate_proj.lora_a", prefix)),
-                    $layer.mlp.gate_proj.lora_a.clone(),
-                );
-                params.insert(
-                    Rc::from(format!("{}.mlp.gate_proj.lora_b", prefix)),
-                    $layer.mlp.gate_proj.lora_b.clone(),
-                );
-                params.insert(
-                    Rc::from(format!("{}.mlp.up_proj.lora_a", prefix)),
-                    $layer.mlp.up_proj.lora_a.clone(),
-                );
-                params.insert(
-                    Rc::from(format!("{}.mlp.up_proj.lora_b", prefix)),
-                    $layer.mlp.up_proj.lora_b.clone(),
-                );
-                params.insert(
-                    Rc::from(format!("{}.mlp.down_proj.lora_a", prefix)),
-                    $layer.mlp.down_proj.lora_a.clone(),
-                );
-                params.insert(
-                    Rc::from(format!("{}.mlp.down_proj.lora_b", prefix)),
-                    $layer.mlp.down_proj.lora_b.clone(),
-                );
-            };
-        }
-
-        match &self.model.layers {
-            GemmaLoraLayers::Gemma1(layers) => {
-                for (i, layer) in layers.iter().enumerate() {
-                    add_layer_params!(layer, i);
-                }
-            }
-            GemmaLoraLayers::Gemma2(layers) => {
-                for (i, layer) in layers.iter().enumerate() {
-                    add_layer_params!(layer, i);
-                }
-            }
-        }
-
-        params
+        collect_lora_parameters(&self.model)
     }
 
     /// Set LoRA parameters.
     pub fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>) {
-        macro_rules! set_layer_params {
-            ($layer:expr, $i:expr) => {
-                let prefix = format!("layers.{}", $i);
-                macro_rules! set_param {
-                    ($param:expr, $key:expr) => {
-                        if let Some(value) = params.get(&Rc::from($key)) {
-                            $param = value.clone();
-                        }
-                    };
-                }
-                set_param!(
-                    $layer.self_attn.q_proj.lora_a,
-                    format!("{}.self_attn.q_proj.lora_a", prefix)
-                );
-                set_param!(
-                    $layer.self_attn.q_proj.lora_b,
-                    format!("{}.self_attn.q_proj.lora_b", prefix)
-                );
-                set_param!(
-                    $layer.self_attn.k_proj.lora_a,
-                    format!("{}.self_attn.k_proj.lora_a", prefix)
-                );
-                set_param!(
-                    $layer.self_attn.k_proj.lora_b,
-                    format!("{}.self_attn.k_proj.lora_b", prefix)
-                );
-                set_param!(
-                    $layer.self_attn.v_proj.lora_a,
-                    format!("{}.self_attn.v_proj.lora_a", prefix)
-                );
-                set_param!(
-                    $layer.self_attn.v_proj.lora_b,
-                    format!("{}.self_attn.v_proj.lora_b", prefix)
-                );
-                set_param!(
-                    $layer.self_attn.o_proj.lora_a,
-                    format!("{}.self_attn.o_proj.lora_a", prefix)
-                );
-                set_param!(
-                    $layer.self_attn.o_proj.lora_b,
-                    format!("{}.self_attn.o_proj.lora_b", prefix)
-                );
-                set_param!(
-                    $layer.mlp.gate_proj.lora_a,
-                    format!("{}.mlp.gate_proj.lora_a", prefix)
-                );
-                set_param!(
-                    $layer.mlp.gate_proj.lora_b,
-                    format!("{}.mlp.gate_proj.lora_b", prefix)
-                );
-                set_param!(
-                    $layer.mlp.up_proj.lora_a,
-                    format!("{}.mlp.up_proj.lora_a", prefix)
-                );
-                set_param!(
-                    $layer.mlp.up_proj.lora_b,
-                    format!("{}.mlp.up_proj.lora_b", prefix)
-                );
-                set_param!(
-                    $layer.mlp.down_proj.lora_a,
-                    format!("{}.mlp.down_proj.lora_a", prefix)
-                );
-                set_param!(
-                    $layer.mlp.down_proj.lora_b,
-                    format!("{}.mlp.down_proj.lora_b", prefix)
-                );
-            };
-        }
-
-        match &mut self.model.layers {
-            GemmaLoraLayers::Gemma1(layers) => {
-                for (i, layer) in layers.iter_mut().enumerate() {
-                    set_layer_params!(layer, i);
-                }
-            }
-            GemmaLoraLayers::Gemma2(layers) => {
-                for (i, layer) in layers.iter_mut().enumerate() {
-                    set_layer_params!(layer, i);
-                }
-            }
-        }
+        helpers_set_lora_parameters(&mut self.model, params);
     }
 
     /// Get number of trainable parameters.
     pub fn num_trainable_params(&self) -> usize {
-        self.model.num_trainable_params()
+        count_trainable_params(&self.model)
     }
 
     /// Get configuration.
@@ -1117,9 +1077,7 @@ impl GemmaLoraForCausalLM {
 
     /// Save LoRA weights to safetensors.
     pub fn save_lora_weights(&self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
-        let params = self.lora_parameters();
-        Array::save_safetensors(params, None, path)?;
-        Ok(())
+        save_lora_weights_impl(&self.model, path)
     }
 
     /// Load LoRA weights from safetensors.
@@ -1130,97 +1088,7 @@ impl GemmaLoraForCausalLM {
         &mut self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), LoraError> {
-        let path = path.as_ref();
-        let file_path = if path.is_dir() {
-            path.join("lora_weights.safetensors")
-        } else {
-            path.to_path_buf()
-        };
-        let loaded = Array::load_safetensors(&file_path)?;
-
-        macro_rules! load_layer_params {
-            ($layer:expr, $i:expr, $loaded:expr) => {
-                let prefix = format!("layers.{}", $i);
-                macro_rules! load_param {
-                    ($param:expr, $key:expr) => {
-                        if let Some(value) = $loaded.get(&Rc::from($key) as &str) {
-                            $param = value.clone();
-                        }
-                    };
-                }
-                load_param!(
-                    $layer.self_attn.q_proj.lora_a,
-                    format!("{}.self_attn.q_proj.lora_a", prefix)
-                );
-                load_param!(
-                    $layer.self_attn.q_proj.lora_b,
-                    format!("{}.self_attn.q_proj.lora_b", prefix)
-                );
-                load_param!(
-                    $layer.self_attn.k_proj.lora_a,
-                    format!("{}.self_attn.k_proj.lora_a", prefix)
-                );
-                load_param!(
-                    $layer.self_attn.k_proj.lora_b,
-                    format!("{}.self_attn.k_proj.lora_b", prefix)
-                );
-                load_param!(
-                    $layer.self_attn.v_proj.lora_a,
-                    format!("{}.self_attn.v_proj.lora_a", prefix)
-                );
-                load_param!(
-                    $layer.self_attn.v_proj.lora_b,
-                    format!("{}.self_attn.v_proj.lora_b", prefix)
-                );
-                load_param!(
-                    $layer.self_attn.o_proj.lora_a,
-                    format!("{}.self_attn.o_proj.lora_a", prefix)
-                );
-                load_param!(
-                    $layer.self_attn.o_proj.lora_b,
-                    format!("{}.self_attn.o_proj.lora_b", prefix)
-                );
-                load_param!(
-                    $layer.mlp.gate_proj.lora_a,
-                    format!("{}.mlp.gate_proj.lora_a", prefix)
-                );
-                load_param!(
-                    $layer.mlp.gate_proj.lora_b,
-                    format!("{}.mlp.gate_proj.lora_b", prefix)
-                );
-                load_param!(
-                    $layer.mlp.up_proj.lora_a,
-                    format!("{}.mlp.up_proj.lora_a", prefix)
-                );
-                load_param!(
-                    $layer.mlp.up_proj.lora_b,
-                    format!("{}.mlp.up_proj.lora_b", prefix)
-                );
-                load_param!(
-                    $layer.mlp.down_proj.lora_a,
-                    format!("{}.mlp.down_proj.lora_a", prefix)
-                );
-                load_param!(
-                    $layer.mlp.down_proj.lora_b,
-                    format!("{}.mlp.down_proj.lora_b", prefix)
-                );
-            };
-        }
-
-        match &mut self.model.layers {
-            GemmaLoraLayers::Gemma1(layers) => {
-                for (i, layer) in layers.iter_mut().enumerate() {
-                    load_layer_params!(layer, i, loaded);
-                }
-            }
-            GemmaLoraLayers::Gemma2(layers) => {
-                for (i, layer) in layers.iter_mut().enumerate() {
-                    load_layer_params!(layer, i, loaded);
-                }
-            }
-        }
-
-        Ok(())
+        load_lora_weights_impl(&mut self.model, path)
     }
 
     /// Load base model weights.
@@ -1652,74 +1520,8 @@ impl ModuleParameters for GemmaLoraForCausalLM {
     }
 }
 
-impl crate::TrainableModel for GemmaLoraForCausalLM {
-    fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
-        GemmaLoraForCausalLM::forward(self, input_ids, mask)
-    }
-
-    fn num_trainable_params(&self) -> usize {
-        GemmaLoraForCausalLM::num_trainable_params(self)
-    }
-
-    fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
-        GemmaLoraForCausalLM::lora_parameters(self)
-    }
-
-    fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>) {
-        GemmaLoraForCausalLM::set_lora_parameters(self, params)
-    }
-
-    fn save_lora_weights(&self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
-        GemmaLoraForCausalLM::save_lora_weights(self, path)
-    }
-
-    fn load_lora_weights(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
-        GemmaLoraForCausalLM::load_lora_weights(self, path)
-    }
-
-    fn enable_gradient_checkpointing(&mut self, layers_per_block: usize) {
-        GemmaLoraForCausalLM::enable_gradient_checkpointing(self, layers_per_block)
-    }
-
-    fn disable_gradient_checkpointing(&mut self) {
-        GemmaLoraForCausalLM::disable_gradient_checkpointing(self)
-    }
-
-    fn supports_gradient_checkpointing(&self) -> bool {
-        true
-    }
-
-    fn forward_with_cache(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-        cache: Option<&mut KVCache>,
-    ) -> Result<Array, LoraError> {
-        GemmaLoraForCausalLM::forward_with_cache(self, input_ids, mask, cache)
-    }
-
-    fn create_cache(&self, max_seq_len: usize) -> Option<KVCache> {
-        Some(GemmaLoraForCausalLM::create_cache(self, max_seq_len))
-    }
-
-    fn supports_kv_cache(&self) -> bool {
-        true
-    }
-
-    fn forward_hidden(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-    ) -> Option<Result<Array, LoraError>> {
-        Some(GemmaLoraForCausalLM::forward_hidden_states(
-            self, input_ids, mask,
-        ))
-    }
-
-    fn lm_head_weight(&self) -> Option<Array> {
-        GemmaLoraForCausalLM::get_lm_head_weight(self)
-    }
-}
+// Implement TrainableModel for GemmaLoraForCausalLM via shared macro.
+crate::impl_trainable_model!(GemmaLoraForCausalLM);
 
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
     let mask = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;

@@ -765,6 +765,74 @@ impl Qwen3QloraForCausalLM {
         self.model.memory_usage()
     }
 
+    /// Estimate memory savings vs. full-precision (ratio of QLoRA memory to fp32 memory).
+    pub fn memory_savings(&self) -> f32 {
+        let (quantized, lora, _) = self.memory_usage();
+        let full_precision = self
+            .model
+            .layers
+            .iter()
+            .map(|l| {
+                l.self_attn.q_proj.num_frozen_params() * 4
+                    + l.self_attn.k_proj.num_frozen_params() * 4
+                    + l.self_attn.v_proj.num_frozen_params() * 4
+                    + l.self_attn.o_proj.num_frozen_params() * 4
+                    + l.mlp.gate_proj.num_frozen_params() * 4
+                    + l.mlp.up_proj.num_frozen_params() * 4
+                    + l.mlp.down_proj.num_frozen_params() * 4
+            })
+            .sum::<usize>()
+            + lora;
+
+        (quantized + lora) as f32 / full_precision as f32
+    }
+
+    /// Load and quantize base model weights from a model directory (single-shard or sharded).
+    pub fn load_and_quantize_from_dir(
+        &mut self,
+        model_dir: impl AsRef<std::path::Path>,
+    ) -> Result<(), LoraError> {
+        let model_dir = model_dir.as_ref();
+
+        // Single-file model
+        let single_file = model_dir.join("model.safetensors");
+        if single_file.exists() {
+            let weights = crate::sanitize_loaded_weights(Array::load_safetensors(&single_file)?)?;
+            return self.load_and_quantize_weights(&weights);
+        }
+
+        // Sharded model
+        let index_path = model_dir.join("model.safetensors.index.json");
+        if !index_path.exists() {
+            return Err(LoraError::Mlx(Exception::custom(
+                "No model.safetensors or model.safetensors.index.json found".to_string(),
+            )));
+        }
+
+        let index_content = std::fs::read_to_string(&index_path)
+            .map_err(|e| LoraError::Mlx(Exception::custom(e.to_string())))?;
+
+        #[derive(serde::Deserialize)]
+        struct WeightIndex {
+            weight_map: HashMap<String, String>,
+        }
+
+        let index: WeightIndex = serde_json::from_str(&index_content)
+            .map_err(|e| LoraError::Mlx(Exception::custom(e.to_string())))?;
+
+        let shard_files: std::collections::HashSet<&String> = index.weight_map.values().collect();
+
+        let mut all_weights = HashMap::new();
+        for shard_file in shard_files {
+            let shard_path = model_dir.join(shard_file);
+            let shard_weights =
+                crate::sanitize_loaded_weights(Array::load_safetensors(&shard_path)?)?;
+            all_weights.extend(shard_weights);
+        }
+
+        self.load_and_quantize_weights(&all_weights)
+    }
+
     /// Get configuration.
     pub fn config(&self) -> &Qwen3Config {
         &self.model.config

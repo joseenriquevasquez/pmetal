@@ -47,14 +47,15 @@ pub mod custom_training;
 pub mod custom_training_step;
 mod dora;
 mod dynamic;
+mod dynamic_qlora;
 pub mod fused_training;
 pub mod galore;
 pub mod gemma_lora;
 pub mod gemma_qlora;
-pub mod generic_lora;
 pub mod llama_lora;
 pub mod llama_qlora;
 mod lora;
+pub mod lora_helpers;
 pub mod mistral_lora;
 pub mod mistral_qlora;
 mod patcher;
@@ -86,6 +87,7 @@ pub use custom_training::{
 pub use custom_training_step::{Qwen3CustomTrainer, Qwen3LayerSaved, Qwen3ModelSaved};
 pub use dora::*;
 pub use dynamic::*;
+pub use dynamic_qlora::DynamicQloraModel;
 pub use fused_training::*;
 pub use galore::{
     GaloreConfig, GaloreParamState, GaloreProjectionState, GaloreProjectionType, GaloreProjector,
@@ -95,6 +97,10 @@ pub use gemma_qlora::*;
 pub use llama_lora::*;
 pub use llama_qlora::*;
 pub use lora::*;
+pub use lora_helpers::{
+    LoraDecoderStack, collect_lora_parameters, count_trainable_params, load_lora_weights_impl,
+    save_lora_weights_impl, set_lora_parameters,
+};
 pub use mistral_lora::*;
 pub use mistral_qlora::*;
 pub use patcher::*;

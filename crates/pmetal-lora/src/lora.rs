@@ -15,6 +15,95 @@ use mlx_rs::{Array, Dtype, error::Exception, nn};
 
 use pmetal_core::LoraConfig;
 
+/// Object-safe interface shared by `LoraLinear` and `LinearAdapter`.
+///
+/// Both types expose the same accessor methods as inherent methods.  This trait
+/// makes that contract explicit so that `LoraDecoderStack` (in `lora_helpers`)
+/// can operate on either type through a uniform `dyn LoraProjection` reference,
+/// avoiding duplicate collection / loading code in every architecture file.
+pub trait LoraProjection {
+    /// Borrow the LoRA A matrix.
+    fn lora_a(&self) -> &Array;
+    /// Borrow the LoRA B matrix.
+    fn lora_b(&self) -> &Array;
+    /// Mutably borrow the LoRA A matrix.
+    fn lora_a_mut(&mut self) -> &mut Array;
+    /// Mutably borrow the LoRA B matrix.
+    fn lora_b_mut(&mut self) -> &mut Array;
+    /// Borrow the frozen base weight matrix.
+    fn weight(&self) -> &Array;
+    /// Mutably borrow the frozen base weight matrix.
+    fn weight_mut(&mut self) -> &mut Array;
+    /// Extra trainable parameters beyond A and B (e.g. DoRA magnitude).
+    ///
+    /// Returns `vec![]` for standard LoRA.
+    fn extra_params(&self) -> Vec<(&str, &Array)>;
+    /// Mutably access extra trainable parameters.
+    fn extra_params_mut(&mut self) -> Vec<(&str, &mut Array)>;
+    /// Number of trainable parameters in this projection.
+    fn num_trainable_params(&self) -> usize;
+}
+
+impl LoraProjection for LoraLinear {
+    fn lora_a(&self) -> &Array {
+        LoraLinear::lora_a(self)
+    }
+    fn lora_b(&self) -> &Array {
+        LoraLinear::lora_b(self)
+    }
+    fn lora_a_mut(&mut self) -> &mut Array {
+        LoraLinear::lora_a_mut(self)
+    }
+    fn lora_b_mut(&mut self) -> &mut Array {
+        LoraLinear::lora_b_mut(self)
+    }
+    fn weight(&self) -> &Array {
+        LoraLinear::weight(self)
+    }
+    fn weight_mut(&mut self) -> &mut Array {
+        LoraLinear::weight_mut(self)
+    }
+    fn extra_params(&self) -> Vec<(&str, &Array)> {
+        LoraLinear::extra_params(self)
+    }
+    fn extra_params_mut(&mut self) -> Vec<(&str, &mut Array)> {
+        LoraLinear::extra_params_mut(self)
+    }
+    fn num_trainable_params(&self) -> usize {
+        LoraLinear::num_trainable_params(self)
+    }
+}
+
+impl LoraProjection for LinearAdapter {
+    fn lora_a(&self) -> &Array {
+        LinearAdapter::lora_a(self)
+    }
+    fn lora_b(&self) -> &Array {
+        LinearAdapter::lora_b(self)
+    }
+    fn lora_a_mut(&mut self) -> &mut Array {
+        LinearAdapter::lora_a_mut(self)
+    }
+    fn lora_b_mut(&mut self) -> &mut Array {
+        LinearAdapter::lora_b_mut(self)
+    }
+    fn weight(&self) -> &Array {
+        LinearAdapter::weight(self)
+    }
+    fn weight_mut(&mut self) -> &mut Array {
+        LinearAdapter::weight_mut(self)
+    }
+    fn extra_params(&self) -> Vec<(&str, &Array)> {
+        LinearAdapter::extra_params(self)
+    }
+    fn extra_params_mut(&mut self) -> Vec<(&str, &mut Array)> {
+        LinearAdapter::extra_params_mut(self)
+    }
+    fn num_trainable_params(&self) -> usize {
+        LinearAdapter::num_trainable_params(self)
+    }
+}
+
 /// Apply inverted dropout to a tensor.
 ///
 /// Zeros elements with probability `p` and scales remaining elements by `1/(1-p)`

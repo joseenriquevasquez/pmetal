@@ -21,6 +21,8 @@ use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, r
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::mistral::MistralConfig;
 
+use crate::lora::LoraProjection;
+use crate::lora_helpers::{LoraDecoderStack, count_trainable_params};
 use crate::{LoraError, LoraLinear, TrainableModel};
 
 /// LoRA-enabled attention layer for Mistral.
@@ -545,6 +547,46 @@ impl MistralLoraModel {
     }
 }
 
+impl LoraDecoderStack for MistralLoraModel {
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn attn_projections(&self, layer: usize) -> Vec<&dyn LoraProjection> {
+        let l = &self.layers[layer];
+        vec![
+            &l.self_attn.q_proj,
+            &l.self_attn.k_proj,
+            &l.self_attn.v_proj,
+            &l.self_attn.o_proj,
+        ]
+    }
+
+    fn attn_projections_mut(&mut self, layer: usize) -> Vec<&mut dyn LoraProjection> {
+        let l = &mut self.layers[layer];
+        vec![
+            &mut l.self_attn.q_proj,
+            &mut l.self_attn.k_proj,
+            &mut l.self_attn.v_proj,
+            &mut l.self_attn.o_proj,
+        ]
+    }
+
+    fn mlp_projections(&self, layer: usize) -> Vec<&dyn LoraProjection> {
+        let l = &self.layers[layer];
+        vec![&l.mlp.gate_proj, &l.mlp.up_proj, &l.mlp.down_proj]
+    }
+
+    fn mlp_projections_mut(&mut self, layer: usize) -> Vec<&mut dyn LoraProjection> {
+        let l = &mut self.layers[layer];
+        vec![
+            &mut l.mlp.gate_proj,
+            &mut l.mlp.up_proj,
+            &mut l.mlp.down_proj,
+        ]
+    }
+}
+
 /// LoRA-enabled Mistral model with LM head.
 #[derive(Debug)]
 pub struct MistralLoraForCausalLM {
@@ -817,11 +859,212 @@ impl MistralLoraForCausalLM {
     pub fn config(&self) -> &MistralConfig {
         &self.model.config
     }
+
+    /// Forward pass producing logits (canonical name used by `impl_trainable_model!`).
+    pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
+        self.forward_internal(input_ids, mask)
+    }
+
+    /// NEFTune forward — Mistral delegates to standard forward (no embedding noise).
+    pub fn forward_noised(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        _noise_alpha: f32,
+    ) -> Result<Array, LoraError> {
+        self.forward_internal(input_ids, mask)
+    }
+
+    /// Hidden-state forward with explicit position IDs.
+    ///
+    /// Mistral does not use per-token position overrides; delegates to standard hidden forward.
+    pub fn forward_hidden_states_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        _position_ids: &Array,
+    ) -> Result<Array, LoraError> {
+        self.forward_hidden_states(input_ids, mask)
+    }
+
+    /// Get number of trainable parameters.
+    pub fn num_trainable_params(&self) -> usize {
+        count_trainable_params(&self.model)
+    }
+
+    /// Get all LoRA parameters as a flat HashMap.
+    ///
+    /// Uses HuggingFace-compatible key format (`model.layers.{i}.self_attn.q_proj.lora_A.weight`).
+    pub fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
+        let mut params = HashMap::new();
+
+        for (i, layer) in self.model.layers.iter().enumerate() {
+            let prefix = format!("model.layers.{}", i);
+
+            // Attention LoRA
+            params.insert(
+                Rc::from(format!("{}.self_attn.q_proj.lora_A.weight", prefix)),
+                layer.self_attn.q_proj.lora_a.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.self_attn.q_proj.lora_B.weight", prefix)),
+                layer.self_attn.q_proj.lora_b.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.self_attn.k_proj.lora_A.weight", prefix)),
+                layer.self_attn.k_proj.lora_a.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.self_attn.k_proj.lora_B.weight", prefix)),
+                layer.self_attn.k_proj.lora_b.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.self_attn.v_proj.lora_A.weight", prefix)),
+                layer.self_attn.v_proj.lora_a.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.self_attn.v_proj.lora_B.weight", prefix)),
+                layer.self_attn.v_proj.lora_b.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.self_attn.o_proj.lora_A.weight", prefix)),
+                layer.self_attn.o_proj.lora_a.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.self_attn.o_proj.lora_B.weight", prefix)),
+                layer.self_attn.o_proj.lora_b.clone(),
+            );
+
+            // MLP LoRA
+            params.insert(
+                Rc::from(format!("{}.mlp.gate_proj.lora_A.weight", prefix)),
+                layer.mlp.gate_proj.lora_a.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.mlp.gate_proj.lora_B.weight", prefix)),
+                layer.mlp.gate_proj.lora_b.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.mlp.up_proj.lora_A.weight", prefix)),
+                layer.mlp.up_proj.lora_a.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.mlp.up_proj.lora_B.weight", prefix)),
+                layer.mlp.up_proj.lora_b.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.mlp.down_proj.lora_A.weight", prefix)),
+                layer.mlp.down_proj.lora_a.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.mlp.down_proj.lora_B.weight", prefix)),
+                layer.mlp.down_proj.lora_b.clone(),
+            );
+        }
+
+        params
+    }
+
+    /// Set LoRA parameters from a HashMap.
+    pub fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>) {
+        for (i, layer) in self.model.layers.iter_mut().enumerate() {
+            let prefix = format!("model.layers.{}", i);
+
+            macro_rules! try_set {
+                ($field:expr, $key:expr) => {
+                    if let Some(p) = params.get(&Rc::from($key)) {
+                        $field = p.clone();
+                    }
+                };
+            }
+
+            // Attention LoRA
+            try_set!(
+                layer.self_attn.q_proj.lora_a,
+                format!("{}.self_attn.q_proj.lora_A.weight", prefix)
+            );
+            try_set!(
+                layer.self_attn.q_proj.lora_b,
+                format!("{}.self_attn.q_proj.lora_B.weight", prefix)
+            );
+            try_set!(
+                layer.self_attn.k_proj.lora_a,
+                format!("{}.self_attn.k_proj.lora_A.weight", prefix)
+            );
+            try_set!(
+                layer.self_attn.k_proj.lora_b,
+                format!("{}.self_attn.k_proj.lora_B.weight", prefix)
+            );
+            try_set!(
+                layer.self_attn.v_proj.lora_a,
+                format!("{}.self_attn.v_proj.lora_A.weight", prefix)
+            );
+            try_set!(
+                layer.self_attn.v_proj.lora_b,
+                format!("{}.self_attn.v_proj.lora_B.weight", prefix)
+            );
+            try_set!(
+                layer.self_attn.o_proj.lora_a,
+                format!("{}.self_attn.o_proj.lora_A.weight", prefix)
+            );
+            try_set!(
+                layer.self_attn.o_proj.lora_b,
+                format!("{}.self_attn.o_proj.lora_B.weight", prefix)
+            );
+
+            // MLP LoRA
+            try_set!(
+                layer.mlp.gate_proj.lora_a,
+                format!("{}.mlp.gate_proj.lora_A.weight", prefix)
+            );
+            try_set!(
+                layer.mlp.gate_proj.lora_b,
+                format!("{}.mlp.gate_proj.lora_B.weight", prefix)
+            );
+            try_set!(
+                layer.mlp.up_proj.lora_a,
+                format!("{}.mlp.up_proj.lora_A.weight", prefix)
+            );
+            try_set!(
+                layer.mlp.up_proj.lora_b,
+                format!("{}.mlp.up_proj.lora_B.weight", prefix)
+            );
+            try_set!(
+                layer.mlp.down_proj.lora_a,
+                format!("{}.mlp.down_proj.lora_A.weight", prefix)
+            );
+            try_set!(
+                layer.mlp.down_proj.lora_b,
+                format!("{}.mlp.down_proj.lora_B.weight", prefix)
+            );
+        }
+    }
+
+    /// Save LoRA weights to a safetensors file.
+    pub fn save_lora_weights(&self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
+        let params = self.lora_parameters();
+        Array::save_safetensors(params, None, path)?;
+        Ok(())
+    }
+
+    /// Load LoRA weights from a safetensors file.
+    pub fn load_lora_weights(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(), LoraError> {
+        let loaded = Array::load_safetensors(path)?;
+        let params: HashMap<Rc<str>, Array> = loaded
+            .into_iter()
+            .map(|(k, v)| (Rc::from(k.as_str()), v))
+            .collect();
+        self.set_lora_parameters(&params);
+        Ok(())
+    }
 }
 
 impl ModuleParameters for MistralLoraForCausalLM {
     fn num_parameters(&self) -> usize {
-        self.model.num_trainable_params()
+        count_trainable_params(&self.model)
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
@@ -1045,265 +1288,8 @@ impl ModuleParameters for MistralLoraForCausalLM {
     }
 }
 
-impl TrainableModel for MistralLoraForCausalLM {
-    fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
-        self.forward_internal(input_ids, mask)
-    }
-
-    fn forward_with_positions(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-        position_ids: &Array,
-    ) -> Result<Array, LoraError> {
-        let hidden_states = self
-            .model
-            .forward_with_positions(input_ids, mask, position_ids)?;
-
-        if let Some(ref mut lm_head) = self.lm_head {
-            Ok(mlx_rs::module::Module::forward(lm_head, &hidden_states)?)
-        } else {
-            Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
-        }
-    }
-
-    fn forward_with_cache(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-        cache: Option<&mut KVCache>,
-    ) -> Result<Array, LoraError> {
-        MistralLoraForCausalLM::forward_with_cache(self, input_ids, mask, cache)
-    }
-
-    fn create_cache(&self, max_seq_len: usize) -> Option<KVCache> {
-        Some(MistralLoraForCausalLM::create_cache(self, max_seq_len))
-    }
-
-    fn supports_kv_cache(&self) -> bool {
-        true
-    }
-
-    fn num_trainable_params(&self) -> usize {
-        self.model.num_trainable_params()
-    }
-
-    fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
-        let mut params = HashMap::new();
-
-        for (i, layer) in self.model.layers.iter().enumerate() {
-            let prefix = format!("model.layers.{}", i);
-
-            // Attention LoRA
-            params.insert(
-                Rc::from(format!("{}.self_attn.q_proj.lora_A.weight", prefix)),
-                layer.self_attn.q_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.q_proj.lora_B.weight", prefix)),
-                layer.self_attn.q_proj.lora_b.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.k_proj.lora_A.weight", prefix)),
-                layer.self_attn.k_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.k_proj.lora_B.weight", prefix)),
-                layer.self_attn.k_proj.lora_b.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.v_proj.lora_A.weight", prefix)),
-                layer.self_attn.v_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.v_proj.lora_B.weight", prefix)),
-                layer.self_attn.v_proj.lora_b.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.o_proj.lora_A.weight", prefix)),
-                layer.self_attn.o_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.o_proj.lora_B.weight", prefix)),
-                layer.self_attn.o_proj.lora_b.clone(),
-            );
-
-            // MLP LoRA
-            params.insert(
-                Rc::from(format!("{}.mlp.gate_proj.lora_A.weight", prefix)),
-                layer.mlp.gate_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.mlp.gate_proj.lora_B.weight", prefix)),
-                layer.mlp.gate_proj.lora_b.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.mlp.up_proj.lora_A.weight", prefix)),
-                layer.mlp.up_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.mlp.up_proj.lora_B.weight", prefix)),
-                layer.mlp.up_proj.lora_b.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.mlp.down_proj.lora_A.weight", prefix)),
-                layer.mlp.down_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.mlp.down_proj.lora_B.weight", prefix)),
-                layer.mlp.down_proj.lora_b.clone(),
-            );
-        }
-
-        params
-    }
-
-    fn set_lora_parameters(&mut self, params: &HashMap<Rc<str>, Array>) {
-        for (i, layer) in self.model.layers.iter_mut().enumerate() {
-            let prefix = format!("model.layers.{}", i);
-
-            // Attention LoRA
-            if let Some(p) = params.get(&Rc::from(format!(
-                "{}.self_attn.q_proj.lora_A.weight",
-                prefix
-            ))) {
-                layer.self_attn.q_proj.lora_a = p.clone();
-            }
-            if let Some(p) = params.get(&Rc::from(format!(
-                "{}.self_attn.q_proj.lora_B.weight",
-                prefix
-            ))) {
-                layer.self_attn.q_proj.lora_b = p.clone();
-            }
-            if let Some(p) = params.get(&Rc::from(format!(
-                "{}.self_attn.k_proj.lora_A.weight",
-                prefix
-            ))) {
-                layer.self_attn.k_proj.lora_a = p.clone();
-            }
-            if let Some(p) = params.get(&Rc::from(format!(
-                "{}.self_attn.k_proj.lora_B.weight",
-                prefix
-            ))) {
-                layer.self_attn.k_proj.lora_b = p.clone();
-            }
-            if let Some(p) = params.get(&Rc::from(format!(
-                "{}.self_attn.v_proj.lora_A.weight",
-                prefix
-            ))) {
-                layer.self_attn.v_proj.lora_a = p.clone();
-            }
-            if let Some(p) = params.get(&Rc::from(format!(
-                "{}.self_attn.v_proj.lora_B.weight",
-                prefix
-            ))) {
-                layer.self_attn.v_proj.lora_b = p.clone();
-            }
-            if let Some(p) = params.get(&Rc::from(format!(
-                "{}.self_attn.o_proj.lora_A.weight",
-                prefix
-            ))) {
-                layer.self_attn.o_proj.lora_a = p.clone();
-            }
-            if let Some(p) = params.get(&Rc::from(format!(
-                "{}.self_attn.o_proj.lora_B.weight",
-                prefix
-            ))) {
-                layer.self_attn.o_proj.lora_b = p.clone();
-            }
-
-            // MLP LoRA
-            if let Some(p) =
-                params.get(&Rc::from(format!("{}.mlp.gate_proj.lora_A.weight", prefix)))
-            {
-                layer.mlp.gate_proj.lora_a = p.clone();
-            }
-            if let Some(p) =
-                params.get(&Rc::from(format!("{}.mlp.gate_proj.lora_B.weight", prefix)))
-            {
-                layer.mlp.gate_proj.lora_b = p.clone();
-            }
-            if let Some(p) = params.get(&Rc::from(format!("{}.mlp.up_proj.lora_A.weight", prefix)))
-            {
-                layer.mlp.up_proj.lora_a = p.clone();
-            }
-            if let Some(p) = params.get(&Rc::from(format!("{}.mlp.up_proj.lora_B.weight", prefix)))
-            {
-                layer.mlp.up_proj.lora_b = p.clone();
-            }
-            if let Some(p) =
-                params.get(&Rc::from(format!("{}.mlp.down_proj.lora_A.weight", prefix)))
-            {
-                layer.mlp.down_proj.lora_a = p.clone();
-            }
-            if let Some(p) =
-                params.get(&Rc::from(format!("{}.mlp.down_proj.lora_B.weight", prefix)))
-            {
-                layer.mlp.down_proj.lora_b = p.clone();
-            }
-        }
-    }
-
-    fn save_lora_weights(&self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
-        let params = self.lora_parameters();
-        let params_ref: Vec<(Rc<str>, &Array)> =
-            params.iter().map(|(k, v)| (k.clone(), v)).collect();
-        mlx_rs::Array::save_safetensors(params_ref, None, path)?;
-        Ok(())
-    }
-
-    fn load_lora_weights(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
-        let loaded = mlx_rs::Array::load_safetensors(path)?;
-        let params: HashMap<Rc<str>, Array> = loaded
-            .into_iter()
-            .map(|(k, v)| (Rc::from(k.as_str()), v))
-            .collect();
-        self.set_lora_parameters(&params);
-        Ok(())
-    }
-
-    fn enable_gradient_checkpointing(&mut self, layers_per_block: usize) {
-        self.checkpoint_config = Some(CheckpointConfig {
-            enabled: true,
-            layers_per_block,
-            eval_at_boundaries: true,
-        });
-    }
-
-    fn disable_gradient_checkpointing(&mut self) {
-        self.checkpoint_config = None;
-    }
-
-    fn supports_gradient_checkpointing(&self) -> bool {
-        true
-    }
-
-    fn forward_hidden(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-    ) -> Option<Result<Array, LoraError>> {
-        Some(MistralLoraForCausalLM::forward_hidden_states(
-            self, input_ids, mask,
-        ))
-    }
-
-    fn forward_hidden_with_positions(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-        position_ids: &Array,
-    ) -> Option<Result<Array, LoraError>> {
-        Some(
-            self.model
-                .forward_with_positions(input_ids, mask, position_ids),
-        )
-    }
-
-    fn lm_head_weight(&self) -> Option<Array> {
-        MistralLoraForCausalLM::get_lm_head_weight(self)
-    }
-}
+// Implement TrainableModel for MistralLoraForCausalLM via shared macro.
+crate::impl_trainable_model!(MistralLoraForCausalLM);
 
 #[cfg(test)]
 mod tests {

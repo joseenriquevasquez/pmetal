@@ -113,8 +113,8 @@ pub use pipeline::{FunctionConstant, PipelineCache};
 // Async command buffer scheduling — DoubleBuffer and TripleBuffer are available
 // via async_scheduler module but not re-exported (no external consumers yet).
 pub use async_scheduler::{
-    AsyncBatchBuilder, AsyncScheduler, CompletionToken, DEFAULT_GPU_TIMEOUT,
-    GpuCompletionToken, InFlightBuffer, SchedulerStats,
+    AsyncBatchBuilder, AsyncScheduler, CompletionToken, DEFAULT_GPU_TIMEOUT, GpuCompletionToken,
+    InFlightBuffer, SchedulerStats,
 };
 
 /// Prelude for convenient imports.

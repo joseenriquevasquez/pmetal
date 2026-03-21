@@ -650,16 +650,30 @@ mod tests {
         let config = FusedTrainingConfig::new(32, 64, 4, 8.0);
         let trainer = FusedLoraTrainer::new(config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[2, 8, 32], None, None, None).unwrap();
-        let weight = mlx_rs::random::normal::<f32>(&[64, 32], None, None, None).unwrap();
-        let lora_a = mlx_rs::random::normal::<f32>(&[4, 32], None, None, None).unwrap();
-        let lora_b = mlx_rs::ops::zeros::<f32>(&[64, 4]).unwrap();
+        // Fused Metal kernels operate in f16 with 2D [batch, features] input
+        let batch_size = 16;
+        let x = mlx_rs::random::normal::<f32>(&[batch_size, 32], None, None, None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let weight = mlx_rs::random::normal::<f32>(&[64, 32], None, None, None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let lora_a = mlx_rs::random::normal::<f32>(&[4, 32], None, None, None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let lora_b = mlx_rs::ops::zeros::<f32>(&[64, 4])
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
 
         let output = trainer.forward(&x, &weight, &lora_a, &lora_b).unwrap();
 
-        assert_eq!(output.output.shape(), &[2, 8, 64]);
+        assert_eq!(output.output.shape(), &[batch_size, 64]);
         assert!(output.intermediate.is_some());
-        assert_eq!(output.intermediate.unwrap().shape(), &[2, 8, 4]);
+        assert_eq!(output.intermediate.unwrap().shape(), &[batch_size, 4]);
     }
 
     #[test]
@@ -668,17 +682,32 @@ mod tests {
         let trainer = FusedLoraTrainer::new(config).unwrap();
 
         let batch_size = 16;
-        let x = mlx_rs::random::normal::<f32>(&[batch_size, 32], None, None, None).unwrap();
-        let weight = mlx_rs::random::normal::<f32>(&[64, 32], None, None, None).unwrap();
-        let lora_a = mlx_rs::random::normal::<f32>(&[4, 32], None, None, None).unwrap();
-        let lora_b = mlx_rs::random::normal::<f32>(&[64, 4], None, None, None).unwrap();
+        // Fused Metal kernels operate in f16
+        let x = mlx_rs::random::normal::<f32>(&[batch_size, 32], None, None, None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let weight = mlx_rs::random::normal::<f32>(&[64, 32], None, None, None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let lora_a = mlx_rs::random::normal::<f32>(&[4, 32], None, None, None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let lora_b = mlx_rs::random::normal::<f32>(&[64, 4], None, None, None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
 
         // Forward
         let output = trainer.forward(&x, &weight, &lora_a, &lora_b).unwrap();
 
         // Fake gradient
-        let grad_output =
-            mlx_rs::random::normal::<f32>(&[batch_size, 64], None, None, None).unwrap();
+        let grad_output = mlx_rs::random::normal::<f32>(&[batch_size, 64], None, None, None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
 
         // Backward for LoRA params
         let (grad_a, grad_b) = trainer
@@ -700,11 +729,23 @@ mod tests {
         let trainer = FusedLoraTrainer::new(config).unwrap();
 
         let batch_size = 16;
-        let weight = mlx_rs::random::normal::<f32>(&[64, 32], None, None, None).unwrap();
-        let lora_a = mlx_rs::random::normal::<f32>(&[4, 32], None, None, None).unwrap();
-        let lora_b = mlx_rs::random::normal::<f32>(&[64, 4], None, None, None).unwrap();
-        let grad_output =
-            mlx_rs::random::normal::<f32>(&[batch_size, 64], None, None, None).unwrap();
+        // Fused Metal kernels operate in f16
+        let weight = mlx_rs::random::normal::<f32>(&[64, 32], None, None, None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let lora_a = mlx_rs::random::normal::<f32>(&[4, 32], None, None, None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let lora_b = mlx_rs::random::normal::<f32>(&[64, 4], None, None, None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let grad_output = mlx_rs::random::normal::<f32>(&[batch_size, 64], None, None, None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
 
         let grad_x = trainer
             .backward_input(&grad_output, &weight, &lora_a, &lora_b)
