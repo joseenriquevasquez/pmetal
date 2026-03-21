@@ -11,7 +11,7 @@
 //! length S, enabling stride-1 vDSP calls.
 
 #[cfg(target_os = "macos")]
-mod ffi {
+pub(crate) mod ffi {
     unsafe extern "C" {
         // === Existing bindings ===
 
@@ -775,6 +775,61 @@ pub fn adam_update(
         let mh = m[i] / bc1;
         let vh = v[i] / bc2;
         w[i] -= lr * mh / (vh.sqrt() + eps);
+    }
+}
+
+/// Fused single-pass AdamW update with weight decay and gradient scaling.
+///
+/// Traverses each element exactly once: read param, grad, m, v; write param, m, v.
+/// Memory traffic: ~28 bytes/element (7 x f32). LLVM auto-vectorizes to NEON FMA.
+///
+/// `grad_scale` is a combined scaling factor applied inline to each gradient,
+/// avoiding a separate `scale_inplace` pass. Typically set to
+/// `clip_ratio / (accum_steps * loss_scale)`.
+///
+/// `t` is the Adam step counter and must be >= 1 (step 0 is undefined — bias
+/// correction would divide by zero). `weight_decay` is applied directly to the
+/// parameter and is NOT scaled by `grad_scale`.
+#[allow(clippy::too_many_arguments)]
+pub fn adam_update_fused(
+    w: &mut [f32],
+    g: &[f32],
+    m: &mut [f32],
+    v: &mut [f32],
+    t: usize,
+    lr: f32,
+    b1: f32,
+    b2: f32,
+    eps: f32,
+    weight_decay: f32,
+    grad_scale: f32,
+) {
+    debug_assert!(t >= 1, "Adam step t must be >= 1");
+
+    let n = w.len();
+    debug_assert_eq!(n, g.len());
+    debug_assert_eq!(n, m.len());
+    debug_assert_eq!(n, v.len());
+
+    if n == 0 {
+        return;
+    }
+
+    let bc1_inv = 1.0 / (1.0 - b1.powi(t as i32));
+    let bc2_inv = 1.0 / (1.0 - b2.powi(t as i32));
+    let one_minus_b1 = 1.0 - b1;
+    let one_minus_b2 = 1.0 - b2;
+
+    for i in 0..n {
+        let gi = g[i] * grad_scale;
+        let mi = b1 * m[i] + one_minus_b1 * gi;
+        let vi = b2 * v[i] + one_minus_b2 * gi * gi;
+        m[i] = mi;
+        v[i] = vi;
+        let m_hat = mi * bc1_inv;
+        let v_hat = vi * bc2_inv;
+        let update = m_hat / (v_hat.sqrt() + eps);
+        w[i] -= lr * (update + weight_decay * w[i]);
     }
 }
 

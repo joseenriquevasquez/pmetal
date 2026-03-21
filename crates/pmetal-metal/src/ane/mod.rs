@@ -45,8 +45,12 @@ pub mod inference;
 pub mod inference_hybrid;
 pub mod iosurface;
 pub mod kernel;
+pub mod loss;
 pub mod mil;
+pub mod pipeline;
+pub mod profiler;
 pub mod runtime;
+pub mod scratch;
 
 // Legacy modules kept for reference but no longer used in training
 pub mod budget;

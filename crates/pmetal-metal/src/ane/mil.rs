@@ -386,6 +386,38 @@ impl MilProgram {
     pub fn text(&self) -> &str {
         &self.text
     }
+
+}
+
+/// Kernel implementation strategy for linear projections on ANE.
+///
+/// ANE hardware is fundamentally a convolution engine. Conv1x1 maps directly
+/// to the hardware multiply-accumulate array, potentially offering better
+/// performance than the matmul path for shapes where both IC and OC are
+/// sufficiently large.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ProjectionStrategy {
+    /// Reshape → transpose → matmul → transpose → reshape (7 MIL ops).
+    /// Works for all shapes. Default for small dimensions.
+    #[default]
+    Matmul,
+    /// Reshape weight to `[OC, IC, 1, 1]` → conv2d (4 MIL ops).
+    /// Requires conv constants to be emitted first.
+    Conv1x1,
+}
+
+impl ProjectionStrategy {
+    /// Choose the faster strategy based on dimension sizes.
+    ///
+    /// Conv1x1 is preferred when both dimensions are large enough to
+    /// saturate the ANE MAC array. Threshold determined empirically.
+    pub fn auto(ic: usize, oc: usize) -> Self {
+        if ic >= 64 && oc >= 64 {
+            Self::Conv1x1
+        } else {
+            Self::Matmul
+        }
+    }
 }
 
 /// Format a shape array as MIL tensor dimension string: `[1, 768, 1, 256]`.
