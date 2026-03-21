@@ -167,7 +167,10 @@ fn validate_ollama_model_name(name: &str) -> anyhow::Result<()> {
 }
 
 /// Validate file path (prevent path traversal).
-pub(crate) fn validate_file_path(path: &str, allow_creation: bool) -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn validate_file_path(
+    path: &str,
+    allow_creation: bool,
+) -> anyhow::Result<std::path::PathBuf> {
     let path = std::path::Path::new(path);
 
     // Prevent path traversal

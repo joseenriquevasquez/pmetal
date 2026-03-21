@@ -282,7 +282,7 @@ pub fn estimate_fit(model: &ModelSpec, device: &DeviceSpec) -> FitEstimate {
     }
 
     // KV cache quantization recommendations
-    if model.kv_cache_bits.is_some() {
+    if let Some(kv_bits) = model.kv_cache_bits {
         let fp16_kv = match (model.num_layers, model.num_kv_heads, model.head_dim) {
             (Some(l), Some(h), Some(d)) => {
                 2.0 * l as f64 * h as f64 * d as f64 * model.context_length as f64 * 2.0 / 1e9
@@ -293,8 +293,7 @@ pub fn estimate_fit(model: &ModelSpec, device: &DeviceSpec) -> FitEstimate {
         if savings > 0.1 {
             notes.push(format!(
                 "KV cache q{}: saves {:.1} GB vs fp16",
-                model.kv_cache_bits.unwrap(),
-                savings
+                kv_bits, savings
             ));
         }
     } else if fit_level == FitLevel::Tight || fit_level == FitLevel::TooLarge {

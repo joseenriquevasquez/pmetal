@@ -336,7 +336,10 @@ impl InferenceEngine {
             let model = &mut state.model;
             let mut cache = model.create_cache_with_mode(
                 max_seq_len,
-                CacheMode::Quantized { bits: 8, group_size: 64 },
+                CacheMode::Quantized {
+                    bits: 8,
+                    group_size: 64,
+                },
             );
 
             // Build input array [1, seq_len] for prefill.
@@ -486,7 +489,10 @@ impl InferenceEngine {
             let model = &mut state.model;
             let mut cache = model.create_cache_with_mode(
                 max_seq_len,
-                CacheMode::Quantized { bits: 8, group_size: 64 },
+                CacheMode::Quantized {
+                    bits: 8,
+                    group_size: 64,
+                },
             );
 
             // Build prefill input array.

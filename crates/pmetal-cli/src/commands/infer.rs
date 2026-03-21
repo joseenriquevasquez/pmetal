@@ -238,7 +238,10 @@ pub(crate) async fn run_inference(
         let k = kv_k_bits.unwrap_or(kv_quant);
         let v = kv_v_bits.unwrap_or(kv_quant);
         if k == v {
-            pmetal_mlx::kv_cache::CacheMode::Quantized { bits: k, group_size: kv_group_size }
+            pmetal_mlx::kv_cache::CacheMode::Quantized {
+                bits: k,
+                group_size: kv_group_size,
+            }
         } else {
             pmetal_mlx::kv_cache::CacheMode::AsymmetricQuantized {
                 key_bits: k,
@@ -247,7 +250,10 @@ pub(crate) async fn run_inference(
             }
         }
     } else {
-        pmetal_mlx::kv_cache::CacheMode::Quantized { bits: kv_quant, group_size: kv_group_size }
+        pmetal_mlx::kv_cache::CacheMode::Quantized {
+            bits: kv_quant,
+            group_size: kv_group_size,
+        }
     };
     tracing::info!("KV cache: {}", cache_mode.describe());
     // Warn about potential quality degradation at very long contexts with quantized KV
@@ -255,7 +261,8 @@ pub(crate) async fn run_inference(
         tracing::warn!(
             "KV cache q{} at {} tokens: community reports quality degradation at >32k context. \
              Use --no-kv-quant if you see issues.",
-            kv_quant, max_seq_len
+            kv_quant,
+            max_seq_len
         );
     }
     let mut cache = model.create_cache_with_mode(max_seq_len, cache_mode);
@@ -1266,10 +1273,8 @@ pub(crate) async fn run_inference_with_lora(
     }
 
     // Load sampling defaults
-    let defaults = pmetal_data::inference_config::load_sampling_defaults(
-        model_path,
-        use_chat && !no_thinking,
-    );
+    let defaults =
+        pmetal_data::inference_config::load_sampling_defaults(model_path, use_chat && !no_thinking);
 
     let temperature = temperature.unwrap_or(defaults.temperature);
     let top_k = top_k.unwrap_or(defaults.top_k);

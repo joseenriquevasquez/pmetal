@@ -102,8 +102,7 @@ pub(crate) async fn run_search(
             .unwrap_or_else(|| "?".to_string());
 
         // Fit indicator
-        let fit_str = if let (Some(dev), Some(params_b)) =
-            (&device_spec, result.estimated_params_b)
+        let fit_str = if let (Some(dev), Some(params_b)) = (&device_spec, result.estimated_params_b)
         {
             let quant = pmetal_hub::fit::detect_quantization_from_id(&result.model_id);
             let model_spec = ModelSpec {
@@ -119,8 +118,7 @@ pub(crate) async fn run_search(
                 kv_cache_bits: None,
             };
             let fit = estimate_fit(&model_spec, dev);
-            if first_fit.is_none() && matches!(fit.fit_level, FitLevel::Fits | FitLevel::Tight)
-            {
+            if first_fit.is_none() && matches!(fit.fit_level, FitLevel::Fits | FitLevel::Tight) {
                 first_fit = Some(result.model_id.clone());
             }
             match fit.fit_level {
@@ -134,11 +132,7 @@ pub(crate) async fn run_search(
 
         println!(
             "{} ({}, {}d, {}l{})",
-            result.model_id,
-            size_str,
-            result.downloads,
-            result.likes,
-            fit_str
+            result.model_id, size_str, result.downloads, result.likes, fit_str
         );
 
         if detailed {

@@ -279,20 +279,15 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
                         let mut obj: serde_json::Value = serde_json::from_str(line)?;
 
                         // If it has "conversations" field as a string, parse it
-                        if let Some(serde_json::Value::String(conv_str)) =
-                            obj.get("conversations")
+                        if let Some(serde_json::Value::String(conv_str)) = obj.get("conversations")
                         {
-                            if let Ok(convs) =
-                                serde_json::from_str::<serde_json::Value>(conv_str)
-                            {
+                            if let Ok(convs) = serde_json::from_str::<serde_json::Value>(conv_str) {
                                 obj["conversations"] = convs;
                             }
                         }
 
                         // If it has "messages" field, convert to ShareGPT format
-                        if let Some(serde_json::Value::Array(msgs)) =
-                            obj.get("messages").cloned()
-                        {
+                        if let Some(serde_json::Value::Array(msgs)) = obj.get("messages").cloned() {
                             let conversations: Vec<_> = msgs
                                 .iter()
                                 .filter_map(|m| {
@@ -408,17 +403,13 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
                                     if arr.is_null(row_idx) {
                                         serde_json::Value::Null
                                     } else {
-                                        serde_json::Value::String(
-                                            arr.value(row_idx).to_string(),
-                                        )
+                                        serde_json::Value::String(arr.value(row_idx).to_string())
                                     }
                                 } else if let Some(arr) = col.as_string_opt::<i64>() {
                                     if arr.is_null(row_idx) {
                                         serde_json::Value::Null
                                     } else {
-                                        serde_json::Value::String(
-                                            arr.value(row_idx).to_string(),
-                                        )
+                                        serde_json::Value::String(arr.value(row_idx).to_string())
                                     }
                                 } else {
                                     serde_json::Value::Null
@@ -747,8 +738,7 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
             };
 
             // For deduplication
-            let mut seen_hashes: std::collections::HashSet<u64> =
-                std::collections::HashSet::new();
+            let mut seen_hashes: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
             let validated_filter_output =
                 crate::validate_output_path(&output, "dataset filter output")?;
@@ -1016,8 +1006,7 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
                     } else {
                         // Sample a fraction
                         use rand::SeedableRng;
-                        let mut rng =
-                            rand::rngs::StdRng::seed_from_u64(seed + dataset_idx as u64);
+                        let mut rng = rand::rngs::StdRng::seed_from_u64(seed + dataset_idx as u64);
                         for sample in samples {
                             if rand::RngExt::random::<f64>(&mut rng) < weight {
                                 merged.push(sample.clone());
@@ -1179,14 +1168,10 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
                                 Some((from.to_string(), value.to_string()))
                             })
                             .collect::<Vec<_>>()
-                    } else if let Some(inst) =
-                        json.get("instruction").and_then(|v| v.as_str())
-                    {
+                    } else if let Some(inst) = json.get("instruction").and_then(|v| v.as_str()) {
                         // Convert Alpaca to conversations
-                        let input_text =
-                            json.get("input").and_then(|v| v.as_str()).unwrap_or("");
-                        let output_text =
-                            json.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                        let input_text = json.get("input").and_then(|v| v.as_str()).unwrap_or("");
+                        let output_text = json.get("output").and_then(|v| v.as_str()).unwrap_or("");
                         let user_msg = if input_text.is_empty() {
                             inst.to_string()
                         } else {
@@ -1385,8 +1370,7 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
                         .collect()
                 });
 
-            let mut seen_hashes: std::collections::HashSet<u64> =
-                std::collections::HashSet::new();
+            let mut seen_hashes: std::collections::HashSet<u64> = std::collections::HashSet::new();
             let mut total = 0usize;
             let mut kept = 0usize;
             let mut filtered_long = 0usize;
@@ -1406,8 +1390,7 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
                     let mut obj = serde_json::Map::new();
                     if let Some(src_obj) = raw_json.as_object() {
                         for (k, v) in src_obj {
-                            let new_key =
-                                map.get(k.as_str()).cloned().unwrap_or_else(|| k.clone());
+                            let new_key = map.get(k.as_str()).cloned().unwrap_or_else(|| k.clone());
                             obj.insert(new_key, v.clone());
                         }
                     }
@@ -1427,14 +1410,10 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
                                 Some((from.to_string(), value.to_string()))
                             })
                             .collect::<Vec<_>>()
-                    } else if let Some(problem) =
-                        json.get("problem").and_then(|v| v.as_str())
-                    {
+                    } else if let Some(problem) = json.get("problem").and_then(|v| v.as_str()) {
                         // Reasoning format: problem / thinking / solution
-                        let thinking =
-                            json.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
-                        let solution =
-                            json.get("solution").and_then(|v| v.as_str()).unwrap_or("");
+                        let thinking = json.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
+                        let solution = json.get("solution").and_then(|v| v.as_str()).unwrap_or("");
                         let assistant_msg = if thinking.is_empty() {
                             solution.to_string()
                         } else {
@@ -1444,13 +1423,9 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
                             ("human".to_string(), problem.to_string()),
                             ("gpt".to_string(), assistant_msg),
                         ]
-                    } else if let Some(inst) =
-                        json.get("instruction").and_then(|v| v.as_str())
-                    {
-                        let input_text =
-                            json.get("input").and_then(|v| v.as_str()).unwrap_or("");
-                        let output_text =
-                            json.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                    } else if let Some(inst) = json.get("instruction").and_then(|v| v.as_str()) {
+                        let input_text = json.get("input").and_then(|v| v.as_str()).unwrap_or("");
+                        let output_text = json.get("output").and_then(|v| v.as_str()).unwrap_or("");
                         let user_msg = if input_text.is_empty() {
                             inst.to_string()
                         } else {
@@ -1480,8 +1455,7 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
                         // Check dedup
                         if !no_dedup {
                             use std::hash::{Hash, Hasher};
-                            let mut hasher =
-                                std::collections::hash_map::DefaultHasher::new();
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
                             text_with_eos.hash(&mut hasher);
                             let hash = hasher.finish();
                             if !seen_hashes.insert(hash) {
@@ -1530,11 +1504,7 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
                     }
                 }
 
-                writeln!(
-                    templated_file,
-                    "{}",
-                    serde_json::json!({"text": formatted})
-                )?;
+                writeln!(templated_file, "{}", serde_json::json!({"text": formatted}))?;
                 kept += 1;
             }
 

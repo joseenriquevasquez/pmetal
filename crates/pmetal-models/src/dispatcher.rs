@@ -220,6 +220,65 @@ impl ModelArchitecture {
     }
 }
 
+/// Dispatch a method call uniformly across all `DynamicModel` variants.
+///
+/// Every arm expands to `m.$method($args...)` where `m` is the inner model.
+/// Use this only for methods where ALL variants have identical call signatures.
+macro_rules! dispatch_uniform {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            Self::Llama(m) => m.$method($($arg),*),
+            Self::Llama4(m) => m.$method($($arg),*),
+            Self::Qwen2(m) => m.$method($($arg),*),
+            Self::Qwen3(m) => m.$method($($arg),*),
+            Self::Qwen3MoE(m) => m.$method($($arg),*),
+            Self::Gemma(m) => m.$method($($arg),*),
+            Self::Mistral(m) => m.$method($($arg),*),
+            Self::Phi(m) => m.$method($($arg),*),
+            Self::Phi4(m) => m.$method($($arg),*),
+            Self::DeepSeek(m) => m.$method($($arg),*),
+            Self::Cohere(m) => m.$method($($arg),*),
+            Self::Granite(m) => m.$method($($arg),*),
+            Self::NemotronH(m) => m.$method($($arg),*),
+            Self::Qwen3Next(m) => m.$method($($arg),*),
+            Self::StarCoder2(m) => m.$method($($arg),*),
+            Self::RecurrentGemma(m) => m.$method($($arg),*),
+            Self::Jamba(m) => m.$method($($arg),*),
+            Self::FalconH1(m) => m.$method($($arg),*),
+            Self::Flux(m) => m.$method($($arg),*),
+            Self::Bert(m) => m.$method($($arg),*),
+        }
+    };
+}
+
+/// Map each `DynamicModel` variant to its corresponding `ModelArchitecture` constant.
+macro_rules! dispatch_architecture {
+    ($self:expr) => {
+        match $self {
+            Self::Llama(_) => ModelArchitecture::Llama,
+            Self::Llama4(_) => ModelArchitecture::Llama4,
+            Self::Qwen2(_) => ModelArchitecture::Qwen2,
+            Self::Qwen3(_) => ModelArchitecture::Qwen3,
+            Self::Qwen3MoE(_) => ModelArchitecture::Qwen3MoE,
+            Self::Gemma(_) => ModelArchitecture::Gemma,
+            Self::Mistral(_) => ModelArchitecture::Mistral,
+            Self::Phi(_) => ModelArchitecture::Phi,
+            Self::Phi4(_) => ModelArchitecture::Phi4,
+            Self::DeepSeek(_) => ModelArchitecture::DeepSeek,
+            Self::Cohere(_) => ModelArchitecture::Cohere,
+            Self::Granite(_) => ModelArchitecture::Granite,
+            Self::NemotronH(_) => ModelArchitecture::NemotronH,
+            Self::Qwen3Next(_) => ModelArchitecture::Qwen3Next,
+            Self::StarCoder2(_) => ModelArchitecture::StarCoder2,
+            Self::RecurrentGemma(_) => ModelArchitecture::RecurrentGemma,
+            Self::Jamba(_) => ModelArchitecture::Jamba,
+            Self::FalconH1(_) => ModelArchitecture::FalconH1,
+            Self::Flux(_) => ModelArchitecture::Flux,
+            Self::Bert(_) => ModelArchitecture::Bert,
+        }
+    };
+}
+
 /// A model whose architecture is dispatched at runtime.
 pub enum DynamicModel {
     Llama(LlamaForCausalLM),
@@ -680,21 +739,32 @@ impl DynamicModel {
         // Ensure group_size is compatible with head_dim (MLX quantize requires divisibility).
         // Models like Phi-3 mini (head_dim=96) or NemotronH (head_dim=32) need adjustment.
         let safe_mode = match mode {
-            CacheMode::Quantized { bits, group_size } if head_dim > 0 && head_dim % group_size != 0 => {
-                let safe_gs = find_compatible_group_size(head_dim, group_size);
-                tracing::info!(
-                    "KV cache: adjusted group_size {group_size} → {safe_gs} (head_dim={head_dim})"
-                );
-                CacheMode::Quantized { bits, group_size: safe_gs }
-            }
-            CacheMode::AsymmetricQuantized { key_bits, value_bits, group_size }
+            CacheMode::Quantized { bits, group_size }
                 if head_dim > 0 && head_dim % group_size != 0 =>
             {
                 let safe_gs = find_compatible_group_size(head_dim, group_size);
                 tracing::info!(
                     "KV cache: adjusted group_size {group_size} → {safe_gs} (head_dim={head_dim})"
                 );
-                CacheMode::AsymmetricQuantized { key_bits, value_bits, group_size: safe_gs }
+                CacheMode::Quantized {
+                    bits,
+                    group_size: safe_gs,
+                }
+            }
+            CacheMode::AsymmetricQuantized {
+                key_bits,
+                value_bits,
+                group_size,
+            } if head_dim > 0 && head_dim % group_size != 0 => {
+                let safe_gs = find_compatible_group_size(head_dim, group_size);
+                tracing::info!(
+                    "KV cache: adjusted group_size {group_size} → {safe_gs} (head_dim={head_dim})"
+                );
+                CacheMode::AsymmetricQuantized {
+                    key_bits,
+                    value_bits,
+                    group_size: safe_gs,
+                }
             }
             other => other,
         };
@@ -729,28 +799,7 @@ impl DynamicModel {
     }
 
     pub fn architecture(&self) -> ModelArchitecture {
-        match self {
-            Self::Llama(_) => ModelArchitecture::Llama,
-            Self::Llama4(_) => ModelArchitecture::Llama4,
-            Self::Qwen2(_) => ModelArchitecture::Qwen2,
-            Self::Qwen3(_) => ModelArchitecture::Qwen3,
-            Self::Qwen3MoE(_) => ModelArchitecture::Qwen3MoE,
-            Self::Gemma(_) => ModelArchitecture::Gemma,
-            Self::Mistral(_) => ModelArchitecture::Mistral,
-            Self::Phi(_) => ModelArchitecture::Phi,
-            Self::Phi4(_) => ModelArchitecture::Phi4,
-            Self::DeepSeek(_) => ModelArchitecture::DeepSeek,
-            Self::Cohere(_) => ModelArchitecture::Cohere,
-            Self::Granite(_) => ModelArchitecture::Granite,
-            Self::NemotronH(_) => ModelArchitecture::NemotronH,
-            Self::Qwen3Next(_) => ModelArchitecture::Qwen3Next,
-            Self::StarCoder2(_) => ModelArchitecture::StarCoder2,
-            Self::RecurrentGemma(_) => ModelArchitecture::RecurrentGemma,
-            Self::Jamba(_) => ModelArchitecture::Jamba,
-            Self::FalconH1(_) => ModelArchitecture::FalconH1,
-            Self::Flux(_) => ModelArchitecture::Flux,
-            Self::Bert(_) => ModelArchitecture::Bert,
-        }
+        dispatch_architecture!(self)
     }
 
     pub fn vocab_size(&self) -> i32 {
@@ -804,6 +853,7 @@ impl DynamicModel {
     }
 
     pub fn eval(&self) -> Result<(), Exception> {
+        // Use explicit UFCS to resolve ambiguity with CausalLMModel::eval on some variants.
         match self {
             Self::Llama(m) => ModuleParametersExt::eval(m),
             Self::Llama4(m) => ModuleParametersExt::eval(m),
@@ -831,203 +881,35 @@ impl DynamicModel {
 
 impl ModuleParameters for DynamicModel {
     fn parameters(&self) -> mlx_rs::module::ModuleParamRef<'_> {
-        match self {
-            Self::Llama(m) => m.parameters(),
-            Self::Llama4(m) => m.parameters(),
-            Self::Qwen2(m) => m.parameters(),
-            Self::Qwen3(m) => m.parameters(),
-            Self::Qwen3MoE(m) => m.parameters(),
-            Self::Gemma(m) => m.parameters(),
-            Self::Mistral(m) => m.parameters(),
-            Self::Phi(m) => m.parameters(),
-            Self::Phi4(m) => m.parameters(),
-            Self::DeepSeek(m) => m.parameters(),
-            Self::Cohere(m) => m.parameters(),
-            Self::Granite(m) => m.parameters(),
-            Self::NemotronH(m) => m.parameters(),
-            Self::Qwen3Next(m) => m.parameters(),
-            Self::StarCoder2(m) => m.parameters(),
-            Self::RecurrentGemma(m) => m.parameters(),
-            Self::Jamba(m) => m.parameters(),
-            Self::FalconH1(m) => m.parameters(),
-            Self::Flux(m) => m.parameters(),
-            Self::Bert(m) => m.parameters(),
-        }
+        dispatch_uniform!(self, parameters)
     }
 
     fn trainable_parameters(&self) -> mlx_rs::module::ModuleParamRef<'_> {
-        match self {
-            Self::Llama(m) => m.trainable_parameters(),
-            Self::Llama4(m) => m.trainable_parameters(),
-            Self::Qwen2(m) => m.trainable_parameters(),
-            Self::Qwen3(m) => m.trainable_parameters(),
-            Self::Qwen3MoE(m) => m.trainable_parameters(),
-            Self::Gemma(m) => m.trainable_parameters(),
-            Self::Mistral(m) => m.trainable_parameters(),
-            Self::Phi(m) => m.trainable_parameters(),
-            Self::Phi4(m) => m.trainable_parameters(),
-            Self::DeepSeek(m) => m.trainable_parameters(),
-            Self::Cohere(m) => m.trainable_parameters(),
-            Self::Granite(m) => m.trainable_parameters(),
-            Self::NemotronH(m) => m.trainable_parameters(),
-            Self::Qwen3Next(m) => m.trainable_parameters(),
-            Self::StarCoder2(m) => m.trainable_parameters(),
-            Self::RecurrentGemma(m) => m.trainable_parameters(),
-            Self::Jamba(m) => m.trainable_parameters(),
-            Self::FalconH1(m) => m.trainable_parameters(),
-            Self::Flux(m) => m.trainable_parameters(),
-            Self::Bert(m) => m.trainable_parameters(),
-        }
+        dispatch_uniform!(self, trainable_parameters)
     }
 
     fn parameters_mut(&mut self) -> mlx_rs::module::ModuleParamMut<'_> {
-        match self {
-            Self::Llama(m) => m.parameters_mut(),
-            Self::Llama4(m) => m.parameters_mut(),
-            Self::Qwen2(m) => m.parameters_mut(),
-            Self::Qwen3(m) => m.parameters_mut(),
-            Self::Qwen3MoE(m) => m.parameters_mut(),
-            Self::Gemma(m) => m.parameters_mut(),
-            Self::Mistral(m) => m.parameters_mut(),
-            Self::Phi(m) => m.parameters_mut(),
-            Self::Phi4(m) => m.parameters_mut(),
-            Self::DeepSeek(m) => m.parameters_mut(),
-            Self::Cohere(m) => m.parameters_mut(),
-            Self::Granite(m) => m.parameters_mut(),
-            Self::NemotronH(m) => m.parameters_mut(),
-            Self::Qwen3Next(m) => m.parameters_mut(),
-            Self::StarCoder2(m) => m.parameters_mut(),
-            Self::RecurrentGemma(m) => m.parameters_mut(),
-            Self::Jamba(m) => m.parameters_mut(),
-            Self::FalconH1(m) => m.parameters_mut(),
-            Self::Flux(m) => m.parameters_mut(),
-            Self::Bert(m) => m.parameters_mut(),
-        }
+        dispatch_uniform!(self, parameters_mut)
     }
 
     fn num_parameters(&self) -> usize {
-        match self {
-            Self::Llama(m) => m.num_parameters(),
-            Self::Llama4(m) => m.num_parameters(),
-            Self::Qwen2(m) => m.num_parameters(),
-            Self::Qwen3(m) => m.num_parameters(),
-            Self::Qwen3MoE(m) => m.num_parameters(),
-            Self::Gemma(m) => m.num_parameters(),
-            Self::Mistral(m) => m.num_parameters(),
-            Self::Phi(m) => m.num_parameters(),
-            Self::Phi4(m) => m.num_parameters(),
-            Self::DeepSeek(m) => m.num_parameters(),
-            Self::Cohere(m) => m.num_parameters(),
-            Self::Granite(m) => m.num_parameters(),
-            Self::NemotronH(m) => m.num_parameters(),
-            Self::Qwen3Next(m) => m.num_parameters(),
-            Self::StarCoder2(m) => m.num_parameters(),
-            Self::RecurrentGemma(m) => m.num_parameters(),
-            Self::Jamba(m) => m.num_parameters(),
-            Self::FalconH1(m) => m.num_parameters(),
-            Self::Flux(m) => m.num_parameters(),
-            Self::Bert(m) => m.num_parameters(),
-        }
+        dispatch_uniform!(self, num_parameters)
     }
 
     fn freeze_parameters(&mut self, recurse: bool) {
-        match self {
-            Self::Llama(m) => m.freeze_parameters(recurse),
-            Self::Llama4(m) => m.freeze_parameters(recurse),
-            Self::Qwen2(m) => m.freeze_parameters(recurse),
-            Self::Qwen3(m) => m.freeze_parameters(recurse),
-            Self::Qwen3MoE(m) => m.freeze_parameters(recurse),
-            Self::Gemma(m) => m.freeze_parameters(recurse),
-            Self::Mistral(m) => m.freeze_parameters(recurse),
-            Self::Phi(m) => m.freeze_parameters(recurse),
-            Self::Phi4(m) => m.freeze_parameters(recurse),
-            Self::DeepSeek(m) => m.freeze_parameters(recurse),
-            Self::Cohere(m) => m.freeze_parameters(recurse),
-            Self::Granite(m) => m.freeze_parameters(recurse),
-            Self::NemotronH(m) => m.freeze_parameters(recurse),
-            Self::Qwen3Next(m) => m.freeze_parameters(recurse),
-            Self::StarCoder2(m) => m.freeze_parameters(recurse),
-            Self::RecurrentGemma(m) => m.freeze_parameters(recurse),
-            Self::Jamba(m) => m.freeze_parameters(recurse),
-            Self::FalconH1(m) => m.freeze_parameters(recurse),
-            Self::Flux(m) => m.freeze_parameters(recurse),
-            Self::Bert(m) => m.freeze_parameters(recurse),
-        }
+        dispatch_uniform!(self, freeze_parameters, recurse)
     }
 
     fn unfreeze_parameters(&mut self, recurse: bool) {
-        match self {
-            Self::Llama(m) => m.unfreeze_parameters(recurse),
-            Self::Llama4(m) => m.unfreeze_parameters(recurse),
-            Self::Qwen2(m) => m.unfreeze_parameters(recurse),
-            Self::Qwen3(m) => m.unfreeze_parameters(recurse),
-            Self::Qwen3MoE(m) => m.unfreeze_parameters(recurse),
-            Self::Gemma(m) => m.unfreeze_parameters(recurse),
-            Self::Mistral(m) => m.unfreeze_parameters(recurse),
-            Self::Phi(m) => m.unfreeze_parameters(recurse),
-            Self::Phi4(m) => m.unfreeze_parameters(recurse),
-            Self::DeepSeek(m) => m.unfreeze_parameters(recurse),
-            Self::Cohere(m) => m.unfreeze_parameters(recurse),
-            Self::Granite(m) => m.unfreeze_parameters(recurse),
-            Self::NemotronH(m) => m.unfreeze_parameters(recurse),
-            Self::Qwen3Next(m) => m.unfreeze_parameters(recurse),
-            Self::StarCoder2(m) => m.unfreeze_parameters(recurse),
-            Self::RecurrentGemma(m) => m.unfreeze_parameters(recurse),
-            Self::Jamba(m) => m.unfreeze_parameters(recurse),
-            Self::FalconH1(m) => m.unfreeze_parameters(recurse),
-            Self::Flux(m) => m.unfreeze_parameters(recurse),
-            Self::Bert(m) => m.unfreeze_parameters(recurse),
-        }
+        dispatch_uniform!(self, unfreeze_parameters, recurse)
     }
 
     fn all_frozen(&self) -> Option<bool> {
-        match self {
-            Self::Llama(m) => m.all_frozen(),
-            Self::Llama4(m) => m.all_frozen(),
-            Self::Qwen2(m) => m.all_frozen(),
-            Self::Qwen3(m) => m.all_frozen(),
-            Self::Qwen3MoE(m) => m.all_frozen(),
-            Self::Gemma(m) => m.all_frozen(),
-            Self::Mistral(m) => m.all_frozen(),
-            Self::Phi(m) => m.all_frozen(),
-            Self::Phi4(m) => m.all_frozen(),
-            Self::DeepSeek(m) => m.all_frozen(),
-            Self::Cohere(m) => m.all_frozen(),
-            Self::Granite(m) => m.all_frozen(),
-            Self::NemotronH(m) => m.all_frozen(),
-            Self::Qwen3Next(m) => m.all_frozen(),
-            Self::StarCoder2(m) => m.all_frozen(),
-            Self::RecurrentGemma(m) => m.all_frozen(),
-            Self::Jamba(m) => m.all_frozen(),
-            Self::FalconH1(m) => m.all_frozen(),
-            Self::Flux(m) => m.all_frozen(),
-            Self::Bert(m) => m.all_frozen(),
-        }
+        dispatch_uniform!(self, all_frozen)
     }
 
     fn any_frozen(&self) -> Option<bool> {
-        match self {
-            Self::Llama(m) => m.any_frozen(),
-            Self::Llama4(m) => m.any_frozen(),
-            Self::Qwen2(m) => m.any_frozen(),
-            Self::Qwen3(m) => m.any_frozen(),
-            Self::Qwen3MoE(m) => m.any_frozen(),
-            Self::Gemma(m) => m.any_frozen(),
-            Self::Mistral(m) => m.any_frozen(),
-            Self::Phi(m) => m.any_frozen(),
-            Self::Phi4(m) => m.any_frozen(),
-            Self::DeepSeek(m) => m.any_frozen(),
-            Self::Cohere(m) => m.any_frozen(),
-            Self::Granite(m) => m.any_frozen(),
-            Self::NemotronH(m) => m.any_frozen(),
-            Self::Qwen3Next(m) => m.any_frozen(),
-            Self::StarCoder2(m) => m.any_frozen(),
-            Self::RecurrentGemma(m) => m.any_frozen(),
-            Self::Jamba(m) => m.any_frozen(),
-            Self::FalconH1(m) => m.any_frozen(),
-            Self::Flux(m) => m.any_frozen(),
-            Self::Bert(m) => m.any_frozen(),
-        }
+        dispatch_uniform!(self, any_frozen)
     }
 }
 

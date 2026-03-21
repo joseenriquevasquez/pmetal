@@ -551,10 +551,12 @@ pub struct Sampler {
     inv_temp: Option<Array>,
     /// Cached vocab_range array for filter operations [0, 1, 2, ..., vocab_size-1]
     /// Lazily initialized on first filter use. Avoids ~600KB allocation per filter call.
-    #[allow(dead_code)] // Used by get_vocab_range; dead only when Metal fused sampler is active
+    #[allow(dead_code)]
+    // Used by get_vocab_range; dead only when Metal fused sampler is active
     cached_vocab_range: Option<Array>,
     /// Cached vocab size to detect when vocab_range needs regeneration
-    #[allow(dead_code)] // Paired with cached_vocab_range; both dead when Metal sampler is active
+    #[allow(dead_code)]
+    // Paired with cached_vocab_range; both dead when Metal sampler is active
     cached_vocab_size: usize,
 }
 
