@@ -657,6 +657,17 @@ impl TrainingLoop {
         }
 
         self.accumulation_step += 1;
+
+        // Evaluate accumulated gradients to free the backward computation graph.
+        // Without this, each micro-batch's gradient arrays keep the entire
+        // forward+backward graph alive (~14 GB per step for a 0.6B model).
+        // With grad_accum=4, that's 56 GB before any evaluation happens.
+        if let Some(ref acc) = self.accumulated_grads {
+            let grad_arrays: Vec<&Array> = acc.values().collect();
+            if !grad_arrays.is_empty() {
+                mlx_rs::transforms::eval(grad_arrays)?;
+            }
+        }
         Ok(())
     }
 
@@ -693,6 +704,15 @@ impl TrainingLoop {
             .checked_mul(batch.seq_len)
             .unwrap_or(usize::MAX);
 
+        if self.step <= 1 {
+            tracing::debug!(
+                step = self.step,
+                batch_size = batch.batch_size,
+                seq_len = batch.seq_len,
+                "train_step: computing loss and gradients"
+            );
+        }
+
         // Compute loss and gradients based on whether we have pixel values (VLM)
         let (loss, grads) = if let Some(ref pixel_values) = batch.pixel_values {
             // VLM training with image inputs
@@ -706,8 +726,22 @@ impl TrainingLoop {
         // NOTE: Unlike mlx-lm which uses mx.compile for JIT fusion, we need to
         // evaluate each step. mlx-rs doesn't expose mx.compile, so deferring
         // evaluation just builds up a massive computation graph.
+        if self.step <= 1 {
+            tracing::debug!(step = self.step, "train_step: evaluating loss...");
+        }
         loss.eval()?;
         let micro_batch_loss = loss.item::<f32>();
+        if self.step <= 3 {
+            let active = pmetal_mlx::memory::get_active_memory();
+            let cache = pmetal_mlx::memory::get_cache_memory();
+            tracing::info!(
+                step = self.step,
+                loss = micro_batch_loss,
+                active_mb = active / (1024 * 1024),
+                cache_mb = cache / (1024 * 1024),
+                "train_step: loss evaluated"
+            );
+        }
 
         // Accumulate loss across micro-batches for accurate reporting
         self.accumulated_loss += micro_batch_loss as f64;
@@ -738,15 +772,25 @@ impl TrainingLoop {
                 // Forces immediate evaluation to clear intermediate activations.
                 // Trade-off: Lower memory usage vs lower throughput.
                 if self.config.eager_evaluation {
-                    // Eval model parameters (clears computation graph)
-                    mlx_rs::transforms::eval_params(model.parameters())?;
-                    // Optimizer state is evaluated via Updatable trait
+                    // Eval only trainable (LoRA) parameters — NOT the frozen base
+                    // model. Evaluating all 600M+ params of a frozen model every step
+                    // is wasteful and can spike memory via unnecessary GPU->CPU sync.
+                    // This matches mlx-lm's approach: mx.eval(state, losses, ...).
+                    mlx_rs::transforms::eval_params(model.trainable_parameters())?;
+                    // Optimizer state (momentum/variance for Adam)
                     let opt_states: Vec<&Array> =
                         optimizer.updatable_states().into_iter().collect();
                     if !opt_states.is_empty() {
                         mlx_rs::transforms::eval(opt_states)?;
                     }
                 }
+                // NOTE: Do NOT clear the buffer cache here. MLX's cache holds
+                // freed buffers for reuse — clearing it forces fresh allocations
+                // that inflate RSS. Without mx.compile (unavailable in mlx-rs),
+                // every step allocates new buffers; the cache is what prevents
+                // unbounded RSS growth by recycling them. MLX's built-in
+                // backpressure (memory_limit) handles OOM prevention.
+
                 // NOTE: When eager_evaluation is false, we use deferred evaluation.
                 // MLX builds a lazy computation graph - forcing evaluation after
                 // every optimizer step is a massive bottleneck (20-50s per step!).

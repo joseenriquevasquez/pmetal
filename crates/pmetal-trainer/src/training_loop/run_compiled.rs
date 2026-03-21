@@ -254,6 +254,12 @@ impl TrainingLoop {
                         self.config.neftune_noise_alpha,
                     )?
                 };
+                // Evaluate each step immediately to prevent computation graph
+                // accumulation. Without mx.compile, each step builds a new graph
+                // (~10 GB for a 0.6B model). Deferring across steps causes OOM.
+                loss.eval()?;
+                eval_training_state(&[], &state)?;
+
                 accumulated_losses.push(loss);
 
                 // Update step counters (these are just integers, no GPU involvement)
@@ -261,16 +267,12 @@ impl TrainingLoop {
                 self.total_tokens += batch_tokens;
                 self.tokens_since_log += batch_tokens;
 
-                // Safety valve: prevent unbounded graph growth in deferred eval mode.
-                // Without gradient checkpointing (not available in MLX-rs), the computation
-                // graph grows per step. For architectures with sequential recurrence (GDN),
-                // each step creates O(T * n_layers) allocation nodes.  Evaluating every
-                // MAX_DEFERRED_STEPS prevents Metal resource limit (499000) exhaustion.
+                // Safety valve kept for GDN models with sequential recurrence.
                 const MAX_DEFERRED_STEPS: usize = 5;
                 if accumulated_losses.len() >= MAX_DEFERRED_STEPS
                     && self.step % self.config.log_every != 0
                 {
-                    eval_training_state(&accumulated_losses, &state)?;
+                    // Already evaluated above, just process the losses
                     for loss in &accumulated_losses {
                         let loss_val = loss.item::<f32>();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;

@@ -162,8 +162,9 @@ impl TrainingLoop {
                     return Ok(());
                 }
 
-                // Logging
-                if self.step % self.config.log_every == 0 {
+                // Logging — always log step 1 for immediate GUI feedback,
+                // then at regular intervals.
+                if self.step % self.config.log_every == 0 || self.step == 1 {
                     // Calculate throughput over the entire logging interval
                     let now = std::time::Instant::now();
                     let tokens_per_sec = match self.last_log_time {

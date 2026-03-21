@@ -175,12 +175,19 @@ impl TrainingLoop {
                 state.1.set_learning_rate(scheduled_lr);
 
                 // Execute packed training step (forward + backward + optimizer update)
-                // DEFERRED EVAL: Loss remains a lazy Array, no GPU-CPU sync here
                 let loss = if self.config.use_cut_cross_entropy {
                     jit_training_step_packed_cce(&mut state, &packed_batch, max_grad_norm)?
                 } else {
                     jit_training_step_packed(&mut state, &packed_batch, max_grad_norm)?
                 };
+
+                // Evaluate each step immediately to prevent computation graph
+                // accumulation. Without mx.compile (unavailable in mlx-rs), each
+                // step builds a NEW graph (~10 GB for a 0.6B model). Deferring
+                // evaluation across 10 steps means 10 graphs (~100 GB) in memory.
+                loss.eval()?;
+                eval_training_state(&[], &state)?;
+
                 accumulated_losses.push(loss);
 
                 // Update step counters
@@ -189,7 +196,7 @@ impl TrainingLoop {
                 self.tokens_since_log += batch_tokens;
 
                 // Logging boundary: NOW we evaluate accumulated losses
-                if self.step % self.config.log_every == 0 {
+                if self.step % self.config.log_every == 0 || self.step == 1 {
                     // Batch evaluate all accumulated losses, model params, and
                     // optimizer states together to prevent graph growth
                     eval_training_state(&accumulated_losses, &state)?;
