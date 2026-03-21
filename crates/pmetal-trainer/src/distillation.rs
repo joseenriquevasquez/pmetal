@@ -314,6 +314,7 @@ impl DistillationTrainer {
                     }
                 }
             }
+
         }
 
         for cb in &mut self.loop_state.callbacks {
