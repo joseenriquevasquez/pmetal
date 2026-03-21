@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
+use futures::FutureExt;
 use mlx_rs::builder::Builder as _;
 use mlx_rs::ops;
 use pmetal::prelude::TrainingCallback;
@@ -1112,7 +1113,7 @@ Selected method '{}' is not library-backed here yet.",
             qlora,
             training: pmetal::core::TrainingConfig {
                 learning_rate: config.learning_rate.unwrap_or(2e-4),
-                batch_size: config.batch_size.unwrap_or(4) as usize,
+                batch_size: config.batch_size.unwrap_or(1) as usize,
                 num_epochs: config.epochs.unwrap_or(3) as usize,
                 max_seq_len: config.max_seq_len.unwrap_or(2048) as usize,
                 gradient_accumulation_steps: config.gradient_accumulation_steps.unwrap_or(1) as usize,
@@ -1140,7 +1141,7 @@ Selected method '{}' is not library-backed here yet.",
                 jit_compilation: config.jit_compilation.unwrap_or(true),
                 fused: true,
                 metal_fused_optimizer: config.fused_optimizer.unwrap_or(false),
-                gradient_checkpointing: config.gradient_checkpointing.unwrap_or(false),
+                gradient_checkpointing: config.gradient_checkpointing.unwrap_or(true),
                 gradient_checkpointing_layers: config.gradient_checkpointing_layers.unwrap_or(4) as usize,
                 cut_cross_entropy: false,
                 ane: true,
@@ -1206,6 +1207,11 @@ Selected method '{}' is not library-backed here yet.",
             error,
         )
         .await;
+
+        // Release MLX Metal buffer cache after training ends (success, error, or cancel).
+        // Without this, freed buffers stay in MLX's cache indefinitely.
+        pmetal::mlx::memory::clear_cache();
+        tracing::info!("Training cleanup: MLX cache cleared");
 
         cancel_flags.write().await.remove(&run_id_task);
     });
@@ -1290,15 +1296,28 @@ pub async fn start_distillation(
             .await;
         });
 
-        let result = run_distillation_in_process(
+        let result = std::panic::AssertUnwindSafe(run_distillation_in_process(
             &config,
             &metrics_path,
             cancel_flag.clone(),
-        )
+        ))
+        .catch_unwind()
         .await;
 
-        let success = result.is_ok();
-        let error = result.err().map(|e| e.to_string());
+        let (success, error) = match result {
+            Ok(Ok(())) => (true, None),
+            Ok(Err(e)) => (false, Some(e.to_string())),
+            Err(panic_payload) => {
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    format!("Distillation crashed: {s}")
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    format!("Distillation crashed: {s}")
+                } else {
+                    "Distillation crashed (internal panic)".to_string()
+                };
+                (false, Some(msg))
+            }
+        };
         finalize_distillation_run(
             &state_arc,
             &event_tx,
@@ -1391,15 +1410,28 @@ pub async fn start_grpo(
             .await;
         });
 
-        let result = run_grpo_in_process(
+        let result = std::panic::AssertUnwindSafe(run_grpo_in_process(
             &config,
             &metrics_path,
             cancel_flag.clone(),
-        )
+        ))
+        .catch_unwind()
         .await;
 
-        let success = result.is_ok();
-        let error = result.err().map(|e| e.to_string());
+        let (success, error) = match result {
+            Ok(Ok(())) => (true, None),
+            Ok(Err(e)) => (false, Some(e.to_string())),
+            Err(panic_payload) => {
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    format!("GRPO crashed: {s}")
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    format!("GRPO crashed: {s}")
+                } else {
+                    "GRPO crashed (internal panic)".to_string()
+                };
+                (false, Some(msg))
+            }
+        };
         finalize_grpo_run(
             &state_arc,
             &event_tx,
@@ -1951,12 +1983,14 @@ pub async fn quantize_model(
     quant_type: String,
     output_dir: String,
 ) -> Result<String> {
-    let model_id_task = model_id.clone();
+    // Resolve remote model IDs (e.g. "unsloth/Qwen3-0.6B-Base") to local cache paths
+    let resolved_path = resolve_model_path(&model_id).await?;
+    let model_path = resolved_path.to_string_lossy().into_owned();
     let quant_type_task = quant_type.clone();
     let output_dir_task = output_dir.clone();
 
     tokio::task::spawn_blocking(move || {
-        run_quantize_in_process(&model_id_task, &quant_type_task, &output_dir_task)
+        run_quantize_in_process(&model_path, &quant_type_task, &output_dir_task)
     })
     .await
     .map_err(|e| AppError(format!("quantize task failed: {e}")))?
@@ -2891,13 +2925,7 @@ fn run_quantize_in_process(
         quantize::quantize,
     };
 
-    let resolved_model_path = if model_path.contains('/') && !PathBuf::from(model_path).exists() {
-        return Err(AppError(
-            "Quantizing remote models is not supported in the GUI yet.".to_string(),
-        ));
-    } else {
-        PathBuf::from(model_path)
-    };
+    let resolved_model_path = PathBuf::from(model_path);
 
     let quantizer = if method == "dynamic" {
         DynamicQuantizer::new(DynamicQuantizationConfig::default(), None)
@@ -2921,26 +2949,10 @@ fn run_quantize_in_process(
     let weights = pmetal::models::loader::load_weights(&resolved_model_path)
         .map_err(|e| AppError(e.to_string()))?;
 
-    let config_path = resolved_model_path.join("config.json");
-    let mut architecture = "llama".to_string();
-    if config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(archs) = json.get("architectures").and_then(|v| v.as_array()) {
-                    if let Some(arch_str) = archs.first().and_then(|v| v.as_str()) {
-                        architecture = match arch_str {
-                            "LlamaForCausalLM" => "llama".to_string(),
-                            "MistralForCausalLM" => "mistral".to_string(),
-                            "Qwen2ForCausalLM" => "qwen2".to_string(),
-                            "GemmaForCausalLM" | "Gemma2ForCausalLM" => "gemma".to_string(),
-                            "PhiForCausalLM" | "Phi3ForCausalLM" => "phi".to_string(),
-                            _ => "llama".to_string(),
-                        };
-                    }
-                }
-            }
-        }
-    }
+    // Use canonical architecture detection instead of hardcoded string matching.
+    let architecture = pmetal::models::ModelArchitecture::detect(&resolved_model_path)
+        .map(|arch| arch.to_string().to_lowercase())
+        .unwrap_or_else(|_| "llama".to_string());
 
     let mut builder = GgufBuilder::with_model(&architecture, "quantized-model");
     let mut keys: Vec<_> = weights.keys().collect();

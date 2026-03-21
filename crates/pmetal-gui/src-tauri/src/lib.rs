@@ -10,7 +10,7 @@ pub fn run() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("pmetal_gui=info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("pmetal_gui=info,pmetal_trainer=info,pmetal_mlx=info,pmetal_lora=info,pmetal_models=info,pmetal=info")),
         )
         .try_init();
 
