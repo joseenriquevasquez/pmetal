@@ -430,21 +430,68 @@ pub async fn run_training(
     };
 
     // -----------------------------------------------------------------------
-    // Phase 7: ANE training (skipped for LoRA/QLoRA)
+    // Phase 7: ANE full-parameter training (if requested and compatible)
     //
-    // ANE has its own weight format and training kernels — incompatible with
-    // LoRA/QLoRA adapters. The orchestrator always uses LoRA or QLoRA, so we
-    // skip the ANE attempt to avoid loading full model weights into memory
-    // (which would be discarded on failure, doubling peak memory usage).
+    // ANE training uses full model weights (not LoRA adapters). When ANE is
+    // requested and the model is compatible (dense transformer, no MoE), we
+    // attempt the ANE path first. On failure, fall back to GPU LoRA training.
     // -----------------------------------------------------------------------
-    if config.dispatch.ane {
-        tracing::debug!(
-            "ANE dispatch requested but skipped: orchestrator uses LoRA/QLoRA \
-             which requires GPU-based adapter training"
-        );
-    }
-
     let mut extra_callbacks = Some(callbacks);
+
+    #[cfg(feature = "ane")]
+    if config.dispatch.ane {
+        use crate::DynamicAneTrainerConfig;
+
+        // Check ANE compatibility from config.json
+        let config_text = std::fs::read_to_string(model_path.join("config.json"))?;
+        let config_json: serde_json::Value = serde_json::from_str(&config_text)?;
+
+        match DynamicAneTrainerConfig::is_ane_compatible(&config_json) {
+            Ok(()) => {
+                tracing::info!("Model is ANE-compatible — attempting ANE full-parameter training");
+                emit_phase(phase_cb, TrainingPhase::CompilingAneKernels);
+
+                match attempt_ane_training(
+                    &config,
+                    &full_config,
+                    &model_path,
+                    &output_dir,
+                    phase_cb,
+                    &mut extra_callbacks,
+                    &train_dataset,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        // ANE training succeeded — save and return
+                        emit_phase(phase_cb, TrainingPhase::SavingWeights);
+
+                        tracing::info!(
+                            loss = format!("{:.4}", result.final_loss),
+                            steps = result.total_steps,
+                            tokens = result.total_tokens,
+                            "ANE training complete"
+                        );
+
+                        emit_phase(phase_cb, TrainingPhase::Complete);
+                        return Ok(result);
+                    }
+                    Err(e) => {
+                        // ANE failed — fall back to GPU LoRA
+                        let reason = format!("{e}");
+                        tracing::warn!("ANE training failed, falling back to GPU: {reason}");
+                        emit_phase(phase_cb, TrainingPhase::AneFallback(reason));
+                    }
+                }
+            }
+            Err(reason) => {
+                tracing::info!(
+                    "Model not ANE-compatible ({reason}), using GPU training"
+                );
+                emit_phase(phase_cb, TrainingPhase::AneFallback(reason));
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Phase 7: Resolve metrics path (absolute, using canonicalized output_dir)
@@ -1049,7 +1096,6 @@ fn run_lora_path(
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "ane")]
-#[allow(dead_code)] // Will be called when full fine-tuning (non-LoRA) path is added
 async fn attempt_ane_training(
     config: &TrainingJobConfig,
     full_config: &FullTrainingConfig,
@@ -1091,26 +1137,49 @@ async fn attempt_ane_training(
     let n_layers = get_usize("num_hidden_layers")?;
     let vocab_size = get_usize("vocab_size")?;
 
-    // ANE kernels bake seq_len into static shapes and attention is O(seq_len²).
-    // Cap to 512 for ANE — larger values cause hardware rejection (status=0x1d)
-    // or extremely slow kernel compilation. The GPU path uses the full seq_len.
-    let ane_max_seq_len = 512;
-    let max_seq_len = if full_config.training.max_seq_len == 0 {
-        let model_max = config_json
-            .get("max_position_embeddings")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .unwrap_or(2048);
-        let capped = model_max.min(ane_max_seq_len);
+    // ANE projection kernels scale linearly with seq_len (IOSurface dimensions).
+    // The O(seq²) attention is decomposed to CPU BLAS, so there's no hard cap,
+    // but attention backward cost is quadratic — use a tight seq_len that fits
+    // the actual data rather than the model's max_position_embeddings.
+    //
+    // Strategy: use dataset p95 length (rounded up to next power of 2, capped
+    // at model max and 4096) to minimize padding waste while covering most samples.
+    let model_max_seq = config_json
+        .get("max_position_embeddings")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(2048);
+
+    let max_seq_len = {
+        // Compute p95 from dataset sample lengths
+        let mut lengths: Vec<usize> = train_dataset
+            .samples()
+            .iter()
+            .map(|s| s.input_ids.len())
+            .collect();
+        lengths.sort_unstable();
+        let p95_idx = (lengths.len() as f64 * 0.95) as usize;
+        let p95 = lengths.get(p95_idx).copied().unwrap_or(512);
+
+        // Round up to next power of 2 for IOSurface alignment
+        let rounded = p95.next_power_of_two().max(64);
+
+        // Apply caps: user-specified max_seq_len, model max, and 4096 upper bound
+        let user_max = if full_config.training.max_seq_len > 0 {
+            full_config.training.max_seq_len
+        } else {
+            4096
+        };
+        let capped = rounded.min(user_max).min(model_max_seq).min(4096);
+
         tracing::info!(
-            model_max = model_max,
-            capped = capped,
-            "Auto-detected ANE seq_len (capped to {})",
-            ane_max_seq_len
+            dataset_p95 = p95,
+            rounded = rounded,
+            model_max = model_max_seq,
+            selected = capped,
+            "ANE seq_len: auto-selected from dataset p95"
         );
         capped
-    } else {
-        full_config.training.max_seq_len.min(ane_max_seq_len)
     };
 
     // -----------------------------------------------------------------------
@@ -1214,9 +1283,25 @@ async fn attempt_ane_training(
         n_layers,
         vocab_size,
         seq_len: max_seq_len,
-        learning_rate: full_config.training.learning_rate as f32,
+        // Full-parameter training needs much lower LR than LoRA.
+        // LoRA default (1e-4) is 10-100x too high for all-param updates.
+        // Cap at 2e-5 unless the user explicitly set a lower value.
+        learning_rate: {
+            let user_lr = full_config.training.learning_rate as f32;
+            let max_full_param_lr = 5e-6;
+            if user_lr > max_full_param_lr {
+                tracing::info!(
+                    user_lr = format!("{:.1e}", user_lr),
+                    capped = format!("{:.1e}", max_full_param_lr),
+                    "LR capped for full-parameter ANE training (LoRA defaults are too high)"
+                );
+                max_full_param_lr
+            } else {
+                user_lr
+            }
+        },
         accum_steps: gradient_accumulation_steps.max(1),
-        warmup_steps: full_config.training.warmup_steps,
+        warmup_steps: full_config.training.warmup_steps.max(50),
         gradient_clip_norm: full_config.training.max_grad_norm as f32,
         rms_norm_eps,
         loss_scale: config.dispatch.loss_scale,
@@ -1230,7 +1315,9 @@ async fn attempt_ane_training(
     // Ensure output directory exists
     std::fs::create_dir_all(output_dir)?;
 
-    let log_every = full_config.training.logging_steps.max(1);
+    // Log every step for ANE training — each step is expensive (seconds, not ms)
+    // so per-step visibility is critical for monitoring.
+    let log_every = 1;
     let save_every = full_config.training.save_steps;
 
     let loop_config = AneTrainingLoopConfig {
@@ -1294,10 +1381,14 @@ async fn attempt_ane_training(
         }
     }
 
-    // Do NOT wire user-provided callbacks (cancel, GUI metrics) into the ANE
-    // training loop. ANE failure is common (hardware rejection) and consuming
-    // the callbacks here would leave the GPU fallback path without them.
-    // The ANE loop still gets the MetricsJsonCallback for JSONL logging.
+    // Wire user-provided callbacks (cancel, GUI metrics) into the ANE loop.
+    // These are consumed here — if ANE fails, the fallback path creates fresh
+    // callbacks or the orchestrator returns early.
+    if let Some(cbs) = extra_callbacks.take() {
+        for cb in cbs {
+            training_loop.add_callback(cb);
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Train

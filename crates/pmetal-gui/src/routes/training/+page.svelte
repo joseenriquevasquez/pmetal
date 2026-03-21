@@ -19,9 +19,10 @@
 
   // Training methods
   const trainingMethods = [
-    { value: 'sft', label: 'SFT', description: 'Supervised Fine-Tuning on instruction/chat data' },
-    { value: 'lora', label: 'LoRA', description: 'Low-Rank Adaptation — parameter-efficient SFT' },
+    { value: 'ane', label: 'ANE', description: 'Full-parameter training on Apple Neural Engine (dense models only)' },
+    { value: 'lora', label: 'LoRA', description: 'Low-Rank Adaptation — parameter-efficient fine-tuning on GPU' },
     { value: 'qlora', label: 'QLoRA', description: 'Quantized LoRA for reduced memory usage (4-bit)' },
+    { value: 'sft', label: 'SFT', description: 'Full-parameter Supervised Fine-Tuning on GPU' },
   ];
 
   const lrSchedulers = ['cosine', 'linear', 'constant', 'cosine_with_restarts', 'polynomial'];
@@ -36,16 +37,16 @@
   let selectedTextColumns = $state<string[]>([]);
   let columnToAdd = $state('');
   let epochs = $state(3);
-  let learningRate = $state(0.0002);
+  let learningRate = $state(0.0001);
   let batchSize = $state(1);
-  let gradAccumSteps = $state(1);
+  let gradAccumSteps = $state(4);
   let loraRank = $state(16);
   let loraAlpha = $state(32);
   let loraDropout = $state(0.0);
   let useRslora = $state(false);
   let useDora = $state(false);
   let maxSeqLen = $state(2048);
-  let warmupSteps = $state(10);
+  let warmupSteps = $state(100);
   let weightDecay = $state(0.01);
   let maxGradNorm = $state(1.0);
   let lrScheduler = $state('cosine');
@@ -56,12 +57,15 @@
   let loadIn4bit = $state(true);
 
   // PMetal optimizations
-  let jitCompilation = $state(false);
+  let jitCompilation = $state(true);
   let gradientCheckpointing = $state(true);
   let sequencePacking = $state(true);
   let flashAttention = $state(true);
-  let fusedOptimizer = $state(false);
+  let fusedOptimizer = $state(true);
   let embeddingLr = $state(0.0);
+
+  // Effective batch size helper for guidance text
+  let effectiveBatchSize = $derived(batchSize * gradAccumSteps * (sequencePacking ? 3 : 1));
 
   // UI state
   let showAdvanced = $state(false);
@@ -85,8 +89,25 @@
   let runs = $derived(trainingStore.runs);
   let activeRuns = $derived(trainingStore.activeRuns);
   let selectedRun = $derived(runs.find(r => r.id === selectedRunId) ?? null);
-  // PMetal always uses LoRA; show config for all methods except bare SFT
-  let isLoraMethod = $derived(selectedMethod !== 'sft');
+  // Show LoRA config for LoRA/QLoRA methods; hide for SFT and ANE (full-param)
+  let isLoraMethod = $derived(selectedMethod === 'lora' || selectedMethod === 'qlora');
+  let isAneMethod = $derived(selectedMethod === 'ane');
+
+  // Adjust LR default when switching training methods
+  let lastMethod = $state('lora');
+  $effect(() => {
+    const method = selectedMethod;
+    if (method === lastMethod) return;
+    lastMethod = method;
+    if (method === 'ane') {
+      // Full-param training needs much lower LR than LoRA
+      learningRate = 0.00002; // 2e-5
+    } else if (method === 'lora' || method === 'qlora') {
+      learningRate = 0.0001; // 1e-4
+    } else {
+      learningRate = 0.00003; // 3e-5 for SFT full-param on GPU
+    }
+  });
 
   // Auto-fill max seq len from model's max_position_embeddings
   let trainingDefaultsModel = $state('');
@@ -96,8 +117,8 @@
     trainingDefaultsModel = model;
     getModelDefaults(model).then((d) => {
       if (d.max_position_embeddings != null) {
-        // Cap at model's context length, but don't exceed 4096 for training memory
-        maxSeqLen = Math.min(d.max_position_embeddings, 4096);
+        // Cap at model's context length, but don't exceed 2048 for training memory
+        maxSeqLen = Math.min(d.max_position_embeddings, 2048);
       }
     }).catch(() => {});
   });
@@ -149,6 +170,10 @@
         datasetSuggestedSeqLen = peek.suggested_seq_len;
         datasetRowsSampled = peek.rows_sampled;
         datasetFullScan = false;
+        // Auto-apply suggested seq_len from dataset scan
+        if (peek.suggested_seq_len > 0) {
+          maxSeqLen = peek.suggested_seq_len;
+        }
         selectedTextColumns = [];
         // Auto-select: prefer 'text', else first column
         const cols = peek.columns;
@@ -671,7 +696,22 @@
           </div>
         </div>
 
-        <!-- LoRA Configuration (shown for all methods except bare SFT) -->
+        <!-- ANE info banner -->
+        {#if isAneMethod}
+          <div class="card border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20">
+            <div class="card-body p-4 space-y-2">
+              <h3 class="font-semibold text-blue-800 dark:text-blue-200">ANE Full-Parameter Training</h3>
+              <ul class="text-sm text-blue-700 dark:text-blue-300 list-disc ml-4 space-y-1">
+                <li>Trains all model parameters on the Apple Neural Engine (not LoRA adapters)</li>
+                <li>Best for dense models (0.5B-3B). Not compatible with MoE or hybrid architectures.</li>
+                <li>Projections run on ANE; attention auto-decomposes to CPU BLAS for larger models</li>
+                <li>Falls back to GPU LoRA automatically if ANE compilation fails</li>
+              </ul>
+            </div>
+          </div>
+        {/if}
+
+        <!-- LoRA Configuration (shown for LoRA/QLoRA methods) -->
         {#if isLoraMethod}
           <div class="card">
             <div class="card-header">
@@ -682,10 +722,12 @@
                 <div>
                   <label class="label" for="lora-rank">Rank</label>
                   <input id="lora-rank" type="number" class="input" min="4" max="256" step="4" bind:value={loraRank} />
+                  <p class="text-xs text-surface-400 mt-0.5">8-16 typical. Higher = more capacity, more memory.</p>
                 </div>
                 <div>
                   <label class="label" for="lora-alpha">Alpha</label>
                   <input id="lora-alpha" type="number" class="input" min="1" bind:value={loraAlpha} />
+                  <p class="text-xs text-surface-400 mt-0.5">Usually 2x rank. Scaling factor.</p>
                 </div>
                 <div>
                   <label class="label" for="lora-dropout">Dropout</label>
@@ -718,22 +760,47 @@
             <h3 class="font-semibold text-surface-900 dark:text-surface-100">Training Hyperparameters</h3>
           </div>
           <div class="card-body space-y-4">
+            <!-- Effective batch size guidance -->
+            {#if sequencePacking}
+              <div class="text-xs text-surface-400 bg-surface-50 dark:bg-surface-800 rounded px-3 py-2">
+                Effective batch: ~{effectiveBatchSize} tokens/step ({batchSize} batch x {gradAccumSteps} accum{sequencePacking ? ' x ~3 packed seqs' : ''}).
+                {#if effectiveBatchSize >= 8 && learningRate > 0.0001}
+                  <span class="text-amber-500">Large effective batch with packing — consider LR 5e-5 to 1e-4.</span>
+                {:else if effectiveBatchSize >= 16 && learningRate > 0.00005}
+                  <span class="text-amber-500">Very large effective batch — consider LR 2e-5 to 5e-5.</span>
+                {/if}
+              </div>
+            {/if}
             <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div>
                 <label class="label" for="epochs">Epochs</label>
                 <input id="epochs" type="number" class="input" min="1" bind:value={epochs} />
+                <p class="text-xs text-surface-400 mt-0.5">1-3 for fine-tuning, 1 for large datasets</p>
               </div>
               <div>
                 <label class="label" for="lr">Learning Rate</label>
                 <input id="lr" type="number" class="input" step="0.00001" bind:value={learningRate} />
+                <p class="text-xs text-surface-400 mt-0.5">
+                  {#if learningRate > 0.0003}
+                    <span class="text-red-500">High — may diverge. Try 5e-5 to 2e-4.</span>
+                  {:else if learningRate > 0.0002}
+                    <span class="text-amber-500">Aggressive — monitor loss carefully.</span>
+                  {:else if learningRate < 0.00001}
+                    <span class="text-blue-500">Very conservative — training will be slow.</span>
+                  {:else}
+                    LoRA: 5e-5 to 2e-4. Lower with packing.
+                  {/if}
+                </p>
               </div>
               <div>
                 <label class="label" for="batch-size">Batch Size</label>
                 <input id="batch-size" type="number" class="input" min="1" bind:value={batchSize} />
+                <p class="text-xs text-surface-400 mt-0.5">Per-device. 1 for large models.</p>
               </div>
               <div>
                 <label class="label" for="grad-accum">Grad Accumulation</label>
                 <input id="grad-accum" type="number" class="input" min="1" bind:value={gradAccumSteps} />
+                <p class="text-xs text-surface-400 mt-0.5">Simulates larger batch. 4-8 typical.</p>
               </div>
             </div>
             <div class="grid grid-cols-2 md:grid-cols-3 gap-4">
@@ -812,18 +879,28 @@
                 <div>
                   <label class="label" for="warmup-steps">Warmup Steps</label>
                   <input id="warmup-steps" type="number" class="input" min="0" bind:value={warmupSteps} />
+                  <p class="text-xs text-surface-400 mt-0.5">
+                    {#if warmupSteps < 10}
+                      <span class="text-amber-500">Very few warmup steps — risk of early divergence.</span>
+                    {:else}
+                      5-10% of total steps. Ramps LR from 0.
+                    {/if}
+                  </p>
                 </div>
                 <div>
                   <label class="label" for="weight-decay">Weight Decay</label>
                   <input id="weight-decay" type="number" class="input" step="0.001" bind:value={weightDecay} />
+                  <p class="text-xs text-surface-400 mt-0.5">L2 regularization. 0.01 standard.</p>
                 </div>
                 <div>
                   <label class="label" for="max-grad-norm">Max Grad Norm</label>
                   <input id="max-grad-norm" type="number" class="input" step="0.1" bind:value={maxGradNorm} />
+                  <p class="text-xs text-surface-400 mt-0.5">Gradient clipping. 1.0 standard.</p>
                 </div>
                 <div>
                   <label class="label" for="save-steps">Save Steps</label>
                   <input id="save-steps" type="number" class="input" min="1" bind:value={saveSteps} />
+                  <p class="text-xs text-surface-400 mt-0.5">Checkpoint interval.</p>
                 </div>
                 <div>
                   <label class="label" for="logging-steps">Logging Steps</label>

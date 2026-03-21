@@ -940,10 +940,9 @@ pub async fn start_training(
     config: TrainingConfig,
     on_metrics: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
-    if !matches!(config.method.as_str(), "sft" | "lora" | "qlora") {
+    if !matches!(config.method.as_str(), "sft" | "lora" | "qlora" | "ane") {
         return Err(AppError(format!(
-            "GUI training currently supports direct-library SFT/LoRA/QLoRA only. \
-Selected method '{}' is not library-backed here yet.",
+            "Unsupported training method '{}'. Expected: ane, lora, qlora, or sft.",
             config.method
         )));
     }
@@ -1009,15 +1008,15 @@ Selected method '{}' is not library-backed here yet.",
 
     // Build a config summary for display in the UI.
     let config_summary = TrainingConfigSummary {
-        learning_rate: config.learning_rate.unwrap_or(2e-4),
-        batch_size: config.batch_size.unwrap_or(4) as usize,
+        learning_rate: config.learning_rate.unwrap_or(1e-4),
+        batch_size: config.batch_size.unwrap_or(1) as usize,
         max_seq_len: config.max_seq_len.unwrap_or(2048) as usize,
         lora_rank: config.lora_rank.map(|r| r as usize),
         lora_alpha: config.lora_alpha.map(|a| a as f32),
         sequence_packing: config.sequence_packing.unwrap_or(true),
         flash_attention: config.flash_attention.unwrap_or(true),
         jit_compilation: config.jit_compilation.unwrap_or(true),
-        gradient_checkpointing: config.gradient_checkpointing.unwrap_or(false),
+        gradient_checkpointing: config.gradient_checkpointing.unwrap_or(true),
     };
 
     let mut run = TrainingRun::new(
@@ -1125,14 +1124,14 @@ Selected method '{}' is not library-backed here yet.",
             },
             qlora,
             training: pmetal::core::TrainingConfig {
-                learning_rate: config.learning_rate.unwrap_or(2e-4),
+                learning_rate: config.learning_rate.unwrap_or(1e-4),
                 batch_size: config.batch_size.unwrap_or(1) as usize,
                 num_epochs: config.epochs.unwrap_or(3) as usize,
                 max_seq_len: config.max_seq_len.unwrap_or(2048) as usize,
-                gradient_accumulation_steps: config.gradient_accumulation_steps.unwrap_or(1) as usize,
-                weight_decay: config.weight_decay.unwrap_or(0.0),
+                gradient_accumulation_steps: config.gradient_accumulation_steps.unwrap_or(4) as usize,
+                weight_decay: config.weight_decay.unwrap_or(0.01),
                 max_grad_norm: config.max_grad_norm.unwrap_or(1.0),
-                warmup_steps: config.warmup_steps.unwrap_or(0) as usize,
+                warmup_steps: config.warmup_steps.unwrap_or(100) as usize,
                 logging_steps: config.logging_steps.unwrap_or(10) as usize,
                 save_steps: config.save_steps.map(|v| v as usize),
                 lr_scheduler: match config.lr_scheduler.as_deref() {
@@ -1153,11 +1152,11 @@ Selected method '{}' is not library-backed here yet.",
                 sequence_packing: config.sequence_packing.unwrap_or(true),
                 jit_compilation: config.jit_compilation.unwrap_or(true),
                 fused: true,
-                metal_fused_optimizer: config.fused_optimizer.unwrap_or(false),
+                metal_fused_optimizer: config.fused_optimizer.unwrap_or(true),
                 gradient_checkpointing: config.gradient_checkpointing.unwrap_or(true),
                 gradient_checkpointing_layers: config.gradient_checkpointing_layers.unwrap_or(4) as usize,
                 cut_cross_entropy: false,
-                ane: true,
+                ane: config.method == "ane",
                 loss_scale: 1.0,
             },
             config_path: None,
