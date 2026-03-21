@@ -16,6 +16,9 @@ pub struct AppConfig {
     pub hf_token: Option<String>,
     pub default_model: Option<String>,
     pub theme: String,
+    /// User-configured directories to scan for models (LM Studio, custom paths, etc.)
+    #[serde(default)]
+    pub custom_model_dirs: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -25,6 +28,7 @@ impl Default for AppConfig {
             hf_token: None,
             default_model: None,
             theme: "dark".to_string(),
+            custom_model_dirs: Vec::new(),
         }
     }
 }
@@ -32,6 +36,18 @@ impl Default for AppConfig {
 // ---------------------------------------------------------------------------
 // Cached model — field names match TS CachedModel interface
 // ---------------------------------------------------------------------------
+
+/// Where a model was discovered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSource {
+    /// Standard HuggingFace hub cache
+    HfCache,
+    /// Fine-tuned output directory
+    Trained,
+    /// User-added custom directory (LM Studio, manual download, etc.)
+    Custom,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedModel {
@@ -44,6 +60,13 @@ pub struct CachedModel {
     pub downloaded_at: Option<DateTime<Utc>>,
     /// e.g. "text-generation", "embedding", "audio", "image"
     pub model_type: Option<String>,
+    /// Where this model was found
+    #[serde(default = "default_source")]
+    pub source: ModelSource,
+}
+
+fn default_source() -> ModelSource {
+    ModelSource::HfCache
 }
 
 // ---------------------------------------------------------------------------
@@ -449,13 +472,38 @@ impl AppState {
     // -----------------------------------------------------------------------
 
     pub async fn refresh_cached_models(&self) {
-        let cache_root = {
+        let (cache_root, custom_dirs) = {
             let cfg = self.config.read().await;
-            PathBuf::from(&cfg.cache_dir)
+            (
+                PathBuf::from(&cfg.cache_dir),
+                cfg.custom_model_dirs.clone(),
+            )
         };
 
+        let mut models = Vec::new();
+
+        // 1. Scan trained model outputs (./output/)
+        scan_trained_outputs(&mut models).await;
+
+        // 2. Scan HuggingFace hub cache
         let hub_models_dir = cache_root.join("hub");
-        let models = scan_hub_cache(&hub_models_dir).await;
+        scan_hub_cache(&hub_models_dir, &mut models).await;
+
+        // 3. Scan well-known third-party model directories
+        scan_well_known_dirs(&mut models).await;
+
+        // 4. Scan user-configured custom directories
+        for dir in &custom_dirs {
+            scan_custom_dir(&PathBuf::from(dir), &mut models).await;
+        }
+
+        models.sort_by(|a, b| {
+            // Trained first, then by size descending
+            let a_trained = a.source == ModelSource::Trained;
+            let b_trained = b.source == ModelSource::Trained;
+            b_trained.cmp(&a_trained).then(b.size.cmp(&a.size))
+        });
+
         *self.cached_models.write().await = models;
     }
 
@@ -654,21 +702,21 @@ pub fn default_hf_cache_dir() -> PathBuf {
 
 /// Public alias used by `lib.rs` init tasks.
 pub async fn scan_hub_cache_pub(hub_dir: &PathBuf) -> Vec<CachedModel> {
-    scan_hub_cache(hub_dir).await
+    let mut models = Vec::new();
+    scan_hub_cache(hub_dir, &mut models).await;
+    models
 }
 
-/// Walks `~/.cache/huggingface/hub` and returns a `CachedModel` entry for each
+/// Walks `~/.cache/huggingface/hub` and appends a `CachedModel` entry for each
 /// repo directory that looks like a downloaded model.
 ///
 /// The HF hub cache layout is:
 ///   hub/models--{org}--{name}/
 ///     snapshots/{hash}/    ← these are symlinks into blobs/
-async fn scan_hub_cache(hub_dir: &PathBuf) -> Vec<CachedModel> {
-    let mut models = Vec::new();
-
+async fn scan_hub_cache(hub_dir: &PathBuf, models: &mut Vec<CachedModel>) {
     let mut read_dir = match tokio::fs::read_dir(hub_dir).await {
         Ok(rd) => rd,
-        Err(_) => return models,
+        Err(_) => return,
     };
 
     while let Ok(Some(entry)) = read_dir.next_entry().await {
@@ -703,11 +751,177 @@ async fn scan_hub_cache(hub_dir: &PathBuf) -> Vec<CachedModel> {
             size_formatted: format_size(size),
             downloaded_at,
             model_type: Some(model_type),
+            source: ModelSource::HfCache,
         });
     }
+}
 
-    models.sort_by(|a, b| b.size.cmp(&a.size));
-    models
+/// Scan `./output/` for fine-tuned model outputs.
+async fn scan_trained_outputs(models: &mut Vec<CachedModel>) {
+    let output_dir = PathBuf::from("./output");
+    scan_model_subdir(&output_dir, ModelSource::Trained, models, 2).await;
+}
+
+/// Scan well-known third-party model directories (LM Studio, etc.)
+async fn scan_well_known_dirs(models: &mut Vec<CachedModel>) {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+
+    let well_known = [
+        home.join(".lmstudio").join("models"),
+        home.join(".cache").join("lm-studio").join("models"),
+    ];
+
+    for dir in &well_known {
+        if dir.exists() {
+            tracing::debug!(path = %dir.display(), "Scanning well-known model directory");
+            scan_custom_dir(dir, models).await;
+        }
+    }
+}
+
+/// Scan a user-configured custom directory for model directories.
+///
+/// A directory is considered a model if it contains `config.json` or
+/// `*.safetensors` files. Recursively scans one level of subdirectories.
+async fn scan_custom_dir(dir: &PathBuf, models: &mut Vec<CachedModel>) {
+    if !dir.exists() {
+        return;
+    }
+
+    let seen: std::collections::HashSet<String> = models.iter().map(|m| m.path.clone()).collect();
+
+    // Check if the directory itself is a model
+    if is_model_dir(dir).await {
+        let path_str = dir.to_string_lossy().into_owned();
+        if !seen.contains(&path_str) {
+            let source = if is_trained_dir(dir).await {
+                ModelSource::Trained
+            } else {
+                ModelSource::Custom
+            };
+            if let Some(model) = build_model_from_dir(dir, source).await {
+                models.push(model);
+            }
+        }
+        return;
+    }
+
+    // Scan subdirectories (1 level deep)
+    scan_model_subdir(dir, ModelSource::Custom, models, 1).await;
+}
+
+/// Recursively scan subdirectories for model dirs up to `max_depth` levels.
+async fn scan_model_subdir(
+    dir: &PathBuf,
+    default_source: ModelSource,
+    models: &mut Vec<CachedModel>,
+    max_depth: usize,
+) {
+    if max_depth == 0 || !dir.exists() {
+        return;
+    }
+
+    let seen: std::collections::HashSet<String> = models.iter().map(|m| m.path.clone()).collect();
+
+    let mut read_dir = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+
+    while let Ok(Some(entry)) = read_dir.next_entry().await {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let path_str = path.to_string_lossy().into_owned();
+        if seen.contains(&path_str) {
+            continue;
+        }
+
+        if is_model_dir(&path).await {
+            let source = if is_trained_dir(&path).await {
+                ModelSource::Trained
+            } else {
+                default_source.clone()
+            };
+            if let Some(model) = build_model_from_dir(&path, source).await {
+                models.push(model);
+            }
+        } else if max_depth > 1 {
+            // Recurse into subdirectories
+            Box::pin(scan_model_subdir(&path, default_source.clone(), models, max_depth - 1)).await;
+        }
+    }
+}
+
+/// Check if a directory looks like a model directory.
+async fn is_model_dir(dir: &PathBuf) -> bool {
+    // Has config.json?
+    if dir.join("config.json").exists() {
+        return true;
+    }
+    // Has adapter_config.json (LoRA adapter)?
+    if dir.join("adapter_config.json").exists() {
+        return true;
+    }
+    // Has any .safetensors files?
+    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name();
+            if name.to_string_lossy().ends_with(".safetensors") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check if a directory is a trained/fine-tuned model output.
+async fn is_trained_dir(dir: &PathBuf) -> bool {
+    dir.join("adapter_config.json").exists()
+        || dir.join("lora_weights.safetensors").exists()
+        || dir.join("training_state.json").exists()
+}
+
+/// Build a CachedModel from a directory path.
+async fn build_model_from_dir(dir: &PathBuf, source: ModelSource) -> Option<CachedModel> {
+    let dir_name = dir.file_name()?.to_string_lossy().to_string();
+
+    // Try to get a better model ID from config.json
+    let model_id = if let Ok(content) = tokio::fs::read_to_string(dir.join("config.json")).await {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
+            // Some configs have _name_or_path
+            cfg["_name_or_path"]
+                .as_str()
+                .filter(|s| !s.is_empty() && !s.starts_with('/'))
+                .map(str::to_string)
+                .unwrap_or_else(|| dir_name.clone())
+        } else {
+            dir_name.clone()
+        }
+    } else {
+        dir_name
+    };
+
+    let size = dir_size_follow_symlinks(dir).await;
+    let downloaded_at = tokio::fs::metadata(dir)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(DateTime::<Utc>::from);
+
+    let model_type = infer_model_type(&model_id);
+
+    Some(CachedModel {
+        id: model_id,
+        path: dir.to_string_lossy().into_owned(),
+        size,
+        size_formatted: format_size(size),
+        downloaded_at,
+        model_type: Some(model_type),
+        source,
+    })
 }
 
 /// Recursively compute directory size, following symlinks so that HF hub

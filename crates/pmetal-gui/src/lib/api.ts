@@ -34,6 +34,8 @@ export interface AppConfig {
   theme: string;
 }
 
+export type ModelSource = 'hf_cache' | 'trained' | 'custom';
+
 export interface CachedModel {
   id: string;
   path: string;
@@ -41,6 +43,7 @@ export interface CachedModel {
   size_formatted: string;
   downloaded_at: string;
   model_type: string | null;
+  source: ModelSource;
 }
 
 export interface ModelInfo {
@@ -416,6 +419,18 @@ export async function downloadModel(
 
 export async function deleteModel(modelId: string): Promise<void> {
   return await invoke('delete_model', { modelId });
+}
+
+export async function addModelDirectory(path: string): Promise<CachedModel[]> {
+  return await invoke('add_model_directory', { path });
+}
+
+export async function removeModelDirectory(path: string): Promise<CachedModel[]> {
+  return await invoke('remove_model_directory', { path });
+}
+
+export async function listModelDirectories(): Promise<string[]> {
+  return await invoke('list_model_directories');
 }
 
 export async function searchHubModels(query: string, limit?: number): Promise<HubSearchResult[]> {

@@ -8,6 +8,7 @@
   let models = $derived(modelsStore.models);
   let loading = $derived(modelsStore.loading);
   let modelsError = $derived(modelsStore.error);
+  let customDirs = $derived(modelsStore.customDirs);
 
   // Search
   let searchQuery = $state('');
@@ -26,6 +27,11 @@
   let revisionInput = $state('main');
   let isDownloading = $state(false);
   let downloadError = $state<string | null>(null);
+
+  // Add directory modal
+  let showAddDirModal = $state(false);
+  let dirPathInput = $state('');
+  let addDirError = $state<string | null>(null);
 
   // Hub search
   let hubQuery = $state('');
@@ -141,6 +147,39 @@
     if (e.key === 'Escape') deleteConfirmModel = null;
   }
 
+  async function handleAddDirectory(e: Event) {
+    e.preventDefault();
+    if (!dirPathInput.trim()) return;
+    addDirError = null;
+    try {
+      await modelsStore.addDirectory(dirPathInput.trim());
+      showAddDirModal = false;
+      dirPathInput = '';
+    } catch (e) {
+      addDirError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  async function handleRemoveDirectory(path: string) {
+    try {
+      await modelsStore.removeDirectory(path);
+    } catch (e) {
+      console.error('Failed to remove directory:', e);
+    }
+  }
+
+  function handleAddDirModalKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') showAddDirModal = false;
+  }
+
+  function getSourceBadge(source: string): { label: string; class: string } {
+    switch (source) {
+      case 'trained': return { label: 'Trained', class: 'badge-success' };
+      case 'custom': return { label: 'Custom', class: 'badge-accent' };
+      default: return { label: 'HF', class: 'badge-neutral' };
+    }
+  }
+
   function getFitColor(fit: string): string {
     switch (fit) {
       case 'fits': return 'text-green-600 dark:text-green-400';
@@ -167,12 +206,20 @@
       <h1 class="text-2xl font-bold text-surface-900 dark:text-surface-100">Models</h1>
       <p class="text-surface-500 dark:text-surface-400 mt-1">Manage cached models and download from HuggingFace</p>
     </div>
-    <button class="btn-primary" onclick={() => (showDownloadModal = true)}>
-      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-      </svg>
-      Download Model
-    </button>
+    <div class="flex items-center gap-2">
+      <button class="btn-secondary" onclick={() => (showAddDirModal = true)}>
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+        </svg>
+        Add Directory
+      </button>
+      <button class="btn-primary" onclick={() => (showDownloadModal = true)}>
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+        </svg>
+        Download Model
+      </button>
+    </div>
   </div>
 
   <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
@@ -240,6 +287,8 @@
                     {#if model.model_type}
                       <span class="badge-neutral text-xs">{model.model_type}</span>
                     {/if}
+                    {@const badge = getSourceBadge(model.source)}
+                    <span class="{badge.class} text-xs">{badge.label}</span>
                   </div>
                 </div>
                 {#if fitData[model.id]}
@@ -261,6 +310,34 @@
           </div>
         {/if}
       </div>
+
+      <!-- Custom Directories -->
+      {#if customDirs.length > 0}
+        <div class="card">
+          <div class="card-header">
+            <h2 class="font-semibold text-surface-900 dark:text-surface-100">Custom Model Directories</h2>
+          </div>
+          <div class="divide-y divide-surface-200 dark:divide-surface-700">
+            {#each customDirs as dir}
+              <div class="flex items-center gap-3 px-6 py-3">
+                <svg class="w-4 h-4 text-surface-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                </svg>
+                <span class="flex-1 text-sm text-surface-700 dark:text-surface-300 truncate font-mono" title={dir}>{dir}</span>
+                <button
+                  class="btn-ghost btn-sm text-red-500 hover:text-red-700 dark:hover:text-red-400"
+                  aria-label="Remove directory {dir}"
+                  onclick={() => handleRemoveDirectory(dir)}
+                >
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
 
       <!-- HuggingFace Search -->
       <div class="card">
@@ -528,6 +605,58 @@
             {isDownloading ? 'Downloading...' : 'Download'}
           </button>
           <button type="button" class="btn-secondary" onclick={() => (showDownloadModal = false)}>Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{/if}
+
+<!-- Add Directory Modal -->
+{#if showAddDirModal}
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" role="presentation" onkeydown={handleAddDirModalKeydown}>
+    <div
+      class="card w-full max-w-md"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="add-dir-modal-title"
+      tabindex="-1"
+    >
+      <div class="card-header flex items-center justify-between">
+        <h3 id="add-dir-modal-title" class="font-semibold text-surface-900 dark:text-surface-100">Add Model Directory</h3>
+        <button class="btn-ghost btn-sm" aria-label="Close dialog" onclick={() => (showAddDirModal = false)}>
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+      <form onsubmit={handleAddDirectory} class="card-body space-y-4">
+        <div>
+          <label class="label" for="dir-path">Directory Path</label>
+          <input
+            id="dir-path"
+            type="text"
+            class="input font-mono text-sm"
+            placeholder="e.g. ~/.lmstudio/models"
+            bind:value={dirPathInput}
+          />
+          <p class="text-xs text-surface-500 mt-1">
+            Path to a directory containing model files (config.json + .safetensors).
+            PMetal will scan this directory and its immediate subdirectories.
+          </p>
+        </div>
+
+        {#if addDirError}
+          <div class="p-3 rounded-lg bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 text-sm" role="alert">
+            {addDirError}
+          </div>
+        {/if}
+
+        <div class="flex gap-3">
+          <button type="submit" class="btn-primary flex-1" disabled={!dirPathInput.trim()}>
+            Add Directory
+          </button>
+          <button type="button" class="btn-secondary" onclick={() => (showAddDirModal = false)}>Cancel</button>
         </div>
       </form>
     </div>

@@ -21,6 +21,7 @@ import type {
 
 class ModelsStore {
   models = $state<CachedModel[]>([]);
+  customDirs = $state<string[]>([]);
   loading = $state(false);
   error = $state<string | null>(null);
 
@@ -28,7 +29,12 @@ class ModelsStore {
     this.loading = true;
     this.error = null;
     try {
-      this.models = await api.listModels();
+      const [models, dirs] = await Promise.all([
+        api.listModels(),
+        api.listModelDirectories(),
+      ]);
+      this.models = models;
+      this.customDirs = dirs;
     } catch (e) {
       this.error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -54,6 +60,26 @@ class ModelsStore {
     try {
       await api.deleteModel(modelId);
       await this.refresh();
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+      throw e;
+    }
+  }
+
+  async addDirectory(path: string) {
+    try {
+      this.models = await api.addModelDirectory(path);
+      this.customDirs = await api.listModelDirectories();
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+      throw e;
+    }
+  }
+
+  async removeDirectory(path: string) {
+    try {
+      this.models = await api.removeModelDirectory(path);
+      this.customDirs = await api.listModelDirectories();
     } catch (e) {
       this.error = e instanceof Error ? e.message : String(e);
       throw e;

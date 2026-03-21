@@ -648,6 +648,59 @@ pub async fn delete_model(
     Ok(())
 }
 
+/// Add a custom directory to scan for models (e.g. LM Studio path).
+#[tauri::command]
+pub async fn add_model_directory(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<CachedModel>> {
+    let dir = PathBuf::from(&path);
+    if !dir.exists() {
+        return Err(AppError(format!("Directory does not exist: {path}")));
+    }
+    if !dir.is_dir() {
+        return Err(AppError(format!("Not a directory: {path}")));
+    }
+
+    // Add to config if not already present
+    {
+        let mut cfg = state.config.write().await;
+        if !cfg.custom_model_dirs.contains(&path) {
+            cfg.custom_model_dirs.push(path);
+        }
+    }
+    state.save_config().await;
+
+    // Rescan all models
+    state.refresh_cached_models().await;
+    Ok(state.cached_models.read().await.clone())
+}
+
+/// Remove a custom model directory.
+#[tauri::command]
+pub async fn remove_model_directory(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<CachedModel>> {
+    {
+        let mut cfg = state.config.write().await;
+        cfg.custom_model_dirs.retain(|d| d != &path);
+    }
+    state.save_config().await;
+
+    // Rescan all models
+    state.refresh_cached_models().await;
+    Ok(state.cached_models.read().await.clone())
+}
+
+/// List configured custom model directories.
+#[tauri::command]
+pub async fn list_model_directories(
+    state: State<'_, AppState>,
+) -> Result<Vec<String>> {
+    Ok(state.config.read().await.custom_model_dirs.clone())
+}
+
 #[tauri::command]
 pub async fn download_model(
     state: State<'_, AppState>,
