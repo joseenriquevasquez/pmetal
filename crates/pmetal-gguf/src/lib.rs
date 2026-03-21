@@ -32,6 +32,7 @@
 
 #![warn(missing_docs)]
 
+pub mod config;
 pub mod dequant;
 pub mod dynamic;
 pub mod imatrix;

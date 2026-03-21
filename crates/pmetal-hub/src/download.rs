@@ -105,6 +105,32 @@ pub async fn download_model(
         model_id
     );
 
+    // Check if this is a GGUF-only repo (no safetensors files)
+    let has_safetensors = all_files
+        .iter()
+        .any(|f| f.ends_with(".safetensors") || f.ends_with(".safetensors.index.json"));
+    let gguf_files: Vec<&str> = all_files
+        .iter()
+        .filter(|f| f.ends_with(".gguf"))
+        .copied()
+        .collect();
+    let is_gguf_only = !has_safetensors && !gguf_files.is_empty();
+
+    if is_gguf_only {
+        tracing::info!(
+            "{} is a GGUF-only repo ({} variants found), selecting best quantization...",
+            model_id,
+            gguf_files.len()
+        );
+    }
+
+    // For GGUF-only repos, pick the best single GGUF file
+    let selected_gguf = if is_gguf_only {
+        Some(select_best_gguf(&gguf_files))
+    } else {
+        None
+    };
+
     // Partition files into those we want and those we skip
     let mut model_dir: Option<PathBuf> = None;
     let mut downloaded = 0usize;
@@ -112,8 +138,26 @@ pub async fn download_model(
     let mut failures = Vec::new();
 
     for filename in &all_files {
-        // Skip files by extension
-        if SKIP_EXTENSIONS.iter().any(|ext| filename.ends_with(ext)) {
+        // For GGUF-only repos: download the selected GGUF + metadata files
+        // For safetensors repos: skip all GGUF files (current behavior)
+        let is_gguf = filename.ends_with(".gguf");
+        if is_gguf {
+            if let Some(ref selected) = selected_gguf {
+                if *filename != selected.as_str() {
+                    tracing::debug!("Skipping {} (not selected GGUF variant)", filename);
+                    skipped += 1;
+                    continue;
+                }
+                // Fall through to download the selected GGUF
+            } else {
+                tracing::debug!("Skipping {} (safetensors available)", filename);
+                skipped += 1;
+                continue;
+            }
+        }
+
+        // Skip files by extension (but not GGUF if we're in GGUF-only mode)
+        if !is_gguf && SKIP_EXTENSIONS.iter().any(|ext| filename.ends_with(ext)) {
             tracing::debug!("Skipping {} (excluded format)", filename);
             skipped += 1;
             continue;
@@ -171,9 +215,57 @@ pub async fn download_model(
         )));
     }
 
-    model_dir.ok_or_else(|| {
+    let dir = model_dir.ok_or_else(|| {
         pmetal_core::PMetalError::Hub(format!("No files downloaded for {}", model_id))
-    })
+    })?;
+
+    // For GGUF-only downloads: generate config.json from GGUF metadata
+    // if no config.json exists in the downloaded directory
+    if is_gguf_only && !dir.join("config.json").exists() {
+        if let Some(ref gguf_name) = selected_gguf {
+            let gguf_path = dir.join(gguf_name);
+            match pmetal_gguf::GgufContent::from_file(&gguf_path) {
+                Ok(content) => {
+                    if let Some(config_path) =
+                        pmetal_gguf::config::write_config_from_gguf(&content, &dir)
+                    {
+                        tracing::info!(
+                            "Generated config.json from GGUF metadata: {}",
+                            config_path.display()
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Could not read GGUF metadata for config generation: {e}");
+                }
+            }
+        }
+    }
+
+    Ok(dir)
+}
+
+/// Select the best GGUF file from a list of variants.
+///
+/// Preference order (best balance of quality vs size):
+/// Q4_K_M > Q5_K_M > Q4_K_S > Q5_K_S > Q6_K > Q3_K_M > Q8_0 > first available
+fn select_best_gguf(gguf_files: &[&str]) -> String {
+    let preferences = [
+        "q4_k_m", "Q4_K_M", "q5_k_m", "Q5_K_M", "q4_k_s", "Q4_K_S", "q5_k_s", "Q5_K_S",
+        "q6_k", "Q6_K", "q3_k_m", "Q3_K_M", "q8_0", "Q8_0", "f16", "F16",
+    ];
+
+    for pref in &preferences {
+        if let Some(f) = gguf_files.iter().find(|f| f.contains(pref)) {
+            return f.to_string();
+        }
+    }
+
+    // Fallback: pick the smallest GGUF file by name (likely lowest quant)
+    gguf_files
+        .first()
+        .map(|f| f.to_string())
+        .unwrap_or_default()
 }
 
 /// Download a specific file from a model repository.

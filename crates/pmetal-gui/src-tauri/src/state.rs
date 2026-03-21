@@ -890,20 +890,39 @@ async fn build_model_from_dir(dir: &PathBuf, source: ModelSource) -> Option<Cach
     let dir_name = dir.file_name()?.to_string_lossy().to_string();
 
     // Try to get a better model ID from config.json
-    let model_id = if let Ok(content) = tokio::fs::read_to_string(dir.join("config.json")).await {
-        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
-            // Some configs have _name_or_path
-            cfg["_name_or_path"]
-                .as_str()
-                .filter(|s| !s.is_empty() && !s.starts_with('/'))
-                .map(str::to_string)
-                .unwrap_or_else(|| dir_name.clone())
+    let mut model_id =
+        if let Ok(content) = tokio::fs::read_to_string(dir.join("config.json")).await {
+            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
+                cfg["_name_or_path"]
+                    .as_str()
+                    .filter(|s| !s.is_empty() && !s.starts_with('/'))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| dir_name.clone())
+            } else {
+                dir_name.clone()
+            }
         } else {
             dir_name.clone()
+        };
+
+    // For GGUF-only directories without config.json: try extracting model name
+    // from GGUF metadata and generate config.json for downstream consumers.
+    if !dir.join("config.json").exists() {
+        if let Some(gguf_path) = find_first_gguf(dir).await {
+            if let Ok(content) = pmetal::gguf::GgufContent::from_file(&gguf_path) {
+                // Use general.name as model ID if available
+                if let Some(pmetal::gguf::MetadataValue::String(name)) =
+                    content.get_metadata("general.name")
+                {
+                    if !name.is_empty() {
+                        model_id = name.clone();
+                    }
+                }
+                // Generate config.json from GGUF metadata
+                pmetal::gguf::config::write_config_from_gguf(&content, dir);
+            }
         }
-    } else {
-        dir_name
-    };
+    }
 
     let size = dir_size_follow_symlinks(dir).await;
     let downloaded_at = tokio::fs::metadata(dir)
@@ -923,6 +942,18 @@ async fn build_model_from_dir(dir: &PathBuf, source: ModelSource) -> Option<Cach
         model_type: Some(model_type),
         source,
     })
+}
+
+/// Find the first .gguf file in a directory.
+async fn find_first_gguf(dir: &PathBuf) -> Option<PathBuf> {
+    let mut rd = tokio::fs::read_dir(dir).await.ok()?;
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with(".gguf") {
+            return Some(entry.path());
+        }
+    }
+    None
 }
 
 /// Recursively compute directory size, following symlinks so that HF hub

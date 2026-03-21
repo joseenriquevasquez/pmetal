@@ -11,6 +11,7 @@ categories.workspace = true
 
 [dependencies]
 pmetal-core = { workspace = true }
+pmetal-gguf = { workspace = true }
 hf-hub = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
