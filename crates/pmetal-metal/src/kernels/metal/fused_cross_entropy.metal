@@ -172,12 +172,15 @@ kernel void fused_cross_entropy_forward_simd(
     // Each thread in SIMD group handles a subset of vocabulary
     float local_max = -INFINITY;
     float local_sum = 0.0f;
+    float local_logit_sum = 0.0f;  // For label smoothing
 
     for (uint v = lane_id; v < params.vocab_size; v += SIMD_SIZE) {
         float logit = row[v];
         if (params.softcap != 0.0f) {
             logit = apply_softcap(logit, params.softcap);
         }
+
+        local_logit_sum += logit;
 
         if (logit > local_max) {
             local_sum = local_sum * exp(local_max - logit) + 1.0f;
@@ -195,6 +198,7 @@ kernel void fused_cross_entropy_forward_simd(
 
     // Sum across SIMD group
     float global_sum = simd_sum(local_sum);
+    float global_logit_sum = simd_sum(local_logit_sum);
 
     // Compute final logsumexp
     float lse = global_max + log(global_sum);
@@ -207,6 +211,13 @@ kernel void fused_cross_entropy_forward_simd(
 
     // Compute loss
     float loss = lse - target_logit;
+
+    // Apply label smoothing if enabled
+    if (params.label_smoothing > 0.0f) {
+        float mean_logit = global_logit_sum / (float)params.vocab_size;
+        float smooth_loss = lse - mean_logit;
+        loss = (1.0f - params.label_smoothing) * loss + params.label_smoothing * smooth_loss;
+    }
 
     if (lane_id == 0) {
         losses[token_idx] = loss;

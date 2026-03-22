@@ -296,7 +296,14 @@ kernel void grouped_gemm_forward(
 ///
 /// Computes dX = dY @ W (not transposed)
 ///
-/// This is similar to forward but uses the untransposed weight.
+/// Uses tiled N-reduction with threadgroup staging, matching the forward pass
+/// pattern. The N (intermediate) dimension is split into BLOCK_K-sized strips
+/// that are cooperatively loaded into threadgroup memory for data reuse.
+///
+/// scratch layout:
+///   [0 .. BLOCK_M*BLOCK_K-1]                           = dY_stage [BLOCK_M, BLOCK_K]
+///   [BLOCK_M*BLOCK_K .. BLOCK_M*BLOCK_K+BLOCK_K*BLOCK_N-1] = W_stage [BLOCK_K, BLOCK_N]
+///   [BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N ..]             = C_tile [BLOCK_M, BLOCK_N]
 kernel void grouped_gemm_backward_dx(
     device const float* dy [[buffer(0)]],     // [M, N] gradient w.r.t. output
     device const float* w [[buffer(1)]],      // [E, N, K] expert weights
@@ -318,10 +325,10 @@ kernel void grouped_gemm_backward_dx(
     uint tid_y = tid.y;
 
     uint K = params.hidden_size;  // Output dimension for backward
-    uint N = params.intermediate;  // Input dimension for backward
+    uint N = params.intermediate;  // Input dimension for backward (reduction dim)
     uint E = params.num_experts;
 
-    uint num_k_tiles = (K + BLOCK_N - 1) / BLOCK_N;  // Note: using BLOCK_N for K
+    uint num_k_tiles = (K + BLOCK_N - 1) / BLOCK_N;
 
     uint processed_tiles = 0;
 
@@ -350,60 +357,91 @@ kernel void grouped_gemm_backward_dx(
 
             device const float* w_expert = w + expert_idx * N * K;
 
-            threadgroup float* C_tile = scratch;
+            // Partition scratch: dY staging + W staging + C accumulator
+            threadgroup float* dY_stage = scratch;                                     // [BLOCK_M, BLOCK_K]
+            threadgroup float* W_stage  = scratch + BLOCK_M * BLOCK_K;                 // [BLOCK_K, BLOCK_N]
+            threadgroup float* C_tile   = scratch + BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N; // [BLOCK_M, BLOCK_N]
 
-            // Zero
-            for (uint i = tid_y * threads_x + tid_x; i < BLOCK_M * BLOCK_N; i += threads_x * threads_y) {
+            uint total_threads = threads_x * threads_y;
+            uint linear_tid = tid_y * threads_x + tid_x;
+
+            // Zero C accumulator
+            for (uint i = linear_tid; i < BLOCK_M * BLOCK_N; i += total_threads) {
                 C_tile[i] = 0.0f;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
+            // Resolve permutation and weights once per M-row
             // dX[m, k] = sum_n dY[m, n] * W[n, k]
+            // Tile the N (reduction) dimension in BLOCK_K-sized strips
+            for (uint n_start = 0; n_start < N; n_start += BLOCK_K) {
+                uint n_end = min(n_start + (uint)BLOCK_K, N);
+                uint n_len = n_end - n_start;
+
+                // Cooperatively load dY strip: [tile_m_size, n_len] into dY_stage[BLOCK_M, BLOCK_K]
+                for (uint i = linear_tid; i < BLOCK_M * BLOCK_K; i += total_threads) {
+                    uint m = i / BLOCK_K;
+                    uint n = i % BLOCK_K;
+                    if (m < tile_m_size && n < n_len) {
+                        uint global_m = tile_m_start + m;
+                        uint dy_m = params.permute_y ? scatter_indices[global_m] : global_m;
+                        dY_stage[m * BLOCK_K + n] = dy[dy_m * N + (n_start + n)];
+                    } else {
+                        dY_stage[m * BLOCK_K + n] = 0.0f;
+                    }
+                }
+
+                // Cooperatively load W strip: W[n, k] into W_stage[n_local, k_local]
+                // W is [N, K] row-major: W[n, k] = w_expert[n * K + k]
+                // W_stage layout: [BLOCK_K, BLOCK_N] where dim0=n, dim1=k
+                for (uint i = linear_tid; i < BLOCK_K * BLOCK_N; i += total_threads) {
+                    uint n = i / BLOCK_N;
+                    uint k = i % BLOCK_N;
+                    if (n < n_len && k < tile_k_size) {
+                        uint global_k = tile_k_start + k;
+                        W_stage[n * BLOCK_N + k] = w_expert[(n_start + n) * K + global_k];
+                    } else {
+                        W_stage[n * BLOCK_N + k] = 0.0f;
+                    }
+                }
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // Accumulate from staged tiles: C[m, k] += dY_stage[m, :] @ W_stage[:, k]
+                for (uint m = tid_y; m < tile_m_size; m += threads_y) {
+                    for (uint k = tid_x; k < tile_k_size; k += threads_x) {
+                        float acc = 0.0f;
+                        for (uint n = 0; n < n_len; n++) {
+                            acc += dY_stage[m * BLOCK_K + n] * W_stage[n * BLOCK_N + k];
+                        }
+                        C_tile[m * BLOCK_N + k] += acc;
+                    }
+                }
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            // Apply topk weights and store dX with permutation
             for (uint m = tid_y; m < tile_m_size; m += threads_y) {
                 uint global_m = tile_m_start + m;
 
-                // Get dY index (with permutation if needed)
-                uint dy_m = params.permute_y ? scatter_indices[global_m] : global_m;
-                device const float* dy_row = dy + dy_m * N;
-
-                // Weight for this token (for gradient scaling)
                 float weight = 1.0f;
                 if (params.fuse_mul) {
                     uint weight_idx = params.permute_x ? gather_indices[global_m] : global_m;
                     weight = topk_weights[weight_idx];
                 }
 
-                for (uint k = tid_x; k < tile_k_size; k += threads_x) {
-                    uint global_k = tile_k_start + k;
-
-                    float acc = 0.0f;
-                    for (uint n = 0; n < N; n++) {
-                        // W is [N, K]
-                        acc += dy_row[n] * w_expert[n * K + global_k];
-                    }
-
-                    C_tile[m * BLOCK_N + k] = acc * weight;
+                uint dx_m;
+                if (params.permute_x) {
+                    uint original_idx = gather_indices[global_m];
+                    dx_m = original_idx / params.topk;
+                } else {
+                    dx_m = global_m;
                 }
-            }
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Store dX with permutation
-            for (uint m = tid_y; m < tile_m_size; m += threads_y) {
-                uint global_m = tile_m_start + m;
 
                 for (uint k = tid_x; k < tile_k_size; k += threads_x) {
                     uint global_k = tile_k_start + k;
-
-                    float val = C_tile[m * BLOCK_N + k];
-
-                    uint dx_m;
-                    if (params.permute_x) {
-                        uint original_idx = gather_indices[global_m];
-                        dx_m = original_idx / params.topk;
-                    } else {
-                        dx_m = global_m;
-                    }
+                    float val = C_tile[m * BLOCK_N + k] * weight;
 
                     // Atomic add since multiple experts may write to same token
                     atomic_fetch_add_explicit(

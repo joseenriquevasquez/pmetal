@@ -73,7 +73,7 @@ impl FusedCrossEntropyConfig {
             label_smoothing: 0.0,
             softcap: 0.0,
             ignore_index: -100,
-            use_simd: vocab_size > 1024, // SIMD better for larger vocab
+            use_simd: true, // SIMD variant is always preferred (supports label smoothing, softcap)
             use_fp16: false,
         }
     }
@@ -1001,7 +1001,7 @@ mod tests {
     #[test]
     fn test_config_small_vocab() {
         let config = FusedCrossEntropyConfig::new(100, 100);
-        assert!(!config.use_simd); // vocab <= 1024
+        assert!(config.use_simd); // SIMD always preferred (supports label smoothing, softcap)
     }
 
     /// Reference cross-entropy for testing.

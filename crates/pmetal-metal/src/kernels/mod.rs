@@ -21,6 +21,8 @@ pub mod fused_sampler;
 pub mod fused_swiglu;
 pub mod fused_training;
 pub mod moe;
+pub mod mpp_bench;
+pub mod mpp_gemm;
 
 // Re-export main types
 pub use batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};

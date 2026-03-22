@@ -269,7 +269,11 @@ kernel void fused_swiglu_forward(
     }
 }
 
-/// Half-precision version for better performance.
+/// Half-precision version with SIMD cooperation.
+///
+/// Same SIMD-cooperative pattern as the f32 variant: each SIMD group of 32 lanes
+/// cooperates on one output element, splitting the hidden dimension reduction
+/// across lanes and merging with simd_sum(). Lane 0 writes the final result.
 kernel void fused_swiglu_forward_f16(
     device const half* input [[buffer(0)]],
     device const half* gate_weight [[buffer(1)]],
@@ -277,23 +281,53 @@ kernel void fused_swiglu_forward_f16(
     device half* output [[buffer(3)]],
     constant FusedSwiGLUParams& params [[buffer(4)]],
     uint token_idx [[threadgroup_position_in_grid]],
-    uint thread_idx [[thread_index_in_threadgroup]]
+    uint thread_idx [[thread_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
     if (token_idx >= params.batch_size) return;
 
     device const half* x = input + token_idx * params.hidden_size;
     device half* out = output + token_idx * params.intermediate_size;
 
-    for (uint i = thread_idx; i < params.intermediate_size; i += THREADS_PER_TOKEN) {
-        device const half* gate_row = gate_weight + i * params.hidden_size;
-        device const half* up_row = up_weight + i * params.hidden_size;
+    const uint num_simd_grps = THREADS_PER_TOKEN / SIMD_SIZE;  // 256/32 = 8
+    const uint lane = simd_lane_id;
+    const uint hidden = params.hidden_size;
 
-        // Vectorized dual dot product with fp32 accumulation for numerical stability
-        float gate_val = 0.0f;
-        float up_val = 0.0f;
-        dual_dot_f16(x, gate_row, up_row, params.hidden_size, gate_val, up_val);
+    // Each SIMD group cooperates on one output element; stride over intermediate_size.
+    for (uint i = simd_group_id; i < params.intermediate_size; i += num_simd_grps) {
+        device const half* gate_row = gate_weight + i * hidden;
+        device const half* up_row   = up_weight   + i * hidden;
 
-        out[i] = half(silu(gate_val) * up_val);
+        // Each lane accumulates a half4-strided partial sum with f32 accumulation.
+        float4 gate_acc4 = float4(0.0f);
+        float4 up_acc4   = float4(0.0f);
+
+        uint s4 = hidden & ~3u;
+        for (uint k = lane * 4; k < s4; k += SIMD_SIZE * 4) {
+            half4 x4 = *(device const half4*)(x + k);
+            float4 x4f = float4(x4);
+            gate_acc4 += x4f * float4(*(device const half4*)(gate_row + k));
+            up_acc4   += x4f * float4(*(device const half4*)(up_row   + k));
+        }
+        float gate_partial = gate_acc4.x + gate_acc4.y + gate_acc4.z + gate_acc4.w;
+        float up_partial   = up_acc4.x   + up_acc4.y   + up_acc4.z   + up_acc4.w;
+
+        // Scalar tail.
+        for (uint k = s4 + lane; k < hidden; k += SIMD_SIZE) {
+            float xv = float(x[k]);
+            gate_partial += xv * float(gate_row[k]);
+            up_partial   += xv * float(up_row[k]);
+        }
+
+        // SIMD reduction across 32 lanes.
+        float gate_val = simd_sum(gate_partial);
+        float up_val   = simd_sum(up_partial);
+
+        // Only lane 0 holds the fully-reduced result.
+        if (lane == 0) {
+            out[i] = half(silu(gate_val) * up_val);
+        }
     }
 }
 

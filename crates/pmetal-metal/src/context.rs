@@ -19,9 +19,15 @@ use crate::tuna::Tuner;
 /// Global Metal context singleton using OnceLock for thread-safe lazy initialization.
 static GLOBAL_CONTEXT: OnceLock<Result<Arc<MetalContext>>> = OnceLock::new();
 
-/// Embedded Metal library binary (compiled at build time).
+/// Embedded Metal 3 library binary (compiled at build time).
 const METAL_LIBRARY_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pmetal_kernels.metallib"));
+
+/// Embedded Metal 4 / MPP library binary (compiled at build time on macOS 26+).
+/// Contains NAX-accelerated kernels for M5+ GPUs.
+#[cfg(has_metal4)]
+const METAL4_LIBRARY_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/pmetal_kernels_metal4.metallib"));
 
 /// Metal execution context.
 ///
@@ -167,7 +173,7 @@ impl DeviceProperties {
         }
     }
 
-    /// Get recommended tile size for matrix operations.
+    /// Get recommended tile size for matrix operations (BM, BN, BK).
     pub fn recommended_tile_size(&self) -> (u32, u32, u32) {
         if self.has_nax {
             // M5/Apple10: NAX-optimized tile sizes. Larger tiles leverage
@@ -182,6 +188,36 @@ impl DeviceProperties {
                 DeviceTier::Ultra | DeviceTier::Max => (64, 64, 32),
                 DeviceTier::Pro => (64, 32, 32),
                 DeviceTier::Base => (32, 32, 32),
+            }
+        }
+    }
+
+    /// Get recommended MPP matmul2d parameters for Metal 4 kernels.
+    ///
+    /// Returns (BM, BN, BK, num_simdgroups) matching the MPP guide's
+    /// recommendations for the M5 chip family.
+    ///
+    /// MPP Guide Section 2.3.1: "On the M5 chip, a 2x2 tile of simdgroups
+    /// per threadgroup is a good starting point for 16-bit floating-point
+    /// operands."
+    pub fn mpp_tile_config(&self) -> (u32, u32, u32, u32) {
+        if !self.has_nax {
+            // Not NAX-capable — these are for legacy fallback selection
+            return (64, 64, 32, 4);
+        }
+        match self.device_tier {
+            DeviceTier::Ultra | DeviceTier::Max => {
+                // Larger tiles for high core count: 128x128 with 4 simdgroups
+                // BK=128 for accumulation loop sync (MPP Guide Section 2.3.4)
+                (128, 128, 128, 4)
+            }
+            DeviceTier::Pro => {
+                // Balanced: 64x64 with 4 simdgroups (2x2, SM=SN=32)
+                (64, 64, 128, 4)
+            }
+            DeviceTier::Base => {
+                // Conservative for lower core count
+                (64, 64, 128, 4)
             }
         }
     }
@@ -457,6 +493,26 @@ impl MetalContext {
                 .map(|l| l.functionNames().len())
                 .unwrap_or(0)
         );
+
+        // Load Metal 4 / MPP library if available and device supports NAX
+        #[cfg(has_metal4)]
+        if properties.has_nax {
+            match cache.load_metal4_library(&device, METAL4_LIBRARY_BYTES) {
+                Ok(()) => {
+                    info!(
+                        "Loaded Metal 4 / MPP library ({} bytes, {} NAX kernels)",
+                        METAL4_LIBRARY_BYTES.len(),
+                        cache
+                            .metal4_library()
+                            .map(|l| l.functionNames().len())
+                            .unwrap_or(0)
+                    );
+                }
+                Err(e) => {
+                    info!("Metal 4 library available but failed to load: {e}");
+                }
+            }
+        }
 
         let pipeline_cache = RwLock::new(cache);
         let tuner = Arc::new(Tuner::new());

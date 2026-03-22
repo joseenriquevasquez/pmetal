@@ -47,8 +47,12 @@ pub struct PipelineCache {
     /// Cached pipeline states, keyed by function name + config hash.
     pipelines: HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
 
-    /// The Metal library containing our kernels.
+    /// The Metal 3 library containing standard kernels.
     library: Option<Retained<ProtocolObject<dyn MTLLibrary>>>,
+
+    /// The Metal 4 / MPP library containing NAX-accelerated kernels (M5+).
+    /// Only loaded when has_metal4 cfg is set and the GPU supports NAX.
+    metal4_library: Option<Retained<ProtocolObject<dyn MTLLibrary>>>,
 }
 
 impl PipelineCache {
@@ -57,6 +61,7 @@ impl PipelineCache {
         Self {
             pipelines: HashMap::new(),
             library: None,
+            metal4_library: None,
         }
     }
 
@@ -101,9 +106,35 @@ impl PipelineCache {
         Ok(())
     }
 
+    /// Load the Metal 4 / MPP library from embedded bytes.
+    ///
+    /// This library contains NAX-accelerated kernels for M5+ GPUs.
+    /// Only call when the device supports NAX (has_nax = true).
+    pub fn load_metal4_library(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        library_data: &[u8],
+    ) -> Result<()> {
+        let dispatch_data = DispatchData::from_bytes(library_data);
+
+        let library = device
+            .newLibraryWithData_error(&dispatch_data)
+            .map_err(|e| MetalError::LibraryLoad(format!("Metal 4 library: {}", e)))?;
+
+        self.metal4_library = Some(library);
+        debug!("Loaded Metal 4 / MPP library ({} bytes)", library_data.len());
+
+        Ok(())
+    }
+
     /// Get a reference to the loaded library.
     pub fn library(&self) -> Option<&ProtocolObject<dyn MTLLibrary>> {
         self.library.as_deref()
+    }
+
+    /// Get a reference to the Metal 4 / MPP library.
+    pub fn metal4_library(&self) -> Option<&ProtocolObject<dyn MTLLibrary>> {
+        self.metal4_library.as_deref()
     }
 
     /// Get or create a pipeline state for a function.
@@ -157,6 +188,95 @@ impl PipelineCache {
         );
 
         // Cache and return a clone
+        self.pipelines.insert(cache_key, pipeline.clone());
+        Ok(pipeline)
+    }
+
+    /// Get or create a pipeline from the Metal 4 / MPP library.
+    ///
+    /// Looks up the function in the Metal 4 library first. Returns an error if
+    /// the Metal 4 library is not loaded (caller should check `has_nax` first).
+    pub fn get_or_create_metal4_pipeline(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        function_name: &str,
+        constants: &HashMap<u64, FunctionConstant>,
+    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
+        // Create a unique key prefixed with "metal4:" to avoid collisions
+        let mut sorted_keys: Vec<_> = constants.keys().collect();
+        sorted_keys.sort();
+        let config_str = sorted_keys
+            .iter()
+            .map(|&k| format!("{}={}", k, constants[k]))
+            .collect::<Vec<_>>()
+            .join(",");
+        let cache_key = format!("metal4:{}:[{}]", function_name, config_str);
+
+        if let Some(pipeline) = self.pipelines.get(&cache_key) {
+            return Ok(pipeline.clone());
+        }
+
+        let library = self.metal4_library.as_ref().ok_or_else(|| {
+            MetalError::LibraryLoad("Metal 4 / MPP library not loaded".to_string())
+        })?;
+
+        let function_ns = NSString::from_str(function_name);
+
+        let constant_values = MTLFunctionConstantValues::new();
+        for (&index, constant) in constants {
+            unsafe {
+                match constant {
+                    FunctionConstant::Bool(value) => {
+                        let ptr = value as *const bool as *mut std::ffi::c_void;
+                        if let Some(non_null) = NonNull::new(ptr) {
+                            constant_values.setConstantValue_type_atIndex(
+                                non_null,
+                                MTLDataType::Bool,
+                                index as usize,
+                            );
+                        }
+                    }
+                    FunctionConstant::UInt(value) => {
+                        let ptr = value as *const u32 as *mut std::ffi::c_void;
+                        if let Some(non_null) = NonNull::new(ptr) {
+                            constant_values.setConstantValue_type_atIndex(
+                                non_null,
+                                MTLDataType::UInt,
+                                index as usize,
+                            );
+                        }
+                    }
+                    FunctionConstant::Float(value) => {
+                        let ptr = value as *const f32 as *mut std::ffi::c_void;
+                        if let Some(non_null) = NonNull::new(ptr) {
+                            constant_values.setConstantValue_type_atIndex(
+                                non_null,
+                                MTLDataType::Float,
+                                index as usize,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let function = library
+            .newFunctionWithName_constantValues_error(&function_ns, &constant_values)
+            .map_err(|e| {
+                MetalError::FunctionNotFound(format!("{} (Metal 4): {}", function_name, e))
+            })?;
+
+        let pipeline = device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|e| MetalError::PipelineCreation(e.to_string()))?;
+
+        debug!(
+            "Created Metal 4 / MPP pipeline for '{}' [{}] (max threads: {})",
+            function_name,
+            config_str,
+            pipeline.maxTotalThreadsPerThreadgroup()
+        );
+
         self.pipelines.insert(cache_key, pipeline.clone());
         Ok(pipeline)
     }

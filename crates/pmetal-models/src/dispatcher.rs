@@ -635,13 +635,40 @@ impl DynamicModel {
 
     pub fn quantize_fp8(&mut self) -> Result<(), Exception> {
         match self {
+            // NemotronH has a bespoke implementation that operates on concrete
+            // `nn::Linear` structs and handles Mamba/attention blocks explicitly.
             Self::NemotronH(model) => model.quantize_fp8_weights(),
+
+            // Flux is a diffusion model whose weight graph is not a flat set of
+            // `nn::Linear` layers reachable through a single `ModuleParameters`
+            // root.  Callers should use `FluxPipeline` and quantize each
+            // component (transformer, VAE, text encoders) individually.
             Self::Flux(_) => Err(Exception::custom(
-                "Flux FP8 quantization is not exposed through DynamicModel. Load the diffusion pipeline via pmetal_models::pipelines::FluxPipeline and quantize its components explicitly.",
+                "Flux FP8 quantization is not exposed through DynamicModel. \
+                 Load the diffusion pipeline via pmetal_models::pipelines::FluxPipeline \
+                 and quantize its components explicitly.",
             )),
-            _ => Err(Exception::custom(
-                "Runtime FP8 quantization is currently implemented for NemotronH only. Other architectures require dedicated FP8-aware kernels or pre-quantized checkpoints.",
-            )),
+
+            // All other causal-LM architectures: traverse the flattened
+            // parameter map and quantize every `.weight` tensor generically.
+            Self::Llama(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Llama4(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Qwen2(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Qwen3(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Qwen3MoE(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Gemma(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Mistral(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Phi(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Phi4(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::DeepSeek(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Cohere(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Granite(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Qwen3Next(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::StarCoder2(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::RecurrentGemma(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Jamba(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::FalconH1(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Bert(m) => crate::fp8_utils::quantize_model_linears(m),
         }
     }
 
