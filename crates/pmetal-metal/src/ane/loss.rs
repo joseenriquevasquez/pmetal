@@ -101,7 +101,11 @@ mod tests {
         let mut dlogits = vec![0.0f32; vocab * seq];
 
         let out = loss_fn.compute(&logits, &targets, vocab, seq, 1.0, &mut dlogits);
-        assert!(out.loss > 0.0, "CE loss should be positive, got {}", out.loss);
+        assert!(
+            out.loss > 0.0,
+            "CE loss should be positive, got {}",
+            out.loss
+        );
     }
 
     #[test]

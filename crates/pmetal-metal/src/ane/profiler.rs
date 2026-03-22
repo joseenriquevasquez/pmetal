@@ -70,6 +70,7 @@ pub struct StepBreakdown {
 ///
 /// Takes the 7 category counters and total, returns percentages.
 /// Overhead is the residual between sum-of-categories and total.
+#[allow(clippy::too_many_arguments)]
 pub fn breakdown(
     io_write_us: u64,
     io_read_us: u64,
@@ -81,7 +82,9 @@ pub fn breakdown(
     total_us: u64,
 ) -> StepBreakdown {
     let total = total_us.max(1) as f64;
-    let accounted = (io_write_us + io_read_us + ane_fwd_us + ane_bwd_us + rmsnorm_us + dw_gemm_us + adam_us) as f64;
+    let accounted =
+        (io_write_us + io_read_us + ane_fwd_us + ane_bwd_us + rmsnorm_us + dw_gemm_us + adam_us)
+            as f64;
 
     StepBreakdown {
         io_write_pct: io_write_us as f64 / total * 100.0,
@@ -96,11 +99,7 @@ pub fn breakdown(
 }
 
 /// Log a step timing breakdown at `tracing::info` level.
-pub fn log_breakdown(
-    step: usize,
-    total_us: u64,
-    b: &StepBreakdown,
-) {
+pub fn log_breakdown(step: usize, total_us: u64, b: &StepBreakdown) {
     tracing::info!(
         step,
         total_ms = total_us as f64 / 1000.0,
@@ -134,8 +133,14 @@ mod tests {
     #[test]
     fn breakdown_sums_to_100() {
         let b = breakdown(100, 200, 300, 400, 50, 150, 100, 1500);
-        let sum = b.io_write_pct + b.io_read_pct + b.ane_fwd_pct + b.ane_bwd_pct
-            + b.rmsnorm_pct + b.dw_gemm_pct + b.adam_pct + b.overhead_pct;
+        let sum = b.io_write_pct
+            + b.io_read_pct
+            + b.ane_fwd_pct
+            + b.ane_bwd_pct
+            + b.rmsnorm_pct
+            + b.dw_gemm_pct
+            + b.adam_pct
+            + b.overhead_pct;
         assert!((sum - 100.0).abs() < 0.01, "expected 100%, got {sum}%");
     }
 }

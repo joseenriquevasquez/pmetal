@@ -1,12 +1,21 @@
 // mpp_fused_lora.metal
 // Metal 4 Fused LoRA using MPP matmul2d.
 //
-// Replaces per-element vectorized dot products with hardware matrix multiply.
-// The base projection y = x @ W^T is now a full block GEMM via matmul2d.
-// LoRA overlay (x @ A^T) @ B^T remains as small-rank matmul.
+// All three phases use hardware matrix multiply:
+//   Phase 1: y = x @ W^T              [batch, out] ← MPP matmul2d
+//   Phase 2: xA = x @ A^T             [batch, rank] ← MPP matmul2d (small)
+//   Phase 3: y += scale * xA @ B^T    [batch, out]  ← MPP matmul2d
 //
-// Forward:  y = x @ W^T + scale * (x @ A^T) @ B^T
-// This is the dominant operation in LoRA training forward pass.
+// Training variant saves xA for backward pass.
+// Inference variant skips xA save.
+//
+// Phase 2 (xA) is computed globally (all output tiles share the result).
+// Phase 3 adds the LoRA contribution to each output tile.
+//
+// Note: For rank > 64, the LoRA GEMM is large enough that MPP provides
+// significant speedup. For rank <= 16, the overhead of matmul2d setup
+// may not be worth it — the Metal 3 SIMD reduction approach is competitive.
+// This kernel uses SIMD dot products for LoRA (rank is typically 4-64).
 
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -24,15 +33,16 @@ struct FusedLoraParams {
 };
 
 // =============================================================================
-// MPP Fused LoRA Forward (fp16)
+// MPP Fused LoRA Forward (fp16) — Training
 // =============================================================================
 //
-// Phase 1: y = x @ W^T             [batch, out] ← MPP matmul2d
-// Phase 2: xA = x @ A^T            [batch, rank] ← MPP matmul2d (small)
-// Phase 3: y += scale * xA @ B^T   [batch, out]  ← MPP matmul2d
+// Grid: [num_out_tiles, num_batch_tiles, 1]
+// Each threadgroup: 4 simdgroups × 32 = 128 threads, computes a 64×64 output tile.
 //
-// All three GEMMs use hardware MMA. The LoRA intermediate (xA) is stored
-// in threadgroup memory between phases 2 and 3.
+// Phase 1: Base projection via matmul2d (dominant cost).
+// Phase 2: xA computed per-thread (rank is small, O(rank × H) per thread batch element).
+//          Saved to xA_out for backward pass.
+// Phase 3: LoRA overlay added per output element from precomputed xA.
 
 kernel void mpp_fused_lora_forward_f16(
     device half* x [[buffer(0)]],
@@ -60,7 +70,7 @@ kernel void mpp_fused_lora_forward_f16(
     const int tile_o = (int)(tgid.x * BN);
     if (tile_b >= batch || tile_o >= out_dim) return;
 
-    // Create tensors
+    // Create tensors for base projection
     auto tX = tensor(x, dextents<int, 2>{in_dim, batch}, array<int, 2>{1, in_dim});
     auto tW = tensor(W, dextents<int, 2>{in_dim, out_dim}, array<int, 2>{1, in_dim});
     auto tY = tensor(y, dextents<int, 2>{out_dim, batch}, array<int, 2>{1, out_dim});
@@ -80,24 +90,73 @@ kernel void mpp_fused_lora_forward_f16(
     base_op.run(sliceX, sliceW, sliceY);
 
     // Phase 2 & 3: LoRA overlay
-    // Only if rank > 0. For the LoRA GEMM, we compute xA = x @ A^T
-    // and then add scale * xA @ B^T to y.
-    //
-    // Since LoRA rank is typically small (4-64), the xA computation
-    // fits in a single tile. We store xA to global memory for backward.
-    //
-    // For the LoRA addition to y, we use the accumulate mode with the
-    // existing y values. This requires a separate pass since we need
-    // xA computed first.
-    //
-    // The LoRA pass is handled by the existing Metal 3 fused_lora kernel
-    // which is already well-optimized for small rank. The base projection
-    // is the bottleneck and benefits most from MPP.
+    if (R > 0) {
+        // Threadgroup scratch for shared xA values (max rank 64)
+        threadgroup float xA_scratch[64 * 64];  // [BM_tokens, max_rank] — 16KB max
+
+        uint total_threads = 128;
+        uint linear_tid = simd_group_id * 32 + simd_lane_id;
+        uint tile_b_size = min((uint)BM, params.batch_size - (uint)tile_b);
+
+        // Phase 2: Compute xA = x @ A^T for each token in this batch tile
+        // Each thread handles a subset of (token, rank) pairs
+        for (uint idx = linear_tid; idx < tile_b_size * (uint)R; idx += total_threads) {
+            uint b = idx / (uint)R;
+            uint r = idx % (uint)R;
+            uint global_b = (uint)tile_b + b;
+
+            device half* x_row = x + global_b * params.in_features;
+            device half* a_row = A + r * params.in_features;
+
+            // Dot product: xA[b, r] = x[b, :] @ A[r, :]^T
+            float4 acc4 = float4(0.0f);
+            uint h4 = params.in_features & ~3u;
+            for (uint h = 0; h < h4; h += 4) {
+                acc4 += float4(*(device const half4*)(x_row + h))
+                      * float4(*(device const half4*)(a_row + h));
+            }
+            float xa_val = acc4.x + acc4.y + acc4.z + acc4.w;
+            for (uint h = h4; h < params.in_features; h++) {
+                xa_val += float(x_row[h]) * float(a_row[h]);
+            }
+
+            xA_scratch[b * (uint)R + r] = xa_val;
+
+            // Save xA for backward pass
+            xA_out[global_b * (uint)R + r] = half(xa_val);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Phase 3: y += scale * xA @ B^T for this output tile
+        // Each thread adds LoRA contribution to its output elements
+        uint tile_o_size = min((uint)BN, params.out_features - (uint)tile_o);
+
+        for (uint idx = linear_tid; idx < tile_b_size * tile_o_size; idx += total_threads) {
+            uint b = idx / tile_o_size;
+            uint o = idx % tile_o_size;
+            uint global_b = (uint)tile_b + b;
+            uint global_o = (uint)tile_o + o;
+
+            // lora_val = scale * sum_r(xA[b, r] * B[o, r])
+            float lora_val = 0.0f;
+            for (uint r = 0; r < (uint)R; r++) {
+                lora_val += xA_scratch[b * (uint)R + r] * float(B[global_o * (uint)R + r]);
+            }
+            lora_val *= params.scale;
+
+            // Add to base projection result
+            y[global_b * params.out_features + global_o] =
+                half(float(y[global_b * params.out_features + global_o]) + lora_val);
+        }
+    }
 }
 
 // =============================================================================
-// MPP LoRA Forward - Inference only (no xA saved)
+// MPP LoRA Forward — Inference (no xA saved)
 // =============================================================================
+//
+// Same as training but doesn't save xA intermediate.
 
 kernel void mpp_lora_forward_inference_f16(
     device half* x [[buffer(0)]],
@@ -114,6 +173,7 @@ kernel void mpp_lora_forward_inference_f16(
     const int batch = (int)params.batch_size;
     const int in_dim = (int)params.in_features;
     const int out_dim = (int)params.out_features;
+    const int R = (int)params.rank;
 
     const int BM = 64;
     const int BN = 64;
@@ -125,11 +185,9 @@ kernel void mpp_lora_forward_inference_f16(
     auto tW = tensor(W, dextents<int, 2>{in_dim, out_dim}, array<int, 2>{1, in_dim});
     auto tY = tensor(y, dextents<int, 2>{out_dim, batch}, array<int, 2>{1, out_dim});
 
-    // Base: y = x @ W^T
+    // Phase 1: Base projection
     constexpr auto base_desc = mpp::tensor_ops::matmul2d_descriptor(
-        64, 64,
-        static_cast<int>(dynamic_extent),
-        false, true, false
+        64, 64, static_cast<int>(dynamic_extent), false, true, false
     );
     mpp::tensor_ops::matmul2d<base_desc, execution_simdgroups<4>> base_op;
 
@@ -138,7 +196,55 @@ kernel void mpp_lora_forward_inference_f16(
     auto sY = tY.slice(tile_o, tile_b);
     base_op.run(sX, sW, sY);
 
-    // LoRA: y += scale * (x @ A^T) @ B^T
-    // Handled as a separate lightweight pass with the existing Metal 3
-    // fused_lora kernel (optimized for small rank via SIMD reductions)
+    // Phase 2 & 3: LoRA overlay
+    if (R > 0) {
+        threadgroup float xA_scratch[64 * 64];
+
+        uint total_threads = 128;
+        uint linear_tid = simd_group_id * 32 + simd_lane_id;
+        uint tile_b_size = min((uint)BM, params.batch_size - (uint)tile_b);
+
+        // Phase 2: Compute xA
+        for (uint idx = linear_tid; idx < tile_b_size * (uint)R; idx += total_threads) {
+            uint b = idx / (uint)R;
+            uint r = idx % (uint)R;
+            uint global_b = (uint)tile_b + b;
+
+            device half* x_row = x + global_b * params.in_features;
+            device half* a_row = A + r * params.in_features;
+
+            float4 acc4 = float4(0.0f);
+            uint h4 = params.in_features & ~3u;
+            for (uint h = 0; h < h4; h += 4) {
+                acc4 += float4(*(device const half4*)(x_row + h))
+                      * float4(*(device const half4*)(a_row + h));
+            }
+            float xa_val = acc4.x + acc4.y + acc4.z + acc4.w;
+            for (uint h = h4; h < params.in_features; h++) {
+                xa_val += float(x_row[h]) * float(a_row[h]);
+            }
+            xA_scratch[b * (uint)R + r] = xa_val;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Phase 3: y += scale * xA @ B^T
+        uint tile_o_size = min((uint)BN, params.out_features - (uint)tile_o);
+
+        for (uint idx = linear_tid; idx < tile_b_size * tile_o_size; idx += total_threads) {
+            uint b = idx / tile_o_size;
+            uint o = idx % tile_o_size;
+            uint global_b = (uint)tile_b + b;
+            uint global_o = (uint)tile_o + o;
+
+            float lora_val = 0.0f;
+            for (uint r = 0; r < (uint)R; r++) {
+                lora_val += xA_scratch[b * (uint)R + r] * float(B[global_o * (uint)R + r]);
+            }
+            lora_val *= params.scale;
+
+            y[global_b * params.out_features + global_o] =
+                half(float(y[global_b * params.out_features + global_o]) + lora_val);
+        }
+    }
 }

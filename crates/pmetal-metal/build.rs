@@ -33,7 +33,12 @@ fn main() {
 
     // Compile Metal 3 shaders (always)
     if shaders_dir.exists() {
-        compile_metal_shaders(&shaders_dir, &out_dir, "air64-apple-macos14.0", "pmetal_kernels");
+        compile_metal_shaders(
+            &shaders_dir,
+            &out_dir,
+            "air64-apple-macos14.0",
+            "pmetal_kernels",
+        );
     } else {
         println!(
             "cargo:warning=No metal shaders directory found at {:?}",
@@ -66,10 +71,14 @@ fn main() {
                 "pmetal_kernels_metal4",
             );
             println!("cargo:rustc-cfg=has_metal4");
-            println!("cargo:warning=Metal 4 / MPP shaders compiled (Metal version {metal_version}, SDK {sdk_version})");
+            println!(
+                "cargo:warning=Metal 4 / MPP shaders compiled (Metal version {metal_version}, SDK {sdk_version})"
+            );
         }
     } else if metal4_dir.exists() {
-        println!("cargo:warning=Metal 4 shaders found but toolchain too old (Metal version {metal_version}, SDK {sdk_version}). Skipping MPP kernels.");
+        println!(
+            "cargo:warning=Metal 4 shaders found but toolchain too old (Metal version {metal_version}, SDK {sdk_version}). Skipping MPP kernels."
+        );
     }
 
     // Declare has_metal4 cfg for check-cfg lint
@@ -130,12 +139,10 @@ fn detect_sdk_version() -> f64 {
 /// a cryptic "Failed to run Metal compiler" panic.
 fn check_metal_toolchain() {
     // Check xcrun itself
-    let xcrun_ok = Command::new("xcrun")
-        .args(["--find", "metal"])
-        .output();
+    let xcrun_ok = Command::new("xcrun").args(["--find", "metal"]).output();
 
     match xcrun_ok {
-        Ok(output) if output.status.success() => return, // Metal compiler found
+        Ok(output) if output.status.success() => {} // Metal compiler found
         Ok(_) => {
             // xcrun exists but can't find metal
             panic!(
@@ -198,10 +205,7 @@ fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path, target: &str, lib_n
         .collect();
 
     if metal_files.is_empty() {
-        println!(
-            "cargo:warning=No .metal files found in {:?}",
-            shaders_dir
-        );
+        println!("cargo:warning=No .metal files found in {:?}", shaders_dir);
         return;
     }
 

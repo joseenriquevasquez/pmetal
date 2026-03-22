@@ -27,17 +27,11 @@ pub fn config_from_gguf(content: &GgufContent) -> Option<serde_json::Value> {
 
     // Architecture string for HF compat
     let hf_arch = map_architecture_class(arch);
-    config.insert(
-        "architectures".to_string(),
-        serde_json::json!([hf_arch]),
-    );
+    config.insert("architectures".to_string(), serde_json::json!([hf_arch]));
 
     // Model name
     if let Some(name) = get_string(content, "general.name") {
-        config.insert(
-            "_name_or_path".to_string(),
-            serde_json::Value::String(name),
-        );
+        config.insert("_name_or_path".to_string(), serde_json::Value::String(name));
     }
 
     // Hidden size (embedding length)
@@ -67,17 +61,13 @@ pub fn config_from_gguf(content: &GgufContent) -> Option<serde_json::Value> {
 
     // Context length
     if let Some(v) = get_u64(content, &format!("{arch}.context_length")) {
-        config.insert(
-            "max_position_embeddings".to_string(),
-            serde_json::json!(v),
-        );
+        config.insert("max_position_embeddings".to_string(), serde_json::json!(v));
     }
 
     // Vocab size — count tokenizer tokens if available
     if let Some(v) = get_u64(content, &format!("{arch}.vocab_size")) {
         config.insert("vocab_size".to_string(), serde_json::json!(v));
-    } else if let Some(MetadataValue::Array(tokens)) =
-        content.get_metadata("tokenizer.ggml.tokens")
+    } else if let Some(MetadataValue::Array(tokens)) = content.get_metadata("tokenizer.ggml.tokens")
     {
         config.insert("vocab_size".to_string(), serde_json::json!(tokens.len()));
     }
@@ -88,10 +78,7 @@ pub fn config_from_gguf(content: &GgufContent) -> Option<serde_json::Value> {
     }
 
     // RMS norm epsilon
-    if let Some(v) = get_f64(
-        content,
-        &format!("{arch}.attention.layer_norm_rms_epsilon"),
-    ) {
+    if let Some(v) = get_f64(content, &format!("{arch}.attention.layer_norm_rms_epsilon")) {
         config.insert("rms_norm_eps".to_string(), serde_json::json!(v));
     }
 
@@ -105,10 +92,7 @@ pub fn config_from_gguf(content: &GgufContent) -> Option<serde_json::Value> {
 
     // Quantization info from general.file_type
     if let Some(v) = get_u64(content, "general.file_type") {
-        config.insert(
-            "gguf_file_type".to_string(),
-            serde_json::json!(v),
-        );
+        config.insert("gguf_file_type".to_string(), serde_json::json!(v));
     }
 
     Some(serde_json::Value::Object(config))

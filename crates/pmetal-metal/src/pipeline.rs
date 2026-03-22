@@ -122,7 +122,10 @@ impl PipelineCache {
             .map_err(|e| MetalError::LibraryLoad(format!("Metal 4 library: {}", e)))?;
 
         self.metal4_library = Some(library);
-        debug!("Loaded Metal 4 / MPP library ({} bytes)", library_data.len());
+        debug!(
+            "Loaded Metal 4 / MPP library ({} bytes)",
+            library_data.len()
+        );
 
         Ok(())
     }

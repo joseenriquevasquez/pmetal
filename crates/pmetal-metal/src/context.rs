@@ -192,34 +192,22 @@ impl DeviceProperties {
         }
     }
 
-    /// Get recommended MPP matmul2d parameters for Metal 4 kernels.
+    /// Get recommended threadgroup tile parameters for GEMM kernels.
     ///
-    /// Returns (BM, BN, BK, num_simdgroups) matching the MPP guide's
-    /// recommendations for the M5 chip family.
+    /// Returns (BM, BN, BK, num_simdgroups) for grid sizing in Rust dispatch.
     ///
-    /// MPP Guide Section 2.3.1: "On the M5 chip, a 2x2 tile of simdgroups
-    /// per threadgroup is a good starting point for 16-bit floating-point
-    /// operands."
+    /// Metal 4 (MPP) kernels hardcode 64×64 tiles with 4 simdgroups in the
+    /// shader source (MPP Guide: SM=SN=32 per simdgroup, 2×2 = 64×64
+    /// threadgroup tile). These values are used by Rust dispatch code to
+    /// compute grid dimensions and threadgroup sizes.
+    ///
+    /// BK=128 is the recommended accumulation loop chunk size for M5
+    /// (MPP Guide Section 2.3.4).
     pub fn mpp_tile_config(&self) -> (u32, u32, u32, u32) {
-        if !self.has_nax {
-            // Not NAX-capable — these are for legacy fallback selection
-            return (64, 64, 32, 4);
-        }
-        match self.device_tier {
-            DeviceTier::Ultra | DeviceTier::Max => {
-                // Larger tiles for high core count: 128x128 with 4 simdgroups
-                // BK=128 for accumulation loop sync (MPP Guide Section 2.3.4)
-                (128, 128, 128, 4)
-            }
-            DeviceTier::Pro => {
-                // Balanced: 64x64 with 4 simdgroups (2x2, SM=SN=32)
-                (64, 64, 128, 4)
-            }
-            DeviceTier::Base => {
-                // Conservative for lower core count
-                (64, 64, 128, 4)
-            }
-        }
+        // All Metal 4 / MPP kernels use 64×64 threadgroup tiles with
+        // 4 cooperating simdgroups (execution_simdgroups<4>).
+        // BK=128 for accumulation loop synchronization.
+        (64, 64, 128, 4)
     }
 }
 

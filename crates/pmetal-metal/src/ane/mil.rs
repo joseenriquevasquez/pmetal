@@ -386,7 +386,6 @@ impl MilProgram {
     pub fn text(&self) -> &str {
         &self.text
     }
-
 }
 
 /// Kernel implementation strategy for linear projections on ANE.

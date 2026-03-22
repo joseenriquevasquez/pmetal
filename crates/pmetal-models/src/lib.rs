@@ -50,10 +50,10 @@
 pub mod architectures;
 pub mod dispatcher;
 pub mod expert_dequant;
-pub mod fp8_utils;
 pub mod expert_io;
 pub mod expert_layout;
 pub mod expert_prefetch;
+pub mod fp8_utils;
 pub mod generation;
 pub mod loader;
 pub mod moe;

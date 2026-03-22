@@ -14,7 +14,7 @@ use std::sync::Arc;
 use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
 
 use crate::{
-    buffer::MetalBuffer,
+    buffer::{AsMetalBuffer, MetalBuffer},
     context::MetalContext,
     error::{MetalError, Result},
     pipeline::FunctionConstant,
@@ -90,22 +90,26 @@ impl MppGemm {
 
     /// Check if MPP GEMM is available on this device (requires M5+ with NAX).
     pub fn is_available(&self) -> bool {
-        self.ctx.properties().has_nax()
-            && self
-                .ctx
-                .pipeline_cache()
-                .metal4_library()
-                .is_some()
+        self.ctx.properties().has_nax() && self.ctx.pipeline_cache().metal4_library().is_some()
     }
 
-    /// Execute MPP GEMM: C = alpha * A @ B^T + beta * C
+    /// Execute MPP GEMM: D = alpha * A @ B^T + beta * C
     ///
-    /// A: [M, K], B: [N, K] (transposed), C: [M, N]
+    /// Buffer element type is determined by `config.use_fp16`:
+    /// - `use_fp16 = true`: buffers must contain fp16 data
+    /// - `use_fp16 = false`: buffers must contain fp32 data
+    ///
+    /// Metal buffers are untyped at the API level — the caller is responsible
+    /// for ensuring the buffer data matches the kernel's expected precision.
+    ///
+    /// For the overwrite case (beta=0): `c_or_d` is the output buffer D.
+    /// For the accumulate case (beta!=0): `c_or_d` is used as both C (source)
+    /// and D (destination), i.e. in-place accumulation.
     pub fn execute(
         &self,
-        a: &MetalBuffer<f32>,
-        b: &MetalBuffer<f32>,
-        c: &MetalBuffer<f32>,
+        a: &dyn AsMetalBuffer,
+        b: &dyn AsMetalBuffer,
+        c_or_d: &dyn AsMetalBuffer,
     ) -> Result<()> {
         if !self.is_available() {
             return Err(MetalError::ExecutionFailed(
@@ -113,8 +117,17 @@ impl MppGemm {
             ));
         }
 
-        let kernel_name = if self.config.beta != 0.0 {
-            "mpp_gemm_accumulate_f16"
+        let is_accumulate = self.config.beta != 0.0;
+
+        let kernel_name = if is_accumulate {
+            if self.config.use_fp16 {
+                "mpp_gemm_accumulate_f16"
+            } else {
+                // No fp32 accumulate variant yet — fall back
+                return Err(MetalError::ExecutionFailed(
+                    "MPP GEMM accumulate not available for fp32 (use fp16)".to_string(),
+                ));
+            }
         } else if self.config.use_fp16 {
             "mpp_gemm_nn_f16"
         } else {
@@ -143,8 +156,8 @@ impl MppGemm {
 
         let bm = 64usize;
         let bn = 64usize;
-        let num_tiles_m = (self.config.m + bm - 1) / bm;
-        let num_tiles_n = (self.config.n + bn - 1) / bn;
+        let num_tiles_m = self.config.m.div_ceil(bm);
+        let num_tiles_n = self.config.n.div_ceil(bn);
         let total_tiles = num_tiles_m * num_tiles_n;
 
         let params = MppGemmParams {
@@ -158,12 +171,25 @@ impl MppGemm {
         };
 
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0, 2);
+            if is_accumulate {
+                // mpp_gemm_accumulate_f16: A=0, B=1, C=2, D=3, params=4
+                // c_or_d serves as both C (read) and D (write) for in-place accumulate
+                encoder.setBuffer_offset_atIndex(Some(a.as_metal_buffer()), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(b.as_metal_buffer()), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(c_or_d.as_metal_buffer()), 0, 2); // C
+                encoder.setBuffer_offset_atIndex(Some(c_or_d.as_metal_buffer()), 0, 3); // D (alias)
 
-            let params_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 3);
+                let params_ptr = NonNull::from(&params).cast();
+                encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 4);
+            } else {
+                // mpp_gemm_nn_{f16,f32}: A=0, B=1, D=2, params=3
+                encoder.setBuffer_offset_atIndex(Some(a.as_metal_buffer()), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(b.as_metal_buffer()), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(c_or_d.as_metal_buffer()), 0, 2); // D
+
+                let params_ptr = NonNull::from(&params).cast();
+                encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 3);
+            }
         }
 
         // 4 simdgroups × 32 threads = 128 threads per threadgroup
@@ -190,5 +216,20 @@ impl MppGemm {
         }
 
         Ok(())
+    }
+
+    /// Convenience: Execute with typed f32 buffers (dispatches to mpp_gemm_nn_f32).
+    pub fn execute_f32(
+        &self,
+        a: &MetalBuffer<f32>,
+        b: &MetalBuffer<f32>,
+        d: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        if self.config.use_fp16 {
+            return Err(MetalError::ExecutionFailed(
+                "execute_f32 called but config.use_fp16 is true".to_string(),
+            ));
+        }
+        self.execute(a, b, d)
     }
 }

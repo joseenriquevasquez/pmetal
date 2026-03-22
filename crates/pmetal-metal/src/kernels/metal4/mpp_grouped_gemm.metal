@@ -13,7 +13,10 @@
 
 using namespace metal;
 
-// Morton ordering for threadgroup walk
+// Morton ordering for cache-friendly tile walk within each expert's tile block.
+// MPP Guide Section 2.3.3: "actively running threadgroups cover a square region
+// of output tiles in the result matrix so that different cores maximally reuse
+// shards of both input matrices."
 inline uint2 morton_decode(uint linear) {
     uint x = 0, y = 0;
     for (uint bit = 0; bit < 16; bit++) {
@@ -78,8 +81,16 @@ kernel void mpp_grouped_gemm_forward_f16(
 
         if (tile_idx < processed_tiles + tiles_for_expert) {
             uint local_tile = tile_idx - processed_tiles;
-            uint tile_m_idx = local_tile % num_m_tiles;
-            uint tile_n_idx = local_tile / num_m_tiles;
+
+            // Morton ordering within this expert's tile grid for LLC locality
+            uint2 morton = morton_decode(local_tile);
+            uint tile_m_idx = morton.y;
+            uint tile_n_idx = morton.x;
+            // Clamp if Morton coords exceed expert's tile grid
+            if (tile_m_idx >= num_m_tiles || tile_n_idx >= num_n_tiles) {
+                tile_m_idx = local_tile % num_m_tiles;
+                tile_n_idx = local_tile / num_m_tiles;
+            }
 
             uint tile_m_start = m_start + tile_m_idx * BLOCK_M;
             uint tile_m_end = min(tile_m_start + (uint)BLOCK_M, m_end);
@@ -167,8 +178,15 @@ kernel void mpp_grouped_gemm_forward_f32(
 
         if (tile_idx < processed_tiles + tiles_for_expert) {
             uint local_tile = tile_idx - processed_tiles;
-            uint tile_m_idx = local_tile % num_m_tiles;
-            uint tile_n_idx = local_tile / num_m_tiles;
+
+            // Morton ordering within this expert's tile grid for LLC locality
+            uint2 morton = morton_decode(local_tile);
+            uint tile_m_idx = morton.y;
+            uint tile_n_idx = morton.x;
+            if (tile_m_idx >= num_m_tiles || tile_n_idx >= num_n_tiles) {
+                tile_m_idx = local_tile % num_m_tiles;
+                tile_n_idx = local_tile / num_m_tiles;
+            }
 
             uint tile_m_start = m_start + tile_m_idx * BLOCK_M;
             uint tile_n_start = tile_n_idx * BLOCK_N;

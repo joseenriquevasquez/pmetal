@@ -251,8 +251,8 @@ pub async fn download_model(
 /// Q4_K_M > Q5_K_M > Q4_K_S > Q5_K_S > Q6_K > Q3_K_M > Q8_0 > first available
 fn select_best_gguf(gguf_files: &[&str]) -> String {
     let preferences = [
-        "q4_k_m", "Q4_K_M", "q5_k_m", "Q5_K_M", "q4_k_s", "Q4_K_S", "q5_k_s", "Q5_K_S",
-        "q6_k", "Q6_K", "q3_k_m", "Q3_K_M", "q8_0", "Q8_0", "f16", "F16",
+        "q4_k_m", "Q4_K_M", "q5_k_m", "Q5_K_M", "q4_k_s", "Q4_K_S", "q5_k_s", "Q5_K_S", "q6_k",
+        "Q6_K", "q3_k_m", "Q3_K_M", "q8_0", "Q8_0", "f16", "F16",
     ];
 
     for pref in &preferences {

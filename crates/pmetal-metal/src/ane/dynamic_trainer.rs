@@ -1013,14 +1013,16 @@ impl DynamicAneTrainer {
         };
         info!(
             size_kb = scratch.size_bytes() / 1024,
-            mode,
-            "backward scratch pool allocated"
+            mode, "backward scratch pool allocated"
         );
         self.bwd_scratch = Some(scratch);
         self.bwd_ids = Some(ids);
 
         // Initialize default loss function if not already set
-        let vocab = self.vocab_map.as_ref().map_or(self.config.vocab_size, |vm| vm.compact_vocab);
+        let vocab = self
+            .vocab_map
+            .as_ref()
+            .map_or(self.config.vocab_size, |vm| vm.compact_vocab);
         if self.loss_fn.is_none() {
             self.loss_fn = Some(Box::new(CrossEntropyLoss::new(vocab)));
         }
@@ -1108,7 +1110,14 @@ impl DynamicAneTrainer {
             // Used when the attention matrix [heads, seq, seq] exceeds ANE SRAM.
 
             // 1. RMSNorm on CPU
-            accelerate::rmsnorm(&mut acts.xnorm, x, &lw.rms_att, d, s, self.config.rms_norm_eps);
+            accelerate::rmsnorm(
+                &mut acts.xnorm,
+                x,
+                &lw.rms_att,
+                d,
+                s,
+                self.config.rms_norm_eps,
+            );
 
             // 2. Q, K, V projections via ANE (individual projection kernels)
             Self::run_projection(kernels, io, d, qd, s, &acts.xnorm, &lw.wq, &mut acts.q)?;
@@ -1137,7 +1146,14 @@ impl DynamicAneTrainer {
                 accelerate::gemm(
                     &acts.q[q_off..q_off + hd * s],
                     &acts.k[k_off..k_off + hd * s],
-                    &mut scores, s, s, hd, scale, 0.0, true, false,
+                    &mut scores,
+                    s,
+                    s,
+                    hd,
+                    scale,
+                    0.0,
+                    true,
+                    false,
                 );
 
                 // Causal mask: set upper triangle to -inf
@@ -1171,12 +1187,27 @@ impl DynamicAneTrainer {
                     &scores,
                     &acts.v[v_off..v_off + hd * s],
                     &mut acts.attn_out[attn_off..attn_off + hd * s],
-                    hd, s, s, 1.0, 0.0, false, true,
+                    hd,
+                    s,
+                    s,
+                    1.0,
+                    0.0,
+                    false,
+                    true,
                 );
             }
 
             // 4. Wo projection via ANE
-            Self::run_projection(kernels, io, qd, d, s, &acts.attn_out, &lw.wo, &mut acts.o_out)?;
+            Self::run_projection(
+                kernels,
+                io,
+                qd,
+                d,
+                s,
+                &acts.attn_out,
+                &lw.wo,
+                &mut acts.o_out,
+            )?;
 
             // 5. Residual
             accelerate::vadd(x, &acts.o_out, &mut acts.x2);
@@ -1196,8 +1227,9 @@ impl DynamicAneTrainer {
                 s,
             );
 
-            let sdpa_model = kernels.sdpa_fwd.as_ref()
-                .ok_or_else(|| MetalError::InvalidConfig("Fused SDPA kernel not compiled".into()))?;
+            let sdpa_model = kernels.sdpa_fwd.as_ref().ok_or_else(|| {
+                MetalError::InvalidConfig("Fused SDPA kernel not compiled".into())
+            })?;
             sdpa_model.evaluate(&[io.sdpa_fwd_in.as_ptr()], &[io.sdpa_fwd_out.as_ptr()])?;
 
             // Read back all taps for backward pass
@@ -1254,7 +1286,16 @@ impl DynamicAneTrainer {
             }
 
             // W2 projection via ANE
-            Self::run_projection(kernels, io, h, d, s, &acts.silu_out, &lw.w2, &mut acts.ffn_out)?;
+            Self::run_projection(
+                kernels,
+                io,
+                h,
+                d,
+                s,
+                &acts.silu_out,
+                &lw.w2,
+                &mut acts.ffn_out,
+            )?;
 
             // Final residual
             accelerate::vadd(&acts.x2, &acts.ffn_out, x);
@@ -1268,7 +1309,9 @@ impl DynamicAneTrainer {
                 s,
             );
 
-            let ffn_model = kernels.ffn_fwd.as_ref()
+            let ffn_model = kernels
+                .ffn_fwd
+                .as_ref()
                 .ok_or_else(|| MetalError::InvalidConfig("Fused FFN kernel not compiled".into()))?;
             ffn_model.evaluate(&[io.ffn_fwd_in.as_ptr()], &[io.ffn_fwd_out.as_ptr()])?;
 
@@ -1287,7 +1330,16 @@ impl DynamicAneTrainer {
             copy_ft(&mut acts.silu_out, h); // ANE gen_dynamic_ffn_w13 outputs 'gate' here
 
             // W2 projection (standalone)
-            Self::run_projection(kernels, io, h, d, s, &acts.silu_out, &lw.w2, &mut acts.ffn_out)?;
+            Self::run_projection(
+                kernels,
+                io,
+                h,
+                d,
+                s,
+                &acts.silu_out,
+                &lw.w2,
+                &mut acts.ffn_out,
+            )?;
 
             // Final residual
             accelerate::vadd(&acts.x2, &acts.ffn_out, x);
@@ -1346,7 +1398,8 @@ impl DynamicAneTrainer {
             &[io.ffn_bwd_w2t_in.as_ptr()],
             &[io.ffn_bwd_w2t_out.as_ptr()],
         )?;
-        io.ffn_bwd_w2t_out.read_f32(scratch.get_mut(ids.dsilu_raw), 0, h, s);
+        io.ffn_bwd_w2t_out
+            .read_f32(scratch.get_mut(ids.dsilu_raw), 0, h, s);
 
         // 2. dW2 = dx @ silu_out^T
         encode_dw_gemm(
@@ -1425,7 +1478,8 @@ impl DynamicAneTrainer {
             &[io.ffn_bwd_w13t_in.as_ptr()],
             &[io.ffn_bwd_w13t_out.as_ptr()],
         )?;
-        io.ffn_bwd_w13t_out.read_f32(scratch.get_mut(ids.dx_ffn), 0, d, s);
+        io.ffn_bwd_w13t_out
+            .read_f32(scratch.get_mut(ids.dx_ffn), 0, d, s);
 
         // 5. FFN RMSNorm backward (CPU)
         // Copy dx_ffn out since rmsnorm_backward needs immutable ref while writing dx_ffn_norm
@@ -1454,12 +1508,30 @@ impl DynamicAneTrainer {
             // 6a. da = dx_ffn_norm @ Wo^T via ANE projection
             let dx_ffn_norm_copy: Vec<f32> = scratch.get(ids.dx_ffn_norm).to_vec();
             let mut da = vec![0.0f32; qd * s];
-            Self::run_projection(kernels, io, d, qd, s, &dx_ffn_norm_copy, &self.layer_weights[l].wo_t, &mut da)?;
+            Self::run_projection(
+                kernels,
+                io,
+                d,
+                qd,
+                s,
+                &dx_ffn_norm_copy,
+                &self.layer_weights[l].wo_t,
+                &mut da,
+            )?;
 
             // dWo
-            encode_dw_gemm(gpu_dw, scratch_a, scratch_b, batch.as_mut(),
-                scratch.get(ids.dx_ffn_norm), &self.layer_acts[l].attn_out,
-                &self.layer_grads[l].wo, d, qd, s);
+            encode_dw_gemm(
+                gpu_dw,
+                scratch_a,
+                scratch_b,
+                batch.as_mut(),
+                scratch.get(ids.dx_ffn_norm),
+                &self.layer_acts[l].attn_out,
+                &self.layer_grads[l].wo,
+                d,
+                qd,
+                s,
+            );
 
             // 6b-6c. Per-head attention backward on CPU
             // Recompute: scores = Q @ K^T * scale, softmax → probs
@@ -1479,20 +1551,37 @@ impl DynamicAneTrainer {
 
                 // Recompute scores = Q_h^T @ K_h * scale: [s, hd] @ [hd, s] → [s, s]
                 let mut scores = vec![0.0f32; s * s];
-                accelerate::gemm(&acts.q[q_off..q_off + hd * s], &acts.k[k_off..k_off + hd * s],
-                    &mut scores, s, s, hd, scale, 0.0, true, false);
+                accelerate::gemm(
+                    &acts.q[q_off..q_off + hd * s],
+                    &acts.k[k_off..k_off + hd * s],
+                    &mut scores,
+                    s,
+                    s,
+                    hd,
+                    scale,
+                    0.0,
+                    true,
+                    false,
+                );
 
                 // Causal mask + softmax
                 for row in 0..s {
-                    for col in (row + 1)..s { scores[row * s + col] = f32::NEG_INFINITY; }
-                    let max_val = scores[row * s..(row + 1) * s].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    for col in (row + 1)..s {
+                        scores[row * s + col] = f32::NEG_INFINITY;
+                    }
+                    let max_val = scores[row * s..(row + 1) * s]
+                        .iter()
+                        .cloned()
+                        .fold(f32::NEG_INFINITY, f32::max);
                     let mut sum = 0.0f32;
                     for col in 0..s {
                         scores[row * s + col] = (scores[row * s + col] - max_val).exp();
                         sum += scores[row * s + col];
                     }
                     let inv = 1.0 / sum;
-                    for col in 0..s { scores[row * s + col] *= inv; }
+                    for col in 0..s {
+                        scores[row * s + col] *= inv;
+                    }
                 }
                 // scores is now probs [s, s]
 
@@ -1500,22 +1589,45 @@ impl DynamicAneTrainer {
                 // Reshape: da_h [hd, s] → da_h^T [s, hd], V_h [hd, s] → V_h^T [s, hd]
                 // dp = da_h^T @ V_h = gemm(da_h, V_h, s, s, hd, trans_a=true, trans_b=false)
                 let mut dp = vec![0.0f32; s * s];
-                accelerate::gemm(&da[da_off..da_off + hd * s], &acts.v[v_off..v_off + hd * s],
-                    &mut dp, s, s, hd, 1.0, 0.0, true, false);
+                accelerate::gemm(
+                    &da[da_off..da_off + hd * s],
+                    &acts.v[v_off..v_off + hd * s],
+                    &mut dp,
+                    s,
+                    s,
+                    hd,
+                    1.0,
+                    0.0,
+                    true,
+                    false,
+                );
 
                 // dV_h = probs^T @ da_h^T → [s, s]^T @ [s, hd] → gemm with trans_a
                 // dV output is [hd, s] channel-first, so: dV = da_h @ probs = gemm(da_h [hd,s], probs [s,s], hd, s, s)
                 let dv_slice = &mut scratch.get_mut(ids.dv)[kv_idx * hd * s..(kv_idx + 1) * hd * s];
-                accelerate::gemm(&da[da_off..da_off + hd * s], &scores,
-                    dv_slice, hd, s, s, 1.0, 1.0, false, false); // accumulate for GQA
+                accelerate::gemm(
+                    &da[da_off..da_off + hd * s],
+                    &scores,
+                    dv_slice,
+                    hd,
+                    s,
+                    s,
+                    1.0,
+                    1.0,
+                    false,
+                    false,
+                ); // accumulate for GQA
 
                 // Softmax backward: ds = probs * (dp - rowsum(probs * dp)) * scale
                 let mut ds = vec![0.0f32; s * s];
                 for row in 0..s {
                     let mut dot = 0.0f32;
-                    for col in 0..s { dot += scores[row * s + col] * dp[row * s + col]; }
                     for col in 0..s {
-                        ds[row * s + col] = scores[row * s + col] * (dp[row * s + col] - dot) * scale;
+                        dot += scores[row * s + col] * dp[row * s + col];
+                    }
+                    for col in 0..s {
+                        ds[row * s + col] =
+                            scores[row * s + col] * (dp[row * s + col] - dot) * scale;
                     }
                 }
 
@@ -1523,15 +1635,35 @@ impl DynamicAneTrainer {
                 // gemm: K_h [hd, s], ds^T [s, s] → K_h @ ds^T → [hd, s], or
                 // dQ = K_h @ ds^T = gemm(K_h [hd,s], ds [s,s], hd, s, s, false, true)
                 let dq_slice = &mut scratch.get_mut(ids.dq)[h_idx * hd * s..(h_idx + 1) * hd * s];
-                accelerate::gemm(&acts.k[k_off..k_off + hd * s], &ds,
-                    dq_slice, hd, s, s, 1.0, 0.0, false, true);
+                accelerate::gemm(
+                    &acts.k[k_off..k_off + hd * s],
+                    &ds,
+                    dq_slice,
+                    hd,
+                    s,
+                    s,
+                    1.0,
+                    0.0,
+                    false,
+                    true,
+                );
 
                 // dK_h = ds^T @ Q_h: [s, s]^T @ [hd, s]^T → [s, hd] → channel-first [hd, s]
                 // dK = Q_h @ ds = gemm(Q_h [hd,s], ds [s,s], hd, s, s, false, false)
                 let dk_off = kv_idx * hd * s;
                 let dk_slice = &mut scratch.get_mut(ids.dk)[dk_off..dk_off + hd * s];
-                accelerate::gemm(&acts.q[q_off..q_off + hd * s], &ds,
-                    dk_slice, hd, s, s, 1.0, 1.0, false, false); // accumulate for GQA
+                accelerate::gemm(
+                    &acts.q[q_off..q_off + hd * s],
+                    &ds,
+                    dk_slice,
+                    hd,
+                    s,
+                    s,
+                    1.0,
+                    1.0,
+                    false,
+                    false,
+                ); // accumulate for GQA
             }
         } else {
             // Fused attention backward via ANE kernels
@@ -1542,35 +1674,69 @@ impl DynamicAneTrainer {
             let bwd1_in_ch = qd + 2 * kvd + d;
             let dy_ch_off = qd + 2 * kvd;
 
-            io.sdpa_bwd1_in.zero_channel_range_f32(0, bwd1_in_ch, bwd1_sp);
-            io.sdpa_bwd1_in.write_f32_strided_at(0, &acts.q, qd, s, bwd1_sp);
-            io.sdpa_bwd1_in.write_f32_strided_at(qd, &acts.k, kvd, s, bwd1_sp);
-            io.sdpa_bwd1_in.write_f32_strided_at(qd + kvd, &acts.v, kvd, s, bwd1_sp);
-            io.sdpa_bwd1_in.write_f32_strided_at(dy_ch_off, scratch.get(ids.dx_ffn_norm), d, s, bwd1_sp);
-            io.sdpa_bwd1_in.write_f32_at_col_offset(dy_ch_off, &self.layer_weights[l].wo, d, qd, s, bwd1_sp);
+            io.sdpa_bwd1_in
+                .zero_channel_range_f32(0, bwd1_in_ch, bwd1_sp);
+            io.sdpa_bwd1_in
+                .write_f32_strided_at(0, &acts.q, qd, s, bwd1_sp);
+            io.sdpa_bwd1_in
+                .write_f32_strided_at(qd, &acts.k, kvd, s, bwd1_sp);
+            io.sdpa_bwd1_in
+                .write_f32_strided_at(qd + kvd, &acts.v, kvd, s, bwd1_sp);
+            io.sdpa_bwd1_in.write_f32_strided_at(
+                dy_ch_off,
+                scratch.get(ids.dx_ffn_norm),
+                d,
+                s,
+                bwd1_sp,
+            );
+            io.sdpa_bwd1_in.write_f32_at_col_offset(
+                dy_ch_off,
+                &self.layer_weights[l].wo,
+                d,
+                qd,
+                s,
+                bwd1_sp,
+            );
 
-            let bwd1_model = kernels.sdpa_bwd1.as_ref()
-                .ok_or_else(|| MetalError::InvalidConfig("Fused sdpa_bwd1 kernel not compiled".into()))?;
+            let bwd1_model = kernels.sdpa_bwd1.as_ref().ok_or_else(|| {
+                MetalError::InvalidConfig("Fused sdpa_bwd1 kernel not compiled".into())
+            })?;
             bwd1_model.evaluate(&[io.sdpa_bwd1_in.as_ptr()], &[io.sdpa_bwd1_out.as_ptr()])?;
 
-            io.sdpa_bwd1_out.read_fp16_as_f32(scratch.get_mut(ids.dv), 0, kvd, s);
+            io.sdpa_bwd1_out
+                .read_fp16_as_f32(scratch.get_mut(ids.dv), 0, kvd, s);
 
             // dWo
-            encode_dw_gemm(gpu_dw, scratch_a, scratch_b, batch.as_mut(),
-                scratch.get(ids.dx_ffn_norm), &self.layer_acts[l].attn_out,
-                &self.layer_grads[l].wo, d, qd, s);
+            encode_dw_gemm(
+                gpu_dw,
+                scratch_a,
+                scratch_b,
+                batch.as_mut(),
+                scratch.get(ids.dx_ffn_norm),
+                &self.layer_acts[l].attn_out,
+                &self.layer_grads[l].wo,
+                d,
+                qd,
+                s,
+            );
 
             // 7. SDPA backward part 2: Q, K, probs, dp → dQ, dK
-            io.sdpa_bwd2_in.copy_from(0, &io.sdpa_bwd1_out, kvd, 2 * score_ch, s);
-            io.sdpa_bwd2_in.write_f32_as_fp16_at(2 * score_ch, &acts.q, qd, s);
-            io.sdpa_bwd2_in.write_f32_as_fp16_at(2 * score_ch + qd, &acts.k, kvd, s);
+            io.sdpa_bwd2_in
+                .copy_from(0, &io.sdpa_bwd1_out, kvd, 2 * score_ch, s);
+            io.sdpa_bwd2_in
+                .write_f32_as_fp16_at(2 * score_ch, &acts.q, qd, s);
+            io.sdpa_bwd2_in
+                .write_f32_as_fp16_at(2 * score_ch + qd, &acts.k, kvd, s);
 
-            let bwd2_model = kernels.sdpa_bwd2.as_ref()
-                .ok_or_else(|| MetalError::InvalidConfig("Fused sdpa_bwd2 kernel not compiled".into()))?;
+            let bwd2_model = kernels.sdpa_bwd2.as_ref().ok_or_else(|| {
+                MetalError::InvalidConfig("Fused sdpa_bwd2 kernel not compiled".into())
+            })?;
             bwd2_model.evaluate(&[io.sdpa_bwd2_in.as_ptr()], &[io.sdpa_bwd2_out.as_ptr()])?;
 
-            io.sdpa_bwd2_out.read_fp16_as_f32(scratch.get_mut(ids.dq), 0, qd, s);
-            io.sdpa_bwd2_out.read_fp16_as_f32(scratch.get_mut(ids.dk), qd, kvd, s);
+            io.sdpa_bwd2_out
+                .read_fp16_as_f32(scratch.get_mut(ids.dq), 0, qd, s);
+            io.sdpa_bwd2_out
+                .read_fp16_as_f32(scratch.get_mut(ids.dk), qd, kvd, s);
         }
 
         // dWq, dWk, dWv
@@ -1673,7 +1839,11 @@ impl DynamicAneTrainer {
         );
 
         // Final dx (residual)
-        accelerate::vadd(scratch.get(ids.dx_ffn_norm), scratch.get(ids.dx_attn_norm), dx);
+        accelerate::vadd(
+            scratch.get(ids.dx_ffn_norm),
+            scratch.get(ids.dx_attn_norm),
+            dx,
+        );
 
         Ok(())
     }
@@ -1754,8 +1924,6 @@ impl DynamicAneTrainer {
                 false,
             );
 
-
-
             // Cross-entropy loss on compact vocab
             // Try ANE softmax first, fall back to CPU
             let mut dlogits = vec![0.0f32; cv * s];
@@ -1772,7 +1940,7 @@ impl DynamicAneTrainer {
                         let l = accelerate::nll_loss_from_probs(
                             &mut dlogits,
                             &probs,
-                            &compact_targets,
+                            compact_targets,
                             cv,
                             s,
                         );
@@ -1782,19 +1950,25 @@ impl DynamicAneTrainer {
                         l
                     } else {
                         // ANE eval failed, fall back to pluggable loss
-                        self.loss_fn.as_mut().unwrap().compute(
-                            &logits, &compact_targets, cv, s, loss_scale, &mut dlogits,
-                        ).loss
+                        self.loss_fn
+                            .as_mut()
+                            .unwrap()
+                            .compute(&logits, compact_targets, cv, s, loss_scale, &mut dlogits)
+                            .loss
                     }
                 } else {
-                    self.loss_fn.as_mut().unwrap().compute(
-                        &logits, &compact_targets, cv, s, loss_scale, &mut dlogits,
-                    ).loss
+                    self.loss_fn
+                        .as_mut()
+                        .unwrap()
+                        .compute(&logits, compact_targets, cv, s, loss_scale, &mut dlogits)
+                        .loss
                 }
             } else {
-                self.loss_fn.as_mut().unwrap().compute(
-                    &logits, &compact_targets, cv, s, loss_scale, &mut dlogits,
-                ).loss
+                self.loss_fn
+                    .as_mut()
+                    .unwrap()
+                    .compute(&logits, compact_targets, cv, s, loss_scale, &mut dlogits)
+                    .loss
             };
 
             // dx = compact_embed^T @ dlogits: [d, cv] @ [cv, s] → [d, s]
@@ -1847,9 +2021,19 @@ impl DynamicAneTrainer {
             );
 
             let mut dlogits = vec![0.0f32; v * s];
-            let loss = self.loss_fn.as_mut().unwrap().compute(
-                &logits, target_tokens, v, s, self.config.loss_scale, &mut dlogits,
-            ).loss;
+            let loss = self
+                .loss_fn
+                .as_mut()
+                .unwrap()
+                .compute(
+                    &logits,
+                    target_tokens,
+                    v,
+                    s,
+                    self.config.loss_scale,
+                    &mut dlogits,
+                )
+                .loss;
 
             let mut dx = vec![0.0f32; d * s];
             accelerate::gemm(

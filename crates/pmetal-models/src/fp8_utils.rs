@@ -22,11 +22,7 @@
 //! `mlx_rs::ops::from_fp8` to dequantise before computation — this matches the
 //! semantics already used by `pmetal_mlx::fp8_quantization`.
 
-use mlx_rs::{
-    error::Exception,
-    module::ModuleParameters,
-    ops::to_fp8,
-};
+use mlx_rs::{error::Exception, module::ModuleParameters, ops::to_fp8};
 
 /// Quantize every `.weight` parameter of `model` to FP8 (E4M3) in-place.
 ///

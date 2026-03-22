@@ -5455,7 +5455,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "pmetal-core",
  "pmetal-data",
@@ -5478,7 +5478,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-core"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "secrecy",
  "serde",
@@ -5490,7 +5490,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-data"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "arrow",
  "image",
@@ -5508,7 +5508,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-distill"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "bitcode",
  "half",
@@ -5530,7 +5530,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-distributed"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5556,11 +5556,12 @@ dependencies = [
 
 [[package]]
 name = "pmetal-gguf"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "byteorder",
  "half",
  "pmetal-core",
+ "serde_json",
  "thiserror 2.0.18",
  "tracing",
  "zerocopy",
@@ -5568,7 +5569,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-gui"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "chrono",
  "dirs",
@@ -5590,13 +5591,14 @@ dependencies = [
 
 [[package]]
 name = "pmetal-hub"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "base64 0.22.1",
  "dirs",
  "hf-hub",
  "indicatif",
  "pmetal-core",
+ "pmetal-gguf",
  "reqwest 0.13.2",
  "serde",
  "serde_json",
@@ -5610,7 +5612,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-lora"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "half",
  "pmetal-core",
@@ -5627,7 +5629,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-merge"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "half",
  "hf-hub",
@@ -5650,7 +5652,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-metal"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "block2",
  "cc",
@@ -5675,7 +5677,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mhc"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "ndarray",
  "num-traits",
@@ -5695,7 +5697,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mlx"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "half",
  "num-traits",
@@ -5749,7 +5751,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-models"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "json5",
  "objc2",
@@ -5769,7 +5771,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-trainer"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "anyhow",
  "arrow",
@@ -5799,7 +5801,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-vocoder"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "half",
  "hf-hub",

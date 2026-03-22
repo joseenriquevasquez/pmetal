@@ -150,13 +150,20 @@ kernel void mpp_qmm_4bit_f16(
 // NAX Quantized MatMul (8-bit weights, fp16 activations)
 // =============================================================================
 //
-// int8 × fp16 → fp16 is natively supported by MPP matmul2d.
-// No dequantization needed — hardware handles mixed precision directly.
+// On-the-fly dequantization: int8 weights are dequantized into threadgroup
+// fp16 tiles with per-group scale applied during the load, then matmul2d
+// computes the GEMM on the dequantized tile.
+//
+// This follows the same pattern as the 4-bit kernel above:
+//   For each K-chunk:
+//     1. Cooperatively dequantize W[tile_n..+BN, k..+BK] → fp16 with scale
+//     2. matmul2d: rD += X_slice @ W_dequant^T
+//   Store accumulated result
 
 kernel void mpp_qmm_8bit_f16(
     device half* x [[buffer(0)]],                    // [M, K] activations
-    device int8_t* w [[buffer(1)]],                  // [N, K] int8 weights
-    device half* scales [[buffer(2)]],                // [N, K/group_size] per-group scales
+    device const int8_t* w [[buffer(1)]],            // [N, K] int8 weights
+    device const half* scales [[buffer(2)]],          // [N, K/group_size] per-group scales
     device half* y [[buffer(3)]],                     // [M, N] output
     constant QuantGemmParams& params [[buffer(4)]],
     uint3 tgid [[threadgroup_position_in_grid]],
@@ -167,31 +174,85 @@ kernel void mpp_qmm_8bit_f16(
     const int M = (int)params.M;
     const int N = (int)params.N;
     const int K = (int)params.K;
+    const uint gs = params.group_size;
 
     const int BM = 64;
     const int BN = 64;
+    const int BK = 64;  // Larger than 4-bit since int8 dequant is cheaper
+
     const int tile_m = (int)(tgid.y * BM);
     const int tile_n = (int)(tgid.x * BN);
     if (tile_m >= M || tile_n >= N) return;
 
-    // MPP natively supports int8 × half → float matmul
-    // Use matmul2d directly with int8 weights
+    // Threadgroup memory for dequantized + scaled weight tile
+    threadgroup half W_dequant[BN * BK];  // 64 × 64 × 2 = 8KB
+
     auto tX = tensor(x, dextents<int, 2>{K, M}, array<int, 2>{1, K});
-    auto tW = tensor(w, dextents<int, 2>{K, N}, array<int, 2>{1, K});
     auto tY = tensor(y, dextents<int, 2>{N, M}, array<int, 2>{1, N});
 
+    // Accumulate output in cooperative tensor
     constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-        64, 64,
-        static_cast<int>(dynamic_extent),
-        false, true, false
+        64, 64, BK,
+        false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate
     );
     mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
 
     auto sliceX = tX.slice(0, tile_m);
-    auto sliceW = tW.slice(0, tile_n);
     auto sliceY = tY.slice(tile_n, tile_m);
-    op.run(sliceX, sliceW, sliceY);
 
-    // Post-multiply by per-group scale
-    // (handled in a separate pass or fused into the weight loading)
+    auto rD = op.get_destination_cooperative_tensor<decltype(sliceX),
+        decltype(tensor((threadgroup half*)W_dequant,
+                        dextents<int, 2>{BK, BN},
+                        array<int, 2>{1, BK})),
+        float>();
+
+    uint total_threads = 128;
+    uint linear_tid = simd_group_id * 32 + simd_lane_id;
+    uint num_groups_k = K / gs;
+
+    // K-loop: dequantize BK columns of W at a time with scale, then matmul
+    for (int k_start = 0; k_start < K; k_start += BK) {
+        // Cooperatively dequantize W[tile_n..+BN, k_start..+BK] with scale
+        for (uint idx = linear_tid; idx < (uint)BN * (uint)BK; idx += total_threads) {
+            uint n_local = idx / (uint)BK;
+            uint k_local = idx % (uint)BK;
+            uint global_n = (uint)tile_n + n_local;
+            uint global_k = (uint)k_start + k_local;
+
+            if (global_n < params.N && global_k < params.K) {
+                // Dequantize: val = scale * int8_val
+                int8_t raw = w[global_n * (uint)K + global_k];
+                uint group_idx = global_k / gs;
+                float scale = float(scales[global_n * num_groups_k + group_idx]);
+                W_dequant[n_local * BK + k_local] = half(scale * float(raw));
+            } else {
+                W_dequant[n_local * BK + k_local] = half(0.0f);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MPP matmul: rD += X_slice @ W_dequant^T
+        auto tW = tensor((threadgroup half*)W_dequant,
+                         dextents<int, 2>{BK, BN},
+                         array<int, 2>{1, BK});
+
+        auto tkX = sliceX.slice(k_start, 0);
+
+        op.run(tkX, tW, rD);
+
+        threadgroup_barrier(mem_flags::mem_none);
+    }
+
+    // Store accumulated result
+    auto oD = op.get_destination_cooperative_tensor<decltype(sliceX),
+        decltype(tensor((threadgroup half*)W_dequant,
+                        dextents<int, 2>{BK, BN},
+                        array<int, 2>{1, BK})),
+        half>();
+    for (int i = 0; i < rD.get_capacity(); i++) {
+        oD[i] = half(rD[i]);
+    }
+    oD.store(sliceY);
 }

@@ -34,7 +34,9 @@ impl AnePipeline {
         thread::scope(|s| {
             let ane_handle = s.spawn(ane_work);
             let cpu_result = cpu_work();
-            let ane_result = ane_handle.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+            let ane_result = ane_handle
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e));
             (ane_result, cpu_result)
         })
     }
@@ -60,8 +62,12 @@ impl AnePipeline {
             let ane_handle = s.spawn(ane_work);
             let cpu1_handle = s.spawn(cpu_work_1);
             let cpu2_result = cpu_work_2();
-            let ane_result = ane_handle.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
-            let cpu1_result = cpu1_handle.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+            let ane_result = ane_handle
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e));
+            let cpu1_result = cpu1_handle
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e));
             (ane_result, cpu1_result, cpu2_result)
         })
     }
@@ -70,8 +76,8 @@ impl AnePipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn overlap_runs_both() {

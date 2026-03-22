@@ -1039,8 +1039,9 @@ impl Qwen3NextSparseMoeBlock {
                 .collect();
 
             let miss_bufs = if !miss_ids.is_empty() {
-                ctx.read_experts(layer_idx, &miss_ids)
-                    .map_err(|e| Exception::custom(format!("expert pread layer {layer_idx}: {e}")))?
+                ctx.read_experts(layer_idx, &miss_ids).map_err(|e| {
+                    Exception::custom(format!("expert pread layer {layer_idx}: {e}"))
+                })?
             } else {
                 vec![]
             };
@@ -1422,11 +1423,7 @@ impl Qwen3NextModel {
             if let (Some(prefetcher), Some(ctx)) = (&self.prefetcher, &self.offload_ctx) {
                 let search = self.moe_layer_indices.partition_point(|&i| i <= layer_idx);
                 if search < self.moe_layer_indices.len() {
-                    prefetcher.predict_and_prefetch(
-                        self.moe_layer_indices[search],
-                        &hidden,
-                        ctx,
-                    );
+                    prefetcher.predict_and_prefetch(self.moe_layer_indices[search], &hidden, ctx);
                 }
             }
         }

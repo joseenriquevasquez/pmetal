@@ -96,6 +96,7 @@ where
 /// Run a comparative benchmark between Metal 3 and Metal 4 implementations.
 ///
 /// Returns a pair of (metal3_result, metal4_result) for comparison.
+#[allow(clippy::too_many_arguments)]
 pub fn bench_comparative<F3, F4>(
     kernel_name: &str,
     m: usize,
@@ -140,15 +141,9 @@ pub fn print_comparison(metal3: &BenchResult, metal4: &Option<BenchResult>) {
     if let Some(m4) = metal4 {
         println!("{}", m4);
         let speedup = metal3.median_time.as_secs_f64() / m4.median_time.as_secs_f64();
-        println!(
-            "{:40} {:.2}x speedup (Metal 4 vs Metal 3)",
-            "", speedup
-        );
+        println!("{:40} {:.2}x speedup (Metal 4 vs Metal 3)", "", speedup);
     } else {
-        println!(
-            "{:40} Metal 4/MPP not available on this device",
-            ""
-        );
+        println!("{:40} Metal 4/MPP not available on this device", "");
     }
     println!();
 }
