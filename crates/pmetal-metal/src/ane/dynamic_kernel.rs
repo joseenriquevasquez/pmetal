@@ -402,18 +402,59 @@ fn emit_gqa_reduce(
 }
 
 // ============================================================================
+// Variant no-op helper for dual-die ANE alternation (UltraFusion)
+// ============================================================================
+
+/// Emit a trivial identity operation on a tensor to produce a different ANE program hash.
+///
+/// When `variant == 0` the input variable name is returned unchanged.
+/// When `variant > 0` a `mul(x, 1.0)` is appended with the given `dtype`, creating
+/// a structurally distinct MIL graph.  The ANE compiler generates a new program hash,
+/// causing the daemon on an M3/M4/M5 Ultra (UltraFusion) chip to assign the kernels
+/// to the second die, extending the degradation-free training window from ~40 to ~80
+/// steps before a thermal-induced throughput drop requires kernel refresh.
+fn emit_variant_noop(
+    p: &mut MilProgram,
+    input: &str,
+    shape: &[usize],
+    dtype: &str,
+    variant: u8,
+) -> String {
+    if variant == 0 {
+        return input.to_string();
+    }
+    let shape_str: String = {
+        let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+        format!("[{}]", dims.join(", "))
+    };
+    let vscale = p.next_var(&format!("vscale_v{variant}"));
+    p.emit_raw(&format!(
+        "        {dtype} {vscale} = const()[name=string(\"{vscale}\"), val={dtype}(1.0)];\n"
+    ));
+    let vout = p.next_var(&format!("vout_v{variant}"));
+    p.emit_raw(&format!(
+        "        tensor<{dtype}, {shape_str}> {vout} = mul(x={input},y={vscale})[name=string(\"{vout}\")];\n"
+    ));
+    vout
+}
+
+// ============================================================================
 // Decomposed kernels: single-projection + attention-only
 // ============================================================================
 
 /// Generate a standalone single linear projection kernel.
-pub fn gen_dynamic_projection(ic: usize, oc: usize, seq: usize) -> DynamicKernelOutput {
+///
+/// `variant`: pass `0` for the primary (A) kernel set, `1` for the secondary
+/// (B) set used in dual-die ANE alternation on UltraFusion chips.
+pub fn gen_dynamic_projection(ic: usize, oc: usize, seq: usize, variant: u8) -> DynamicKernelOutput {
     let sp = seq + oc;
     let mut p = MilProgram::new_fp32(ic, sp);
     p.emit_cast("x16", &[1, ic, 1, sp], "x", "fp16");
     let out16 = emit_dyn_matmul(&mut p, "mm", "x16", ic, oc, seq, 0, seq);
     let out32 = p.next_var("out32");
     p.emit_cast(&out32, &[1, oc, 1, seq], &out16, "fp32");
-    let mil_text = p.finalize(&out32);
+    let final_out = emit_variant_noop(&mut p, &out32, &[1, oc, 1, seq], "fp32", variant);
+    let mil_text = p.finalize(&final_out);
 
     DynamicKernelOutput {
         mil_text,
@@ -436,7 +477,9 @@ pub fn gen_dynamic_projection(ic: usize, oc: usize, seq: usize) -> DynamicKernel
 }
 
 /// Generate the attention-only SDPA kernel (no weight projections).
-pub fn gen_dynamic_sdpa_attn(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
+///
+/// `variant`: pass `0` for primary, `1` for secondary (dual-die alternation).
+pub fn gen_dynamic_sdpa_attn(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKernelOutput {
     let c = &dkc.cfg;
     let qd = c.q_dim();
     let kvd = c.kv_dim();
@@ -536,8 +579,9 @@ pub fn gen_dynamic_sdpa_attn(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 
     let out32 = p.next_var("out32");
     p.emit_cast(&out32, &[1, qd, 1, s], &attn_flat, "fp32");
+    let final_out_sa = emit_variant_noop(&mut p, &out32, &[1, qd, 1, s], "fp32", variant);
 
-    let mil_text = p.finalize(&out32);
+    let mil_text = p.finalize(&final_out_sa);
     let mut static_weights = WeightDict::new();
     static_weights.add(mask_path, build_causal_mask(s));
 
@@ -562,13 +606,16 @@ pub fn gen_dynamic_sdpa_attn(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 }
 
 /// Generate a standalone softmax kernel over the channel (vocab) dimension.
-pub fn gen_dynamic_softmax(vocab: usize, seq: usize) -> DynamicKernelOutput {
+///
+/// `variant`: pass `0` for primary, `1` for secondary (dual-die alternation).
+pub fn gen_dynamic_softmax(vocab: usize, seq: usize, variant: u8) -> DynamicKernelOutput {
     let mut p = MilProgram::new(vocab, seq);
     let ax = p.next_var("ax");
     p.emit_scalar_const(&ax, "int32", "1");
     let out = p.next_var("sm");
     p.emit_softmax(&out, &[1, vocab, 1, seq], &ax, "x");
-    let mil_text = p.finalize(&out);
+    let final_out_sm = emit_variant_noop(&mut p, &out, &[1, vocab, 1, seq], "fp16", variant);
+    let mil_text = p.finalize(&final_out_sm);
 
     DynamicKernelOutput {
         mil_text,
@@ -606,7 +653,9 @@ fn build_causal_mask(seq_len: usize) -> Vec<u8> {
 // ============================================================================
 
 /// Generate the dynamic SDPA forward kernel with fused RMSNorm and tap outputs.
-pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
+///
+/// `variant`: pass `0` for primary, `1` for secondary (dual-die alternation).
+pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKernelOutput {
     let c = &dkc.cfg;
     let d = c.dim;
     let s = c.seq_len;
@@ -764,8 +813,9 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 
     let taps32 = p.next_var("taps32");
     p.emit_cast(&taps32, &[1, out_ch, 1, s], &taps16, "fp32");
+    let final_out = emit_variant_noop(&mut p, &taps32, &[1, out_ch, 1, s], "fp32", variant);
 
-    let mil_text = p.finalize(&taps32);
+    let mil_text = p.finalize(&final_out);
     let mut static_weights = WeightDict::new();
     static_weights.add(mask_path, build_causal_mask(s));
 
@@ -794,7 +844,9 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 // ============================================================================
 
 /// Generate the dynamic FFN forward kernel with fused RMSNorm.
-pub fn gen_dynamic_ffn_w13(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
+///
+/// `variant`: pass `0` for primary, `1` for secondary (dual-die alternation).
+pub fn gen_dynamic_ffn_w13(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKernelOutput {
     let c = &dkc.cfg;
     let d = c.dim;
     let h = c.hidden_dim;
@@ -847,8 +899,9 @@ pub fn gen_dynamic_ffn_w13(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 
     let out32 = p.next_var("out32");
     p.emit_cast(&out32, &[1, out_ch, 1, s], &out16, "fp32");
+    let final_out = emit_variant_noop(&mut p, &out32, &[1, out_ch, 1, s], "fp32", variant);
 
-    let mil_text = p.finalize(&out32);
+    let mil_text = p.finalize(&final_out);
 
     DynamicKernelOutput {
         mil_text,
@@ -1626,7 +1679,7 @@ mod tests {
     #[test]
     fn test_dynamic_sdpa_fwd_generates_valid_mil() {
         let dkc = test_config();
-        let out = gen_dynamic_sdpa_fwd(&dkc);
+        let out = gen_dynamic_sdpa_fwd(&dkc, 0);
         assert!(out.mil_text.contains("program(1.3)"));
         assert!(out.mil_text.contains("softmax("));
         assert!(out.mil_text.contains("BLOBFILE"));
@@ -1637,7 +1690,7 @@ mod tests {
     #[test]
     fn test_dynamic_ffn_w13_generates_valid_mil() {
         let dkc = test_config();
-        let out = gen_dynamic_ffn_w13(&dkc);
+        let out = gen_dynamic_ffn_w13(&dkc, 0);
         assert!(out.mil_text.contains("sigmoid("));
         assert_eq!(out.input_layout.ic, 64);
         assert_eq!(out.output_layout.ic, 3 * 128);
@@ -1737,7 +1790,7 @@ mod tests {
     #[test]
     fn test_qwen3_dynamic_sdpa_fwd() {
         let dkc = qwen3_config();
-        let out = gen_dynamic_sdpa_fwd(&dkc);
+        let out = gen_dynamic_sdpa_fwd(&dkc, 0);
         assert!(out.mil_text.contains("program(1.3)"));
         assert_eq!(out.input_layout.ic, 64);
     }
@@ -1776,7 +1829,7 @@ mod tests {
         let qd = dkc.cfg.q_dim(); // 64
         let kvd = dkc.cfg.kv_dim(); // 32
         let d = dkc.cfg.dim; // 64
-        let out = gen_dynamic_sdpa_fwd(&dkc);
+        let out = gen_dynamic_sdpa_fwd(&dkc, 0);
         assert!(out.mil_text.contains("concat("));
         assert_eq!(out.input_layout.ic, d);
         assert_eq!(out.output_layout.ic, 2 * d + 2 * qd + 2 * kvd);
@@ -1794,5 +1847,41 @@ mod tests {
         assert!(out.mil_text.contains("reduce_sum("));
         assert_eq!(out.input_layout.ic, qd + 2 * kvd + d);
         assert_eq!(out.output_layout.ic, kvd + 2 * score_ch);
+    }
+
+    #[test]
+    fn test_variant_produces_different_mil_hash() {
+        // Verify that variant=1 kernels produce structurally different MIL text
+        // (different program hash) while producing the same tensor shapes.
+        let dkc = test_config();
+
+        // SDPA forward
+        let a = gen_dynamic_sdpa_fwd(&dkc, 0);
+        let b = gen_dynamic_sdpa_fwd(&dkc, 1);
+        assert_ne!(a.mil_text, b.mil_text, "Variant-B must produce different MIL");
+        assert!(b.mil_text.contains("vscale_v1"), "Variant-B must contain noop scalar");
+        assert!(b.mil_text.contains("vout_v1"), "Variant-B must contain noop output");
+        // Shapes must be identical (no-op is numerically transparent)
+        assert_eq!(a.input_layout.ic, b.input_layout.ic);
+        assert_eq!(a.output_layout.ic, b.output_layout.ic);
+        assert_eq!(a.input_layout.total_spatial, b.input_layout.total_spatial);
+
+        // Projection kernels
+        let pa = gen_dynamic_projection(64, 64, 32, 0);
+        let pb = gen_dynamic_projection(64, 64, 32, 1);
+        assert_ne!(pa.mil_text, pb.mil_text);
+        assert_eq!(pa.output_layout.ic, pb.output_layout.ic);
+
+        // FFN kernels
+        let fa = gen_dynamic_ffn_w13(&dkc, 0);
+        let fb = gen_dynamic_ffn_w13(&dkc, 1);
+        assert_ne!(fa.mil_text, fb.mil_text);
+        assert_eq!(fa.output_layout.ic, fb.output_layout.ic);
+
+        // Softmax kernels (fp16 output)
+        let sa = gen_dynamic_softmax(100, 32, 0);
+        let sb = gen_dynamic_softmax(100, 32, 1);
+        assert_ne!(sa.mil_text, sb.mil_text);
+        assert!(sb.mil_text.contains("fp16"), "Softmax variant noop must be fp16");
     }
 }

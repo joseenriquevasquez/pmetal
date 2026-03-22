@@ -129,8 +129,19 @@ impl AneTrainingLoop {
                 cb.on_step_start(batch_idx);
             }
 
-            // No budget check needed — dynamic pipeline never recompiles
+            // No budget check needed — dynamic pipeline never recompiles.
             let loss = self.trainer.train_batch(batch, max_steps)?;
+
+            // Detect ANE throughput degradation (~2-3x slowdown after ~40 steps)
+            // and recompile kernels to recover. The check is O(1) — ring buffer
+            // average vs. baseline — so it adds no measurable overhead.
+            if self.trainer.check_degradation() {
+                tracing::info!(
+                    step = batch_idx + 1,
+                    "ANE throughput degradation detected, refreshing kernels"
+                );
+                self.trainer.refresh_kernels()?;
+            }
 
             // Update state
             self.state.step = batch_idx + 1;
@@ -169,6 +180,10 @@ impl AneTrainingLoop {
                 total_ms: timings.total_us as f64 / 1000.0,
                 tokens: batch.len() * seq_len,
                 grad_norm: None,
+                io_staging_ms: timings.io_write_us as f64 / 1000.0
+                    + timings.io_read_us as f64 / 1000.0,
+                optimizer_ms: timings.adam_us as f64 / 1000.0,
+                ..Default::default()
             };
             for cb in &mut self.callbacks {
                 cb.on_step_end_with_metrics(&metrics);

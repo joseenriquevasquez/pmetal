@@ -19,7 +19,7 @@
 //! └────────────────┘
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use tracing::{debug, info};
@@ -497,6 +497,32 @@ pub struct DynamicAneTrainer {
     compact_embed_grad: Vec<f32>,
     /// Compact embedding Adam state.
     compact_embed_adam: AdamParam,
+    // --- ANE throughput degradation detection ---
+    /// Baseline hardware execution time (ns) from first 5 calibration steps.
+    /// `None` until the calibration window is filled.
+    baseline_hw_ns: Option<u64>,
+    /// Ring buffer of the last 8 `hw_execution_time_ns` samples from the SDPA
+    /// forward kernel (or largest fused projection kernel in decomposed mode).
+    hw_ring: VecDeque<u64>,
+    /// Total ANE dispatches recorded since the last kernel refresh.
+    total_ane_evals: u64,
+    /// Training step number at which kernels were last compiled / refreshed.
+    last_refresh_step: usize,
+    /// Fraction above baseline that triggers a kernel refresh (default 1.15 = 15%).
+    refresh_threshold: f32,
+    /// Maximum ANE dispatches before a proactive safety refresh (default 25 000).
+    /// Doubled when dual-die alternation is active (Ultra chips).
+    max_evals_before_refresh: u64,
+    // --- Dual-die ANE alternation (UltraFusion / M3/M4/M5 Ultra) ---
+    /// Second set of compiled kernels for dual-die alternation (Ultra only).
+    ///
+    /// The MIL programs in this set are trivially different (variant=1 no-op)
+    /// from the primary set so the ANE daemon assigns them to the second die.
+    kernels_b: Option<DynamicKernels>,
+    /// Second IOSurface pool paired with `kernels_b`.
+    io_pool_b: Option<DynIoPool>,
+    /// Toggle: which kernel set to use this step (false = A, true = B).
+    use_kernel_set_b: bool,
 }
 
 /// Encode a dW GEMM (`C += A @ B^T`) into a BatchedCommandBuffer (GPU path),
@@ -726,6 +752,15 @@ impl DynamicAneTrainer {
             compact_embed: Vec::new(),
             compact_embed_grad: Vec::new(),
             compact_embed_adam: AdamParam::new(0),
+            baseline_hw_ns: None,
+            hw_ring: VecDeque::with_capacity(8),
+            total_ane_evals: 0,
+            last_refresh_step: 0,
+            refresh_threshold: 1.15,
+            max_evals_before_refresh: 25_000,
+            kernels_b: None,
+            io_pool_b: None,
+            use_kernel_set_b: false,
         }
     }
 
@@ -742,6 +777,94 @@ impl DynamicAneTrainer {
     /// Number of ANE compilations performed (should be 9+ after compile_kernels).
     pub fn compile_count(&self) -> usize {
         self.compile_count
+    }
+
+    /// Check whether ANE throughput has degraded enough to warrant a kernel refresh.
+    ///
+    /// Returns `true` when either:
+    /// - the 8-step moving average of `hw_execution_time_ns` exceeds
+    ///   `baseline_hw_ns * refresh_threshold` (15% degradation), OR
+    /// - `total_ane_evals` has reached `max_evals_before_refresh` (safety limit).
+    ///
+    /// Returns `false` if fewer than 8 samples have been collected (calibration
+    /// window not yet filled) or no baseline has been established.
+    pub fn check_degradation(&self) -> bool {
+        // Safety limit: unconditional refresh after N total evaluations.
+        if self.total_ane_evals >= self.max_evals_before_refresh {
+            return true;
+        }
+
+        let Some(baseline) = self.baseline_hw_ns else {
+            return false;
+        };
+
+        // Need a full ring buffer before triggering (avoids false positives during
+        // early calibration).
+        if self.hw_ring.len() < 8 {
+            return false;
+        }
+
+        let moving_avg = self.hw_ring.iter().sum::<u64>() / self.hw_ring.len() as u64;
+        let threshold = (baseline as f32 * self.refresh_threshold) as u64;
+        moving_avg > threshold
+    }
+
+    /// Refresh ANE kernels to recover from throughput degradation.
+    ///
+    /// Recompiles all kernels via `compile_kernels()`, resets the hw_ring and
+    /// `total_ane_evals`, and clears the baseline so it will be re-calibrated
+    /// from the next 5 steps.
+    pub fn refresh_kernels(&mut self) -> Result<()> {
+        let step = self.adam_t;
+        tracing::info!(
+            step,
+            total_evals = self.total_ane_evals,
+            baseline_ns = self.baseline_hw_ns,
+            "ANE kernel refresh: recompiling to recover throughput"
+        );
+
+        self.compile_kernels()?;
+
+        // Reset degradation tracking so calibration restarts from scratch.
+        self.hw_ring.clear();
+        self.total_ane_evals = 0;
+        self.baseline_hw_ns = None;
+        self.last_refresh_step = step;
+
+        tracing::info!(step, "ANE kernel refresh complete");
+        Ok(())
+    }
+
+    /// Record a hardware execution time sample from a representative kernel.
+    ///
+    /// Pushes `hw_ns` into the 8-slot ring buffer, evicting the oldest value when
+    /// full. After the first 5 samples the baseline is set to their median.
+    /// `total_ane_evals` is incremented on every call.
+    fn record_hw_sample(&mut self, hw_ns: u64) {
+        // Ignore zero readings: perf stats class unavailable or hw timer not set.
+        if hw_ns == 0 {
+            return;
+        }
+
+        self.total_ane_evals += 1;
+
+        if self.hw_ring.len() == 8 {
+            self.hw_ring.pop_front();
+        }
+        self.hw_ring.push_back(hw_ns);
+
+        // Establish baseline from the median of the first 5 valid samples.
+        const CALIBRATION_WINDOW: usize = 5;
+        if self.baseline_hw_ns.is_none() && self.hw_ring.len() >= CALIBRATION_WINDOW {
+            let mut window: Vec<u64> = self.hw_ring.iter().take(CALIBRATION_WINDOW).copied().collect();
+            window.sort_unstable();
+            let median = window[CALIBRATION_WINDOW / 2];
+            self.baseline_hw_ns = Some(median);
+            tracing::debug!(
+                baseline_ns = median,
+                "ANE throughput baseline established"
+            );
+        }
     }
 
     /// Install a VocabMap for compact classifier/embedding operations.
@@ -822,20 +945,22 @@ impl DynamicAneTrainer {
                     sp = out.input_layout.total_spatial,
                     "Compiling dynamic kernel"
                 );
-                if let Err(e) = rt.compile(out.mil_text.as_bytes(), wd) {
-                    tracing::error!("Failed to compile {name}: {e}");
-                    let mil_path = format!("/tmp/ane_debug_{name}.mil");
-                    if let Err(we) = std::fs::write(&mil_path, &out.mil_text) {
-                        tracing::error!("Could not write debug MIL to {mil_path}: {we}");
-                    } else {
-                        tracing::error!(
-                            "Full MIL written to {mil_path} ({} bytes)",
-                            out.mil_text.len()
-                        );
+                match rt.compile(out.mil_text.as_bytes(), wd) {
+                    Ok(model) => Ok(model),
+                    Err(e) => {
+                        tracing::error!("Failed to compile {name}: {e}");
+                        let mil_path = format!("/tmp/ane_debug_{name}.mil");
+                        if let Err(we) = std::fs::write(&mil_path, &out.mil_text) {
+                            tracing::error!("Could not write debug MIL to {mil_path}: {we}");
+                        } else {
+                            tracing::error!(
+                                "Full MIL written to {mil_path} ({} bytes)",
+                                out.mil_text.len()
+                            );
+                        }
+                        Err(e)
                     }
-                    return Err(e);
                 }
-                rt.compile(out.mil_text.as_bytes(), wd)
             };
 
         // 1. Determine unique projection shapes needed (Fallback/Hybrid)
@@ -858,12 +983,17 @@ impl DynamicAneTrainer {
             "Compiling ANE performance frontier kernels..."
         );
 
+        // Detect UltraFusion for dual-die alternation.
+        let is_ultra = MetalContext::global()
+            .map(|ctx| ctx.properties().is_ultra_fusion)
+            .unwrap_or(false);
+
         // 2. Compile projection kernels (retained for flexibility/caching)
         let mut projections = HashMap::new();
         let mut proj_inputs = HashMap::new();
         let mut proj_outputs = HashMap::new();
         for &(ic, oc) in &proj_shapes {
-            let out = dynamic_kernel::gen_dynamic_projection(ic, oc, s);
+            let out = dynamic_kernel::gen_dynamic_projection(ic, oc, s, 0);
             let model = compile(&out, rt, &format!("proj_{ic}x{oc}"))?;
             projections.insert((ic, oc), model);
             proj_inputs.insert((ic, oc), IoSurface::for_tensor_f32(ic, s + oc)?);
@@ -890,7 +1020,7 @@ impl DynamicAneTrainer {
             self.decomposed_attn = true;
             None
         } else {
-            let k1 = dynamic_kernel::gen_dynamic_sdpa_fwd(&dkc);
+            let k1 = dynamic_kernel::gen_dynamic_sdpa_fwd(&dkc, 0);
             let model = compile(&k1, rt, "sdpa_fwd")?;
             self.compile_count += 1;
             Some(model)
@@ -912,7 +1042,7 @@ impl DynamicAneTrainer {
             self.decomposed_ffn = true;
             None
         } else {
-            let k2 = dynamic_kernel::gen_dynamic_ffn_w13(&dkc);
+            let k2 = dynamic_kernel::gen_dynamic_ffn_w13(&dkc, 0);
             let model = compile(&k2, rt, "ffn_fwd")?;
             self.compile_count += 1;
             Some(model)
@@ -950,7 +1080,7 @@ impl DynamicAneTrainer {
             .map(|vm| vm.compact_vocab)
             .unwrap_or(self.config.vocab_size);
         let (softmax_kern, softmax_in, softmax_out) = {
-            let sm_out = dynamic_kernel::gen_dynamic_softmax(softmax_vocab, s);
+            let sm_out = dynamic_kernel::gen_dynamic_softmax(softmax_vocab, s, 0);
             match compile(&sm_out, rt, "softmax") {
                 Ok(model) => {
                     self.compile_count += 1;
@@ -1000,6 +1130,134 @@ impl DynamicAneTrainer {
             softmax: softmax_kern,
         });
         self.io_pool = Some(io_pool);
+
+        // 7. Compile B kernel set for dual-die alternation on UltraFusion chips.
+        //
+        // Uses variant=1 to produce MIL programs with a different hash.  The ANE
+        // daemon assigns programs with different hashes to different dies, so
+        // alternating between A and B sets per training step distributes thermal
+        // load across both dies of an M3/M4/M5 Ultra, extending the
+        // degradation-free window from ~40 to ~80 steps.
+        if is_ultra {
+            info!("UltraFusion detected — compiling variant-B kernel set for dual-die alternation");
+
+            let mut proj_b = HashMap::new();
+            let mut proj_in_b = HashMap::new();
+            let mut proj_out_b = HashMap::new();
+            for &(ic, oc) in &proj_shapes {
+                let out_b = dynamic_kernel::gen_dynamic_projection(ic, oc, s, 1);
+                let model_b = compile(&out_b, rt, &format!("proj_{ic}x{oc}_b"))?;
+                proj_b.insert((ic, oc), model_b);
+                proj_in_b.insert((ic, oc), IoSurface::for_tensor_f32(ic, s + oc)?);
+                proj_out_b.insert((ic, oc), IoSurface::for_tensor_f32(oc, s)?);
+                self.compile_count += 1;
+            }
+
+            let sdpa_fwd_b = if self.decomposed_attn {
+                None
+            } else {
+                let k1b = dynamic_kernel::gen_dynamic_sdpa_fwd(&dkc, 1);
+                let m = compile(&k1b, rt, "sdpa_fwd_b")?;
+                self.compile_count += 1;
+                Some(m)
+            };
+
+            let ffn_fwd_b = if self.decomposed_ffn {
+                None
+            } else {
+                let k2b = dynamic_kernel::gen_dynamic_ffn_w13(&dkc, 1);
+                let m = compile(&k2b, rt, "ffn_fwd_b")?;
+                self.compile_count += 1;
+                Some(m)
+            };
+
+            // Backward kernels are shared (not part of die alternation):
+            // use primary set's bwd kernels for B too.  Re-compile them as
+            // separate AneModel instances pointing to the same MIL, so the
+            // B IOSurface pool can be used independently.
+            let ffn_bwd_w2t_b = {
+                let k4b = dynamic_kernel::gen_dynamic_ffn_bwd_w2t(&dkc);
+                compile(&k4b, rt, "ffn_bwd_w2t_b")?
+            };
+            let ffn_bwd_w13t_b = {
+                let k5b = dynamic_kernel::gen_dynamic_ffn_bwd_w13t(&dkc);
+                compile(&k5b, rt, "ffn_bwd_w13t_b")?
+            };
+            let (sdpa_bwd1_b, sdpa_bwd2_b) = if self.decomposed_attn {
+                (None, None)
+            } else {
+                let b1 = compile(&dynamic_kernel::gen_dynamic_sdpa_bwd1(&dkc), rt, "sdpa_bwd1_b")?;
+                let b2 = compile(&dynamic_kernel::gen_dynamic_sdpa_bwd2(&dkc), rt, "sdpa_bwd2_b")?;
+                self.compile_count += 2;
+                (Some(b1), Some(b2))
+            };
+
+            let softmax_b = match dynamic_kernel::gen_dynamic_softmax(softmax_vocab, s, 1) {
+                sm_out_b => match compile(&sm_out_b, rt, "softmax_b") {
+                    Ok(m) => {
+                        self.compile_count += 1;
+                        Some(m)
+                    }
+                    Err(_) => None,
+                },
+            };
+
+            // Allocate softmax IOSurfaces as a pair — both must succeed or both None.
+            let sm_io_b = if softmax_b.is_some() {
+                match (
+                    IoSurface::for_tensor(softmax_vocab, s),
+                    IoSurface::for_tensor(softmax_vocab, s),
+                ) {
+                    (Ok(sin), Ok(sout)) => (Some(sin), Some(sout)),
+                    _ => {
+                        tracing::warn!("Softmax B-set IOSurface pair allocation failed");
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            };
+
+            let io_pool_b = DynIoPool {
+                proj_inputs: proj_in_b,
+                proj_outputs: proj_out_b,
+                sdpa_fwd_in: IoSurface::for_tensor_f32(d, sdpa_fwd_sp)?,
+                sdpa_fwd_out: IoSurface::for_tensor_f32(2 * d + 2 * qd + 2 * kvd, s)?,
+                ffn_fwd_in: IoSurface::for_tensor_f32(d, ffn_fwd_sp)?,
+                ffn_fwd_out: IoSurface::for_tensor_f32(3 * h, s)?,
+                sdpa_bwd1_in: IoSurface::for_tensor_f32(bwd1_in_ch, s + qd)?,
+                sdpa_bwd1_out: IoSurface::for_tensor(bwd1_out_ch, s)?,
+                sdpa_bwd2_in: IoSurface::for_tensor(bwd2_in_ch, s)?,
+                sdpa_bwd2_out: IoSurface::for_tensor(bwd2_out_ch, s)?,
+                ffn_bwd_w2t_in: IoSurface::for_tensor_f32(d, s + h)?,
+                ffn_bwd_w2t_out: IoSurface::for_tensor_f32(h, s)?,
+                ffn_bwd_w13t_in: IoSurface::for_tensor_f32(h, 2 * s + 2 * d)?,
+                ffn_bwd_w13t_out: IoSurface::for_tensor_f32(d, s)?,
+                softmax_in: sm_io_b.0,
+                softmax_out: sm_io_b.1,
+            };
+
+            self.kernels_b = Some(DynamicKernels {
+                projections: proj_b,
+                sdpa_fwd: sdpa_fwd_b,
+                ffn_fwd: ffn_fwd_b,
+                sdpa_bwd1: sdpa_bwd1_b,
+                sdpa_bwd2: sdpa_bwd2_b,
+                ffn_bwd_w2t: ffn_bwd_w2t_b,
+                ffn_bwd_w13t: ffn_bwd_w13t_b,
+                softmax: softmax_b,
+            });
+            self.io_pool_b = Some(io_pool_b);
+
+            // Double the safety refresh window: with two dies, degradation
+            // occurs at roughly twice the rate of evaluations.
+            self.max_evals_before_refresh *= 2;
+
+            info!(
+                max_evals = self.max_evals_before_refresh,
+                "Dual-die alternation ready; safety refresh window doubled"
+            );
+        }
 
         // Pre-allocate backward scratch pool (eliminates ~13 Vec allocs per layer per step)
         let entries = backward_scratch_entries(d, h, s, qd, kvd);
@@ -1096,14 +1354,37 @@ impl DynamicAneTrainer {
         let lw = &self.layer_weights[l];
         let acts = &mut self.layer_acts[l];
 
-        let kernels = self
-            .kernels
-            .as_ref()
-            .ok_or_else(|| MetalError::InvalidConfig("Kernels not compiled".into()))?;
-        let io = self
-            .io_pool
-            .as_ref()
-            .ok_or_else(|| MetalError::InvalidConfig("IO pool not allocated".into()))?;
+        // hw_sample collects a single hw_execution_time_ns reading (layer 0 only).
+        // We defer the call to record_hw_sample() until after all borrows are
+        // released at the end of the function, to satisfy the borrow checker.
+        let mut hw_sample: Option<u64> = None;
+
+        // Dual-die selection: choose kernel set A or B based on the per-step toggle.
+        // Both fields are borrowed as shared refs here.  The toggle is flipped once
+        // per full step (not per layer) in train_step() after the forward loop.
+        let (kernels, io) = if self.use_kernel_set_b {
+            if let (Some(kb), Some(ib)) = (self.kernels_b.as_ref(), self.io_pool_b.as_ref()) {
+                (kb, ib)
+            } else {
+                (
+                    self.kernels
+                        .as_ref()
+                        .ok_or_else(|| MetalError::InvalidConfig("Kernels not compiled".into()))?,
+                    self.io_pool
+                        .as_ref()
+                        .ok_or_else(|| MetalError::InvalidConfig("IO pool not allocated".into()))?,
+                )
+            }
+        } else {
+            (
+                self.kernels
+                    .as_ref()
+                    .ok_or_else(|| MetalError::InvalidConfig("Kernels not compiled".into()))?,
+                self.io_pool
+                    .as_ref()
+                    .ok_or_else(|| MetalError::InvalidConfig("IO pool not allocated".into()))?,
+            )
+        };
 
         if self.decomposed_attn {
             // ====== Decomposed Attention (ANE projections + CPU BLAS attention) ======
@@ -1119,8 +1400,26 @@ impl DynamicAneTrainer {
                 self.config.rms_norm_eps,
             );
 
-            // 2. Q, K, V projections via ANE (individual projection kernels)
-            Self::run_projection(kernels, io, d, qd, s, &acts.xnorm, &lw.wq, &mut acts.q)?;
+            // 2. Q, K, V projections via ANE (individual projection kernels).
+            // On layer 0, use evaluate_with_stats on the Q projection to collect
+            // hw timing for degradation detection.  The result is stored in
+            // `hw_sample` and forwarded to record_hw_sample() at function exit,
+            // after all mutable borrows of `self` fields are released.
+            if l == 0 {
+                let q_key = (d, qd);
+                let q_kernel = kernels.projections.get(&q_key).ok_or_else(|| {
+                    MetalError::InvalidConfig(format!("No projection kernel for ({d}, {qd})"))
+                })?;
+                let io_in = io.proj_inputs.get(&q_key).unwrap();
+                let io_out = io.proj_outputs.get(&q_key).unwrap();
+                io_in.write_packed_f32(&acts.xnorm, &[(&lw.wq, qd)], d, s);
+                let stats = q_kernel
+                    .evaluate_with_stats(&[io_in.as_ptr()], &[io_out.as_ptr()])?;
+                io_out.read_f32(&mut acts.q, 0, qd, s);
+                hw_sample = Some(stats.hw_execution_time_ns);
+            } else {
+                Self::run_projection(kernels, io, d, qd, s, &acts.xnorm, &lw.wq, &mut acts.q)?;
+            }
             Self::run_projection(kernels, io, d, kvd, s, &acts.xnorm, &lw.wk, &mut acts.k)?;
             Self::run_projection(kernels, io, d, kvd, s, &acts.xnorm, &lw.wv, &mut acts.v)?;
 
@@ -1230,7 +1529,16 @@ impl DynamicAneTrainer {
             let sdpa_model = kernels.sdpa_fwd.as_ref().ok_or_else(|| {
                 MetalError::InvalidConfig("Fused SDPA kernel not compiled".into())
             })?;
-            sdpa_model.evaluate(&[io.sdpa_fwd_in.as_ptr()], &[io.sdpa_fwd_out.as_ptr()])?;
+            // Use evaluate_with_stats on layer 0 to collect hw timing for
+            // degradation detection.  Result stored in `hw_sample` and forwarded
+            // to record_hw_sample() at function exit after borrows are released.
+            if l == 0 {
+                let stats = sdpa_model
+                    .evaluate_with_stats(&[io.sdpa_fwd_in.as_ptr()], &[io.sdpa_fwd_out.as_ptr()])?;
+                hw_sample = Some(stats.hw_execution_time_ns);
+            } else {
+                sdpa_model.evaluate(&[io.sdpa_fwd_in.as_ptr()], &[io.sdpa_fwd_out.as_ptr()])?;
+            }
 
             // Read back all taps for backward pass
             // Taps: [o_out, q, k, v, attn_flat, xnorm]
@@ -1343,6 +1651,12 @@ impl DynamicAneTrainer {
 
             // Final residual
             accelerate::vadd(&acts.x2, &acts.ffn_out, x);
+        }
+
+        // All borrows of self.layer_acts[l] and self.kernels/io_pool are released
+        // here.  Record the hw sample now so that record_hw_sample can take &mut self.
+        if let Some(ns) = hw_sample {
+            self.record_hw_sample(ns);
         }
 
         Ok(())
@@ -1884,6 +2198,12 @@ impl DynamicAneTrainer {
         for l in 0..self.config.n_layers {
             self.layer_acts[l].layer_in.copy_from_slice(&x);
             self.forward_layer(l, &mut x)?;
+        }
+        // Flip the dual-die toggle after all layers have run.
+        // All layers in a given step use the same kernel set (A or B), so we
+        // flip once here rather than inside forward_layer.
+        if self.kernels_b.is_some() {
+            self.use_kernel_set_b = !self.use_kernel_set_b;
         }
         self.last_timings.ane_fwd_us += fwd_start.elapsed().as_micros() as u64;
 
