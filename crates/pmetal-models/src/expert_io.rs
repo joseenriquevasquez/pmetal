@@ -28,9 +28,18 @@ use std::thread::JoinHandle;
 
 use crate::expert_layout::ExpertPackLayout;
 
-/// Number of I/O threads for parallel pread.
-/// 4 threads gives 3-4x speedup for top-k=4-8 expert reads.
-const NUM_IO_THREADS: usize = 4;
+/// Optimal I/O thread count based on device memory bandwidth.
+fn io_thread_count() -> usize {
+    match pmetal_metal::context::MetalContext::global()
+        .map(|ctx| ctx.properties().device_tier)
+    {
+        Ok(pmetal_metal::context::DeviceTier::Base) => 2,
+        Ok(pmetal_metal::context::DeviceTier::Pro) => 4,
+        Ok(pmetal_metal::context::DeviceTier::Max) => 6,
+        Ok(pmetal_metal::context::DeviceTier::Ultra) => 8,
+        _ => 4, // fallback
+    }
+}
 
 /// A pread task sent to a worker thread.
 struct IoWork {
@@ -65,9 +74,9 @@ pub struct ExpertIoPool {
 }
 
 impl ExpertIoPool {
-    /// Create a new I/O pool with the default number of threads.
+    /// Create a new I/O pool with a device-tier-aware number of threads.
     pub fn new() -> Self {
-        Self::with_threads(NUM_IO_THREADS)
+        Self::with_threads(io_thread_count())
     }
 
     /// Create with a specific number of threads.

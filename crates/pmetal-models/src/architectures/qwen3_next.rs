@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use crate::expert_io::ExpertOffloadContext;
 use crate::expert_prefetch::ExpertPrefetcher;
 use crate::traits::ModelConfig;
+use pmetal_metal::expert_buffer::{ExpertBufferPool, ExpertBufferPoolConfig};
 use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use pmetal_mlx::{
     gather_mm,
@@ -819,6 +820,14 @@ pub struct Qwen3NextSparseMoeBlock {
     pub offload_ctx: Option<Arc<ExpertOffloadContext>>,
     /// If set, pre-gated prediction engine that prefetches experts in the background.
     pub prefetcher: Option<Arc<ExpertPrefetcher>>,
+    /// Zero-copy buffer pool for offloaded expert weights (2*K double-buffered).
+    pub buffer_pool: Option<Arc<ExpertBufferPool>>,
+    /// Reusable fused expert kernel (allocated once in enable_offloading).
+    pub fused_expert: Option<pmetal_metal::FusedMoeExpert>,
+    /// Reusable per-expert output buffers (one per top-k, allocated once).
+    pub expert_out_bufs: Vec<pmetal_metal::buffer::MetalBuffer<f32>>,
+    /// Reusable intermediate scratch buffer for expert forward.
+    pub expert_intermediate: Option<pmetal_metal::buffer::MetalBuffer<f32>>,
 }
 
 impl Qwen3NextSparseMoeBlock {
@@ -852,6 +861,10 @@ impl Qwen3NextSparseMoeBlock {
             layer_idx: 0,
             offload_ctx: None,
             prefetcher: None,
+            buffer_pool: None,
+            fused_expert: None,
+            expert_out_bufs: Vec::new(),
+            expert_intermediate: None,
         })
     }
 
@@ -861,6 +874,67 @@ impl Qwen3NextSparseMoeBlock {
     /// from SSD rather than from resident GPU arrays.
     pub fn enable_offloading(&mut self, ctx: Arc<ExpertOffloadContext>, layer_idx: usize) {
         self.layer_idx = layer_idx;
+
+        // Initialize zero-copy buffer pool and reusable Metal resources
+        if let Ok(metal_ctx) = pmetal_metal::context::MetalContext::global() {
+            let expert_size = ctx.layout.expert_size;
+            let k = self.top_k as usize;
+
+            // Buffer pool: 2*K buffers for double-buffered zero-copy pread
+            match ExpertBufferPool::new(
+                &metal_ctx,
+                ExpertBufferPoolConfig {
+                    buffer_size: expert_size,
+                    k,
+                },
+            ) {
+                Ok(pool) => self.buffer_pool = Some(Arc::new(pool)),
+                Err(e) => tracing::warn!("ExpertBufferPool allocation failed, using legacy copy path: {e}"),
+            }
+
+            // Reusable fused expert kernel
+            let bits = match ctx.layout.bits {
+                crate::expert_layout::PackedBits::Four => pmetal_metal::ExpertBits::Four,
+                crate::expert_layout::PackedBits::Two => pmetal_metal::ExpertBits::Two,
+            };
+            match pmetal_metal::FusedMoeExpert::new(
+                metal_ctx.clone(),
+                pmetal_metal::FusedMoeExpertConfig {
+                    hidden_dim: ctx.layout.hidden_dim as u32,
+                    intermediate_dim: ctx.layout.intermediate_dim as u32,
+                    group_size: ctx.layout.group_size as u32,
+                    bits,
+                },
+            ) {
+                Ok(expert) => self.fused_expert = Some(expert),
+                Err(e) => tracing::warn!("FusedMoeExpert creation failed: {e}"),
+            }
+
+            // Reusable per-expert output buffers
+            let mut out_bufs = Vec::with_capacity(k);
+            for _ in 0..k {
+                if let Ok(buf) = pmetal_metal::buffer::MetalBuffer::<f32>::new(
+                    &metal_ctx,
+                    ctx.layout.hidden_dim,
+                    pmetal_metal::buffer::BufferUsage::Shared,
+                ) {
+                    out_bufs.push(buf);
+                }
+            }
+            if out_bufs.len() == k {
+                self.expert_out_bufs = out_bufs;
+            }
+
+            // Reusable intermediate scratch
+            if let Ok(scratch) = pmetal_metal::buffer::MetalBuffer::<f32>::new(
+                &metal_ctx,
+                ctx.layout.intermediate_dim,
+                pmetal_metal::buffer::BufferUsage::Shared,
+            ) {
+                self.expert_intermediate = Some(scratch);
+            }
+        }
+
         self.offload_ctx = Some(ctx);
     }
 
@@ -964,13 +1038,12 @@ impl Qwen3NextSparseMoeBlock {
         result.reshape(shape)
     }
 
-    /// Offloaded forward pass: routes to top-k experts whose weights are read
-    /// on-demand from the packed SSD file for this layer.
-    ///
     /// Offloaded forward pass: routes to top-k experts whose weights are
     /// read on-demand from packed SSD files and dispatched to Metal kernels.
     ///
-    /// Data flow: route → pread K experts → parse → GPU forward → combine
+    /// Two paths:
+    /// - **Zero-copy** (all misses): pread into AlignedBuffer → Metal kernel at byte offsets
+    /// - **Legacy** (prefetch hits): Vec<u8> buffers → parse_expert_weights → MetalBuffer copies
     fn forward_offloaded(&mut self, x: &Array) -> Result<Array, Exception> {
         let shape = x.shape();
         let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
@@ -1022,7 +1095,6 @@ impl Qwen3NextSparseMoeBlock {
         #[cfg(unix)]
         {
             // ---- Prefetch-aware expert loading ----
-            // Check prefetcher for hits, only pread the misses.
             let io_start = std::time::Instant::now();
 
             let prefetched: Vec<Option<Vec<u8>>> = self
@@ -1038,62 +1110,19 @@ impl Qwen3NextSparseMoeBlock {
                 .map(|(i, _)| expert_indices[i])
                 .collect();
 
-            let miss_bufs = if !miss_ids.is_empty() {
-                ctx.read_experts(layer_idx, &miss_ids).map_err(|e| {
-                    Exception::custom(format!("expert pread layer {layer_idx}: {e}"))
-                })?
-            } else {
-                vec![]
-            };
-
-            // Merge hits + misses in original order
-            let mut expert_bufs: Vec<Vec<u8>> = Vec::with_capacity(expert_indices.len());
-            let mut miss_iter = miss_bufs.into_iter();
             let prefetch_hits = prefetched.iter().filter(|b| b.is_some()).count();
-            for hit in prefetched {
-                expert_bufs.push(match hit {
-                    Some(buf) => buf,
-                    None => miss_iter.next().unwrap(),
-                });
-            }
 
-            let io_us = io_start.elapsed().as_micros();
-            tracing::trace!(
-                layer = layer_idx,
-                io_ms = io_us as f64 / 1000.0,
-                hits = prefetch_hits,
-                misses = miss_ids.len(),
-                "offloaded MoE I/O"
-            );
+            // ---- Dispatch: zero-copy aligned path or legacy copy path ----
+            let fused_expert = self.fused_expert.as_ref().ok_or_else(|| {
+                Exception::custom("forward_offloaded: fused_expert not initialized")
+            })?;
+            let intermediate = self.expert_intermediate.as_ref().ok_or_else(|| {
+                Exception::custom("forward_offloaded: expert_intermediate not initialized")
+            })?;
 
-            // ---- Parse + forward each expert via Metal dequant kernels ----
             let metal_ctx = pmetal_metal::context::MetalContext::global()
                 .map_err(|e| Exception::custom(e.to_string()))?;
-
             let record = &ctx.layout.record;
-            let bits = match ctx.layout.bits {
-                crate::expert_layout::PackedBits::Four => pmetal_metal::ExpertBits::Four,
-                crate::expert_layout::PackedBits::Two => pmetal_metal::ExpertBits::Two,
-            };
-
-            let fused_expert = pmetal_metal::FusedMoeExpert::new(
-                metal_ctx.clone(),
-                pmetal_metal::FusedMoeExpertConfig {
-                    hidden_dim: ctx.layout.hidden_dim as u32,
-                    intermediate_dim: ctx.layout.intermediate_dim as u32,
-                    group_size: ctx.layout.group_size as u32,
-                    bits,
-                },
-            )
-            .map_err(|e| Exception::custom(e.to_string()))?;
-
-            // Allocate scratch buffers for expert forward
-            let expert_intermediate = pmetal_metal::MetalBuffer::<f32>::new(
-                &metal_ctx,
-                ctx.layout.intermediate_dim,
-                pmetal_metal::BufferUsage::Shared,
-            )
-            .map_err(|e| Exception::custom(e.to_string()))?;
 
             // x_flat to Metal buffer (tiny for T=1 decode)
             let x_flat_f32 = x_flat.as_type::<f32>()?;
@@ -1102,58 +1131,139 @@ impl Qwen3NextSparseMoeBlock {
                 pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(&metal_ctx, &x_flat_f32)
                     .map_err(|e| Exception::custom(e.to_string()))?;
 
-            // Process each expert
-            let mut expert_outputs: Vec<Vec<f32>> = Vec::with_capacity(expert_indices.len());
-
-            // Encode all K expert forwards into a single command buffer (C3: deferred dispatch).
-            // One command buffer for all experts eliminates K-1 GPU flushes.
             let cmd_buf = fused_expert
                 .create_command_buffer()
                 .map_err(|e| Exception::custom(e.to_string()))?;
 
-            // Per-expert output buffers (needed because each expert writes to same hidden_dim)
-            let mut per_expert_out: Vec<pmetal_metal::MetalBuffer<f32>> =
-                Vec::with_capacity(expert_bufs.len());
-            for _ in 0..expert_bufs.len() {
-                per_expert_out.push(
-                    pmetal_metal::MetalBuffer::<f32>::new(
-                        &metal_ctx,
-                        ctx.layout.hidden_dim,
-                        pmetal_metal::BufferUsage::Shared,
-                    )
-                    .map_err(|e| Exception::custom(e.to_string()))?,
-                );
-            }
+            // Zero-copy path requires ALL experts to be cache misses, because
+            // prefetched data arrives as Vec<u8> (not in AlignedBuffers), so we
+            // cannot mix aligned and non-aligned experts in one dispatch.
+            let use_aligned = self.buffer_pool.is_some()
+                && miss_ids.len() == expert_indices.len()
+                && self.expert_out_bufs.len() >= expert_indices.len();
 
-            for (i, raw_bytes) in expert_bufs.iter().enumerate() {
-                let weights =
-                    crate::expert_dequant::parse_expert_weights(raw_bytes, record, &metal_ctx)
-                        .map_err(|e| Exception::custom(e))?;
+            if use_aligned {
+                // ---- ZERO-COPY PATH ----
+                // pread directly into 2MB-aligned Metal-registered buffers.
+                // No intermediate copies, no parse_expert_weights.
+                let pool = self.buffer_pool.as_ref().unwrap();
+                let mut aligned_bufs: Vec<pmetal_metal::expert_buffer::AlignedBuffer> =
+                    (0..expert_indices.len())
+                        .map(|_| pool.acquire_blocking())
+                        .collect();
+
+                ctx.read_experts_aligned(layer_idx, &expert_indices, &mut aligned_bufs)
+                    .map_err(|e| {
+                        // Return buffers to pool on error
+                        for buf in aligned_bufs.drain(..) {
+                            pool.release(buf);
+                        }
+                        Exception::custom(format!("expert aligned pread layer {layer_idx}: {e}"))
+                    })?;
+
+                let io_us = io_start.elapsed().as_micros();
+                tracing::trace!(
+                    layer = layer_idx,
+                    io_ms = io_us as f64 / 1000.0,
+                    path = "zero-copy",
+                    experts = expert_indices.len(),
+                    "offloaded MoE I/O"
+                );
+
+                // Encode all experts with byte offsets into the single aligned buffer
+                for (i, abuf) in aligned_bufs.iter().enumerate() {
+                    fused_expert
+                        .encode_expert_aligned(
+                            &cmd_buf,
+                            &input_buf,
+                            abuf.metal_buffer(),
+                            record.gate_weight.offset,
+                            record.gate_scales.offset,
+                            record.gate_biases.offset,
+                            record.up_weight.offset,
+                            record.up_scales.offset,
+                            record.up_biases.offset,
+                            record.down_weight.offset,
+                            record.down_scales.offset,
+                            record.down_biases.offset,
+                            &self.expert_out_bufs[i],
+                            intermediate,
+                        )
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                }
+
+                // Single commit + wait for all K experts
+                fused_expert
+                    .submit_and_wait(&cmd_buf)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+
+                // Return buffers to pool (GPU work is complete after waitUntilCompleted)
+                for buf in aligned_bufs {
+                    pool.release(buf);
+                }
+            } else {
+                // ---- LEGACY COPY PATH ----
+                // Used when prefetch hits exist (prefetched buffers are Vec<u8>),
+                // or when buffer pool is unavailable.
+                let miss_bufs = if !miss_ids.is_empty() {
+                    ctx.read_experts(layer_idx, &miss_ids).map_err(|e| {
+                        Exception::custom(format!("expert pread layer {layer_idx}: {e}"))
+                    })?
+                } else {
+                    vec![]
+                };
+
+                // Merge hits + misses in original order
+                let mut expert_bufs: Vec<Vec<u8>> = Vec::with_capacity(expert_indices.len());
+                let mut miss_iter = miss_bufs.into_iter();
+                for hit in prefetched {
+                    expert_bufs.push(match hit {
+                        Some(buf) => buf,
+                        None => miss_iter.next().unwrap(),
+                    });
+                }
+
+                let io_us = io_start.elapsed().as_micros();
+                tracing::trace!(
+                    layer = layer_idx,
+                    io_ms = io_us as f64 / 1000.0,
+                    path = "legacy",
+                    hits = prefetch_hits,
+                    misses = miss_ids.len(),
+                    "offloaded MoE I/O"
+                );
+
+                for (i, raw_bytes) in expert_bufs.iter().enumerate() {
+                    let weights =
+                        crate::expert_dequant::parse_expert_weights(raw_bytes, record, &metal_ctx)
+                            .map_err(|e| Exception::custom(e))?;
+
+                    fused_expert
+                        .encode_into(
+                            &cmd_buf,
+                            &input_buf,
+                            &weights,
+                            &self.expert_out_bufs[i],
+                            intermediate,
+                        )
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                }
 
                 fused_expert
-                    .encode_into(
-                        &cmd_buf,
-                        &input_buf,
-                        &weights,
-                        &per_expert_out[i],
-                        &expert_intermediate,
-                    )
+                    .submit_and_wait(&cmd_buf)
                     .map_err(|e| Exception::custom(e.to_string()))?;
             }
 
-            // Single commit + wait for all K experts
-            fused_expert
-                .submit_and_wait(&cmd_buf)
-                .map_err(|e| Exception::custom(e.to_string()))?;
-
-            for buf in &per_expert_out {
-                expert_outputs.push(buf.as_slice().to_vec());
-            }
-
             // ---- Combine: weighted sum + shared expert + residual ----
-            // Build expert output tensor [batch_seq, k, hidden]
-            let all_expert_data: Vec<f32> = expert_outputs.into_iter().flatten().collect();
-            let down_out = Array::from_slice(&all_expert_data, &[batch_seq, k, hidden]);
+            // Convert Metal output buffers to MLX arrays (zero-copy)
+            let k_usize = k as usize;
+            let mut expert_arrays: Vec<Array> = Vec::with_capacity(k_usize);
+            for i in 0..expert_indices.len().min(self.expert_out_bufs.len()) {
+                let slice = self.expert_out_bufs[i].as_slice();
+                expert_arrays.push(Array::from_slice(slice, &[1, hidden]));
+            }
+            let down_out = ops::stack_axis(&expert_arrays, 1)?;
+            let down_out = down_out.reshape(&[batch_seq, k, hidden])?;
 
             let shared_y = self.shared_expert.forward(&x_flat)?;
             let shared_gate_logit = self.shared_expert_gate.forward(&x_flat)?;

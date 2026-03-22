@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use mlx_rs::error::Exception;
+use mlx_rs::module::ModuleParameters as _;
 use pmetal_data::Tokenizer;
 use pmetal_data::chat_templates::{ChatTemplateType, Message, ToolDefinition};
 use pmetal_lora::{DynamicLoraModel, TrainableModel as _};
@@ -262,16 +263,18 @@ impl InferenceRunner {
 
         // 7. Load model (standard or LoRA-merged)
         let max_seq_len = input_ids.len() + config.max_tokens + 64;
-        let cache_mode = resolve_cache_mode(
-            config.kv_quant,
-            config.kv_k_bits,
-            config.kv_v_bits,
-            config.kv_group_size,
-            config.no_kv_quant,
-        );
-        tracing::info!(mode = %cache_mode.describe(), tokens = max_seq_len, "KV cache");
+        // kv_quant may be promoted to Q8 by auto-detect below (standard path only)
+        let mut kv_quant = config.kv_quant;
 
         let (model, cache, mamba_cache) = if let Some(ref lora_path) = config.lora_path {
+            let cache_mode = resolve_cache_mode(
+                kv_quant,
+                config.kv_k_bits,
+                config.kv_v_bits,
+                config.kv_group_size,
+                config.no_kv_quant,
+            );
+            tracing::info!(mode = %cache_mode.describe(), tokens = max_seq_len, "KV cache");
             let (lora_model, cache, mamba_cache) =
                 load_model_with_lora(model_path, lora_path, max_seq_len)?;
             (LoadedModel::Lora(lora_model), cache, mamba_cache)
@@ -289,6 +292,36 @@ impl InferenceRunner {
             if let Some(ref experts_dir) = config.experts_dir {
                 m.enable_expert_offloading(Path::new(experts_dir))?;
             }
+
+            // Auto-enable KV quantization for memory-constrained setups
+            if kv_quant == 0 && !config.no_kv_quant {
+                if let Ok(ctx) = pmetal_metal::context::MetalContext::global() {
+                    let props = ctx.properties();
+                    let available_gb = props.recommended_working_set_size as f64
+                        / (1024.0 * 1024.0 * 1024.0);
+                    let param_count = m.num_parameters();
+                    let bytes_per_param = if config.fp8 { 1.05 } else { 2.0 };
+                    let estimated_weight_gb =
+                        param_count as f64 * bytes_per_param / (1024.0 * 1024.0 * 1024.0);
+                    if estimated_weight_gb > available_gb * 0.7 {
+                        tracing::info!(
+                            estimated_weight_gb = format!("{:.1}", estimated_weight_gb),
+                            available_gb = format!("{:.1}", available_gb),
+                            "Auto-enabling KV cache quantization (Q8) for memory-constrained setup"
+                        );
+                        kv_quant = 8;
+                    }
+                }
+            }
+
+            let cache_mode = resolve_cache_mode(
+                kv_quant,
+                config.kv_k_bits,
+                config.kv_v_bits,
+                config.kv_group_size,
+                config.no_kv_quant,
+            );
+            tracing::info!(mode = %cache_mode.describe(), tokens = max_seq_len, "KV cache");
 
             let cache = m.create_cache_with_mode(max_seq_len, cache_mode);
             let mamba_cache = m.create_mamba_cache();
