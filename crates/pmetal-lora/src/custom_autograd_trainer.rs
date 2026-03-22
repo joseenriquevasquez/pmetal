@@ -1,8 +1,8 @@
 //! Custom Autograd Trainer
 //!
 //! This module provides a complete training implementation using custom autograd
-//! that bypasses MLX's autodiff for ~50% memory reduction. This is the technique
-//! used by unsloth to enable training of larger models on limited memory.
+//! that bypasses MLX's autodiff for ~50% memory reduction via selective activation
+//! saving, enabling training of larger models on limited memory.
 //!
 //! # Architecture
 //!

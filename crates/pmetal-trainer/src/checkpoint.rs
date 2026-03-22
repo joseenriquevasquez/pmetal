@@ -26,10 +26,7 @@ use crate::{Result, SftError};
 ///
 /// The file is written atomically via a `.tmp` rename to avoid leaving a
 /// partially-written snapshot that could corrupt a resume.
-pub fn save_best_snapshot(
-    checkpoint_dir: &Path,
-    weights: &HashMap<Rc<str>, Array>,
-) -> Result<()> {
+pub fn save_best_snapshot(checkpoint_dir: &Path, weights: &HashMap<Rc<str>, Array>) -> Result<()> {
     fs::create_dir_all(checkpoint_dir).map_err(|e| {
         SftError::Io(std::io::Error::new(
             e.kind(),

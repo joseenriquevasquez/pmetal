@@ -11,7 +11,7 @@
 //! This implementation uses several state-of-the-art optimizations:
 //! - **Compiled GELU**: Uses `mlx_rs::nn::gelu_approximate()` with kernel fusion
 //! - **Fast RMS Norm**: Uses `mlx_rs::fast::rms_norm()` for optimized normalization
-//! - **Unsloth-style Gemma norm**: Efficient +1 weight offset handling
+//! - **Gemma norm**: Efficient +1 weight offset handling
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -42,7 +42,7 @@ use crate::{LoraError, LoraLinear};
 /// Gemma-style RMSNorm with +1 offset.
 ///
 /// Uses `mlx_rs::fast::rms_norm()` for optimized fused kernel execution,
-/// following the Unsloth pattern for Gemma models where the output is:
+/// Gemma models compute the output as:
 /// `output = rms_norm(x) * (1 + weight)`
 #[derive(Debug)]
 pub struct GemmaRmsNorm {

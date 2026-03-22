@@ -1672,7 +1672,7 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
             println!("# Full preparation pipeline");
             println!("pmetal dataset prepare tatsu-lab/alpaca \\");
             println!("  --output-dir ./alpaca_prepared \\");
-            println!("  --model unsloth/Qwen3-0.6B \\");
+            println!("  --model Qwen/Qwen3-0.6B \\");
             println!("  --template chatml \\");
             println!("  --max-seq-len 2048 \\");
             println!("  --val-ratio 0.05");
@@ -1688,7 +1688,7 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
             println!("pmetal dataset split -i templated.jsonl -o ./splits --val-ratio 0.1");
             println!();
             println!("# Analyze your data");
-            println!("pmetal dataset analyze -p train.jsonl --model unsloth/Qwen3-0.6B");
+            println!("pmetal dataset analyze -p train.jsonl --model Qwen/Qwen3-0.6B");
         }
     }
 

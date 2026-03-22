@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .position(|a| a == "--model")
         .and_then(|i| args.get(i + 1))
         .map(String::as_str)
-        .unwrap_or("unsloth/Qwen3-0.6B");
+        .unwrap_or("Qwen/Qwen3-0.6B");
     let prompt = args
         .iter()
         .position(|a| a == "--prompt")

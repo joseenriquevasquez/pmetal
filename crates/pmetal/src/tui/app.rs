@@ -288,7 +288,7 @@ impl App {
                     self.pending_modal_context = Some(PendingModalTarget::DownloadModel);
                     self.modal_stack.push(Modal::text_input(
                         "Download Model",
-                        "Model ID (e.g. unsloth/Qwen3-0.6B):",
+                        "Model ID (e.g. Qwen/Qwen3-0.6B):",
                     ));
                 }
                 KeyCode::Char('a') if !self.models.searching => {

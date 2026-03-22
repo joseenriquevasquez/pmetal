@@ -297,8 +297,8 @@ impl InferenceRunner {
             if kv_quant == 0 && !config.no_kv_quant {
                 if let Ok(ctx) = pmetal_metal::context::MetalContext::global() {
                     let props = ctx.properties();
-                    let available_gb = props.recommended_working_set_size as f64
-                        / (1024.0 * 1024.0 * 1024.0);
+                    let available_gb =
+                        props.recommended_working_set_size as f64 / (1024.0 * 1024.0 * 1024.0);
                     let param_count = m.num_parameters();
                     let bytes_per_param = if config.fp8 { 1.05 } else { 2.0 };
                     let estimated_weight_gb =

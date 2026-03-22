@@ -61,7 +61,7 @@ Block size selection per head dimension:
 | FlashAttention | O(n) memory attention with fused softmax, tier-aware block sizes |
 | Fused GDN | Gated Delta Network recurrence kernel — single-pass state update |
 | Fused LoRA | Combined forward pass for adapter layers (~2× speedup) |
-| Fused Cross-Entropy | Unsloth-style chunked loss computation |
+| Fused Cross-Entropy | Chunked vocabulary loss computation |
 | Fused Linear Cross-Entropy | Skips logits materialization entirely |
 | Fused RoPE | Rotary position embeddings in-kernel |
 | Fused SwiGLU | Fused gate + activation with tier-tuned threadgroups |

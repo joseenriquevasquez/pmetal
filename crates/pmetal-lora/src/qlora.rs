@@ -4,7 +4,7 @@
 //! - Storing base weights in 4-bit NF4 format (87.5% memory reduction)
 //! - Keeping LoRA adapters A and B in full precision (trainable)
 //! - Dequantizing base weights on-the-fly during forward pass
-//! - Optional dequantization caching for frozen weights (Unsloth-style optimization)
+//! - Optional dequantization caching for frozen weights (avoids redundant computation per forward pass)
 //!
 //! Memory savings for a 7B model:
 //! - Full precision: 28 GB
@@ -94,7 +94,7 @@ impl QLoraConfig {
 /// - `A` is the LoRA down-projection (trainable, full precision)
 /// - `B` is the LoRA up-projection (trainable, full precision)
 ///
-/// # Weight Caching (Unsloth-style optimization)
+/// # Weight Caching
 ///
 /// Since base weights are frozen during LoRA training, dequantization can be cached
 /// to avoid redundant computation on each forward pass. Enable with `enable_weight_cache()`.

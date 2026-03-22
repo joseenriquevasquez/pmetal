@@ -20,13 +20,13 @@ pmetal distill \
 # Online distillation (live teacher inference)
 pmetal distill \
   --teacher Qwen/Qwen3-4B \
-  --student unsloth/Qwen3.5-0.8B-Base \
+  --student Qwen/Qwen3.5-0.8B-Base \
   --dataset train.jsonl
 
 # Offline distillation (cached logits)
 pmetal distill \
   --teacher Qwen/Qwen3-4B \
-  --student unsloth/Qwen3.5-0.8B-Base \
+  --student Qwen/Qwen3.5-0.8B-Base \
   --dataset train.jsonl \
   --offline
 

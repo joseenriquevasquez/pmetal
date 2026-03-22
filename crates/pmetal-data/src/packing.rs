@@ -38,7 +38,6 @@
 //!
 //! # References
 //!
-//! - [Unsloth Packing](https://github.com/unslothai/unsloth)
 //! - [FlashAttention Variable Length](https://github.com/Dao-AILab/flash-attention)
 
 use super::Sample;

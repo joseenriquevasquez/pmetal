@@ -23,7 +23,7 @@ use pmetal_hub::Hub;
 let hub = Hub::new()?;
 
 // Download model to cache
-let model_path = hub.download("unsloth/Llama-3.2-1B")?;
+let model_path = hub.download("meta-llama/Llama-3.2-1B")?;
 
 // Use cached path
 println!("Model at: {}", model_path.display());
@@ -49,8 +49,8 @@ use pmetal_hub::Cache;
 let cache = Cache::default();
 
 // Check if model is cached
-if cache.contains("unsloth/Llama-3.2-1B")? {
-    let path = cache.get("unsloth/Llama-3.2-1B")?;
+if cache.contains("meta-llama/Llama-3.2-1B")? {
+    let path = cache.get("meta-llama/Llama-3.2-1B")?;
 }
 
 // Clear cache

@@ -273,6 +273,18 @@ pub struct StepMetrics {
     pub tokens: usize,
     /// Gradient norm (if computed).
     pub grad_norm: Option<f64>,
+    /// GPU forward+backward time (ms). Zero for ANE-only training.
+    #[serde(default)]
+    pub gpu_fwd_bwd_ms: f64,
+    /// Optimizer step time (ms) — covers Metal fused, MLX, or CPU Adam.
+    #[serde(default)]
+    pub optimizer_ms: f64,
+    /// I/O staging time (ms) — IOSurface writes + expert pread.
+    #[serde(default)]
+    pub io_staging_ms: f64,
+    /// Overhead not attributed to any category (ms).
+    #[serde(default)]
+    pub overhead_ms: f64,
 }
 
 /// Checkpoint metadata for saving/loading training state.

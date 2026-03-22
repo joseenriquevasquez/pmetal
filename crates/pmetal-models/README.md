@@ -61,7 +61,7 @@ These have implementations but are not wired into `DynamicModel` — use their t
 use pmetal_models::{DynamicModel, GenerationConfig, generate};
 
 // Load model with auto-detection
-let model = DynamicModel::from_pretrained("unsloth/Llama-3.2-1B")?;
+let model = DynamicModel::from_pretrained("meta-llama/Llama-3.2-1B")?;
 
 // Configure generation
 let config = GenerationConfig::sampling(256, 0.7)

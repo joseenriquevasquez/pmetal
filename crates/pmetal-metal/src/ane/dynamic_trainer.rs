@@ -856,14 +856,16 @@ impl DynamicAneTrainer {
         // Establish baseline from the median of the first 5 valid samples.
         const CALIBRATION_WINDOW: usize = 5;
         if self.baseline_hw_ns.is_none() && self.hw_ring.len() >= CALIBRATION_WINDOW {
-            let mut window: Vec<u64> = self.hw_ring.iter().take(CALIBRATION_WINDOW).copied().collect();
+            let mut window: Vec<u64> = self
+                .hw_ring
+                .iter()
+                .take(CALIBRATION_WINDOW)
+                .copied()
+                .collect();
             window.sort_unstable();
             let median = window[CALIBRATION_WINDOW / 2];
             self.baseline_hw_ns = Some(median);
-            tracing::debug!(
-                baseline_ns = median,
-                "ANE throughput baseline established"
-            );
+            tracing::debug!(baseline_ns = median, "ANE throughput baseline established");
         }
     }
 
@@ -1186,20 +1188,27 @@ impl DynamicAneTrainer {
             let (sdpa_bwd1_b, sdpa_bwd2_b) = if self.decomposed_attn {
                 (None, None)
             } else {
-                let b1 = compile(&dynamic_kernel::gen_dynamic_sdpa_bwd1(&dkc), rt, "sdpa_bwd1_b")?;
-                let b2 = compile(&dynamic_kernel::gen_dynamic_sdpa_bwd2(&dkc), rt, "sdpa_bwd2_b")?;
+                let b1 = compile(
+                    &dynamic_kernel::gen_dynamic_sdpa_bwd1(&dkc),
+                    rt,
+                    "sdpa_bwd1_b",
+                )?;
+                let b2 = compile(
+                    &dynamic_kernel::gen_dynamic_sdpa_bwd2(&dkc),
+                    rt,
+                    "sdpa_bwd2_b",
+                )?;
                 self.compile_count += 2;
                 (Some(b1), Some(b2))
             };
 
-            let softmax_b = match dynamic_kernel::gen_dynamic_softmax(softmax_vocab, s, 1) {
-                sm_out_b => match compile(&sm_out_b, rt, "softmax_b") {
-                    Ok(m) => {
-                        self.compile_count += 1;
-                        Some(m)
-                    }
-                    Err(_) => None,
-                },
+            let sm_out_b = dynamic_kernel::gen_dynamic_softmax(softmax_vocab, s, 1);
+            let softmax_b = match compile(&sm_out_b, rt, "softmax_b") {
+                Ok(m) => {
+                    self.compile_count += 1;
+                    Some(m)
+                }
+                Err(_) => None,
             };
 
             // Allocate softmax IOSurfaces as a pair — both must succeed or both None.
@@ -1413,8 +1422,7 @@ impl DynamicAneTrainer {
                 let io_in = io.proj_inputs.get(&q_key).unwrap();
                 let io_out = io.proj_outputs.get(&q_key).unwrap();
                 io_in.write_packed_f32(&acts.xnorm, &[(&lw.wq, qd)], d, s);
-                let stats = q_kernel
-                    .evaluate_with_stats(&[io_in.as_ptr()], &[io_out.as_ptr()])?;
+                let stats = q_kernel.evaluate_with_stats(&[io_in.as_ptr()], &[io_out.as_ptr()])?;
                 io_out.read_f32(&mut acts.q, 0, qd, s);
                 hw_sample = Some(stats.hw_execution_time_ns);
             } else {

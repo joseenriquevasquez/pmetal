@@ -545,7 +545,10 @@ impl TrainingLoop {
                 AdaptiveAction::Continue
             }
             AdaptiveAction::Rollback => {
-                tracing::warn!(step = self.step, "Divergence detected — rolling back to best snapshot");
+                tracing::warn!(
+                    step = self.step,
+                    "Divergence detected — rolling back to best snapshot"
+                );
                 if self.restore_best_weights(model) {
                     AdaptiveAction::Rollback
                 } else {

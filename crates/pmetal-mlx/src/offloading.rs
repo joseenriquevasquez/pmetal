@@ -588,14 +588,14 @@ impl Drop for GradientOffloader {
 }
 
 // =============================================================================
-// Frozen Parameter Offloading (Unsloth-style)
+// Frozen Parameter Offloading
 // =============================================================================
 
 /// Frozen parameter manager for memory-efficient LoRA training.
 ///
-/// This implements Unsloth's optimization where frozen base model weights
-/// are offloaded to CPU during training, keeping only trainable LoRA adapters
-/// on GPU. This can reduce GPU memory by 50-70% for large models.
+/// Frozen base model weights are offloaded to CPU during training, keeping
+/// only trainable LoRA adapters on GPU. This can reduce GPU memory by 50-70%
+/// for large models.
 ///
 /// # How It Works
 ///

@@ -1,8 +1,8 @@
 //! Dynamic quantization scheduling.
 //!
 //! Determines the best quantization type for each layer based on an Importance Matrix (IMatrix).
-//! Implements the "Dynamic 2.0" strategy inspired by Unsloth's approach, and additionally
-//! supports KL-divergence calibrated per-tensor quantization type selection.
+//! Implements a dynamic quantization strategy using importance-based layer sensitivity, and
+//! additionally supports KL-divergence calibrated per-tensor quantization type selection.
 //!
 //! # Strategy
 //!
@@ -21,7 +21,6 @@
 //!
 //! # References
 //!
-//! - [Unsloth Dynamic 2.0](https://docs.unsloth.ai/basics/unsloth-dynamic-2.0-ggufs)
 //! - [llama.cpp imatrix](https://github.com/ggml-org/llama.cpp/blob/master/tools/imatrix/README.md)
 
 use crate::imatrix::IMatrix;

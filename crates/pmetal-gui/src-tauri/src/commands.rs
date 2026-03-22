@@ -1758,7 +1758,7 @@ pub async fn fuse_lora(
     lora_path: String,
     output_dir: String,
 ) -> Result<FuseResult> {
-    // Resolve remote model IDs (e.g. "unsloth/Qwen3-0.6B-Base") before the
+    // Resolve remote model IDs (e.g. "Qwen/Qwen3-0.6B-Base") before the
     // blocking fuse step, since `run_fuse_in_process` cannot be async.
     let resolved_base = resolve_model_path(&base_model).await?;
     let base_model_task = resolved_base.to_string_lossy().into_owned();
@@ -1930,7 +1930,7 @@ pub async fn quantize_model(
     quant_type: String,
     output_dir: String,
 ) -> Result<String> {
-    // Resolve remote model IDs (e.g. "unsloth/Qwen3-0.6B-Base") to local cache paths
+    // Resolve remote model IDs (e.g. "Qwen/Qwen3-0.6B-Base") to local cache paths
     let resolved_path = resolve_model_path(&model_id).await?;
     let model_path = resolved_path.to_string_lossy().into_owned();
     let quant_type_task = quant_type.clone();

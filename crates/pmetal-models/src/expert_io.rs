@@ -30,9 +30,7 @@ use crate::expert_layout::ExpertPackLayout;
 
 /// Optimal I/O thread count based on device memory bandwidth.
 fn io_thread_count() -> usize {
-    match pmetal_metal::context::MetalContext::global()
-        .map(|ctx| ctx.properties().device_tier)
-    {
+    match pmetal_metal::context::MetalContext::global().map(|ctx| ctx.properties().device_tier) {
         Ok(pmetal_metal::context::DeviceTier::Base) => 2,
         Ok(pmetal_metal::context::DeviceTier::Pro) => 4,
         Ok(pmetal_metal::context::DeviceTier::Max) => 6,

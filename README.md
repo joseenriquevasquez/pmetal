@@ -68,7 +68,7 @@ pmetal infer \
 # Knowledge distillation
 pmetal distill \
   --teacher Qwen/Qwen3-4B \
-  --student unsloth/Qwen3.5-0.8B-Base \
+  --student Qwen/Qwen3.5-0.8B-Base \
   --dataset train.jsonl
 
 # GRPO reasoning training
@@ -392,7 +392,7 @@ Custom Metal shaders provide significant speedups:
 - **FlashAttention**: O(n) memory attention with fused softmax, tier-aware block sizes
 - **Fused GDN**: Gated Delta Network recurrence kernel (ported from FLA Triton) — single-pass state update with SIMD reductions
 - **Fused LoRA**: Combined forward pass for adapter layers (~2x speedup with `lora-metal-fused` feature)
-- **Fused Cross-Entropy**: Unsloth-style chunked loss computation
+- **Fused Cross-Entropy**: Chunked vocabulary loss computation
 - **Fused Linear Cross-Entropy**: Skips logits materialization entirely
 - **Fused RoPE**: Rotary position embeddings in-kernel
 - **Fused SwiGLU**: Fused gate + activation with tier-tuned threadgroups
@@ -611,5 +611,5 @@ Licensed under either of MIT or Apache-2.0.
 
 - [MLX](https://github.com/ml-explore/mlx) - Apple's machine learning framework
 - [mlx-rs](https://github.com/oxideai/mlx-rs) - Rust bindings for MLX
-- [Unsloth](https://github.com/unslothai/unsloth) - Inspiration for fused kernels
+- Fused kernel techniques — see THIRD_PARTY_NOTICES for attributions
 - [Tauri](https://tauri.app) - Desktop application framework

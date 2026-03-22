@@ -21,7 +21,7 @@ pub use models::{ModelSource, ModelsTab, write_training_info};
 pub use training::{TrainingAction, TrainingStatus, TrainingTab};
 
 /// Extract a short model name from a model ID.
-/// e.g. "unsloth/Qwen3-0.6B" → "Qwen3-0.6B", "trained/foo" → "foo"
+/// e.g. "Qwen/Qwen3-0.6B" → "Qwen3-0.6B", "trained/foo" → "foo"
 pub fn model_short_name(model_id: &str) -> String {
     model_id.rsplit('/').next().unwrap_or(model_id).to_string()
 }

@@ -7,7 +7,7 @@
 //! - Grouped-query attention (GQA)
 //! - Multi-query attention (MQA)
 //!
-//! ## Backend Selection (Unsloth-style)
+//! ## Backend Selection
 //!
 //! The attention dispatcher automatically selects the best backend based on:
 //! 1. Whether sequences are packed (use VarLen)
@@ -170,7 +170,7 @@ impl SequenceInfo {
     }
 }
 
-/// Attention backend dispatcher (Unsloth-style).
+/// Attention backend dispatcher.
 ///
 /// Automatically selects the optimal attention backend based on:
 /// - Sequence packing status

@@ -821,8 +821,7 @@ fn run_qlora_path(
         let adaptive_config = AdaptiveLrConfig::for_lora();
         let control_file = PathBuf::from(output_dir).join(".lr_control.json");
         training_loop.enable_adaptive_lr_with_control(adaptive_config, control_file);
-        training_loop
-            .set_snapshot_persist_dir(checkpoint_manager.checkpoint_dir().to_path_buf());
+        training_loop.set_snapshot_persist_dir(checkpoint_manager.checkpoint_dir().to_path_buf());
     }
 
     if config.resume {
@@ -980,8 +979,7 @@ fn run_lora_path(
         let adaptive_config = AdaptiveLrConfig::for_lora();
         let control_file = PathBuf::from(output_dir).join(".lr_control.json");
         training_loop.enable_adaptive_lr_with_control(adaptive_config, control_file);
-        training_loop
-            .set_snapshot_persist_dir(checkpoint_manager.checkpoint_dir().to_path_buf());
+        training_loop.set_snapshot_persist_dir(checkpoint_manager.checkpoint_dir().to_path_buf());
     }
 
     if config.resume {

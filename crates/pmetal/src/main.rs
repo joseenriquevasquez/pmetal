@@ -149,11 +149,11 @@ enum Commands {
         #[arg(long, default_value = "16")]
         lora_r: usize,
 
-        /// LoRA alpha (scaling factor). Unsloth recommends 2x rank.
+        /// LoRA alpha (scaling factor). Recommended: 2x rank.
         #[arg(long, default_value = "32")]
         lora_alpha: f32,
 
-        /// Learning rate. Unsloth recommends 2e-4 for most tasks.
+        /// Learning rate. Recommended: 2e-4 for most tasks.
         #[arg(long, default_value = "2e-4")]
         learning_rate: f64,
 
@@ -228,7 +228,7 @@ enum Commands {
         log_metrics: Option<String>,
 
         /// Separate learning rate for embedding layers.
-        /// Unsloth recommends 5e-5 for embeddings vs 2e-4 for LoRA params.
+        /// Recommended: 5e-5 for embeddings vs 2e-4 for LoRA params.
         /// Improves training stability for large vocabulary models.
         #[arg(long)]
         embedding_lr: Option<f32>,
@@ -513,7 +513,7 @@ enum Commands {
     /// Benchmark generation loop timing (detailed profiling)
     BenchGen {
         /// Model to benchmark
-        #[arg(short, long, default_value = "unsloth/Qwen3-0.6B")]
+        #[arg(short, long, default_value = "Qwen/Qwen3-0.6B")]
         model: String,
     },
 

@@ -742,7 +742,7 @@ Initial public release.
 - **pmetal-metal**: Custom Metal compute kernels:
   - FlashAttention with O(n) memory
   - Fused LoRA forward pass
-  - Fused cross-entropy (Unsloth-style chunked loss)
+  - Fused cross-entropy (chunked vocabulary loss)
   - Fused RoPE
   - Fused sampler with JIT compilation
   - Fused DoRA kernels

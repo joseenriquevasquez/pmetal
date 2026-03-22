@@ -542,11 +542,11 @@ impl std::fmt::Debug for FusedLoraTrainer {
 }
 
 // =============================================================================
-// FUSED LINEAR + CROSS-ENTROPY (UNSLOTH'S SECRET SAUCE)
+// FUSED LINEAR + CROSS-ENTROPY
 // =============================================================================
 //
-// This is the key memory optimization from unsloth: compute cross-entropy loss
-// directly from hidden states, without materializing the full logits tensor.
+// Key memory optimization: compute cross-entropy loss directly from hidden
+// states, without materializing the full logits tensor.
 //
 // Memory savings example:
 // - batch=4, seq=1024, vocab=150K, fp16 → logits would be 1.2GB

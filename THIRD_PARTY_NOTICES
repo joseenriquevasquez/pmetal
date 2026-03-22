@@ -34,6 +34,7 @@ pmetal-mlx-sys crate. MLX is Apple's open-source machine learning framework.
 
 Source: https://github.com/ml-explore/mlx
 License: MIT
+Reference: MLX: Benchmarking On-Device ML on Apple Silicon (https://arxiv.org/abs/2510.18921)
 
 
 2. flash-linear-attention (FLA)
@@ -65,6 +66,7 @@ The algorithm and structure are derived directly from the original source.
 
 Source: https://github.com/fla-org/flash-linear-attention
 License: MIT
+Reference: Gated Delta Networks: Improving Mamba2 with Delta Rule (https://arxiv.org/abs/2412.06464)
 File: crates/pmetal-metal/src/kernels/metal/fused_gdn.metal
 
 
@@ -97,6 +99,7 @@ follow the original design.
 
 Source: https://github.com/philipturner/metal-flash-attention
 License: MIT
+Reference: FlashAttention-2 (https://arxiv.org/abs/2307.08691)
 File: crates/pmetal-metal/src/kernels/metal/flash_attention.metal
 
 
@@ -167,5 +170,7 @@ No source code was copied from the original repository.
 
 Source: https://github.com/unslothai/unsloth
 License: Apache 2.0
+References: LoRA: Low-Rank Adaptation of Large Language Models (https://arxiv.org/abs/2106.09685),
+            Cut Your Losses in Large-Vocabulary Language Models (https://arxiv.org/abs/2411.09009)
 Files: crates/pmetal-metal/src/kernels/metal/fused_cross_entropy.metal,
        crates/pmetal-metal/src/kernels/metal/fused_lora.metal

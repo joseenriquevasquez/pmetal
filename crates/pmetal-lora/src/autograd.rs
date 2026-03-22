@@ -1,8 +1,8 @@
 //! Custom LoRA Autograd with In-Place Gradients
 //!
-//! This module implements unsloth-style custom autograd for LoRA training.
-//! Instead of relying on framework autodiff (which saves all intermediate activations),
-//! we compute gradients explicitly, saving only what's needed:
+//! This module implements custom autograd for LoRA training that minimizes
+//! activation memory. Instead of relying on framework autodiff (which saves all
+//! intermediate activations), we compute gradients explicitly, saving only what's needed:
 //!
 //! - `x`: Input tensor (for dA computation)
 //! - `x @ A^T`: Intermediate (for dB computation)
@@ -392,7 +392,7 @@ pub fn fused_mlp_forward(
     Ok((output, saved))
 }
 
-/// Fused MLP backward pass (Unsloth-style optimization).
+/// Fused MLP backward pass (single-pass, minimal intermediate allocation).
 ///
 /// This computes gradients for all three MLP projections (gate, up, down)
 /// in a single pass, minimizing intermediate tensor allocations.

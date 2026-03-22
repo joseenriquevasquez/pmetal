@@ -1,4 +1,4 @@
-//! Smart Gradient Checkpointing (Unsloth-style).
+//! Smart Gradient Checkpointing.
 //!
 //! Implements selective activation saving that intelligently chooses which
 //! layers to checkpoint based on memory pressure and compute cost.
@@ -130,7 +130,7 @@ pub struct SmartCheckpointConfig {
 impl Default for SmartCheckpointConfig {
     fn default() -> Self {
         let mut layer_policies = HashMap::new();
-        // Default policies based on Unsloth's approach
+        // Default policies based on layer recompute cost
         layer_policies.insert(LayerType::Attention, CheckpointPolicy::Smart);
         layer_policies.insert(LayerType::Mlp, CheckpointPolicy::AlwaysRecompute);
         layer_policies.insert(LayerType::Norm, CheckpointPolicy::AlwaysRecompute);
@@ -549,8 +549,8 @@ pub fn create_transformer_layer_types(num_layers: usize, has_moe: bool) -> Vec<L
 
 /// Configuration for very long context training (500K+ tokens).
 ///
-/// Implements Unsloth-style disk-based gradient checkpointing for extreme
-/// context lengths that exceed available GPU memory.
+/// Implements disk-based gradient checkpointing for extreme context lengths
+/// that exceed available GPU memory.
 ///
 /// ## How It Works
 ///

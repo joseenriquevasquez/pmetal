@@ -1,4 +1,4 @@
-//! Custom Training with Unsloth-Style Autograd
+//! Custom Training with Minimal-Activation Autograd
 //!
 //! This module implements a custom training step that bypasses MLX autodiff
 //! for LoRA layers, achieving ~50% memory reduction compared to standard
@@ -14,7 +14,7 @@
 //! - `x`: Input to LoRA layer (for computing dA)
 //! - `x @ A^T`: Intermediate (for computing dB)
 //!
-//! This is the technique used by unsloth to achieve 2x memory reduction.
+//! This selective activation saving achieves ~2x memory reduction vs standard autodiff.
 //!
 //! # Architecture
 //!

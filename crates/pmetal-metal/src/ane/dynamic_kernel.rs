@@ -446,7 +446,12 @@ fn emit_variant_noop(
 ///
 /// `variant`: pass `0` for the primary (A) kernel set, `1` for the secondary
 /// (B) set used in dual-die ANE alternation on UltraFusion chips.
-pub fn gen_dynamic_projection(ic: usize, oc: usize, seq: usize, variant: u8) -> DynamicKernelOutput {
+pub fn gen_dynamic_projection(
+    ic: usize,
+    oc: usize,
+    seq: usize,
+    variant: u8,
+) -> DynamicKernelOutput {
     let sp = seq + oc;
     let mut p = MilProgram::new_fp32(ic, sp);
     p.emit_cast("x16", &[1, ic, 1, sp], "x", "fp16");
@@ -1858,9 +1863,18 @@ mod tests {
         // SDPA forward
         let a = gen_dynamic_sdpa_fwd(&dkc, 0);
         let b = gen_dynamic_sdpa_fwd(&dkc, 1);
-        assert_ne!(a.mil_text, b.mil_text, "Variant-B must produce different MIL");
-        assert!(b.mil_text.contains("vscale_v1"), "Variant-B must contain noop scalar");
-        assert!(b.mil_text.contains("vout_v1"), "Variant-B must contain noop output");
+        assert_ne!(
+            a.mil_text, b.mil_text,
+            "Variant-B must produce different MIL"
+        );
+        assert!(
+            b.mil_text.contains("vscale_v1"),
+            "Variant-B must contain noop scalar"
+        );
+        assert!(
+            b.mil_text.contains("vout_v1"),
+            "Variant-B must contain noop output"
+        );
         // Shapes must be identical (no-op is numerically transparent)
         assert_eq!(a.input_layout.ic, b.input_layout.ic);
         assert_eq!(a.output_layout.ic, b.output_layout.ic);
@@ -1882,6 +1896,9 @@ mod tests {
         let sa = gen_dynamic_softmax(100, 32, 0);
         let sb = gen_dynamic_softmax(100, 32, 1);
         assert_ne!(sa.mil_text, sb.mil_text);
-        assert!(sb.mil_text.contains("fp16"), "Softmax variant noop must be fp16");
+        assert!(
+            sb.mil_text.contains("fp16"),
+            "Softmax variant noop must be fp16"
+        );
     }
 }

@@ -332,7 +332,7 @@ impl FalconH1Attention {
         let k = k.transpose_axes(&[0, 2, 1, 3])?;
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
 
-        // Apply key multiplier BEFORE RoPE (matches HF/Unsloth implementation)
+        // Apply key multiplier BEFORE RoPE (matches HF reference implementation)
         let k = if (self.key_multiplier - 1.0).abs() > 1e-7 {
             k.multiply(&Array::from_f32(self.key_multiplier))?
         } else {

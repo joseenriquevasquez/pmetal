@@ -1,6 +1,6 @@
 //! Grouped GEMM MoE - Efficient Mixture of Experts with batched expert computation.
 //!
-//! This implements Unsloth-style grouped GEMM for MoE models, providing
+//! This implements grouped GEMM for MoE models, providing
 //! significant speedups over naive per-expert processing:
 //!
 //! # Performance

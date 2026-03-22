@@ -889,7 +889,9 @@ impl Qwen3NextSparseMoeBlock {
                 },
             ) {
                 Ok(pool) => self.buffer_pool = Some(Arc::new(pool)),
-                Err(e) => tracing::warn!("ExpertBufferPool allocation failed, using legacy copy path: {e}"),
+                Err(e) => tracing::warn!(
+                    "ExpertBufferPool allocation failed, using legacy copy path: {e}"
+                ),
             }
 
             // Reusable fused expert kernel
@@ -1147,10 +1149,10 @@ impl Qwen3NextSparseMoeBlock {
                 // pread directly into 2MB-aligned Metal-registered buffers.
                 // No intermediate copies, no parse_expert_weights.
                 let pool = self.buffer_pool.as_ref().unwrap();
-                let mut aligned_bufs: Vec<pmetal_metal::expert_buffer::AlignedBuffer> =
-                    (0..expert_indices.len())
-                        .map(|_| pool.acquire_blocking())
-                        .collect();
+                let mut aligned_bufs: Vec<pmetal_metal::expert_buffer::AlignedBuffer> = (0
+                    ..expert_indices.len())
+                    .map(|_| pool.acquire_blocking())
+                    .collect();
 
                 ctx.read_experts_aligned(layer_idx, &expert_indices, &mut aligned_bufs)
                     .map_err(|e| {

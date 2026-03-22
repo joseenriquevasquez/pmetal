@@ -415,7 +415,7 @@ impl LoraLinear {
 
     /// Forward pass with gradient context for custom autograd.
     ///
-    /// This is the unsloth-style custom autograd forward that saves minimal state:
+    /// This is the minimal-activation custom autograd forward that saves minimal state:
     /// - `x`: Input tensor (for dA computation)
     /// - `x @ A^T`: Intermediate (for dB computation)
     ///

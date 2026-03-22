@@ -12,7 +12,7 @@ Live teacher inference during training. Highest quality but slowest — both tea
 ```bash
 pmetal distill \
   --teacher Qwen/Qwen3-4B \
-  --student unsloth/Qwen3.5-0.8B-Base \
+  --student Qwen/Qwen3.5-0.8B-Base \
   --dataset train.jsonl
 ```
 
