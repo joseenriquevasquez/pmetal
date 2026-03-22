@@ -12,7 +12,7 @@
 //
 //  References:
 //  - LoRA: https://arxiv.org/abs/2106.09685
-//  - Unsloth: https://github.com/unslothai/unsloth
+//  - LoRA fused kernels: https://arxiv.org/abs/2106.09685
 
 #include <metal_stdlib>
 using namespace metal;
@@ -536,4 +536,4 @@ kernel void lora_forward_inference(
 // These would fuse Q, K, V LoRA projections into a single kernel pass
 
 // Placeholder for fused MLP LoRA kernels (gate/up/down projections with SwiGLU)
-// These would fuse all three projections similar to unsloth's LoRA_MLP
+// These would fuse all three projections into a single kernel pass

@@ -25,7 +25,7 @@
 //! # References
 //!
 //! - "Proximal Policy Optimization Algorithms" (Schulman et al., 2017)
-//! - TRL/Unsloth implementations
+//! - Standard RLHF implementations
 
 use mlx_rs::Array;
 use mlx_rs::error::Exception;

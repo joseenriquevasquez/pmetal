@@ -24,7 +24,7 @@
 //! # Novel Optimization
 //!
 //! The `fused_mlp_lora_forward` kernel fuses the ENTIRE MLP (gate/up/down)
-//! into a single kernel, which is more aggressive than unsloth's approach.
+//! into a single kernel, fusing all three MLP projections in one pass.
 
 use std::ptr::NonNull;
 use std::sync::Arc;

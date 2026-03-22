@@ -21,7 +21,7 @@
 //! 5. Matmul with `x`
 //!
 //! *Note:* Exact fusion of normalization into GEMM is difficult due to the row-norm dependency.
-//! A practical SOTA approach (e.g. Unsloth) often pre-computes the effective weight for inference
+//! A practical SOTA approach pre-computes the effective weight for inference
 //! or uses a specialized kernel that handles the decomposition on-the-fly for memory savings
 //! at the cost of compute.
 //!

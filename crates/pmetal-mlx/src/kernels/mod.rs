@@ -9,7 +9,7 @@
 //! - SwiGLU/GEGLU activations (including Metal-optimized fused MLP)
 //! - Cross-entropy loss computation
 //! - Cut Cross Entropy for 13x longer context
-//! - Metal-accelerated fused linear + cross-entropy (key unsloth optimization)
+//! - Metal-accelerated fused linear + cross-entropy (memory-efficient loss without full logit materialization)
 
 pub mod cross_entropy;
 pub mod cut_cross_entropy;

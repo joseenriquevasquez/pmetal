@@ -12,7 +12,7 @@
 // - Single kernel launch instead of 4+ separate ops
 // - ~15-25% speedup over separate RMSNorm + LoRA
 //
-// This is a novel optimization not found in unsloth or mlx-lm.
+// This is a novel optimization: no existing framework fuses normalization with LoRA.
 // =============================================================================
 
 #include <metal_stdlib>

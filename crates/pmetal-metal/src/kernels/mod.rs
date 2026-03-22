@@ -38,7 +38,7 @@ pub use fused_cross_entropy::{
     FusedCrossEntropy,
     FusedCrossEntropyConfig,
     FusedCrossEntropyOutput,
-    // The key unsloth optimization: fused linear + cross-entropy
+    // Chunked vocabulary optimization: fused linear + cross-entropy
     FusedLinearCrossEntropy,
     FusedLinearCrossEntropyConfig,
     FusedLinearCrossEntropyOutput,

@@ -226,7 +226,7 @@ impl SequencePacker {
 
                 // Loss mask: 1.0 for all positions EXCEPT the last token of each sequence
                 // This prevents cross-sequence gradient flow in packed batches
-                // (Unsloth-style boundary masking)
+                // (sequence boundary masking for packed batches)
                 for i in 0..seq_len {
                     if i == seq_len - 1 {
                         // Last token of this sequence - mask it to prevent

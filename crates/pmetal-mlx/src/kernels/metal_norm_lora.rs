@@ -1,6 +1,6 @@
 //! Metal-accelerated fused RMSNorm + LoRA operations.
 //!
-//! This module provides a novel optimization not found in unsloth or mlx-lm:
+//! This module provides a novel optimization not found in existing frameworks:
 //! fusing RMSNorm with LoRA projection in a single operation.
 //!
 //! # Architecture

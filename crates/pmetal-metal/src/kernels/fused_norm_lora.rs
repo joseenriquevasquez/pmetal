@@ -18,8 +18,7 @@
 //!
 //! # Novel Optimization
 //!
-//! This is a novel optimization not found in unsloth or mlx-lm.
-//! Neither competitor fuses normalization with LoRA.
+//! This is a novel optimization: no existing framework fuses normalization with LoRA.
 
 use std::ptr::NonNull;
 use std::sync::Arc;

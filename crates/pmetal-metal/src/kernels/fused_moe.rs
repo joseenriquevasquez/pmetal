@@ -131,6 +131,14 @@ pub struct FusedMoeExpert {
     config: FusedMoeExpertConfig,
 }
 
+impl std::fmt::Debug for FusedMoeExpert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FusedMoeExpert")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Packed expert weight buffers for a single expert.
 ///
 /// All weights are in quantized form (uint32 packed, bf16 scales/biases).

@@ -82,7 +82,7 @@ pub type MlxMetalOptimizerResult<T> = std::result::Result<T, MlxMetalOptimizerEr
 
 /// Learning rate schedule type.
 ///
-/// Based on SOTA implementations from mlx-lm and Unsloth:
+/// Based on SOTA implementations from mlx-lm:
 /// - `Constant`: Fixed learning rate
 /// - `CosineDecay`: Cosine annealing from init_lr to 0
 /// - `CosineDecayWithWarmup`: Linear warmup followed by cosine decay
@@ -96,7 +96,7 @@ pub enum LrSchedule {
         total_steps: u32,
     },
     /// Linear warmup followed by cosine decay.
-    /// This is the SOTA schedule used by mlx-lm and Unsloth.
+    /// This is the recommended SOTA schedule used by mlx-lm.
     CosineDecayWithWarmup {
         /// Number of warmup steps (typically 5-10% of total).
         warmup_steps: u32,
@@ -266,7 +266,7 @@ impl ParameterLayout {
 
 /// Pre-computed scalar arrays for optimizer efficiency.
 /// These are created once and reused every step to avoid allocation overhead.
-/// Based on SOTA pattern from mlx-lm and Unsloth.
+/// Based on SOTA pattern from mlx-lm.
 struct CachedScalars {
     beta1: Array,
     beta2: Array,
@@ -294,7 +294,7 @@ impl CachedScalars {
 ///
 /// # SOTA Features
 ///
-/// Based on analysis of Unsloth, and mlx-lm:
+/// Based on analysis of mlx-lm and related SOTA implementations:
 /// - **Learning rate scheduling**: Supports constant, cosine decay, and warmup
 /// - **Pre-computed scalars**: Caches beta1, beta2, eps arrays to avoid allocation
 /// - **MLX-native state**: Stores m/v as MLX Arrays for graph connectivity
@@ -1275,7 +1275,7 @@ impl MlxMetalOptimizerBuilder {
     }
 
     /// Set learning rate schedule to cosine decay with warmup.
-    /// SOTA: This is the recommended schedule from Unsloth and mlx-lm.
+    /// SOTA: This is the recommended schedule; typical warmup is 5-10% of total steps.
     /// Typical warmup is 5-10% of total steps.
     pub fn cosine_decay_with_warmup(
         mut self,

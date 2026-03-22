@@ -26,8 +26,7 @@
 //!
 //! # Separate Embedding Learning Rates
 //!
-//! PMetal supports separate learning rates for embeddings, matching Unsloth's
-//! approach for improved training stability:
+//! PMetal supports separate learning rates for embeddings for improved training stability:
 //!
 //! - Embeddings use a lower learning rate (default 5e-5 vs 2e-4 for LoRA)
 //! - Use [`AdamWGroups`] optimizer or the `--embedding-lr` CLI flag
@@ -36,7 +35,7 @@
 //! use pmetal_trainer::{AdamWGroups, AdamWGroupsBuilder};
 //!
 //! let optimizer = AdamWGroupsBuilder::new(2e-4)
-//!     .with_embedding_lr(5e-5)  // Unsloth's default
+//!     .with_embedding_lr(5e-5)  // recommended default
 //!     .with_weight_decay(0.01)
 //!     .build()?;
 //! ```

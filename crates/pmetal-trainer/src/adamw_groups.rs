@@ -3,7 +3,7 @@
 //! This module provides an AdamW optimizer that supports separate learning rates
 //! for different parameter groups, commonly used for:
 //!
-//! - Lower learning rate for embeddings (Unsloth uses 5e-5 vs 2e-4 for LoRA)
+//! - Lower learning rate for embeddings (recommended 5e-5 vs 2e-4 for LoRA)
 //! - Different weight decay for different layers
 //! - Layer-wise learning rate decay
 //!
@@ -370,7 +370,7 @@ impl AdamWGroupsBuilder {
 
     /// Set the embedding learning rate.
     ///
-    /// Unsloth recommends 5e-5 for embeddings (vs 2e-4 for LoRA).
+    /// Recommended default is 5e-5 for embeddings (vs 2e-4 for LoRA).
     pub fn with_embedding_lr(mut self, lr: f32) -> Self {
         self.embedding_lr = Some(lr);
         self

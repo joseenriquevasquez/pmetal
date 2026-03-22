@@ -10,7 +10,7 @@
 //! to gather the logit at the target index first, then subtract the scalar
 //! logsumexp — saving ~4 GB VRAM for 128K-vocab models at typical batch sizes.
 //!
-//! This is the technique used by DeepSeek V3/R1 and Unsloth.
+//! This is the technique used by DeepSeek V3/R1.
 
 use mlx_rs::Array;
 use mlx_rs::error::Exception;

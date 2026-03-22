@@ -64,7 +64,6 @@ tempfile = { workspace = true }
 [lints]
 workspace = true
 
-# Benchmarks will be added later
-# [[bench]]
-# name = "flash_attention"
-# harness = false
+[[bench]]
+name = "ane_kernels"
+harness = false

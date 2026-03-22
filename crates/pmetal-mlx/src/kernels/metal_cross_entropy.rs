@@ -1,6 +1,6 @@
 //! Metal-accelerated fused linear + cross-entropy loss.
 //!
-//! This module provides THE key optimization from unsloth: computing cross-entropy
+//! This module provides a key memory optimization: computing cross-entropy
 //! loss directly from hidden states without ever materializing the full logits tensor.
 //!
 //! # Memory Savings
@@ -200,7 +200,7 @@ fn array_to_metal_buffer_f16(ctx: &MetalContext, array: &Array) -> Result<MetalB
 
 /// Compute fused linear + cross-entropy loss.
 ///
-/// This is THE key optimization from unsloth: computing loss directly from hidden
+/// This is a key memory optimization: computing loss directly from hidden
 /// states without materializing the full `[batch * seq, vocab_size]` logits tensor.
 ///
 /// # Arguments

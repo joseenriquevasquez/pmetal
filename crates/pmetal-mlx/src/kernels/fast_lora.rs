@@ -1,7 +1,7 @@
 //! Fused LoRA operations for efficient fine-tuning.
 //!
 //! This module implements optimized LoRA forward and backward passes using
-//! techniques from Unsloth:
+//! several techniques to minimize overhead:
 //! - Pre-transposed matrices to avoid transpose at forward time
 //! - Scale fused into LoRA B to avoid separate multiply
 //! - Addmm pattern for fused multiply-add operations

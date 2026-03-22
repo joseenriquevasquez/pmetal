@@ -30,7 +30,6 @@
 //! # References
 //!
 //! - Apple ML: https://github.com/apple/ml-cross-entropy
-//! - Unsloth integration: unsloth/kernels/cross_entropy_loss.py
 
 use mlx_rs::error::{Exception, Result};
 use mlx_rs::ops::indexing::TryIndexOp;

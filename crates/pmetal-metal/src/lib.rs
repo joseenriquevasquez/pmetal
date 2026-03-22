@@ -88,7 +88,7 @@ pub use kernels::fused_cross_entropy::{
     FusedCrossEntropy,
     FusedCrossEntropyConfig,
     FusedCrossEntropyOutput,
-    // Key unsloth optimization: fused linear + cross-entropy (skips logits materialization)
+    // Chunked vocabulary optimization: fused linear + cross-entropy (skips logits materialization)
     FusedLinearCrossEntropy,
     FusedLinearCrossEntropyConfig,
     FusedLinearCrossEntropyOutput,

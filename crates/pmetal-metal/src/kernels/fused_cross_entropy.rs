@@ -3,7 +3,7 @@
 //! Fused cross-entropy loss kernel.
 //!
 //! This module provides GPU-accelerated cross-entropy loss computation
-//! following the unsloth optimization pattern:
+//! using a fused forward/backward pattern:
 //!
 //! - Forward: CE(x, y) = logsumexp(x) - x[y]
 //! - Backward: dL/dx = softmax(x) - one_hot(y)
@@ -556,7 +556,7 @@ impl std::fmt::Debug for FusedCrossEntropy {
 // FUSED LINEAR + CROSS-ENTROPY (THE BIG WIN)
 // =============================================================================
 //
-// This is unsloth's secret sauce: compute cross-entropy loss directly from
+// Chunked vocabulary optimization: compute cross-entropy loss directly from
 // hidden states without EVER materializing the full [batch, seq, vocab] logits.
 //
 // Memory savings:
@@ -566,7 +566,7 @@ impl std::fmt::Debug for FusedCrossEntropy {
 
 /// Configuration for fused linear + cross-entropy loss.
 ///
-/// This is the key optimization from unsloth: computing loss directly from
+/// Memory-efficient chunked vocabulary loss: computes loss directly from
 /// hidden states without materializing the `[batch, seq, vocab_size]` logits tensor.
 #[derive(Debug, Clone)]
 pub struct FusedLinearCrossEntropyConfig {
@@ -676,7 +676,7 @@ impl FusedLinearCrossEntropyOutput {
 
 /// Fused linear + cross-entropy loss kernel.
 ///
-/// This is THE key optimization from unsloth that provides 40% memory reduction:
+/// Chunked vocabulary optimization providing up to 40% memory reduction:
 /// - Takes hidden states [num_tokens, hidden_size] directly
 /// - Computes loss WITHOUT materializing full [num_tokens, vocab_size] logits
 /// - Processes vocabulary in chunks to keep memory constant

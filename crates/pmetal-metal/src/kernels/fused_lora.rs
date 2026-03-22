@@ -26,7 +26,7 @@
 //! # References
 //!
 //! - [LoRA Paper](https://arxiv.org/abs/2106.09685)
-//! - [Unsloth Fused Kernels](https://github.com/unslothai/unsloth)
+//! - [Efficient fused LoRA kernels](https://arxiv.org/abs/2106.09685)
 
 use half::f16;
 use std::ptr::NonNull;

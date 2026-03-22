@@ -60,7 +60,7 @@ struct OnlineLogsumexp {
 ///
 /// Uses online softmax to avoid materializing the full softmax distribution.
 /// Handles ignored indices by setting their loss to 0.
-/// Stores logsumexp for efficient backward pass (unsloth optimization).
+/// Stores logsumexp for efficient backward pass (avoids recomputing softmax denominator).
 kernel void fused_cross_entropy_forward(
     device const float* logits [[buffer(0)]],        // [num_tokens, vocab_size]
     device const int* targets [[buffer(1)]],         // [num_tokens]
@@ -225,7 +225,7 @@ kernel void fused_cross_entropy_forward_simd(
     }
 }
 
-/// Fused cross-entropy backward pass (unsloth-style optimization).
+/// Fused cross-entropy backward pass using cached logsumexp.
 ///
 /// Uses cached logsumexp from forward to compute gradients efficiently:
 /// dL/dlogits[i, j] = exp(logits[i,j] - logsumexp[i]) - (1 if j == target[i] else 0)
@@ -460,8 +460,8 @@ kernel void fused_cross_entropy_forward_f16(
 // FUSED LINEAR + CROSS-ENTROPY (THE BIG WIN)
 // =============================================================================
 //
-// This is unsloth's secret sauce: compute cross-entropy loss directly from
-// hidden states without EVER materializing the full [batch, seq, vocab] logits.
+// Fused linear cross-entropy: compute loss directly from hidden states
+// without materializing the full [batch, seq, vocab] logits tensor.
 //
 // Memory savings:
 //   - batch=4, seq=1024, vocab=150K, fp16 → logits would be 1.2GB
@@ -474,7 +474,6 @@ kernel void fused_cross_entropy_forward_f16(
 //   4. Get logit at target index directly
 //   5. Return loss = logsumexp - target_logit
 //
-// Reference: unsloth/unsloth/kernels/cross_entropy_loss.py
 // =============================================================================
 
 #define CE_CHUNK_SIZE 4096
