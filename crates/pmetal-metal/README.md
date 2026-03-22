@@ -10,7 +10,7 @@ This crate provides custom Metal shaders that accelerate LLM training and infere
 
 - **FlashAttention**: O(n) memory attention with fused softmax (forward + backward)
 - **Fused LoRA**: Combined base + adapter forward pass (~2x speedup)
-- **Fused Cross-Entropy**: Chunked loss computation (Unsloth optimization)
+- **Fused Cross-Entropy**: Chunked vocabulary loss (avoids logits materialization)
 - **Fused RoPE**: Rotary position embeddings computed in-kernel
 - **Fused Sampler**: JIT-compiled token sampling
 - **Fused SwiGLU**: MLP activation fusion

@@ -1,8 +1,9 @@
 PMetal Third-Party Notices
 =========================
 
-PMetal includes code derived from or inspired by the following projects.
-This file satisfies the attribution requirements of their respective licenses.
+PMetal incorporates code from, or derives implementations based on, the
+following projects. This file documents attribution as required by their
+respective licenses.
 
 
 1. MLX (Apple Inc.)
@@ -38,8 +39,9 @@ License: MIT
 2. flash-linear-attention (FLA)
 -------------------------------
 
-PMetal's fused_gdn.metal kernel is ported from FLA's Triton implementation
-of the fused recurrent gated delta rule forward kernel.
+PMetal's fused_gdn.metal kernel is a Metal port of FLA's Triton
+implementation of the fused recurrent gated delta rule forward kernel.
+The algorithm and structure are derived directly from the original source.
 
     Copyright (c) 2023-2025 Songlin Yang
 
@@ -69,8 +71,9 @@ File: crates/pmetal-metal/src/kernels/metal/fused_gdn.metal
 3. metal-flash-attention (Philip Turner)
 -----------------------------------------
 
-PMetal's flash_attention.metal references the Metal FlashAttention
-implementation for Apple Silicon.
+PMetal's flash_attention.metal is derived from the Metal FlashAttention
+implementation for Apple Silicon. Tiling strategy and kernel structure
+follow the original design.
 
     Copyright (c) 2024 Philip Turner
 
@@ -100,9 +103,11 @@ File: crates/pmetal-metal/src/kernels/metal/flash_attention.metal
 4. FlashAttention (Tri Dao)
 ---------------------------
 
-PMetal implements the FlashAttention-2 algorithm for Metal. The algorithm
-is described in the paper; no source code was copied from the reference
-CUDA implementation.
+PMetal implements the FlashAttention-2 algorithm for Metal, based on the
+algorithm described in the original paper. The basic fused cross-entropy
+kernel also follows the online softmax approach from the Flash-Attention
+Triton implementation. Both are independent Metal reimplementations; no
+source code was used from the original implementation.
 
     Copyright (c) 2022, the respective contributors, as shown by the AUTHORS file.
     All rights reserved.
@@ -140,9 +145,11 @@ Reference: FlashAttention-2 (https://arxiv.org/abs/2307.08691)
 5. Unsloth (Unsloth AI, Inc.)
 ------------------------------
 
-PMetal's fused cross-entropy, LoRA, and grouped GEMM kernels are inspired
-by optimization patterns from Unsloth. These are independent Metal
-reimplementations of the same algorithmic ideas, not code copies.
+PMetal's fused linear cross-entropy and fused LoRA kernels are independent
+Metal implementations informed by algorithmic techniques from the Unsloth
+project. The chunked vocabulary cross-entropy approach and fused LoRA
+forward/backward strategy follow designs described in Unsloth's source.
+No source code was copied from the original repository.
 
     Copyright 2024- Unsloth AI, Inc.
 
