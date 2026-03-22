@@ -1211,6 +1211,7 @@ pub async fn start_training(
                 cut_cross_entropy: false,
                 ane: config.method == "ane",
                 loss_scale: 1.0,
+                distributed: None,
             },
             config_path: None,
             log_metrics: Some(metrics_path.display().to_string()),
