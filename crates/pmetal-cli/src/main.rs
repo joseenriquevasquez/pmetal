@@ -1923,6 +1923,98 @@ fn main() -> anyhow::Result<()> {
     tokio_main()
 }
 
+// ---------------------------------------------------------------------------
+// Persistent logging
+// ---------------------------------------------------------------------------
+
+/// Initialize logging with file output to `~/.cache/pmetal/logs/{component}.log`.
+///
+/// - **CLI mode**: logs to both stderr and file
+/// - **TUI mode**: logs to file only (stderr would corrupt the terminal), or
+///   to `PMETAL_LOG_FILE` if set for backwards compatibility
+///
+/// The previous log is rotated to `{component}.log.1`.
+fn init_logging(component: &str, suppress_stderr: bool) {
+    // Determine log file path
+    let log_path = if let Ok(custom) = std::env::var("PMETAL_LOG_FILE") {
+        std::path::PathBuf::from(custom)
+    } else {
+        let dir = pmetal_log_dir();
+        let path = dir.join(format!("{component}.log"));
+
+        // Rotate: keep one previous log
+        let prev = dir.join(format!("{component}.log.1"));
+        if path.exists() {
+            let _ = std::fs::rename(&path, &prev);
+        }
+        path
+    };
+
+    let filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(tracing::Level::INFO.into());
+
+    if suppress_stderr {
+        // TUI: file only (no stderr to avoid corrupting terminal)
+        if let Ok(file) = std::fs::File::create(&log_path) {
+            tracing_subscriber::fmt()
+                .with_writer(std::sync::Mutex::new(file))
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .init();
+        }
+    } else {
+        // CLI: stderr + tee to file
+        let file = std::fs::File::create(&log_path).ok();
+        let file = file.map(std::sync::Mutex::new).map(std::sync::Arc::new);
+        let file_clone = file.clone();
+
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(move || TeeWriter {
+                stderr: std::io::stderr(),
+                file: file_clone.clone(),
+            })
+            .init();
+    }
+}
+
+fn pmetal_log_dir() -> std::path::PathBuf {
+    let dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from(".cache"))
+        .join("pmetal")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Writer that tees output to both stderr and a log file.
+struct TeeWriter {
+    stderr: std::io::Stderr,
+    file: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
+}
+
+impl std::io::Write for TeeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.stderr.write(buf)?;
+        if let Some(ref file) = self.file {
+            if let Ok(mut f) = file.lock() {
+                let _ = f.write_all(&buf[..n]);
+            }
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stderr.flush()?;
+        if let Some(ref file) = self.file {
+            if let Ok(mut f) = file.lock() {
+                let _ = f.flush();
+            }
+        }
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn tokio_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -1930,30 +2022,7 @@ async fn tokio_main() -> anyhow::Result<()> {
     // Initialize logging — suppress stderr output when running the TUI
     // to avoid corrupting the raw terminal display.
     let is_tui = matches!(cli.command, Commands::Tui { .. });
-    if is_tui {
-        // In TUI mode, only log to file (if PMETAL_LOG_FILE is set) or discard.
-        if let Ok(log_path) = std::env::var("PMETAL_LOG_FILE") {
-            if let Ok(file) = std::fs::File::create(&log_path) {
-                tracing_subscriber::fmt()
-                    .with_writer(std::sync::Mutex::new(file))
-                    .with_env_filter(
-                        tracing_subscriber::EnvFilter::from_default_env()
-                            .add_directive(tracing::Level::INFO.into()),
-                    )
-                    .with_ansi(false)
-                    .init();
-            }
-            // If File::create fails, fall through silently — tracing is a no-op.
-        }
-        // Otherwise: no subscriber installed, tracing calls are no-ops.
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(tracing::Level::INFO.into()),
-            )
-            .init();
-    }
+    init_logging(if is_tui { "tui" } else { "cli" }, is_tui);
 
     match cli.command {
         Commands::Train {

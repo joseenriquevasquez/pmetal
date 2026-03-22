@@ -7,12 +7,9 @@ use tauri::{Manager, WindowEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("pmetal_gui=info,pmetal_trainer=info,pmetal_mlx=info,pmetal_lora=info,pmetal_models=info,pmetal=info")),
-        )
-        .try_init();
+    // Set up file + stderr logging, plus a panic hook that writes to the log.
+    let log_path = init_logging("gui");
+    install_panic_hook(log_path);
 
     let app_state = AppState::new();
 
@@ -195,4 +192,117 @@ impl AppStateInit {
         *self.cached_models.write().await = models;
         tracing::info!("Refreshed model cache: {count} models found");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent logging
+// ---------------------------------------------------------------------------
+
+/// Log directory: ~/.cache/pmetal/logs/
+fn log_dir() -> std::path::PathBuf {
+    let dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from(".cache"))
+        .join("pmetal")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Initialize logging with both stderr and file output.
+///
+/// Log file: `~/.cache/pmetal/logs/{component}.log`
+/// Rotates on startup (previous log renamed to `{component}.log.1`).
+/// Returns the log file path for use in the panic hook.
+fn init_logging(component: &str) -> Option<std::path::PathBuf> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(
+            "pmetal_gui=info,pmetal_trainer=info,pmetal_mlx=info,pmetal_lora=info,pmetal_models=info,pmetal=info",
+        )
+    });
+
+    let dir = log_dir();
+    let log_path = dir.join(format!("{component}.log"));
+
+    // Rotate: keep one previous log
+    let prev = dir.join(format!("{component}.log.1"));
+    if log_path.exists() {
+        let _ = std::fs::rename(&log_path, &prev);
+    }
+
+    let file = match std::fs::File::create(&log_path) {
+        Ok(f) => f,
+        Err(_) => {
+            // Fall back to stderr-only logging
+            let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+            return None;
+        }
+    };
+
+    // Tee writer: stderr + file
+    let file = std::sync::Arc::new(std::sync::Mutex::new(file));
+    let file_clone = file.clone();
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(move || TeeWriter {
+            stderr: std::io::stderr(),
+            file: Some(file_clone.clone()),
+        })
+        .try_init();
+
+    Some(log_path)
+}
+
+/// Writer that tees output to both stderr and a log file.
+struct TeeWriter {
+    stderr: std::io::Stderr,
+    file: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
+}
+
+impl std::io::Write for TeeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.stderr.write(buf)?;
+        if let Some(ref file) = self.file {
+            if let Ok(mut f) = file.lock() {
+                // Strip ANSI escape codes for the file
+                let _ = f.write_all(&buf[..n]);
+            }
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stderr.flush()?;
+        if let Some(ref file) = self.file {
+            if let Ok(mut f) = file.lock() {
+                let _ = f.flush();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Install a panic hook that writes crash details to the log file.
+///
+/// On panic, appends the panic info + backtrace to the log file so that
+/// even if the GUI exits immediately, crash context is preserved on disk.
+fn install_panic_hook(log_path: Option<std::path::PathBuf>) {
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Write to the log file directly (tracing may not work in a panic)
+        if let Some(ref path) = log_path {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
+                let _ = writeln!(f, "\n=== PANIC ===");
+                let _ = writeln!(f, "Time: {:?}", std::time::SystemTime::now());
+                let _ = writeln!(f, "{info}");
+                let bt = std::backtrace::Backtrace::force_capture();
+                let _ = writeln!(f, "{bt}");
+                let _ = writeln!(f, "=== END PANIC ===\n");
+            }
+        }
+        // Also log via tracing (may or may not work depending on panic context)
+        tracing::error!("PANIC: {info}");
+        original(info);
+    }));
 }
