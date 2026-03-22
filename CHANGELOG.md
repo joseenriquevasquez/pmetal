@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.13] - 2026-03-22
+
+### Added
+
+- **Warmup-aware adaptive LR**: Grace period now automatically extends to cover the LR scheduler's warmup duration via `set_warmup_steps()`, preventing false divergence triggers during the normal LR ramp. Backed by ZClip/SPAM research — loss increasing during warmup is expected behavior
+- **`WarmupCapped` LR event**: Optional early warmup monitoring (disabled by default) for pre-training runs where loss rise during warmup may indicate problems. Enable with `warmup_max_loss_increase: 0.03-0.05`
+
+- **Metal 4 / MPP kernel suite**: 8 Metal Performance Primitives kernels for M5 (Apple10) NAX hardware acceleration, compiled as a separate `pmetal_kernels_metal4.metallib` with automatic runtime dispatch
+  - `mpp_gemm.metal`: Core GEMM with Morton ordering, fp16/fp32 variants, and alpha/beta accumulation via cooperative tensor postfix fusion (BK=128 K-loop per MPP Guide Section 2.3.4)
+  - `mpp_flash_attention.metal`: FlashAttention-2 with both QK and PV block GEMMs via matmul2d — QK uses 32x32 tiles, PV uses 4 chunks of 32x32 for D=128, P stored as half for PV matmul (30KB threadgroup memory budget)
+  - `mpp_fused_swiglu.metal`: Fused SwiGLU MLP — gate and up projections via matmul2d into threadgroup tiles, SwiGLU activation as cooperative post-step
+  - `mpp_fused_lora.metal`: Fully fused LoRA forward — base projection via matmul2d, xA computed cooperatively in threadgroup scratch (shared across output elements), LoRA overlay added per-element. Training variant saves xA for backward pass
+  - `mpp_fused_norm_lora.metal`: Fused RMSNorm + Linear + LoRA — SIMD cooperative RMS reduction, vectorized norm+dot for base projection, xA computed once and shared via threadgroup scratch
+  - `mpp_grouped_gemm.metal`: MoE grouped GEMM with per-expert Morton ordering for LLC cache locality, sequential expert-offset tile lookup
+  - `mpp_dw_gemm.metal`: ANE training weight gradient GEMM — simple overwrite and alpha/beta accumulation paths with cooperative tensor postfix fusion
+  - `mpp_quantized.metal`: NAX quantized inference — 4-bit (on-the-fly dequant + matmul2d, BK=32) and 8-bit (on-the-fly dequant with per-group scale, BK=64) variants
+- **Dual metallib build system**: Conditional Metal 4 compilation (`-std=metal4.0 -target air64-apple-macos26.0`) when Metal compiler >= 400 and SDK >= 26.0, with `has_metal4` cfg flag for Rust-side conditional compilation
+- **Metal 4 pipeline cache**: `PipelineCache::load_metal4_library()`, `get_or_create_metal4_pipeline()` with function constant support and `"metal4:"` key prefix
+- **NAX detection**: `DeviceProperties::has_nax()` (Apple10+ / architecture gen >= 17), automatic Metal 4 library loading when NAX is available
+- **MPP GEMM Rust dispatch** (`mpp_gemm.rs`): `MppGemm` with `is_available()` check, type-erased `execute(&dyn AsMetalBuffer)`, Morton ordering via function constants, linearized 1D grid
+- **Benchmark infrastructure** (`mpp_bench.rs`): `bench_gpu_op()` with warmup/timed iterations, `bench_comparative()` for Metal 3 vs Metal 4 side-by-side, `GemmBenchConfig` with standard problem sizes from decode (M=1) to training (M=2048)
+- **Generic FP8 quantization** (`fp8_utils.rs`): `quantize_model_linears()` via `ModuleParameters` trait traversal — works for all 18 architectures
+
+### Changed
+
+- **Crate consolidation**: `pmetal-cli` merged into `pmetal` crate — SDK facade + CLI binary in one crate. `cargo build -p pmetal` now builds the binary (feature-gated behind `cli`). Library-only usage: `--no-default-features --features core`
+- **Adaptive LR defaults (conservative)**: `divergence_slope_threshold` 0.05 → 0.005, `warmup_fraction` 0.15 → 0.25, warmup monitoring disabled by default. Grace period tied to actual LR scheduler warmup_steps instead of a fixed fraction of total steps
+- **Metal 3 fused_swiglu_forward_f16**: Rewritten with SIMD cooperative reduction (was per-thread independent dots)
+- **Metal 3 fused_cross_entropy**: Label smoothing enabled in SIMD path, `use_simd` now defaults to true for all vocab sizes
+- **Metal 3 grouped_gemm backward_dx**: Replaced untiled O(M*N*K) inner loop with BLOCK_K-sized N-reduction strips using threadgroup staging
+- **FP8 dispatcher**: Changed catch-all error to 18 explicit match arms calling generic `quantize_model_linears()`
+
+### Fixed
+
+- **mpp_fused_norm_lora.metal 512KB threadgroup alloc**: `threadgroup half norm_tile[64*4096]` (524KB) exceeded 32KB limit — would crash pipeline creation. Rewrote to use 68-float scratch buffer
+- **mpp_fused_norm_lora.metal LoRA O(R*H) per output**: LoRA recomputed `xA` from scratch for every output element. Now computes xA once cooperatively and shares via threadgroup scratch
+- **mpp_quantized.metal 8-bit unscaled output**: Per-group scale was deferred to nonexistent "separate pass". Rewrote with accumulation loop applying scale during on-the-fly dequantization
+- **mpp_gemm.rs buffer type mismatch**: `execute()` took `MetalBuffer<f32>` but dispatched to f16 kernels. Changed to `&dyn AsMetalBuffer` (type-erased)
+- **mpp_gemm.rs accumulate buffer binding**: Accumulate kernel (A=0, B=1, C=2, D=3, params=4) was bound with params at index 3 and missing D buffer. Fixed index mapping
+- **mpp_flash_attention.metal scalar PV GEMM**: O += P @ V used per-element scalar loops despite header claiming block GEMM. Implemented via matmul2d with 4 chunks of 32x32 for D=128
+- **mpp_fused_lora.metal stub LoRA phases**: Only base projection was implemented. Added cooperative xA computation + per-element LoRA overlay for both training and inference variants
+- **matmul2d_descriptor tile size mismatch** (prior diligence): 6 kernels had `desc(32,32)` producing 32x32 threadgroup tiles but Rust dispatch strided by 64 — 75% of output uncomputed. Fixed to `desc(64,64)` except FlashAttention (correctly 32x32 for Bq=Bk=32)
+- **Adaptive LR divergence threshold too high**: `divergence_slope_threshold` of 0.05 required ~200% loss increase over 40 steps — effectively dead code. Reduced to 0.005 (20% over 40 steps)
+- **Adaptive LR step counter in run_packed**: Accumulated losses were all fed to the adaptive controller with the same batch-end step number. Now retroactively sets the correct per-step value so the grace period and detection windows align properly
+- **Clippy `needless_return`**: Removed bare `return` in `pmetal-metal/build.rs` match arm
+
 ## [0.3.12] - 2026-03-21
 
 ### Added
