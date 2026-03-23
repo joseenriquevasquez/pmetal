@@ -382,11 +382,31 @@ impl AttentionDispatcher {
             AttentionBackend::VarLen => fast_sdpa(q, k, v, scale, &mask)?,
 
             // MetalKernel: custom fused Metal kernels (e.g. softcap, sliding window)
-            // are invoked at the model level via crate::kernels::fused_sdpa.  For
-            // dispatch purposes we fall back to MlxFast which correctly handles the
-            // general case; model code that requires the fused kernel calls it
-            // directly rather than going through this dispatcher.
-            AttentionBackend::MetalKernel => fast_sdpa(q, k, v, scale, &mask)?,
+            // are routed through the shared fused attention wrapper so the
+            // dispatcher and direct model calls use the same backend logic.
+            AttentionBackend::MetalKernel => {
+                let mask_type = match (config.is_causal, config.sliding_window) {
+                    (_, Some(window)) => {
+                        crate::kernels::fused_attention::AttentionMaskType::SlidingWindow(
+                            window as i32,
+                        )
+                    }
+                    (true, None) => crate::kernels::fused_attention::AttentionMaskType::Causal,
+                    (false, None) => crate::kernels::fused_attention::AttentionMaskType::None,
+                };
+
+                let fused_config = crate::kernels::fused_attention::FusedAttentionConfig {
+                    num_heads: q.dim(1),
+                    num_kv_heads: k.dim(1),
+                    head_dim: q.dim(3),
+                    scale,
+                    mask_type,
+                    logit_softcapping: config.has_softcap().then_some(config.softcap),
+                };
+
+                crate::kernels::fused_attention::fused_sdpa(q, k, v, &fused_config, None)
+                    .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?
+            }
         };
 
         Ok((output, backend))

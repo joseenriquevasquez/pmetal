@@ -5079,6 +5079,7 @@ dependencies = [
 name = "pmetal-mlx"
 version = "0.3.13"
 dependencies = [
+ "dirs",
  "half",
  "num-traits",
  "pmetal-core",
@@ -5088,6 +5089,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
  "zerocopy",

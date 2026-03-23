@@ -166,6 +166,32 @@ impl MlxMetalBridge {
         unsafe { metal_buffer_from_ptr(ctx, ptr as *mut f16, array.size()) }
     }
 
+    /// Create a zero-copy buffer view from a packed `u32` MLX array.
+    pub fn view_u32<'a>(
+        ctx: &'a MetalContext,
+        array: &'a Array,
+    ) -> MetalResult<MetalBufferView<'a, u32>> {
+        if array.dtype() != Dtype::Uint32 {
+            return Err(MetalError::InvalidConfig(format!(
+                "view_u32 requires Uint32 array, got {:?}",
+                array.dtype()
+            )));
+        }
+
+        array
+            .eval()
+            .map_err(|e| MetalError::InvalidConfig(format!("Failed to eval array: {e}")))?;
+
+        let ptr = unsafe { mlx_sys::mlx_array_data_uint32(array.as_ptr()) };
+        if ptr.is_null() {
+            return Err(MetalError::InvalidConfig(
+                "MLX array data pointer is null".into(),
+            ));
+        }
+
+        unsafe { metal_buffer_from_ptr(ctx, ptr as *mut u32, array.size()) }
+    }
+
     /// Copy MLX array data to a new f32 Metal buffer, converting dtype if needed.
     ///
     /// This method is safer than zero-copy as it owns its data, but slower

@@ -11,15 +11,26 @@
 //! - Reduced memory bandwidth by avoiding intermediate tensor materialization
 //! - Native GQA support eliminates expand_kv_heads overhead
 
+use std::{sync::OnceLock, time::Instant};
+
 use mlx_rs::{
-    Array,
+    Array, Dtype,
     error::Exception,
     fast::{ScaledDotProductAttentionMask, scaled_dot_product_attention},
     ops::indexing::{Ellipsis, IndexOp},
 };
+use pmetal_metal::{
+    FlashAttention, FlashAttentionConfig as MetalFlashAttentionConfig, MetalContext,
+    MppFlashAttention, MppFlashAttentionConfig,
+    context::{DeviceProperties, DeviceTier},
+};
+use serde::{Deserialize, Serialize};
+
+use super::persistent_cache::PersistentChoiceCache;
+use super::utils::{array_to_metal_buffer_f16, metal_buffer_into_array_f16};
 
 /// Attention mask type for fused attention.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AttentionMaskType {
     /// No mask (for bidirectional attention).
     None,
@@ -27,6 +38,104 @@ pub enum AttentionMaskType {
     Causal,
     /// Sliding window causal mask with given window size.
     SlidingWindow(i32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum AttentionBackendChoice {
+    MlxFast,
+    MetalFlash,
+    MppFlash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AttentionDispatchKey {
+    device_name: String,
+    device_tier: &'static str,
+    dtype: &'static str,
+    batch: i32,
+    num_heads: i32,
+    num_kv_heads: i32,
+    query_seq_len: i32,
+    kv_seq_len: i32,
+    head_dim: i32,
+    mask_type: AttentionMaskType,
+}
+
+static ATTENTION_BACKEND_CACHE: OnceLock<PersistentChoiceCache<AttentionBackendChoice>> =
+    OnceLock::new();
+
+fn attention_backend_cache() -> &'static PersistentChoiceCache<AttentionBackendChoice> {
+    ATTENTION_BACKEND_CACHE.get_or_init(|| PersistentChoiceCache::new("attention_backends.json"))
+}
+
+fn device_tier_key(tier: DeviceTier) -> &'static str {
+    match tier {
+        DeviceTier::Base => "base",
+        DeviceTier::Pro => "pro",
+        DeviceTier::Max => "max",
+        DeviceTier::Ultra => "ultra",
+    }
+}
+
+fn dtype_key(dtype: Dtype) -> Option<&'static str> {
+    match dtype {
+        Dtype::Float16 => Some("f16"),
+        Dtype::Float32 => Some("f32"),
+        Dtype::Bfloat16 => Some("bf16"),
+        _ => None,
+    }
+}
+
+impl AttentionDispatchKey {
+    fn new(
+        props: &DeviceProperties,
+        dtype: Dtype,
+        q_shape: &[i32],
+        k_shape: &[i32],
+        mask_type: AttentionMaskType,
+    ) -> Option<Self> {
+        Some(Self {
+            device_name: props.name.clone(),
+            device_tier: device_tier_key(props.device_tier),
+            dtype: dtype_key(dtype)?,
+            batch: q_shape[0],
+            num_heads: q_shape[1],
+            num_kv_heads: k_shape[1],
+            query_seq_len: q_shape[2],
+            kv_seq_len: k_shape[2],
+            head_dim: q_shape[3],
+            mask_type,
+        })
+    }
+
+    fn cache_key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}",
+            self.device_name,
+            self.device_tier,
+            self.dtype,
+            self.batch,
+            self.num_heads,
+            self.num_kv_heads,
+            self.query_seq_len,
+            self.kv_seq_len,
+            self.head_dim,
+            self.mask_type
+        )
+    }
+}
+
+fn cached_attention_backend(key: &AttentionDispatchKey) -> Option<AttentionBackendChoice> {
+    attention_backend_cache().get(&key.cache_key())
+}
+
+fn cache_attention_backend(key: AttentionDispatchKey, backend: AttentionBackendChoice) {
+    attention_backend_cache().insert(key.cache_key(), backend);
+}
+
+#[cfg(test)]
+fn clear_cached_attention_backends() {
+    attention_backend_cache().clear();
 }
 
 /// Configuration for fused attention.
@@ -116,12 +225,211 @@ pub fn fused_sdpa(
     config: &FusedAttentionConfig,
     custom_mask: Option<&Array>,
 ) -> Result<Array, Exception> {
+    if let Some(output) =
+        try_selected_attention_backend(queries, keys, values, config, custom_mask)?
+    {
+        return Ok(output);
+    }
+
+    if let Some(output) = try_metal_flash_attention(queries, keys, values, config, custom_mask)? {
+        return Ok(output);
+    }
+
     // Apply logit softcapping if configured (Gemma2 style)
     // This requires pre/post processing around attention
     if let Some(cap) = config.logit_softcapping {
-        return fused_sdpa_with_softcapping(queries, keys, values, config, custom_mask, cap);
+        return manual_sdpa_with_softcapping(queries, keys, values, config, custom_mask, cap);
     }
 
+    fast_fused_sdpa(queries, keys, values, config, custom_mask)
+}
+
+fn try_selected_attention_backend(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    config: &FusedAttentionConfig,
+    custom_mask: Option<&Array>,
+) -> Result<Option<Array>, Exception> {
+    let metal_ctx = match MetalContext::global() {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            tracing::debug!("Metal attention selection unavailable, falling back: {error}");
+            return Ok(None);
+        }
+    };
+
+    let Some(dispatch_key) = benchmarkable_attention_dispatch_key(
+        queries,
+        keys,
+        values,
+        config,
+        custom_mask,
+        metal_ctx.properties(),
+    ) else {
+        return Ok(None);
+    };
+
+    if let Some(backend) = cached_attention_backend(&dispatch_key) {
+        return execute_attention_backend(backend, queries, keys, values, config, &metal_ctx)
+            .map(Some)
+            .or_else(|error| {
+                tracing::debug!(
+                    "Cached {:?} attention backend failed, falling back to MLX fast SDPA: {error}",
+                    backend
+                );
+                cache_attention_backend(dispatch_key.clone(), AttentionBackendChoice::MlxFast);
+                fast_fused_sdpa(queries, keys, values, config, None).map(Some)
+            });
+    }
+
+    let (backend, output) =
+        benchmark_attention_backends(queries, keys, values, config, &metal_ctx)?;
+    cache_attention_backend(dispatch_key, backend);
+    Ok(Some(output))
+}
+
+fn benchmarkable_attention_dispatch_key(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    config: &FusedAttentionConfig,
+    custom_mask: Option<&Array>,
+    props: &DeviceProperties,
+) -> Option<AttentionDispatchKey> {
+    if custom_mask.is_some() || config.logit_softcapping.is_some() {
+        return None;
+    }
+
+    if !flash_attention_supported(queries, keys, values, custom_mask) {
+        return None;
+    }
+
+    let q_shape = queries.shape();
+    let k_shape = keys.shape();
+    AttentionDispatchKey::new(props, queries.dtype(), q_shape, k_shape, config.mask_type)
+}
+
+fn execute_attention_backend(
+    backend: AttentionBackendChoice,
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    config: &FusedAttentionConfig,
+    metal_ctx: &std::sync::Arc<MetalContext>,
+) -> Result<Array, Exception> {
+    match backend {
+        AttentionBackendChoice::MlxFast => fast_fused_sdpa(queries, keys, values, config, None),
+        AttentionBackendChoice::MetalFlash => {
+            run_metal_flash_attention(queries, keys, values, config, metal_ctx)
+        }
+        AttentionBackendChoice::MppFlash => {
+            run_mpp_flash_attention(queries, keys, values, config, metal_ctx)
+        }
+    }
+}
+
+fn benchmark_attention_backends(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    config: &FusedAttentionConfig,
+    metal_ctx: &std::sync::Arc<MetalContext>,
+) -> Result<(AttentionBackendChoice, Array), Exception> {
+    let mlx_start = Instant::now();
+    let mlx_output = fast_fused_sdpa(queries, keys, values, config, None)?;
+    mlx_output.eval()?;
+    let mlx_elapsed = mlx_start.elapsed();
+    let reference_output = mlx_output.clone();
+
+    let mut best_backend = AttentionBackendChoice::MlxFast;
+    let mut best_elapsed = mlx_elapsed;
+    let mut best_output = mlx_output;
+
+    if let Some((elapsed, output)) = benchmark_attention_candidate(
+        AttentionBackendChoice::MetalFlash,
+        queries,
+        keys,
+        values,
+        config,
+        metal_ctx,
+        &reference_output,
+    )? {
+        if elapsed < best_elapsed {
+            best_backend = AttentionBackendChoice::MetalFlash;
+            best_elapsed = elapsed;
+            best_output = output;
+        }
+    }
+
+    if mpp_flash_attention_supported(queries, keys, values, None, metal_ctx.properties()) {
+        if let Some((elapsed, output)) = benchmark_attention_candidate(
+            AttentionBackendChoice::MppFlash,
+            queries,
+            keys,
+            values,
+            config,
+            metal_ctx,
+            &reference_output,
+        )? {
+            if elapsed < best_elapsed {
+                best_backend = AttentionBackendChoice::MppFlash;
+                best_elapsed = elapsed;
+                best_output = output;
+            }
+        }
+    }
+
+    tracing::debug!(
+        "Selected {:?} attention backend ({:?})",
+        best_backend,
+        best_elapsed
+    );
+    Ok((best_backend, best_output))
+}
+
+fn benchmark_attention_candidate(
+    backend: AttentionBackendChoice,
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    config: &FusedAttentionConfig,
+    metal_ctx: &std::sync::Arc<MetalContext>,
+    reference: &Array,
+) -> Result<Option<(std::time::Duration, Array)>, Exception> {
+    let start = Instant::now();
+    let output = match execute_attention_backend(backend, queries, keys, values, config, metal_ctx)
+    {
+        Ok(output) => {
+            output.eval()?;
+            output
+        }
+        Err(error) => {
+            tracing::debug!("{backend:?} attention benchmark failed: {error}");
+            return Ok(None);
+        }
+    };
+    let elapsed = start.elapsed();
+    let max_diff = max_abs_diff(reference, &output)?;
+    if max_diff > 0.1 {
+        tracing::debug!(
+            "Rejecting {:?} attention backend due to max_diff={:.5}",
+            backend,
+            max_diff
+        );
+        return Ok(None);
+    }
+
+    Ok(Some((elapsed, output)))
+}
+
+fn fast_fused_sdpa(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    config: &FusedAttentionConfig,
+    custom_mask: Option<&Array>,
+) -> Result<Array, Exception> {
     // Determine mask to use
     match (&config.mask_type, custom_mask) {
         // Custom mask provided - use it directly
@@ -158,10 +466,220 @@ pub fn fused_sdpa(
     }
 }
 
+fn try_metal_flash_attention(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    config: &FusedAttentionConfig,
+    custom_mask: Option<&Array>,
+) -> Result<Option<Array>, Exception> {
+    if !flash_attention_supported(queries, keys, values, custom_mask) {
+        return Ok(None);
+    }
+
+    let metal_ctx = match MetalContext::global() {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            tracing::debug!("Metal FlashAttention unavailable, falling back to MLX: {error}");
+            return Ok(None);
+        }
+    };
+
+    match run_metal_flash_attention(queries, keys, values, config, &metal_ctx) {
+        Ok(output) => Ok(Some(output)),
+        Err(error) => {
+            tracing::debug!(
+                "Metal FlashAttention unavailable, falling back to MLX/manual attention: {}",
+                error
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn flash_attention_supported(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    custom_mask: Option<&Array>,
+) -> bool {
+    if custom_mask.is_some() {
+        return false;
+    }
+
+    if !matches!(
+        queries.dtype(),
+        Dtype::Float16 | Dtype::Float32 | Dtype::Bfloat16
+    ) || queries.dtype() != keys.dtype()
+        || queries.dtype() != values.dtype()
+    {
+        return false;
+    }
+
+    let q_shape = queries.shape();
+    let k_shape = keys.shape();
+    let v_shape = values.shape();
+
+    if q_shape.len() != 4 || k_shape.len() != 4 || v_shape.len() != 4 {
+        return false;
+    }
+
+    matches!(q_shape[3] as usize, 64 | 80 | 96 | 128 | 256)
+}
+
+fn mpp_flash_attention_supported(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    custom_mask: Option<&Array>,
+    props: &DeviceProperties,
+) -> bool {
+    props.has_nax()
+        && flash_attention_supported(queries, keys, values, custom_mask)
+        && queries.shape()[3] == 128
+}
+
+fn max_abs_diff(lhs: &Array, rhs: &Array) -> Result<f32, Exception> {
+    let lhs = if lhs.dtype() == Dtype::Float32 {
+        lhs.clone()
+    } else {
+        lhs.as_dtype(Dtype::Float32)?
+    };
+    let rhs = if rhs.dtype() == Dtype::Float32 {
+        rhs.clone()
+    } else {
+        rhs.as_dtype(Dtype::Float32)?
+    };
+
+    let diff = lhs.subtract(&rhs)?.abs()?.max(None)?;
+    diff.eval()?;
+    Ok(diff.item::<f32>())
+}
+
+fn run_metal_flash_attention(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    config: &FusedAttentionConfig,
+    metal_ctx: &std::sync::Arc<MetalContext>,
+) -> Result<Array, Exception> {
+    let q_shape = queries.shape();
+    let k_shape = keys.shape();
+    let head_dim = q_shape[3] as usize;
+    let sliding_window = match config.mask_type {
+        AttentionMaskType::SlidingWindow(window) => Some(window as usize),
+        _ => None,
+    };
+
+    let fa_config = MetalFlashAttentionConfig {
+        batch_size: q_shape[0] as usize,
+        num_heads: q_shape[1] as usize,
+        num_kv_heads: k_shape[1] as usize,
+        query_seq_len: q_shape[2] as usize,
+        kv_seq_len: k_shape[2] as usize,
+        head_dim,
+        scale: Some(config.scale),
+        is_causal: !matches!(config.mask_type, AttentionMaskType::None),
+        sliding_window,
+        softcap: config.logit_softcapping,
+        is_training: false,
+    };
+
+    let flash_attn = match FlashAttention::new(metal_ctx.clone(), fa_config) {
+        Ok(flash_attn) => flash_attn,
+        Err(error) => {
+            return Err(Exception::custom(error.to_string()));
+        }
+    };
+
+    let q_buffer = array_to_metal_buffer_f16(metal_ctx, queries)
+        .map_err(|error| Exception::custom(error.to_string()))?;
+    let k_buffer = array_to_metal_buffer_f16(metal_ctx, keys)
+        .map_err(|error| Exception::custom(error.to_string()))?;
+    let v_buffer = array_to_metal_buffer_f16(metal_ctx, values)
+        .map_err(|error| Exception::custom(error.to_string()))?;
+
+    let output = match flash_attn.forward(&q_buffer, &k_buffer, &v_buffer) {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(Exception::custom(error.to_string()));
+        }
+    };
+
+    let output = metal_buffer_into_array_f16(output.output, q_shape)
+        .map_err(|error| Exception::custom(error.to_string()))?;
+
+    if queries.dtype() == Dtype::Float16 {
+        Ok(output)
+    } else {
+        Ok(output.as_dtype(queries.dtype())?)
+    }
+}
+
+fn run_mpp_flash_attention(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    config: &FusedAttentionConfig,
+    metal_ctx: &std::sync::Arc<MetalContext>,
+) -> Result<Array, Exception> {
+    if !mpp_flash_attention_supported(queries, keys, values, None, metal_ctx.properties()) {
+        return Err(Exception::custom(
+            "MPP FlashAttention unsupported for current device or shape".to_string(),
+        ));
+    }
+
+    let q_shape = queries.shape();
+    let k_shape = keys.shape();
+    let mpp_config = MppFlashAttentionConfig {
+        batch_size: q_shape[0] as usize,
+        num_heads: q_shape[1] as usize,
+        num_kv_heads: k_shape[1] as usize,
+        query_seq_len: q_shape[2] as usize,
+        kv_seq_len: k_shape[2] as usize,
+        head_dim: q_shape[3] as usize,
+        scale: Some(config.scale),
+        is_causal: !matches!(config.mask_type, AttentionMaskType::None),
+        sliding_window: match config.mask_type {
+            AttentionMaskType::SlidingWindow(window) => Some(window as usize),
+            _ => None,
+        },
+        softcap: config.logit_softcapping,
+    };
+
+    let flash_attn = MppFlashAttention::new(metal_ctx.clone(), mpp_config)
+        .map_err(|error| Exception::custom(error.to_string()))?;
+    if !flash_attn.is_available() {
+        return Err(Exception::custom(
+            "MPP FlashAttention unavailable on current device".to_string(),
+        ));
+    }
+
+    let q_buffer = array_to_metal_buffer_f16(metal_ctx, queries)
+        .map_err(|error| Exception::custom(error.to_string()))?;
+    let k_buffer = array_to_metal_buffer_f16(metal_ctx, keys)
+        .map_err(|error| Exception::custom(error.to_string()))?;
+    let v_buffer = array_to_metal_buffer_f16(metal_ctx, values)
+        .map_err(|error| Exception::custom(error.to_string()))?;
+
+    let output = flash_attn
+        .forward(&q_buffer, &k_buffer, &v_buffer)
+        .map_err(|error| Exception::custom(error.to_string()))?;
+
+    let output = metal_buffer_into_array_f16(output.output, q_shape)
+        .map_err(|error| Exception::custom(error.to_string()))?;
+
+    if queries.dtype() == Dtype::Float16 {
+        Ok(output)
+    } else {
+        Ok(output.as_dtype(queries.dtype())?)
+    }
+}
+
 /// Fused SDPA with attention logit softcapping (Gemma2 style).
 ///
 /// Applies: scores = cap * tanh(scores / cap) before softmax
-fn fused_sdpa_with_softcapping(
+fn manual_sdpa_with_softcapping(
     queries: &Array,
     keys: &Array,
     values: &Array,
@@ -394,6 +912,29 @@ mod tests {
         mlx_rs::random::normal::<f32>(shape, None, None, None).unwrap()
     }
 
+    fn test_device_properties() -> DeviceProperties {
+        DeviceProperties {
+            name: "Apple M5 Test".to_string(),
+            max_threads_per_threadgroup: 1024,
+            max_threadgroup_memory_length: 32 * 1024,
+            has_unified_memory: true,
+            recommended_working_set_size: 8 * 1024 * 1024 * 1024,
+            max_buffer_length: 256 * 1024 * 1024,
+            gpu_family: pmetal_metal::context::AppleGPUFamily::Apple10,
+            device_tier: DeviceTier::Max,
+            has_dynamic_caching: true,
+            has_hardware_ray_tracing: true,
+            has_mesh_shaders: true,
+            has_nax: true,
+            architecture_gen: 17,
+            memory_bandwidth_gbps: 546.0,
+            gpu_core_count: 40,
+            ane_core_count: 16,
+            is_ultra_fusion: false,
+            die_count: 1,
+        }
+    }
+
     #[test]
     fn test_fused_sdpa_basic() {
         let batch = 2;
@@ -494,7 +1035,7 @@ mod tests {
         let batch = 1;
         let n_heads = 4;
         let seq_len = 8;
-        let head_dim = 32;
+        let head_dim = 64;
         let softcap = 50.0;
 
         let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
@@ -506,6 +1047,102 @@ mod tests {
         let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
 
         output.eval().unwrap();
+        assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
+    }
+
+    #[test]
+    fn test_fused_sdpa_metal_matches_fast_reference() {
+        let batch = 1;
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let seq_len = 8;
+        let head_dim = 64;
+
+        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
+        let keys = random_tensor(&[batch, n_kv_heads, seq_len, head_dim]);
+        let values = random_tensor(&[batch, n_kv_heads, seq_len, head_dim]);
+
+        let config = FusedAttentionConfig::new(n_heads, n_kv_heads, head_dim);
+        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
+        let reference = fast_fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
+
+        let output = output.as_dtype(Dtype::Float32).unwrap();
+        let reference = reference.as_dtype(Dtype::Float32).unwrap();
+        output.eval().unwrap();
+        reference.eval().unwrap();
+
+        for (actual, expected) in output
+            .as_slice::<f32>()
+            .iter()
+            .zip(reference.as_slice::<f32>().iter())
+        {
+            assert!(
+                (actual - expected).abs() < 0.1,
+                "Metal attention diverged from MLX fast path: actual={}, expected={}",
+                actual,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_sdpa_softcapping_matches_manual_reference() {
+        let batch = 1;
+        let n_heads = 4;
+        let seq_len = 8;
+        let head_dim = 64;
+        let softcap = 50.0;
+
+        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
+        let keys = random_tensor(&[batch, n_heads, seq_len, head_dim]);
+        let values = random_tensor(&[batch, n_heads, seq_len, head_dim]);
+
+        let config =
+            FusedAttentionConfig::new(n_heads, n_heads, head_dim).with_logit_softcapping(softcap);
+        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
+        let reference =
+            manual_sdpa_with_softcapping(&queries, &keys, &values, &config, None, softcap).unwrap();
+
+        let output = output.as_dtype(Dtype::Float32).unwrap();
+        let reference = reference.as_dtype(Dtype::Float32).unwrap();
+        output.eval().unwrap();
+        reference.eval().unwrap();
+
+        for (actual, expected) in output
+            .as_slice::<f32>()
+            .iter()
+            .zip(reference.as_slice::<f32>().iter())
+        {
+            assert!(
+                (actual - expected).abs() < 0.1,
+                "Metal softcap attention diverged from manual reference: actual={}, expected={}",
+                actual,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_sdpa_preserves_input_dtype() {
+        let batch = 1;
+        let n_heads = 2;
+        let seq_len = 4;
+        let head_dim = 64;
+
+        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim])
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        let keys = random_tensor(&[batch, n_heads, seq_len, head_dim])
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        let values = random_tensor(&[batch, n_heads, seq_len, head_dim])
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+
+        let config = FusedAttentionConfig::new(n_heads, n_heads, head_dim);
+        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
+
+        assert_eq!(output.dtype(), Dtype::Float32);
         assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
     }
 
@@ -602,5 +1239,76 @@ mod tests {
 
         output.eval().unwrap();
         assert_eq!(output.shape(), &[batch, n_heads, q_seq_len, head_dim]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_attention_backend_cache_roundtrip() {
+        clear_cached_attention_backends();
+
+        let key = AttentionDispatchKey {
+            device_name: "Apple M5 Max".to_string(),
+            device_tier: "max",
+            dtype: "f16",
+            batch: 1,
+            num_heads: 8,
+            num_kv_heads: 2,
+            query_seq_len: 16,
+            kv_seq_len: 16,
+            head_dim: 64,
+            mask_type: AttentionMaskType::Causal,
+        };
+
+        assert_eq!(cached_attention_backend(&key), None);
+        cache_attention_backend(key.clone(), AttentionBackendChoice::MppFlash);
+        assert_eq!(
+            cached_attention_backend(&key),
+            Some(AttentionBackendChoice::MppFlash)
+        );
+
+        clear_cached_attention_backends();
+    }
+
+    #[test]
+    fn test_benchmarkable_attention_dispatch_key_rejects_softcapping() {
+        let props = test_device_properties();
+        let queries = random_tensor(&[1, 4, 8, 64]);
+        let keys = random_tensor(&[1, 4, 8, 64]);
+        let values = random_tensor(&[1, 4, 8, 64]);
+        let config = FusedAttentionConfig::new(4, 4, 64).with_logit_softcapping(30.0);
+
+        assert!(
+            benchmarkable_attention_dispatch_key(&queries, &keys, &values, &config, None, &props)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_mpp_flash_attention_support_requires_apple10_and_d128() {
+        let props = test_device_properties();
+        let queries = random_tensor(&[1, 4, 8, 128]);
+        let keys = random_tensor(&[1, 4, 8, 128]);
+        let values = random_tensor(&[1, 4, 8, 128]);
+
+        assert!(mpp_flash_attention_supported(
+            &queries, &keys, &values, None, &props
+        ));
+
+        let mut no_nax = props.clone();
+        no_nax.has_nax = false;
+        assert!(!mpp_flash_attention_supported(
+            &queries, &keys, &values, None, &no_nax
+        ));
+
+        let queries_d64 = random_tensor(&[1, 4, 8, 64]);
+        let keys_d64 = random_tensor(&[1, 4, 8, 64]);
+        let values_d64 = random_tensor(&[1, 4, 8, 64]);
+        assert!(!mpp_flash_attention_supported(
+            &queries_d64,
+            &keys_d64,
+            &values_d64,
+            None,
+            &props
+        ));
     }
 }

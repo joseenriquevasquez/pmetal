@@ -46,22 +46,22 @@ impl ArrayExt for Array {
 
 /// Create a zeros array with the given shape and dtype.
 pub fn zeros(shape: &[i32], dtype: Dtype) -> mlx_rs::error::Result<Array> {
-    mlx_rs::ops::zeros::<f32>(shape).map(|a| a.as_dtype(dtype).unwrap())
+    mlx_rs::ops::zeros_dtype(shape, dtype)
 }
 
 /// Create a ones array with the given shape and dtype.
 pub fn ones(shape: &[i32], dtype: Dtype) -> mlx_rs::error::Result<Array> {
-    mlx_rs::ops::ones::<f32>(shape).map(|a| a.as_dtype(dtype).unwrap())
+    mlx_rs::ops::ones_dtype(shape, dtype)
 }
 
 /// Create a random normal array with the given shape and dtype.
 pub fn randn(shape: &[i32], dtype: Dtype) -> mlx_rs::error::Result<Array> {
-    mlx_rs::random::normal::<f32>(shape, None, None, None).map(|a| a.as_dtype(dtype).unwrap())
+    mlx_rs::random::normal::<f32>(shape, None, None, None).and_then(|a| a.as_dtype(dtype))
 }
 
 /// Create a random uniform array with the given shape, range, and dtype.
 pub fn rand(shape: &[i32], low: f32, high: f32, dtype: Dtype) -> mlx_rs::error::Result<Array> {
-    mlx_rs::random::uniform::<_, f32>(low, high, shape, None).map(|a| a.as_dtype(dtype).unwrap())
+    mlx_rs::random::uniform::<_, f32>(low, high, shape, None).and_then(|a| a.as_dtype(dtype))
 }
 
 /// Matrix multiplication with gathered indices.
@@ -140,5 +140,48 @@ pub fn gather_mm_device(
         }
 
         Ok(Array::from_ptr(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_zeros_uses_requested_dtype() {
+        let array = zeros(&[2, 3], Dtype::Int32).unwrap();
+        array.eval().unwrap();
+
+        assert_eq!(array.dtype(), Dtype::Int32);
+        assert_eq!(array.shape(), &[2, 3]);
+        assert_eq!(array.as_slice::<i32>(), &[0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_ones_uses_requested_dtype() {
+        let array = ones(&[2, 2], Dtype::Int32).unwrap();
+        array.eval().unwrap();
+
+        assert_eq!(array.dtype(), Dtype::Int32);
+        assert_eq!(array.shape(), &[2, 2]);
+        assert_eq!(array.as_slice::<i32>(), &[1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn test_randn_uses_requested_dtype() {
+        let array = randn(&[4, 5], Dtype::Float16).unwrap();
+        array.eval().unwrap();
+
+        assert_eq!(array.dtype(), Dtype::Float16);
+        assert_eq!(array.shape(), &[4, 5]);
+    }
+
+    #[test]
+    fn test_rand_uses_requested_dtype() {
+        let array = rand(&[3, 2], -1.0, 1.0, Dtype::Float16).unwrap();
+        array.eval().unwrap();
+
+        assert_eq!(array.dtype(), Dtype::Float16);
+        assert_eq!(array.shape(), &[3, 2]);
     }
 }

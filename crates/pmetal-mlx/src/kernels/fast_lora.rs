@@ -12,7 +12,102 @@
 //!
 //! Where W_t = W.T (pre-transposed), A_t = A.T, B_scaled_t = (scale * B).T
 
-use mlx_rs::Array;
+use std::{sync::OnceLock, time::Instant};
+
+use mlx_rs::{Array, Dtype};
+use pmetal_metal::{
+    MetalBuffer, MetalContext,
+    buffer::BufferUsage,
+    context::{DeviceProperties, DeviceTier},
+    kernels::mpp_gemm::{MppGemm, MppGemmConfig},
+};
+use serde::{Deserialize, Serialize};
+
+use crate::bridge::MlxMetalBridge;
+
+use super::persistent_cache::PersistentChoiceCache;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ProjectionBackend {
+    Mlx,
+    Mpp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProjectionDispatchKey {
+    device_name: String,
+    device_tier: &'static str,
+    dtype: &'static str,
+    m: usize,
+    n: usize,
+    k: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectionProblem {
+    m: usize,
+    n: usize,
+    k: usize,
+    output_shape: Vec<i32>,
+}
+
+static RHS_TRANSPOSED_BACKEND_CACHE: OnceLock<PersistentChoiceCache<ProjectionBackend>> =
+    OnceLock::new();
+
+fn rhs_transposed_backend_cache() -> &'static PersistentChoiceCache<ProjectionBackend> {
+    RHS_TRANSPOSED_BACKEND_CACHE
+        .get_or_init(|| PersistentChoiceCache::new("projection_backends.json"))
+}
+
+fn device_tier_key(tier: DeviceTier) -> &'static str {
+    match tier {
+        DeviceTier::Base => "base",
+        DeviceTier::Pro => "pro",
+        DeviceTier::Max => "max",
+        DeviceTier::Ultra => "ultra",
+    }
+}
+
+fn dtype_key(dtype: Dtype) -> Option<&'static str> {
+    match dtype {
+        Dtype::Float16 => Some("f16"),
+        Dtype::Float32 => Some("f32"),
+        _ => None,
+    }
+}
+
+impl ProjectionDispatchKey {
+    fn new(props: &DeviceProperties, dtype: Dtype, m: usize, n: usize, k: usize) -> Option<Self> {
+        Some(Self {
+            device_name: props.name.clone(),
+            device_tier: device_tier_key(props.device_tier),
+            dtype: dtype_key(dtype)?,
+            m,
+            n,
+            k,
+        })
+    }
+
+    fn cache_key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            self.device_name, self.device_tier, self.dtype, self.m, self.n, self.k
+        )
+    }
+}
+
+fn cached_projection_backend(key: &ProjectionDispatchKey) -> Option<ProjectionBackend> {
+    rhs_transposed_backend_cache().get(&key.cache_key())
+}
+
+fn cache_projection_backend(key: ProjectionDispatchKey, backend: ProjectionBackend) {
+    rhs_transposed_backend_cache().insert(key.cache_key(), backend);
+}
+
+#[cfg(test)]
+fn clear_cached_projection_backends() {
+    rhs_transposed_backend_cache().clear();
+}
 
 /// Configuration for fused LoRA layer.
 #[derive(Debug, Clone)]
@@ -188,7 +283,7 @@ pub fn fused_lora_forward(
     scale: f32,
 ) -> mlx_rs::error::Result<Array> {
     // Base forward: y_base = x @ W.T
-    let y_base = x.matmul(&weight.t())?;
+    let y_base = matmul_rhs_transposed_best_effort(x, weight)?;
 
     // LoRA forward: y_lora = scale * (x @ A.T) @ B.T
     let xa = x.matmul(&lora_a.t())?;
@@ -198,6 +293,218 @@ pub fn fused_lora_forward(
 
     // Combined output
     y_base.add(&y_lora)
+}
+
+fn matmul_rhs_transposed_best_effort(x: &Array, weight: &Array) -> mlx_rs::error::Result<Array> {
+    let dtype = x.dtype();
+    let Some(problem) = rhs_transposed_problem(x, weight) else {
+        return run_mlx_rhs_transposed(x, weight);
+    };
+
+    let ctx = match MetalContext::global() {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            tracing::debug!("MPP GEMM unavailable, falling back to MLX: {error}");
+            return run_mlx_rhs_transposed(x, weight);
+        }
+    };
+
+    if !ctx.properties().should_consider_mpp_gemm(
+        problem.m,
+        problem.n,
+        problem.k,
+        dtype == Dtype::Float16,
+    ) {
+        return run_mlx_rhs_transposed(x, weight);
+    }
+
+    let Some(dispatch_key) =
+        ProjectionDispatchKey::new(ctx.properties(), dtype, problem.m, problem.n, problem.k)
+    else {
+        return run_mlx_rhs_transposed(x, weight);
+    };
+
+    if let Some(backend) = cached_projection_backend(&dispatch_key) {
+        return execute_projection_backend(backend, x, weight, &ctx, &problem).or_else(|error| {
+            tracing::debug!(
+                "Cached {:?} projection path failed, falling back to MLX: {error}",
+                backend
+            );
+            cache_projection_backend(dispatch_key.clone(), ProjectionBackend::Mlx);
+            run_mlx_rhs_transposed(x, weight)
+        });
+    }
+
+    let (backend, output) = benchmark_projection_backends(x, weight, &ctx, &problem)?;
+    cache_projection_backend(dispatch_key, backend);
+    Ok(output)
+}
+
+fn rhs_transposed_problem(x: &Array, weight: &Array) -> Option<ProjectionProblem> {
+    let dtype = x.dtype();
+    if dtype != weight.dtype() || !matches!(dtype, Dtype::Float16 | Dtype::Float32) {
+        return None;
+    }
+
+    let x_shape = x.shape();
+    let weight_shape = weight.shape();
+    if x_shape.len() < 2 || weight_shape.len() != 2 {
+        return None;
+    }
+
+    let k = *x_shape.last()? as usize;
+    if weight_shape[1] as usize != k {
+        return None;
+    }
+
+    let m = x_shape[..x_shape.len() - 1]
+        .iter()
+        .map(|dim| *dim as usize)
+        .product::<usize>();
+    let n = weight_shape[0] as usize;
+
+    let mut output_shape = x_shape.to_vec();
+    *output_shape.last_mut()? = n as i32;
+
+    Some(ProjectionProblem {
+        m,
+        n,
+        k,
+        output_shape,
+    })
+}
+
+fn run_mlx_rhs_transposed(x: &Array, weight: &Array) -> mlx_rs::error::Result<Array> {
+    x.matmul(&weight.t())
+}
+
+fn execute_projection_backend(
+    backend: ProjectionBackend,
+    x: &Array,
+    weight: &Array,
+    ctx: &std::sync::Arc<MetalContext>,
+    problem: &ProjectionProblem,
+) -> mlx_rs::error::Result<Array> {
+    match backend {
+        ProjectionBackend::Mlx => run_mlx_rhs_transposed(x, weight),
+        ProjectionBackend::Mpp => run_mpp_rhs_transposed(x, weight, ctx, problem),
+    }
+}
+
+fn benchmark_projection_backends(
+    x: &Array,
+    weight: &Array,
+    ctx: &std::sync::Arc<MetalContext>,
+    problem: &ProjectionProblem,
+) -> mlx_rs::error::Result<(ProjectionBackend, Array)> {
+    let mlx_start = Instant::now();
+    let mlx_output = run_mlx_rhs_transposed(x, weight)?;
+    mlx_output.eval()?;
+    let mlx_elapsed = mlx_start.elapsed();
+
+    let mpp_start = Instant::now();
+    let mpp_output = match run_mpp_rhs_transposed(x, weight, ctx, problem) {
+        Ok(output) => {
+            output.eval()?;
+            Some(output)
+        }
+        Err(error) => {
+            tracing::debug!(
+                "MPP GEMM benchmark failed for [{}x{}] x [{}x{}]^T, using MLX: {error}",
+                problem.m,
+                problem.k,
+                problem.n,
+                problem.k
+            );
+            None
+        }
+    };
+    let mpp_elapsed = mpp_start.elapsed();
+
+    if let Some(mpp_output) = mpp_output {
+        if mpp_elapsed < mlx_elapsed {
+            tracing::debug!(
+                "Selected MPP GEMM for [{}x{}] x [{}x{}]^T ({:?} vs {:?})",
+                problem.m,
+                problem.k,
+                problem.n,
+                problem.k,
+                mpp_elapsed,
+                mlx_elapsed
+            );
+            return Ok((ProjectionBackend::Mpp, mpp_output));
+        }
+    }
+
+    tracing::debug!(
+        "Selected MLX matmul for [{}x{}] x [{}x{}]^T ({:?} vs {:?})",
+        problem.m,
+        problem.k,
+        problem.n,
+        problem.k,
+        mlx_elapsed,
+        mpp_elapsed
+    );
+    Ok((ProjectionBackend::Mlx, mlx_output))
+}
+
+fn run_mpp_rhs_transposed(
+    x: &Array,
+    weight: &Array,
+    ctx: &std::sync::Arc<MetalContext>,
+    problem: &ProjectionProblem,
+) -> mlx_rs::error::Result<Array> {
+    let dtype = x.dtype();
+    let x_shape = x.shape();
+
+    let mut config = MppGemmConfig::new(problem.m, problem.n, problem.k);
+    config.use_fp16 = dtype == Dtype::Float16;
+    let gemm = MppGemm::new(ctx.clone(), config);
+    if !gemm.is_available() {
+        return Err(mlx_rs::error::Exception::custom(
+            "MPP GEMM unavailable on current device".to_string(),
+        ));
+    }
+
+    let x_2d = if x_shape.len() == 2 {
+        x.clone()
+    } else {
+        x.reshape(&[problem.m as i32, problem.k as i32])?
+    };
+
+    match dtype {
+        Dtype::Float16 => {
+            let x_view = MlxMetalBridge::view_f16(ctx, &x_2d)
+                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+            let weight_view = MlxMetalBridge::view_f16(ctx, weight)
+                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+            let output_buffer = MetalBuffer::new(ctx, problem.m * problem.n, BufferUsage::Shared)
+                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+
+            gemm.execute(&x_view, &weight_view, &output_buffer)
+                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+
+            MlxMetalBridge::buffer_into_array_f16(output_buffer, &problem.output_shape)
+                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
+        }
+        Dtype::Float32 => {
+            let x_view = MlxMetalBridge::view_f32(ctx, &x_2d)
+                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+            let weight_view = MlxMetalBridge::view_f32(ctx, weight)
+                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+            let output_buffer = MetalBuffer::new(ctx, problem.m * problem.n, BufferUsage::Shared)
+                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+
+            gemm.execute(&x_view, &weight_view, &output_buffer)
+                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+
+            MlxMetalBridge::buffer_into_array_f32(output_buffer, &problem.output_shape)
+                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
+        }
+        _ => Err(mlx_rs::error::Exception::custom(
+            "Unsupported dtype for MPP GEMM".to_string(),
+        )),
+    }
 }
 
 /// Compute fused LoRA forward pass for quantized weights.
@@ -457,5 +764,125 @@ mod tests {
         assert_eq!(q.shape(), &[batch, seq_len, hidden]);
         assert_eq!(k.shape(), &[batch, seq_len, hidden]);
         assert_eq!(v.shape(), &[batch, seq_len, hidden]);
+    }
+
+    #[test]
+    fn test_fused_lora_forward_matches_reference_large_f32() {
+        let batch = 2;
+        let seq_len = 4;
+        let in_features = 128;
+        let out_features = 256;
+        let rank = 16;
+        let scale = 1.5;
+
+        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, in_features], None, None, None)
+            .unwrap();
+        let weight =
+            mlx_rs::random::normal::<f32>(&[out_features, in_features], None, None, None).unwrap();
+        let (lora_a, lora_b) = create_lora_params(in_features, out_features, rank).unwrap();
+
+        let output = fused_lora_forward(&x, &weight, &lora_a, &lora_b, scale).unwrap();
+        let reference = x
+            .matmul(&weight.t())
+            .unwrap()
+            .add(
+                &x.matmul(&lora_a.t())
+                    .unwrap()
+                    .matmul(&lora_b.t())
+                    .unwrap()
+                    .multiply(&Array::from_f32(scale))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let diff = output.subtract(&reference).unwrap();
+        let max_diff = diff.abs().unwrap().max(None).unwrap();
+        max_diff.eval().unwrap();
+        assert!(max_diff.item::<f32>() < 1e-4);
+    }
+
+    #[test]
+    fn test_fused_lora_forward_matches_reference_large_f16() {
+        let batch = 2;
+        let seq_len = 4;
+        let in_features = 128;
+        let out_features = 256;
+        let rank = 16;
+        let scale = 1.5;
+
+        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, in_features], None, None, None)
+            .unwrap()
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+        let weight = mlx_rs::random::normal::<f32>(&[out_features, in_features], None, None, None)
+            .unwrap()
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+        let (lora_a, lora_b) = create_lora_params(in_features, out_features, rank).unwrap();
+        let lora_a = lora_a.as_dtype(Dtype::Float16).unwrap();
+        let lora_b = lora_b.as_dtype(Dtype::Float16).unwrap();
+
+        let output = fused_lora_forward(&x, &weight, &lora_a, &lora_b, scale).unwrap();
+        let reference = x
+            .matmul(&weight.t())
+            .unwrap()
+            .add(
+                &x.matmul(&lora_a.t())
+                    .unwrap()
+                    .matmul(&lora_b.t())
+                    .unwrap()
+                    .multiply(&Array::from_f32(scale).as_dtype(Dtype::Float16).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let output = output.as_dtype(Dtype::Float32).unwrap();
+        let reference = reference.as_dtype(Dtype::Float32).unwrap();
+        let diff = output.subtract(&reference).unwrap();
+        let max_diff = diff.abs().unwrap().max(None).unwrap();
+        max_diff.eval().unwrap();
+        assert!(max_diff.item::<f32>() < 0.1);
+        assert_eq!(output.shape(), &[batch, seq_len, out_features]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_projection_backend_cache_roundtrip() {
+        clear_cached_projection_backends();
+
+        let key = ProjectionDispatchKey {
+            device_name: "Apple M5 Max".to_string(),
+            device_tier: "max",
+            dtype: "f16",
+            m: 8,
+            n: 256,
+            k: 128,
+        };
+
+        assert_eq!(cached_projection_backend(&key), None);
+        cache_projection_backend(key.clone(), ProjectionBackend::Mpp);
+        assert_eq!(
+            cached_projection_backend(&key),
+            Some(ProjectionBackend::Mpp)
+        );
+
+        clear_cached_projection_backends();
+    }
+
+    #[test]
+    fn test_rhs_transposed_problem_infers_output_shape() {
+        let x = Array::zeros::<f32>(&[2, 4, 128]).unwrap();
+        let weight = Array::zeros::<f32>(&[256, 128]).unwrap();
+
+        let problem = rhs_transposed_problem(&x, &weight).unwrap();
+        assert_eq!(
+            problem,
+            ProjectionProblem {
+                m: 8,
+                n: 256,
+                k: 128,
+                output_shape: vec![2, 4, 256],
+            }
+        );
     }
 }

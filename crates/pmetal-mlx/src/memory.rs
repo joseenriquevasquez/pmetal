@@ -6,6 +6,9 @@
 
 #![allow(unsafe_code)]
 
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
+
 use pmetal_core::MemoryStats;
 
 // ---------------------------------------------------------------------------
@@ -16,6 +19,9 @@ pub use mlx_rs::memory::{
     clear_cache, get_active_memory, get_cache_memory, get_memory_limit, get_peak_memory,
     reset_peak_memory, set_cache_limit, set_memory_limit, set_wired_limit,
 };
+
+#[cfg(target_os = "macos")]
+static SYSTEM_MEMORY_BYTES: OnceLock<Option<u64>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Diagnostics
@@ -122,19 +128,25 @@ pub fn get_memory_stats() -> MemoryStats {
 pub fn get_system_memory() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
-        use std::process::Command;
-        let output = Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-            .ok()?;
-        let mem_str = String::from_utf8(output.stdout).ok()?;
-        mem_str.trim().parse().ok()
+        *SYSTEM_MEMORY_BYTES.get_or_init(query_system_memory)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         None
     }
+}
+
+#[cfg(target_os = "macos")]
+fn query_system_memory() -> Option<u64> {
+    use std::process::Command;
+
+    let output = Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    let mem_str = String::from_utf8(output.stdout).ok()?;
+    mem_str.trim().parse().ok()
 }
 
 /// Get GPU memory limit (recommended working set size).
@@ -350,5 +362,15 @@ mod tests {
         let mem = get_system_memory();
         assert!(mem.is_some());
         assert!(mem.unwrap() > 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_system_memory_is_cached() {
+        let first = get_system_memory();
+        let second = get_system_memory();
+
+        assert_eq!(first, second);
+        assert_eq!(first, query_system_memory());
     }
 }
