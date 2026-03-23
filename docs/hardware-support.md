@@ -15,7 +15,7 @@ Status of hardware-specific optimizations in PMetal.
 | Memory bandwidth | `pmetal-metal/src/context.rs` | Tier + family lookup table |
 | NAX (Neural Accelerators in GPU) | `pmetal-metal/src/context.rs` | Apple10+ (M5) |
 | ANE perf stats | `pmetal-metal/src/ane/runtime.rs` | `_ANEPerformanceStats` API |
-| UltraFusion topology | — | Not detected |
+| UltraFusion topology | `pmetal-metal/src/context.rs` | Detected via `sysctl hw.packages` |
 
 ## Per-Chip Support Matrix
 
@@ -79,7 +79,7 @@ These are accessed via Metal 4.0 (`-std=metal4.0`) kernels. MLX upstream has pro
 
 ## Kernel Tuning by Tier
 
-### Matrix Tile Size (GEMM, LoRA forward)
+### Matrix Tile Size (standard GEMM, LoRA forward)
 
 | Tier | Apple7–9 | Apple10 (M5+, NAX) |
 |------|----------|-------------------|
@@ -88,17 +88,19 @@ These are accessed via Metal 4.0 (`-std=metal4.0`) kernels. MLX upstream has pro
 | Max | 64×64×32 | 128×64×32 |
 | Ultra | 64×64×32 | 128×64×32 |
 
+These tier tables apply to the standard Metal GEMM/LoRA kernels. On Apple10/M5 hardware, the Metal 4 / MPP dispatcher now auto-tunes and persists among `32×32` / `1`-simdgroup, `64×32` / `2`-simdgroup, `32×64` / `2`-simdgroup, and `64×64` / `4`-simdgroup kernel variants, plus Morton-vs-linear tile walk order. Aligned full tiles use static extents, and the dispatcher exposes an async command-buffer API for overlap. Apple7-9 continue to use the standard Metal kernels.
+
 ### FlashAttention (`flash_attention.rs`)
 
 Block size selection per head dimension:
 
 | Head Dim | Base | Pro | Max | Ultra |
 |----------|------|-----|-----|-------|
-| 64 | 64×32 | 64×32 | 64×64 | 64×64 |
-| 80 | 64×32 | 64×32 | 64×64 | 64×64 |
-| 96 | 64×32 | 64×32 | 64×64 | 64×64 |
-| 128 | 32×32 | 32×32 | 64×64 | 64×64 |
-| 256 | 32×16 | 32×16 | 32×32 | 32×32 |
+| 64 | 64×32 | 64×64 | 64×64 | 64×64 |
+| 80 | 32×32 | 64×32 | 64×32 | 64×32 |
+| 96 | 32×32 | 64×32 | 64×32 | 64×32 |
+| 128 | 32×32 | 32×32 | 64×32 | 64×32 |
+| 256 | 16×16 | 16×16 | 32×16 | 32×16 |
 
 ### Fused RMSNorm + LoRA (`fused_norm_lora.rs`)
 
@@ -135,10 +137,14 @@ MLX upstream has NAX-optimized kernels for M5. Integration path:
 
 - [x] M5 detection (Apple10, arch gen 17)
 - [x] NAX availability flag (`has_nax`)
-- [x] NAX-aware tile size tuning
+- [x] Tier-aware baseline tile recommendations for standard Metal kernels
+- [x] Async MPP command-buffer API in Rust dispatcher
+- [x] Persisted MPP Morton walk-order auto-tuning on Apple10/M5
+- [x] Static full-tile MPP extents for aligned M/N dispatches
+- [x] Benchmark and persist MLX vs MPP backend choice for 4-bit affine quantized linear inference on Apple10/M5
+- [x] Tier-aware MPP dispatcher tuning across `32×32`, `64×32`, `32×64`, and `64×64` MPP tile variants on Apple10/M5
 - [ ] Upstream mlx-rs NAX kernel passthrough (requires mlx-rs update to MLX with NAX)
-- [ ] Profile NAX vs standard kernels on M5 for quantized inference
-- [ ] Benchmark NAX SDPA vs FlashAttention on M5
+- [x] Benchmark and persist Apple10/M5 MPP FlashAttention vs Metal FlashAttention vs MLX fast SDPA for supported `head_dim = 128` inference shapes
 
 ### P1 — ANE chaining API
 
@@ -169,6 +175,7 @@ Current distributed crate (`pmetal-distributed`) is multi-machine over TCP/mDNS.
 
 Replace hardcoded tier-based parameters with runtime optimization:
 
-- [ ] Auto-benchmark kernel configs on first run and cache optimal parameters
+- [x] Persist hot-path inference backend benchmarks across launches (FlashAttention vs MLX SDPA, MPP vs MLX matmul)
+- [ ] Auto-benchmark broader kernel configs on first run and cache optimal parameters
 - [ ] Query actual memory bandwidth via IOKit/sysctl instead of tier lookup table
 - [ ] M5 Pro/Max/Ultra profiling once hardware is available

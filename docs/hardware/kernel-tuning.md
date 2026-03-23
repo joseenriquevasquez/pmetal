@@ -13,17 +13,19 @@ PMetal automatically selects kernel parameters based on your device tier and GPU
 | Max | 64×64×32 | 128×64×32 |
 | Ultra | 64×64×32 | 128×64×32 |
 
+These tier tables apply to the standard Metal GEMM/LoRA kernels. On Apple10/M5 hardware, the Metal 4 / MPP dispatcher now auto-tunes and persists among `32×32` / `1`-simdgroup, `64×32` / `2`-simdgroup, `32×64` / `2`-simdgroup, and `64×64` / `4`-simdgroup variants, plus Morton-vs-linear tile walk order. Aligned M/N tiles use static full-tile extents. Apple7-9 continue to use the standard Metal kernels. For 4-bit affine quantized linear inference, Apple10/M5 also benchmarks and persists MLX `quantized_matmul` versus the MPP path per device and problem shape. For supported `head_dim = 128` inference attention shapes, Apple10/M5 now benchmarks and persists MLX fast SDPA vs Metal FlashAttention vs MPP FlashAttention, rejecting MPP candidates that diverge numerically from the MLX reference.
+
 ## FlashAttention Block Sizes
 
 Block size selection per head dimension:
 
 | Head Dim | Base | Pro | Max | Ultra |
 |----------|------|-----|-----|-------|
-| 64 | 64×32 | 64×32 | 64×64 | 64×64 |
-| 80 | 64×32 | 64×32 | 64×64 | 64×64 |
-| 96 | 64×32 | 64×32 | 64×64 | 64×64 |
-| 128 | 32×32 | 32×32 | 64×64 | 64×64 |
-| 256 | 32×16 | 32×16 | 32×32 | 32×32 |
+| 64 | 64×32 | 64×64 | 64×64 | 64×64 |
+| 80 | 32×32 | 64×32 | 64×32 | 64×32 |
+| 96 | 32×32 | 64×32 | 64×32 | 64×32 |
+| 128 | 32×32 | 32×32 | 64×32 | 64×32 |
+| 256 | 16×16 | 16×16 | 32×16 | 32×16 |
 
 ## Fused Kernel Threadgroup Sizes
 
