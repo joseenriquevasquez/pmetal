@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-23
+
+### Added
+
+- **`pmetal-mcp` crate**: Full MCP (Model Context Protocol) server exposing 45 tools for Claude Desktop and other MCP clients. Covers all pmetal functionality — training, inference, distillation, GRPO, RLKD, quantization, model merging, dataset operations, evaluation, benchmarking, model search, and Ollama export
+  - **Device & models**: `device_info`, `search_models`, `download_model`, `list_local_models`, `model_fit`, `model_info`
+  - **Inference**: `generate` (blocking), `chat` (via running serve instance), `start_serve`, `benchmark`, `bench_train`, `bench_gen`, `bench_corpus`
+  - **Training**: `train`, `distill`, `grpo`, `rlkd`, `embed_train` — all as background jobs with full parameter coverage matching the CLI
+  - **Runtime training control**: `job_set_lr`, `job_reduce_lr`, `job_reset_lr`, `job_save_checkpoint`, `job_graceful_stop` — LLM-driven adaptive training via the control file protocol
+  - **Job management**: `list_jobs`, `job_status`, `job_logs`, `stop_job`
+  - **Dataset ops**: `dataset_analyze`, `dataset_preview`, `dataset_validate`, `dataset_download`, `dataset_convert`, `dataset_filter`, `dataset_split`, `dataset_merge`, `dataset_sample`, `dataset_template`, `dataset_prepare`
+  - **Quantization & conversion**: `quantize`, `fuse_lora`, `merge_models`, `pack_experts`, `ollama_create`, `ollama_modelfile`
+  - **Evaluation**: `eval_perplexity`
+  - All tools include rich `#[description]` annotations for parameter documentation in the MCP schema
+  - Standalone binary (`pmetal-mcp`) for Claude Desktop + `pmetal mcp` subcommand (behind `mcp` feature flag)
+  - Uses `turbomcp` v3.0.7 from crates.io
+
+- **Runtime training control protocol**: Extended the control file protocol (`.lr_control.json`) with `SaveCheckpoint` and `GracefulStop` commands. The adaptive LR controller now polls the control file before checking its `enabled` flag, so external agents (MCP, TUI) can always send commands regardless of whether automatic detection is active
+
+- **`--no-adaptive-lr` flag**: Disables automatic spike/plateau/divergence detection while keeping the control file protocol active. Enables fully LLM-driven learning rate control — the agent observes loss via `job_status` and manually adjusts LR via `job_set_lr`/`job_reduce_lr`
+
+### Changed
+
+- **ANE is now opt-in**: The `--no-ane` flag has been replaced with `--ane` across CLI, TUI, orchestrator, and MCP. ANE training is experimental and limited to small models, so it defaults to off. The orchestrator's `DispatchConfig` now sets `ane: false` by default
+
 ## [0.3.13] - 2026-03-22
 
 ### Added
