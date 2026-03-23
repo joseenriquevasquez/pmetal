@@ -9,6 +9,10 @@ use pmetal_data::inference_config::collect_all_stop_tokens;
 use pmetal_mlx::kv_cache::CacheMode;
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::{GenerationConfig, Sampler};
+use pmetal_models::{
+    GenerationOutput, generate_cached_ane_streaming, generate_cached_hybrid_cpu_streaming,
+    is_ane_inference_compatible, is_hybrid_cpu_compatible,
+};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -64,6 +68,55 @@ pub enum TokenEvent {
     Error(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreferredGenerationBackend {
+    Gpu,
+    Ane,
+    CpuHybrid,
+}
+
+#[derive(Debug)]
+struct BackendState {
+    preferred: PreferredGenerationBackend,
+}
+
+fn estimate_parameter_count(config_json: &serde_json::Value) -> Option<u64> {
+    let hidden = config_json.get("hidden_size")?.as_u64()?;
+    let layers = config_json.get("num_hidden_layers")?.as_u64()?;
+    let vocab = config_json.get("vocab_size")?.as_u64()?;
+
+    Some(
+        12u64
+            .saturating_mul(hidden)
+            .saturating_mul(hidden)
+            .saturating_mul(layers)
+            .saturating_add(hidden.saturating_mul(vocab)),
+    )
+}
+
+fn select_accelerated_backend(
+    config_json: &serde_json::Value,
+    ane_enabled: bool,
+) -> PreferredGenerationBackend {
+    if !ane_enabled {
+        return PreferredGenerationBackend::Gpu;
+    }
+
+    let prefer_gpu_for_decode = estimate_parameter_count(config_json)
+        .map(|params| params < 2_000_000_000)
+        .unwrap_or(false);
+
+    if !prefer_gpu_for_decode && is_ane_inference_compatible(config_json).is_ok() {
+        return PreferredGenerationBackend::Ane;
+    }
+
+    if is_hybrid_cpu_compatible(config_json).is_ok() {
+        return PreferredGenerationBackend::CpuHybrid;
+    }
+
+    PreferredGenerationBackend::Gpu
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Inference engine
 // ────────────────────────────────────────────────────────────────────────────
@@ -78,8 +131,14 @@ pub struct InferenceEngine {
     chat_template: ChatTemplate,
     /// Model name/ID for API responses.
     model_id: String,
+    /// Resolved local model directory (used by ANE / CPU-hybrid backends).
+    model_path: std::path::PathBuf,
     /// Maximum sequence length for KV cache.
     max_seq_len: usize,
+    /// Fixed ANE bucket cap for accelerated backends.
+    ane_max_seq_len: usize,
+    /// Preferred generation backend; falls back to GPU permanently on failure.
+    backend: Arc<Mutex<BackendState>>,
     /// Stop token IDs collected from all available sources.
     stop_token_ids: Vec<u32>,
     /// Model creation timestamp.
@@ -106,6 +165,27 @@ impl InferenceEngine {
         model_path: &std::path::Path,
         max_seq_len: usize,
     ) -> ServeResult<Self> {
+        Self::new_with_backend(
+            model,
+            tokenizer,
+            model_id,
+            model_path,
+            max_seq_len,
+            true,
+            1024,
+        )
+    }
+
+    /// Create a new inference engine with explicit backend controls.
+    pub fn new_with_backend(
+        model: DynamicModel,
+        tokenizer: pmetal_data::Tokenizer,
+        model_id: String,
+        model_path: &std::path::Path,
+        max_seq_len: usize,
+        ane_enabled: bool,
+        ane_max_seq_len: usize,
+    ) -> ServeResult<Self> {
         let chat_template = detect_chat_template(model_path, &model_id);
 
         // Collect stop tokens from all available sources using the canonical
@@ -121,6 +201,36 @@ impl InferenceEngine {
             stop_token_ids
         );
 
+        let preferred_backend = match std::fs::read_to_string(model_path.join("config.json")) {
+            Ok(config_text) => match serde_json::from_str::<serde_json::Value>(&config_text) {
+                Ok(config_json) => select_accelerated_backend(&config_json, ane_enabled),
+                Err(err) => {
+                    tracing::warn!(
+                        model = %model_path.display(),
+                        "Failed to parse config.json for backend selection: {}",
+                        err
+                    );
+                    PreferredGenerationBackend::Gpu
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    model = %model_path.display(),
+                    "Failed to read config.json for backend selection: {}",
+                    err
+                );
+                PreferredGenerationBackend::Gpu
+            }
+        };
+
+        tracing::info!(
+            model = %model_path.display(),
+            backend = ?preferred_backend,
+            ane_enabled,
+            ane_max_seq_len,
+            "Selected serving generation backend"
+        );
+
         let created_at = chrono::Utc::now().timestamp();
 
         Ok(Self {
@@ -128,7 +238,12 @@ impl InferenceEngine {
             tokenizer: Arc::new(tokenizer),
             chat_template,
             model_id,
+            model_path: model_path.to_path_buf(),
             max_seq_len,
+            ane_max_seq_len,
+            backend: Arc::new(Mutex::new(BackendState {
+                preferred: preferred_backend,
+            })),
             stop_token_ids,
             created_at,
         })
@@ -291,6 +406,195 @@ impl InferenceEngine {
         config
     }
 
+    fn backend_or_gpu(backend: &Arc<Mutex<BackendState>>) -> PreferredGenerationBackend {
+        backend
+            .lock()
+            .map(|state| state.preferred)
+            .unwrap_or(PreferredGenerationBackend::Gpu)
+    }
+
+    fn downgrade_backend(
+        backend: &Arc<Mutex<BackendState>>,
+        failed_backend: PreferredGenerationBackend,
+    ) {
+        if let Ok(mut state) = backend.lock() {
+            if state.preferred == failed_backend {
+                state.preferred = PreferredGenerationBackend::Gpu;
+            }
+        }
+    }
+
+    fn finish_reason(output: &GenerationOutput) -> String {
+        if output.stopped_by_token {
+            "stop".to_string()
+        } else {
+            "length".to_string()
+        }
+    }
+
+    fn build_metrics(
+        start: Instant,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        first_token_time_ms: Option<f64>,
+    ) -> RequestMetrics {
+        let total_latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let tokens_per_second = if total_latency_ms > 0.0 {
+            completion_tokens as f64 / (total_latency_ms / 1000.0)
+        } else {
+            0.0
+        };
+
+        RequestMetrics {
+            first_token_latency_ms: first_token_time_ms.unwrap_or(total_latency_ms),
+            total_latency_ms,
+            tokens_per_second,
+            prompt_tokens,
+            completion_tokens,
+        }
+    }
+
+    fn try_accelerated_generate_blocking(
+        backend: &Arc<Mutex<BackendState>>,
+        model_path: &std::path::Path,
+        input_ids: &[u32],
+        gen_config: &GenerationConfig,
+        ane_max_seq_len: usize,
+    ) -> ServeResult<Option<(Vec<u32>, String, RequestMetrics)>> {
+        let preferred_backend = Self::backend_or_gpu(backend);
+        if preferred_backend == PreferredGenerationBackend::Gpu {
+            return Ok(None);
+        }
+
+        let prompt_tokens = input_ids.len();
+        let start = Instant::now();
+        let mut first_token_time_ms = None;
+
+        let output = match preferred_backend {
+            PreferredGenerationBackend::Ane => generate_cached_ane_streaming(
+                model_path,
+                input_ids,
+                gen_config,
+                ane_max_seq_len,
+                |_| {
+                    if first_token_time_ms.is_none() {
+                        first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    true
+                },
+            ),
+            PreferredGenerationBackend::CpuHybrid => {
+                generate_cached_hybrid_cpu_streaming(model_path, input_ids, gen_config, |_| {
+                    if first_token_time_ms.is_none() {
+                        first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    true
+                })
+            }
+            PreferredGenerationBackend::Gpu => unreachable!(),
+        };
+
+        match output {
+            Ok(output) => {
+                let generated = output.token_ids[prompt_tokens..].to_vec();
+                let metrics =
+                    Self::build_metrics(start, prompt_tokens, generated.len(), first_token_time_ms);
+                Ok(Some((generated, Self::finish_reason(&output), metrics)))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    backend = ?preferred_backend,
+                    model = %model_path.display(),
+                    "Accelerated serving backend failed ({}), falling back to GPU",
+                    err
+                );
+                Self::downgrade_backend(backend, preferred_backend);
+                Ok(None)
+            }
+        }
+    }
+
+    fn try_accelerated_streaming_blocking(
+        backend: &Arc<Mutex<BackendState>>,
+        model_path: &std::path::Path,
+        input_ids: &[u32],
+        gen_config: &GenerationConfig,
+        ane_max_seq_len: usize,
+        tx: &tokio::sync::mpsc::Sender<TokenEvent>,
+    ) -> bool {
+        let preferred_backend = Self::backend_or_gpu(backend);
+        if preferred_backend == PreferredGenerationBackend::Gpu {
+            return false;
+        }
+
+        let prompt_tokens = input_ids.len();
+        let start = Instant::now();
+        let mut first_token_time_ms = None;
+        let mut completion_tokens = 0usize;
+        let mut receiver_dropped = false;
+
+        let output = match preferred_backend {
+            PreferredGenerationBackend::Ane => generate_cached_ane_streaming(
+                model_path,
+                input_ids,
+                gen_config,
+                ane_max_seq_len,
+                |token| {
+                    if first_token_time_ms.is_none() {
+                        first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    completion_tokens += 1;
+                    if tx.blocking_send(TokenEvent::Token(token)).is_err() {
+                        receiver_dropped = true;
+                        return false;
+                    }
+                    true
+                },
+            ),
+            PreferredGenerationBackend::CpuHybrid => {
+                generate_cached_hybrid_cpu_streaming(model_path, input_ids, gen_config, |token| {
+                    if first_token_time_ms.is_none() {
+                        first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    completion_tokens += 1;
+                    if tx.blocking_send(TokenEvent::Token(token)).is_err() {
+                        receiver_dropped = true;
+                        return false;
+                    }
+                    true
+                })
+            }
+            PreferredGenerationBackend::Gpu => unreachable!(),
+        };
+
+        if receiver_dropped {
+            return true;
+        }
+
+        match output {
+            Ok(output) => {
+                let metrics = Self::build_metrics(
+                    start,
+                    prompt_tokens,
+                    completion_tokens,
+                    first_token_time_ms,
+                );
+                let _ = tx.blocking_send(TokenEvent::Done(Self::finish_reason(&output), metrics));
+                true
+            }
+            Err(err) => {
+                tracing::warn!(
+                    backend = ?preferred_backend,
+                    model = %model_path.display(),
+                    "Accelerated serving backend failed ({}), falling back to GPU",
+                    err
+                );
+                Self::downgrade_backend(backend, preferred_backend);
+                false
+            }
+        }
+    }
+
     /// Extract the last-position logits from a model output tensor.
     ///
     /// Model outputs have shape `[1, seq_len, vocab_size]` (after prefill) or
@@ -319,12 +623,12 @@ impl InferenceEngine {
 
         let prompt_tokens = input_ids.len();
         let gen_config = self.build_generation_config(&params);
-        // Use the (possibly clamped) value from the built config.
-        let max_tokens = gen_config.max_new_tokens;
-        let stop_tokens = gen_config.stop_tokens.clone();
         let input_ids = input_ids.to_vec();
         let model_arc = Arc::clone(&self.model);
+        let model_path = self.model_path.clone();
         let max_seq_len = self.max_seq_len;
+        let ane_max_seq_len = self.ane_max_seq_len;
+        let backend = Arc::clone(&self.backend);
 
         // Generation is synchronous/blocking; run it on a dedicated blocking
         // thread so we don't stall the async executor.
@@ -332,6 +636,18 @@ impl InferenceEngine {
         // DynamicModel is !Send — ModelState wraps it with an unsafe Send impl
         // guarded by the Mutex. The Mutex is cloned (Arc) into the closure.
         let result = tokio::task::spawn_blocking(move || {
+            if let Some(result) = Self::try_accelerated_generate_blocking(
+                &backend,
+                &model_path,
+                &input_ids,
+                &gen_config,
+                ane_max_seq_len,
+            )? {
+                return Ok(result);
+            }
+
+            let max_tokens = gen_config.max_new_tokens;
+            let stop_tokens = gen_config.stop_tokens.clone();
             let mut state = model_arc.lock().map_err(|_| ServeError::Busy)?;
             let model = &mut state.model;
             let mut cache = model.create_cache_with_mode(
@@ -401,21 +717,9 @@ impl InferenceEngine {
                 }
             }
 
-            let total_latency_ms = start.elapsed().as_secs_f64() * 1000.0;
             let completion_tokens = generated.len();
-            let tokens_per_second = if total_latency_ms > 0.0 {
-                completion_tokens as f64 / (total_latency_ms / 1000.0)
-            } else {
-                0.0
-            };
-
-            let metrics = RequestMetrics {
-                first_token_latency_ms: first_token_time.unwrap_or(total_latency_ms),
-                total_latency_ms,
-                tokens_per_second,
-                prompt_tokens,
-                completion_tokens,
-            };
+            let metrics =
+                Self::build_metrics(start, prompt_tokens, completion_tokens, first_token_time);
 
             Ok::<_, ServeError>((generated, finish_reason, metrics))
         })
@@ -457,12 +761,12 @@ impl InferenceEngine {
 
         let prompt_tokens = input_ids.len();
         let gen_config = self.build_generation_config(&params);
-        // Use the (possibly clamped) value from the built config.
-        let max_tokens = gen_config.max_new_tokens;
-        let stop_tokens = gen_config.stop_tokens.clone();
         let input_ids = input_ids.to_vec();
         let model_arc = Arc::clone(&self.model);
+        let model_path = self.model_path.clone();
         let max_seq_len = self.max_seq_len;
+        let ane_max_seq_len = self.ane_max_seq_len;
+        let backend = Arc::clone(&self.backend);
 
         // Spawn generation on a dedicated blocking thread.
         tokio::task::spawn_blocking(move || {
@@ -475,6 +779,20 @@ impl InferenceEngine {
                     }
                 };
             }
+
+            if Self::try_accelerated_streaming_blocking(
+                &backend,
+                &model_path,
+                &input_ids,
+                &gen_config,
+                ane_max_seq_len,
+                &tx,
+            ) {
+                return;
+            }
+
+            let max_tokens = gen_config.max_new_tokens;
+            let stop_tokens = gen_config.stop_tokens.clone();
 
             let state_guard = match model_arc.lock() {
                 Ok(g) => g,
@@ -581,25 +899,79 @@ impl InferenceEngine {
                 }
             }
 
-            let total_latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-            let tokens_per_second = if total_latency_ms > 0.0 {
-                completion_tokens as f64 / (total_latency_ms / 1000.0)
-            } else {
-                0.0
-            };
-
-            let metrics = RequestMetrics {
-                first_token_latency_ms: first_token_time.unwrap_or(total_latency_ms),
-                total_latency_ms,
-                tokens_per_second,
-                prompt_tokens,
-                completion_tokens,
-            };
+            let metrics =
+                Self::build_metrics(start, prompt_tokens, completion_tokens, first_token_time);
 
             // Done — send final event (ignore send error, client may be gone).
             let _ = tx.blocking_send(TokenEvent::Done(finish_reason, metrics));
         });
 
         rx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dense_config(hidden_size: u64, num_layers: u64, vocab_size: u64) -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": hidden_size,
+            "num_hidden_layers": num_layers,
+            "vocab_size": vocab_size,
+            "num_experts": 0,
+            "num_local_experts": 0
+        })
+    }
+
+    #[test]
+    fn test_estimate_parameter_count() {
+        let config = dense_config(1024, 24, 32768);
+        let estimated = estimate_parameter_count(&config).unwrap();
+        assert_eq!(estimated, 12 * 1024 * 1024 * 24 + 1024 * 32768);
+    }
+
+    #[test]
+    fn test_select_accelerated_backend_prefers_gpu_for_small_dense_model() {
+        let config = dense_config(1024, 24, 32768);
+        assert_eq!(
+            select_accelerated_backend(&config, true),
+            PreferredGenerationBackend::Gpu
+        );
+    }
+
+    #[test]
+    fn test_select_accelerated_backend_prefers_ane_for_large_dense_model() {
+        let config = dense_config(8192, 80, 128_256);
+        assert_eq!(
+            select_accelerated_backend(&config, true),
+            PreferredGenerationBackend::Ane
+        );
+    }
+
+    #[test]
+    fn test_select_accelerated_backend_prefers_cpu_hybrid_for_qwen3_next() {
+        let config = serde_json::json!({
+            "model_type": "qwen3_next",
+            "hidden_size": 1024,
+            "num_hidden_layers": 24,
+            "vocab_size": 151936,
+            "num_experts": 0,
+            "num_local_experts": 0
+        });
+        assert_eq!(
+            select_accelerated_backend(&config, true),
+            PreferredGenerationBackend::CpuHybrid
+        );
+    }
+
+    #[test]
+    fn test_select_accelerated_backend_honors_no_ane() {
+        let config = dense_config(8192, 80, 128_256);
+        assert_eq!(
+            select_accelerated_backend(&config, false),
+            PreferredGenerationBackend::Gpu
+        );
     }
 }

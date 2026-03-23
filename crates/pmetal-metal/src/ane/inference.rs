@@ -339,6 +339,20 @@ impl AneInferenceEngine {
         &self.config
     }
 
+    /// Update request-scoped generation parameters without rebuilding kernels.
+    pub fn set_generation_params(
+        &mut self,
+        temperature: f32,
+        top_k: usize,
+        max_tokens: usize,
+        eos_token_id: Option<u32>,
+    ) {
+        self.config.temperature = temperature;
+        self.config.top_k = top_k;
+        self.config.max_tokens = max_tokens;
+        self.config.eos_token_id = eos_token_id;
+    }
+
     /// Get the compilation budget tracker.
     pub fn budget(&self) -> &CompileBudget {
         &self.budget
@@ -1712,6 +1726,19 @@ mod tests {
         // 2 kernels per layer * 2 layers = 4 per compile batch
         assert_eq!(engine.budget().kernels_per_batch(), 4);
         assert!(engine.budget().can_compile_batch());
+    }
+
+    #[test]
+    fn test_set_generation_params() {
+        let config = small_config();
+        let mut engine = AneInferenceEngine::new(config, 0).unwrap();
+
+        engine.set_generation_params(0.8, 32, 128, Some(42));
+
+        assert_eq!(engine.config().temperature, 0.8);
+        assert_eq!(engine.config().top_k, 32);
+        assert_eq!(engine.config().max_tokens, 128);
+        assert_eq!(engine.config().eos_token_id, Some(42));
     }
 
     #[test]

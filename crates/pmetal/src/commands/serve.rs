@@ -9,6 +9,8 @@ pub(crate) async fn run_serve(
     host: String,
     max_seq_len: usize,
     experts_dir: Option<String>,
+    ane_enabled: bool,
+    ane_max_seq_len: usize,
 ) -> anyhow::Result<()> {
     use pmetal_models::dispatcher::DynamicModel;
     use pmetal_serve::{InferenceEngine, ServeConfig};
@@ -51,8 +53,15 @@ pub(crate) async fn run_serve(
     tracing::info!("Model loaded successfully");
 
     // Create inference engine
-    let engine =
-        InferenceEngine::new(model, tokenizer, model_id.clone(), &model_path, max_seq_len)?;
+    let engine = InferenceEngine::new_with_backend(
+        model,
+        tokenizer,
+        model_id.clone(),
+        &model_path,
+        max_seq_len,
+        ane_enabled,
+        ane_max_seq_len,
+    )?;
 
     // Start server
     let config = ServeConfig {

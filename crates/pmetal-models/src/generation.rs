@@ -34,6 +34,146 @@ use mlx_rs::{
 use pmetal_mlx::kv_cache::KVCache;
 use std::collections::HashMap;
 
+#[cfg(feature = "ane")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AneEngineKey {
+    model_path: std::path::PathBuf,
+    ane_seq_len: usize,
+}
+
+#[cfg(feature = "ane")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HybridCpuEngineKey {
+    model_path: std::path::PathBuf,
+}
+
+#[cfg(feature = "ane")]
+thread_local! {
+    static ANE_ENGINE_CACHE: std::cell::RefCell<HashMap<AneEngineKey, pmetal_metal::ane::inference::AneInferenceEngine>> =
+        std::cell::RefCell::new(HashMap::new());
+    static HYBRID_CPU_ENGINE_CACHE: std::cell::RefCell<HashMap<HybridCpuEngineKey, pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceEngine>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+#[cfg(feature = "ane")]
+fn build_ane_engine(
+    model_path: &std::path::Path,
+    config: pmetal_metal::ane::inference::AneInferenceConfig,
+    prompt_len: usize,
+) -> std::result::Result<
+    pmetal_metal::ane::inference::AneInferenceEngine,
+    pmetal_metal::error::MetalError,
+> {
+    let mut engine = pmetal_metal::ane::inference::AneInferenceEngine::new(config, prompt_len)?;
+    engine.load_weights_safetensors(model_path)?;
+    engine.compile_kernels()?;
+    Ok(engine)
+}
+
+#[cfg(feature = "ane")]
+fn with_cached_ane_engine<R>(
+    model_path: &std::path::Path,
+    config: pmetal_metal::ane::inference::AneInferenceConfig,
+    prompt_len: usize,
+    f: impl FnOnce(
+        &mut pmetal_metal::ane::inference::AneInferenceEngine,
+    ) -> std::result::Result<R, pmetal_metal::error::MetalError>,
+) -> std::result::Result<R, pmetal_metal::error::MetalError> {
+    let key = AneEngineKey {
+        model_path: model_path.to_path_buf(),
+        ane_seq_len: config.resolve_ane_seq_len(prompt_len),
+    };
+
+    ANE_ENGINE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let needs_rebuild = match cache.get(&key) {
+            Some(engine) => engine.config().max_seq_len < config.max_seq_len,
+            None => true,
+        };
+
+        if needs_rebuild {
+            tracing::info!(
+                model = %model_path.display(),
+                ane_seq_len = key.ane_seq_len,
+                max_seq_len = config.max_seq_len,
+                "Building cached ANE inference engine"
+            );
+            let engine = build_ane_engine(model_path, config.clone(), prompt_len)?;
+            cache.insert(key.clone(), engine);
+        }
+
+        let engine = cache.get_mut(&key).ok_or_else(|| {
+            pmetal_metal::error::MetalError::Internal(
+                "ANE engine cache missing freshly-built entry".to_string(),
+            )
+        })?;
+        engine.set_generation_params(
+            config.temperature,
+            config.top_k,
+            config.max_tokens,
+            config.eos_token_id,
+        );
+        f(engine)
+    })
+}
+
+#[cfg(feature = "ane")]
+fn build_hybrid_cpu_engine(
+    model_path: &std::path::Path,
+    config: pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceConfig,
+) -> std::result::Result<
+    pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceEngine,
+    pmetal_metal::error::MetalError,
+> {
+    let mut engine = pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceEngine::new(config)?;
+    engine.load_weights_safetensors(model_path)?;
+    Ok(engine)
+}
+
+#[cfg(feature = "ane")]
+fn with_cached_hybrid_cpu_engine<R>(
+    model_path: &std::path::Path,
+    config: pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceConfig,
+    f: impl FnOnce(
+        &mut pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceEngine,
+    ) -> std::result::Result<R, pmetal_metal::error::MetalError>,
+) -> std::result::Result<R, pmetal_metal::error::MetalError> {
+    let key = HybridCpuEngineKey {
+        model_path: model_path.to_path_buf(),
+    };
+
+    HYBRID_CPU_ENGINE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let needs_rebuild = match cache.get(&key) {
+            Some(engine) => engine.config().max_seq_len < config.max_seq_len,
+            None => true,
+        };
+
+        if needs_rebuild {
+            tracing::info!(
+                model = %model_path.display(),
+                max_seq_len = config.max_seq_len,
+                "Building cached CPU-hybrid inference engine"
+            );
+            let engine = build_hybrid_cpu_engine(model_path, config.clone())?;
+            cache.insert(key.clone(), engine);
+        }
+
+        let engine = cache.get_mut(&key).ok_or_else(|| {
+            pmetal_metal::error::MetalError::Internal(
+                "CPU-hybrid engine cache missing freshly-built entry".to_string(),
+            )
+        })?;
+        engine.set_generation_params(
+            config.temperature,
+            config.top_k,
+            config.max_tokens,
+            config.eos_token_id,
+        );
+        f(engine)
+    })
+}
+
 /// Wait for a specific array to be ready (computed).
 ///
 /// This is the key to matching Python's async_eval behavior. Python's async_eval
@@ -2147,21 +2287,52 @@ where
 ///
 /// Returns a [`GenerationOutput`] compatible with the GPU generation functions.
 #[cfg(feature = "ane")]
-pub fn generate_cached_ane(
+fn load_model_config_json(
+    model_path: &std::path::Path,
+) -> std::result::Result<serde_json::Value, pmetal_metal::error::MetalError> {
+    let config_text = std::fs::read_to_string(model_path.join("config.json")).map_err(|e| {
+        pmetal_metal::error::MetalError::InvalidConfig(format!("Failed to read config.json: {e}"))
+    })?;
+    serde_json::from_str(&config_text).map_err(|e| {
+        pmetal_metal::error::MetalError::InvalidConfig(format!("Failed to parse config.json: {e}"))
+    })
+}
+
+#[cfg(feature = "ane")]
+fn build_cached_generation_output(
+    input_len: usize,
+    token_ids: Vec<u32>,
+    gen_config: &GenerationConfig,
+    cancelled: bool,
+    saw_stop_token: bool,
+) -> GenerationOutput {
+    let num_generated = token_ids.len().saturating_sub(input_len);
+    let stopped_by_token =
+        !cancelled && (saw_stop_token || num_generated < gen_config.max_new_tokens);
+
+    GenerationOutput {
+        token_ids,
+        num_generated,
+        stopped_by_token,
+        stopped_by_length: !cancelled
+            && !stopped_by_token
+            && num_generated >= gen_config.max_new_tokens,
+    }
+}
+
+#[cfg(feature = "ane")]
+fn build_ane_inference_config(
     model_path: &std::path::Path,
     input_ids: &[u32],
     gen_config: &GenerationConfig,
     ane_max_seq_len: usize,
-) -> std::result::Result<GenerationOutput, pmetal_metal::error::MetalError> {
-    use pmetal_metal::ane::inference::{AneInferenceConfig, AneInferenceEngine};
+) -> std::result::Result<
+    pmetal_metal::ane::inference::AneInferenceConfig,
+    pmetal_metal::error::MetalError,
+> {
+    use pmetal_metal::ane::inference::AneInferenceConfig;
 
-    // Read and parse config.json for model architecture parameters
-    let config_text = std::fs::read_to_string(model_path.join("config.json")).map_err(|e| {
-        pmetal_metal::error::MetalError::InvalidConfig(format!("Failed to read config.json: {e}"))
-    })?;
-    let config_json: serde_json::Value = serde_json::from_str(&config_text).map_err(|e| {
-        pmetal_metal::error::MetalError::InvalidConfig(format!("Failed to parse config.json: {e}"))
-    })?;
+    let config_json = load_model_config_json(model_path)?;
 
     let get_usize = |key: &str| -> std::result::Result<usize, pmetal_metal::error::MetalError> {
         config_json
@@ -2198,7 +2369,7 @@ pub fn generate_cached_ane(
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
 
-    let ane_config = AneInferenceConfig {
+    Ok(AneInferenceConfig {
         dim,
         hidden_dim,
         n_heads,
@@ -2218,27 +2389,66 @@ pub fn generate_cached_ane(
         rms_norm_eps,
         head_dim,
         ..Default::default()
-    };
-
-    let mut engine = AneInferenceEngine::new(ane_config, input_ids.len())?;
-    engine.load_weights_safetensors(model_path)?;
-    engine.compile_kernels()?;
-
-    let prompt_len = input_ids.len();
-    let token_ids = engine.generate_cached(input_ids)?;
-    let num_generated = token_ids.len() - prompt_len;
-
-    let stopped_by_token = gen_config
-        .stop_tokens
-        .iter()
-        .any(|eos| token_ids.last() == Some(eos));
-
-    Ok(GenerationOutput {
-        token_ids,
-        num_generated,
-        stopped_by_token,
-        stopped_by_length: !stopped_by_token && num_generated >= gen_config.max_new_tokens,
     })
+}
+
+#[cfg(feature = "ane")]
+pub fn generate_cached_ane(
+    model_path: &std::path::Path,
+    input_ids: &[u32],
+    gen_config: &GenerationConfig,
+    ane_max_seq_len: usize,
+) -> std::result::Result<GenerationOutput, pmetal_metal::error::MetalError> {
+    generate_cached_ane_streaming(model_path, input_ids, gen_config, ane_max_seq_len, |_| true)
+}
+
+#[cfg(feature = "ane")]
+pub fn generate_cached_ane_streaming<F>(
+    model_path: &std::path::Path,
+    input_ids: &[u32],
+    gen_config: &GenerationConfig,
+    ane_max_seq_len: usize,
+    mut on_token: F,
+) -> std::result::Result<GenerationOutput, pmetal_metal::error::MetalError>
+where
+    F: FnMut(u32) -> bool,
+{
+    let ane_config =
+        build_ane_inference_config(model_path, input_ids, gen_config, ane_max_seq_len)?;
+    let stop_tokens = gen_config.stop_tokens.clone();
+    let prompt_len = input_ids.len();
+    let mut cancelled = false;
+    let mut saw_stop_token = false;
+
+    let token_ids = with_cached_ane_engine(model_path, ane_config, prompt_len, |engine| {
+        engine.generate_cached_streaming(input_ids, |token| {
+            if stop_tokens.contains(&token) {
+                saw_stop_token = true;
+                return false;
+            }
+            if !on_token(token) {
+                cancelled = true;
+                return false;
+            }
+            true
+        })
+    })?;
+
+    Ok(build_cached_generation_output(
+        prompt_len,
+        token_ids,
+        gen_config,
+        cancelled,
+        saw_stop_token,
+    ))
+}
+
+/// Check if a model config is compatible with ANE inference.
+#[cfg(feature = "ane")]
+pub fn is_ane_inference_compatible(
+    config_json: &serde_json::Value,
+) -> std::result::Result<(), String> {
+    pmetal_metal::ane::dynamic_trainer::DynamicAneTrainerConfig::is_ane_compatible(config_json)
 }
 
 /// Check if a model config is compatible with the CPU hybrid engine.
@@ -2249,28 +2459,18 @@ pub fn is_hybrid_cpu_compatible(
     pmetal_metal::ane::inference_hybrid::is_hybrid_cpu_compatible(config_json)
 }
 
-/// Generate tokens using the CPU GEMV hybrid engine for Qwen3.5 models.
-///
-/// This path uses CPU-only inference with `cblas_sgemv` for all matrix-vector
-/// multiplies, eliminating GPU kernel launch overhead for batch=1 decode.
-/// GDN layers use O(1) linear recurrence; attention layers use standard KV cache.
-///
-/// Compatible with non-MoE Qwen3.5 models (e.g., 0.8B).
 #[cfg(feature = "ane")]
-pub fn generate_cached_hybrid_cpu(
+fn build_hybrid_cpu_inference_config(
     model_path: &std::path::Path,
     input_ids: &[u32],
     gen_config: &GenerationConfig,
-) -> std::result::Result<GenerationOutput, pmetal_metal::error::MetalError> {
-    use pmetal_metal::ane::inference_hybrid::{Qwen3NextInferenceConfig, Qwen3NextInferenceEngine};
+) -> std::result::Result<
+    pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceConfig,
+    pmetal_metal::error::MetalError,
+> {
+    use pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceConfig;
 
-    // Read and parse config.json
-    let config_text = std::fs::read_to_string(model_path.join("config.json")).map_err(|e| {
-        pmetal_metal::error::MetalError::InvalidConfig(format!("Failed to read config.json: {e}"))
-    })?;
-    let config_json: serde_json::Value = serde_json::from_str(&config_text).map_err(|e| {
-        pmetal_metal::error::MetalError::InvalidConfig(format!("Failed to parse config.json: {e}"))
-    })?;
+    let config_json = load_model_config_json(model_path)?;
 
     let get_usize = |key: &str| -> std::result::Result<usize, pmetal_metal::error::MetalError> {
         config_json
@@ -2347,7 +2547,7 @@ pub fn generate_cached_hybrid_cpu(
             (rope_theta, partial_rotary_factor)
         };
 
-    let engine_config = Qwen3NextInferenceConfig {
+    Ok(Qwen3NextInferenceConfig {
         dim,
         hidden_dim,
         n_heads,
@@ -2371,26 +2571,62 @@ pub fn generate_cached_hybrid_cpu(
         top_k: gen_config.top_k,
         max_tokens: gen_config.max_new_tokens,
         eos_token_id: gen_config.stop_tokens.first().copied(),
-    };
-
-    let mut engine = Qwen3NextInferenceEngine::new(engine_config)?;
-    engine.load_weights_safetensors(model_path)?;
-
-    let prompt_len = input_ids.len();
-    let token_ids = engine.generate_cached(input_ids)?;
-    let num_generated = token_ids.len() - prompt_len;
-
-    let stopped_by_token = gen_config
-        .stop_tokens
-        .iter()
-        .any(|eos| token_ids.last() == Some(eos));
-
-    Ok(GenerationOutput {
-        token_ids,
-        num_generated,
-        stopped_by_token,
-        stopped_by_length: !stopped_by_token && num_generated >= gen_config.max_new_tokens,
     })
+}
+
+/// Generate tokens using the CPU GEMV hybrid engine for Qwen3.5 models.
+///
+/// This path uses CPU-only inference with `cblas_sgemv` for all matrix-vector
+/// multiplies, eliminating GPU kernel launch overhead for batch=1 decode.
+/// GDN layers use O(1) linear recurrence; attention layers use standard KV cache.
+///
+/// Compatible with non-MoE Qwen3.5 models (e.g., 0.8B).
+#[cfg(feature = "ane")]
+pub fn generate_cached_hybrid_cpu(
+    model_path: &std::path::Path,
+    input_ids: &[u32],
+    gen_config: &GenerationConfig,
+) -> std::result::Result<GenerationOutput, pmetal_metal::error::MetalError> {
+    generate_cached_hybrid_cpu_streaming(model_path, input_ids, gen_config, |_| true)
+}
+
+#[cfg(feature = "ane")]
+pub fn generate_cached_hybrid_cpu_streaming<F>(
+    model_path: &std::path::Path,
+    input_ids: &[u32],
+    gen_config: &GenerationConfig,
+    mut on_token: F,
+) -> std::result::Result<GenerationOutput, pmetal_metal::error::MetalError>
+where
+    F: FnMut(u32) -> bool,
+{
+    let engine_config = build_hybrid_cpu_inference_config(model_path, input_ids, gen_config)?;
+    let stop_tokens = gen_config.stop_tokens.clone();
+    let prompt_len = input_ids.len();
+    let mut cancelled = false;
+    let mut saw_stop_token = false;
+
+    let token_ids = with_cached_hybrid_cpu_engine(model_path, engine_config, |engine| {
+        engine.generate_cached_streaming(input_ids, |token| {
+            if stop_tokens.contains(&token) {
+                saw_stop_token = true;
+                return false;
+            }
+            if !on_token(token) {
+                cancelled = true;
+                return false;
+            }
+            true
+        })
+    })?;
+
+    Ok(build_cached_generation_output(
+        prompt_len,
+        token_ids,
+        gen_config,
+        cancelled,
+        saw_stop_token,
+    ))
 }
 
 #[cfg(test)]
@@ -2584,5 +2820,47 @@ mod tests {
 
         // Token 3: 5.0 (no penalty)
         assert!((logits_vec[3] - 5.0).abs() < 0.01);
+    }
+
+    #[cfg(feature = "ane")]
+    #[test]
+    fn test_cached_generation_output_marks_early_stop_as_token_stop() {
+        let gen_config = GenerationConfig::greedy(4);
+        let output =
+            build_cached_generation_output(3, vec![10, 11, 12, 13], &gen_config, false, false);
+
+        assert_eq!(output.num_generated, 1);
+        assert!(output.stopped_by_token);
+        assert!(!output.stopped_by_length);
+    }
+
+    #[cfg(feature = "ane")]
+    #[test]
+    fn test_cached_generation_output_preserves_cancellation_state() {
+        let gen_config = GenerationConfig::greedy(4);
+        let output =
+            build_cached_generation_output(3, vec![10, 11, 12, 13], &gen_config, true, false);
+
+        assert_eq!(output.num_generated, 1);
+        assert!(!output.stopped_by_token);
+        assert!(!output.stopped_by_length);
+    }
+
+    #[cfg(feature = "ane")]
+    #[test]
+    fn test_is_ane_inference_compatible_rejects_hybrid_architectures() {
+        let dense: serde_json::Value = serde_json::json!({
+            "model_type": "llama",
+            "num_experts": 0,
+            "num_local_experts": 0
+        });
+        assert!(is_ane_inference_compatible(&dense).is_ok());
+
+        let hybrid: serde_json::Value = serde_json::json!({
+            "model_type": "qwen3_next",
+            "num_experts": 0,
+            "num_local_experts": 0
+        });
+        assert!(is_ane_inference_compatible(&hybrid).is_err());
     }
 }

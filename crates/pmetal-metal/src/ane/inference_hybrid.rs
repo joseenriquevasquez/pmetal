@@ -437,6 +437,20 @@ impl Qwen3NextInferenceEngine {
         &self.config
     }
 
+    /// Update request-scoped generation parameters without rebuilding weights.
+    pub fn set_generation_params(
+        &mut self,
+        temperature: f32,
+        top_k: usize,
+        max_tokens: usize,
+        eos_token_id: Option<u32>,
+    ) {
+        self.config.temperature = temperature;
+        self.config.top_k = top_k;
+        self.config.max_tokens = max_tokens;
+        self.config.eos_token_id = eos_token_id;
+    }
+
     // ========================================================================
     // Generation
     // ========================================================================
@@ -1466,6 +1480,18 @@ mod tests {
         let config = small_config();
         let engine = Qwen3NextInferenceEngine::new(config).unwrap();
         assert_eq!(engine.config().n_layers, 4);
+    }
+
+    #[test]
+    fn test_set_generation_params() {
+        let config = small_config();
+        let mut engine = Qwen3NextInferenceEngine::new(config).unwrap();
+        engine.set_generation_params(0.75, 24, 48, Some(11));
+
+        assert_eq!(engine.config().temperature, 0.75);
+        assert_eq!(engine.config().top_k, 24);
+        assert_eq!(engine.config().max_tokens, 48);
+        assert_eq!(engine.config().eos_token_id, Some(11));
     }
 
     #[test]

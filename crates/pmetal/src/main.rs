@@ -1040,6 +1040,18 @@ enum Commands {
         /// Created with `pmetal pack-experts`.
         #[arg(long)]
         experts_dir: Option<String>,
+
+        /// Disable ANE (Apple Neural Engine) for serving, falling back to GPU/Metal.
+        #[cfg(feature = "ane")]
+        #[arg(long)]
+        no_ane: bool,
+
+        /// Maximum ANE kernel sequence length (power-of-2 bucket cap).
+        /// Higher values allow longer prompts on ANE but may fail to compile on
+        /// wider models. Default: 1024.
+        #[cfg(feature = "ane")]
+        #[arg(long, default_value = "1024")]
+        ane_max_seq_len: usize,
     },
 
     /// Dataset utilities for preparing and analyzing training data
@@ -2199,8 +2211,32 @@ async fn tokio_main() -> anyhow::Result<()> {
             host,
             max_seq_len,
             experts_dir,
+            #[cfg(feature = "ane")]
+            no_ane,
+            #[cfg(feature = "ane")]
+            ane_max_seq_len,
         } => {
-            commands::serve::run_serve(model, lora, port, host, max_seq_len, experts_dir).await?;
+            #[cfg(feature = "ane")]
+            let ane_enabled = !no_ane;
+            #[cfg(not(feature = "ane"))]
+            let ane_enabled = false;
+
+            #[cfg(feature = "ane")]
+            let serve_ane_max_seq_len = ane_max_seq_len;
+            #[cfg(not(feature = "ane"))]
+            let serve_ane_max_seq_len = 1024;
+
+            commands::serve::run_serve(
+                model,
+                lora,
+                port,
+                host,
+                max_seq_len,
+                experts_dir,
+                ane_enabled,
+                serve_ane_max_seq_len,
+            )
+            .await?;
         }
 
         Commands::Infer {

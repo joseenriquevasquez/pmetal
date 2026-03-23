@@ -33,9 +33,19 @@ curl http://localhost:8080/v1/chat/completions \
 ### As a Library
 
 ```rust
+use std::path::Path;
+
 use pmetal_serve::{InferenceEngine, ServeConfig, server::run_server};
 
-let engine = InferenceEngine::new(model, tokenizer)?;
+let engine = InferenceEngine::new(
+    model,
+    tokenizer,
+    "my-model".to_string(),
+    Path::new("/path/to/model"),
+    4096,
+    true,
+    1024,
+)?;
 let config = ServeConfig {
     port: 8080,
     host: "0.0.0.0".to_string(),

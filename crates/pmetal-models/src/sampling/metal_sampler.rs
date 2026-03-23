@@ -59,6 +59,12 @@ pub enum MetalSamplerError {
 /// Result type for MetalSampler operations.
 pub type Result<T> = std::result::Result<T, MetalSamplerError>;
 
+/// In-flight sampler dispatch that retains the source logits until completion.
+struct PendingDispatch {
+    cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    logits: Array,
+}
+
 /// High-performance Metal sampler using fused kernel.
 ///
 /// This sampler bypasses the mlx-rs sampling path to execute all sampling
@@ -69,8 +75,9 @@ pub struct MetalSampler {
     fused: FusedSampler,
     /// Metal context.
     ctx: Arc<MetalContext>,
-    /// Pending command buffer (if async operation in flight).
-    pending_cmd: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    /// Pending asynchronous dispatch, including a retained logits array to keep
+    /// zero-copy memory alive until the GPU has finished reading from it.
+    pending: Option<PendingDispatch>,
 }
 
 impl MetalSampler {
@@ -88,7 +95,7 @@ impl MetalSampler {
         Ok(Self {
             fused,
             ctx,
-            pending_cmd: None,
+            pending: None,
         })
     }
 
@@ -107,7 +114,7 @@ impl MetalSampler {
         Ok(Self {
             fused,
             ctx,
-            pending_cmd: None,
+            pending: None,
         })
     }
 
@@ -131,9 +138,8 @@ impl MetalSampler {
     /// * `top_p` - Top-P nucleus sampling threshold
     /// * `min_p` - Min-P threshold relative to max probability
     ///
-    /// # Safety
-    /// The logits array must outlive this operation. The caller should
-    /// ensure the array is not modified until `get_token()` is called.
+    /// This method retains the source array until completion so callers may
+    /// safely drop their original handle after dispatch.
     pub fn sample_async(
         &mut self,
         logits: &Array,
@@ -142,21 +148,8 @@ impl MetalSampler {
         top_p: f32,
         min_p: f32,
     ) -> Result<()> {
-        // Validate input
-        if logits.size() == 0 {
-            return Err(MetalSamplerError::EmptyArray);
-        }
-
-        // Ensure array is evaluated before getting data pointer
-        logits
-            .eval()
-            .map_err(|_| MetalSamplerError::NonContiguous)?;
-
-        // Check dtype - must be f32
-        let dtype = logits.dtype();
-        if dtype != mlx_rs::Dtype::Float32 {
-            return Err(MetalSamplerError::WrongDtype(dtype));
-        }
+        self.wait_for_pending()?;
+        self.validate_logits(logits)?;
 
         // Get raw data pointer from MLX array via as_slice()
         // SAFETY: Array is evaluated and we're using unified memory
@@ -172,7 +165,10 @@ impl MetalSampler {
             .fused
             .sample_async(&buffer_view, temperature, top_k, top_p, min_p)?;
 
-        self.pending_cmd = Some(cmd);
+        self.pending = Some(PendingDispatch {
+            cmd,
+            logits: logits.clone(),
+        });
         Ok(())
     }
 
@@ -180,21 +176,8 @@ impl MetalSampler {
     ///
     /// Faster path for temperature=0 (greedy decoding).
     pub fn argmax_async(&mut self, logits: &Array) -> Result<()> {
-        // Validate input
-        if logits.size() == 0 {
-            return Err(MetalSamplerError::EmptyArray);
-        }
-
-        // Ensure array is evaluated
-        logits
-            .eval()
-            .map_err(|_| MetalSamplerError::NonContiguous)?;
-
-        // Check dtype
-        let dtype = logits.dtype();
-        if dtype != mlx_rs::Dtype::Float32 {
-            return Err(MetalSamplerError::WrongDtype(dtype));
-        }
+        self.wait_for_pending()?;
+        self.validate_logits(logits)?;
 
         // Get raw data pointer via as_slice()
         let slice = logits.as_slice::<f32>();
@@ -206,7 +189,10 @@ impl MetalSampler {
 
         // Dispatch kernel
         let cmd = self.fused.argmax_async(&buffer_view)?;
-        self.pending_cmd = Some(cmd);
+        self.pending = Some(PendingDispatch {
+            cmd,
+            logits: logits.clone(),
+        });
         Ok(())
     }
 
@@ -214,23 +200,13 @@ impl MetalSampler {
     ///
     /// If no operation is pending, returns 0.
     pub fn get_token(&mut self) -> Result<u32> {
-        if let Some(cmd) = self.pending_cmd.take() {
-            cmd.waitUntilCompleted();
-
-            // Check for errors
-            if let Some(error) = cmd.error() {
-                return Err(MetalSamplerError::Metal(MetalError::ExecutionFailed(
-                    error.to_string(),
-                )));
-            }
-        }
-
+        self.wait_for_pending()?;
         Ok(self.fused.read_result())
     }
 
     /// Check if there's a pending operation.
     pub fn has_pending(&self) -> bool {
-        self.pending_cmd.is_some()
+        self.pending.is_some()
     }
 
     /// Get the vocabulary size.
@@ -257,6 +233,42 @@ impl MetalSampler {
     pub fn argmax(&mut self, logits: &Array) -> Result<u32> {
         self.argmax_async(logits)?;
         self.get_token()
+    }
+
+    fn validate_logits(&self, logits: &Array) -> Result<()> {
+        // Validate input
+        if logits.size() == 0 {
+            return Err(MetalSamplerError::EmptyArray);
+        }
+
+        // Ensure array is evaluated before getting data pointer
+        logits
+            .eval()
+            .map_err(|_| MetalSamplerError::NonContiguous)?;
+
+        // Check dtype - must be f32
+        let dtype = logits.dtype();
+        if dtype != mlx_rs::Dtype::Float32 {
+            return Err(MetalSamplerError::WrongDtype(dtype));
+        }
+        Ok(())
+    }
+
+    fn wait_for_pending(&mut self) -> Result<()> {
+        if let Some(pending) = self.pending.take() {
+            pending.cmd.waitUntilCompleted();
+
+            // Keep the logits alive until the command buffer has fully completed.
+            let _retained_logits = pending.logits;
+
+            if let Some(error) = pending.cmd.error() {
+                return Err(MetalSamplerError::Metal(MetalError::ExecutionFailed(
+                    error.to_string(),
+                )));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -358,5 +370,59 @@ mod tests {
             "Token 0 should appear ~90% of time, got {:.1}%",
             ratio * 100.0
         );
+    }
+
+    #[test]
+    fn test_metal_sampler_async_retains_logits_until_completion() {
+        let mut sampler = MetalSampler::new(2048).unwrap();
+
+        let mut logits_vec = vec![-100.0f32; 2048];
+        logits_vec[777] = 42.0;
+        let logits = Array::from_slice(&logits_vec, &[2048]);
+        logits.eval().unwrap();
+
+        sampler.argmax_async(&logits).unwrap();
+        assert!(sampler.has_pending());
+
+        drop(logits);
+
+        // Churn additional allocations to increase the odds of catching any
+        // stale-pointer bug in the zero-copy path.
+        let scratch: Vec<Array> = (0..32)
+            .map(|i| Array::from_slice(&vec![i as f32; 2048], &[2048]))
+            .collect();
+        assert_eq!(scratch.len(), 32);
+
+        let token = sampler.get_token().unwrap();
+        assert_eq!(token, 777);
+        assert!(!sampler.has_pending());
+    }
+
+    #[test]
+    fn test_metal_sampler_async_serializes_reused_output_buffer() {
+        let mut sampler = MetalSampler::new(256).unwrap();
+
+        let mut first_logits = vec![-10.0f32; 256];
+        first_logits[11] = 10.0;
+        let first = Array::from_slice(&first_logits, &[256]);
+        first.eval().unwrap();
+
+        let mut second_logits = vec![-10.0f32; 256];
+        second_logits[173] = 10.0;
+        let second = Array::from_slice(&second_logits, &[256]);
+        second.eval().unwrap();
+
+        sampler.argmax_async(&first).unwrap();
+        assert!(sampler.has_pending());
+
+        // A second async dispatch reuses the sampler's shared output buffer.
+        // This must implicitly synchronize the first command before launching
+        // the second one.
+        sampler.argmax_async(&second).unwrap();
+        assert!(sampler.has_pending());
+
+        let token = sampler.get_token().unwrap();
+        assert_eq!(token, 173);
+        assert!(!sampler.has_pending());
     }
 }
