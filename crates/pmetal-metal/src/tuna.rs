@@ -35,9 +35,10 @@ use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use half::f16;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
@@ -45,8 +46,10 @@ use objc2_metal::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::context::MetalContext;
+use crate::buffer::{BufferUsage, MetalBuffer};
+use crate::context::{DeviceTier, MetalContext};
 use crate::error::{MetalError, Result};
+use crate::kernels::mpp_gemm::{MppGemm, MppGemmConfig, MppGemmKernelVariant};
 use tracing::{debug, info, warn};
 
 // ============================================================================
@@ -160,6 +163,70 @@ impl Default for NormLoraTunedConfig {
     }
 }
 
+/// Configuration for tuned MPP GEMM dispatch.
+///
+/// The tuner selects both the threadgroup tile/simdgroup variant and the tile
+/// walk order for a given MPP GEMM problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MppGemmTunedConfig {
+    /// Kernel tile/simdgroup variant.
+    pub variant: MppGemmKernelVariant,
+    /// Whether to dispatch tiles in Morton Z-order rather than linear order.
+    pub use_morton: bool,
+}
+
+impl Default for MppGemmTunedConfig {
+    fn default() -> Self {
+        Self {
+            variant: MppGemmKernelVariant::default(),
+            use_morton: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Problem description for tuning MPP GEMM dispatch.
+pub struct MppGemmTuneRequest {
+    /// Output rows.
+    pub m: usize,
+    /// Output columns.
+    pub n: usize,
+    /// Reduction dimension.
+    pub k: usize,
+    /// Batch count for batched GEMM dispatch.
+    pub batch_size: usize,
+    /// Whether the kernel uses fp16 buffers instead of fp32.
+    pub use_fp16: bool,
+    /// Whether the kernel performs in-place accumulation (`beta != 0`).
+    pub accumulate: bool,
+}
+
+impl MppGemmTuneRequest {
+    fn cache_key(self, device_name: &str, device_tier: DeviceTier) -> String {
+        format!(
+            "mpp_gemm:{}:{}:{}:{}:{}:{}:{}:{}",
+            device_name,
+            device_tier_key(device_tier),
+            self.m,
+            self.n,
+            self.k,
+            self.batch_size,
+            if self.use_fp16 { "f16" } else { "f32" },
+            if self.accumulate { "acc" } else { "plain" }
+        )
+    }
+}
+
+fn device_tier_key(tier: DeviceTier) -> &'static str {
+    match tier {
+        DeviceTier::Base => "base",
+        DeviceTier::Pro => "pro",
+        DeviceTier::Max => "max",
+        DeviceTier::Ultra => "ultra",
+    }
+}
+
 // ============================================================================
 // Disk cache free helpers (outside Tuner so borrowck is happy)
 // ============================================================================
@@ -224,6 +291,10 @@ pub struct Tuner {
     /// Key: "norm_lora:batch:hidden:out_features:rank"
     norm_lora_cache: Mutex<HashMap<String, NormLoraTunedConfig>>,
 
+    /// Cache of best configurations for MPP GEMM dispatch.
+    /// Key: "mpp_gemm:device_name:device_tier:m:n:k:batch:dtype:accumulate"
+    mpp_gemm_cache: Mutex<HashMap<String, MppGemmTunedConfig>>,
+
     /// Path for persistent cache storage (`~/.cache/pmetal/tuna/` by default).
     /// `None` means no disk persistence (in-memory only).
     cache_dir: Option<PathBuf>,
@@ -244,6 +315,7 @@ impl Tuner {
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
+            mpp_gemm_cache: Mutex::new(HashMap::new()),
             cache_dir: None,
         }
     }
@@ -261,6 +333,7 @@ impl Tuner {
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
+            mpp_gemm_cache: Mutex::new(HashMap::new()),
             cache_dir: cache_dir.clone(),
         };
 
@@ -295,6 +368,10 @@ impl Tuner {
         load_disk_cache_file::<NormLoraTunedConfig>(
             &dir.join("norm_lora.json"),
             &self.norm_lora_cache,
+        );
+        load_disk_cache_file::<MppGemmTunedConfig>(
+            &dir.join("mpp_gemm.json"),
+            &self.mpp_gemm_cache,
         );
     }
 
@@ -345,6 +422,15 @@ impl Tuner {
         };
         let path = dir.join("norm_lora.json");
         self.flush_cache_file(&path, &self.norm_lora_cache, key, config);
+    }
+
+    /// Persist the full MPP GEMM in-memory cache to `mpp_gemm.json`.
+    fn save_mpp_gemm_to_disk(&self, key: &str, config: &MppGemmTunedConfig) {
+        let Some(dir) = self.ensure_cache_dir() else {
+            return;
+        };
+        let path = dir.join("mpp_gemm.json");
+        self.flush_cache_file(&path, &self.mpp_gemm_cache, key, config);
     }
 
     /// Generic helper: insert `key`→`config` into the mutex-guarded map, then
@@ -429,6 +515,317 @@ impl Tuner {
                 tracing::error!("Failed to acquire merge_cache lock: {}", e);
             }
         }
+    }
+
+    // =========================================================================
+    // MPP GEMM Dispatch Tuning (benchmarked)
+    // =========================================================================
+
+    /// Tune the MPP GEMM dispatch shape and launch order for a specific problem size.
+    pub fn tune_mpp_gemm(
+        &self,
+        context: &Arc<MetalContext>,
+        request: MppGemmTuneRequest,
+    ) -> Result<MppGemmTunedConfig> {
+        let props = context.properties();
+        let key = request.cache_key(&props.name, props.device_tier);
+
+        {
+            let cache = self
+                .mpp_gemm_cache
+                .lock()
+                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
+            if let Some(&config) = cache.get(&key) {
+                return Ok(config);
+            }
+        }
+
+        let mut best_config = self.heuristic_mpp_gemm_config(request, props.device_tier);
+        let mut best_time = f64::INFINITY;
+
+        if !props.has_nax() || context.pipeline_cache().metal4_library().is_none() {
+            debug!(
+                "Skipping MPP GEMM tuning on non-NAX or Metal 4-unavailable device: {}",
+                props.name
+            );
+        } else if !props.should_consider_mpp_gemm(request.m, request.n, request.k, request.use_fp16)
+        {
+            debug!(
+                "Skipping MPP GEMM benchmarking for small problem [M={}, N={}, K={}, B={}]",
+                request.m, request.n, request.k, request.batch_size
+            );
+        } else {
+            info!(
+                "Tuning MPP GEMM dispatch for [M={}, N={}, K={}, B={}, dtype={}, mode={}]...",
+                request.m,
+                request.n,
+                request.k,
+                request.batch_size,
+                if request.use_fp16 { "f16" } else { "f32" },
+                if request.accumulate {
+                    "accumulate"
+                } else {
+                    "overwrite"
+                }
+            );
+
+            let candidates = self.candidate_mpp_gemm_configs(request, props.device_tier);
+
+            for candidate in candidates {
+                match self.benchmark_mpp_gemm(context, candidate, request) {
+                    Ok(time) => {
+                        debug!(
+                            "MPP GEMM config {:?} took {:.3} ms",
+                            candidate,
+                            time * 1000.0
+                        );
+                        if time < best_time {
+                            best_time = time;
+                            best_config = candidate;
+                        }
+                    }
+                    Err(error) => {
+                        debug!("MPP GEMM config {:?} failed: {}", candidate, error);
+                    }
+                }
+            }
+        }
+
+        {
+            let mut cache = self
+                .mpp_gemm_cache
+                .lock()
+                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
+            cache.insert(key.clone(), best_config);
+        }
+        self.save_mpp_gemm_to_disk(&key, &best_config);
+
+        if best_time.is_finite() {
+            info!(
+                "Best MPP GEMM config: {:?} ({:.3} ms)",
+                best_config,
+                best_time * 1000.0
+            );
+        } else {
+            debug!("Selected heuristic MPP GEMM config: {:?}", best_config);
+        }
+
+        Ok(best_config)
+    }
+
+    fn heuristic_mpp_gemm_variant(
+        &self,
+        request: MppGemmTuneRequest,
+        device_tier: DeviceTier,
+    ) -> MppGemmKernelVariant {
+        let wide = request.n >= request.m.saturating_mul(2);
+        let tall = request.m >= request.n.saturating_mul(2);
+        let tiny = request.m <= 32 || request.n <= 32;
+
+        match device_tier {
+            DeviceTier::Base => {
+                if tiny {
+                    MppGemmKernelVariant::Sg1_32x32
+                } else if wide {
+                    MppGemmKernelVariant::Sg2_32x64
+                } else {
+                    MppGemmKernelVariant::Sg2_64x32
+                }
+            }
+            DeviceTier::Pro => {
+                if tiny {
+                    MppGemmKernelVariant::Sg1_32x32
+                } else if wide {
+                    MppGemmKernelVariant::Sg2_32x64
+                } else if tall {
+                    MppGemmKernelVariant::Sg2_64x32
+                } else {
+                    MppGemmKernelVariant::Sg4_64x64
+                }
+            }
+            DeviceTier::Max | DeviceTier::Ultra => {
+                if tiny {
+                    MppGemmKernelVariant::Sg1_32x32
+                } else if wide {
+                    MppGemmKernelVariant::Sg2_32x64
+                } else if tall {
+                    MppGemmKernelVariant::Sg2_64x32
+                } else {
+                    MppGemmKernelVariant::Sg4_64x64
+                }
+            }
+        }
+    }
+
+    fn heuristic_mpp_gemm_config(
+        &self,
+        request: MppGemmTuneRequest,
+        device_tier: DeviceTier,
+    ) -> MppGemmTunedConfig {
+        let use_morton =
+            request.accumulate || request.batch_size > 1 || request.m > 32 || request.n > 512;
+        MppGemmTunedConfig {
+            variant: self.heuristic_mpp_gemm_variant(request, device_tier),
+            use_morton,
+        }
+    }
+
+    fn candidate_mpp_gemm_variants(
+        &self,
+        request: MppGemmTuneRequest,
+        device_tier: DeviceTier,
+    ) -> Vec<MppGemmKernelVariant> {
+        let mut variants = vec![self.heuristic_mpp_gemm_variant(request, device_tier)];
+        match device_tier {
+            DeviceTier::Base => variants.extend([
+                MppGemmKernelVariant::Sg1_32x32,
+                MppGemmKernelVariant::Sg2_64x32,
+                MppGemmKernelVariant::Sg2_32x64,
+            ]),
+            DeviceTier::Pro => variants.extend([
+                MppGemmKernelVariant::Sg1_32x32,
+                MppGemmKernelVariant::Sg2_64x32,
+                MppGemmKernelVariant::Sg2_32x64,
+                MppGemmKernelVariant::Sg4_64x64,
+            ]),
+            DeviceTier::Max | DeviceTier::Ultra => variants.extend([
+                MppGemmKernelVariant::Sg1_32x32,
+                MppGemmKernelVariant::Sg2_64x32,
+                MppGemmKernelVariant::Sg2_32x64,
+                MppGemmKernelVariant::Sg4_64x64,
+            ]),
+        }
+        let mut unique = Vec::with_capacity(variants.len());
+        for variant in variants {
+            if !unique.contains(&variant) {
+                unique.push(variant);
+            }
+        }
+        unique
+    }
+
+    fn candidate_mpp_gemm_configs(
+        &self,
+        request: MppGemmTuneRequest,
+        device_tier: DeviceTier,
+    ) -> Vec<MppGemmTunedConfig> {
+        let preferred = self.heuristic_mpp_gemm_config(request, device_tier);
+        let mut configs = vec![preferred];
+
+        for variant in self.candidate_mpp_gemm_variants(request, device_tier) {
+            configs.push(MppGemmTunedConfig {
+                variant,
+                use_morton: preferred.use_morton,
+            });
+            configs.push(MppGemmTunedConfig {
+                variant,
+                use_morton: !preferred.use_morton,
+            });
+        }
+
+        let mut unique = Vec::with_capacity(configs.len());
+        for config in configs {
+            if !unique.contains(&config) {
+                unique.push(config);
+            }
+        }
+        unique
+    }
+
+    fn benchmark_mpp_gemm(
+        &self,
+        context: &Arc<MetalContext>,
+        candidate: MppGemmTunedConfig,
+        request: MppGemmTuneRequest,
+    ) -> Result<f64> {
+        let total_elements = request
+            .batch_size
+            .checked_mul(
+                request
+                    .m
+                    .checked_mul(request.k)
+                    .and_then(|x| x.checked_add(request.n.checked_mul(request.k)?))
+                    .and_then(|x| x.checked_add(request.m.checked_mul(request.n)?))
+                    .ok_or_else(|| {
+                        MetalError::InvalidConfig("MPP GEMM benchmark size overflow".to_string())
+                    })?,
+            )
+            .ok_or_else(|| {
+                MetalError::InvalidConfig("MPP GEMM benchmark size overflow".to_string())
+            })?;
+
+        let bytes_per_element = if request.use_fp16 { 2usize } else { 4usize };
+        let total_bytes = total_elements.saturating_mul(bytes_per_element);
+        if total_bytes > 256 * 1024 * 1024 {
+            let heuristic =
+                self.heuristic_mpp_gemm_config(request, context.properties().device_tier);
+            return Ok(if heuristic == candidate { 1.0 } else { 10.0 });
+        }
+
+        let start = Instant::now();
+        let iterations = 3;
+
+        if request.use_fp16 {
+            let a = MetalBuffer::<f16>::zeros(
+                context,
+                request.batch_size * request.m * request.k,
+                BufferUsage::Shared,
+            )?;
+            let b = MetalBuffer::<f16>::zeros(
+                context,
+                request.batch_size * request.n * request.k,
+                BufferUsage::Shared,
+            )?;
+            let d = MetalBuffer::<f16>::zeros(
+                context,
+                request.batch_size * request.m * request.n,
+                BufferUsage::Shared,
+            )?;
+            let mut config = MppGemmConfig::new(request.m, request.n, request.k);
+            config.batch_size = request.batch_size;
+            config.use_fp16 = true;
+            config.use_morton = candidate.use_morton;
+            config.kernel_variant = candidate.variant;
+            config.beta = if request.accumulate { 1.0 } else { 0.0 };
+            config.auto_tune_morton = false;
+            config.auto_tune_variant = false;
+            let gemm = MppGemm::new(Arc::clone(context), config);
+            gemm.execute(&a, &b, &d)?;
+            for _ in 0..iterations {
+                gemm.execute(&a, &b, &d)?;
+            }
+        } else {
+            let a = MetalBuffer::<f32>::zeros(
+                context,
+                request.batch_size * request.m * request.k,
+                BufferUsage::Shared,
+            )?;
+            let b = MetalBuffer::<f32>::zeros(
+                context,
+                request.batch_size * request.n * request.k,
+                BufferUsage::Shared,
+            )?;
+            let d = MetalBuffer::<f32>::zeros(
+                context,
+                request.batch_size * request.m * request.n,
+                BufferUsage::Shared,
+            )?;
+            let mut config = MppGemmConfig::new(request.m, request.n, request.k);
+            config.batch_size = request.batch_size;
+            config.use_fp16 = false;
+            config.use_morton = candidate.use_morton;
+            config.kernel_variant = candidate.variant;
+            config.beta = if request.accumulate { 1.0 } else { 0.0 };
+            config.auto_tune_morton = false;
+            config.auto_tune_variant = false;
+            let gemm = MppGemm::new(Arc::clone(context), config);
+            gemm.execute(&a, &b, &d)?;
+            for _ in 0..iterations {
+                gemm.execute(&a, &b, &d)?;
+            }
+        }
+
+        Ok(start.elapsed().as_secs_f64() / iterations as f64)
     }
 
     // =========================================================================
@@ -1549,6 +1946,13 @@ mod tests {
         assert!(!c.use_tiled);
     }
 
+    #[test]
+    fn mpp_gemm_tuned_config_default() {
+        let c = MppGemmTunedConfig::default();
+        assert_eq!(c.variant, MppGemmKernelVariant::Sg4_64x64);
+        assert!(c.use_morton);
+    }
+
     // -------------------------------------------------------------------------
     // Serde round-trips
     // -------------------------------------------------------------------------
@@ -1596,6 +2000,24 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let decoded: NormLoraTunedConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, decoded);
+    }
+
+    #[test]
+    fn mpp_gemm_tuned_config_serde_roundtrip() {
+        let config = MppGemmTunedConfig {
+            variant: MppGemmKernelVariant::Sg2_32x64,
+            use_morton: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let decoded: MppGemmTunedConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, decoded);
+    }
+
+    #[test]
+    fn mpp_gemm_tuned_config_deserializes_legacy_cache_entries() {
+        let decoded: MppGemmTunedConfig = serde_json::from_str(r#"{"use_morton":false}"#).unwrap();
+        assert_eq!(decoded.variant, MppGemmKernelVariant::Sg4_64x64);
+        assert!(!decoded.use_morton);
     }
 
     // -------------------------------------------------------------------------
@@ -1652,6 +2074,7 @@ mod tests {
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
+            mpp_gemm_cache: Mutex::new(HashMap::new()),
             cache_dir: Some(cache_path.clone()),
         };
 
@@ -1695,12 +2118,216 @@ mod tests {
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
+            mpp_gemm_cache: Mutex::new(HashMap::new()),
             cache_dir: Some(cache_path),
         };
         tuner.load_disk_cache();
 
         let guard = tuner.swiglu_cache.lock().unwrap();
         assert_eq!(guard.get(key), Some(&config));
+    }
+
+    #[test]
+    fn mpp_gemm_disk_cache_write_read_roundtrip() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = tmp_dir.path().join("pmetal").join("tuna");
+
+        let tuner = Tuner {
+            cache: Mutex::new(HashMap::new()),
+            merge_cache: Mutex::new(HashMap::new()),
+            swiglu_cache: Mutex::new(HashMap::new()),
+            cross_entropy_cache: Mutex::new(HashMap::new()),
+            norm_lora_cache: Mutex::new(HashMap::new()),
+            mpp_gemm_cache: Mutex::new(HashMap::new()),
+            cache_dir: Some(cache_path.clone()),
+        };
+
+        let key = "mpp_gemm:Apple M5 Pro:pro:64:256:128:1:f16:plain";
+        let config = MppGemmTunedConfig {
+            variant: MppGemmKernelVariant::Sg2_32x64,
+            use_morton: false,
+        };
+        tuner.save_mpp_gemm_to_disk(key, &config);
+
+        let json_path = cache_path.join("mpp_gemm.json");
+        assert!(json_path.exists(), "mpp_gemm.json should have been created");
+
+        let contents = fs::read_to_string(&json_path).unwrap();
+        let map: HashMap<String, MppGemmTunedConfig> = serde_json::from_str(&contents).unwrap();
+        assert_eq!(map.get(key), Some(&config));
+    }
+
+    #[test]
+    fn mpp_gemm_disk_cache_load_populates_in_memory() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = tmp_dir.path().join("pmetal").join("tuna");
+        fs::create_dir_all(&cache_path).unwrap();
+
+        let key = "mpp_gemm:Apple M5 Max:max:128:512:256:2:f16:acc";
+        let config = MppGemmTunedConfig {
+            variant: MppGemmKernelVariant::Sg4_64x64,
+            use_morton: true,
+        };
+        let map: HashMap<&str, MppGemmTunedConfig> = [(key, config)].into_iter().collect();
+        let json = serde_json::to_string_pretty(&map).unwrap();
+        fs::write(cache_path.join("mpp_gemm.json"), &json).unwrap();
+
+        let mut tuner = Tuner {
+            cache: Mutex::new(HashMap::new()),
+            merge_cache: Mutex::new(HashMap::new()),
+            swiglu_cache: Mutex::new(HashMap::new()),
+            cross_entropy_cache: Mutex::new(HashMap::new()),
+            norm_lora_cache: Mutex::new(HashMap::new()),
+            mpp_gemm_cache: Mutex::new(HashMap::new()),
+            cache_dir: Some(cache_path),
+        };
+        tuner.load_disk_cache();
+
+        let guard = tuner.mpp_gemm_cache.lock().unwrap();
+        assert_eq!(guard.get(key), Some(&config));
+    }
+
+    #[test]
+    fn mpp_gemm_heuristic_prefers_linear_for_small_single_batch() {
+        let tuner = Tuner::new();
+        let config = tuner.heuristic_mpp_gemm_config(
+            MppGemmTuneRequest {
+                m: 16,
+                n: 256,
+                k: 128,
+                batch_size: 1,
+                use_fp16: true,
+                accumulate: false,
+            },
+            DeviceTier::Base,
+        );
+        assert_eq!(config.variant, MppGemmKernelVariant::Sg1_32x32);
+        assert!(!config.use_morton);
+    }
+
+    #[test]
+    fn mpp_gemm_heuristic_prefers_morton_for_accumulate_or_batched_work() {
+        let tuner = Tuner::new();
+        assert!(
+            tuner
+                .heuristic_mpp_gemm_config(
+                    MppGemmTuneRequest {
+                        m: 16,
+                        n: 256,
+                        k: 128,
+                        batch_size: 2,
+                        use_fp16: true,
+                        accumulate: false,
+                    },
+                    DeviceTier::Pro,
+                )
+                .use_morton
+        );
+        assert!(
+            tuner
+                .heuristic_mpp_gemm_config(
+                    MppGemmTuneRequest {
+                        m: 16,
+                        n: 256,
+                        k: 128,
+                        batch_size: 1,
+                        use_fp16: true,
+                        accumulate: true,
+                    },
+                    DeviceTier::Pro,
+                )
+                .use_morton
+        );
+        assert!(
+            tuner
+                .heuristic_mpp_gemm_config(
+                    MppGemmTuneRequest {
+                        m: 64,
+                        n: 256,
+                        k: 128,
+                        batch_size: 1,
+                        use_fp16: true,
+                        accumulate: false,
+                    },
+                    DeviceTier::Max,
+                )
+                .use_morton
+        );
+    }
+
+    #[test]
+    fn mpp_gemm_heuristic_variant_tracks_shape_and_tier() {
+        let tuner = Tuner::new();
+        let wide = MppGemmTuneRequest {
+            m: 64,
+            n: 256,
+            k: 128,
+            batch_size: 1,
+            use_fp16: true,
+            accumulate: false,
+        };
+        let tall = MppGemmTuneRequest {
+            m: 256,
+            n: 64,
+            k: 128,
+            batch_size: 1,
+            use_fp16: true,
+            accumulate: false,
+        };
+        let balanced = MppGemmTuneRequest {
+            m: 128,
+            n: 128,
+            k: 128,
+            batch_size: 1,
+            use_fp16: true,
+            accumulate: false,
+        };
+
+        assert_eq!(
+            tuner.heuristic_mpp_gemm_variant(wide, DeviceTier::Base),
+            MppGemmKernelVariant::Sg2_32x64
+        );
+        assert_eq!(
+            tuner.heuristic_mpp_gemm_variant(tall, DeviceTier::Base),
+            MppGemmKernelVariant::Sg2_64x32
+        );
+        assert_eq!(
+            tuner.heuristic_mpp_gemm_variant(balanced, DeviceTier::Pro),
+            MppGemmKernelVariant::Sg4_64x64
+        );
+    }
+
+    #[test]
+    fn mpp_gemm_candidates_cover_supported_variants_without_duplicates() {
+        let tuner = Tuner::new();
+        let request = MppGemmTuneRequest {
+            m: 128,
+            n: 128,
+            k: 128,
+            batch_size: 1,
+            use_fp16: true,
+            accumulate: false,
+        };
+        let variants = tuner.candidate_mpp_gemm_variants(request, DeviceTier::Pro);
+        assert_eq!(
+            variants,
+            vec![
+                MppGemmKernelVariant::Sg4_64x64,
+                MppGemmKernelVariant::Sg1_32x32,
+                MppGemmKernelVariant::Sg2_64x32,
+                MppGemmKernelVariant::Sg2_32x64,
+            ]
+        );
+
+        let configs = tuner.candidate_mpp_gemm_configs(request, DeviceTier::Pro);
+        assert_eq!(configs.len(), 8);
+        assert_eq!(
+            configs.first(),
+            Some(&MppGemmTunedConfig {
+                variant: MppGemmKernelVariant::Sg4_64x64,
+                use_morton: true,
+            })
+        );
     }
 
     // -------------------------------------------------------------------------

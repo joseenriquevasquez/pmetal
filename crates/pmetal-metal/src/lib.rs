@@ -108,6 +108,10 @@ pub use kernels::fused_sampler::{AsMetalBuffer, FusedSampler, FusedSamplerConfig
 pub use kernels::fused_swiglu::{
     FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput,
 };
+pub use kernels::mpp_flash_attention::{
+    MppFlashAttention, MppFlashAttentionConfig, MppFlashAttentionOutput,
+};
+pub use kernels::mpp_quantized::{MppQuantizedGemm, MppQuantizedGemmConfig};
 pub use pipeline::{FunctionConstant, PipelineCache};
 
 // Async command buffer scheduling — DoubleBuffer and TripleBuffer are available
@@ -132,5 +136,6 @@ pub mod prelude {
     };
     pub use crate::kernels::fused_lora::{FusedLora, FusedLoraConfig};
     pub use crate::kernels::fused_sampler::{FusedSampler, FusedSamplerConfig};
+    pub use crate::kernels::mpp_flash_attention::{MppFlashAttention, MppFlashAttentionConfig};
     pub use crate::pipeline::PipelineCache;
 }

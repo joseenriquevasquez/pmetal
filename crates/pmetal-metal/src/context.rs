@@ -192,22 +192,50 @@ impl DeviceProperties {
         }
     }
 
-    /// Get recommended threadgroup tile parameters for GEMM kernels.
+    /// Get the default MPP GEMM threadgroup tile parameters for this tier.
     ///
-    /// Returns (BM, BN, BK, num_simdgroups) for grid sizing in Rust dispatch.
-    ///
-    /// Metal 4 (MPP) kernels hardcode 64×64 tiles with 4 simdgroups in the
-    /// shader source (MPP Guide: SM=SN=32 per simdgroup, 2×2 = 64×64
-    /// threadgroup tile). These values are used by Rust dispatch code to
-    /// compute grid dimensions and threadgroup sizes.
-    ///
-    /// BK=128 is the recommended accumulation loop chunk size for M5
-    /// (MPP Guide Section 2.3.4).
+    /// Returns `(BM, BN, BK, num_simdgroups)` as a starting-point heuristic for
+    /// Apple10/M5 tuning. The actual dispatcher can now auto-tune among
+    /// multiple kernel variants (`32x32`, `64x32`, `32x64`, `64x64`), so this
+    /// method represents the preferred default before per-shape benchmarking.
     pub fn mpp_tile_config(&self) -> (u32, u32, u32, u32) {
-        // All Metal 4 / MPP kernels use 64×64 threadgroup tiles with
-        // 4 cooperating simdgroups (execution_simdgroups<4>).
-        // BK=128 for accumulation loop synchronization.
-        (64, 64, 128, 4)
+        let (bm, bn, num_simdgroups) = match self.device_tier {
+            DeviceTier::Base => (64, 32, 2),
+            DeviceTier::Pro | DeviceTier::Max | DeviceTier::Ultra => (64, 64, 4),
+        };
+        (bm, bn, 128, num_simdgroups)
+    }
+
+    /// Heuristic gate for whether a GEMM is large enough to justify trying MPP.
+    ///
+    /// This is intentionally conservative. Small or poorly-aligned projections
+    /// often do better on MLX's default kernels once dispatch overhead is
+    /// included, so callers should only benchmark or dispatch MPP after this
+    /// fast rejection step passes.
+    pub fn should_consider_mpp_gemm(&self, m: usize, n: usize, k: usize, use_fp16: bool) -> bool {
+        if !self.has_nax || m == 0 || n < 64 || k < 64 {
+            return false;
+        }
+
+        let aligned = n % 64 == 0 && k % 128 == 0;
+        let work = (m as u128) * (n as u128) * (k as u128);
+
+        let base_threshold = match (self.device_tier, use_fp16) {
+            (DeviceTier::Ultra | DeviceTier::Max, true) => 524_288_u128,
+            (DeviceTier::Ultra | DeviceTier::Max, false) => 1_048_576_u128,
+            (DeviceTier::Pro, true) => 1_048_576_u128,
+            (DeviceTier::Pro, false) => 2_097_152_u128,
+            (DeviceTier::Base, true) => 2_097_152_u128,
+            (DeviceTier::Base, false) => 4_194_304_u128,
+        };
+
+        let threshold = if aligned {
+            base_threshold / 2
+        } else {
+            base_threshold
+        };
+
+        work >= threshold
     }
 }
 
@@ -503,7 +531,7 @@ impl MetalContext {
         }
 
         let pipeline_cache = RwLock::new(cache);
-        let tuner = Arc::new(Tuner::new());
+        let tuner = Arc::new(Tuner::with_persistent_cache());
 
         Ok(Self {
             device,
@@ -595,6 +623,42 @@ impl std::fmt::Debug for MetalContext {
 mod tests {
     use super::*;
 
+    fn test_device_properties(tier: DeviceTier, has_nax: bool) -> DeviceProperties {
+        DeviceProperties {
+            name: "Apple M5 Test".to_string(),
+            max_threads_per_threadgroup: 1024,
+            max_threadgroup_memory_length: 32 * 1024,
+            has_unified_memory: true,
+            recommended_working_set_size: 8 * 1024 * 1024 * 1024,
+            max_buffer_length: 256 * 1024 * 1024,
+            gpu_family: if has_nax {
+                AppleGPUFamily::Apple10
+            } else {
+                AppleGPUFamily::Apple9
+            },
+            device_tier: tier,
+            has_dynamic_caching: true,
+            has_hardware_ray_tracing: true,
+            has_mesh_shaders: true,
+            has_nax,
+            architecture_gen: if has_nax { 17 } else { 16 },
+            memory_bandwidth_gbps: match tier {
+                DeviceTier::Base => 120.0,
+                DeviceTier::Pro => 273.0,
+                DeviceTier::Max => 546.0,
+                DeviceTier::Ultra => 800.0,
+            },
+            gpu_core_count: 20,
+            ane_core_count: 16,
+            is_ultra_fusion: matches!(tier, DeviceTier::Ultra),
+            die_count: if matches!(tier, DeviceTier::Ultra) {
+                2
+            } else {
+                1
+            },
+        }
+    }
+
     #[test]
     fn test_context_creation() {
         let ctx = MetalContext::new();
@@ -683,5 +747,42 @@ mod tests {
         // M5 should have NAX
         assert!(family >= AppleGPUFamily::Apple10);
         assert_eq!(architecture_gen(family), 17);
+    }
+
+    #[test]
+    fn test_mpp_gate_requires_nax() {
+        let props = test_device_properties(DeviceTier::Max, false);
+        assert!(!props.should_consider_mpp_gemm(8, 256, 128, true));
+    }
+
+    #[test]
+    fn test_mpp_gate_rejects_tiny_problem() {
+        let props = test_device_properties(DeviceTier::Max, true);
+        assert!(!props.should_consider_mpp_gemm(1, 64, 64, true));
+    }
+
+    #[test]
+    fn test_mpp_gate_prefers_large_aligned_problem() {
+        let props = test_device_properties(DeviceTier::Max, true);
+        assert!(props.should_consider_mpp_gemm(8, 256, 128, true));
+    }
+
+    #[test]
+    fn test_mpp_gate_is_more_conservative_for_base_f32() {
+        let props = test_device_properties(DeviceTier::Base, true);
+        assert!(!props.should_consider_mpp_gemm(8, 256, 128, false));
+        assert!(props.should_consider_mpp_gemm(64, 256, 128, false));
+    }
+
+    #[test]
+    fn test_mpp_tile_config_defaults_by_tier() {
+        assert_eq!(
+            test_device_properties(DeviceTier::Base, true).mpp_tile_config(),
+            (64, 32, 128, 2)
+        );
+        assert_eq!(
+            test_device_properties(DeviceTier::Pro, true).mpp_tile_config(),
+            (64, 64, 128, 4)
+        );
     }
 }

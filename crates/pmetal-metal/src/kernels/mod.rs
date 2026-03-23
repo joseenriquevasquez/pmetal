@@ -22,7 +22,9 @@ pub mod fused_swiglu;
 pub mod fused_training;
 pub mod moe;
 pub mod mpp_bench;
+pub mod mpp_flash_attention;
 pub mod mpp_gemm;
+pub mod mpp_quantized;
 
 // Re-export main types
 pub use batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
@@ -67,3 +69,7 @@ pub use fused_training::{
     FusedGradientClipping, FusedTrainingCoordinator, ParamInfo,
 };
 pub use moe::{MoeConfig, MoeGemmOutput, MoeKernel, MoeRouting};
+pub use mpp_flash_attention::{
+    MppFlashAttention, MppFlashAttentionConfig, MppFlashAttentionOutput,
+};
+pub use mpp_quantized::{MppQuantizedGemm, MppQuantizedGemmConfig};
