@@ -39,12 +39,16 @@ PMetal detects at startup:
 - **Device tier** (Base/Pro/Max/Ultra)
 - **GPU core count**
 - **ANE core count** and availability
-- **Memory bandwidth** (tier + family lookup)
+- **Memory bandwidth** (persisted GPU copy benchmark with spec fallback)
 - **NAX** (M5+, Apple10)
 - **Metal features** (dynamic caching, mesh shaders)
 - **UltraFusion topology** (via `sysctl hw.packages`)
 
 Use `pmetal info` to display all detected hardware properties.
+
+Use `pmetal bench-corpus` to collect a comparable kernel report for the current machine. That corpus exercises standard-Metal hot paths on M1-M4 and adds MPP GEMM coverage on Apple10/M5 when NAX is available.
+
+Across Apple7-10 GPUs, PMetal now benchmarks, persists, and reuses standard-Metal Tuna specializations for `fused_swiglu`, `fused_mlp`, `fused_norm_lora`, and fused linear cross-entropy. M1-M4 remain first-class paths rather than “fallback” hardware.
 
 ## M5-Specific: NAX
 
@@ -54,7 +58,7 @@ M5 (Apple10, arch gen 17) introduces Neural Accelerator units within GPU cores f
 - Quantized inference (FP4/FP8)
 - Scaled dot-product attention
 
-Accessed via Metal 4.0 (`-std=metal4.0`) kernels. NAX availability is checked via `DeviceProperties::has_nax()`. PMetal currently ships the Metal 4 dispatcher, NAX-capable hardware detection, persisted Apple10/M5 MPP dispatch tuning across `32×32`, `64×32`, `32×64`, and `64×64` threadgroup variants, and persisted runtime selection between MLX fast SDPA, Metal FlashAttention, and MPP FlashAttention for supported `head_dim = 128` inference shapes. Upstream `mlx-rs` NAX passthrough is still in progress.
+Accessed via Metal 4.0 (`-std=metal4.0`) kernels. NAX availability is checked via `DeviceProperties::has_nax()`. PMetal currently ships the Metal 4 dispatcher, NAX-capable hardware detection, persisted Apple10/M5 MPP dispatch tuning across `32×32`, `64×32`, `32×64`, and `64×64` threadgroup variants, and persisted runtime selection between MLX fast SDPA, Metal FlashAttention, and MPP FlashAttention for supported `head_dim = 64`, `96`, and `128` inference shapes. Upstream `mlx-rs` NAX passthrough is still in progress.
 
 ## ANE (Apple Neural Engine)
 
@@ -65,6 +69,7 @@ PMetal's ANE pipeline:
 - **Power-of-2 bucketing**: Optimal kernel compilation for sequence lengths
 - **CPU RMSNorm**: f32 computation on CPU to avoid fp16 ANE overflow
 - **IOSurface Zero-Copy**: Shared memory surfaces for CPU-ANE transfer
+- **Experimental RT Eval**: `infer` / `serve` support `--ane-real-time`, but PMetal still falls back to standard ANE if the private real-time path rejects the request on the current OS/framework
 - **M1–M5 Compatibility**: Per-matrix blobs for M1, single-blob for M3+
 
 ## See Also

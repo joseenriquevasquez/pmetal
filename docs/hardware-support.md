@@ -12,7 +12,7 @@ Status of hardware-specific optimizations in PMetal.
 | Architecture generation (14–17) | `pmetal-metal/src/context.rs` | Mapped from GPU family |
 | GPU core count | `pmetal-metal/src/context.rs` | Estimated from name + tier |
 | ANE core count | `pmetal-metal/src/context.rs` | Tier-based (16/32) |
-| Memory bandwidth | `pmetal-metal/src/context.rs` | Tier + family lookup table |
+| Memory bandwidth | `pmetal-metal/src/context.rs` | Persisted GPU copy benchmark + spec fallback |
 | NAX (Neural Accelerators in GPU) | `pmetal-metal/src/context.rs` | Apple10+ (M5) |
 | ANE perf stats | `pmetal-metal/src/ane/runtime.rs` | `_ANEPerformanceStats` API |
 | UltraFusion topology | `pmetal-metal/src/context.rs` | Detected via `sysctl hw.packages` |
@@ -62,8 +62,8 @@ These are accessed via Metal 4.0 (`-std=metal4.0`) kernels. MLX upstream has pro
 - **Measured FP16 TFLOPS**: 12.17–12.44 (comparable to M4 Pro)
 - **Training**: 101–120 ms/step (vs M4 Max at 64 ms/step)
 - **Weight reload**: NOT supported (weights baked at compile time)
-- **Chaining API**: `_ANEChainingRequest` available (research — no working invocation yet)
-- **Real-time eval**: `evaluateRealTimeWithModel:` available
+- **Chaining API**: `_ANEChainingRequest` available (research — PMetal can prepare experimental loopback requests, but stable execution is not solved yet)
+- **Real-time eval**: `_ANEClient.evaluateRealTimeWithModel:` is detected; PMetal exposes an experimental `--ane-real-time` opt-in with automatic fallback to standard ANE if the private path fails
 - **Perf stats**: `_ANEPerformanceStats.hwExecutionTime` provides ns-precision hardware timing
 
 ### ANE MIL Compatibility
@@ -104,21 +104,55 @@ Block size selection per head dimension:
 
 ### Fused RMSNorm + LoRA (`fused_norm_lora.rs`)
 
-| Tier | Threadgroup Size |
-|------|-----------------|
-| Base | 128 |
-| Pro | 128 |
-| Max | 256 |
-| Ultra | 256 |
+Tuna now benchmarks and persists the effective specialization for this kernel per problem shape, and the Metal shader is compiled with the matching `THREADS_PER_TOKEN` constant instead of relying on dead host-side heuristics.
+
+Heuristic seed values before benchmark candidate generation:
+
+| Tier | Threads / Token | Tiled Path |
+|------|-----------------|-----------|
+| Base | 128 | `out_features > 256` |
+| Pro | 256 | `out_features > 256` |
+| Max | 512 | `out_features > 256` |
+| Ultra | 512 | `out_features > 256` |
+
+If the caller disables tiling explicitly, PMetal respects that and stays on the non-tiled path.
 
 ### Fused SwiGLU (`fused_swiglu.rs`)
 
-| Tier | Threadgroup Size |
-|------|-----------------|
-| Base | 256 |
-| Pro | 256 |
-| Max | 512 |
-| Ultra | 512 |
+Tuna now benchmarks and persists the effective specialization for standard-Metal `fused_swiglu` / `fused_mlp`, and the shader is compiled with matching `THREADS_PER_TOKEN` and `SWIGLU_CHUNK_SIZE` function constants.
+
+Heuristic seed values before benchmark candidate generation:
+
+| Tier | Threads / Token | Chunk Size |
+|------|-----------------|-----------|
+| Base | 128 or 256 | 1024 or 2048 |
+| Pro | 256 | 2048 or 4096 |
+| Max | 512 | 2048 or 4096 |
+| Ultra | 512 | 2048 or 4096 |
+
+The lower Base-tier values apply to smaller `intermediate_size` shapes; higher values apply to larger MLPs.
+
+### Fused Linear Cross-Entropy (`fused_cross_entropy.rs`)
+
+The fused linear CE path now benchmarks and persists both its `CE_THREADS_PER_TOKEN` specialization and default vocabulary chunk size per device, dtype, and problem shape. The MLX CutCrossEntropy fallback uses the same resolved default chunk size when the caller leaves the chunk size at the default, so M1-M4 and M5 share the measured chunk choice instead of drifting apart.
+
+Heuristic seed values before benchmark candidate generation:
+
+| Tier | Threads / Token | Chunk Size |
+|------|-----------------|-----------|
+| Base | 128 / 256 / 512 | 1024 or 2048 |
+| Pro | 256 / 512 / 1024 | 2048 or 4096 |
+| Max | 256 / 512 / 1024 | 4096 or 8192 |
+| Ultra | 256 / 512 / 1024 | 4096 or 8192 |
+
+Thread count seeds still scale with vocabulary size and clamp to the device maximum:
+- Base-tier: `< 32k vocab` → `128`, `32k..128k` → `256`, `> 128k` → `512`
+- Pro / Max / Ultra: `< 32k vocab` → `256`, `32k..128k` → `512`, `> 128k` → `1024`
+
+Chunk-size seeds still narrow for wider hidden states:
+- Base: `1024` once `hidden_size >= 4096`
+- Pro: `2048` once `hidden_size >= 8192`
+- Max / Ultra: `4096` once `hidden_size >= 8192`
 
 ### Batch Size Multiplier
 
@@ -144,14 +178,15 @@ MLX upstream has NAX-optimized kernels for M5. Integration path:
 - [x] Benchmark and persist MLX vs MPP backend choice for 4-bit affine quantized linear inference on Apple10/M5
 - [x] Tier-aware MPP dispatcher tuning across `32×32`, `64×32`, `32×64`, and `64×64` MPP tile variants on Apple10/M5
 - [ ] Upstream mlx-rs NAX kernel passthrough (requires mlx-rs update to MLX with NAX)
-- [x] Benchmark and persist Apple10/M5 MPP FlashAttention vs Metal FlashAttention vs MLX fast SDPA for supported `head_dim = 128` inference shapes
+- [x] Benchmark and persist Apple10/M5 MPP FlashAttention vs Metal FlashAttention vs MLX fast SDPA for supported `head_dim = 64`, `96`, and `128` inference shapes
 
 ### P1 — ANE chaining API
 
 `_ANEChainingRequest` with loopback could pipeline multiple layers as a single ANE program:
 
 - [x] Class detection + telemetry
-- [ ] Prototype single-chain invocation (2 layers, loopback input→output)
+- [x] Experimental loopback request construction + `_ANEClient.prepareChainingWithModel:` submission API
+- [ ] Stable single-chain execution on hardware without private-framework aborts (`cargo test -p pmetal-metal test_prepare_loopback_chain_smoke -- --ignored --nocapture` on the local M4 Max still aborted the child process on 2026-03-23)
 - [ ] Benchmark chained vs sequential dispatch latency
 - [ ] If viable: integrate into ANE inference engine for multi-layer dispatch
 
@@ -159,9 +194,11 @@ MLX upstream has NAX-optimized kernels for M5. Integration path:
 
 `_ANEClient.evaluateRealTimeWithModel:` may provide lower/more predictable latency:
 
-- [ ] Prototype RT eval path
-- [ ] Compare RT vs standard eval latency distribution
-- [ ] If beneficial: add `--ane-realtime` CLI flag
+- [x] Runtime probe + `AneModel::evaluate_real_time*` wrapper
+- [x] Experimental `--ane-real-time` opt-in for `infer` / `serve`
+- [x] Automatic fallback to standard ANE dispatch if the private RT path fails
+- [ ] Compare RT vs standard eval latency distribution (the ignored hardware test on the local M4 Max still hit `ANEProgramProcessRequestDirect() ... Program Inference error` for the tiny synthetic MIL kernel on 2026-03-23)
+- [ ] Promote beyond experimental only after measured latency wins and stable correctness
 
 ### P3 — UltraFusion-aware distributed
 
@@ -176,6 +213,14 @@ Current distributed crate (`pmetal-distributed`) is multi-machine over TCP/mDNS.
 Replace hardcoded tier-based parameters with runtime optimization:
 
 - [x] Persist hot-path inference backend benchmarks across launches (FlashAttention vs MLX SDPA, MPP vs MLX matmul)
+- [x] Benchmark and persist MLX CutCrossEntropy vs Metal fused linear cross-entropy backend choice for benchmarkable shapes
+- [x] Benchmark and persist fused linear cross-entropy thread/chunk specialization per device, dtype, and problem shape
+- [x] Benchmark and persist standard Metal FlashAttention block-size selection for supported head dimensions
+- [x] Wire broader standard-Metal fused kernels through persisted Tuna specialization (`fused_swiglu`, `fused_mlp`, `fused_norm_lora`, fused linear cross-entropy)
+- [x] Benchmark and persist standard-Metal `fused_swiglu`, `fused_mlp`, and `fused_norm_lora` kernel specialization choices
+- [x] Add a structured `pmetal bench-corpus` kernel benchmark command for comparable per-tier measurements on M1-M4 and M5
 - [ ] Auto-benchmark broader kernel configs on first run and cache optimal parameters
-- [ ] Query actual memory bandwidth via IOKit/sysctl instead of tier lookup table
+- [x] Measure and persist approximate GPU unified-memory bandwidth via copy benchmark, with spec-table fallback when probing is unavailable
+- [x] Record local M4 Max benchmark-corpus reports in `.strategy/bench_corpus_m4_max_2026_03_23.json` and `.strategy/bench_corpus_m4_max_quick_2026_03_23.json`
+- [ ] Run `pmetal bench-corpus` on representative M1/M2/M3/M4/M5 hardware and check in the reports that justify default choices
 - [ ] M5 Pro/Max/Ultra profiling once hardware is available
