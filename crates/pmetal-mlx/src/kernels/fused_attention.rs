@@ -536,7 +536,7 @@ fn mpp_flash_attention_supported(
 ) -> bool {
     props.has_nax()
         && flash_attention_supported(queries, keys, values, custom_mask)
-        && queries.shape()[3] == 128
+        && matches!(queries.shape()[3], 64 | 96 | 128)
 }
 
 fn max_abs_diff(lhs: &Array, rhs: &Array) -> Result<f32, Exception> {
@@ -928,6 +928,7 @@ mod tests {
             has_nax: true,
             architecture_gen: 17,
             memory_bandwidth_gbps: 546.0,
+            memory_bandwidth_source: pmetal_metal::context::MemoryBandwidthSource::SpecTableFallback,
             gpu_core_count: 40,
             ane_core_count: 16,
             is_ultra_fusion: false,
@@ -1284,7 +1285,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mpp_flash_attention_support_requires_apple10_and_d128() {
+    fn test_mpp_flash_attention_support_requires_apple10_and_supported_head_dim() {
         let props = test_device_properties();
         let queries = random_tensor(&[1, 4, 8, 128]);
         let keys = random_tensor(&[1, 4, 8, 128]);
@@ -1303,10 +1304,32 @@ mod tests {
         let queries_d64 = random_tensor(&[1, 4, 8, 64]);
         let keys_d64 = random_tensor(&[1, 4, 8, 64]);
         let values_d64 = random_tensor(&[1, 4, 8, 64]);
-        assert!(!mpp_flash_attention_supported(
+        assert!(mpp_flash_attention_supported(
             &queries_d64,
             &keys_d64,
             &values_d64,
+            None,
+            &props
+        ));
+
+        let queries_d96 = random_tensor(&[1, 4, 8, 96]);
+        let keys_d96 = random_tensor(&[1, 4, 8, 96]);
+        let values_d96 = random_tensor(&[1, 4, 8, 96]);
+        assert!(mpp_flash_attention_supported(
+            &queries_d96,
+            &keys_d96,
+            &values_d96,
+            None,
+            &props
+        ));
+
+        let queries_d80 = random_tensor(&[1, 4, 8, 80]);
+        let keys_d80 = random_tensor(&[1, 4, 8, 80]);
+        let values_d80 = random_tensor(&[1, 4, 8, 80]);
+        assert!(!mpp_flash_attention_supported(
+            &queries_d80,
+            &keys_d80,
+            &values_d80,
             None,
             &props
         ));

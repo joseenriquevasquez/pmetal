@@ -4,7 +4,7 @@
 //!
 //! This is an Apple10/M5-only forward-path wrapper over
 //! `metal4/mpp_flash_attention.metal`. The current shader contract supports
-//! fp16 attention with `head_dim = 128` for causal and non-causal inference.
+//! fp16 attention with `head_dim = 64`, `96`, or `128` for causal and non-causal inference.
 
 use std::collections::HashMap;
 use std::ptr::NonNull;
@@ -33,7 +33,7 @@ pub struct MppFlashAttentionConfig {
     pub query_seq_len: usize,
     /// Key/value sequence length.
     pub kv_seq_len: usize,
-    /// Head dimension. The current MPP kernel supports only `128`.
+    /// Head dimension. The current MPP kernel supports `64`, `96`, and `128`.
     pub head_dim: usize,
     /// Optional softmax scaling factor. Defaults to `1 / sqrt(head_dim)`.
     pub scale: Option<f32>,
@@ -100,9 +100,9 @@ fn validate_config(config: &MppFlashAttentionConfig) -> Result<()> {
         ));
     }
 
-    if config.head_dim != 128 {
+    if !matches!(config.head_dim, 64 | 96 | 128) {
         return Err(MetalError::InvalidConfig(format!(
-            "MPP FlashAttention currently supports head_dim=128, got {}",
+            "MPP FlashAttention currently supports head_dim=64, 96, or 128, got {}",
             config.head_dim
         )));
     }
@@ -119,10 +119,17 @@ fn validate_config(config: &MppFlashAttentionConfig) -> Result<()> {
 
 fn kernel_name(config: &MppFlashAttentionConfig) -> Result<&'static str> {
     validate_config(config)?;
-    if config.is_causal {
-        Ok("mpp_flash_attention_fwd_d128_causal")
-    } else {
-        Ok("mpp_flash_attention_fwd_d128")
+    match (config.head_dim, config.is_causal) {
+        (64, true) => Ok("mpp_flash_attention_fwd_d64_causal"),
+        (64, false) => Ok("mpp_flash_attention_fwd_d64"),
+        (96, true) => Ok("mpp_flash_attention_fwd_d96_causal"),
+        (96, false) => Ok("mpp_flash_attention_fwd_d96"),
+        (128, true) => Ok("mpp_flash_attention_fwd_d128_causal"),
+        (128, false) => Ok("mpp_flash_attention_fwd_d128"),
+        _ => Err(MetalError::InvalidConfig(format!(
+            "unsupported MPP FlashAttention head_dim={}",
+            config.head_dim
+        ))),
     }
 }
 
@@ -132,7 +139,8 @@ fn validate_input_sizes(
     keys: &MetalBuffer<f16>,
     values: &MetalBuffer<f16>,
 ) -> Result<()> {
-    let expected_queries = config.batch_size * config.num_heads * config.query_seq_len * 128;
+    let expected_queries =
+        config.batch_size * config.num_heads * config.query_seq_len * config.head_dim;
     if queries.len() != expected_queries {
         return Err(MetalError::DimensionMismatch {
             param: "queries",
@@ -141,7 +149,7 @@ fn validate_input_sizes(
         });
     }
 
-    let expected_kv = config.batch_size * config.num_kv_heads * config.kv_seq_len * 128;
+    let expected_kv = config.batch_size * config.num_kv_heads * config.kv_seq_len * config.head_dim;
     if keys.len() != expected_kv {
         return Err(MetalError::DimensionMismatch {
             param: "keys",
@@ -313,14 +321,22 @@ mod tests {
     #[test]
     fn mpp_flash_attention_config_accepts_supported_shape() {
         assert!(validate_config(&test_config()).is_ok());
+
+        let mut d64 = test_config();
+        d64.head_dim = 64;
+        assert!(validate_config(&d64).is_ok());
+
+        let mut d96 = test_config();
+        d96.head_dim = 96;
+        assert!(validate_config(&d96).is_ok());
     }
 
     #[test]
     fn mpp_flash_attention_config_rejects_unsupported_head_dim() {
         let mut config = test_config();
-        config.head_dim = 64;
+        config.head_dim = 80;
         let err = validate_config(&config).unwrap_err();
-        assert!(err.to_string().contains("head_dim=128"));
+        assert!(err.to_string().contains("head_dim=64, 96, or 128"));
     }
 
     #[test]
@@ -346,6 +362,18 @@ mod tests {
             kernel_name(&non_causal).unwrap(),
             "mpp_flash_attention_fwd_d128"
         );
+
+        let mut d64 = test_config();
+        d64.head_dim = 64;
+        assert_eq!(kernel_name(&d64).unwrap(), "mpp_flash_attention_fwd_d64_causal");
+        d64.is_causal = false;
+        assert_eq!(kernel_name(&d64).unwrap(), "mpp_flash_attention_fwd_d64");
+
+        let mut d96 = test_config();
+        d96.head_dim = 96;
+        assert_eq!(kernel_name(&d96).unwrap(), "mpp_flash_attention_fwd_d96_causal");
+        d96.is_causal = false;
+        assert_eq!(kernel_name(&d96).unwrap(), "mpp_flash_attention_fwd_d96");
     }
 
     #[test]
@@ -353,5 +381,15 @@ mod tests {
         let config = test_config();
         assert_eq!(config.output_size(), 8 * 32 * 128);
         assert_eq!(config.logsumexp_size(), 8 * 32);
+
+        let mut d64 = test_config();
+        d64.head_dim = 64;
+        assert_eq!(d64.output_size(), 8 * 32 * 64);
+        assert_eq!(d64.logsumexp_size(), 8 * 32);
+
+        let mut d96 = test_config();
+        d96.head_dim = 96;
+        assert_eq!(d96.output_size(), 8 * 32 * 96);
+        assert_eq!(d96.logsumexp_size(), 8 * 32);
     }
 }
