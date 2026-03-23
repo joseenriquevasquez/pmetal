@@ -53,6 +53,7 @@ fn build_info_json(
         "memory_total_gb": system_memory.map(bytes_to_gb),
         "recommended_working_set_gb": bytes_to_gb(props.recommended_working_set_size),
         "memory_bandwidth_gbps": props.memory_bandwidth_gbps,
+        "memory_bandwidth_source": format!("{:?}", props.memory_bandwidth_source),
         "has_unified_memory": props.has_unified_memory,
         "metal_available": true,
     })
@@ -80,7 +81,11 @@ fn build_info_lines(
             "Recommended WS: {:.0} GB",
             bytes_to_gb(props.recommended_working_set_size)
         ),
-        format!("Bandwidth:      {:.0} GB/s", props.memory_bandwidth_gbps),
+        format!(
+            "Bandwidth:      {:.0} GB/s ({:?})",
+            props.memory_bandwidth_gbps,
+            props.memory_bandwidth_source
+        ),
         format!(
             "NAX (Neural):   {}",
             if props.has_nax { "yes" } else { "no" }
@@ -101,7 +106,9 @@ fn build_info_lines(
 
 #[cfg(test)]
 mod tests {
-    use pmetal_metal::context::{AppleGPUFamily, DeviceProperties, DeviceTier};
+    use pmetal_metal::context::{
+        AppleGPUFamily, DeviceProperties, DeviceTier, MemoryBandwidthSource,
+    };
 
     use super::*;
 
@@ -121,6 +128,7 @@ mod tests {
             has_nax: true,
             architecture_gen: 17,
             memory_bandwidth_gbps: 273.0,
+            memory_bandwidth_source: MemoryBandwidthSource::SpecTableFallback,
             gpu_core_count: 20,
             ane_core_count: 16,
             is_ultra_fusion: false,
@@ -137,6 +145,10 @@ mod tests {
         assert_eq!(json["recommended_working_set_gb"], serde_json::json!(48.0));
         assert_eq!(json["has_unified_memory"], serde_json::json!(true));
         assert_eq!(json["metal_available"], serde_json::json!(true));
+        assert_eq!(
+            json["memory_bandwidth_source"],
+            serde_json::json!("SpecTableFallback")
+        );
     }
 
     #[test]
@@ -147,6 +159,10 @@ mod tests {
         assert!(lines.iter().any(|line| line == "Unified Memory: yes"));
         assert!(lines.iter().any(|line| line == "System Memory:  64 GB"));
         assert!(lines.iter().any(|line| line == "Recommended WS: 48 GB"));
+        assert!(
+            lines.iter()
+                .any(|line| line == "Bandwidth:      273 GB/s (SpecTableFallback)")
+        );
     }
 
     #[test]

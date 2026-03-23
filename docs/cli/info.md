@@ -19,7 +19,7 @@ Shows:
 - **GPU core count**
 - **ANE core count** and availability
 - **NAX support** (M5+)
-- **Memory bandwidth** (GB/s)
+- **Memory bandwidth** (GB/s, with measured-vs-fallback source)
 - **Metal features** (dynamic caching, mesh shaders)
 - **UltraFusion topology** (Ultra chips)
 
