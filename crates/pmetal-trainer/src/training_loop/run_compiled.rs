@@ -283,8 +283,12 @@ impl TrainingLoop {
                         if action == AdaptiveAction::Rollback {
                             self.restore_best_weights(&mut state.0);
                         }
-                        if action == AdaptiveAction::EarlyStop {
-                            self.restore_best_weights(&mut state.0);
+                        if action == AdaptiveAction::EarlyStop
+                            || action == AdaptiveAction::GracefulStop
+                        {
+                            if action == AdaptiveAction::EarlyStop {
+                                self.restore_best_weights(&mut state.0);
+                            }
                             if let Some(manager) = checkpoint_manager {
                                 self.save_checkpoint(
                                     &state.0,
@@ -294,6 +298,16 @@ impl TrainingLoop {
                                 )?;
                             }
                             return Ok(state.0);
+                        }
+                        if action == AdaptiveAction::SaveCheckpoint {
+                            if let Some(manager) = checkpoint_manager {
+                                self.save_checkpoint(
+                                    &state.0,
+                                    manager,
+                                    false,
+                                    Some(self.running_loss),
+                                )?;
+                            }
                         }
                     }
                     accumulated_losses.clear();
@@ -312,12 +326,18 @@ impl TrainingLoop {
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
                         let action = self.apply_adaptive_lr(loss_val as f64);
                         match action {
-                            AdaptiveAction::EarlyStop => {
-                                adaptive_action = AdaptiveAction::EarlyStop;
+                            AdaptiveAction::EarlyStop | AdaptiveAction::GracefulStop => {
+                                adaptive_action = action;
                                 break;
                             }
+                            AdaptiveAction::SaveCheckpoint
+                                if adaptive_action == AdaptiveAction::Continue =>
+                            {
+                                adaptive_action = AdaptiveAction::SaveCheckpoint;
+                            }
                             AdaptiveAction::Rollback
-                                if adaptive_action != AdaptiveAction::EarlyStop =>
+                                if adaptive_action == AdaptiveAction::Continue
+                                    || adaptive_action == AdaptiveAction::SaveCheckpoint =>
                             {
                                 adaptive_action = AdaptiveAction::Rollback;
                             }
@@ -332,12 +352,27 @@ impl TrainingLoop {
                     if adaptive_action == AdaptiveAction::Rollback {
                         self.restore_best_weights(&mut state.0);
                     }
-                    if adaptive_action == AdaptiveAction::EarlyStop {
-                        self.restore_best_weights(&mut state.0);
+                    if adaptive_action == AdaptiveAction::EarlyStop
+                        || adaptive_action == AdaptiveAction::GracefulStop
+                    {
+                        if adaptive_action == AdaptiveAction::EarlyStop {
+                            self.restore_best_weights(&mut state.0);
+                        }
                         if let Some(manager) = checkpoint_manager {
                             self.save_checkpoint(&state.0, manager, true, Some(self.running_loss))?;
                         }
                         return Ok(state.0);
+                    }
+                    // Handle external checkpoint save request
+                    if adaptive_action == AdaptiveAction::SaveCheckpoint {
+                        if let Some(manager) = checkpoint_manager {
+                            self.save_checkpoint(
+                                &state.0,
+                                manager,
+                                false,
+                                Some(self.running_loss),
+                            )?;
+                        }
                     }
 
                     // Calculate throughput
@@ -657,12 +692,27 @@ impl TrainingLoop {
                     if action == AdaptiveAction::Rollback {
                         self.restore_best_weights(&mut state.0);
                     }
-                    if action == AdaptiveAction::EarlyStop {
-                        self.restore_best_weights(&mut state.0);
+                    if action == AdaptiveAction::EarlyStop
+                        || action == AdaptiveAction::GracefulStop
+                    {
+                        if action == AdaptiveAction::EarlyStop {
+                            self.restore_best_weights(&mut state.0);
+                        }
                         if let Some(manager) = checkpoint_manager {
                             self.save_checkpoint(&state.0, manager, true, Some(self.running_loss))?;
                         }
                         return Ok(state.0);
+                    }
+                    // Handle external checkpoint save request
+                    if action == AdaptiveAction::SaveCheckpoint {
+                        if let Some(manager) = checkpoint_manager {
+                            self.save_checkpoint(
+                                &state.0,
+                                manager,
+                                false,
+                                Some(self.running_loss),
+                            )?;
+                        }
                     }
 
                     // Calculate throughput

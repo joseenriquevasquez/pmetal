@@ -223,12 +223,18 @@ impl TrainingLoop {
                         self.step = saved_step - batch_size + i;
                         let action = self.apply_adaptive_lr(loss_val as f64);
                         match action {
-                            AdaptiveAction::EarlyStop => {
-                                adaptive_action = AdaptiveAction::EarlyStop;
+                            AdaptiveAction::EarlyStop | AdaptiveAction::GracefulStop => {
+                                adaptive_action = action;
                                 break;
                             }
+                            AdaptiveAction::SaveCheckpoint
+                                if adaptive_action == AdaptiveAction::Continue =>
+                            {
+                                adaptive_action = AdaptiveAction::SaveCheckpoint;
+                            }
                             AdaptiveAction::Rollback
-                                if adaptive_action != AdaptiveAction::EarlyStop =>
+                                if adaptive_action == AdaptiveAction::Continue
+                                    || adaptive_action == AdaptiveAction::SaveCheckpoint =>
                             {
                                 adaptive_action = AdaptiveAction::Rollback;
                             }
@@ -254,17 +260,34 @@ impl TrainingLoop {
                         );
                     }
 
-                    // Handle early stop
-                    if adaptive_action == AdaptiveAction::EarlyStop {
-                        tracing::info!(
-                            "Early stopping triggered. Restoring best weights and exiting."
-                        );
-                        self.restore_best_weights(&mut state.0);
+                    // Handle early stop / graceful stop
+                    if adaptive_action == AdaptiveAction::EarlyStop
+                        || adaptive_action == AdaptiveAction::GracefulStop
+                    {
+                        if adaptive_action == AdaptiveAction::EarlyStop {
+                            tracing::info!(
+                                "Early stopping triggered. Restoring best weights and exiting."
+                            );
+                            self.restore_best_weights(&mut state.0);
+                        } else {
+                            tracing::info!("Graceful stop requested. Saving checkpoint and exiting.");
+                        }
                         // Save the best checkpoint before exiting
                         if let Some(manager) = checkpoint_manager {
                             self.save_checkpoint(&state.0, manager, true, Some(self.running_loss))?;
                         }
                         return Ok(state.0);
+                    }
+                    // Handle external checkpoint save request
+                    if adaptive_action == AdaptiveAction::SaveCheckpoint {
+                        if let Some(manager) = checkpoint_manager {
+                            self.save_checkpoint(
+                                &state.0,
+                                manager,
+                                false,
+                                Some(self.running_loss),
+                            )?;
+                        }
                     }
 
                     // Calculate throughput

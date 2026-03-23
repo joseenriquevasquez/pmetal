@@ -65,6 +65,10 @@ pub enum LrEvent {
         loss_increase_pct: f64,
         new_multiplier: f64,
     },
+    /// External request to save a checkpoint (training continues).
+    ControlCheckpoint,
+    /// External request for graceful stop (save best + checkpoint, then exit).
+    ControlStop,
 }
 
 impl std::fmt::Display for LrEvent {
@@ -97,6 +101,8 @@ impl std::fmt::Display for LrEvent {
                 f,
                 "warmup_cap(+{loss_increase_pct:.1}%, mult={new_multiplier:.3})"
             ),
+            LrEvent::ControlCheckpoint => write!(f, "control_checkpoint"),
+            LrEvent::ControlStop => write!(f, "control_stop"),
         }
     }
 }
@@ -220,7 +226,7 @@ impl Default for AdaptiveLrConfig {
             max_divergence_reductions: 4,
             min_lr: 1e-7,
             control_poll_interval: 10,
-            rollback_enabled: true,
+            rollback_enabled: false,
             max_rollbacks: 5,
             rollback_lr_factor: 0.5,
             warmup_fraction: 0.30,
@@ -266,7 +272,7 @@ impl AdaptiveLrConfig {
     }
 }
 
-/// Control command from TUI → training subprocess.
+/// Control command from TUI/MCP → training subprocess.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum LrControlCommand {
@@ -276,6 +282,10 @@ pub enum LrControlCommand {
     ReduceLr { factor: f64 },
     /// Reset to the scheduled LR (clear all adaptive adjustments).
     ResetLr,
+    /// Trigger an immediate checkpoint save (training continues).
+    SaveCheckpoint,
+    /// Gracefully stop: restore best weights, save checkpoint, then exit.
+    GracefulStop,
 }
 
 /// The adaptive LR controller.
@@ -463,18 +473,9 @@ impl AdaptiveLrController {
     /// Returns `(adjusted_lr, event)` where `adjusted_lr` is what should be
     /// applied to the optimizer for the *next* step.
     pub fn step(&mut self, step: usize, loss: f64, scheduled_lr: f64) -> (f64, LrEvent) {
-        if !self.config.enabled {
-            return (scheduled_lr, LrEvent::Scheduled);
-        }
-
-        // Guard against NaN/Inf loss — skip adaptive logic to avoid poisoning EMA
-        if !loss.is_finite() {
-            tracing::warn!("Non-finite loss ({loss}) at step {step}, skipping adaptive LR");
-            let base_lr = scheduled_lr * self.lr_multiplier;
-            return (base_lr.max(self.config.min_lr), LrEvent::Scheduled);
-        }
-
-        // 1. Check for manual override via control file
+        // Always poll the control file, even when adaptive logic is disabled.
+        // This allows external control (MCP/TUI) to set LR, save checkpoints,
+        // and gracefully stop — regardless of whether automatic detection is on.
         if self.config.control_poll_interval > 0
             && step.saturating_sub(self.last_control_poll) >= self.config.control_poll_interval
         {
@@ -482,6 +483,19 @@ impl AdaptiveLrController {
             if let Some(cmd) = self.poll_control_file() {
                 return self.apply_control_command(cmd, scheduled_lr);
             }
+        }
+
+        if !self.config.enabled {
+            // Use manual LR if set, otherwise scheduled
+            let lr = self.manual_lr.unwrap_or(scheduled_lr);
+            return (lr, LrEvent::Scheduled);
+        }
+
+        // Guard against NaN/Inf loss — skip adaptive logic to avoid poisoning EMA
+        if !loss.is_finite() {
+            tracing::warn!("Non-finite loss ({loss}) at step {step}, skipping adaptive LR");
+            let base_lr = scheduled_lr * self.lr_multiplier;
+            return (base_lr.max(self.config.min_lr), LrEvent::Scheduled);
         }
 
         // If manual LR is set, use it directly (no adaptive logic)
@@ -1026,6 +1040,16 @@ impl AdaptiveLrController {
                 self.last_event = event.clone();
                 tracing::info!("LR reset to schedule: {scheduled_lr:.2e}");
                 (scheduled_lr, event)
+            }
+            LrControlCommand::SaveCheckpoint => {
+                tracing::info!("External checkpoint save requested");
+                let lr = self.manual_lr.unwrap_or(scheduled_lr * self.lr_multiplier);
+                (lr, LrEvent::ControlCheckpoint)
+            }
+            LrControlCommand::GracefulStop => {
+                tracing::info!("External graceful stop requested");
+                let lr = self.manual_lr.unwrap_or(scheduled_lr * self.lr_multiplier);
+                (lr, LrEvent::ControlStop)
             }
         }
     }

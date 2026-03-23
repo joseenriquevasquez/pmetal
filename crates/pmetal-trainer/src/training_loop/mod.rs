@@ -244,6 +244,10 @@ pub enum AdaptiveAction {
     Rollback,
     /// Too many rollbacks — stop training and use the best checkpoint.
     EarlyStop,
+    /// External request to save a checkpoint (training continues).
+    SaveCheckpoint,
+    /// External request: restore best weights, save checkpoint, exit.
+    GracefulStop,
 }
 
 /// Training loop that connects all components.
@@ -435,17 +439,8 @@ impl TrainingLoop {
             let action = match &event {
                 crate::adaptive_lr::LrEvent::RollbackTriggered { .. } => AdaptiveAction::Rollback,
                 crate::adaptive_lr::LrEvent::EarlyStop { .. } => AdaptiveAction::EarlyStop,
-                crate::adaptive_lr::LrEvent::Scheduled => {
-                    // Check if we should snapshot the current weights as best
-                    if ctrl.should_snapshot_best(step) {
-                        // Signal that the training loop should take a snapshot
-                        // (actual snapshotting happens in the training method,
-                        //  since we don't have access to the model here)
-                        AdaptiveAction::Continue
-                    } else {
-                        AdaptiveAction::Continue
-                    }
-                }
+                crate::adaptive_lr::LrEvent::ControlCheckpoint => AdaptiveAction::SaveCheckpoint,
+                crate::adaptive_lr::LrEvent::ControlStop => AdaptiveAction::GracefulStop,
                 _ => AdaptiveAction::Continue,
             };
 
@@ -559,6 +554,15 @@ impl TrainingLoop {
             AdaptiveAction::EarlyStop => {
                 tracing::warn!(step = self.step, "Max rollbacks exhausted — early stopping");
                 AdaptiveAction::EarlyStop
+            }
+            AdaptiveAction::SaveCheckpoint => {
+                tracing::info!(step = self.step, "External checkpoint save requested");
+                AdaptiveAction::SaveCheckpoint
+            }
+            AdaptiveAction::GracefulStop => {
+                tracing::info!(step = self.step, "External graceful stop requested");
+                self.restore_best_weights(model);
+                AdaptiveAction::GracefulStop
             }
         }
     }

@@ -146,8 +146,12 @@ impl TrainingLoop {
                 if action == AdaptiveAction::Rollback {
                     self.restore_best_weights(model);
                 }
-                if action == AdaptiveAction::EarlyStop {
-                    self.restore_best_weights(model);
+                if action == AdaptiveAction::EarlyStop
+                    || action == AdaptiveAction::GracefulStop
+                {
+                    if action == AdaptiveAction::EarlyStop {
+                        self.restore_best_weights(model);
+                    }
                     #[cfg(feature = "distributed")]
                     let should_ckpt = self.distributed.as_ref().is_none_or(|d| d.is_master());
                     #[cfg(not(feature = "distributed"))]
@@ -158,6 +162,18 @@ impl TrainingLoop {
                         }
                     }
                     return Ok(());
+                }
+                // Handle external checkpoint save request
+                if action == AdaptiveAction::SaveCheckpoint {
+                    #[cfg(feature = "distributed")]
+                    let should_ckpt = self.distributed.as_ref().is_none_or(|d| d.is_master());
+                    #[cfg(not(feature = "distributed"))]
+                    let should_ckpt = true;
+                    if should_ckpt {
+                        if let Some(manager) = checkpoint_manager {
+                            self.save_checkpoint(model, manager, false, Some(self.running_loss))?;
+                        }
+                    }
                 }
 
                 // Logging + callback dispatch

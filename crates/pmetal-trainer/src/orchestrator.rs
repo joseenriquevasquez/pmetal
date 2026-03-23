@@ -73,6 +73,9 @@ pub struct DispatchConfig {
     /// Loss scaling factor for ANE training. Multiplies dlogits before backward
     /// to prevent fp32 gradient underflow at >350M params. Default: 1.0.
     pub loss_scale: f32,
+    /// Disable automatic adaptive LR (spike/plateau/divergence detection).
+    /// Control file polling stays active for manual LR control via MCP/TUI.
+    pub no_adaptive_lr: bool,
     #[cfg(feature = "distributed")]
     pub distributed: Option<pmetal_core::DistributedTrainingConfig>,
 }
@@ -88,8 +91,9 @@ impl Default for DispatchConfig {
             gradient_checkpointing: true,
             gradient_checkpointing_layers: 4,
             cut_cross_entropy: false,
-            ane: true,
+            ane: false,
             loss_scale: 1.0,
+            no_adaptive_lr: false,
             #[cfg(feature = "distributed")]
             distributed: None,
         }
@@ -818,7 +822,10 @@ fn run_qlora_path(
     }
 
     {
-        let adaptive_config = AdaptiveLrConfig::for_lora();
+        let mut adaptive_config = AdaptiveLrConfig::for_lora();
+        if config.dispatch.no_adaptive_lr {
+            adaptive_config.enabled = false;
+        }
         let control_file = PathBuf::from(output_dir).join(".lr_control.json");
         training_loop.enable_adaptive_lr_with_control(adaptive_config, control_file);
         training_loop.set_snapshot_persist_dir(checkpoint_manager.checkpoint_dir().to_path_buf());
@@ -976,7 +983,10 @@ fn run_lora_path(
     }
 
     {
-        let adaptive_config = AdaptiveLrConfig::for_lora();
+        let mut adaptive_config = AdaptiveLrConfig::for_lora();
+        if config.dispatch.no_adaptive_lr {
+            adaptive_config.enabled = false;
+        }
         let control_file = PathBuf::from(output_dir).join(".lr_control.json");
         training_loop.enable_adaptive_lr_with_control(adaptive_config, control_file);
         training_loop.set_snapshot_persist_dir(checkpoint_manager.checkpoint_dir().to_path_buf());

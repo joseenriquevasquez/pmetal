@@ -147,8 +147,10 @@ impl TrainingLoop {
                     self.restore_best_weights(model);
                 }
                 // Handle early stop
-                if action == AdaptiveAction::EarlyStop {
-                    self.restore_best_weights(model);
+                if action == AdaptiveAction::EarlyStop || action == AdaptiveAction::GracefulStop {
+                    if action == AdaptiveAction::EarlyStop {
+                        self.restore_best_weights(model);
+                    }
                     // Rank-0 only: save checkpoint
                     #[cfg(feature = "distributed")]
                     let should_checkpoint = self.distributed.as_ref().is_none_or(|d| d.is_master());
@@ -160,6 +162,12 @@ impl TrainingLoop {
                         }
                     }
                     return Ok(());
+                }
+                // Handle external checkpoint save request
+                if action == AdaptiveAction::SaveCheckpoint {
+                    if let Some(manager) = checkpoint_manager {
+                        self.save_checkpoint(model, manager, false, Some(self.running_loss))?;
+                    }
                 }
 
                 // Logging — always log step 1 for immediate GUI feedback,
