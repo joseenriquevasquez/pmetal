@@ -181,9 +181,9 @@ impl TrainingTab {
             ),
             FormField::new(
                 "ANE",
-                "Auto",
+                "Disabled",
                 FieldKind::Enum {
-                    options: vec!["Auto".into(), "Enabled".into(), "Disabled".into()],
+                    options: vec!["Disabled".into(), "Enabled".into()],
                 },
                 "Hardware",
             ),
@@ -513,8 +513,8 @@ impl TrainingTab {
         if self.field_value("Cut Cross-Entropy") == "Enabled" {
             args.push("--cut-cross-entropy".into());
         }
-        if self.field_value("ANE") == "Disabled" {
-            args.push("--no-ane".into());
+        if self.field_value("ANE") == "Enabled" {
+            args.push("--ane".into());
         }
 
         args

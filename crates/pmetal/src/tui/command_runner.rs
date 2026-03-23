@@ -598,7 +598,8 @@ async fn run_training_direct(
             gradient_checkpointing: true,
             gradient_checkpointing_layers: 4,
             cut_cross_entropy: has_flag(&spec.args, "--cut-cross-entropy"),
-            ane: !has_flag(&spec.args, "--no-ane"),
+            no_adaptive_lr: has_flag(&spec.args, "--no-adaptive-lr"),
+            ane: has_flag(&spec.args, "--ane"),
             loss_scale: parse_arg(&spec.args, "--loss-scale", 1.0f32)?,
             #[cfg(feature = "distributed")]
             distributed: None,

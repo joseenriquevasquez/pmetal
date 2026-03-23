@@ -64,6 +64,9 @@ dashboard = ["cli", "dep:ratatui", "dep:crossterm", "dep:futures", "dep:tokio-ut
 # Serve: HTTP inference server
 serve = ["cli", "dep:pmetal-serve"]
 
+# MCP: Model Context Protocol server for Claude Desktop
+mcp = ["cli", "dep:pmetal-mcp"]
+
 [dependencies]
 # Sub-crates (all optional — activated by feature flags above)
 pmetal-core = { workspace = true, optional = true }
@@ -81,6 +84,7 @@ pmetal-distill = { workspace = true, optional = true }
 pmetal-merge = { workspace = true, optional = true }
 pmetal-vocoder = { workspace = true, optional = true }
 pmetal-serve = { workspace = true, optional = true }
+pmetal-mcp = { workspace = true, optional = true }
 mlx-rs = { workspace = true, optional = true }
 
 # Always-on (SDK facade needs these)

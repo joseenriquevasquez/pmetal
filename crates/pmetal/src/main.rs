@@ -262,6 +262,12 @@ enum Commands {
         #[arg(long)]
         cut_cross_entropy: bool,
 
+        /// Disable automatic adaptive LR (spike/plateau/divergence detection).
+        /// Control file polling stays active for manual LR control via MCP/TUI.
+        /// Use this when you want an external agent (LLM) to fully control the learning rate.
+        #[arg(long)]
+        no_adaptive_lr: bool,
+
         /// Custom JSONL column containing the training text.
         ///
         /// When set to anything other than "text", bypasses format auto-detection
@@ -297,10 +303,10 @@ enum Commands {
         #[arg(long)]
         response_column: Option<String>,
 
-        /// Disable ANE (Apple Neural Engine) for training, falling back to GPU/MLX.
+        /// Enable ANE (Apple Neural Engine) for training (experimental).
         #[cfg(feature = "ane")]
         #[arg(long)]
-        no_ane: bool,
+        ane: bool,
 
         /// Distributed training: comma-separated peer addresses (ip:port).
         /// All nodes in the cluster must specify the same peer list.
@@ -425,10 +431,10 @@ enum Commands {
         #[arg(long)]
         experts_dir: Option<String>,
 
-        /// Disable ANE (Apple Neural Engine) for inference, falling back to GPU/Metal.
+        /// Enable ANE (Apple Neural Engine) for inference (experimental).
         #[cfg(feature = "ane")]
         #[arg(long)]
-        no_ane: bool,
+        ane: bool,
 
         /// Maximum ANE kernel sequence length (power-of-2 bucket cap).
         /// ANE kernels are compiled for a fixed spatial dimension — larger values
@@ -1033,6 +1039,10 @@ enum Commands {
         log_metrics: Option<String>,
     },
 
+    /// Start MCP server for Claude Desktop integration
+    #[cfg(feature = "mcp")]
+    Mcp,
+
     /// Start an OpenAI-compatible inference server
     #[cfg(feature = "serve")]
     Serve {
@@ -1061,10 +1071,10 @@ enum Commands {
         #[arg(long)]
         experts_dir: Option<String>,
 
-        /// Disable ANE (Apple Neural Engine) for serving, falling back to GPU/Metal.
+        /// Enable ANE (Apple Neural Engine) for serving (experimental).
         #[cfg(feature = "ane")]
         #[arg(long)]
-        no_ane: bool,
+        ane: bool,
 
         /// Maximum ANE kernel sequence length (power-of-2 bucket cap).
         /// Higher values allow longer prompts on ANE but may fail to compile on
@@ -2097,13 +2107,14 @@ async fn tokio_main() -> anyhow::Result<()> {
             weight_decay,
             seed,
             cut_cross_entropy,
+            no_adaptive_lr,
             text_column,
             text_columns,
             column_separator,
             prompt_column,
             response_column,
             #[cfg(feature = "ane")]
-            no_ane,
+            ane,
             #[cfg(feature = "distributed")]
             distributed_peers,
             #[cfg(feature = "distributed")]
@@ -2210,8 +2221,9 @@ async fn tokio_main() -> anyhow::Result<()> {
                     gradient_checkpointing: !no_gradient_checkpointing,
                     gradient_checkpointing_layers,
                     cut_cross_entropy,
+                    no_adaptive_lr,
                     #[cfg(feature = "ane")]
-                    ane: !no_ane,
+                    ane,
                     #[cfg(not(feature = "ane"))]
                     ane: false,
                     loss_scale,
@@ -2228,6 +2240,11 @@ async fn tokio_main() -> anyhow::Result<()> {
             orchestrator::run_training(job_config, None, Vec::new()).await?;
         }
 
+        #[cfg(feature = "mcp")]
+        Commands::Mcp => {
+            pmetal_mcp::run_stdio().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+
         #[cfg(feature = "serve")]
         Commands::Serve {
             model,
@@ -2237,14 +2254,14 @@ async fn tokio_main() -> anyhow::Result<()> {
             max_seq_len,
             experts_dir,
             #[cfg(feature = "ane")]
-            no_ane,
+            ane,
             #[cfg(feature = "ane")]
             ane_max_seq_len,
             #[cfg(feature = "ane")]
             ane_real_time,
         } => {
             #[cfg(feature = "ane")]
-            let ane_enabled = !no_ane;
+            let ane_enabled = ane;
             #[cfg(not(feature = "ane"))]
             let ane_enabled = false;
 
@@ -2296,7 +2313,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             fp8,
             experts_dir,
             #[cfg(feature = "ane")]
-            no_ane,
+            ane,
             #[cfg(feature = "ane")]
             ane_max_seq_len,
             #[cfg(feature = "ane")]
@@ -2347,7 +2364,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 fp8,
                 tool_defs.as_deref(),
                 #[cfg(feature = "ane")]
-                !no_ane,
+                ane,
                 #[cfg(not(feature = "ane"))]
                 false,
                 #[cfg(feature = "ane")]
