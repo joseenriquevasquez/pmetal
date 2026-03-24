@@ -259,14 +259,31 @@ struct FlashAttentionTuneRequest {
     is_training: bool,
 }
 
+fn bucket_flash_attention_decode_kv_seq_len(kv_seq_len: usize) -> usize {
+    match kv_seq_len {
+        0..=256 => kv_seq_len.div_ceil(32) * 32,
+        257..=2048 => kv_seq_len.div_ceil(128) * 128,
+        _ => kv_seq_len.div_ceil(256) * 256,
+    }
+}
+
 impl FlashAttentionTuneRequest {
     fn from_config(config: &FlashAttentionConfig) -> Self {
+        let is_bucketable_decode = !config.is_training
+            && config.query_seq_len == 1
+            && config.sliding_window.is_none()
+            && config.softcap.is_none();
+        let kv_seq_len = if is_bucketable_decode {
+            bucket_flash_attention_decode_kv_seq_len(config.kv_seq_len)
+        } else {
+            config.kv_seq_len
+        };
         Self {
             batch_size: config.batch_size,
             num_heads: config.num_heads,
             num_kv_heads: config.num_kv_heads,
             query_seq_len: config.query_seq_len,
-            kv_seq_len: config.kv_seq_len,
+            kv_seq_len,
             head_dim: config.head_dim,
             is_causal: config.is_causal,
             has_sliding_window: config.sliding_window.is_some(),
@@ -3527,6 +3544,45 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn flash_attention_decode_tune_request_buckets_single_token_kv_lengths() {
+        let mut config = FlashAttentionConfig::inference(1, 8, 2, 1, 256);
+        config.kv_seq_len = 1025;
+        let request = FlashAttentionTuneRequest::from_config(&config);
+        assert_eq!(request.query_seq_len, 1);
+        assert_eq!(request.kv_seq_len, 1152);
+
+        config.kv_seq_len = 1032;
+        let request = FlashAttentionTuneRequest::from_config(&config);
+        assert_eq!(request.kv_seq_len, 1152);
+    }
+
+    #[test]
+    fn flash_attention_tune_request_keeps_exact_lengths_outside_decode_case() {
+        let training = FlashAttentionConfig {
+            query_seq_len: 1,
+            kv_seq_len: 1025,
+            is_training: true,
+            ..FlashAttentionConfig::inference(1, 8, 2, 1, 256)
+        };
+        let training_request = FlashAttentionTuneRequest::from_config(&training);
+        assert_eq!(training_request.kv_seq_len, 1025);
+
+        let prefill = FlashAttentionConfig::inference(1, 8, 2, 64, 256);
+        let prefill_request = FlashAttentionTuneRequest::from_config(&prefill);
+        assert_eq!(prefill_request.query_seq_len, 64);
+        assert_eq!(prefill_request.kv_seq_len, 64);
+
+        let decode_with_softcap = FlashAttentionConfig {
+            query_seq_len: 1,
+            kv_seq_len: 1025,
+            softcap: Some(30.0),
+            ..FlashAttentionConfig::inference(1, 8, 2, 1, 256)
+        };
+        let softcap_request = FlashAttentionTuneRequest::from_config(&decode_with_softcap);
+        assert_eq!(softcap_request.kv_seq_len, 1025);
     }
 
     #[test]

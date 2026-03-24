@@ -218,10 +218,50 @@ impl FusedMoeExpert {
         output: &MetalBuffer<f32>,
         intermediate: &MetalBuffer<f32>,
     ) -> Result<()> {
+        self.encode_into_with_offsets(command_buffer, input, 0, weights, output, 0, intermediate)
+    }
+
+    /// Encode both phases into an external command buffer (non-blocking),
+    /// reading and writing from element offsets inside the provided buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_into_with_offsets(
+        &self,
+        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+        input: &MetalBuffer<f32>,
+        input_offset_elems: usize,
+        weights: &ExpertWeightBuffers,
+        output: &MetalBuffer<f32>,
+        output_offset_elems: usize,
+        intermediate: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        validate_offset_span(
+            input.len(),
+            input_offset_elems,
+            self.config.hidden_dim as usize,
+            "input",
+        )?;
+        validate_offset_span(
+            output.len(),
+            output_offset_elems,
+            self.config.hidden_dim as usize,
+            "output",
+        )?;
         // Phase A: fused gate+up+SwiGLU
-        self.encode_gate_up_swiglu(command_buffer, input, weights, intermediate)?;
+        self.encode_gate_up_swiglu(
+            command_buffer,
+            input,
+            input_offset_elems,
+            weights,
+            intermediate,
+        )?;
         // Phase B: down projection
-        self.encode_down_projection(command_buffer, intermediate, weights, output)?;
+        self.encode_down_projection(
+            command_buffer,
+            intermediate,
+            weights,
+            output,
+            output_offset_elems,
+        )?;
         Ok(())
     }
 
@@ -240,7 +280,24 @@ impl FusedMoeExpert {
         &self,
         command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<()> {
+        self.submit(command_buffer)?;
+        self.wait_for_completion(command_buffer)
+    }
+
+    /// Submit a command buffer without waiting.
+    pub fn submit(
+        &self,
+        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> Result<()> {
         command_buffer.commit();
+        Ok(())
+    }
+
+    /// Wait for a previously submitted command buffer.
+    pub fn wait_for_completion(
+        &self,
+        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> Result<()> {
         command_buffer.waitUntilCompleted();
         if let Some(error) = command_buffer.error() {
             return Err(MetalError::ExecutionFailed(error.to_string()));
@@ -253,6 +310,7 @@ impl FusedMoeExpert {
         &self,
         command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
         input: &MetalBuffer<f32>,
+        input_offset_elems: usize,
         weights: &ExpertWeightBuffers,
         output: &MetalBuffer<f32>,
     ) -> Result<()> {
@@ -274,7 +332,11 @@ impl FusedMoeExpert {
             encoder.setBuffer_offset_atIndex(Some(weights.up_weights.metal_buffer()), 0, 3);
             encoder.setBuffer_offset_atIndex(Some(weights.up_scales.metal_buffer()), 0, 4);
             encoder.setBuffer_offset_atIndex(Some(weights.up_biases.metal_buffer()), 0, 5);
-            encoder.setBuffer_offset_atIndex(Some(input.metal_buffer()), 0, 6);
+            encoder.setBuffer_offset_atIndex(
+                Some(input.metal_buffer()),
+                byte_offset::<f32>(input_offset_elems)?,
+                6,
+            );
             encoder.setBuffer_offset_atIndex(Some(output.metal_buffer()), 0, 7);
 
             let out_dim = self.config.intermediate_dim;
@@ -315,6 +377,7 @@ impl FusedMoeExpert {
         input: &MetalBuffer<f32>,
         weights: &ExpertWeightBuffers,
         output: &MetalBuffer<f32>,
+        output_offset_elems: usize,
     ) -> Result<()> {
         let kernel_name = self.config.bits.matvec_kernel_name();
         let pipeline = {
@@ -333,7 +396,11 @@ impl FusedMoeExpert {
             encoder.setBuffer_offset_atIndex(Some(weights.down_scales.metal_buffer()), 0, 1);
             encoder.setBuffer_offset_atIndex(Some(weights.down_biases.metal_buffer()), 0, 2);
             encoder.setBuffer_offset_atIndex(Some(input.metal_buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(output.metal_buffer()), 0, 4);
+            encoder.setBuffer_offset_atIndex(
+                Some(output.metal_buffer()),
+                byte_offset::<f32>(output_offset_elems)?,
+                4,
+            );
 
             let out_dim = self.config.hidden_dim;
             let in_dim = self.config.intermediate_dim;
@@ -392,6 +459,59 @@ impl FusedMoeExpert {
         output: &MetalBuffer<f32>,
         intermediate: &MetalBuffer<f32>,
     ) -> Result<()> {
+        self.encode_expert_aligned_with_offsets(
+            command_buffer,
+            input,
+            0,
+            expert_buf,
+            gate_w_off,
+            gate_s_off,
+            gate_b_off,
+            up_w_off,
+            up_s_off,
+            up_b_off,
+            down_w_off,
+            down_s_off,
+            down_b_off,
+            output,
+            0,
+            intermediate,
+        )
+    }
+
+    /// Offset-capable aligned expert encode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_expert_aligned_with_offsets(
+        &self,
+        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+        input: &MetalBuffer<f32>,
+        input_offset_elems: usize,
+        expert_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        gate_w_off: usize,
+        gate_s_off: usize,
+        gate_b_off: usize,
+        up_w_off: usize,
+        up_s_off: usize,
+        up_b_off: usize,
+        down_w_off: usize,
+        down_s_off: usize,
+        down_b_off: usize,
+        output: &MetalBuffer<f32>,
+        output_offset_elems: usize,
+        intermediate: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        validate_offset_span(
+            input.len(),
+            input_offset_elems,
+            self.config.hidden_dim as usize,
+            "input",
+        )?;
+        validate_offset_span(
+            output.len(),
+            output_offset_elems,
+            self.config.hidden_dim as usize,
+            "output",
+        )?;
         // Phase A: gate+up+SwiGLU
         {
             let pipeline = {
@@ -413,7 +533,11 @@ impl FusedMoeExpert {
                 encoder.setBuffer_offset_atIndex(Some(expert_buf), up_w_off, 3);
                 encoder.setBuffer_offset_atIndex(Some(expert_buf), up_s_off, 4);
                 encoder.setBuffer_offset_atIndex(Some(expert_buf), up_b_off, 5);
-                encoder.setBuffer_offset_atIndex(Some(input.metal_buffer()), 0, 6);
+                encoder.setBuffer_offset_atIndex(
+                    Some(input.metal_buffer()),
+                    byte_offset::<f32>(input_offset_elems)?,
+                    6,
+                );
                 encoder.setBuffer_offset_atIndex(Some(intermediate.metal_buffer()), 0, 7);
 
                 let out_dim = self.config.intermediate_dim;
@@ -462,7 +586,11 @@ impl FusedMoeExpert {
                 encoder.setBuffer_offset_atIndex(Some(expert_buf), down_s_off, 1);
                 encoder.setBuffer_offset_atIndex(Some(expert_buf), down_b_off, 2);
                 encoder.setBuffer_offset_atIndex(Some(intermediate.metal_buffer()), 0, 3);
-                encoder.setBuffer_offset_atIndex(Some(output.metal_buffer()), 0, 4);
+                encoder.setBuffer_offset_atIndex(
+                    Some(output.metal_buffer()),
+                    byte_offset::<f32>(output_offset_elems)?,
+                    4,
+                );
 
                 let out_dim = self.config.hidden_dim;
                 let in_dim = self.config.intermediate_dim;
@@ -493,6 +621,36 @@ impl FusedMoeExpert {
 
         Ok(())
     }
+}
+
+fn validate_offset_span(
+    buffer_len: usize,
+    offset_elems: usize,
+    span_elems: usize,
+    label: &'static str,
+) -> Result<()> {
+    let end = offset_elems.checked_add(span_elems).ok_or_else(|| {
+        MetalError::InvalidConfig(format!(
+            "{label} offset overflow: offset={offset_elems}, span={span_elems}"
+        ))
+    })?;
+    if end > buffer_len {
+        return Err(MetalError::InvalidConfig(format!(
+            "{label} offset range [{offset_elems}..{end}) exceeds buffer length {buffer_len}"
+        )));
+    }
+    Ok(())
+}
+
+fn byte_offset<T>(offset_elems: usize) -> Result<usize> {
+    offset_elems
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| {
+            MetalError::InvalidConfig(format!(
+                "buffer byte offset overflow: offset={offset_elems}, elem_size={}",
+                std::mem::size_of::<T>()
+            ))
+        })
 }
 
 // ============================================================================
@@ -724,6 +882,27 @@ impl GatherQmmSwiglu {
             .ok_or(MetalError::CommandBufferCreation)
     }
 
+    /// Submit a command buffer without waiting.
+    pub fn submit(
+        &self,
+        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> Result<()> {
+        command_buffer.commit();
+        Ok(())
+    }
+
+    /// Wait for a previously submitted command buffer.
+    pub fn wait_for_completion(
+        &self,
+        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> Result<()> {
+        command_buffer.waitUntilCompleted();
+        if let Some(error) = command_buffer.error() {
+            return Err(MetalError::ExecutionFailed(error.to_string()));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode_gate_up_swiglu(
         &self,
@@ -867,6 +1046,26 @@ impl GatherQmmSwiglu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_offset_span_accepts_in_bounds_range() {
+        validate_offset_span(1024, 128, 256, "input").unwrap();
+        validate_offset_span(256, 0, 256, "output").unwrap();
+    }
+
+    #[test]
+    fn test_validate_offset_span_rejects_out_of_bounds_range() {
+        let error = validate_offset_span(256, 128, 256, "input").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("input offset range"));
+        assert!(message.contains("exceeds buffer length 256"));
+    }
+
+    #[test]
+    fn test_byte_offset_overflow_is_reported() {
+        let error = byte_offset::<f32>(usize::MAX).unwrap_err();
+        assert!(error.to_string().contains("buffer byte offset overflow"));
+    }
 
     #[test]
     fn test_expert_config_validation() {

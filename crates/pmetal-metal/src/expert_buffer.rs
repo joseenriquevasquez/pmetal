@@ -301,6 +301,17 @@ impl AlignedBuffer {
         self.raw.as_ptr() as *mut u8
     }
 
+    /// An immutable byte slice covering the full allocation.
+    ///
+    /// Safe for read-only inspection once the caller has synchronized any
+    /// in-flight GPU writes that might target this buffer.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `raw` is valid for `size` bytes for the lifetime of `self`,
+        // and we only expose immutable access here.
+        unsafe { std::slice::from_raw_parts(self.raw.as_ptr() as *const u8, self.size) }
+    }
+
     /// A mutable byte slice covering the full allocation.
     ///
     /// # Safety
@@ -312,6 +323,27 @@ impl AlignedBuffer {
         // SAFETY: `raw` is valid for `size` bytes and exclusively owned by
         // this struct at the point where the caller holds `&mut self`.
         unsafe { std::slice::from_raw_parts_mut(self.raw.as_ptr() as *mut u8, self.size) }
+    }
+
+    /// Copy a byte slice into the start of the buffer.
+    ///
+    /// This is a convenience wrapper for prefetched-expert paths that already
+    /// have the expert bytes resident in CPU memory and want to preserve the
+    /// aligned Metal-shared fast path for subsequent GPU dispatch.
+    pub fn write_prefix(&mut self, src: &[u8]) -> Result<()> {
+        if src.len() > self.size {
+            return Err(MetalError::InvalidConfig(format!(
+                "write_prefix: source length {} exceeds buffer size {}",
+                src.len(),
+                self.size
+            )));
+        }
+
+        // SAFETY: `self` is exclusively borrowed and no concurrent GPU access
+        // is permitted while the caller holds `&mut self`.
+        let dst = unsafe { self.as_bytes_mut() };
+        dst[..src.len()].copy_from_slice(src);
+        Ok(())
     }
 
     // ── I/O ───────────────────────────────────────────────────────────────────
@@ -827,6 +859,18 @@ mod tests {
         for (i, &byte) in slice2.iter().enumerate() {
             assert_eq!(byte, (i % 251) as u8);
         }
+    }
+
+    #[test]
+    fn test_aligned_buffer_write_prefix() {
+        let ctx = MetalContext::new().unwrap();
+        let mut buf = AlignedBuffer::new(ctx.device(), ALIGN_2MB).unwrap();
+        let payload = [9u8, 7, 5, 3, 1];
+        buf.write_prefix(&payload).unwrap();
+
+        // SAFETY: no concurrent GPU access in this test.
+        let slice = unsafe { buf.as_bytes_mut() };
+        assert_eq!(&slice[..payload.len()], &payload);
     }
 
     #[test]
