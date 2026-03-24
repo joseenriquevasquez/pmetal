@@ -366,11 +366,17 @@ struct GdnInputProjectionBenchmarkSetup {
     input: Array,
     input_data: Vec<f32>,
     qkv_weight: Array,
+    qkv_weight_t: Array,
     z_weight: Array,
+    z_weight_t: Array,
     b_weight: Array,
+    b_weight_t: Array,
     a_weight: Array,
+    a_weight_t: Array,
     qkv_z_combined_weight: Array,
+    qkv_z_combined_weight_t: Array,
     combined_weight: Array,
+    combined_weight_t: Array,
     combined_weight_data: Vec<f32>,
     reference_output_data: Vec<f32>,
 }
@@ -385,6 +391,7 @@ struct GdnLinearProjectionBenchmarkSetup {
     input: Array,
     input_data: Vec<f32>,
     weight: Array,
+    weight_t: Array,
     weight_data: Vec<f32>,
     reference_output_data: Vec<f32>,
 }
@@ -682,11 +689,38 @@ pub(crate) async fn run_gdn_decode_benchmark(
                 },
             )?;
 
+            let split_cached_t_outcome = benchmark_operation(
+                warmup_iterations,
+                benchmark_iterations,
+                || -> anyhow::Result<()> {
+                    let projected = mlx_split_projection_rhs_transposed(
+                        &setup.input,
+                        &setup.qkv_weight_t,
+                        &setup.z_weight_t,
+                        &setup.b_weight_t,
+                        &setup.a_weight_t,
+                    )?;
+                    projected.eval()?;
+                    Ok(())
+                },
+            )?;
+
             let combined_outcome = benchmark_operation(
                 warmup_iterations,
                 benchmark_iterations,
                 || -> anyhow::Result<()> {
                     let projected = mlx_linear_projection(&setup.input, &setup.combined_weight)?;
+                    projected.eval()?;
+                    Ok(())
+                },
+            )?;
+
+            let combined_cached_t_outcome = benchmark_operation(
+                warmup_iterations,
+                benchmark_iterations,
+                || -> anyhow::Result<()> {
+                    let projected =
+                        mlx_linear_projection_rhs_transposed(&setup.input, &setup.combined_weight_t)?;
                     projected.eval()?;
                     Ok(())
                 },
@@ -714,6 +748,28 @@ pub(crate) async fn run_gdn_decode_benchmark(
                 },
             )?;
 
+            let combined_split_cached_t_outcome = benchmark_operation(
+                warmup_iterations,
+                benchmark_iterations,
+                || -> anyhow::Result<()> {
+                    let (qkv, z, b_val, a) = mlx_combined_split_projection_rhs_transposed(
+                        &setup.input,
+                        &setup.combined_weight_t,
+                        setup.batch_size,
+                        setup.seq_len,
+                        setup.conv_dim,
+                        setup.value_dim,
+                        setup.num_v_heads,
+                        setup.head_v_dim,
+                    )?;
+                    qkv.eval()?;
+                    z.eval()?;
+                    b_val.eval()?;
+                    a.eval()?;
+                    Ok(())
+                },
+            )?;
+
             let qkv_z_combined_split_outcome = benchmark_operation(
                 warmup_iterations,
                 benchmark_iterations,
@@ -723,6 +779,30 @@ pub(crate) async fn run_gdn_decode_benchmark(
                         &setup.qkv_z_combined_weight,
                         &setup.b_weight,
                         &setup.a_weight,
+                        setup.batch_size,
+                        setup.seq_len,
+                        setup.conv_dim,
+                        setup.value_dim,
+                        setup.num_v_heads,
+                        setup.head_v_dim,
+                    )?;
+                    qkv.eval()?;
+                    z.eval()?;
+                    b_val.eval()?;
+                    a.eval()?;
+                    Ok(())
+                },
+            )?;
+
+            let qkv_z_combined_split_cached_t_outcome = benchmark_operation(
+                warmup_iterations,
+                benchmark_iterations,
+                || -> anyhow::Result<()> {
+                    let (qkv, z, b_val, a) = mlx_qkv_z_combined_split_projection_rhs_transposed(
+                        &setup.input,
+                        &setup.qkv_z_combined_weight_t,
+                        &setup.b_weight_t,
+                        &setup.a_weight_t,
                         setup.batch_size,
                         setup.seq_len,
                         setup.conv_dim,
@@ -837,12 +917,25 @@ pub(crate) async fn run_gdn_decode_benchmark(
                         outcome: split_outcome,
                     },
                     GdnDecodeBackendResult {
+                        name: "mlx_split_cached_t".to_string(),
+                        max_abs_diff_vs_reference: Some(0.0),
+                        outcome: split_cached_t_outcome,
+                    },
+                    GdnDecodeBackendResult {
                         name: "mlx_combined".to_string(),
                         max_abs_diff_vs_reference: Some(max_abs_diff(
                             &setup.reference_output_data,
                             &combined_output_data,
                         )),
                         outcome: combined_outcome,
+                    },
+                    GdnDecodeBackendResult {
+                        name: "mlx_combined_cached_t".to_string(),
+                        max_abs_diff_vs_reference: Some(max_abs_diff(
+                            &setup.reference_output_data,
+                            &combined_output_data,
+                        )),
+                        outcome: combined_cached_t_outcome,
                     },
                     GdnDecodeBackendResult {
                         name: "mlx_combined_split".to_string(),
@@ -853,12 +946,28 @@ pub(crate) async fn run_gdn_decode_benchmark(
                         outcome: combined_split_outcome,
                     },
                     GdnDecodeBackendResult {
+                        name: "mlx_combined_split_cached_t".to_string(),
+                        max_abs_diff_vs_reference: Some(max_abs_diff(
+                            &setup.reference_output_data,
+                            &combined_output_data,
+                        )),
+                        outcome: combined_split_cached_t_outcome,
+                    },
+                    GdnDecodeBackendResult {
                         name: "mlx_qkv_z_combined_split".to_string(),
                         max_abs_diff_vs_reference: Some(max_abs_diff(
                             &setup.reference_output_data,
                             &qkv_z_combined_output_data,
                         )),
                         outcome: qkv_z_combined_split_outcome,
+                    },
+                    GdnDecodeBackendResult {
+                        name: "mlx_qkv_z_combined_split_cached_t".to_string(),
+                        max_abs_diff_vs_reference: Some(max_abs_diff(
+                            &setup.reference_output_data,
+                            &qkv_z_combined_output_data,
+                        )),
+                        outcome: qkv_z_combined_split_cached_t_outcome,
                     },
                     GdnDecodeBackendResult {
                         name: "accelerate_combined".to_string(),
@@ -885,6 +994,17 @@ pub(crate) async fn run_gdn_decode_benchmark(
                 benchmark_iterations,
                 || -> anyhow::Result<()> {
                     let projected = mlx_linear_projection(&setup.input, &setup.weight)?;
+                    projected.eval()?;
+                    Ok(())
+                },
+            )?;
+
+            let mlx_cached_t_outcome = benchmark_operation(
+                warmup_iterations,
+                benchmark_iterations,
+                || -> anyhow::Result<()> {
+                    let projected =
+                        mlx_linear_projection_rhs_transposed(&setup.input, &setup.weight_t)?;
                     projected.eval()?;
                     Ok(())
                 },
@@ -953,6 +1073,11 @@ pub(crate) async fn run_gdn_decode_benchmark(
                         name: "mlx_linear".to_string(),
                         max_abs_diff_vs_reference: Some(0.0),
                         outcome: mlx_outcome,
+                    },
+                    GdnDecodeBackendResult {
+                        name: "mlx_linear_cached_t".to_string(),
+                        max_abs_diff_vs_reference: Some(0.0),
+                        outcome: mlx_cached_t_outcome,
                     },
                     GdnDecodeBackendResult {
                         name: "accelerate_combined".to_string(),
@@ -1272,15 +1397,27 @@ fn build_gdn_decode_benchmark_setup(
             let z_weight = gdn.in_proj_z.weight.as_ref().as_type::<f32>()?;
             let b_weight = gdn.in_proj_b.weight.as_ref().as_type::<f32>()?;
             let a_weight = gdn.in_proj_a.weight.as_ref().as_type::<f32>()?;
+            let qkv_weight_t = qkv_weight.t();
+            let z_weight_t = z_weight.t();
+            let b_weight_t = b_weight.t();
+            let a_weight_t = a_weight.t();
             qkv_weight.eval()?;
             z_weight.eval()?;
             b_weight.eval()?;
             a_weight.eval()?;
+            qkv_weight_t.eval()?;
+            z_weight_t.eval()?;
+            b_weight_t.eval()?;
+            a_weight_t.eval()?;
 
             let combined_weight = build_combined_input_projection_weight(gdn)?;
             let qkv_z_combined_weight = build_qkv_z_combined_projection_weight(gdn)?;
+            let combined_weight_t = combined_weight.t();
+            let qkv_z_combined_weight_t = qkv_z_combined_weight.t();
             combined_weight.eval()?;
             qkv_z_combined_weight.eval()?;
+            combined_weight_t.eval()?;
+            qkv_z_combined_weight_t.eval()?;
             let combined_weight_data = combined_weight.as_slice::<f32>().to_vec();
             let reference_output =
                 mlx_split_projection(&input, &qkv_weight, &z_weight, &b_weight, &a_weight)?;
@@ -1301,11 +1438,17 @@ fn build_gdn_decode_benchmark_setup(
                     input,
                     input_data,
                     qkv_weight,
+                    qkv_weight_t,
                     z_weight,
+                    z_weight_t,
                     b_weight,
+                    b_weight_t,
                     a_weight,
+                    a_weight_t,
                     qkv_z_combined_weight,
+                    qkv_z_combined_weight_t,
                     combined_weight,
+                    combined_weight_t,
                     combined_weight_data,
                     reference_output_data: reference_output.as_slice::<f32>().to_vec(),
                 },
@@ -1322,7 +1465,9 @@ fn build_gdn_decode_benchmark_setup(
                 &[batch_size as i32, seq_len as i32, input_dim as i32],
             );
             let weight = gdn.out_proj.weight.as_ref().as_type::<f32>()?;
+            let weight_t = weight.t();
             weight.eval()?;
+            weight_t.eval()?;
             let weight_data = weight.as_slice::<f32>().to_vec();
             let reference_output = mlx_linear_projection(&input, &weight)?;
             reference_output.eval()?;
@@ -1337,6 +1482,7 @@ fn build_gdn_decode_benchmark_setup(
                 input,
                 input_data,
                 weight,
+                weight_t,
                 weight_data,
                 reference_output_data: reference_output.as_slice::<f32>().to_vec(),
             }))
@@ -1397,6 +1543,10 @@ fn mlx_linear_projection(input: &Array, weight: &Array) -> anyhow::Result<Array>
     Ok(ops::matmul(input, &weight.t())?)
 }
 
+fn mlx_linear_projection_rhs_transposed(input: &Array, weight_t: &Array) -> anyhow::Result<Array> {
+    Ok(ops::matmul(input, weight_t)?)
+}
+
 fn mlx_split_projection(
     input: &Array,
     qkv_weight: &Array,
@@ -1411,6 +1561,20 @@ fn mlx_split_projection(
     Ok(ops::concatenate_axis(&[&qkv, &z, &b_val, &a], -1)?)
 }
 
+fn mlx_split_projection_rhs_transposed(
+    input: &Array,
+    qkv_weight_t: &Array,
+    z_weight_t: &Array,
+    b_weight_t: &Array,
+    a_weight_t: &Array,
+) -> anyhow::Result<Array> {
+    let qkv = mlx_linear_projection_rhs_transposed(input, qkv_weight_t)?;
+    let z = mlx_linear_projection_rhs_transposed(input, z_weight_t)?;
+    let b_val = mlx_linear_projection_rhs_transposed(input, b_weight_t)?;
+    let a = mlx_linear_projection_rhs_transposed(input, a_weight_t)?;
+    Ok(ops::concatenate_axis(&[&qkv, &z, &b_val, &a], -1)?)
+}
+
 fn mlx_combined_split_projection(
     input: &Array,
     combined_weight: &Array,
@@ -1422,6 +1586,28 @@ fn mlx_combined_split_projection(
     head_v_dim: usize,
 ) -> anyhow::Result<(Array, Array, Array, Array)> {
     let projected = mlx_linear_projection(input, combined_weight)?;
+    split_combined_projection(
+        &projected,
+        batch_size,
+        seq_len,
+        conv_dim,
+        value_dim,
+        num_v_heads,
+        head_v_dim,
+    )
+}
+
+fn mlx_combined_split_projection_rhs_transposed(
+    input: &Array,
+    combined_weight_t: &Array,
+    batch_size: usize,
+    seq_len: usize,
+    conv_dim: usize,
+    value_dim: usize,
+    num_v_heads: usize,
+    head_v_dim: usize,
+) -> anyhow::Result<(Array, Array, Array, Array)> {
+    let projected = mlx_linear_projection_rhs_transposed(input, combined_weight_t)?;
     split_combined_projection(
         &projected,
         batch_size,
@@ -1457,6 +1643,33 @@ fn mlx_qkv_z_combined_split_projection(
     ])?;
     let b_val = mlx_linear_projection(input, b_weight)?;
     let a = mlx_linear_projection(input, a_weight)?;
+    Ok((qkv, z, b_val, a))
+}
+
+fn mlx_qkv_z_combined_split_projection_rhs_transposed(
+    input: &Array,
+    qkv_z_combined_weight_t: &Array,
+    b_weight_t: &Array,
+    a_weight_t: &Array,
+    batch_size: usize,
+    seq_len: usize,
+    conv_dim: usize,
+    value_dim: usize,
+    num_v_heads: usize,
+    head_v_dim: usize,
+) -> anyhow::Result<(Array, Array, Array, Array)> {
+    let projected = mlx_linear_projection_rhs_transposed(input, qkv_z_combined_weight_t)?;
+    let qkv_end = conv_dim as i32;
+    let z_end = qkv_end + value_dim as i32;
+    let qkv = projected.index((.., .., ..qkv_end));
+    let z = projected.index((.., .., qkv_end..z_end)).reshape(&[
+        batch_size as i32,
+        seq_len as i32,
+        num_v_heads as i32,
+        head_v_dim as i32,
+    ])?;
+    let b_val = mlx_linear_projection_rhs_transposed(input, b_weight_t)?;
+    let a = mlx_linear_projection_rhs_transposed(input, a_weight_t)?;
     Ok((qkv, z, b_val, a))
 }
 
@@ -4169,6 +4382,205 @@ mod tests {
 
         assert!(max_abs_diff(reference.as_slice::<f32>(), stitched.as_slice::<f32>()) < 1e-4);
         assert_eq!(stitched.shape(), &[batch_size as i32, seq_len as i32, total_output_dim as i32]);
+    }
+
+    #[test]
+    fn mlx_split_projection_rhs_transposed_matches_reference_layout() {
+        let batch_size = 1usize;
+        let seq_len = 1usize;
+        let hidden_size = 8usize;
+        let conv_dim = 8usize;
+        let value_dim = 3usize;
+        let num_v_heads = 1usize;
+        let total_output_dim = conv_dim + value_dim + (num_v_heads * 2);
+        let input_data: Vec<f32> = (0..batch_size * seq_len * hidden_size)
+            .map(deterministic_value)
+            .collect();
+        let qkv_weight_data: Vec<f32> = (0..conv_dim * hidden_size)
+            .map(|index| deterministic_value(index + 521))
+            .collect();
+        let z_weight_data: Vec<f32> = (0..value_dim * hidden_size)
+            .map(|index| deterministic_value(index + 683))
+            .collect();
+        let b_weight_data: Vec<f32> = (0..num_v_heads * hidden_size)
+            .map(|index| deterministic_value(index + 811))
+            .collect();
+        let a_weight_data: Vec<f32> = (0..num_v_heads * hidden_size)
+            .map(|index| deterministic_value(index + 947))
+            .collect();
+        let input = Array::from_slice(
+            &input_data,
+            &[batch_size as i32, seq_len as i32, hidden_size as i32],
+        );
+        let qkv_weight =
+            Array::from_slice(&qkv_weight_data, &[conv_dim as i32, hidden_size as i32]);
+        let z_weight =
+            Array::from_slice(&z_weight_data, &[value_dim as i32, hidden_size as i32]);
+        let b_weight =
+            Array::from_slice(&b_weight_data, &[num_v_heads as i32, hidden_size as i32]);
+        let a_weight =
+            Array::from_slice(&a_weight_data, &[num_v_heads as i32, hidden_size as i32]);
+
+        let reference = mlx_split_projection(&input, &qkv_weight, &z_weight, &b_weight, &a_weight)
+            .expect("mlx split");
+        reference.eval().expect("eval");
+        let projected = mlx_split_projection_rhs_transposed(
+            &input,
+            &qkv_weight.t(),
+            &z_weight.t(),
+            &b_weight.t(),
+            &a_weight.t(),
+        )
+        .expect("transposed split");
+        projected.eval().expect("eval");
+
+        assert!(max_abs_diff(reference.as_slice::<f32>(), projected.as_slice::<f32>()) < 1e-4);
+        assert_eq!(
+            projected.shape(),
+            &[batch_size as i32, seq_len as i32, total_output_dim as i32]
+        );
+    }
+
+    #[test]
+    fn mlx_combined_split_projection_rhs_transposed_matches_reference_layout() {
+        let batch_size = 1usize;
+        let seq_len = 1usize;
+        let hidden_size = 8usize;
+        let conv_dim = 8usize;
+        let value_dim = 3usize;
+        let num_v_heads = 1usize;
+        let head_v_dim = 3usize;
+        let total_output_dim = conv_dim + value_dim + (num_v_heads * 2);
+        let input_data: Vec<f32> = (0..batch_size * seq_len * hidden_size)
+            .map(deterministic_value)
+            .collect();
+        let weight_data: Vec<f32> = (0..total_output_dim * hidden_size)
+            .map(|index| deterministic_value(index + 1051))
+            .collect();
+        let input = Array::from_slice(
+            &input_data,
+            &[batch_size as i32, seq_len as i32, hidden_size as i32],
+        );
+        let combined_weight = Array::from_slice(
+            &weight_data,
+            &[total_output_dim as i32, hidden_size as i32],
+        );
+
+        let reference = mlx_linear_projection(&input, &combined_weight).expect("mlx projection");
+        reference.eval().expect("eval");
+        let (qkv, z, b_val, a) = mlx_combined_split_projection_rhs_transposed(
+            &input,
+            &combined_weight.t(),
+            batch_size,
+            seq_len,
+            conv_dim,
+            value_dim,
+            num_v_heads,
+            head_v_dim,
+        )
+        .expect("split projection");
+        let z_flat = z
+            .reshape(&[batch_size as i32, seq_len as i32, value_dim as i32])
+            .expect("reshape");
+        let stitched = ops::concatenate_axis(&[&qkv, &z_flat, &b_val, &a], -1).expect("concat");
+        stitched.eval().expect("eval");
+
+        assert!(max_abs_diff(reference.as_slice::<f32>(), stitched.as_slice::<f32>()) < 1e-4);
+    }
+
+    #[test]
+    fn mlx_qkv_z_combined_split_projection_rhs_transposed_matches_reference_layout() {
+        let batch_size = 1usize;
+        let seq_len = 1usize;
+        let hidden_size = 8usize;
+        let conv_dim = 8usize;
+        let value_dim = 3usize;
+        let num_v_heads = 1usize;
+        let head_v_dim = 3usize;
+        let input_data: Vec<f32> = (0..batch_size * seq_len * hidden_size)
+            .map(deterministic_value)
+            .collect();
+        let qkv_z_weight_data: Vec<f32> = (0..(conv_dim + value_dim) * hidden_size)
+            .map(|index| deterministic_value(index + 1171))
+            .collect();
+        let b_weight_data: Vec<f32> = (0..num_v_heads * hidden_size)
+            .map(|index| deterministic_value(index + 1301))
+            .collect();
+        let a_weight_data: Vec<f32> = (0..num_v_heads * hidden_size)
+            .map(|index| deterministic_value(index + 1459))
+            .collect();
+        let input = Array::from_slice(
+            &input_data,
+            &[batch_size as i32, seq_len as i32, hidden_size as i32],
+        );
+        let qkv_z_weight = Array::from_slice(
+            &qkv_z_weight_data,
+            &[(conv_dim + value_dim) as i32, hidden_size as i32],
+        );
+        let b_weight =
+            Array::from_slice(&b_weight_data, &[num_v_heads as i32, hidden_size as i32]);
+        let a_weight =
+            Array::from_slice(&a_weight_data, &[num_v_heads as i32, hidden_size as i32]);
+
+        let reference = mlx_split_projection(
+            &input,
+            &qkv_z_weight.index((..conv_dim as i32, ..)),
+            &qkv_z_weight.index((conv_dim as i32.., ..)),
+            &b_weight,
+            &a_weight,
+        )
+        .expect("mlx split");
+        reference.eval().expect("eval");
+        let (qkv, z, b_val, a) = mlx_qkv_z_combined_split_projection_rhs_transposed(
+            &input,
+            &qkv_z_weight.t(),
+            &b_weight.t(),
+            &a_weight.t(),
+            batch_size,
+            seq_len,
+            conv_dim,
+            value_dim,
+            num_v_heads,
+            head_v_dim,
+        )
+        .expect("split projection");
+        let z_flat = z
+            .reshape(&[batch_size as i32, seq_len as i32, value_dim as i32])
+            .expect("reshape");
+        let stitched = ops::concatenate_axis(&[&qkv, &z_flat, &b_val, &a], -1).expect("concat");
+        stitched.eval().expect("eval");
+
+        assert!(max_abs_diff(reference.as_slice::<f32>(), stitched.as_slice::<f32>()) < 1e-4);
+    }
+
+    #[test]
+    fn mlx_linear_projection_rhs_transposed_matches_reference() {
+        let batch_size = 1usize;
+        let seq_len = 1usize;
+        let input_dim = 6usize;
+        let output_dim = 10usize;
+        let input_data: Vec<f32> = (0..batch_size * seq_len * input_dim)
+            .map(deterministic_value)
+            .collect();
+        let weight_data: Vec<f32> = (0..output_dim * input_dim)
+            .map(|index| deterministic_value(index + 1601))
+            .collect();
+        let input = Array::from_slice(
+            &input_data,
+            &[batch_size as i32, seq_len as i32, input_dim as i32],
+        );
+        let weight = Array::from_slice(
+            &weight_data,
+            &[output_dim as i32, input_dim as i32],
+        );
+
+        let reference = mlx_linear_projection(&input, &weight).expect("mlx projection");
+        reference.eval().expect("eval");
+        let projected =
+            mlx_linear_projection_rhs_transposed(&input, &weight.t()).expect("transposed linear");
+        projected.eval().expect("eval");
+
+        assert!(max_abs_diff(reference.as_slice::<f32>(), projected.as_slice::<f32>()) < 1e-4);
     }
 
     #[test]
