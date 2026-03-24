@@ -107,6 +107,7 @@ impl Default for InferenceRunnerConfig {
 }
 
 /// Loaded model — either a standard model or a LoRA-merged model.
+#[allow(clippy::large_enum_variant)]
 enum LoadedModel {
     Standard(DynamicModel),
     Lora(DynamicLoraModel),
