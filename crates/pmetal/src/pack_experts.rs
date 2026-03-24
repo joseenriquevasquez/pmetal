@@ -17,11 +17,290 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Seek, Write};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use pmetal_models::expert_layout::{ExpertComponent, ExpertPackLayout, PackedBits};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExpertTensorLayout {
+    SplitPerExpert { layer_prefix: String },
+    FusedGateUp { layer_prefix: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionKind {
+    Gate,
+    Up,
+    Down,
+}
+
+impl ProjectionKind {
+    fn split_name(self) -> &'static str {
+        match self {
+            Self::Gate => "gate_proj",
+            Self::Up => "up_proj",
+            Self::Down => "down_proj",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComponentField {
+    Weight,
+    Scales,
+    Biases,
+}
+
+impl ComponentField {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Weight => "weight",
+            Self::Scales => "scales",
+            Self::Biases => "biases",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorSliceSpec {
+    expert_idx: usize,
+    row_offset: usize,
+    row_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorSource {
+    key: String,
+    slice: Option<TensorSliceSpec>,
+}
+
+#[derive(serde::Deserialize)]
+struct SafeTensorHeader {
+    #[serde(rename = "__metadata__")]
+    _metadata: Option<HashMap<String, String>>,
+    #[serde(flatten)]
+    tensors: HashMap<String, safetensors::tensor::TensorInfo>,
+}
+
+struct ShardReader {
+    file: fs::File,
+    data_offset: u64,
+    tensors: HashMap<String, safetensors::tensor::TensorInfo>,
+}
+
+struct MatrixDataView {
+    dtype: safetensors::Dtype,
+    rows: usize,
+    cols: usize,
+    data: Vec<u8>,
+}
+
+impl ShardReader {
+    fn open(path: &Path) -> Result<Self> {
+        let mut file =
+            fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+        let mut header_len_bytes = [0u8; 8];
+        file.read_exact(&mut header_len_bytes)
+            .with_context(|| format!("Failed to read safetensors header from {}", path.display()))?;
+        let header_len = u64::from_le_bytes(header_len_bytes) as usize;
+
+        let mut header_bytes = vec![0u8; header_len];
+        file.read_exact(&mut header_bytes)
+            .with_context(|| format!("Failed to read safetensors JSON header from {}", path.display()))?;
+        let header: SafeTensorHeader = serde_json::from_slice(&header_bytes)
+            .with_context(|| format!("Failed to parse safetensors JSON header from {}", path.display()))?;
+
+        Ok(Self {
+            file,
+            data_offset: 8 + header_len as u64,
+            tensors: header.tensors,
+        })
+    }
+
+    fn read_matrix_data(&mut self, source: &TensorSource) -> Result<Option<MatrixDataView>> {
+        let info = match self.tensors.get(&source.key) {
+            Some(info) => info.clone(),
+            None => return Ok(None),
+        };
+
+        match &source.slice {
+            None => {
+                if info.shape.len() != 2 {
+                    bail!(
+                        "Expected 2-D tensor for `{}`, got shape {:?}",
+                        source.key,
+                        info.shape
+                    );
+                }
+
+                let start = self.data_offset + info.data_offsets.0 as u64;
+                let len = info.data_offsets.1 - info.data_offsets.0;
+                let mut data = vec![0u8; len];
+                self.file.seek(std::io::SeekFrom::Start(start))?;
+                self.file.read_exact(&mut data)?;
+
+                Ok(Some(MatrixDataView {
+                    dtype: info.dtype,
+                    rows: info.shape[0],
+                    cols: info.shape[1],
+                    data,
+                }))
+            }
+            Some(slice) => {
+                if info.shape.len() != 3 {
+                    bail!(
+                        "Expected 3-D fused expert tensor for `{}`, got shape {:?}",
+                        source.key,
+                        info.shape
+                    );
+                }
+
+                let num_experts = info.shape[0];
+                let rows = info.shape[1];
+                let cols = info.shape[2];
+                if slice.expert_idx >= num_experts {
+                    bail!(
+                        "Expert index {} out of range for `{}` with {num_experts} experts",
+                        slice.expert_idx,
+                        source.key
+                    );
+                }
+                if slice.row_offset + slice.row_count > rows {
+                    bail!(
+                        "Row slice {}..{} out of range for `{}` with {rows} rows",
+                        slice.row_offset,
+                        slice.row_offset + slice.row_count,
+                        source.key
+                    );
+                }
+
+                let bytes_per_elem = dtype_nbytes(info.dtype)?;
+                let start_elem = ((slice.expert_idx * rows) + slice.row_offset) * cols;
+                let elem_count = slice.row_count * cols;
+                let start = self.data_offset
+                    + info.data_offsets.0 as u64
+                    + (start_elem * bytes_per_elem) as u64;
+                let mut data = vec![0u8; elem_count * bytes_per_elem];
+                self.file.seek(std::io::SeekFrom::Start(start))?;
+                self.file.read_exact(&mut data)?;
+
+                Ok(Some(MatrixDataView {
+                    dtype: info.dtype,
+                    rows: slice.row_count,
+                    cols,
+                    data,
+                }))
+            }
+        }
+    }
+}
+
+impl ExpertTensorLayout {
+    fn detect(shard_map: &HashMap<String, String>, model_dir: &Path) -> Result<Self> {
+        if !shard_map.is_empty() {
+            return Self::detect_from_names(shard_map.keys().map(String::as_str));
+        }
+
+        let single = model_dir.join("model.safetensors");
+        if !single.exists() {
+            bail!("Could not detect expert tensor layout: no safetensors index or single-file model");
+        }
+
+        let data = fs::read(&single)
+            .with_context(|| format!("Failed to read {}", single.display()))?;
+        let tensors = safetensors::SafeTensors::deserialize(&data)
+            .map_err(|e| anyhow::anyhow!("safetensors parse error: {e}"))?;
+        Self::detect_from_names(tensors.names())
+    }
+
+    fn detect_from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<Self> {
+        let names: Vec<&str> = names.into_iter().collect();
+
+        for prefix in ["model.language_model.layers", "model.layers"] {
+            if names
+                .iter()
+                .any(|name| name.starts_with(prefix) && name.contains(".mlp.experts.gate_up_proj"))
+            {
+                return Ok(Self::FusedGateUp {
+                    layer_prefix: prefix.to_string(),
+                });
+            }
+        }
+
+        for prefix in ["model.language_model.layers", "model.layers"] {
+            if names.iter().any(|name| {
+                name.starts_with(prefix)
+                    && name.contains(".mlp.experts.")
+                    && name.ends_with(".gate_proj.weight")
+            }) {
+                return Ok(Self::SplitPerExpert {
+                    layer_prefix: prefix.to_string(),
+                });
+            }
+        }
+
+        bail!("Could not detect expert tensor layout from checkpoint tensor names")
+    }
+
+    fn describe(&self) -> &'static str {
+        match self {
+            Self::SplitPerExpert { .. } => "split-per-expert",
+            Self::FusedGateUp { .. } => "fused-gate-up",
+        }
+    }
+
+    fn resolve_source(
+        &self,
+        layer_idx: usize,
+        expert_idx: usize,
+        projection: ProjectionKind,
+        field: ComponentField,
+        hidden_dim: usize,
+        intermediate_dim: usize,
+    ) -> TensorSource {
+        match self {
+            Self::SplitPerExpert { layer_prefix } => TensorSource {
+                key: format!(
+                    "{layer_prefix}.{layer_idx}.mlp.experts.{expert_idx}.{}.{}",
+                    projection.split_name(),
+                    field.suffix()
+                ),
+                slice: None,
+            },
+            Self::FusedGateUp { layer_prefix } => {
+                let base = format!("{layer_prefix}.{layer_idx}.mlp.experts");
+                match projection {
+                    ProjectionKind::Gate => TensorSource {
+                        key: format!("{base}.gate_up_proj"),
+                        slice: Some(TensorSliceSpec {
+                            expert_idx,
+                            row_offset: 0,
+                            row_count: intermediate_dim,
+                        }),
+                    },
+                    ProjectionKind::Up => TensorSource {
+                        key: format!("{base}.gate_up_proj"),
+                        slice: Some(TensorSliceSpec {
+                            expert_idx,
+                            row_offset: intermediate_dim,
+                            row_count: intermediate_dim,
+                        }),
+                    },
+                    ProjectionKind::Down => TensorSource {
+                        key: format!("{base}.down_proj"),
+                        slice: Some(TensorSliceSpec {
+                            expert_idx,
+                            row_offset: 0,
+                            row_count: hidden_dim,
+                        }),
+                    },
+                }
+            }
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
@@ -160,36 +439,53 @@ pub fn pack_experts(model_dir: &Path, output_dir: &Path, bits: Option<u8>) -> Re
         HashMap::new()
     };
 
+    let tensor_layout = ExpertTensorLayout::detect(&shard_map, model_dir)?;
+
     // ── 3. Detect whether the model is pre-quantized ──────────────────────────
     //
     // A pre-quantized model has `.scales` and `.biases` tensors alongside
     // `.weight`.  We detect this by looking for any expert scales key in the
     // index, or by peeking inside the single safetensors file.
     let is_prequantized = detect_prequantized(&shard_map, model_dir)?;
+    if is_prequantized && matches!(tensor_layout, ExpertTensorLayout::FusedGateUp { .. }) {
+        bail!(
+            "Pre-quantized fused expert tensors are not supported yet; \
+             repack from full-precision weights first"
+        );
+    }
     eprintln!("  Pre-quantized:   {}", is_prequantized);
+    eprintln!("  Tensor layout:   {}", tensor_layout.describe());
 
     // ── 4. Shard byte cache keyed by shard filename ───────────────────────────
     //
-    // Shard bytes are loaded on demand and retained for the lifetime of the
-    // packing run so that later layers sharing a shard file do not re-read it.
-    // The parsed `SafeTensors` view is zero-copy into these bytes.
-    let mut shard_byte_cache: HashMap<String, Vec<u8>> = HashMap::new();
+    // Shards are opened lazily and only the requested tensor byte ranges are
+    // read, so very large checkpoints do not require fully resident copies in
+    // RAM while still avoiding repeated header parsing.
+    let mut shard_readers: HashMap<String, ShardReader> = HashMap::new();
 
     // ── 5. Pack each MoE layer ────────────────────────────────────────────────
 
     let record = &layout.record;
 
     // Component list in binary layout order (matches ExpertRecord::compute).
-    let components: &[(&str, &ExpertComponent)] = &[
-        ("gate_proj.weight", &record.gate_weight),
-        ("gate_proj.scales", &record.gate_scales),
-        ("gate_proj.biases", &record.gate_biases),
-        ("up_proj.weight", &record.up_weight),
-        ("up_proj.scales", &record.up_scales),
-        ("up_proj.biases", &record.up_biases),
-        ("down_proj.weight", &record.down_weight),
-        ("down_proj.scales", &record.down_scales),
-        ("down_proj.biases", &record.down_biases),
+    let components: &[(ProjectionKind, ComponentField, &ExpertComponent)] = &[
+        (ProjectionKind::Gate, ComponentField::Weight, &record.gate_weight),
+        (ProjectionKind::Gate, ComponentField::Scales, &record.gate_scales),
+        (ProjectionKind::Gate, ComponentField::Biases, &record.gate_biases),
+        (ProjectionKind::Up, ComponentField::Weight, &record.up_weight),
+        (ProjectionKind::Up, ComponentField::Scales, &record.up_scales),
+        (ProjectionKind::Up, ComponentField::Biases, &record.up_biases),
+        (ProjectionKind::Down, ComponentField::Weight, &record.down_weight),
+        (
+            ProjectionKind::Down,
+            ComponentField::Scales,
+            &record.down_scales,
+        ),
+        (
+            ProjectionKind::Down,
+            ComponentField::Biases,
+            &record.down_biases,
+        ),
     ];
 
     let total = moe_layers.len();
@@ -215,16 +511,18 @@ pub fn pack_experts(model_dir: &Path, output_dir: &Path, bits: Option<u8>) -> Re
         let needed_shards = collect_needed_shards(
             layer_idx,
             num_experts,
+            &tensor_layout,
+            hidden_dim,
+            intermediate,
             is_prequantized,
             &shard_map,
             model_dir,
         );
         for shard_name in &needed_shards {
-            if !shard_byte_cache.contains_key(shard_name) {
+            if !shard_readers.contains_key(shard_name) {
                 let shard_path = model_dir.join(shard_name);
-                let data = fs::read(&shard_path)
-                    .with_context(|| format!("Failed to read {}", shard_path.display()))?;
-                shard_byte_cache.insert(shard_name.clone(), data);
+                let reader = ShardReader::open(&shard_path)?;
+                shard_readers.insert(shard_name.clone(), reader);
             }
         }
 
@@ -234,23 +532,29 @@ pub fn pack_experts(model_dir: &Path, output_dir: &Path, bits: Option<u8>) -> Re
         for expert_idx in 0..num_experts {
             let expert_base = layout.expert_offset(expert_idx);
 
-            for (suffix, component) in components {
-                let key = format!("model.layers.{layer_idx}.mlp.experts.{expert_idx}.{suffix}");
+            for (projection, field, component) in components {
+                let source = tensor_layout.resolve_source(
+                    layer_idx,
+                    expert_idx,
+                    *projection,
+                    *field,
+                    hidden_dim,
+                    intermediate,
+                );
                 let file_offset = (expert_base + component.offset) as u64;
-
-                let shard_name = resolve_shard(&key, &shard_map, model_dir);
+                let shard_name = resolve_shard(&source.key, &shard_map, model_dir);
 
                 match shard_name {
                     None => {
                         write_zeros(&mut layer_file, file_offset, component.size)?;
                     }
                     Some(ref sn) => {
-                        if let Some(bytes) = shard_byte_cache.get(sn) {
+                        if let Some(reader) = shard_readers.get_mut(sn) {
                             write_component(
                                 &mut layer_file,
-                                bytes,
-                                &key,
-                                suffix,
+                                reader,
+                                &source,
+                                *field,
                                 component,
                                 file_offset,
                                 is_prequantized,
@@ -303,48 +607,26 @@ pub fn pack_experts(model_dir: &Path, output_dir: &Path, bits: Option<u8>) -> Re
 #[allow(clippy::too_many_arguments)]
 fn write_component(
     file: &mut fs::File,
-    shard_bytes: &[u8],
-    key: &str,
-    suffix: &str,
+    shard_reader: &mut ShardReader,
+    source: &TensorSource,
+    field: ComponentField,
     component: &ExpertComponent,
     file_offset: u64,
     is_prequantized: bool,
     bits: PackedBits,
     group_size: usize,
 ) -> Result<()> {
-    let tensors = safetensors::SafeTensors::deserialize(shard_bytes)
-        .map_err(|e| anyhow::anyhow!("safetensors parse error for `{key}`: {e}"))?;
-
     if is_prequantized {
-        // Pre-quantized path: copy the raw tensor bytes verbatim.
-        match tensors.tensor(key) {
-            Ok(tv) => {
-                let data = tv.data();
-                if data.len() != component.size {
-                    bail!(
-                        "Size mismatch for `{key}`: layout expects {} bytes, \
-                         tensor has {} bytes",
-                        component.size,
-                        data.len()
-                    );
-                }
-                file.seek(std::io::SeekFrom::Start(file_offset))?;
-                file.write_all(data)?;
-            }
-            Err(_) => {
-                // Tensor absent — sparse checkpoint or optional field.
-                write_zeros(file, file_offset, component.size)?;
-            }
-        }
+        copy_prequantized_component(file, shard_reader, source, component, file_offset)?;
     } else {
         // Full-precision path: quantize weight tensors on the fly.
         // The weight pass also writes scales and biases; the subsequent
         // `.scales` / `.biases` suffix visits are no-ops.
-        if suffix.ends_with(".weight") {
-            quantize_and_write(
+        if field == ComponentField::Weight {
+            quantize_and_write_source(
                 file,
-                &tensors,
-                key,
+                shard_reader,
+                source,
                 component,
                 file_offset,
                 bits,
@@ -372,9 +654,68 @@ fn write_component(
 ///
 /// Scales and biases are stored as bf16 at the offsets immediately following the
 /// weight in the binary layout (as computed by `ExpertRecord::compute`).
-fn quantize_and_write(
+fn copy_prequantized_component(
     file: &mut fs::File,
-    tensors: &safetensors::SafeTensors<'_>,
+    shard_reader: &mut ShardReader,
+    source: &TensorSource,
+    component: &ExpertComponent,
+    file_offset: u64,
+) -> Result<()> {
+    if source.slice.is_some() {
+        bail!(
+            "Pre-quantized fused expert slices are not supported for `{}`",
+            source.key
+        );
+    }
+
+    match shard_reader.read_matrix_data(source)? {
+        Some(view) => {
+            let data = view.data;
+            if data.len() != component.size {
+                bail!(
+                    "Size mismatch for `{}`: layout expects {} bytes, tensor has {} bytes",
+                    source.key,
+                    component.size,
+                    data.len()
+                );
+            }
+            file.seek(std::io::SeekFrom::Start(file_offset))?;
+            file.write_all(&data)?;
+        }
+        None => {
+            write_zeros(file, file_offset, component.size)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn quantize_and_write_source(
+    file: &mut fs::File,
+    shard_reader: &mut ShardReader,
+    source: &TensorSource,
+    weight_component: &ExpertComponent,
+    weight_file_offset: u64,
+    bits: PackedBits,
+    group_size: usize,
+) -> Result<()> {
+    let view = shard_reader
+        .read_matrix_data(source)?
+        .ok_or_else(|| anyhow::anyhow!("Tensor not found: `{}`", source.key))?;
+    quantize_and_write_matrix(
+        file,
+        &view,
+        &source.key,
+        weight_component,
+        weight_file_offset,
+        bits,
+        group_size,
+    )
+}
+
+fn quantize_and_write_matrix(
+    file: &mut fs::File,
+    view: &MatrixDataView,
     weight_key: &str,
     weight_component: &ExpertComponent,
     weight_file_offset: u64,
@@ -383,20 +724,12 @@ fn quantize_and_write(
 ) -> Result<()> {
     use safetensors::Dtype;
 
-    let tv = tensors
-        .tensor(weight_key)
-        .map_err(|_| anyhow::anyhow!("Tensor not found: `{weight_key}`"))?;
-
-    let shape = tv.shape();
-    if shape.len() != 2 {
-        bail!("Expected 2-D weight tensor for `{weight_key}`, got shape {shape:?}");
-    }
-    let out_dim = shape[0];
-    let in_dim = shape[1];
-    let raw = tv.data();
+    let out_dim = view.rows;
+    let in_dim = view.cols;
+    let raw = &view.data;
 
     // Decode the raw bytes to f32.
-    let weights_f32: Vec<f32> = match tv.dtype() {
+    let weights_f32: Vec<f32> = match view.dtype {
         Dtype::F32 => raw
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -417,7 +750,7 @@ fn quantize_and_write(
     };
 
     let pf = bits.pack_factor(); // values packed per uint32
-    let bit_width = bits as u32;
+    let bit_width = bits.bit_width();
     let max_q = ((1u32 << bit_width) - 1) as f32;
 
     // Derived dimensions.
@@ -520,41 +853,59 @@ fn quantize_and_write(
 fn collect_needed_shards(
     layer_idx: usize,
     num_experts: usize,
+    tensor_layout: &ExpertTensorLayout,
+    hidden_dim: usize,
+    intermediate_dim: usize,
     is_prequantized: bool,
     shard_map: &HashMap<String, String>,
     model_dir: &Path,
 ) -> Vec<String> {
-    let projections = ["gate_proj", "up_proj", "down_proj"];
-    let mut suffixes = vec!["weight"];
+    let projections = [ProjectionKind::Gate, ProjectionKind::Up, ProjectionKind::Down];
+    let mut fields = vec![ComponentField::Weight];
     if is_prequantized {
-        suffixes.push("scales");
-        suffixes.push("biases");
+        fields.push(ComponentField::Scales);
+        fields.push(ComponentField::Biases);
     }
 
     let mut shards: Vec<String> = Vec::new();
-    // Always probe expert 0.
-    for proj in &projections {
-        for sfx in &suffixes {
-            let key = format!("model.layers.{layer_idx}.mlp.experts.0.{proj}.{sfx}");
-            if let Some(s) = resolve_shard(&key, shard_map, model_dir) {
-                if !shards.contains(&s) {
-                    shards.push(s);
-                }
-            }
-        }
-    }
-    // Also probe expert 1 to catch shard splits in very large models.
-    if num_experts > 1 {
-        for proj in &projections {
-            let key = format!("model.layers.{layer_idx}.mlp.experts.1.{proj}.weight");
-            if let Some(s) = resolve_shard(&key, shard_map, model_dir) {
-                if !shards.contains(&s) {
-                    shards.push(s);
+    let probe_experts: &[usize] =
+        if matches!(tensor_layout, ExpertTensorLayout::SplitPerExpert { .. }) && num_experts > 1 {
+            &[0, 1]
+        } else {
+            &[0]
+        };
+
+    for &expert_idx in probe_experts {
+        for projection in &projections {
+            for field in &fields {
+                let source = tensor_layout.resolve_source(
+                    layer_idx,
+                    expert_idx,
+                    *projection,
+                    *field,
+                    hidden_dim,
+                    intermediate_dim,
+                );
+                if let Some(s) = resolve_shard(&source.key, shard_map, model_dir) {
+                    if !shards.contains(&s) {
+                        shards.push(s);
+                    }
                 }
             }
         }
     }
     shards
+}
+
+fn dtype_nbytes(dtype: safetensors::Dtype) -> Result<usize> {
+    use safetensors::Dtype;
+
+    match dtype {
+        Dtype::F32 | Dtype::U32 => Ok(4),
+        Dtype::BF16 | Dtype::F16 => Ok(2),
+        Dtype::U8 => Ok(1),
+        other => bail!("Unsupported dtype {other:?} for expert packing"),
+    }
 }
 
 /// Resolve the shard filename that contains tensor `key`.
@@ -857,6 +1208,21 @@ mod tests {
         assert_eq!((word >> 28) & 0xF, 15);
     }
 
+    #[test]
+    fn test_detect_fused_vlm_qwen35_layout() {
+        let layout = ExpertTensorLayout::detect_from_names([
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            "model.language_model.layers.0.mlp.experts.down_proj",
+        ])
+        .unwrap();
+        assert_eq!(
+            layout,
+            ExpertTensorLayout::FusedGateUp {
+                layer_prefix: "model.language_model.layers".to_string(),
+            }
+        );
+    }
+
     /// End-to-end smoke test: build a synthetic pre-quantized safetensors model
     /// and verify pack_experts produces correct layer files.
     #[test]
@@ -983,6 +1349,151 @@ mod tests {
             sample, [0u8; 4],
             "expert 0 gate_weight bytes should be non-zero"
         );
+    }
+
+    #[test]
+    fn test_pack_experts_fused_qwen35_matches_split_layout() {
+        use std::collections::HashMap;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let split_dir = tmp.path().join("split_model");
+        let fused_dir = tmp.path().join("fused_model");
+        let split_out = tmp.path().join("split_out");
+        let fused_out = tmp.path().join("fused_out");
+        fs::create_dir_all(&split_dir).unwrap();
+        fs::create_dir_all(&fused_dir).unwrap();
+
+        let hidden = 16usize;
+        let inter = 8usize;
+        let gs = 8usize;
+        let num_experts = 2usize;
+
+        let split_config = serde_json::json!({
+            "model_type": "qwen3_moe",
+            "num_hidden_layers": 1,
+            "hidden_size": hidden,
+            "num_experts": num_experts,
+            "moe_intermediate_size": inter,
+            "decoder_sparse_step": 1,
+            "quantization_config": { "group_size": gs },
+        });
+        fs::write(
+            split_dir.join("config.json"),
+            serde_json::to_string(&split_config).unwrap(),
+        )
+        .unwrap();
+
+        let fused_config = serde_json::json!({
+            "model_type": "qwen3_5_moe",
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "num_hidden_layers": 1,
+                "hidden_size": hidden,
+                "num_experts": num_experts,
+                "moe_intermediate_size": inter,
+                "decoder_sparse_step": 1,
+                "quantization_config": { "group_size": gs },
+            }
+        });
+        fs::write(
+            fused_dir.join("config.json"),
+            serde_json::to_string(&fused_config).unwrap(),
+        )
+        .unwrap();
+
+        let mut split_tensors: HashMap<String, (Vec<usize>, safetensors::Dtype, Vec<u8>)> =
+            HashMap::new();
+        let mut fused_tensors: HashMap<String, (Vec<usize>, safetensors::Dtype, Vec<u8>)> =
+            HashMap::new();
+
+        let mut fused_gate_up = vec![0f32; num_experts * inter * 2 * hidden];
+        let mut fused_down = vec![0f32; num_experts * hidden * inter];
+
+        for expert_idx in 0..num_experts {
+            let gate = make_weight_matrix(inter, hidden, 0.1 + expert_idx as f32);
+            let up = make_weight_matrix(inter, hidden, 1.1 + expert_idx as f32);
+            let down = make_weight_matrix(hidden, inter, 2.1 + expert_idx as f32);
+
+            split_tensors.insert(
+                format!("model.layers.0.mlp.experts.{expert_idx}.gate_proj.weight"),
+                (vec![inter, hidden], safetensors::Dtype::BF16, bf16_bytes(&gate)),
+            );
+            split_tensors.insert(
+                format!("model.layers.0.mlp.experts.{expert_idx}.up_proj.weight"),
+                (vec![inter, hidden], safetensors::Dtype::BF16, bf16_bytes(&up)),
+            );
+            split_tensors.insert(
+                format!("model.layers.0.mlp.experts.{expert_idx}.down_proj.weight"),
+                (vec![hidden, inter], safetensors::Dtype::BF16, bf16_bytes(&down)),
+            );
+
+            let gate_up_base = expert_idx * inter * 2 * hidden;
+            let gate_rows = inter * hidden;
+            fused_gate_up[gate_up_base..gate_up_base + gate_rows].copy_from_slice(&gate);
+            fused_gate_up[gate_up_base + gate_rows..gate_up_base + gate_rows * 2]
+                .copy_from_slice(&up);
+
+            let down_base = expert_idx * hidden * inter;
+            fused_down[down_base..down_base + hidden * inter].copy_from_slice(&down);
+        }
+
+        fused_tensors.insert(
+            "model.language_model.layers.0.mlp.experts.gate_up_proj".to_string(),
+            (
+                vec![num_experts, inter * 2, hidden],
+                safetensors::Dtype::BF16,
+                bf16_bytes(&fused_gate_up),
+            ),
+        );
+        fused_tensors.insert(
+            "model.language_model.layers.0.mlp.experts.down_proj".to_string(),
+            (
+                vec![num_experts, hidden, inter],
+                safetensors::Dtype::BF16,
+                bf16_bytes(&fused_down),
+            ),
+        );
+
+        fs::write(
+            split_dir.join("model.safetensors"),
+            build_safetensors_bytes(&split_tensors),
+        )
+        .unwrap();
+        fs::write(
+            fused_dir.join("model.safetensors"),
+            build_safetensors_bytes(&fused_tensors),
+        )
+        .unwrap();
+
+        pack_experts(&split_dir, &split_out, Some(4)).unwrap();
+        pack_experts(&fused_dir, &fused_out, Some(4)).unwrap();
+
+        let split_layout = ExpertPackLayout::load(&split_out).unwrap();
+        let fused_layout = ExpertPackLayout::load(&fused_out).unwrap();
+        assert_eq!(split_layout.expert_size, fused_layout.expert_size);
+        assert_eq!(split_layout.record.gate_weight.shape, fused_layout.record.gate_weight.shape);
+
+        let split_layer = fs::read(split_out.join("layer_00.bin")).unwrap();
+        let fused_layer = fs::read(fused_out.join("layer_00.bin")).unwrap();
+        assert_eq!(split_layer, fused_layer);
+    }
+
+    fn make_weight_matrix(rows: usize, cols: usize, seed: f32) -> Vec<f32> {
+        let mut out = Vec::with_capacity(rows * cols);
+        for row in 0..rows {
+            for col in 0..cols {
+                out.push(seed + row as f32 * 0.01 + col as f32 * 0.001);
+            }
+        }
+        out
+    }
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|v| f32_to_bf16(*v).to_le_bytes())
+            .collect()
     }
 
     /// Build a minimal valid safetensors byte stream.
