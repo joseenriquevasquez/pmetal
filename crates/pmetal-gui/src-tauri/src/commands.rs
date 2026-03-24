@@ -1210,6 +1210,7 @@ pub async fn start_training(
                 gradient_checkpointing_layers: config.gradient_checkpointing_layers.unwrap_or(4) as usize,
                 cut_cross_entropy: false,
                 ane: config.method == "ane",
+                no_adaptive_lr: false,
                 loss_scale: 1.0,
                 distributed: None,
             },
