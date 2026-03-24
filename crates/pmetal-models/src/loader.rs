@@ -25,7 +25,9 @@ use crate::architectures::nemotron_h::{
 use crate::architectures::phi::PhiForCausalLM;
 use crate::architectures::qwen2::Qwen2ForCausalLM;
 use crate::architectures::qwen3::Qwen3ForCausalLM;
-use crate::architectures::qwen3_next::{Qwen3NextConfig, Qwen3NextForCausalLM, sanitize_weights};
+use crate::architectures::qwen3_next::{
+    Qwen3NextConfig, Qwen3NextForCausalLM, Qwen3NextSanitizeOptions, sanitize_weights,
+};
 use crate::architectures::t5::T5EncoderModel;
 use crate::architectures::vae::FluxVAE;
 
@@ -58,6 +60,11 @@ impl From<mlx_rs::error::Exception> for LoadError {
 }
 
 const PARAM_EVAL_BATCH_SIZE: usize = 128;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Qwen3NextLoadOptions {
+    pub skip_routed_experts: bool,
+}
 
 fn assign_loaded_weights<M: ModuleParameters>(model: &mut M, loaded: HashMap<String, Array>) {
     let mut params = model.parameters_mut().flatten();
@@ -750,6 +757,33 @@ pub struct WeightIndex {
     pub weight_map: HashMap<String, String>,
 }
 
+fn is_non_text_auxiliary_weight(key: &str) -> bool {
+    key.starts_with("model.visual.")
+        || key.starts_with("visual.")
+        || key.starts_with("model.audio.")
+        || key.starts_with("model.multi_modal_projector.")
+}
+
+fn is_qwen3_next_raw_routed_expert_weight(key: &str) -> bool {
+    key.contains(".mlp.experts.")
+}
+
+fn should_keep_qwen3_next_raw_weight(key: &str, options: Qwen3NextLoadOptions) -> bool {
+    !(is_non_text_auxiliary_weight(key)
+        || key.contains("mtp.")
+        || options.skip_routed_experts && is_qwen3_next_raw_routed_expert_weight(key))
+}
+
+fn is_qwen3_next_routed_expert_param_key(key: &str) -> bool {
+    key.ends_with(".mlp.switch_mlp_gate_proj")
+        || key.ends_with(".mlp.switch_mlp_up_proj")
+        || key.ends_with(".mlp.switch_mlp_down_proj")
+}
+
+fn is_qwen3_next_allowed_missing_param(key: &str, options: Qwen3NextLoadOptions) -> bool {
+    options.skip_routed_experts && is_qwen3_next_routed_expert_param_key(key)
+}
+
 /// Validate that a shard path does not escape the model directory (path traversal protection).
 ///
 /// HuggingFace cache uses symlinks: snapshot files point to `../../blobs/`.
@@ -850,6 +884,56 @@ pub fn load_generic_weights<M: ModuleParameters>(
     Ok(())
 }
 
+fn load_weights_filtered<F>(
+    model_dir: impl AsRef<Path>,
+    mut keep_key: F,
+) -> Result<HashMap<String, Array>, LoadError>
+where
+    F: FnMut(&str) -> bool,
+{
+    let model_dir = model_dir.as_ref();
+    let mut all_weights = HashMap::new();
+    let single_file = model_dir.join("model.safetensors");
+    if single_file.exists() {
+        let weights =
+            Array::load_safetensors(&single_file).map_err(|e| LoadError::Mlx(e.to_string()))?;
+        return Ok(weights
+            .into_iter()
+            .filter(|(key, _)| keep_key(key))
+            .collect());
+    }
+
+    let index_path = model_dir.join("model.safetensors.index.json");
+    if !index_path.exists() {
+        return Err(LoadError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No weights found",
+        )));
+    }
+
+    let index_content = std::fs::read_to_string(&index_path)?;
+    let index: WeightIndex = serde_json::from_str(&index_content)?;
+    let shard_files: HashSet<&String> = index
+        .weight_map
+        .iter()
+        .filter(|(key, _)| keep_key(key))
+        .map(|(_, shard_file)| shard_file)
+        .collect();
+
+    for shard_file in shard_files {
+        let shard_path = validate_shard_path(model_dir, shard_file)?;
+        let shard_weights =
+            Array::load_safetensors(&shard_path).map_err(|e| LoadError::Mlx(e.to_string()))?;
+        all_weights.extend(
+            shard_weights
+                .into_iter()
+                .filter(|(key, _)| keep_key(key)),
+        );
+    }
+
+    Ok(all_weights)
+}
+
 pub fn load_nemotron_weights(
     model: &mut NemotronHForCausalLM,
     model_dir: impl AsRef<Path>,
@@ -874,27 +958,37 @@ pub fn load_qwen3_next_weights(
     model_dir: impl AsRef<Path>,
     config: &Qwen3NextConfig,
 ) -> Result<(), LoadError> {
-    let mut weights = load_weights(model_dir)?;
-    sanitize_weights(&mut weights, config)
+    load_qwen3_next_weights_with_options(model, model_dir, config, Qwen3NextLoadOptions::default())
+}
+
+pub fn load_qwen3_next_weights_with_options(
+    model: &mut Qwen3NextForCausalLM,
+    model_dir: impl AsRef<Path>,
+    config: &Qwen3NextConfig,
+    options: Qwen3NextLoadOptions,
+) -> Result<(), LoadError> {
+    let mut weights = load_weights_filtered(model_dir, |key| {
+        should_keep_qwen3_next_raw_weight(key, options)
+    })?;
+    sanitize_weights(
+        &mut weights,
+        config,
+        Qwen3NextSanitizeOptions {
+            skip_routed_experts: options.skip_routed_experts,
+        },
+    )
         .map_err(|e| LoadError::SafeTensors(format!("{:?}", e)))?;
 
     // Apply sanitized weights to model parameters
     let mut params = model.parameters_mut().flatten();
     let expected_keys: HashSet<String> = params.keys().map(|key| key.to_string()).collect();
-    let loaded_keys: HashSet<String> = weights.keys().cloned().collect();
+    let mut loaded_param_keys = HashSet::new();
     let mut matched = 0usize;
     let mut unmatched = Vec::new();
     for (key, value) in &weights {
-        // Skip non-text weights (vision encoder, audio encoder, etc.)
-        if key.starts_with("model.visual.")
-            || key.starts_with("visual.")
-            || key.starts_with("model.audio.")
-            || key.starts_with("model.multi_modal_projector.")
-        {
-            continue;
-        }
         if let Some(param) = params.get_mut(&**key) {
             **param = value.clone();
+            loaded_param_keys.insert(key.clone());
             matched += 1;
         } else {
             unmatched.push(key.clone());
@@ -909,7 +1003,8 @@ pub fn load_qwen3_next_weights(
     }
 
     let missing: Vec<String> = expected_keys
-        .difference(&loaded_keys)
+        .difference(&loaded_param_keys)
+        .filter(|key| !is_qwen3_next_allowed_missing_param(key, options))
         .take(20)
         .cloned()
         .collect();
@@ -926,31 +1021,7 @@ pub fn load_qwen3_next_weights(
 
 /// Load all safetensor weights from a model directory.
 pub fn load_weights(model_dir: impl AsRef<Path>) -> Result<HashMap<String, Array>, LoadError> {
-    let model_dir = model_dir.as_ref();
-    let mut all_weights = HashMap::new();
-    let single_file = model_dir.join("model.safetensors");
-    if single_file.exists() {
-        let weights =
-            Array::load_safetensors(&single_file).map_err(|e| LoadError::Mlx(e.to_string()))?;
-        return Ok(weights);
-    }
-    let index_path = model_dir.join("model.safetensors.index.json");
-    if !index_path.exists() {
-        return Err(LoadError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "No weights found",
-        )));
-    }
-    let index_content = std::fs::read_to_string(&index_path)?;
-    let index: WeightIndex = serde_json::from_str(&index_content)?;
-    let shard_files: HashSet<&String> = index.weight_map.values().collect();
-    for shard_file in shard_files {
-        let shard_path = validate_shard_path(model_dir, shard_file)?;
-        let shard_weights =
-            Array::load_safetensors(&shard_path).map_err(|e| LoadError::Mlx(e.to_string()))?;
-        all_weights.extend(shard_weights);
-    }
-    Ok(all_weights)
+    load_weights_filtered(model_dir, |_| true)
 }
 
 pub fn load_llama_weights(
@@ -1483,4 +1554,93 @@ fn remap_bert_weight_name(hf_name: &str) -> String {
 
     // 5. Prepend `model.` to match `BertForEmbedding { model: BertModel }`.
     format!("model.{name}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn write_safetensors(
+        path: &Path,
+        weights: &HashMap<String, Array>,
+    ) -> Result<(), mlx_rs::error::IoError> {
+        Array::save_safetensors(
+            weights.iter().map(|(key, value)| (key.as_str(), value)),
+            None,
+            path,
+        )
+    }
+
+    #[test]
+    fn qwen3_next_raw_weight_filter_skips_auxiliary_and_routed_expert_keys() {
+        let options = Qwen3NextLoadOptions {
+            skip_routed_experts: true,
+        };
+
+        assert!(should_keep_qwen3_next_raw_weight(
+            "model.language_model.embed_tokens.weight",
+            options
+        ));
+        assert!(!should_keep_qwen3_next_raw_weight(
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            options
+        ));
+        assert!(!should_keep_qwen3_next_raw_weight("model.visual.patch_embed.weight", options));
+        assert!(!should_keep_qwen3_next_raw_weight("mtp.fc.weight", options));
+    }
+
+    #[test]
+    fn qwen3_next_missing_allowlist_only_covers_routed_expert_params() {
+        let options = Qwen3NextLoadOptions {
+            skip_routed_experts: true,
+        };
+
+        assert!(is_qwen3_next_allowed_missing_param(
+            "model.layers.0.mlp.switch_mlp_gate_proj",
+            options
+        ));
+        assert!(!is_qwen3_next_allowed_missing_param(
+            "model.layers.0.linear_attn.in_proj_qkv.weight",
+            options
+        ));
+        assert!(!is_qwen3_next_allowed_missing_param(
+            "model.layers.0.mlp.switch_mlp_gate_proj",
+            Qwen3NextLoadOptions::default()
+        ));
+    }
+
+    #[test]
+    fn load_weights_filtered_reads_only_needed_shards() {
+        let temp = tempdir().unwrap();
+        let model_dir = temp.path();
+        let text_shard = model_dir.join("text.safetensors");
+        let broken_shard = model_dir.join("broken.safetensors");
+
+        let mut text_weights = HashMap::new();
+        text_weights.insert(
+            "model.embed_tokens.weight".to_string(),
+            Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]),
+        );
+        write_safetensors(&text_shard, &text_weights).unwrap();
+        std::fs::write(&broken_shard, b"not safetensors").unwrap();
+
+        let index = serde_json::json!({
+            "metadata": {},
+            "weight_map": {
+                "model.embed_tokens.weight": "text.safetensors",
+                "model.language_model.layers.0.mlp.experts.gate_up_proj": "broken.safetensors"
+            }
+        });
+        std::fs::write(
+            model_dir.join("model.safetensors.index.json"),
+            serde_json::to_string_pretty(&index).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_weights_filtered(model_dir, |key| !key.contains(".mlp.experts.")).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains_key("model.embed_tokens.weight"));
+    }
 }

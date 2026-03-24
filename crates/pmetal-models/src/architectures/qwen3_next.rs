@@ -10,8 +10,11 @@
 //! Reference: `mlx-lm/models/qwen3_next.py` (Apple, 2025).
 
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use mlx_rs::{
     Array,
@@ -38,6 +41,7 @@ use pmetal_mlx::{
         fused_moe::moe_combine_mlx,
         fused_sdpa,
         gated_delta::gated_delta_update,
+        metal_swiglu::fused_swiglu_forward,
         rope::{RopeScaling, apply_rope},
     },
 };
@@ -58,6 +62,7 @@ pub struct Qwen3NextConfig {
     /// Hidden dimension.
     pub hidden_size: i32,
     /// Intermediate size for dense MLP layers.
+    #[serde(default)]
     pub intermediate_size: i32,
     /// Number of hidden layers.
     pub num_hidden_layers: i32,
@@ -148,6 +153,17 @@ pub struct Qwen3NextConfig {
     pub layer_types: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen3NextRoutedExpertMode {
+    Resident,
+    Placeholder,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Qwen3NextSanitizeOptions {
+    pub skip_routed_experts: bool,
+}
+
 /// Nested RoPE parameters from HuggingFace config format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RopeParameters {
@@ -225,6 +241,12 @@ impl Qwen3NextConfig {
                 }
             }
         }
+
+        if self.intermediate_size <= 0 {
+            self.intermediate_size = self
+                .shared_expert_intermediate_size
+                .max(self.moe_intermediate_size);
+        }
     }
 
     /// Get head dimension.
@@ -254,7 +276,8 @@ impl Qwen3NextConfig {
         if self.mlp_only_layers.contains(&idx) {
             return false;
         }
-        self.num_experts > 0 && ((idx + 1) % self.decoder_sparse_step == 0)
+        let sparse_step = self.decoder_sparse_step.max(1);
+        self.num_experts > 0 && ((idx + 1) % sparse_step == 0)
     }
 
     /// RoPE dimensions for partial rotary.
@@ -340,6 +363,86 @@ impl Default for Qwen3NextConfig {
 }
 
 // ============================================================================
+// Profiling
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Qwen3NextProfileSection {
+    pub name: String,
+    pub elapsed_us: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Qwen3NextLayerProfile {
+    pub layer_idx: usize,
+    pub layer_kind: String,
+    pub sections: Vec<Qwen3NextProfileSection>,
+    pub total_us: u64,
+}
+
+impl Qwen3NextLayerProfile {
+    fn new(layer_idx: usize, is_linear: bool) -> Self {
+        Self {
+            layer_idx,
+            layer_kind: if is_linear {
+                "linear_attention".to_string()
+            } else {
+                "full_attention".to_string()
+            },
+            sections: Vec::new(),
+            total_us: 0,
+        }
+    }
+
+    fn push_section(&mut self, name: &str, start: Instant) {
+        self.sections.push(Qwen3NextProfileSection {
+            name: name.to_string(),
+            elapsed_us: start.elapsed().as_micros() as u64,
+        });
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Qwen3NextForwardProfile {
+    pub phase: String,
+    pub input_shape: Vec<i32>,
+    pub embedding_us: u64,
+    pub layers: Vec<Qwen3NextLayerProfile>,
+    pub final_norm_us: u64,
+    pub lm_head_us: u64,
+    pub total_us: u64,
+}
+
+impl Qwen3NextForwardProfile {
+    fn new(phase: impl Into<String>, input_shape: Vec<i32>) -> Self {
+        Self {
+            phase: phase.into(),
+            input_shape,
+            embedding_us: 0,
+            layers: Vec::new(),
+            final_norm_us: 0,
+            lm_head_us: 0,
+            total_us: 0,
+        }
+    }
+}
+
+fn profile_array_section<F>(
+    layer_profile: &mut Qwen3NextLayerProfile,
+    name: &str,
+    op: F,
+) -> Result<Array, Exception>
+where
+    F: FnOnce() -> Result<Array, Exception>,
+{
+    let start = Instant::now();
+    let output = op()?;
+    output.eval()?;
+    layer_profile.push_section(name, start);
+    Ok(output)
+}
+
+// ============================================================================
 // Gated RMSNorm (with optional silu gate)
 // ============================================================================
 
@@ -408,9 +511,13 @@ impl Qwen3NextMLP {
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&nn::silu(&gate)?.multiply(&up)?)
+        fused_swiglu_forward(
+            x,
+            self.gate_proj.weight.as_ref(),
+            self.up_proj.weight.as_ref(),
+            self.down_proj.weight.as_ref(),
+        )
+        .map_err(|e| Exception::custom(e.to_string()))
     }
 }
 
@@ -502,6 +609,7 @@ impl Qwen3NextAttention {
         let shape = x.shape();
         let b = shape[0];
         let l = shape[1];
+        let cache_active = cache.is_some();
 
         // Project Q (with gate) and K, V
         let q_proj_out = self.q_proj.forward(x)?;
@@ -558,11 +666,7 @@ impl Qwen3NextAttention {
         // Fused SDPA with GQA
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
             .with_scale(self.scale)
-            .with_mask_type(if mask.is_some() {
-                AttentionMaskType::None
-            } else {
-                AttentionMaskType::Causal
-            });
+            .with_mask_type(Self::mask_type_for_call(mask, cache_active, l));
 
         let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
         let output =
@@ -573,6 +677,103 @@ impl Qwen3NextAttention {
         // Gated output: o_proj(output * sigmoid(gate))
         let gated = output.multiply(&nn::sigmoid(&gate)?)?;
         self.o_proj.forward(&gated)
+    }
+
+    pub fn forward_profiled(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+        layer_profile: &mut Qwen3NextLayerProfile,
+    ) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let b = shape[0];
+        let l = shape[1];
+        let cache_active = cache.is_some();
+
+        let prep_start = Instant::now();
+        let q_proj_out = self.q_proj.forward(x)?;
+        let q_gate = q_proj_out.reshape(&[b, l, self.n_heads, self.head_dim * 2])?;
+        let queries = q_gate.index((.., .., .., ..self.head_dim));
+        let gate = q_gate.index((.., .., .., self.head_dim..)).reshape(&[
+            b,
+            l,
+            self.n_heads * self.head_dim,
+        ])?;
+        let keys = self.k_proj.forward(x)?;
+        let values = self.v_proj.forward(x)?;
+        let mut queries = self.q_norm.forward(&queries)?;
+        let mut keys =
+            self.k_norm
+                .forward(&keys.reshape(&[b, l, self.n_kv_heads, self.head_dim])?)?;
+        let values = values.reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
+        queries = queries.transpose_axes(&[0, 2, 1, 3])?;
+        keys = keys.transpose_axes(&[0, 2, 1, 3])?;
+        let values = values.transpose_axes(&[0, 2, 1, 3])?;
+        queries.eval()?;
+        keys.eval()?;
+        values.eval()?;
+        layer_profile.push_section("attn_prepare_qkv", prep_start);
+
+        let rope_cache_start = Instant::now();
+        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let queries = apply_rope(
+            &queries,
+            self.rope_dims,
+            false,
+            self.effective_base,
+            self.rope_scale,
+            offset,
+        )?;
+        let keys = apply_rope(
+            &keys,
+            self.rope_dims,
+            false,
+            self.effective_base,
+            self.rope_scale,
+            offset,
+        )?;
+        let (keys, values) = if let Some((cache, layer_idx)) = cache {
+            cache.update_and_fetch(layer_idx, &keys, &values)?
+        } else {
+            (keys, values)
+        };
+        queries.eval()?;
+        keys.eval()?;
+        values.eval()?;
+        layer_profile.push_section("attn_rope_cache", rope_cache_start);
+
+        let sdpa_start = Instant::now();
+        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
+            .with_scale(self.scale)
+            .with_mask_type(Self::mask_type_for_call(mask, cache_active, l));
+        let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
+        output.eval()?;
+        layer_profile.push_section("attn_sdpa", sdpa_start);
+
+        let out_start = Instant::now();
+        let output =
+            output
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, l, self.n_heads * self.head_dim])?;
+        let gated = output.multiply(&nn::sigmoid(&gate)?)?;
+        let projected = self.o_proj.forward(&gated)?;
+        projected.eval()?;
+        layer_profile.push_section("attn_out_proj", out_start);
+        Ok(projected)
+    }
+
+    fn mask_type_for_call(
+        mask: Option<&Array>,
+        cache_active: bool,
+        query_len: i32,
+    ) -> AttentionMaskType {
+        let _ = (cache_active, query_len);
+        if mask.is_some() {
+            AttentionMaskType::None
+        } else {
+            AttentionMaskType::Causal
+        }
     }
 }
 
@@ -610,9 +811,13 @@ pub struct Qwen3NextGatedDeltaNet {
     pub value_dim: i32,
     pub conv_dim: i32,
     pub conv_kernel_size: i32,
+    pub combined_in_proj_weight: Option<Array>,
+    pub combined_in_proj_signature: Option<Vec<usize>>,
 }
 
 impl Qwen3NextGatedDeltaNet {
+    const COMBINED_INPUT_PROJ_MAX_HIDDEN: i32 = 2048;
+
     pub fn new(config: &Qwen3NextConfig) -> Result<Self, Exception> {
         let hidden_size = config.hidden_size;
         let num_v_heads = config.linear_num_value_heads;
@@ -676,10 +881,260 @@ impl Qwen3NextGatedDeltaNet {
             value_dim,
             conv_dim,
             conv_kernel_size,
+            combined_in_proj_weight: None,
+            combined_in_proj_signature: None,
         })
     }
 
-    pub fn forward(
+    fn current_input_proj_signature(&self) -> Vec<usize> {
+        vec![
+            self.in_proj_qkv.weight.as_ref().as_ptr().ctx as usize,
+            self.in_proj_z.weight.as_ref().as_ptr().ctx as usize,
+            self.in_proj_b.weight.as_ref().as_ptr().ctx as usize,
+            self.in_proj_a.weight.as_ref().as_ptr().ctx as usize,
+        ]
+    }
+
+    fn ensure_combined_input_proj_weight(&mut self) -> Result<Array, Exception> {
+        let signature = self.current_input_proj_signature();
+        let needs_refresh = self.combined_in_proj_weight.is_none()
+            || self.combined_in_proj_signature.as_ref() != Some(&signature);
+
+        if needs_refresh {
+            let weights = [
+                self.in_proj_qkv.weight.as_ref().clone(),
+                self.in_proj_z.weight.as_ref().clone(),
+                self.in_proj_b.weight.as_ref().clone(),
+                self.in_proj_a.weight.as_ref().clone(),
+            ];
+            let weight_refs: Vec<&Array> = weights.iter().collect();
+            let combined = ops::concatenate_axis(&weight_refs, 0)?;
+            combined.eval()?;
+            self.combined_in_proj_weight = Some(combined);
+            self.combined_in_proj_signature = Some(signature);
+        }
+
+        Ok(self.combined_in_proj_weight.as_ref().unwrap().clone())
+    }
+
+    fn combined_input_projection(
+        &mut self,
+        inputs: &Array,
+    ) -> Result<(Array, Array, Array, Array), Exception> {
+        let shape = inputs.shape();
+        let b = shape[0];
+        let s = shape[1];
+        let combined_weight = self.ensure_combined_input_proj_weight()?;
+        let projected = ops::matmul(inputs, &combined_weight.t())?;
+
+        let qkv_end = self.conv_dim;
+        let z_end = qkv_end + self.value_dim;
+        let b_end = z_end + self.num_v_heads;
+
+        let qkv = projected.index((.., .., ..qkv_end));
+        let z = projected
+            .index((.., .., qkv_end..z_end))
+            .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?;
+        let b_val = projected.index((.., .., z_end..b_end));
+        let a = projected.index((.., .., b_end..));
+        Ok((qkv, z, b_val, a))
+    }
+
+    fn should_use_combined_input_proj(&self, inputs: &Array, mask: Option<&Array>) -> bool {
+        mask.is_none()
+            && inputs.dim(1) == 1
+            && self.hidden_size <= Self::COMBINED_INPUT_PROJ_MAX_HIDDEN
+    }
+
+    fn forward_cached_decode(
+        &mut self,
+        inputs: &Array,
+        cache: &mut MambaCacheEntry,
+    ) -> Result<Array, Exception> {
+        let shape = inputs.shape();
+        let b = shape[0];
+        let s = shape[1];
+        let (qkv, z, b_val, a) = self.combined_input_projection(inputs)?;
+        let conv_input = cache.update_conv_state(&qkv, self.conv_kernel_size)?;
+        let conv_out = nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?;
+        self.finish_forward_from_conv_out(&conv_out, b, s, &z, &a, &b_val, None, Some(cache))
+    }
+
+    fn forward_cached_decode_profiled(
+        &mut self,
+        inputs: &Array,
+        cache: &mut MambaCacheEntry,
+        layer_profile: &mut Qwen3NextLayerProfile,
+    ) -> Result<Array, Exception> {
+        let shape = inputs.shape();
+        let b = shape[0];
+        let s = shape[1];
+
+        let input_proj_start = Instant::now();
+        let (qkv, z, b_val, a) = self.combined_input_projection(inputs)?;
+        qkv.eval()?;
+        z.eval()?;
+        b_val.eval()?;
+        a.eval()?;
+        layer_profile.push_section("gdn_input_proj", input_proj_start);
+
+        let conv_start = Instant::now();
+        let conv_input = cache.update_conv_state(&qkv, self.conv_kernel_size)?;
+        let conv_out = nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?;
+        conv_out.eval()?;
+        layer_profile.push_section("gdn_conv", conv_start);
+
+        self.finish_forward_from_conv_out_profiled(
+            &conv_out,
+            b,
+            s,
+            &z,
+            &a,
+            &b_val,
+            None,
+            Some(cache),
+            layer_profile,
+        )
+    }
+
+    fn finish_forward_from_conv_out(
+        &mut self,
+        conv_out: &Array,
+        batch: i32,
+        seq_len: i32,
+        z: &Array,
+        a: &Array,
+        b_val: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut MambaCacheEntry>,
+    ) -> Result<Array, Exception> {
+        // Split conv output — simple positional split on last dim (Python line 156-163)
+        // Split at [key_dim, 2*key_dim] into q, k, v
+        let q_conv = conv_out.index((.., .., ..self.key_dim));
+        let k_conv = conv_out.index((.., .., self.key_dim..self.key_dim * 2));
+        let v_conv = conv_out.index((.., .., self.key_dim * 2..));
+
+        // Take only the last S timesteps (conv adds padding)
+        let out_len = q_conv.dim(1);
+        let q_conv = q_conv.index((.., (out_len - seq_len).., ..)).reshape(&[
+            batch,
+            seq_len,
+            self.num_k_heads,
+            self.head_k_dim,
+        ])?;
+        let k_conv = k_conv.index((.., (out_len - seq_len).., ..)).reshape(&[
+            batch,
+            seq_len,
+            self.num_k_heads,
+            self.head_k_dim,
+        ])?;
+        let v_conv = v_conv.index((.., (out_len - seq_len).., ..)).reshape(&[
+            batch,
+            seq_len,
+            self.num_v_heads,
+            self.head_v_dim,
+        ])?;
+
+        // Match the upstream Qwen 3.5 GDN contract: l2-normalize Q/K per head,
+        // then scale Q by 1/sqrt(dk) before the recurrent update.
+        let q_normed = l2norm_last_dim(&q_conv, 1e-6)?
+            .multiply(&Array::from_f32((self.head_k_dim as f32).sqrt().recip()))?;
+        let k_normed = l2norm_last_dim(&k_conv, 1e-6)?;
+
+        // Get SSM state from cache
+        let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
+
+        // Run GDN recurrence with already-normalized Q/K.
+        let (out, new_state) = gated_delta_update(
+            &q_normed,
+            &k_normed,
+            &v_conv,
+            a,
+            b_val,
+            self.a_log.as_ref(),
+            self.dt_bias.as_ref(),
+            ssm_state,
+            mask,
+            false, // inference: use fast chunk path for long sequences
+        )?;
+
+        // Update SSM state in cache
+        if let Some(cache) = cache {
+            cache.ssm_state = Some(new_state);
+        }
+
+        // Apply gated norm and output projection
+        let out = self.norm.forward(&out, Some(z))?;
+        self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])?)
+    }
+
+    fn finish_forward_from_conv_out_profiled(
+        &mut self,
+        conv_out: &Array,
+        batch: i32,
+        seq_len: i32,
+        z: &Array,
+        a: &Array,
+        b_val: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut MambaCacheEntry>,
+        layer_profile: &mut Qwen3NextLayerProfile,
+    ) -> Result<Array, Exception> {
+        let recurrence_start = Instant::now();
+        let q_conv = conv_out.index((.., .., ..self.key_dim));
+        let k_conv = conv_out.index((.., .., self.key_dim..self.key_dim * 2));
+        let v_conv = conv_out.index((.., .., self.key_dim * 2..));
+        let out_len = q_conv.dim(1);
+        let q_conv = q_conv.index((.., (out_len - seq_len).., ..)).reshape(&[
+            batch,
+            seq_len,
+            self.num_k_heads,
+            self.head_k_dim,
+        ])?;
+        let k_conv = k_conv.index((.., (out_len - seq_len).., ..)).reshape(&[
+            batch,
+            seq_len,
+            self.num_k_heads,
+            self.head_k_dim,
+        ])?;
+        let v_conv = v_conv.index((.., (out_len - seq_len).., ..)).reshape(&[
+            batch,
+            seq_len,
+            self.num_v_heads,
+            self.head_v_dim,
+        ])?;
+        let q_normed = l2norm_last_dim(&q_conv, 1e-6)?
+            .multiply(&Array::from_f32((self.head_k_dim as f32).sqrt().recip()))?;
+        let k_normed = l2norm_last_dim(&k_conv, 1e-6)?;
+        let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
+        let (out, new_state) = gated_delta_update(
+            &q_normed,
+            &k_normed,
+            &v_conv,
+            a,
+            b_val,
+            self.a_log.as_ref(),
+            self.dt_bias.as_ref(),
+            ssm_state,
+            mask,
+            false,
+        )?;
+        out.eval()?;
+        layer_profile.push_section("gdn_recurrence", recurrence_start);
+
+        if let Some(cache) = cache {
+            cache.ssm_state = Some(new_state);
+        }
+
+        let out_proj_start = Instant::now();
+        let out = self.norm.forward(&out, Some(z))?;
+        let projected = self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])?)?;
+        projected.eval()?;
+        layer_profile.push_section("gdn_out_proj", out_proj_start);
+        Ok(projected)
+    }
+
+    fn forward_general(
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
@@ -697,18 +1152,6 @@ impl Qwen3NextGatedDeltaNet {
                 .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?;
         let b_val = self.in_proj_b.forward(inputs)?;
         let a = self.in_proj_a.forward(inputs)?;
-
-        // Convolution state management
-        let conv_state = if let Some(ref cache) = cache {
-            cache.conv_state.clone()
-        } else {
-            None
-        };
-        let conv_state = conv_state.unwrap_or_else(|| {
-            Array::zeros::<f32>(&[b, self.conv_kernel_size - 1, self.conv_dim]).unwrap()
-        });
-
-        // Mask QKV BEFORE conv (Python line 149-150)
         let qkv = if let Some(mask) = mask {
             let mask_expanded = mask.reshape(&[mask.dim(0), mask.dim(1), 1])?;
             ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0))?
@@ -716,80 +1159,118 @@ impl Qwen3NextGatedDeltaNet {
             qkv
         };
 
-        // Prepend conv state and run conv1d + silu
-        let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1)?;
+        let conv_out = if let Some(cache_entry) = cache.as_deref_mut() {
+            let conv_input = cache_entry.update_conv_state(&qkv, self.conv_kernel_size)?;
+            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?
+        } else {
+            let conv_state = mlx_rs::ops::zeros_dtype(
+                &[b, self.conv_kernel_size - 1, self.conv_dim],
+                qkv.dtype(),
+            )?;
+            let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1)?;
+            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?
+        };
 
-        // Update conv state in cache
-        if let Some(cache) = cache.as_deref_mut() {
-            let keep = self.conv_kernel_size - 1;
-            let total_len = conv_input.dim(1);
-            cache.conv_state = Some(conv_input.index((.., (total_len - keep).., ..)));
+        self.finish_forward_from_conv_out(&conv_out, b, s, &z, &a, &b_val, mask, cache)
+    }
+
+    pub fn forward(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut MambaCacheEntry>,
+    ) -> Result<Array, Exception> {
+        if self.should_use_combined_input_proj(inputs, mask) && let Some(cache) = cache {
+            return self.forward_cached_decode(inputs, cache);
+        }
+        self.forward_general(inputs, mask, cache)
+    }
+
+    pub fn forward_profiled(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        mut cache: Option<&mut MambaCacheEntry>,
+        layer_profile: &mut Qwen3NextLayerProfile,
+    ) -> Result<Array, Exception> {
+        if self.should_use_combined_input_proj(inputs, mask) && let Some(cache) = cache {
+            return self.forward_cached_decode_profiled(inputs, cache, layer_profile);
         }
 
-        let conv_out = nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?;
+        let shape = inputs.shape();
+        let b = shape[0];
+        let s = shape[1];
 
-        // Split conv output — simple positional split on last dim (Python line 156-163)
-        // Split at [key_dim, 2*key_dim] into q, k, v
-        let q_conv = conv_out.index((.., .., ..self.key_dim));
-        let k_conv = conv_out.index((.., .., self.key_dim..self.key_dim * 2));
-        let v_conv = conv_out.index((.., .., self.key_dim * 2..));
+        let qkv_start = Instant::now();
+        let qkv = self.in_proj_qkv.forward(inputs)?;
+        qkv.eval()?;
+        layer_profile.push_section("gdn_input_qkv", qkv_start);
 
-        // Take only the last S timesteps (conv adds padding)
-        let out_len = q_conv.dim(1);
-        let q_conv = q_conv.index((.., (out_len - s).., ..)).reshape(&[
+        let z_start = Instant::now();
+        let z =
+            self.in_proj_z
+                .forward(inputs)?
+                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?;
+        z.eval()?;
+        layer_profile.push_section("gdn_input_z", z_start);
+
+        let b_start = Instant::now();
+        let b_val = self.in_proj_b.forward(inputs)?;
+        b_val.eval()?;
+        layer_profile.push_section("gdn_input_b", b_start);
+
+        let a_start = Instant::now();
+        let a = self.in_proj_a.forward(inputs)?;
+        a.eval()?;
+        layer_profile.push_section("gdn_input_a", a_start);
+
+        let qkv = if let Some(mask) = mask {
+            let mask_start = Instant::now();
+            let mask_expanded = mask.reshape(&[mask.dim(0), mask.dim(1), 1])?;
+            let masked = ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0))?;
+            masked.eval()?;
+            layer_profile.push_section("gdn_input_mask", mask_start);
+            masked
+        } else {
+            qkv
+        };
+
+        let conv_start = Instant::now();
+        let conv_out = if let Some(cache_entry) = cache.as_deref_mut() {
+            let conv_input = cache_entry.update_conv_state(&qkv, self.conv_kernel_size)?;
+            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?
+        } else {
+            let conv_state = mlx_rs::ops::zeros_dtype(
+                &[b, self.conv_kernel_size - 1, self.conv_dim],
+                qkv.dtype(),
+            )?;
+            let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1)?;
+            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?
+        };
+        conv_out.eval()?;
+        layer_profile.push_section("gdn_conv", conv_start);
+
+        self.finish_forward_from_conv_out_profiled(
+            &conv_out,
             b,
             s,
-            self.num_k_heads,
-            self.head_k_dim,
-        ])?;
-        let k_conv = k_conv.index((.., (out_len - s).., ..)).reshape(&[
-            b,
-            s,
-            self.num_k_heads,
-            self.head_k_dim,
-        ])?;
-        let v_conv = v_conv.index((.., (out_len - s).., ..)).reshape(&[
-            b,
-            s,
-            self.num_v_heads,
-            self.head_v_dim,
-        ])?;
-
-        // Apply Q/K RMS normalization with scaling (Python line 166-168)
-        let inv_scale = (self.head_k_dim as f32).powf(-0.5);
-        let q_normed =
-            mlx_rs::fast::rms_norm(&q_conv, &Array::ones::<f32>(&[self.head_k_dim])?, 1e-6)?
-                .multiply(&Array::from_f32(inv_scale * inv_scale))?;
-        let k_normed =
-            mlx_rs::fast::rms_norm(&k_conv, &Array::ones::<f32>(&[self.head_k_dim])?, 1e-6)?
-                .multiply(&Array::from_f32(inv_scale))?;
-
-        // Get SSM state from cache
-        let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
-
-        // Run GDN recurrence (inference only — base model has no training path)
-        let (out, new_state) = gated_delta_update(
-            &q_normed,
-            &k_normed,
-            &v_conv,
+            &z,
             &a,
             &b_val,
-            self.a_log.as_ref(),
-            self.dt_bias.as_ref(),
-            ssm_state,
             mask,
-            false, // inference: use fast chunk path for long sequences
-        )?;
-
-        // Update SSM state in cache
-        if let Some(cache) = cache {
-            cache.ssm_state = Some(new_state);
-        }
-
-        // Apply gated norm and output projection
-        let out = self.norm.forward(&out, Some(&z))?;
-        self.out_proj.forward(&out.reshape(&[b, s, -1])?)
+            cache,
+            layer_profile,
+        )
     }
+}
+
+fn l2norm_last_dim(x: &Array, eps: f32) -> Result<Array, Exception> {
+    let norm = x
+        .square()?
+        .sum_axis(-1, true)?
+        .add(&Array::from_f32(eps))?
+        .sqrt()?;
+    x.divide(&norm)
 }
 
 // ============================================================================
@@ -813,6 +1294,8 @@ pub struct Qwen3NextSparseMoeBlock {
     pub num_experts: i32,
     pub top_k: i32,
     pub norm_topk_prob: bool,
+    /// Whether routed expert weights are currently resident in MLX arrays.
+    pub routed_experts_loaded: bool,
     /// Which transformer layer this block belongs to (used for expert file lookup).
     pub layer_idx: usize,
     /// If set, routed expert weights are loaded on-demand from SSD instead of
@@ -831,7 +1314,29 @@ pub struct Qwen3NextSparseMoeBlock {
 }
 
 impl Qwen3NextSparseMoeBlock {
+    const PREFILL_EXPERT_WINDOW_TOKENS: usize = 8;
+
+    fn required_pool_buffers(top_k: usize) -> usize {
+        top_k
+            .max(Self::PREFILL_EXPERT_WINDOW_TOKENS.saturating_mul(top_k))
+            .max(1)
+    }
+
+    fn required_output_buffers(top_k: usize) -> usize {
+        Self::PREFILL_EXPERT_WINDOW_TOKENS
+            .saturating_mul(top_k)
+            .max(top_k)
+            .max(1)
+    }
+
     pub fn new(config: &Qwen3NextConfig) -> Result<Self, Exception> {
+        Self::new_with_routed_expert_mode(config, Qwen3NextRoutedExpertMode::Resident)
+    }
+
+    pub fn new_with_routed_expert_mode(
+        config: &Qwen3NextConfig,
+        routed_expert_mode: Qwen3NextRoutedExpertMode,
+    ) -> Result<Self, Exception> {
         let dim = config.hidden_size;
         let intermediate_size = config.moe_intermediate_size;
         let num_experts = config.num_experts;
@@ -841,9 +1346,22 @@ impl Qwen3NextSparseMoeBlock {
             .build()?;
 
         // SwitchGLU stacked weights: [num_experts, intermediate_size, dim] etc.
-        let gate_proj = Array::zeros::<f32>(&[num_experts, intermediate_size, dim])?;
-        let up_proj = Array::zeros::<f32>(&[num_experts, intermediate_size, dim])?;
-        let down_proj = Array::zeros::<f32>(&[num_experts, dim, intermediate_size])?;
+        let routed_experts_loaded = routed_expert_mode == Qwen3NextRoutedExpertMode::Resident;
+        let gate_proj = if routed_experts_loaded {
+            Array::zeros::<f32>(&[num_experts, intermediate_size, dim])?
+        } else {
+            Array::zeros::<f32>(&[1])?
+        };
+        let up_proj = if routed_experts_loaded {
+            Array::zeros::<f32>(&[num_experts, intermediate_size, dim])?
+        } else {
+            Array::zeros::<f32>(&[1])?
+        };
+        let down_proj = if routed_experts_loaded {
+            Array::zeros::<f32>(&[num_experts, dim, intermediate_size])?
+        } else {
+            Array::zeros::<f32>(&[1])?
+        };
 
         let shared_expert = Qwen3NextMLP::new(dim, config.shared_expert_intermediate_size)?;
         let shared_expert_gate = nn::LinearBuilder::new(dim, 1).bias(false).build()?;
@@ -858,6 +1376,7 @@ impl Qwen3NextSparseMoeBlock {
             num_experts,
             top_k: config.num_experts_per_tok,
             norm_topk_prob: config.norm_topk_prob,
+            routed_experts_loaded,
             layer_idx: 0,
             offload_ctx: None,
             prefetcher: None,
@@ -878,9 +1397,12 @@ impl Qwen3NextSparseMoeBlock {
         // Initialize zero-copy buffer pool and reusable Metal resources
         if let Ok(metal_ctx) = pmetal_metal::context::MetalContext::global() {
             let expert_size = ctx.layout.expert_size;
-            let k = self.top_k as usize;
+            let decode_streams = self.top_k as usize;
+            let total_pool_buffers = Self::required_pool_buffers(decode_streams);
+            let k = total_pool_buffers.div_ceil(2);
 
-            // Buffer pool: 2*K buffers for double-buffered zero-copy pread
+            // Buffer pool: enough 2 MB-aligned buffers for both T=1 decode
+            // and the exact-routing prefill window path.
             match ExpertBufferPool::new(
                 &metal_ctx,
                 ExpertBufferPoolConfig {
@@ -913,8 +1435,9 @@ impl Qwen3NextSparseMoeBlock {
             }
 
             // Reusable per-expert output buffers
-            let mut out_bufs = Vec::with_capacity(k);
-            for _ in 0..k {
+            let output_buffer_count = Self::required_output_buffers(decode_streams);
+            let mut out_bufs = Vec::with_capacity(output_buffer_count);
+            for _ in 0..output_buffer_count {
                 if let Ok(buf) = pmetal_metal::buffer::MetalBuffer::<f32>::new(
                     &metal_ctx,
                     ctx.layout.hidden_dim,
@@ -923,7 +1446,7 @@ impl Qwen3NextSparseMoeBlock {
                     out_bufs.push(buf);
                 }
             }
-            if out_bufs.len() == k {
+            if out_bufs.len() == output_buffer_count {
                 self.expert_out_bufs = out_bufs;
             }
 
@@ -952,7 +1475,12 @@ impl Qwen3NextSparseMoeBlock {
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         // Dispatch to offloaded path when an ExpertOffloadContext is present.
         if self.offload_ctx.is_some() {
-            return self.forward_offloaded(x);
+            return self.forward_offloaded(x, None);
+        }
+        if !self.routed_experts_loaded {
+            return Err(Exception::custom(
+                "routed expert weights are not resident; enable expert offloading with --experts-dir",
+            ));
         }
 
         let shape = x.shape();
@@ -1040,20 +1568,24 @@ impl Qwen3NextSparseMoeBlock {
         result.reshape(shape)
     }
 
-    /// Offloaded forward pass: routes to top-k experts whose weights are
-    /// read on-demand from packed SSD files and dispatched to Metal kernels.
-    ///
-    /// Two paths:
-    /// - **Zero-copy** (all misses): pread into AlignedBuffer → Metal kernel at byte offsets
-    /// - **Legacy** (prefetch hits): Vec<u8> buffers → parse_expert_weights → MetalBuffer copies
-    fn forward_offloaded(&mut self, x: &Array) -> Result<Array, Exception> {
-        let shape = x.shape();
-        let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
-        let hidden = shape[shape.len() - 1];
-        let x_flat = x.reshape(&[batch_seq, hidden])?;
+    pub fn forward_profiled(
+        &mut self,
+        x: &Array,
+        layer_profile: &mut Qwen3NextLayerProfile,
+    ) -> Result<Array, Exception> {
+        if self.offload_ctx.is_some() {
+            return self.forward_offloaded(x, Some(layer_profile));
+        }
 
-        // ---- Routing (identical to resident path) ----
-        let gate_logits = self.gate.forward(&x_flat)?;
+        let start = Instant::now();
+        let output = self.forward(x)?;
+        output.eval()?;
+        layer_profile.push_section("moe_resident", start);
+        Ok(output)
+    }
+
+    fn route_experts(&mut self, x_flat: &Array) -> Result<(Array, Vec<usize>, i32), Exception> {
+        let gate_logits = self.gate.forward(x_flat)?;
         let gates = ops::softmax_axis(
             &if gate_logits.dtype() != mlx_rs::Dtype::Float32 {
                 gate_logits.as_type::<f32>()?
@@ -1079,11 +1611,315 @@ impl Qwen3NextSparseMoeBlock {
             top_weights
         };
 
-        // ---- Extract expert indices to CPU ----
         let top_indices_i32 = top_indices.as_type::<i32>()?;
         top_indices_i32.eval()?;
         let flat_indices: Vec<i32> = top_indices_i32.as_slice().to_vec();
         let expert_indices: Vec<usize> = flat_indices.iter().map(|&i| i as usize).collect();
+
+        Ok((top_weights, expert_indices, k))
+    }
+
+    fn ordered_unique_experts(expert_indices: &[usize]) -> (Vec<usize>, HashMap<usize, usize>) {
+        let mut unique = Vec::new();
+        let mut index_map = HashMap::new();
+        for &expert_idx in expert_indices {
+            if let std::collections::hash_map::Entry::Vacant(entry) = index_map.entry(expert_idx) {
+                let slot = unique.len();
+                unique.push(expert_idx);
+                entry.insert(slot);
+            }
+        }
+        (unique, index_map)
+    }
+
+    /// Offloaded forward pass: routes to top-k experts whose weights are
+    /// read on-demand from packed SSD files and dispatched to Metal kernels.
+    ///
+    /// Two paths:
+    /// - **Aligned fast path**: prefetched hits are copied into AlignedBuffers,
+    ///   misses are pread into AlignedBuffers, then the Metal expert kernel reads
+    ///   component byte offsets directly
+    /// - **Legacy**: Vec<u8> buffers → parse_expert_weights → MetalBuffer copies
+    fn forward_offloaded(
+        &mut self,
+        x: &Array,
+        mut layer_profile: Option<&mut Qwen3NextLayerProfile>,
+    ) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
+        let hidden = shape[shape.len() - 1];
+        let x_flat = x.reshape(&[batch_seq, hidden])?;
+
+        // The fused offloaded expert path is still single-token at the kernel
+        // level. For prompt prefill, process small token windows with exact
+        // routing, load each unique expert once per window, and then reuse
+        // those loaded experts across the tokens in the window.
+        if batch_seq > 1 {
+            let prefill_start = Instant::now();
+            let ctx = self.offload_ctx.as_ref().unwrap().clone();
+            let layer_idx = self.layer_idx;
+            let metal_ctx = pmetal_metal::context::MetalContext::global()
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            let record = &ctx.layout.record;
+
+            let mut window_outputs = Vec::with_capacity(
+                batch_seq as usize / Self::PREFILL_EXPERT_WINDOW_TOKENS + 1,
+            );
+
+            for window_start in (0..batch_seq as usize).step_by(Self::PREFILL_EXPERT_WINDOW_TOKENS)
+            {
+                let window_end =
+                    (window_start + Self::PREFILL_EXPERT_WINDOW_TOKENS).min(batch_seq as usize);
+                let window_len = (window_end - window_start) as i32;
+                let window_input = x_flat
+                    .index((window_start as i32..window_end as i32, ..))
+                    .reshape(&[window_len, hidden])?;
+
+                let (window_top_weights, window_expert_indices, k) =
+                    self.route_experts(&window_input)?;
+                let k_usize = k as usize;
+
+                let shared_y = self.shared_expert.forward(&window_input)?;
+                let shared_gate_logit = self.shared_expert_gate.forward(&window_input)?;
+                shared_y.eval()?;
+                shared_gate_logit.eval()?;
+                let fused_expert = self.fused_expert.as_ref().ok_or_else(|| {
+                    Exception::custom("forward_offloaded: fused_expert not initialized")
+                })?;
+                let intermediate = self.expert_intermediate.as_ref().ok_or_else(|| {
+                    Exception::custom("forward_offloaded: expert_intermediate not initialized")
+                })?;
+
+                let (unique_experts, unique_index_map) =
+                    Self::ordered_unique_experts(&window_expert_indices);
+                let prefetched: Vec<Option<Vec<u8>>> = self
+                    .prefetcher
+                    .as_ref()
+                    .map(|p| p.try_get(layer_idx, &unique_experts))
+                    .unwrap_or_else(|| vec![None; unique_experts.len()]);
+
+                let miss_plan = prefetched_miss_plan(&prefetched, &unique_experts);
+                let window_output_buffers = window_len as usize * k_usize;
+                let use_aligned = self.buffer_pool.is_some()
+                    && self.expert_out_bufs.len() >= window_output_buffers
+                    && self
+                        .buffer_pool
+                        .as_ref()
+                        .is_some_and(|pool| pool.total_buffers() >= unique_experts.len());
+                let mut window_down_tokens = Vec::with_capacity(window_len as usize);
+
+                if use_aligned {
+                    let pool = self.buffer_pool.as_ref().unwrap();
+                    let mut unique_bufs: Vec<pmetal_metal::expert_buffer::AlignedBuffer> =
+                        (0..unique_experts.len())
+                            .map(|_| pool.acquire_blocking())
+                            .collect();
+
+                    let aligned_load = if miss_plan.len() == unique_experts.len() {
+                        ctx.read_experts_aligned(layer_idx, &unique_experts, &mut unique_bufs)
+                            .map_err(|e| {
+                                Exception::custom(format!(
+                                    "expert aligned pread layer {layer_idx}: {e}"
+                                ))
+                            })
+                    } else {
+                        prefetched
+                            .iter()
+                            .zip(unique_bufs.iter_mut())
+                            .try_for_each(|(hit, aligned)| match hit {
+                                Some(raw_bytes) => {
+                                    copy_prefetched_expert_into_aligned(aligned, raw_bytes)
+                                }
+                                None => Ok(()),
+                            })
+                            .and_then(|_| {
+                                load_missing_experts_into_aligned_buffers(
+                                    &ctx,
+                                    layer_idx,
+                                    &miss_plan,
+                                    &mut unique_bufs,
+                                )
+                            })
+                    };
+                    if let Err(error) = aligned_load {
+                        for buf in unique_bufs.drain(..) {
+                            pool.release(buf);
+                        }
+                        return Err(error);
+                    }
+
+                    let cmd_buf = fused_expert
+                        .create_command_buffer()
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    for token_offset in 0..window_len as usize {
+                        let token_input = window_input
+                            .index((token_offset as i32, ..))
+                            .reshape(&[1, hidden])?;
+                        let token_input_f32 = token_input.as_type::<f32>()?;
+                        token_input_f32.eval()?;
+                        let input_buf = pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(
+                            &metal_ctx,
+                            &token_input_f32,
+                        )
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                        for slot in 0..k_usize {
+                            let expert_idx = window_expert_indices[token_offset * k_usize + slot];
+                            let unique_slot = *unique_index_map
+                                .get(&expert_idx)
+                                .expect("unique expert index must exist");
+                            let abuf = &unique_bufs[unique_slot];
+                            let output_slot = token_offset * k_usize + slot;
+                            fused_expert
+                                .encode_expert_aligned(
+                                    &cmd_buf,
+                                    &input_buf,
+                                    abuf.metal_buffer(),
+                                    record.gate_weight.offset,
+                                    record.gate_scales.offset,
+                                    record.gate_biases.offset,
+                                    record.up_weight.offset,
+                                    record.up_scales.offset,
+                                    record.up_biases.offset,
+                                    record.down_weight.offset,
+                                    record.down_scales.offset,
+                                    record.down_biases.offset,
+                                    &self.expert_out_bufs[output_slot],
+                                    intermediate,
+                                )
+                                .map_err(|e| Exception::custom(e.to_string()))?;
+                        }
+                    }
+
+                    fused_expert
+                        .submit(&cmd_buf)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    fused_expert
+                        .wait_for_completion(&cmd_buf)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+
+                    for token_offset in 0..window_len as usize {
+                        let mut expert_arrays: Vec<Array> = Vec::with_capacity(k_usize);
+                        for slot in 0..k_usize {
+                            let output_slot = token_offset * k_usize + slot;
+                            let slice = self.expert_out_bufs[output_slot].as_slice();
+                            expert_arrays.push(Array::from_slice(slice, &[1, hidden]));
+                        }
+                        let down_out = ops::stack_axis(&expert_arrays, 1)?.reshape(&[k, hidden])?;
+                        window_down_tokens.push(down_out);
+                    }
+
+                    for buf in unique_bufs {
+                        pool.release(buf);
+                    }
+                } else {
+                    let miss_ids: Vec<usize> =
+                        miss_plan.iter().map(|(_, expert_idx)| *expert_idx).collect();
+                    let miss_bufs = if !miss_ids.is_empty() {
+                        ctx.read_experts(layer_idx, &miss_ids).map_err(|e| {
+                            Exception::custom(format!("expert pread layer {layer_idx}: {e}"))
+                        })?
+                    } else {
+                        vec![]
+                    };
+
+                    let mut unique_bufs: Vec<Arc<Vec<u8>>> =
+                        Vec::with_capacity(unique_experts.len());
+                    let mut miss_iter = miss_bufs.into_iter().map(Arc::new);
+                    for hit in prefetched {
+                        unique_bufs.push(match hit {
+                            Some(buf) => Arc::new(buf),
+                            None => miss_iter.next().unwrap(),
+                        });
+                    }
+
+                    let cmd_buf = fused_expert
+                        .create_command_buffer()
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    for token_offset in 0..window_len as usize {
+                        let token_input = window_input
+                            .index((token_offset as i32, ..))
+                            .reshape(&[1, hidden])?;
+                        let token_input_f32 = token_input.as_type::<f32>()?;
+                        token_input_f32.eval()?;
+                        let input_buf = pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(
+                            &metal_ctx,
+                            &token_input_f32,
+                        )
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                        for slot in 0..k_usize {
+                            let expert_idx = window_expert_indices[token_offset * k_usize + slot];
+                            let unique_slot = *unique_index_map
+                                .get(&expert_idx)
+                                .expect("unique expert index must exist");
+                            let output_slot = token_offset * k_usize + slot;
+                            let weights = crate::expert_dequant::parse_expert_weights(
+                                &unique_bufs[unique_slot],
+                                record,
+                                &metal_ctx,
+                            )
+                            .map_err(Exception::custom)?;
+
+                            fused_expert
+                                .encode_into(
+                                    &cmd_buf,
+                                    &input_buf,
+                                    &weights,
+                                    &self.expert_out_bufs[output_slot],
+                                    intermediate,
+                                )
+                                .map_err(|e| Exception::custom(e.to_string()))?;
+                        }
+                    }
+
+                    fused_expert
+                        .submit(&cmd_buf)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    fused_expert
+                        .wait_for_completion(&cmd_buf)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+
+                    for token_offset in 0..window_len as usize {
+                        let mut expert_arrays: Vec<Array> = Vec::with_capacity(k_usize);
+                        for slot in 0..k_usize {
+                            let output_slot = token_offset * k_usize + slot;
+                            let slice = self.expert_out_bufs[output_slot].as_slice();
+                            expert_arrays.push(Array::from_slice(slice, &[1, hidden]));
+                        }
+                        let down_out = ops::stack_axis(&expert_arrays, 1)?.reshape(&[k, hidden])?;
+                        window_down_tokens.push(down_out);
+                    }
+                }
+
+                let down_refs: Vec<&Array> = window_down_tokens.iter().collect();
+                let window_down_out =
+                    ops::stack_axis(&down_refs, 0)?.reshape(&[window_len, k, hidden])?;
+                let window_output = moe_combine_mlx(
+                    &window_input,
+                    &window_down_out,
+                    &window_top_weights,
+                    &shared_y,
+                    &shared_gate_logit,
+                    k,
+                    window_len,
+                )?
+                .reshape(&[window_len, hidden])?;
+                window_outputs.push(window_output);
+            }
+            let window_refs: Vec<&Array> = window_outputs.iter().collect();
+            let stacked = ops::concatenate_axis(&window_refs, 0)?.reshape(shape)?;
+            stacked.eval()?;
+            if let Some(profile) = layer_profile.as_deref_mut() {
+                profile.push_section("moe_prefill_windowed", prefill_start);
+            }
+            return Ok(stacked);
+        }
+
+        // ---- Routing (identical to resident path) ----
+        let routing_start = Instant::now();
+        let (top_weights, expert_indices, k) = self.route_experts(&x_flat)?;
+        if let Some(profile) = layer_profile.as_deref_mut() {
+            profile.push_section("moe_route", routing_start);
+        }
 
         // ---- Load expert weights from SSD ----
         let ctx = self.offload_ctx.as_ref().unwrap().clone();
@@ -1099,17 +1935,17 @@ impl Qwen3NextSparseMoeBlock {
             // ---- Prefetch-aware expert loading ----
             let io_start = std::time::Instant::now();
 
-            let prefetched: Vec<Option<Vec<u8>>> = self
+            let prefetched_raw: Vec<Option<Vec<u8>>> = self
                 .prefetcher
                 .as_ref()
                 .map(|p| p.try_get(layer_idx, &expert_indices))
                 .unwrap_or_else(|| vec![None; expert_indices.len()]);
+            let prefetched = prefetched_raw;
 
-            let miss_ids: Vec<usize> = prefetched
+            let miss_plan = prefetched_miss_plan(&prefetched, &expert_indices);
+            let miss_ids: Vec<usize> = miss_plan
                 .iter()
-                .enumerate()
-                .filter(|(_, buf)| buf.is_none())
-                .map(|(i, _)| expert_indices[i])
+                .map(|(_, expert_idx)| *expert_idx)
                 .collect();
 
             let prefetch_hits = prefetched.iter().filter(|b| b.is_some()).count();
@@ -1133,46 +1969,88 @@ impl Qwen3NextSparseMoeBlock {
                 pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(&metal_ctx, &x_flat_f32)
                     .map_err(|e| Exception::custom(e.to_string()))?;
 
-            let cmd_buf = fused_expert
-                .create_command_buffer()
-                .map_err(|e| Exception::custom(e.to_string()))?;
-
-            // Zero-copy path requires ALL experts to be cache misses, because
-            // prefetched data arrives as Vec<u8> (not in AlignedBuffers), so we
-            // cannot mix aligned and non-aligned experts in one dispatch.
-            let use_aligned = self.buffer_pool.is_some()
-                && miss_ids.len() == expert_indices.len()
-                && self.expert_out_bufs.len() >= expert_indices.len();
-
-            if use_aligned {
-                // ---- ZERO-COPY PATH ----
-                // pread directly into 2MB-aligned Metal-registered buffers.
-                // No intermediate copies, no parse_expert_weights.
+            let use_aligned =
+                self.buffer_pool.is_some() && self.expert_out_bufs.len() >= expert_indices.len();
+            let mut aligned_release_bufs: Option<Vec<pmetal_metal::expert_buffer::AlignedBuffer>> =
+                None;
+            let cmd_buf = if use_aligned {
+                // ---- ALIGNED FAST PATH ----
+                // Prefetched hits are copied into aligned Metal-shared buffers,
+                // and misses are read directly into aligned buffers. This keeps
+                // the Metal expert kernel on its byte-offset path even when
+                // prefetch hits exist.
                 let pool = self.buffer_pool.as_ref().unwrap();
                 let mut aligned_bufs: Vec<pmetal_metal::expert_buffer::AlignedBuffer> = (0
                     ..expert_indices.len())
                     .map(|_| pool.acquire_blocking())
                     .collect();
 
-                ctx.read_experts_aligned(layer_idx, &expert_indices, &mut aligned_bufs)
-                    .map_err(|e| {
-                        // Return buffers to pool on error
-                        for buf in aligned_bufs.drain(..) {
-                            pool.release(buf);
-                        }
-                        Exception::custom(format!("expert aligned pread layer {layer_idx}: {e}"))
-                    })?;
+                let aligned_load = if miss_plan.is_empty() {
+                    prefetched
+                        .iter()
+                        .zip(aligned_bufs.iter_mut())
+                        .try_for_each(|(hit, aligned)| match hit {
+                            Some(raw_bytes) => {
+                                copy_prefetched_expert_into_aligned(aligned, raw_bytes)
+                            }
+                            None => Ok(()),
+                        })
+                } else if miss_plan.len() == expert_indices.len() {
+                    ctx.read_experts_aligned(layer_idx, &expert_indices, &mut aligned_bufs)
+                        .map_err(|e| {
+                            Exception::custom(format!(
+                                "expert aligned pread layer {layer_idx}: {e}"
+                            ))
+                        })
+                } else {
+                    prefetched
+                        .iter()
+                        .zip(aligned_bufs.iter_mut())
+                        .try_for_each(|(hit, aligned)| match hit {
+                            Some(raw_bytes) => {
+                                copy_prefetched_expert_into_aligned(aligned, raw_bytes)
+                            }
+                            None => Ok(()),
+                        })
+                        .and_then(|_| {
+                            load_missing_experts_into_aligned_buffers(
+                                &ctx,
+                                layer_idx,
+                                &miss_plan,
+                                &mut aligned_bufs,
+                            )
+                        })
+                };
+
+                if let Err(error) = aligned_load {
+                    for buf in aligned_bufs.drain(..) {
+                        pool.release(buf);
+                    }
+                    return Err(error);
+                }
+                if let Some(profile) = layer_profile.as_deref_mut() {
+                    profile.push_section("moe_expert_io", io_start);
+                }
 
                 let io_us = io_start.elapsed().as_micros();
                 tracing::trace!(
                     layer = layer_idx,
                     io_ms = io_us as f64 / 1000.0,
-                    path = "zero-copy",
+                    path = if prefetch_hits > 0 {
+                        "aligned-mixed"
+                    } else {
+                        "aligned-direct"
+                    },
                     experts = expert_indices.len(),
+                    hits = prefetch_hits,
+                    misses = miss_ids.len(),
                     "offloaded MoE I/O"
                 );
 
-                // Encode all experts with byte offsets into the single aligned buffer
+                let encode_submit_start = Instant::now();
+                let cmd_buf = fused_expert
+                    .create_command_buffer()
+                    .map_err(|e| Exception::custom(e.to_string()))?;
                 for (i, abuf) in aligned_bufs.iter().enumerate() {
                     fused_expert
                         .encode_expert_aligned(
@@ -1193,20 +2071,20 @@ impl Qwen3NextSparseMoeBlock {
                         )
                         .map_err(|e| Exception::custom(e.to_string()))?;
                 }
-
-                // Single commit + wait for all K experts
                 fused_expert
-                    .submit_and_wait(&cmd_buf)
+                    .submit(&cmd_buf)
                     .map_err(|e| Exception::custom(e.to_string()))?;
-
-                // Return buffers to pool (GPU work is complete after waitUntilCompleted)
-                for buf in aligned_bufs {
-                    pool.release(buf);
+                if let Some(profile) = layer_profile.as_deref_mut() {
+                    profile.push_section("moe_expert_encode_submit", encode_submit_start);
                 }
+                aligned_release_bufs = Some(aligned_bufs);
+                cmd_buf
             } else {
                 // ---- LEGACY COPY PATH ----
-                // Used when prefetch hits exist (prefetched buffers are Vec<u8>),
-                // or when buffer pool is unavailable.
+                // Used when the aligned buffer pool is unavailable.
+                let cmd_buf = fused_expert
+                    .create_command_buffer()
+                    .map_err(|e| Exception::custom(e.to_string()))?;
                 let miss_bufs = if !miss_ids.is_empty() {
                     ctx.read_experts(layer_idx, &miss_ids).map_err(|e| {
                         Exception::custom(format!("expert pread layer {layer_idx}: {e}"))
@@ -1216,11 +2094,11 @@ impl Qwen3NextSparseMoeBlock {
                 };
 
                 // Merge hits + misses in original order
-                let mut expert_bufs: Vec<Vec<u8>> = Vec::with_capacity(expert_indices.len());
-                let mut miss_iter = miss_bufs.into_iter();
+                let mut expert_bufs: Vec<Arc<Vec<u8>>> = Vec::with_capacity(expert_indices.len());
+                let mut miss_iter = miss_bufs.into_iter().map(Arc::new);
                 for hit in prefetched {
                     expert_bufs.push(match hit {
-                        Some(buf) => buf,
+                        Some(buf) => Arc::new(buf),
                         None => miss_iter.next().unwrap(),
                     });
                 }
@@ -1234,7 +2112,11 @@ impl Qwen3NextSparseMoeBlock {
                     misses = miss_ids.len(),
                     "offloaded MoE I/O"
                 );
+                if let Some(profile) = layer_profile.as_deref_mut() {
+                    profile.push_section("moe_expert_io", io_start);
+                }
 
+                let encode_submit_start = Instant::now();
                 for (i, raw_bytes) in expert_bufs.iter().enumerate() {
                     let weights =
                         crate::expert_dequant::parse_expert_weights(raw_bytes, record, &metal_ctx)
@@ -1252,12 +2134,42 @@ impl Qwen3NextSparseMoeBlock {
                 }
 
                 fused_expert
-                    .submit_and_wait(&cmd_buf)
+                    .submit(&cmd_buf)
                     .map_err(|e| Exception::custom(e.to_string()))?;
+                if let Some(profile) = layer_profile.as_deref_mut() {
+                    profile.push_section("moe_expert_encode_submit", encode_submit_start);
+                }
+                cmd_buf
+            };
+            let shared_start = Instant::now();
+            let shared_y = self.shared_expert.forward(&x_flat)?;
+            let shared_gate_logit = self.shared_expert_gate.forward(&x_flat)?;
+            shared_y.eval()?;
+            shared_gate_logit.eval()?;
+            if let Some(profile) = layer_profile.as_deref_mut() {
+                profile.push_section("moe_shared", shared_start);
+            }
+
+            let wait_start = Instant::now();
+            fused_expert
+                .wait_for_completion(&cmd_buf)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            if let Some(profile) = layer_profile.as_deref_mut() {
+                profile.push_section("moe_expert_wait", wait_start);
+                profile.push_section("moe_expert_gpu", wait_start);
+            }
+
+            if let Some(aligned_bufs) = aligned_release_bufs {
+                let pool = self.buffer_pool.as_ref().unwrap();
+                for buf in aligned_bufs {
+                    pool.release(buf);
+                }
             }
 
             // ---- Combine: weighted sum + shared expert + residual ----
+            let combine_start = Instant::now();
             // Convert Metal output buffers to MLX arrays (zero-copy)
+            let output_wrap_start = Instant::now();
             let k_usize = k as usize;
             let mut expert_arrays: Vec<Array> = Vec::with_capacity(k_usize);
             for i in 0..expert_indices.len().min(self.expert_out_bufs.len()) {
@@ -1266,9 +2178,9 @@ impl Qwen3NextSparseMoeBlock {
             }
             let down_out = ops::stack_axis(&expert_arrays, 1)?;
             let down_out = down_out.reshape(&[batch_seq, k, hidden])?;
-
-            let shared_y = self.shared_expert.forward(&x_flat)?;
-            let shared_gate_logit = self.shared_expert_gate.forward(&x_flat)?;
+            if let Some(profile) = layer_profile.as_deref_mut() {
+                profile.push_section("moe_output_wrap", output_wrap_start);
+            }
 
             let result = moe_combine_mlx(
                 &x_flat,
@@ -1279,9 +2191,66 @@ impl Qwen3NextSparseMoeBlock {
                 k,
                 batch_seq,
             )?;
-            result.reshape(shape)
+            let reshaped = result.reshape(shape)?;
+            reshaped.eval()?;
+            if let Some(profile) = layer_profile {
+                profile.push_section("moe_combine", combine_start);
+            }
+            Ok(reshaped)
         }
     }
+}
+
+fn prefetched_miss_plan<T>(
+    prefetched: &[Option<T>],
+    expert_indices: &[usize],
+) -> Vec<(usize, usize)> {
+    prefetched
+        .iter()
+        .enumerate()
+        .filter_map(|(slot_idx, hit)| {
+            hit.is_none()
+                .then_some((slot_idx, expert_indices[slot_idx]))
+        })
+        .collect()
+}
+
+fn copy_prefetched_expert_into_aligned(
+    aligned: &mut pmetal_metal::expert_buffer::AlignedBuffer,
+    raw_bytes: &[u8],
+) -> Result<(), Exception> {
+    aligned
+        .write_prefix(raw_bytes)
+        .map_err(|e| Exception::custom(e.to_string()))
+}
+
+#[cfg(unix)]
+fn load_missing_experts_into_aligned_buffers(
+    ctx: &ExpertOffloadContext,
+    layer_idx: usize,
+    miss_plan: &[(usize, usize)],
+    aligned_bufs: &mut [pmetal_metal::expert_buffer::AlignedBuffer],
+) -> Result<(), Exception> {
+    if miss_plan.is_empty() {
+        return Ok(());
+    }
+
+    let file = ctx
+        .file_manager
+        .file_for_layer(layer_idx)
+        .ok_or_else(|| Exception::custom(format!("Layer {layer_idx} has no MoE expert file")))?;
+    let fd = file.as_raw_fd();
+    let expert_size = ctx.file_manager.expert_size() as u64;
+
+    for &(slot_idx, expert_idx) in miss_plan {
+        aligned_bufs[slot_idx]
+            .pread(fd, expert_idx as u64 * expert_size)
+            .map_err(|e| {
+                Exception::custom(format!("expert aligned pread layer {layer_idx}: {e}"))
+            })?;
+    }
+
+    Ok(())
 }
 
 // ============================================================================
@@ -1352,6 +2321,17 @@ impl Qwen3NextFeedForward {
             Self::MoE(m) => m.forward(x),
         }
     }
+
+    pub fn forward_profiled(
+        &mut self,
+        x: &Array,
+        layer_profile: &mut Qwen3NextLayerProfile,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Dense(m) => profile_array_section(layer_profile, "mlp_dense", || m.forward(x)),
+            Self::MoE(m) => m.forward_profiled(x, layer_profile),
+        }
+    }
 }
 
 // ============================================================================
@@ -1378,6 +2358,14 @@ pub struct Qwen3NextDecoderLayer {
 
 impl Qwen3NextDecoderLayer {
     pub fn new(config: &Qwen3NextConfig, layer_idx: usize) -> Result<Self, Exception> {
+        Self::new_with_routed_expert_mode(config, layer_idx, Qwen3NextRoutedExpertMode::Resident)
+    }
+
+    pub fn new_with_routed_expert_mode(
+        config: &Qwen3NextConfig,
+        layer_idx: usize,
+        routed_expert_mode: Qwen3NextRoutedExpertMode,
+    ) -> Result<Self, Exception> {
         let is_linear = config.is_linear_layer(layer_idx);
 
         let linear_attn = if is_linear {
@@ -1399,7 +2387,10 @@ impl Qwen3NextDecoderLayer {
             .build()?;
 
         let mlp = if config.use_moe_at(layer_idx) {
-            Qwen3NextFeedForward::MoE(Qwen3NextSparseMoeBlock::new(config)?)
+            Qwen3NextFeedForward::MoE(Qwen3NextSparseMoeBlock::new_with_routed_expert_mode(
+                config,
+                routed_expert_mode,
+            )?)
         } else {
             Qwen3NextFeedForward::Dense(Qwen3NextMLP::new(
                 config.hidden_size,
@@ -1440,6 +2431,44 @@ impl Qwen3NextDecoderLayer {
         let mlp_in = self.post_attention_layernorm.forward(&h)?;
         h.add(&self.mlp.forward(&mlp_in)?)
     }
+
+    pub fn forward_profiled(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<(&mut KVCache, usize)>,
+        mamba_cache: Option<&mut MambaCacheEntry>,
+        layer_idx: usize,
+    ) -> Result<(Array, Qwen3NextLayerProfile), Exception> {
+        let layer_start = Instant::now();
+        let mut profile = Qwen3NextLayerProfile::new(layer_idx, self.is_linear);
+
+        let normed = profile_array_section(&mut profile, "input_layernorm", || {
+            self.input_layernorm.forward(x)
+        })?;
+        let r = if self.is_linear {
+            self.linear_attn
+                .as_mut()
+                .expect("linear_attn must be Some for linear layers")
+                .forward_profiled(&normed, mask, mamba_cache, &mut profile)?
+        } else {
+            self.self_attn
+                .as_mut()
+                .expect("self_attn must be Some for attention layers")
+                .forward_profiled(&normed, mask, kv_cache, &mut profile)?
+        };
+        let h = profile_array_section(&mut profile, "attn_residual", || x.add(&r))?;
+        let mlp_in = profile_array_section(&mut profile, "post_attention_layernorm", || {
+            self.post_attention_layernorm.forward(&h)
+        })?;
+        let mlp_start = Instant::now();
+        let mlp_out = self.mlp.forward_profiled(&mlp_in, &mut profile)?;
+        mlp_out.eval()?;
+        profile.push_section("mlp", mlp_start);
+        let out = profile_array_section(&mut profile, "mlp_residual", || h.add(&mlp_out))?;
+        profile.total_us = layer_start.elapsed().as_micros() as u64;
+        Ok((out, profile))
+    }
 }
 
 // ============================================================================
@@ -1465,9 +2494,16 @@ pub struct Qwen3NextModel {
 
 impl Qwen3NextModel {
     pub fn new(config: &Qwen3NextConfig) -> Result<Self, Exception> {
+        Self::new_with_routed_expert_mode(config, Qwen3NextRoutedExpertMode::Resident)
+    }
+
+    pub fn new_with_routed_expert_mode(
+        config: &Qwen3NextConfig,
+        routed_expert_mode: Qwen3NextRoutedExpertMode,
+    ) -> Result<Self, Exception> {
         let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)?;
         let layers = (0..config.num_hidden_layers as usize)
-            .map(|i| Qwen3NextDecoderLayer::new(config, i))
+            .map(|i| Qwen3NextDecoderLayer::new_with_routed_expert_mode(config, i, routed_expert_mode))
             .collect::<Result<Vec<_>, _>>()?;
         let norm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
@@ -1511,8 +2547,23 @@ impl Qwen3NextModel {
         // GDN interprets the mask as a token-validity boolean [B,T], not attention weights.
         let fa_mask = mask;
         let ssm_mask: Option<&Array> = None;
+        let prefill_like = hidden.dim(1) > 1;
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            // Kick off prefetch for the next MoE layer using the current
+            // layer input only for prompt prefill, where overlapping the next
+            // sparse layer's reads is worth the extra predictor work. For
+            // single-token decode, keep prefetch after the layer so we do not
+            // serialize the hot path before the current layer runs.
+            if prefill_like
+                && let (Some(prefetcher), Some(ctx)) = (&self.prefetcher, &self.offload_ctx)
+            {
+                let search = self.moe_layer_indices.partition_point(|&i| i <= layer_idx);
+                if search < self.moe_layer_indices.len() {
+                    prefetcher.predict_and_prefetch(self.moe_layer_indices[search], &hidden, ctx);
+                }
+            }
+
             let kv = if !layer.is_linear {
                 kv_cache.as_deref_mut().map(|c| (c, layer_idx))
             } else {
@@ -1529,10 +2580,9 @@ impl Qwen3NextModel {
             let layer_mask = if layer.is_linear { ssm_mask } else { fa_mask };
             hidden = layer.forward(&hidden, layer_mask, kv, mamba)?;
 
-            // Predict + prefetch experts for the next MoE layer (non-blocking).
-            // Uses current layer's output hidden states to predict which experts
-            // the next MoE layer will route to, then dispatches background pread.
-            if let (Some(prefetcher), Some(ctx)) = (&self.prefetcher, &self.offload_ctx) {
+            if !prefill_like
+                && let (Some(prefetcher), Some(ctx)) = (&self.prefetcher, &self.offload_ctx)
+            {
                 let search = self.moe_layer_indices.partition_point(|&i| i <= layer_idx);
                 if search < self.moe_layer_indices.len() {
                     prefetcher.predict_and_prefetch(self.moe_layer_indices[search], &hidden, ctx);
@@ -1541,6 +2591,72 @@ impl Qwen3NextModel {
         }
 
         self.norm.forward(&hidden)
+    }
+
+    pub fn forward_with_cache_profiled(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        mut kv_cache: Option<&mut KVCache>,
+        mut mamba_cache: Option<&mut MambaCache>,
+        phase: impl Into<String>,
+    ) -> Result<(Array, Qwen3NextForwardProfile), Exception> {
+        let model_start = Instant::now();
+        let mut profile = Qwen3NextForwardProfile::new(phase, input_ids.shape().to_vec());
+
+        let embed_start = Instant::now();
+        let mut hidden = Module::forward(&mut self.embed_tokens, input_ids)?;
+        hidden.eval()?;
+        profile.embedding_us = embed_start.elapsed().as_micros() as u64;
+
+        let fa_mask = mask;
+        let ssm_mask: Option<&Array> = None;
+        let prefill_like = hidden.dim(1) > 1;
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            if prefill_like
+                && let (Some(prefetcher), Some(ctx)) = (&self.prefetcher, &self.offload_ctx)
+            {
+                let search = self.moe_layer_indices.partition_point(|&i| i <= layer_idx);
+                if search < self.moe_layer_indices.len() {
+                    prefetcher.predict_and_prefetch(self.moe_layer_indices[search], &hidden, ctx);
+                }
+            }
+
+            let kv = if !layer.is_linear {
+                kv_cache.as_deref_mut().map(|c| (c, layer_idx))
+            } else {
+                None
+            };
+            let mamba = if layer.is_linear {
+                mamba_cache
+                    .as_deref_mut()
+                    .and_then(|c| c.get_mut(layer_idx))
+            } else {
+                None
+            };
+            let layer_mask = if layer.is_linear { ssm_mask } else { fa_mask };
+            let (next_hidden, layer_profile) =
+                layer.forward_profiled(&hidden, layer_mask, kv, mamba, layer_idx)?;
+            hidden = next_hidden;
+            profile.layers.push(layer_profile);
+
+            if !prefill_like
+                && let (Some(prefetcher), Some(ctx)) = (&self.prefetcher, &self.offload_ctx)
+            {
+                let search = self.moe_layer_indices.partition_point(|&i| i <= layer_idx);
+                if search < self.moe_layer_indices.len() {
+                    prefetcher.predict_and_prefetch(self.moe_layer_indices[search], &hidden, ctx);
+                }
+            }
+        }
+
+        let final_norm_start = Instant::now();
+        let hidden = self.norm.forward(&hidden)?;
+        hidden.eval()?;
+        profile.final_norm_us = final_norm_start.elapsed().as_micros() as u64;
+        profile.total_us = model_start.elapsed().as_micros() as u64;
+        Ok((hidden, profile))
     }
 }
 
@@ -1559,7 +2675,14 @@ pub struct Qwen3NextForCausalLM {
 
 impl Qwen3NextForCausalLM {
     pub fn new(config: Qwen3NextConfig) -> Result<Self, Exception> {
-        let model = Qwen3NextModel::new(&config)?;
+        Self::new_with_routed_expert_mode(config, Qwen3NextRoutedExpertMode::Resident)
+    }
+
+    pub fn new_with_routed_expert_mode(
+        config: Qwen3NextConfig,
+        routed_expert_mode: Qwen3NextRoutedExpertMode,
+    ) -> Result<Self, Exception> {
+        let model = Qwen3NextModel::new_with_routed_expert_mode(&config, routed_expert_mode)?;
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
@@ -1573,6 +2696,16 @@ impl Qwen3NextForCausalLM {
             model,
             lm_head,
             config,
+        })
+    }
+
+    pub fn requires_expert_offloading(&self) -> bool {
+        self.model.layers.iter().any(|layer| {
+            matches!(
+                &layer.mlp,
+                Qwen3NextFeedForward::MoE(block)
+                    if !block.routed_experts_loaded && block.offload_ctx.is_none()
+            )
         })
     }
 
@@ -1602,6 +2735,30 @@ impl Qwen3NextForCausalLM {
         self.lm_head_forward(&h)
     }
 
+    pub fn forward_with_cache_profiled(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+        phase: impl Into<String>,
+    ) -> Result<(Array, Qwen3NextForwardProfile), Exception> {
+        let total_start = Instant::now();
+        let (h, mut profile) = self.model.forward_with_cache_profiled(
+            input_ids,
+            mask,
+            kv_cache,
+            mamba_cache,
+            phase,
+        )?;
+        let lm_head_start = Instant::now();
+        let logits = self.lm_head_forward(&h)?;
+        logits.eval()?;
+        profile.lm_head_us = lm_head_start.elapsed().as_micros() as u64;
+        profile.total_us = total_start.elapsed().as_micros() as u64;
+        Ok((logits, profile))
+    }
+
     pub fn config(&self) -> &Qwen3NextConfig {
         &self.config
     }
@@ -1619,7 +2776,7 @@ impl Qwen3NextForCausalLM {
         );
 
         // Extract gate weights from each MoE layer for the prefetcher
-        let mut gate_weights: HashMap<usize, Arc<Vec<f32>>> = HashMap::new();
+        let mut gate_weights: HashMap<usize, Vec<f32>> = HashMap::new();
         for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
             if let Qwen3NextFeedForward::MoE(ref mut block) = layer.mlp {
                 // Enable offloading on the block (sets offload_ctx + layer_idx)
@@ -1628,8 +2785,7 @@ impl Qwen3NextForCausalLM {
                 // Extract gate weight matrix for prefetch prediction
                 let w = block.gate.weight.as_ref().as_type::<f32>()?;
                 w.eval()?;
-                let data: Vec<f32> = w.as_slice().to_vec();
-                gate_weights.insert(layer_idx, Arc::new(data));
+                gate_weights.insert(layer_idx, w.as_slice().to_vec());
             }
         }
 
@@ -1665,6 +2821,7 @@ impl Qwen3NextForCausalLM {
                     *block.switch_mlp_gate_proj = Array::zeros::<f32>(&[1])?;
                     *block.switch_mlp_up_proj = Array::zeros::<f32>(&[1])?;
                     *block.switch_mlp_down_proj = Array::zeros::<f32>(&[1])?;
+                    block.routed_experts_loaded = false;
                 }
             }
         }
@@ -1699,6 +2856,7 @@ impl Qwen3NextForCausalLM {
 pub fn sanitize_weights(
     weights: &mut HashMap<String, Array>,
     config: &Qwen3NextConfig,
+    options: Qwen3NextSanitizeOptions,
 ) -> Result<(), Exception> {
     // Detect shift condition BEFORE removing MTP (matching Python line 289-293)
     let has_mtp = weights.keys().any(|k| k.contains("mtp."));
@@ -1730,10 +2888,33 @@ pub fn sanitize_weights(
         }
     }
 
-    // Check if expert stacking is needed
-    let needs_stacking = weights.contains_key("model.layers.0.mlp.experts.0.up_proj.weight");
+    let needs_fused_stacking = weights.contains_key("model.layers.0.mlp.experts.gate_up_proj");
+    let needs_split_stacking = weights.contains_key("model.layers.0.mlp.experts.0.up_proj.weight");
 
-    if needs_stacking {
+    if needs_fused_stacking {
+        for l in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{l}.mlp");
+            let gate_up_key = format!("{prefix}.experts.gate_up_proj");
+            let down_key = format!("{prefix}.experts.down_proj");
+
+            if options.skip_routed_experts {
+                weights.remove(&gate_up_key);
+                weights.remove(&down_key);
+                continue;
+            }
+
+            if let Some(gate_up) = weights.remove(&gate_up_key) {
+                let inter = config.moe_intermediate_size;
+                let gate = gate_up.index((.., 0..inter, ..));
+                let up = gate_up.index((.., inter..inter * 2, ..));
+                weights.insert(format!("{prefix}.switch_mlp_gate_proj"), gate);
+                weights.insert(format!("{prefix}.switch_mlp_up_proj"), up);
+            }
+            if let Some(down) = weights.remove(&down_key) {
+                weights.insert(format!("{prefix}.switch_mlp_down_proj"), down);
+            }
+        }
+    } else if needs_split_stacking {
         for l in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{l}.mlp");
             for n in &["up_proj", "down_proj", "gate_proj"] {
@@ -1741,13 +2922,21 @@ pub fn sanitize_weights(
                 for e in 0..config.num_experts {
                     let key = format!("{prefix}.experts.{e}.{n}.weight");
                     if let Some(w) = weights.remove(&key) {
-                        expert_weights.push(w);
+                        if !options.skip_routed_experts {
+                            expert_weights.push(w);
+                        }
                     }
                 }
                 if !expert_weights.is_empty() {
                     let refs: Vec<&Array> = expert_weights.iter().collect();
                     let stacked = ops::stack_axis(&refs, 0)?;
-                    weights.insert(format!("{prefix}.switch_mlp.{n}.weight"), stacked);
+                    let dest = match *n {
+                        "gate_proj" => format!("{prefix}.switch_mlp_gate_proj"),
+                        "up_proj" => format!("{prefix}.switch_mlp_up_proj"),
+                        "down_proj" => format!("{prefix}.switch_mlp_down_proj"),
+                        _ => unreachable!(),
+                    };
+                    weights.insert(dest, stacked);
                 }
             }
         }
@@ -1916,6 +3105,30 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_mlp_forward_matches_manual_swiglu() {
+        let mut mlp = Qwen3NextMLP::new(32, 64).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
+
+        let gate = mlp.gate_proj.forward(&x).unwrap();
+        let up = mlp.up_proj.forward(&x).unwrap();
+        let expected = mlp
+            .down_proj
+            .forward(&nn::silu(&gate).unwrap().multiply(&up).unwrap())
+            .unwrap();
+        let actual = mlp.forward(&x).unwrap();
+        let max_diff = actual
+            .subtract(&expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(max_diff < 1e-5, "max diff too high: {max_diff}");
+    }
+
+    #[test]
+    #[serial]
     fn test_gated_rms_norm() {
         let norm = Qwen3NextRMSNormGated::new(32, 1e-6).unwrap();
         let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
@@ -1941,6 +3154,28 @@ mod tests {
     }
 
     #[test]
+    fn test_attention_mask_type_selection() {
+        assert_eq!(
+            Qwen3NextAttention::mask_type_for_call(None, false, 4),
+            AttentionMaskType::Causal
+        );
+        assert_eq!(
+            Qwen3NextAttention::mask_type_for_call(None, true, 1),
+            AttentionMaskType::Causal
+        );
+
+        let custom_mask = Array::ones::<bool>(&[1, 1, 1, 1]).unwrap();
+        assert_eq!(
+            Qwen3NextAttention::mask_type_for_call(Some(&custom_mask), false, 4),
+            AttentionMaskType::None
+        );
+        assert_eq!(
+            Qwen3NextAttention::mask_type_for_call(Some(&custom_mask), true, 1),
+            AttentionMaskType::None
+        );
+    }
+
+    #[test]
     #[serial]
     fn test_gdn_output_shape() {
         let config = tiny_config();
@@ -1948,6 +3183,246 @@ mod tests {
         let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
         let output = gdn.forward(&x, None, None).unwrap();
         assert_eq!(output.shape(), &[1, 4, 32]);
+    }
+
+    #[test]
+    fn test_prefetched_miss_plan_tracks_slots_and_experts() {
+        let prefetched = vec![Some(vec![1u8; 4]), None, Some(vec![2u8; 4]), None];
+        let expert_indices = vec![2usize, 3, 7, 11];
+        let miss_plan = prefetched_miss_plan(&prefetched, &expert_indices);
+        assert_eq!(miss_plan, vec![(1, 3), (3, 11)]);
+    }
+
+    #[test]
+    fn test_sparse_moe_required_pool_buffers_covers_prefill_window() {
+        assert_eq!(Qwen3NextSparseMoeBlock::required_pool_buffers(0), 1);
+        assert_eq!(Qwen3NextSparseMoeBlock::required_pool_buffers(4), 32);
+        assert_eq!(Qwen3NextSparseMoeBlock::required_pool_buffers(8), 64);
+    }
+
+    #[test]
+    fn test_sparse_moe_required_output_buffers_covers_prefill_window() {
+        assert_eq!(Qwen3NextSparseMoeBlock::required_output_buffers(0), 1);
+        assert_eq!(Qwen3NextSparseMoeBlock::required_output_buffers(4), 32);
+        assert_eq!(Qwen3NextSparseMoeBlock::required_output_buffers(8), 64);
+    }
+
+    #[test]
+    fn test_sanitize_weights_keeps_legacy_norm_shift_when_needed() {
+        let config = tiny_config();
+        let mut weights = HashMap::from([
+            (
+                "model.language_model.layers.0.input_layernorm.weight".to_string(),
+                Array::from_slice(&[0.25f32, -0.5, 1.0], &[3]),
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.conv1d.weight".to_string(),
+                Array::zeros::<f32>(&[4, 1, 4]).unwrap(),
+            ),
+            ("mtp.fc.weight".to_string(), Array::from_f32(1.0)),
+        ]);
+
+        sanitize_weights(&mut weights, &config, Qwen3NextSanitizeOptions::default()).unwrap();
+
+        let shifted = weights
+            .get("model.layers.0.input_layernorm.weight")
+            .unwrap()
+            .as_type::<f32>()
+            .unwrap();
+        let shifted_vec: Vec<f32> = shifted.as_slice().to_vec();
+        assert_eq!(shifted_vec, vec![1.25, 0.5, 2.0]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_copy_prefetched_expert_into_aligned_buffer() {
+        let ctx = pmetal_metal::context::MetalContext::global().unwrap();
+        let mut aligned =
+            pmetal_metal::expert_buffer::AlignedBuffer::new(ctx.device(), 16).unwrap();
+        let payload = vec![9u8, 7, 5, 3, 1];
+        copy_prefetched_expert_into_aligned(&mut aligned, &payload).unwrap();
+        assert!(aligned.size() >= payload.len());
+    }
+
+    #[test]
+    #[serial]
+    fn test_gdn_combined_input_projection_matches_separate_linears() {
+        let config = tiny_config();
+        let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[1, 1, 32], None, None, None).unwrap();
+
+        let qkv_ref = gdn.in_proj_qkv.forward(&x).unwrap();
+        let z_ref = gdn
+            .in_proj_z
+            .forward(&x)
+            .unwrap()
+            .reshape(&[1, 1, gdn.num_v_heads, gdn.head_v_dim])
+            .unwrap();
+        let b_ref = gdn.in_proj_b.forward(&x).unwrap();
+        let a_ref = gdn.in_proj_a.forward(&x).unwrap();
+
+        let (qkv, z, b_val, a) = gdn.combined_input_projection(&x).unwrap();
+
+        qkv.eval().unwrap();
+        z.eval().unwrap();
+        b_val.eval().unwrap();
+        a.eval().unwrap();
+        qkv_ref.eval().unwrap();
+        z_ref.eval().unwrap();
+        b_ref.eval().unwrap();
+        a_ref.eval().unwrap();
+
+        let max_qkv_diff = qkv
+            .subtract(&qkv_ref)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        let max_z_diff = z
+            .subtract(&z_ref)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        let max_b_diff = b_val
+            .subtract(&b_ref)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        let max_a_diff = a
+            .subtract(&a_ref)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+
+        assert!(
+            max_qkv_diff < 1e-5,
+            "combined qkv projection diverged: {max_qkv_diff}"
+        );
+        assert!(max_z_diff < 1e-5, "combined z projection diverged: {max_z_diff}");
+        assert!(max_b_diff < 1e-5, "combined b projection diverged: {max_b_diff}");
+        assert!(max_a_diff < 1e-5, "combined a projection diverged: {max_a_diff}");
+    }
+
+    #[test]
+    fn test_gdn_combined_input_projection_is_gated_by_hidden_size_and_decode_shape() {
+        let mut config = tiny_config();
+        config.hidden_size = 2048;
+        let gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
+        let decode = Array::zeros::<f32>(&[1, 1, 2048]).unwrap();
+        let prefill = Array::zeros::<f32>(&[1, 2, 2048]).unwrap();
+
+        assert!(gdn.should_use_combined_input_proj(&decode, None));
+        assert!(!gdn.should_use_combined_input_proj(&prefill, None));
+
+        let mut large_config = config.clone();
+        large_config.hidden_size = 4096;
+        let large_gdn = Qwen3NextGatedDeltaNet::new(&large_config).unwrap();
+        assert!(!large_gdn.should_use_combined_input_proj(&decode, None));
+    }
+
+    #[test]
+    #[serial]
+    fn test_gdn_cached_decode_matches_general_path() {
+        let config = tiny_config();
+        let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
+        let prefill = mlx_rs::random::normal::<f32>(&[1, 3, 32], None, None, None).unwrap();
+        let decode = mlx_rs::random::normal::<f32>(&[1, 1, 32], None, None, None).unwrap();
+        let mut cache_general = MambaCacheEntry::default();
+        let mut cache_fast = MambaCacheEntry::default();
+
+        let _ = gdn
+            .forward_general(&prefill, None, Some(&mut cache_general))
+            .unwrap();
+        let _ = gdn.forward(&prefill, None, Some(&mut cache_fast)).unwrap();
+
+        let reference = gdn
+            .forward_general(&decode, None, Some(&mut cache_general))
+            .unwrap();
+        let optimized = gdn.forward(&decode, None, Some(&mut cache_fast)).unwrap();
+
+        let output_diff = reference.subtract(&optimized).unwrap().abs().unwrap();
+        let max_output_diff = output_diff.max(None).unwrap().item::<f32>();
+        assert!(
+            max_output_diff < 1e-4,
+            "cached decode output diverged from general path: {max_output_diff}"
+        );
+
+        let conv_diff = cache_general
+            .conv_state
+            .as_ref()
+            .unwrap()
+            .subtract(cache_fast.conv_state.as_ref().unwrap())
+            .unwrap()
+            .abs()
+            .unwrap();
+        let max_conv_diff = conv_diff.max(None).unwrap().item::<f32>();
+        assert!(
+            max_conv_diff < 1e-6,
+            "cached decode conv state diverged from general path: {max_conv_diff}"
+        );
+
+        let ssm_diff = cache_general
+            .ssm_state
+            .as_ref()
+            .unwrap()
+            .subtract(cache_fast.ssm_state.as_ref().unwrap())
+            .unwrap()
+            .abs()
+            .unwrap();
+        let max_ssm_diff = ssm_diff.max(None).unwrap().item::<f32>();
+        assert!(
+            max_ssm_diff < 1e-4,
+            "cached decode SSM state diverged from general path: {max_ssm_diff}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_profiled_forward_collects_layer_sections() {
+        let config = tiny_config();
+        let mut model = Qwen3NextForCausalLM::new(config).unwrap();
+        let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+
+        let (logits, profile) = model
+            .forward_with_cache_profiled(&input_ids, None, None, None, "prefill")
+            .unwrap();
+
+        assert_eq!(logits.shape(), &[1, 4, 100]);
+        assert_eq!(profile.phase, "prefill");
+        assert_eq!(profile.layers.len(), 4);
+        assert!(profile.embedding_us > 0);
+        assert!(profile.final_norm_us > 0);
+        assert!(profile.lm_head_us > 0);
+        assert!(profile.total_us >= profile.embedding_us + profile.final_norm_us);
+
+        let linear_layer = &profile.layers[0];
+        assert_eq!(linear_layer.layer_kind, "linear_attention");
+        assert!(
+            linear_layer
+                .sections
+                .iter()
+                .any(|section| section.name == "gdn_recurrence")
+        );
+
+        let attn_layer = &profile.layers[3];
+        assert_eq!(attn_layer.layer_kind, "full_attention");
+        assert!(
+            attn_layer
+                .sections
+                .iter()
+                .any(|section| section.name == "attn_sdpa")
+        );
     }
 
     #[test]
@@ -2069,5 +3544,128 @@ mod tests {
         assert!(!config.is_linear_layer(3)); // full_attention
         assert!(config.is_linear_layer(4));
         assert!(!config.is_linear_layer(7)); // full_attention
+    }
+
+    #[test]
+    fn test_qwen35_moe_text_config_without_intermediate_size_parses() {
+        let nested_json = r#"{
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "hidden_size": 3072,
+                "num_hidden_layers": 48,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "vocab_size": 151936,
+                "rms_norm_eps": 1e-6,
+                "tie_word_embeddings": false,
+                "num_experts": 256,
+                "num_experts_per_tok": 8,
+                "moe_intermediate_size": 1024,
+                "shared_expert_intermediate_size": 1024,
+                "mlp_only_layers": [],
+                "layer_types": ["linear_attention", "full_attention"]
+            }
+        }"#;
+
+        let config_json: serde_json::Value = serde_json::from_str(nested_json).unwrap();
+        let text_config_str = serde_json::to_string(&config_json["text_config"]).unwrap();
+        let mut config: Qwen3NextConfig = serde_json::from_str(&text_config_str).unwrap();
+        config.apply_rope_parameters();
+
+        assert_eq!(config.intermediate_size, 1024);
+        assert!(config.use_moe_at(0));
+        assert!(config.use_moe_at(1));
+    }
+
+    #[test]
+    fn test_sanitize_weights_stacks_fused_qwen35_moe_experts() {
+        let mut config = tiny_config();
+        config.num_hidden_layers = 1;
+        config.num_experts = 2;
+        config.num_experts_per_tok = 2;
+        config.moe_intermediate_size = 4;
+        config.hidden_size = 8;
+
+        let gate_up_data: Vec<f32> = (0..(2 * 8 * 8)).map(|i| i as f32).collect();
+        let down_data: Vec<f32> = (0..(2 * 8 * 4)).map(|i| 1000.0 + i as f32).collect();
+        let mut weights = HashMap::from([
+            (
+                "model.language_model.layers.0.mlp.experts.gate_up_proj".to_string(),
+                Array::from_slice(&gate_up_data, &[2, 8, 8]),
+            ),
+            (
+                "model.language_model.layers.0.mlp.experts.down_proj".to_string(),
+                Array::from_slice(&down_data, &[2, 8, 4]),
+            ),
+        ]);
+
+        sanitize_weights(&mut weights, &config, Qwen3NextSanitizeOptions::default()).unwrap();
+
+        let gate = weights
+            .get("model.layers.0.mlp.switch_mlp_gate_proj")
+            .unwrap();
+        let up = weights
+            .get("model.layers.0.mlp.switch_mlp_up_proj")
+            .unwrap();
+        let down = weights
+            .get("model.layers.0.mlp.switch_mlp_down_proj")
+            .unwrap();
+        assert_eq!(gate.shape(), &[2, 4, 8]);
+        assert_eq!(up.shape(), &[2, 4, 8]);
+        assert_eq!(down.shape(), &[2, 8, 4]);
+        assert!(!weights.contains_key("model.language_model.layers.0.mlp.experts.gate_up_proj"));
+    }
+
+    #[test]
+    fn test_sanitize_weights_can_skip_fused_routed_experts() {
+        let mut config = tiny_config();
+        config.num_hidden_layers = 1;
+        config.num_experts = 2;
+        config.num_experts_per_tok = 2;
+        config.moe_intermediate_size = 4;
+        config.hidden_size = 8;
+
+        let mut weights = HashMap::from([
+            (
+                "model.language_model.layers.0.mlp.experts.gate_up_proj".to_string(),
+                Array::zeros::<f32>(&[2, 8, 8]).unwrap(),
+            ),
+            (
+                "model.language_model.layers.0.mlp.experts.down_proj".to_string(),
+                Array::zeros::<f32>(&[2, 8, 4]).unwrap(),
+            ),
+        ]);
+
+        sanitize_weights(
+            &mut weights,
+            &config,
+            Qwen3NextSanitizeOptions {
+                skip_routed_experts: true,
+            },
+        )
+        .unwrap();
+
+        assert!(weights.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_placeholder_sparse_moe_block_requires_offload_before_forward() {
+        let mut config = tiny_config();
+        config.num_experts = 2;
+        config.num_experts_per_tok = 2;
+        config.moe_intermediate_size = 8;
+        config.shared_expert_intermediate_size = 16;
+
+        let mut block = Qwen3NextSparseMoeBlock::new_with_routed_expert_mode(
+            &config,
+            Qwen3NextRoutedExpertMode::Placeholder,
+        )
+        .unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[1, 2, config.hidden_size], None, None, None)
+            .unwrap();
+        let err = block.forward(&x).unwrap_err().to_string();
+        assert!(err.contains("enable expert offloading"));
     }
 }

@@ -2049,6 +2049,11 @@ impl NemotronHForCausalLM {
         }
     }
 
+    /// Eagerly build stacked expert caches for all MoE layers.
+    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
+        self.backbone.init_stacked_moe()
+    }
+
     /// Forward pass with optional KV cache and Mamba cache.
     pub fn forward_with_cache(
         &mut self,

@@ -40,7 +40,8 @@ use pmetal_mlx::kernels::{
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache, MambaCacheEntry};
 use pmetal_models::ModelConfig;
 use pmetal_models::architectures::qwen3_next::{
-    Qwen3NextConfig, Qwen3NextRMSNormGated, Qwen3NextSparseMoeBlock, sanitize_weights,
+    Qwen3NextConfig, Qwen3NextRMSNormGated, Qwen3NextSanitizeOptions,
+    Qwen3NextSparseMoeBlock, sanitize_weights,
 };
 
 use crate::{LoraError, LoraLinear};
@@ -1606,14 +1607,14 @@ impl Qwen3NextLoraForCausalLM {
                         moe.gate.weight = Param::new(w.clone());
                     }
                     // Frozen stacked expert weights (post sanitize_weights)
-                    if let Some(w) = weights.get(&format!("{pfx}.mlp.switch_mlp.gate_proj.weight"))
+                    if let Some(w) = weights.get(&format!("{pfx}.mlp.switch_mlp_gate_proj"))
                     {
                         moe.switch_mlp_gate_proj = Param::new(w.clone());
                     }
-                    if let Some(w) = weights.get(&format!("{pfx}.mlp.switch_mlp.up_proj.weight")) {
+                    if let Some(w) = weights.get(&format!("{pfx}.mlp.switch_mlp_up_proj")) {
                         moe.switch_mlp_up_proj = Param::new(w.clone());
                     }
-                    if let Some(w) = weights.get(&format!("{pfx}.mlp.switch_mlp.down_proj.weight"))
+                    if let Some(w) = weights.get(&format!("{pfx}.mlp.switch_mlp_down_proj"))
                     {
                         moe.switch_mlp_down_proj = Param::new(w.clone());
                     }
@@ -1670,7 +1671,12 @@ impl Qwen3NextLoraForCausalLM {
         if single_file.exists() {
             let mut weights =
                 crate::sanitize_loaded_weights(Array::load_safetensors(&single_file)?)?;
-            sanitize_weights(&mut weights, &self.model.config).map_err(LoraError::Mlx)?;
+            sanitize_weights(
+                &mut weights,
+                &self.model.config,
+                Qwen3NextSanitizeOptions::default(),
+            )
+            .map_err(LoraError::Mlx)?;
             return self.load_base_weights(&weights);
         }
 
@@ -1703,7 +1709,12 @@ impl Qwen3NextLoraForCausalLM {
             all_weights.extend(shard_weights);
         }
 
-        sanitize_weights(&mut all_weights, &self.model.config).map_err(LoraError::Mlx)?;
+        sanitize_weights(
+            &mut all_weights,
+            &self.model.config,
+            Qwen3NextSanitizeOptions::default(),
+        )
+        .map_err(LoraError::Mlx)?;
         self.load_base_weights(&all_weights)
     }
 

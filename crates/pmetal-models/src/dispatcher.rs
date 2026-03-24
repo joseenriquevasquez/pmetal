@@ -6,7 +6,7 @@
 use crate::architectures::*;
 use crate::loader::{
     load_bert_weights, load_falcon_h1_weights, load_generic_weights, load_nemotron_weights,
-    load_qwen3_next_weights, load_weights,
+    load_qwen3_next_weights_with_options, load_weights, Qwen3NextLoadOptions,
 };
 use crate::traits::{CausalLMModel, ModelConfig};
 use mlx_rs::{
@@ -33,6 +33,11 @@ fn find_compatible_group_size(head_dim: usize, preferred: usize) -> usize {
 }
 
 const PARAM_EVAL_BATCH_SIZE: usize = 128;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DynamicModelLoadOptions {
+    pub prefer_expert_offload: bool,
+}
 
 fn eval_module_parameters_batched(module: &impl ModuleParameters) -> Result<(), Exception> {
     let params = module.parameters().flatten();
@@ -105,7 +110,12 @@ impl ModelArchitecture {
             "llama4" => Some(Self::Llama4),
             "llama" | "llama3" => Some(Self::Llama),
             "qwen3_moe" => Some(Self::Qwen3MoE),
-            "qwen3_next" | "qwen3_5" | "qwen3.5" | "qwen3_5_text" => Some(Self::Qwen3Next),
+            "qwen3_next"
+            | "qwen3_5"
+            | "qwen3.5"
+            | "qwen3_5_text"
+            | "qwen3_5_moe"
+            | "qwen3_5_moe_text" => Some(Self::Qwen3Next),
             "qwen3" => Some(Self::Qwen3),
             "qwen2" | "qwen2_5" => Some(Self::Qwen2),
             "gemma" | "gemma2" | "gemma3" => Some(Self::Gemma),
@@ -143,6 +153,8 @@ impl ModelArchitecture {
                 || lower.contains("qwen35")
                 || lower.contains("qwen3_5")
                 || lower.contains("qwen3.5")
+                || lower.contains("qwen35moe")
+                || lower.contains("qwen3_5_moe")
             {
                 return Some(Self::Qwen3Next);
             }
@@ -344,8 +356,25 @@ impl std::fmt::Debug for DynamicModel {
 }
 
 impl DynamicModel {
+    fn init_post_load_fast_paths(&mut self) -> Result<(), Exception> {
+        match self {
+            Self::Qwen3MoE(model) => model.init_stacked_moe(),
+            Self::DeepSeek(model) => model.init_stacked_moe(),
+            Self::NemotronH(model) => model.init_stacked_moe(),
+            _ => Ok(()),
+        }
+    }
+
     /// Load a model from a directory, automatically detecting its architecture.
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self, Exception> {
+        Self::load_with_options(model_dir, DynamicModelLoadOptions::default())
+    }
+
+    /// Load a model from a directory with caller-controlled load behavior.
+    pub fn load_with_options(
+        model_dir: impl AsRef<Path>,
+        options: DynamicModelLoadOptions,
+    ) -> Result<Self, Exception> {
         let model_dir = model_dir.as_ref();
         let config_path = model_dir.join("config.json");
         if !config_path.exists() {
@@ -418,7 +447,9 @@ impl DynamicModel {
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 eval_module_parameters_batched(&model)?;
-                Ok(Self::Qwen3MoE(model))
+                let mut model = Self::Qwen3MoE(model);
+                model.init_post_load_fast_paths()?;
+                Ok(model)
             }
             ModelArchitecture::Gemma => {
                 let mut config: GemmaConfig = json5::from_str(&config_content)
@@ -470,7 +501,9 @@ impl DynamicModel {
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 eval_module_parameters_batched(&model)?;
-                Ok(Self::DeepSeek(model))
+                let mut model = Self::DeepSeek(model);
+                model.init_post_load_fast_paths()?;
+                Ok(model)
             }
             ModelArchitecture::Cohere => {
                 let config: CohereConfig = json5::from_str(&config_content)
@@ -497,7 +530,9 @@ impl DynamicModel {
                 crate::loader::load_nemotron_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 eval_module_parameters_batched(&model)?;
-                Ok(Self::NemotronH(model))
+                let mut model = Self::NemotronH(model);
+                model.init_post_load_fast_paths()?;
+                Ok(model)
             }
             ModelArchitecture::Qwen3Next => {
                 // Qwen 3.5 configs may have text_config nesting (VLM wrapper format)
@@ -514,8 +549,26 @@ impl DynamicModel {
                 let mut config: Qwen3NextConfig = serde_json::from_str(&text_config_str)
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 config.apply_rope_parameters();
-                let mut model = Qwen3NextForCausalLM::new(config.clone())?;
-                load_qwen3_next_weights(&mut model, model_dir, &config)
+                let skip_routed_experts =
+                    options.prefer_expert_offload && config.num_experts > 0;
+                let routed_expert_mode = if skip_routed_experts {
+                    Qwen3NextRoutedExpertMode::Placeholder
+                } else {
+                    Qwen3NextRoutedExpertMode::Resident
+                };
+                let mut model =
+                    Qwen3NextForCausalLM::new_with_routed_expert_mode(
+                        config.clone(),
+                        routed_expert_mode,
+                    )?;
+                let load_options = if skip_routed_experts {
+                    Qwen3NextLoadOptions {
+                        skip_routed_experts: true,
+                    }
+                } else {
+                    Qwen3NextLoadOptions::default()
+                };
+                load_qwen3_next_weights_with_options(&mut model, model_dir, &config, load_options)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Qwen3Next(model))
@@ -930,6 +983,13 @@ impl DynamicModel {
         }
     }
 
+    pub fn requires_expert_offloading(&self) -> bool {
+        match self {
+            Self::Qwen3Next(m) => m.requires_expert_offloading(),
+            _ => false,
+        }
+    }
+
     /// Get prefetch hit/miss statistics (if expert offloading is enabled).
     pub fn prefetch_stats(&self) -> Option<crate::expert_prefetch::PrefetchStats> {
         match self {
@@ -983,5 +1043,204 @@ impl Module<Array> for DynamicModel {
 
     fn training_mode(&mut self, _mode: bool) {
         // No-op for now as most models don't implement Module trait yet
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn tiny_qwen3_moe_config() -> Qwen3MoEConfig {
+        Qwen3MoEConfig {
+            hidden_size: 32,
+            intermediate_size: 64,
+            moe_intermediate_size: Some(32),
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: Some(1),
+            head_dim: 16,
+            vocab_size: 100,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            decoder_sparse_step: 1,
+            tie_word_embeddings: true,
+            ..Default::default()
+        }
+    }
+
+    fn tiny_deepseek_config() -> DeepSeekConfig {
+        DeepSeekConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            moe_intermediate_size: 24,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: Some(4),
+            n_shared_experts: Some(1),
+            n_routed_experts: Some(4),
+            num_experts_per_tok: 2,
+            moe_layer_freq: 1,
+            first_k_dense_replace: 0,
+            ..DeepSeekConfig::default()
+        }
+    }
+
+    fn tiny_nemotron_h_config() -> NemotronHConfig {
+        NemotronHConfig {
+            model_type: "nemotron_h".to_string(),
+            vocab_size: 1000,
+            hidden_size: 128,
+            intermediate_size: 256,
+            num_hidden_layers: 4,
+            max_position_embeddings: 512,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            attention_bias: false,
+            head_dim: Some(32),
+            mamba_num_heads: 4,
+            mamba_head_dim: 32,
+            mamba_proj_bias: false,
+            ssm_state_size: 16,
+            conv_kernel: 4,
+            n_groups: 2,
+            time_step_limit: (0.0, f32::INFINITY),
+            time_step_min: None,
+            time_step_max: None,
+            mlp_bias: false,
+            mlp_hidden_act: "relu2".to_string(),
+            layer_norm_epsilon: 1e-5,
+            use_bias: false,
+            use_conv_bias: true,
+            tie_word_embeddings: true,
+            hybrid_override_pattern: Some("M*-E".to_string()),
+            moe_intermediate_size: Some(64),
+            moe_shared_expert_intermediate_size: None,
+            n_group: None,
+            n_routed_experts: Some(2),
+            n_shared_experts: None,
+            topk_group: None,
+            num_experts_per_tok: Some(1),
+            norm_topk_prob: None,
+            routed_scaling_factor: None,
+            rope_theta: 10000.0,
+        }
+    }
+
+    fn tiny_qwen35_moe_text_config() -> Qwen3NextConfig {
+        Qwen3NextConfig {
+            model_type: "qwen3_5_moe_text".to_string(),
+            vocab_size: 100,
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: Some(1),
+            head_dim: Some(16),
+            max_position_embeddings: 256,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            tie_word_embeddings: true,
+            linear_num_value_heads: 2,
+            linear_num_key_heads: 1,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            decoder_sparse_step: 1,
+            moe_intermediate_size: 48,
+            shared_expert_intermediate_size: 32,
+            mlp_only_layers: Vec::new(),
+            norm_topk_prob: true,
+            partial_rotary_factor: 0.25,
+            attention_bias: false,
+            rope_scaling: None,
+            rope_parameters: None,
+            layer_types: Some(vec![
+                "linear_attention".to_string(),
+                "linear_attention".to_string(),
+            ]),
+        }
+    }
+
+    #[test]
+    fn qwen35_moe_model_type_detects_as_qwen3_next() {
+        assert_eq!(
+            ModelArchitecture::from_model_type("qwen3_5_moe"),
+            Some(ModelArchitecture::Qwen3Next)
+        );
+        assert_eq!(
+            ModelArchitecture::from_model_type("qwen3_5_moe_text"),
+            Some(ModelArchitecture::Qwen3Next)
+        );
+    }
+
+    #[test]
+    fn qwen35_moe_architecture_string_detects_as_qwen3_next() {
+        let architectures = vec!["Qwen3_5_MoeForConditionalGeneration".to_string()];
+        assert_eq!(
+            ModelArchitecture::from_architectures(&architectures),
+            Some(ModelArchitecture::Qwen3Next)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn qwen35_placeholder_model_requires_expert_offloading() {
+        let model = DynamicModel::Qwen3Next(
+            Qwen3NextForCausalLM::new_with_routed_expert_mode(
+                tiny_qwen35_moe_text_config(),
+                Qwen3NextRoutedExpertMode::Placeholder,
+            )
+            .unwrap(),
+        );
+        assert!(model.requires_expert_offloading());
+    }
+
+    #[test]
+    #[serial]
+    fn qwen3_moe_post_load_fast_paths_initialize_stacked_experts() {
+        let mut model = DynamicModel::Qwen3MoE(Qwen3MoE::new(tiny_qwen3_moe_config()).unwrap());
+        model.init_post_load_fast_paths().unwrap();
+
+        let DynamicModel::Qwen3MoE(model) = &model else {
+            panic!("expected qwen3-moe model");
+        };
+        let Qwen3MoEFeedForward::MoE(moe) = &model.model.layers[0].ffn else {
+            panic!("expected moe layer");
+        };
+        assert!(moe.has_stacked_moe());
+    }
+
+    #[test]
+    #[serial]
+    fn deepseek_post_load_fast_paths_initialize_stacked_experts() {
+        let mut model = DynamicModel::DeepSeek(DeepSeek::new(tiny_deepseek_config()).unwrap());
+        model.init_post_load_fast_paths().unwrap();
+
+        let DynamicModel::DeepSeek(model) = &model else {
+            panic!("expected deepseek model");
+        };
+        let DeepSeekMLPType::MoE(moe) = &model.model.layers[0].mlp else {
+            panic!("expected moe layer");
+        };
+        assert!(moe.has_stacked_moe());
+    }
+
+    #[test]
+    #[serial]
+    fn nemotron_h_post_load_fast_paths_initialize_stacked_experts() {
+        let mut model =
+            DynamicModel::NemotronH(NemotronHForCausalLM::new(tiny_nemotron_h_config()).unwrap());
+        model.init_post_load_fast_paths().unwrap();
+
+        let DynamicModel::NemotronH(model) = &model else {
+            panic!("expected nemotron-h model");
+        };
+        let moe_layer = &model.backbone.layers[3].mixer;
+        assert!(moe_layer.stacked_moe_up.is_some());
+        assert!(moe_layer.stacked_moe_down.is_some());
     }
 }
