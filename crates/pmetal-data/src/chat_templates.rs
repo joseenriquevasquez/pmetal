@@ -411,11 +411,7 @@ impl ChatTemplate {
 
     /// Create a Qwen template.
     pub fn qwen() -> Self {
-        let mut template = Self::new(ChatTemplateType::Qwen);
-        template.default_system_message = Some(
-            "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.".to_string(),
-        );
-        template
+        Self::new(ChatTemplateType::Qwen)
     }
 
     /// Create an Alpaca template.
@@ -510,6 +506,23 @@ impl ChatTemplate {
             ChatTemplateType::GptOss => self.format_gpt_oss(messages),
             ChatTemplateType::Cohere => self.format_cohere(messages),
             ChatTemplateType::Custom => self.format_chatml(messages, tools),
+        }
+    }
+
+    /// Format an inference prompt with any template-specific generation prefill.
+    ///
+    /// Most templates can reuse the standard formatter, but Qwen 3 / 3.5 expects
+    /// the assistant generation prompt to include a `<think>` prefill rather than
+    /// relying on a `/no_think` system directive.
+    pub fn apply_inference(
+        &self,
+        messages: &[Message],
+        no_thinking: bool,
+        tools: Option<&[ToolDefinition]>,
+    ) -> FormattedChat {
+        match self.template_type {
+            ChatTemplateType::Qwen => self.format_qwen_inference(messages, tools, no_thinking),
+            _ => self.apply_with_tools(messages, tools),
         }
     }
 
@@ -625,6 +638,38 @@ impl ChatTemplate {
             response_start,
             template_type: self.template_type,
         }
+    }
+
+    /// Format Qwen inference exactly like its tokenizer-provided ChatML prompt.
+    ///
+    /// The last-user generation prompt is:
+    /// - `<|im_start|>assistant\n<think>\n` in thinking mode
+    /// - `<|im_start|>assistant\n<think>\n\n</think>\n\n` in non-thinking mode
+    fn format_qwen_inference(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        no_thinking: bool,
+    ) -> FormattedChat {
+        let mut formatted = self.format_chatml(messages, tools);
+        let non_system: Vec<&Message> = messages.iter().filter(|m| m.role != "system").collect();
+
+        if matches!(non_system.last(), Some(last) if last.role == "user" || last.role == "tool") {
+            let assistant_header = "<|im_start|>assistant\n";
+            if formatted.text.ends_with(assistant_header) {
+                let replacement = if no_thinking {
+                    format!("{assistant_header}<think>\n\n</think>\n\n")
+                } else {
+                    format!("{assistant_header}<think>\n")
+                };
+                let new_len = formatted.text.len() - assistant_header.len();
+                formatted.text.truncate(new_len);
+                formatted.text.push_str(&replacement);
+                formatted.response_start = formatted.text.len();
+            }
+        }
+
+        formatted
     }
 
     /// Format using Llama-2 format.
@@ -1477,13 +1522,15 @@ pub fn detect_chat_template(model_path: &std::path::Path, model_name: &str) -> C
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
             if let Some(jinja) = extract_jinja_template(&json) {
                 if let Some(mut template) = detect_template_from_jinja(&jinja) {
-                    // Refine: if the Jinja matched generic ChatML but model_type is "qwen2",
-                    // upgrade to Qwen variant (adds default system message for training).
+                    // Refine: if the Jinja matched generic ChatML but the checkpoint
+                    // is actually Qwen, upgrade to the Qwen variant so inference can
+                    // use the tokenizer's expected `<think>` generation prefill.
                     if template.template_type == ChatTemplateType::ChatMl {
                         let is_qwen = json
                             .get("model_type")
                             .and_then(|v| v.as_str())
-                            .is_some_and(|t| t.to_lowercase().contains("qwen"));
+                            .is_some_and(|t| t.to_lowercase().contains("qwen"))
+                            || model_name.to_lowercase().contains("qwen");
                         if is_qwen {
                             template = ChatTemplate::qwen();
                         }
@@ -1722,6 +1769,52 @@ mod tests {
         assert!(formatted.text.contains("<|im_start|>user"));
         assert!(formatted.text.contains("<|im_start|>assistant"));
         assert!(formatted.text.contains("<|im_end|>"));
+    }
+
+    #[test]
+    fn test_detect_chat_template_upgrades_qwen_chatml_from_model_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template":"<|im_start|>{{ messages }}<|im_end|>"}"#,
+        )
+        .unwrap();
+
+        let detected = detect_chat_template(dir.path(), "unsloth/Qwen3.5-0.8B");
+        assert_eq!(detected.template_type, ChatTemplateType::Qwen);
+    }
+
+    #[test]
+    fn test_qwen_inference_prompt_adds_empty_think_block_when_disabled() {
+        let template = ChatTemplate::qwen();
+        let messages = vec![Message::user("write fizzbuzz")];
+        let formatted = template.apply_inference(&messages, true, None);
+        assert!(
+            formatted
+                .text
+                .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        );
+        assert_eq!(formatted.response_start, formatted.text.len());
+    }
+
+    #[test]
+    fn test_qwen_inference_prompt_adds_open_think_block_when_enabled() {
+        let template = ChatTemplate::qwen();
+        let messages = vec![Message::user("write fizzbuzz")];
+        let formatted = template.apply_inference(&messages, false, None);
+        assert!(formatted.text.ends_with("<|im_start|>assistant\n<think>\n"));
+        assert_eq!(formatted.response_start, formatted.text.len());
+    }
+
+    #[test]
+    fn test_qwen_inference_prompt_does_not_inject_default_system_message() {
+        let template = ChatTemplate::qwen();
+        let messages = vec![Message::user("write fizzbuzz")];
+        let formatted = template.apply_inference(&messages, true, None);
+        assert_eq!(
+            formatted.text,
+            "<|im_start|>user\nwrite fizzbuzz<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
     }
 
     #[test]
