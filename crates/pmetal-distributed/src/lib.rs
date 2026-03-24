@@ -1,9 +1,10 @@
-//! Distributed training backend for PMetal.
+//! Distributed training and inference backend for PMetal.
 //!
-//! Enables "Home Clusters" by synchronizing gradients across multiple devices
-//! (e.g., Mac Studio + MacBook Pro) over standard networks (TCP/IP, Wi-Fi).
+//! Enables "Home Clusters" by synchronizing gradients, sharding models,
+//! and distributing inference across multiple Apple Silicon devices
+//! over standard networks (TCP/IP, Thunderbolt/RDMA).
 //!
-//! # Features
+//! # Core Features
 //!
 //! - **Zero-Configuration Discovery**: Automatically finds peers using mDNS/Bonjour
 //! - **Ring All-Reduce**: Bandwidth-optimal gradient synchronization
@@ -14,6 +15,15 @@
 //! - **Gradient Compression**: TopK, quantization, and error feedback
 //! - **Network Isolation**: PSK-based namespace isolation
 //! - **Observability**: Comprehensive metrics and tracing
+//!
+//! # Advanced Features (feature-gated)
+//!
+//! - **`mlx-collectives`**: MLX distributed C API wrappers (JACCL/RDMA over Thunderbolt 5)
+//! - **`tensor-parallel`**: Weight sharding, distributed linear layers (AllToSharded/ShardedToAll)
+//! - **`expert-parallel`**: MoE expert dispatch across nodes (all-to-all communication)
+//! - **`context-parallel`**: Ring attention, KV cache sharding for long-context inference
+//! - **`zero`**: ZeRO optimizer state/gradient sharding for memory-efficient training
+//! - **`pipeline-training`**: 1F1B and zero-bubble pipeline training schedules
 //!
 //! # Quick Start (Auto-Discovery)
 //!
@@ -116,6 +126,32 @@ pub mod pipeline;
 pub mod solver;
 pub mod ultrafusion;
 
+// ─── Feature-gated modules ──────────────────────────────────────────────────
+
+/// MLX distributed C API wrappers (JACCL/Ring/RDMA backends).
+#[cfg(feature = "mlx-collectives")]
+pub mod mlx_dist;
+
+/// Tensor parallelism: weight sharding and distributed linear layers.
+#[cfg(feature = "tensor-parallel")]
+pub mod tensor_parallel;
+
+/// Expert parallelism: MoE expert dispatch across nodes.
+#[cfg(feature = "expert-parallel")]
+pub mod expert_parallel;
+
+/// Context parallelism: ring attention and KV cache sharding.
+#[cfg(feature = "context-parallel")]
+pub mod context_parallel;
+
+/// ZeRO optimizer state/gradient sharding (pure Rust, no MLX dependency).
+#[cfg(feature = "zero")]
+pub mod zero;
+
+/// Pipeline training schedules: 1F1B and zero-bubble (pure Rust).
+#[cfg(feature = "pipeline-training")]
+pub mod pipeline_training;
+
 // Re-exports for convenience
 pub use activation_codec::ActivationCodec;
 pub use activation_transport::{ActivationMessage, DtypeTag};
@@ -140,6 +176,26 @@ pub use ultrafusion::{
     UltraFusionDieProfile, UltraFusionExecutionConfig, UltraFusionPlan, UltraFusionStagePlan,
 };
 // ReduceOp is already public via `pub enum ReduceOp` at module level
+
+// ─── Feature-gated re-exports ───────────────────────────────────────────────
+
+#[cfg(feature = "mlx-collectives")]
+pub use mlx_dist::{DistributedGroup, MlxDistributedBackend};
+
+#[cfg(feature = "tensor-parallel")]
+pub use tensor_parallel::{ShardingDirective, ShardingPlan, shard_weight};
+
+#[cfg(feature = "expert-parallel")]
+pub use expert_parallel::{CapacityConfig, ExpertDispatcher, ExpertPlacement};
+
+#[cfg(feature = "context-parallel")]
+pub use context_parallel::{CPMode, ring_attention_forward};
+
+#[cfg(feature = "zero")]
+pub use zero::{ZeROPartitioner, ZeROStage};
+
+#[cfg(feature = "pipeline-training")]
+pub use pipeline_training::{MicroBatchAction, ZBAction, schedule_1f1b, schedule_zero_bubble};
 
 /// Interface for distributed operations.
 #[async_trait]
@@ -270,4 +326,22 @@ pub mod prelude {
     pub use crate::ultrafusion::{
         UltraFusionDieProfile, UltraFusionExecutionConfig, UltraFusionPlan, UltraFusionStagePlan,
     };
+
+    #[cfg(feature = "mlx-collectives")]
+    pub use crate::mlx_dist::{DistributedGroup, MlxDistributedBackend};
+
+    #[cfg(feature = "tensor-parallel")]
+    pub use crate::tensor_parallel::{ShardingDirective, ShardingPlan};
+
+    #[cfg(feature = "expert-parallel")]
+    pub use crate::expert_parallel::{ExpertDispatcher, ExpertPlacement};
+
+    #[cfg(feature = "context-parallel")]
+    pub use crate::context_parallel::CPMode;
+
+    #[cfg(feature = "zero")]
+    pub use crate::zero::{ZeROPartitioner, ZeROStage};
+
+    #[cfg(feature = "pipeline-training")]
+    pub use crate::pipeline_training::{MicroBatchAction, ZBAction};
 }

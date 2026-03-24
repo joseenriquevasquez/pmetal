@@ -2,9 +2,26 @@
 name = "pmetal-distributed"
 version.workspace = true
 edition.workspace = true
-description = "Distributed training backend for PMetal (Home Clusters)"
+description = "Distributed training and inference backend for PMetal (Home Clusters)"
 license.workspace = true
 repository.workspace = true
+
+[features]
+default = []
+# MLX distributed C API wrappers (JACCL/Ring/RDMA backends)
+mlx-collectives = ["dep:mlx-rs", "dep:mlx-sys"]
+# Weight sharding, distributed linear layers
+tensor-parallel = ["mlx-collectives"]
+# MoE expert dispatch across nodes
+expert-parallel = ["mlx-collectives"]
+# Ring attention, KV cache sharding
+context-parallel = ["mlx-collectives"]
+# ZeRO optimizer state/gradient sharding (pure Rust, no MLX dep)
+zero = []
+# 1F1B and zero-bubble pipeline training schedules (pure Rust)
+pipeline-training = []
+# Enable all distributed capabilities
+full = ["mlx-collectives", "tensor-parallel", "expert-parallel", "context-parallel", "zero", "pipeline-training"]
 
 [dependencies]
 # Use workspace versions for consistency
@@ -48,6 +65,10 @@ rand = { workspace = true }
 parking_lot = "0.12"
 half = { workspace = true }
 ordered-float = "5"
+
+# MLX bindings (optional — gated behind mlx-collectives feature)
+mlx-rs = { workspace = true, optional = true }
+mlx-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
