@@ -303,6 +303,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CLI `--distributed-peers`, `--distributed-auto`, `--compression-strategy`**: Distributed training flags behind `distributed` feature
 - **CLI `pmetal serve --model <path> --port 8080`**: Inference server command behind `serve` feature
 - **CLI `--accurate` and `--low-memory`**: Flags for f64 LoRA merge path
+- **New merge methods in CLI**: `ram`, `ram_plus`, `multislerp` registered as merge method options
 
 ### Fixed
 
