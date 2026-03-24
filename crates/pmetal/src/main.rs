@@ -124,6 +124,18 @@ pub enum WorkloadInferenceContext {
     TextPrefix,
 }
 
+/// GDN projection stage for `bench-gdn`.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum GdnBenchmarkStage {
+    /// Benchmark the four decode input projections (`qkv`, `z`, `b`, `a`)
+    #[default]
+    #[value(name = "input-proj")]
+    InputProj,
+    /// Benchmark the decode output projection after recurrent update + norm
+    #[value(name = "out-proj")]
+    OutProj,
+}
+
 /// Named workload presets for `bench-workload`.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum WorkloadBenchmarkPreset {
@@ -133,6 +145,12 @@ pub enum WorkloadBenchmarkPreset {
     /// Hybrid Qwen3Next regression workload with a conservative training cap
     #[value(name = "hybrid-qwen3next")]
     HybridQwen3Next,
+    /// Longer-running steady-state hybrid Qwen3.5 inference regression workload
+    #[value(name = "hybrid-qwen35-steady")]
+    HybridQwen35Steady,
+    /// Nemotron-H sparse/hybrid inference regression workload
+    #[value(name = "moe-nemotronh")]
+    MoeNemotronH,
 }
 
 #[derive(Parser)]
@@ -481,6 +499,15 @@ enum Commands {
         #[arg(long, default_value = "5")]
         benchmark_iters: usize,
 
+        /// Run an opt-in per-layer forward profile for supported hybrid models.
+        /// Currently implemented for Qwen 3.5 / qwen3_next standard inference.
+        #[arg(long)]
+        profile_layers: bool,
+
+        /// Write the layer profile report as pretty JSON.
+        #[arg(long)]
+        profile_output: Option<String>,
+
         /// KV cache quantization bits (8=q8_0, 4=q4_0, 0=fp16).
         /// Omit to auto-select the fastest mode that still fits the device budget.
         #[arg(long)]
@@ -599,6 +626,10 @@ enum Commands {
         )]
         dataset: String,
 
+        /// Packed expert directory for sparse/offloaded inference workloads
+        #[arg(long)]
+        experts_dir: Option<String>,
+
         /// Number of prompt samples to benchmark for inference
         #[arg(long, default_value = "8")]
         prompt_samples: usize,
@@ -615,6 +646,10 @@ enum Commands {
         #[arg(long, default_value = "32")]
         decode_steps: usize,
 
+        /// Number of timed inference passes per prompt sample
+        #[arg(long, default_value = "1")]
+        inference_repeats: usize,
+
         /// Number of raw samples to include in the sampled training subset
         #[arg(long, default_value = "8")]
         train_samples: usize,
@@ -630,6 +665,45 @@ enum Commands {
         /// Maximum sequence length for the short training run (0 = auto-select from sampled data, capped for a quick run)
         #[arg(long, default_value = "0")]
         max_seq_len: usize,
+
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Optional output path for the JSON report
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Benchmark Qwen3.5 GDN decode backends on the actual model layer shapes
+    BenchGdn {
+        /// Qwen3.5/Qwen3Next model ID or local path
+        #[arg(long, default_value = "unsloth/Qwen3.5-0.8B")]
+        model: String,
+
+        /// Projection stage to benchmark
+        #[arg(long, value_enum, default_value = "input-proj")]
+        stage: GdnBenchmarkStage,
+
+        /// Optional transformer layer index to benchmark (defaults to the first GDN layer)
+        #[arg(long)]
+        layer: Option<usize>,
+
+        /// Batch size for the synthetic decode input
+        #[arg(long, default_value = "1")]
+        batch_size: usize,
+
+        /// Sequence length for the synthetic input (1 = decode shape)
+        #[arg(long, default_value = "1")]
+        seq_len: usize,
+
+        /// Warmup iterations per backend
+        #[arg(long, default_value = "10")]
+        warmup_iterations: usize,
+
+        /// Timed iterations per backend
+        #[arg(long, default_value = "50")]
+        benchmark_iterations: usize,
 
         /// Output results as JSON
         #[arg(long)]
@@ -2404,6 +2478,8 @@ async fn tokio_main() -> anyhow::Result<()> {
             ane_real_time,
             benchmark,
             benchmark_iters,
+            profile_layers,
+            profile_output,
             kv_quant,
             kv_k_bits,
             kv_v_bits,
@@ -2423,6 +2499,11 @@ async fn tokio_main() -> anyhow::Result<()> {
                 } else {
                     None
                 };
+
+            let validated_profile_output = profile_output
+                .as_deref()
+                .map(|path| validate_output_path(path, "infer profile output"))
+                .transpose()?;
 
             commands::infer::run_inference(
                 &model,
@@ -2461,6 +2542,8 @@ async fn tokio_main() -> anyhow::Result<()> {
                 false,
                 benchmark,
                 benchmark_iters,
+                profile_layers,
+                validated_profile_output.as_deref(),
                 kv_quant,
                 kv_k_bits,
                 kv_v_bits,
@@ -2551,10 +2634,12 @@ async fn tokio_main() -> anyhow::Result<()> {
             preset,
             model,
             dataset,
+            experts_dir,
             prompt_samples,
             max_prompt_tokens,
             inference_context,
             decode_steps,
+            inference_repeats,
             train_samples,
             train_steps,
             batch_size,
@@ -2569,6 +2654,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             if let Some(preset) = preset {
                 commands::bench::run_workload_benchmark_preset(
                     preset,
+                    experts_dir.as_deref(),
                     validated_output.as_deref(),
                     json,
                 )
@@ -2577,10 +2663,12 @@ async fn tokio_main() -> anyhow::Result<()> {
                 commands::bench::run_workload_benchmark(
                     &model,
                     &dataset,
+                    experts_dir.as_deref(),
                     prompt_samples,
                     max_prompt_tokens,
                     inference_context,
                     decode_steps,
+                    inference_repeats,
                     train_samples,
                     train_steps,
                     batch_size,
@@ -2590,6 +2678,35 @@ async fn tokio_main() -> anyhow::Result<()> {
                 )
                 .await?;
             }
+        }
+
+        Commands::BenchGdn {
+            model,
+            stage,
+            layer,
+            batch_size,
+            seq_len,
+            warmup_iterations,
+            benchmark_iterations,
+            json,
+            output,
+        } => {
+            let validated_output = output
+                .as_deref()
+                .map(|path| validate_output_path(path, "GDN benchmark output"))
+                .transpose()?;
+            commands::bench::run_gdn_decode_benchmark(
+                &model,
+                stage,
+                layer,
+                batch_size,
+                seq_len,
+                warmup_iterations,
+                benchmark_iterations,
+                validated_output.as_deref(),
+                json,
+            )
+            .await?;
         }
 
         Commands::Init { output } => {

@@ -1,6 +1,7 @@
-use crate::{WorkloadBenchmarkPreset, WorkloadInferenceContext};
+use crate::{GdnBenchmarkStage, WorkloadBenchmarkPreset, WorkloadInferenceContext};
 use anyhow::Context;
 use half::f16;
+use mlx_rs::{Array, ops, ops::indexing::IndexOp};
 use mlx_rs::module::ModuleParameters as _;
 use pmetal::inference_runner::{CacheModeRequest, select_cache_mode_for_model};
 use pmetal_core::{
@@ -23,11 +24,12 @@ use pmetal_models::architectures::deepseek::{DeepSeekConfig, DeepSeekMoE};
 use pmetal_models::architectures::jamba::{JambaConfig, JambaLayer};
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::architectures::llama4::{Llama4MoE, Llama4TextConfig};
+use pmetal_models::architectures::qwen3_next::Qwen3NextGatedDeltaNet;
 use pmetal_models::architectures::qwen3_moe::{Qwen3MoEBlock, Qwen3MoEConfig};
-use pmetal_models::dispatcher::DynamicModel;
+use pmetal_models::dispatcher::{DynamicModel, DynamicModelLoadOptions};
 use pmetal_trainer::orchestrator::{FullTrainingConfig, run_training};
 use pmetal_trainer::{DispatchConfig, TrainingJobConfig};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -107,7 +109,7 @@ pub(crate) async fn run_benchmark(
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WorkloadBenchmarkReport {
     version: String,
     generated_at_unix_ms: u128,
@@ -118,16 +120,44 @@ pub(crate) struct WorkloadBenchmarkReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct GdnDecodeBenchmarkReport {
+    version: String,
+    generated_at_unix_ms: u128,
+    device: KernelBenchmarkDevice,
+    stage: String,
+    model_id: String,
+    resolved_model_path: String,
+    layer_idx: usize,
+    batch_size: usize,
+    seq_len: usize,
+    input_dim: usize,
+    output_dim: usize,
+    warmup_iterations: usize,
+    benchmark_iterations: usize,
+    reference_backend: String,
+    backends: Vec<GdnDecodeBackendResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GdnDecodeBackendResult {
+    name: String,
+    max_abs_diff_vs_reference: Option<f32>,
+    outcome: KernelBenchmarkOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkloadBenchmarkConfig {
     preset: Option<String>,
     model_id: String,
     dataset_id: String,
+    experts_dir: Option<String>,
     resolved_model_path: String,
     resolved_dataset_path: String,
     prompt_samples: usize,
     max_prompt_tokens: usize,
     inference_prompt_len: WorkloadPromptLenSelection,
     decode_steps: usize,
+    inference_repeats: usize,
     train_samples: usize,
     train_steps: usize,
     batch_size: usize,
@@ -135,7 +165,7 @@ struct WorkloadBenchmarkConfig {
     training_seq_len: WorkloadTrainingSeqLenSelection,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum WorkloadBenchmarkSection<T> {
     Completed(T),
@@ -143,22 +173,36 @@ enum WorkloadBenchmarkSection<T> {
     Failed { error: String },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct InferenceWorkloadMetrics {
     prompt_samples: usize,
+    measurement_passes: usize,
     prompt_tokens: usize,
     max_prompt_tokens: usize,
     decode_steps: usize,
+    inference_repeats: usize,
     cache_mode: String,
     cache_mode_source: String,
+    first_generated_token_id: Option<u32>,
+    first_generated_token_text: Option<String>,
     total_prefill_ms: f64,
     prefill_tok_per_sec: f64,
+    mean_prefill_tok_per_sec: f64,
+    median_prefill_tok_per_sec: f64,
     total_decode_ms: f64,
     decode_tok_per_sec: f64,
     decode_ms_per_token: f64,
+    mean_decode_tok_per_sec: f64,
+    median_decode_tok_per_sec: f64,
+    mean_decode_ms_per_token: f64,
+    median_decode_ms_per_token: f64,
+    prefetch_hits: Option<usize>,
+    prefetch_misses: Option<usize>,
+    prefetch_total: Option<usize>,
+    prefetch_hit_rate: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkloadPromptLenSelection {
     context_source: String,
     context_source_reason: String,
@@ -171,7 +215,7 @@ struct WorkloadPromptLenSelection {
     sample_truncated_pct: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TrainingWorkloadMetrics {
     train_samples: usize,
     train_steps: usize,
@@ -187,7 +231,7 @@ struct TrainingWorkloadMetrics {
     final_loss: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkloadTrainingSeqLenSelection {
     requested_max_seq_len: usize,
     effective_max_seq_len: usize,
@@ -207,6 +251,7 @@ struct WorkloadPresetConfig {
     max_prompt_tokens: usize,
     inference_context: WorkloadInferenceContext,
     decode_steps: usize,
+    inference_repeats: usize,
     train_samples: usize,
     train_steps: usize,
     batch_size: usize,
@@ -241,6 +286,8 @@ fn preset_label(preset: WorkloadBenchmarkPreset) -> &'static str {
     match preset {
         WorkloadBenchmarkPreset::DenseQwen3 => "dense-qwen3",
         WorkloadBenchmarkPreset::HybridQwen3Next => "hybrid-qwen3next",
+        WorkloadBenchmarkPreset::HybridQwen35Steady => "hybrid-qwen35-steady",
+        WorkloadBenchmarkPreset::MoeNemotronH => "moe-nemotronh",
     }
 }
 
@@ -254,6 +301,7 @@ fn workload_preset_config(preset: WorkloadBenchmarkPreset) -> WorkloadPresetConf
             max_prompt_tokens: 0,
             inference_context: WorkloadInferenceContext::Auto,
             decode_steps: 16,
+            inference_repeats: 1,
             train_samples: 4,
             train_steps: 2,
             batch_size: 1,
@@ -261,18 +309,89 @@ fn workload_preset_config(preset: WorkloadBenchmarkPreset) -> WorkloadPresetConf
         },
         WorkloadBenchmarkPreset::HybridQwen3Next => WorkloadPresetConfig {
             preset,
-            model_id: "unsloth/Qwen3.5-0.8B-Base",
+            model_id: "unsloth/Qwen3.5-0.8B",
             dataset_id: "TeichAI/gemini-3-pro-preview-high-reasoning-250x",
             prompt_samples: 4,
             max_prompt_tokens: 0,
             inference_context: WorkloadInferenceContext::TextPrefix,
             decode_steps: 8,
+            inference_repeats: 1,
+            train_samples: 0,
+            train_steps: 0,
+            batch_size: 1,
+            max_seq_len: 0,
+        },
+        WorkloadBenchmarkPreset::HybridQwen35Steady => WorkloadPresetConfig {
+            preset,
+            model_id: "unsloth/Qwen3.5-0.8B",
+            dataset_id: "TeichAI/gemini-3-pro-preview-high-reasoning-250x",
+            prompt_samples: 2,
+            max_prompt_tokens: 0,
+            inference_context: WorkloadInferenceContext::TextPrefix,
+            decode_steps: 64,
+            inference_repeats: 3,
+            train_samples: 0,
+            train_steps: 0,
+            batch_size: 1,
+            max_seq_len: 0,
+        },
+        WorkloadBenchmarkPreset::MoeNemotronH => WorkloadPresetConfig {
+            preset,
+            model_id: "unsloth/NVIDIA-Nemotron-3-Nano-4B",
+            dataset_id: "TeichAI/gemini-3-pro-preview-high-reasoning-250x",
+            prompt_samples: 2,
+            max_prompt_tokens: 512,
+            inference_context: WorkloadInferenceContext::TextPrefix,
+            decode_steps: 4,
+            inference_repeats: 1,
             train_samples: 0,
             train_steps: 0,
             batch_size: 1,
             max_seq_len: 0,
         },
     }
+}
+
+struct GdnInputProjectionBenchmarkSetup {
+    model_path: PathBuf,
+    layer_idx: usize,
+    batch_size: usize,
+    seq_len: usize,
+    input_dim: usize,
+    output_dim: usize,
+    conv_dim: usize,
+    value_dim: usize,
+    num_v_heads: usize,
+    head_v_dim: usize,
+    input: Array,
+    input_data: Vec<f32>,
+    qkv_weight: Array,
+    z_weight: Array,
+    b_weight: Array,
+    a_weight: Array,
+    qkv_z_combined_weight: Array,
+    combined_weight: Array,
+    combined_weight_data: Vec<f32>,
+    reference_output_data: Vec<f32>,
+}
+
+struct GdnLinearProjectionBenchmarkSetup {
+    model_path: PathBuf,
+    layer_idx: usize,
+    batch_size: usize,
+    seq_len: usize,
+    input_dim: usize,
+    output_dim: usize,
+    input: Array,
+    input_data: Vec<f32>,
+    weight: Array,
+    weight_data: Vec<f32>,
+    reference_output_data: Vec<f32>,
+}
+
+enum GdnBenchmarkSetup {
+    InputProj(GdnInputProjectionBenchmarkSetup),
+    OutProj(GdnLinearProjectionBenchmarkSetup),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -287,10 +406,10 @@ pub(crate) struct KernelBenchmarkReport {
     cases: Vec<KernelBenchmarkCaseResult>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct KernelBenchmarkDevice {
     name: String,
-    tier: &'static str,
+    tier: String,
     architecture_gen: u32,
     gpu_core_count: u32,
     ane_core_count: u32,
@@ -298,7 +417,7 @@ struct KernelBenchmarkDevice {
     is_apple10_or_newer: bool,
     is_ultra_fusion: bool,
     memory_bandwidth_gbps: f64,
-    memory_bandwidth_source: &'static str,
+    memory_bandwidth_source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -489,7 +608,7 @@ pub(crate) fn run_kernel_benchmark_corpus(
         benchmark_iterations,
         device: KernelBenchmarkDevice {
             name: props.name.clone(),
-            tier: device_tier_label(props.device_tier),
+            tier: device_tier_label(props.device_tier).to_string(),
             architecture_gen: props.architecture_gen,
             gpu_core_count: props.gpu_core_count,
             ane_core_count: props.ane_core_count,
@@ -497,7 +616,8 @@ pub(crate) fn run_kernel_benchmark_corpus(
             is_apple10_or_newer: props.is_apple10_or_newer(),
             is_ultra_fusion: props.is_ultra_fusion,
             memory_bandwidth_gbps: props.memory_bandwidth_gbps,
-            memory_bandwidth_source: memory_bandwidth_source_label(props.memory_bandwidth_source),
+            memory_bandwidth_source: memory_bandwidth_source_label(props.memory_bandwidth_source)
+                .to_string(),
         },
         summary,
         cases: results,
@@ -522,13 +642,367 @@ pub(crate) fn run_kernel_benchmark_corpus(
     Ok(())
 }
 
+pub(crate) async fn run_gdn_decode_benchmark(
+    model_id: &str,
+    stage: GdnBenchmarkStage,
+    layer: Option<usize>,
+    batch_size: usize,
+    seq_len: usize,
+    warmup_iterations: usize,
+    benchmark_iterations: usize,
+    output: Option<&Path>,
+    json: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(batch_size > 0, "batch_size must be greater than 0");
+    anyhow::ensure!(seq_len > 0, "seq_len must be greater than 0");
+    anyhow::ensure!(
+        benchmark_iterations > 0,
+        "benchmark_iterations must be greater than 0"
+    );
+
+    let device = workload_benchmark_device()?;
+    let model_path = resolve_workload_model_path(model_id).await?;
+    let setup = build_gdn_decode_benchmark_setup(&model_path, stage, layer, batch_size, seq_len)?;
+
+    let report = match setup {
+        GdnBenchmarkSetup::InputProj(setup) => {
+            let split_outcome = benchmark_operation(
+                warmup_iterations,
+                benchmark_iterations,
+                || -> anyhow::Result<()> {
+                    let qkv = mlx_linear_projection(&setup.input, &setup.qkv_weight)?;
+                    let z = mlx_linear_projection(&setup.input, &setup.z_weight)?;
+                    let b_val = mlx_linear_projection(&setup.input, &setup.b_weight)?;
+                    let a = mlx_linear_projection(&setup.input, &setup.a_weight)?;
+                    qkv.eval()?;
+                    z.eval()?;
+                    b_val.eval()?;
+                    a.eval()?;
+                    Ok(())
+                },
+            )?;
+
+            let combined_outcome = benchmark_operation(
+                warmup_iterations,
+                benchmark_iterations,
+                || -> anyhow::Result<()> {
+                    let projected = mlx_linear_projection(&setup.input, &setup.combined_weight)?;
+                    projected.eval()?;
+                    Ok(())
+                },
+            )?;
+
+            let combined_split_outcome = benchmark_operation(
+                warmup_iterations,
+                benchmark_iterations,
+                || -> anyhow::Result<()> {
+                    let (qkv, z, b_val, a) = mlx_combined_split_projection(
+                        &setup.input,
+                        &setup.combined_weight,
+                        setup.batch_size,
+                        setup.seq_len,
+                        setup.conv_dim,
+                        setup.value_dim,
+                        setup.num_v_heads,
+                        setup.head_v_dim,
+                    )?;
+                    qkv.eval()?;
+                    z.eval()?;
+                    b_val.eval()?;
+                    a.eval()?;
+                    Ok(())
+                },
+            )?;
+
+            let qkv_z_combined_split_outcome = benchmark_operation(
+                warmup_iterations,
+                benchmark_iterations,
+                || -> anyhow::Result<()> {
+                    let (qkv, z, b_val, a) = mlx_qkv_z_combined_split_projection(
+                        &setup.input,
+                        &setup.qkv_z_combined_weight,
+                        &setup.b_weight,
+                        &setup.a_weight,
+                        setup.batch_size,
+                        setup.seq_len,
+                        setup.conv_dim,
+                        setup.value_dim,
+                        setup.num_v_heads,
+                        setup.head_v_dim,
+                    )?;
+                    qkv.eval()?;
+                    z.eval()?;
+                    b_val.eval()?;
+                    a.eval()?;
+                    Ok(())
+                },
+            )?;
+
+            let accelerate_outcome = benchmark_operation(
+                warmup_iterations,
+                benchmark_iterations,
+                || -> anyhow::Result<()> {
+                    let _ = accelerate_combined_projection(
+                        &setup.input_data,
+                        &setup.combined_weight_data,
+                        batch_size * seq_len,
+                        setup.input_dim,
+                        setup.output_dim,
+                    );
+                    Ok(())
+                },
+            )?;
+
+            let accelerate_roundtrip_outcome = benchmark_operation(
+                warmup_iterations,
+                benchmark_iterations,
+                || -> anyhow::Result<()> {
+                    let (qkv, z, b_val, a) = accelerate_roundtrip_split_projection(
+                        &setup.input,
+                        &setup.combined_weight_data,
+                        setup.batch_size,
+                        setup.seq_len,
+                        setup.input_dim,
+                        setup.output_dim,
+                        setup.conv_dim,
+                        setup.value_dim,
+                        setup.num_v_heads,
+                        setup.head_v_dim,
+                    )?;
+                    qkv.eval()?;
+                    z.eval()?;
+                    b_val.eval()?;
+                    a.eval()?;
+                    Ok(())
+                },
+            )?;
+
+            let combined_output = mlx_linear_projection(&setup.input, &setup.combined_weight)?;
+            combined_output.eval()?;
+            let combined_output_data = combined_output.as_slice::<f32>().to_vec();
+            let (qkv_qz, z_qz, b_qz, a_qz) = mlx_qkv_z_combined_split_projection(
+                &setup.input,
+                &setup.qkv_z_combined_weight,
+                &setup.b_weight,
+                &setup.a_weight,
+                setup.batch_size,
+                setup.seq_len,
+                setup.conv_dim,
+                setup.value_dim,
+                setup.num_v_heads,
+                setup.head_v_dim,
+            )?;
+            let qkv_z_combined_output = ops::concatenate_axis(&[
+                &qkv_qz,
+                &z_qz.reshape(&[
+                    setup.batch_size as i32,
+                    setup.seq_len as i32,
+                    setup.value_dim as i32,
+                ])?,
+                &b_qz,
+                &a_qz,
+            ], -1)?;
+            qkv_z_combined_output.eval()?;
+            let qkv_z_combined_output_data = qkv_z_combined_output.as_slice::<f32>().to_vec();
+            let accelerate_output = accelerate_combined_projection(
+                &setup.input_data,
+                &setup.combined_weight_data,
+                batch_size * seq_len,
+                setup.input_dim,
+                setup.output_dim,
+            );
+
+            GdnDecodeBenchmarkReport {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                generated_at_unix_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+                device,
+                stage: "input-proj".to_string(),
+                model_id: model_id.to_string(),
+                resolved_model_path: setup.model_path.display().to_string(),
+                layer_idx: setup.layer_idx,
+                batch_size,
+                seq_len,
+                input_dim: setup.input_dim,
+                output_dim: setup.output_dim,
+                warmup_iterations,
+                benchmark_iterations,
+                reference_backend: "mlx_split".to_string(),
+                backends: vec![
+                    GdnDecodeBackendResult {
+                        name: "mlx_split".to_string(),
+                        max_abs_diff_vs_reference: Some(0.0),
+                        outcome: split_outcome,
+                    },
+                    GdnDecodeBackendResult {
+                        name: "mlx_combined".to_string(),
+                        max_abs_diff_vs_reference: Some(max_abs_diff(
+                            &setup.reference_output_data,
+                            &combined_output_data,
+                        )),
+                        outcome: combined_outcome,
+                    },
+                    GdnDecodeBackendResult {
+                        name: "mlx_combined_split".to_string(),
+                        max_abs_diff_vs_reference: Some(max_abs_diff(
+                            &setup.reference_output_data,
+                            &combined_output_data,
+                        )),
+                        outcome: combined_split_outcome,
+                    },
+                    GdnDecodeBackendResult {
+                        name: "mlx_qkv_z_combined_split".to_string(),
+                        max_abs_diff_vs_reference: Some(max_abs_diff(
+                            &setup.reference_output_data,
+                            &qkv_z_combined_output_data,
+                        )),
+                        outcome: qkv_z_combined_split_outcome,
+                    },
+                    GdnDecodeBackendResult {
+                        name: "accelerate_combined".to_string(),
+                        max_abs_diff_vs_reference: Some(max_abs_diff(
+                            &setup.reference_output_data,
+                            &accelerate_output,
+                        )),
+                        outcome: accelerate_outcome,
+                    },
+                    GdnDecodeBackendResult {
+                        name: "accelerate_roundtrip_split".to_string(),
+                        max_abs_diff_vs_reference: Some(max_abs_diff(
+                            &setup.reference_output_data,
+                            &accelerate_output,
+                        )),
+                        outcome: accelerate_roundtrip_outcome,
+                    },
+                ],
+            }
+        }
+        GdnBenchmarkSetup::OutProj(setup) => {
+            let mlx_outcome = benchmark_operation(
+                warmup_iterations,
+                benchmark_iterations,
+                || -> anyhow::Result<()> {
+                    let projected = mlx_linear_projection(&setup.input, &setup.weight)?;
+                    projected.eval()?;
+                    Ok(())
+                },
+            )?;
+
+            let accelerate_outcome = benchmark_operation(
+                warmup_iterations,
+                benchmark_iterations,
+                || -> anyhow::Result<()> {
+                    let _ = accelerate_combined_projection(
+                        &setup.input_data,
+                        &setup.weight_data,
+                        batch_size * seq_len,
+                        setup.input_dim,
+                        setup.output_dim,
+                    );
+                    Ok(())
+                },
+            )?;
+
+            let accelerate_roundtrip_outcome = benchmark_operation(
+                warmup_iterations,
+                benchmark_iterations,
+                || -> anyhow::Result<()> {
+                    let projected = accelerate_roundtrip_linear_projection(
+                        &setup.input,
+                        &setup.weight_data,
+                        setup.batch_size,
+                        setup.seq_len,
+                        setup.input_dim,
+                        setup.output_dim,
+                    )?;
+                    projected.eval()?;
+                    Ok(())
+                },
+            )?;
+
+            let accelerate_output = accelerate_combined_projection(
+                &setup.input_data,
+                &setup.weight_data,
+                batch_size * seq_len,
+                setup.input_dim,
+                setup.output_dim,
+            );
+
+            GdnDecodeBenchmarkReport {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                generated_at_unix_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+                device,
+                stage: "out-proj".to_string(),
+                model_id: model_id.to_string(),
+                resolved_model_path: setup.model_path.display().to_string(),
+                layer_idx: setup.layer_idx,
+                batch_size,
+                seq_len,
+                input_dim: setup.input_dim,
+                output_dim: setup.output_dim,
+                warmup_iterations,
+                benchmark_iterations,
+                reference_backend: "mlx_linear".to_string(),
+                backends: vec![
+                    GdnDecodeBackendResult {
+                        name: "mlx_linear".to_string(),
+                        max_abs_diff_vs_reference: Some(0.0),
+                        outcome: mlx_outcome,
+                    },
+                    GdnDecodeBackendResult {
+                        name: "accelerate_combined".to_string(),
+                        max_abs_diff_vs_reference: Some(max_abs_diff(
+                            &setup.reference_output_data,
+                            &accelerate_output,
+                        )),
+                        outcome: accelerate_outcome,
+                    },
+                    GdnDecodeBackendResult {
+                        name: "accelerate_roundtrip_linear".to_string(),
+                        max_abs_diff_vs_reference: Some(max_abs_diff(
+                            &setup.reference_output_data,
+                            &accelerate_output,
+                        )),
+                        outcome: accelerate_roundtrip_outcome,
+                    },
+                ],
+            }
+        }
+    };
+
+    let report_json = serde_json::to_string_pretty(&report)?;
+    if let Some(output_path) = output {
+        std::fs::write(output_path, &report_json).with_context(|| {
+            format!(
+                "failed to write GDN decode benchmark to {}",
+                output_path.display()
+            )
+        })?;
+    }
+
+    if json {
+        println!("{report_json}");
+    } else {
+        print_gdn_decode_benchmark_report(&report, output);
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn run_workload_benchmark(
     model_id: &str,
     dataset_id: &str,
+    experts_dir: Option<&str>,
     prompt_samples: usize,
     max_prompt_tokens: usize,
     inference_context: WorkloadInferenceContext,
     decode_steps: usize,
+    inference_repeats: usize,
     train_samples: usize,
     train_steps: usize,
     batch_size: usize,
@@ -540,10 +1014,12 @@ pub(crate) async fn run_workload_benchmark(
         None,
         model_id,
         dataset_id,
+        experts_dir,
         prompt_samples,
         max_prompt_tokens,
         inference_context,
         decode_steps,
+        inference_repeats,
         train_samples,
         train_steps,
         batch_size,
@@ -556,6 +1032,7 @@ pub(crate) async fn run_workload_benchmark(
 
 pub(crate) async fn run_workload_benchmark_preset(
     preset: WorkloadBenchmarkPreset,
+    experts_dir: Option<&str>,
     output: Option<&Path>,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -564,10 +1041,12 @@ pub(crate) async fn run_workload_benchmark_preset(
         Some(preset_label(config.preset).to_string()),
         config.model_id,
         config.dataset_id,
+        experts_dir,
         config.prompt_samples,
         config.max_prompt_tokens,
         config.inference_context,
         config.decode_steps,
+        config.inference_repeats,
         config.train_samples,
         config.train_steps,
         config.batch_size,
@@ -582,10 +1061,12 @@ async fn run_workload_benchmark_internal(
     preset: Option<String>,
     model_id: &str,
     dataset_id: &str,
+    experts_dir: Option<&str>,
     prompt_samples: usize,
     max_prompt_tokens: usize,
     inference_context: WorkloadInferenceContext,
     decode_steps: usize,
+    inference_repeats: usize,
     train_samples: usize,
     train_steps: usize,
     batch_size: usize,
@@ -621,6 +1102,7 @@ async fn run_workload_benchmark_internal(
     );
     let inference = benchmark_real_inference(
         &model_path,
+        experts_dir,
         &selected_inference_samples,
         inference_prompt_len
             .as_ref()
@@ -634,6 +1116,7 @@ async fn run_workload_benchmark_internal(
             })
             .unwrap_or(ResolvedWorkloadInferenceContext::Prompt),
         decode_steps,
+        inference_repeats,
     );
     let training = benchmark_real_training(
         model_id,
@@ -688,12 +1171,14 @@ async fn run_workload_benchmark_internal(
             preset,
             model_id: model_id.to_string(),
             dataset_id: dataset_id.to_string(),
+            experts_dir: experts_dir.map(ToOwned::to_owned),
             resolved_model_path: model_path.display().to_string(),
             resolved_dataset_path: dataset_path.display().to_string(),
             prompt_samples,
             max_prompt_tokens: inference_prompt_len.effective_max_prompt_tokens,
             inference_prompt_len,
             decode_steps,
+            inference_repeats,
             train_samples,
             train_steps,
             batch_size,
@@ -730,7 +1215,7 @@ fn workload_benchmark_device() -> anyhow::Result<KernelBenchmarkDevice> {
     let props = ctx.properties();
     Ok(KernelBenchmarkDevice {
         name: props.name.clone(),
-        tier: device_tier_label(props.device_tier),
+        tier: device_tier_label(props.device_tier).to_string(),
         architecture_gen: props.architecture_gen,
         gpu_core_count: props.gpu_core_count,
         ane_core_count: props.ane_core_count,
@@ -738,8 +1223,345 @@ fn workload_benchmark_device() -> anyhow::Result<KernelBenchmarkDevice> {
         is_apple10_or_newer: props.is_apple10_or_newer(),
         is_ultra_fusion: props.is_ultra_fusion,
         memory_bandwidth_gbps: props.memory_bandwidth_gbps,
-        memory_bandwidth_source: memory_bandwidth_source_label(props.memory_bandwidth_source),
+        memory_bandwidth_source: memory_bandwidth_source_label(props.memory_bandwidth_source)
+            .to_string(),
     })
+}
+
+fn build_gdn_decode_benchmark_setup(
+    model_path: &Path,
+    stage: GdnBenchmarkStage,
+    layer: Option<usize>,
+    batch_size: usize,
+    seq_len: usize,
+) -> anyhow::Result<GdnBenchmarkSetup> {
+    let model = DynamicModel::load_with_options(
+        model_path,
+        DynamicModelLoadOptions {
+            prefer_expert_offload: true,
+        },
+    )?;
+    let DynamicModel::Qwen3Next(model) = model else {
+        anyhow::bail!(
+            "GDN decode benchmark only supports qwen3_next / qwen3_5 model families"
+        );
+    };
+
+    let layer_idx = resolve_qwen3_next_gdn_layer_index(&model, layer)?;
+    let gdn = model.model.layers[layer_idx]
+        .linear_attn
+        .as_ref()
+        .context("selected layer does not contain a GDN block")?;
+    match stage {
+        GdnBenchmarkStage::InputProj => {
+            let input_dim = gdn.hidden_size as usize;
+            let conv_dim = gdn.conv_dim as usize;
+            let value_dim = gdn.value_dim as usize;
+            let num_v_heads = gdn.num_v_heads as usize;
+            let head_v_dim = gdn.head_v_dim as usize;
+            let output_dim = conv_dim + value_dim + (num_v_heads * 2);
+            let input_data: Vec<f32> = (0..batch_size * seq_len * input_dim)
+                .map(deterministic_value)
+                .collect();
+            let input = Array::from_slice(
+                &input_data,
+                &[batch_size as i32, seq_len as i32, input_dim as i32],
+            );
+
+            let qkv_weight = gdn.in_proj_qkv.weight.as_ref().as_type::<f32>()?;
+            let z_weight = gdn.in_proj_z.weight.as_ref().as_type::<f32>()?;
+            let b_weight = gdn.in_proj_b.weight.as_ref().as_type::<f32>()?;
+            let a_weight = gdn.in_proj_a.weight.as_ref().as_type::<f32>()?;
+            qkv_weight.eval()?;
+            z_weight.eval()?;
+            b_weight.eval()?;
+            a_weight.eval()?;
+
+            let combined_weight = build_combined_input_projection_weight(gdn)?;
+            let qkv_z_combined_weight = build_qkv_z_combined_projection_weight(gdn)?;
+            combined_weight.eval()?;
+            qkv_z_combined_weight.eval()?;
+            let combined_weight_data = combined_weight.as_slice::<f32>().to_vec();
+            let reference_output =
+                mlx_split_projection(&input, &qkv_weight, &z_weight, &b_weight, &a_weight)?;
+            reference_output.eval()?;
+
+            Ok(GdnBenchmarkSetup::InputProj(
+                GdnInputProjectionBenchmarkSetup {
+                    model_path: model_path.to_path_buf(),
+                    layer_idx,
+                    batch_size,
+                    seq_len,
+                    input_dim,
+                    output_dim,
+                    conv_dim,
+                    value_dim,
+                    num_v_heads,
+                    head_v_dim,
+                    input,
+                    input_data,
+                    qkv_weight,
+                    z_weight,
+                    b_weight,
+                    a_weight,
+                    qkv_z_combined_weight,
+                    combined_weight,
+                    combined_weight_data,
+                    reference_output_data: reference_output.as_slice::<f32>().to_vec(),
+                },
+            ))
+        }
+        GdnBenchmarkStage::OutProj => {
+            let input_dim = gdn.value_dim as usize;
+            let output_dim = gdn.hidden_size as usize;
+            let input_data: Vec<f32> = (0..batch_size * seq_len * input_dim)
+                .map(deterministic_value)
+                .collect();
+            let input = Array::from_slice(
+                &input_data,
+                &[batch_size as i32, seq_len as i32, input_dim as i32],
+            );
+            let weight = gdn.out_proj.weight.as_ref().as_type::<f32>()?;
+            weight.eval()?;
+            let weight_data = weight.as_slice::<f32>().to_vec();
+            let reference_output = mlx_linear_projection(&input, &weight)?;
+            reference_output.eval()?;
+
+            Ok(GdnBenchmarkSetup::OutProj(GdnLinearProjectionBenchmarkSetup {
+                model_path: model_path.to_path_buf(),
+                layer_idx,
+                batch_size,
+                seq_len,
+                input_dim,
+                output_dim,
+                input,
+                input_data,
+                weight,
+                weight_data,
+                reference_output_data: reference_output.as_slice::<f32>().to_vec(),
+            }))
+        }
+    }
+}
+
+fn resolve_qwen3_next_gdn_layer_index(
+    model: &pmetal_models::architectures::qwen3_next::Qwen3NextForCausalLM,
+    requested_layer: Option<usize>,
+) -> anyhow::Result<usize> {
+    if let Some(layer_idx) = requested_layer {
+        let layer = model
+            .model
+            .layers
+            .get(layer_idx)
+            .with_context(|| format!("layer {layer_idx} is out of range"))?;
+        anyhow::ensure!(
+            layer.linear_attn.is_some(),
+            "layer {layer_idx} is not a GDN linear-attention layer"
+        );
+        return Ok(layer_idx);
+    }
+
+    model
+        .model
+        .layers
+        .iter()
+        .position(|layer| layer.linear_attn.is_some())
+        .context("model does not contain any GDN linear-attention layers")
+}
+
+fn build_combined_input_projection_weight(
+    gdn: &Qwen3NextGatedDeltaNet,
+) -> anyhow::Result<Array> {
+    let weights = [
+        gdn.in_proj_qkv.weight.as_ref().as_type::<f32>()?,
+        gdn.in_proj_z.weight.as_ref().as_type::<f32>()?,
+        gdn.in_proj_b.weight.as_ref().as_type::<f32>()?,
+        gdn.in_proj_a.weight.as_ref().as_type::<f32>()?,
+    ];
+    let refs: Vec<&Array> = weights.iter().collect();
+    Ok(ops::concatenate_axis(&refs, 0)?)
+}
+
+fn build_qkv_z_combined_projection_weight(
+    gdn: &Qwen3NextGatedDeltaNet,
+) -> anyhow::Result<Array> {
+    let weights = [
+        gdn.in_proj_qkv.weight.as_ref().as_type::<f32>()?,
+        gdn.in_proj_z.weight.as_ref().as_type::<f32>()?,
+    ];
+    let refs: Vec<&Array> = weights.iter().collect();
+    Ok(ops::concatenate_axis(&refs, 0)?)
+}
+
+fn mlx_linear_projection(input: &Array, weight: &Array) -> anyhow::Result<Array> {
+    Ok(ops::matmul(input, &weight.t())?)
+}
+
+fn mlx_split_projection(
+    input: &Array,
+    qkv_weight: &Array,
+    z_weight: &Array,
+    b_weight: &Array,
+    a_weight: &Array,
+) -> anyhow::Result<Array> {
+    let qkv = mlx_linear_projection(input, qkv_weight)?;
+    let z = mlx_linear_projection(input, z_weight)?;
+    let b_val = mlx_linear_projection(input, b_weight)?;
+    let a = mlx_linear_projection(input, a_weight)?;
+    Ok(ops::concatenate_axis(&[&qkv, &z, &b_val, &a], -1)?)
+}
+
+fn mlx_combined_split_projection(
+    input: &Array,
+    combined_weight: &Array,
+    batch_size: usize,
+    seq_len: usize,
+    conv_dim: usize,
+    value_dim: usize,
+    num_v_heads: usize,
+    head_v_dim: usize,
+) -> anyhow::Result<(Array, Array, Array, Array)> {
+    let projected = mlx_linear_projection(input, combined_weight)?;
+    split_combined_projection(
+        &projected,
+        batch_size,
+        seq_len,
+        conv_dim,
+        value_dim,
+        num_v_heads,
+        head_v_dim,
+    )
+}
+
+fn mlx_qkv_z_combined_split_projection(
+    input: &Array,
+    qkv_z_combined_weight: &Array,
+    b_weight: &Array,
+    a_weight: &Array,
+    batch_size: usize,
+    seq_len: usize,
+    conv_dim: usize,
+    value_dim: usize,
+    num_v_heads: usize,
+    head_v_dim: usize,
+) -> anyhow::Result<(Array, Array, Array, Array)> {
+    let projected = mlx_linear_projection(input, qkv_z_combined_weight)?;
+    let qkv_end = conv_dim as i32;
+    let z_end = qkv_end + value_dim as i32;
+    let qkv = projected.index((.., .., ..qkv_end));
+    let z = projected.index((.., .., qkv_end..z_end)).reshape(&[
+        batch_size as i32,
+        seq_len as i32,
+        num_v_heads as i32,
+        head_v_dim as i32,
+    ])?;
+    let b_val = mlx_linear_projection(input, b_weight)?;
+    let a = mlx_linear_projection(input, a_weight)?;
+    Ok((qkv, z, b_val, a))
+}
+
+fn accelerate_combined_projection(
+    input: &[f32],
+    combined_weight: &[f32],
+    rows: usize,
+    hidden_size: usize,
+    total_output_dim: usize,
+) -> Vec<f32> {
+    let mut output = vec![0.0f32; rows * total_output_dim];
+    pmetal_metal::accelerate::gemm(
+        input,
+        combined_weight,
+        &mut output,
+        rows,
+        total_output_dim,
+        hidden_size,
+        1.0,
+        0.0,
+        false,
+        true,
+    );
+    output
+}
+
+fn accelerate_roundtrip_split_projection(
+    input: &Array,
+    combined_weight: &[f32],
+    batch_size: usize,
+    seq_len: usize,
+    hidden_size: usize,
+    total_output_dim: usize,
+    conv_dim: usize,
+    value_dim: usize,
+    num_v_heads: usize,
+    head_v_dim: usize,
+) -> anyhow::Result<(Array, Array, Array, Array)> {
+    let input_cpu = input.as_slice::<f32>().to_vec();
+    let projected = accelerate_combined_projection(
+        &input_cpu,
+        combined_weight,
+        batch_size * seq_len,
+        hidden_size,
+        total_output_dim,
+    );
+    let projected = Array::from_slice(
+        &projected,
+        &[batch_size as i32, seq_len as i32, total_output_dim as i32],
+    );
+    split_combined_projection(
+        &projected,
+        batch_size,
+        seq_len,
+        conv_dim,
+        value_dim,
+        num_v_heads,
+        head_v_dim,
+    )
+}
+
+fn accelerate_roundtrip_linear_projection(
+    input: &Array,
+    weight: &[f32],
+    batch_size: usize,
+    seq_len: usize,
+    input_dim: usize,
+    output_dim: usize,
+) -> anyhow::Result<Array> {
+    let input_cpu = input.as_slice::<f32>().to_vec();
+    let projected = accelerate_combined_projection(
+        &input_cpu,
+        weight,
+        batch_size * seq_len,
+        input_dim,
+        output_dim,
+    );
+    Ok(Array::from_slice(
+        &projected,
+        &[batch_size as i32, seq_len as i32, output_dim as i32],
+    ))
+}
+
+fn split_combined_projection(
+    projected: &Array,
+    batch_size: usize,
+    seq_len: usize,
+    conv_dim: usize,
+    value_dim: usize,
+    num_v_heads: usize,
+    head_v_dim: usize,
+) -> anyhow::Result<(Array, Array, Array, Array)> {
+    let qkv_end = conv_dim as i32;
+    let z_end = qkv_end + value_dim as i32;
+    let b_end = z_end + num_v_heads as i32;
+    let qkv = projected.index((.., .., ..qkv_end));
+    let z = projected.index((.., .., qkv_end..z_end)).reshape(&[
+        batch_size as i32,
+        seq_len as i32,
+        num_v_heads as i32,
+        head_v_dim as i32,
+    ])?;
+    let b_val = projected.index((.., .., z_end..b_end));
+    let a = projected.index((.., .., b_end..));
+    Ok((qkv, z, b_val, a))
 }
 
 async fn resolve_workload_model_path(model_id: &str) -> anyhow::Result<PathBuf> {
@@ -833,10 +1655,12 @@ fn benchmark_inference_text(
 
 fn benchmark_real_inference(
     model_path: &Path,
+    experts_dir: Option<&str>,
     samples: &[TextSample],
     max_prompt_tokens: usize,
     inference_context: ResolvedWorkloadInferenceContext,
     decode_steps: usize,
+    inference_repeats: usize,
 ) -> anyhow::Result<WorkloadBenchmarkSection<InferenceWorkloadMetrics>> {
     if samples.is_empty() {
         return Ok(WorkloadBenchmarkSection::Skipped {
@@ -845,7 +1669,19 @@ fn benchmark_real_inference(
     }
 
     let tokenizer = Tokenizer::from_model_dir(model_path)?;
-    let mut model = DynamicModel::load(model_path)?;
+    let mut model = DynamicModel::load_with_options(
+        model_path,
+        pmetal_models::dispatcher::DynamicModelLoadOptions {
+            prefer_expert_offload: experts_dir.is_some(),
+        },
+    )?;
+    if let Some(experts_dir) = experts_dir {
+        model.enable_expert_offloading(Path::new(experts_dir))?;
+    } else if model.requires_expert_offloading() {
+        anyhow::bail!(
+            "this model requires expert offloading; repack routed experts with `pmetal pack-experts` and rerun bench-workload with --experts-dir <packed_dir>"
+        );
+    }
     let cache_max_seq_len = max_prompt_tokens
         .saturating_add(decode_steps)
         .saturating_add(8);
@@ -876,10 +1712,17 @@ fn benchmark_real_inference(
         let _ = run_prefill_decode_pass(&mut model, &warmup_ids, decode_steps, cache_mode)?;
     }
 
+    let inference_repeats = inference_repeats.max(1);
     let mut total_prompt_tokens = 0usize;
     let mut total_prefill = Duration::default();
     let mut total_decode = Duration::default();
     let mut measured_samples = 0usize;
+    let mut measurement_passes = 0usize;
+    let mut first_generated_token_id = None;
+    let mut first_generated_token_text = None;
+    let mut prefill_tok_sec = Vec::new();
+    let mut decode_tok_sec = Vec::new();
+    let mut decode_ms_per_token = Vec::new();
 
     for sample in samples {
         let prompt_ids =
@@ -888,12 +1731,31 @@ fn benchmark_real_inference(
             continue;
         }
 
-        let (prefill_time, decode_time) =
-            run_prefill_decode_pass(&mut model, &prompt_ids, decode_steps, cache_mode)?;
-        total_prompt_tokens += prompt_ids.len();
-        total_prefill += prefill_time;
-        total_decode += decode_time;
         measured_samples += 1;
+        for _ in 0..inference_repeats {
+            let pass = run_prefill_decode_pass(&mut model, &prompt_ids, decode_steps, cache_mode)?;
+            let prompt_tokens = prompt_ids.len();
+            let prefill_ms = duration_to_ms(pass.prefill_elapsed);
+            let decode_ms = duration_to_ms(pass.decode_elapsed);
+
+            total_prompt_tokens += prompt_tokens;
+            total_prefill += pass.prefill_elapsed;
+            total_decode += pass.decode_elapsed;
+            measurement_passes += 1;
+            if first_generated_token_id.is_none() {
+                first_generated_token_id = Some(pass.first_generated_token_id);
+                first_generated_token_text =
+                    tokenizer.decode(&[pass.first_generated_token_id]).ok();
+            }
+
+            if prompt_tokens > 0 && prefill_ms > 0.0 {
+                prefill_tok_sec.push(prompt_tokens as f64 / (prefill_ms / 1000.0));
+            }
+            if decode_steps > 0 && decode_ms > 0.0 {
+                decode_tok_sec.push(decode_steps as f64 / (decode_ms / 1000.0));
+                decode_ms_per_token.push(decode_ms / decode_steps as f64);
+            }
+        }
     }
 
     if measured_samples == 0 || total_prompt_tokens == 0 {
@@ -904,22 +1766,35 @@ fn benchmark_real_inference(
 
     let prefill_ms = duration_to_ms(total_prefill);
     let decode_ms = duration_to_ms(total_decode);
-    let decode_tokens = measured_samples * decode_steps;
+    let decode_tokens = measurement_passes * decode_steps;
+    let mean_prefill_tok_per_sec = mean(&prefill_tok_sec);
+    let mean_decode_tok_per_sec = mean(&decode_tok_sec);
+    let mean_decode_ms_per_token = mean(&decode_ms_per_token);
+    let median_prefill_tok_per_sec = median(&mut prefill_tok_sec);
+    let median_decode_tok_per_sec = median(&mut decode_tok_sec);
+    let median_decode_ms_per_token = median(&mut decode_ms_per_token);
+    let prefetch_stats = model.prefetch_stats();
 
     Ok(WorkloadBenchmarkSection::Completed(
         InferenceWorkloadMetrics {
             prompt_samples: measured_samples,
+            measurement_passes,
             prompt_tokens: total_prompt_tokens,
             max_prompt_tokens,
             decode_steps,
+            inference_repeats,
             cache_mode: cache_mode.describe(),
             cache_mode_source: cache_selection.source.as_str().to_string(),
+            first_generated_token_id,
+            first_generated_token_text,
             total_prefill_ms: prefill_ms,
             prefill_tok_per_sec: if prefill_ms > 0.0 {
                 total_prompt_tokens as f64 / (prefill_ms / 1000.0)
             } else {
                 0.0
             },
+            mean_prefill_tok_per_sec,
+            median_prefill_tok_per_sec,
             total_decode_ms: decode_ms,
             decode_tok_per_sec: if decode_tokens > 0 && decode_ms > 0.0 {
                 decode_tokens as f64 / (decode_ms / 1000.0)
@@ -931,8 +1806,22 @@ fn benchmark_real_inference(
             } else {
                 0.0
             },
+            mean_decode_tok_per_sec,
+            median_decode_tok_per_sec,
+            mean_decode_ms_per_token,
+            median_decode_ms_per_token,
+            prefetch_hits: prefetch_stats.as_ref().map(|stats| stats.hits),
+            prefetch_misses: prefetch_stats.as_ref().map(|stats| stats.misses),
+            prefetch_total: prefetch_stats.as_ref().map(|stats| stats.total),
+            prefetch_hit_rate: prefetch_stats.as_ref().map(|stats| stats.hit_rate()),
         },
     ))
+}
+
+struct PrefillDecodePassResult {
+    prefill_elapsed: Duration,
+    decode_elapsed: Duration,
+    first_generated_token_id: u32,
 }
 
 fn encode_benchmark_prompt(
@@ -954,7 +1843,7 @@ fn run_prefill_decode_pass(
     prompt_ids: &[u32],
     decode_steps: usize,
     cache_mode: CacheMode,
-) -> anyhow::Result<(Duration, Duration)> {
+) -> anyhow::Result<PrefillDecodePassResult> {
     use mlx_rs::Array;
     use mlx_rs::ops::indexing::{IndexOp, argmax};
 
@@ -975,7 +1864,8 @@ fn run_prefill_decode_pass(
     logits.eval()?;
     let prefill_elapsed = prefill_start.elapsed();
 
-    let mut next_token = argmax(&logits.index((.., -1, ..)), None)?.item::<u32>() as i32;
+    let first_generated_token_id = argmax(logits.index((.., -1, ..)), None)?.item::<u32>();
+    let mut next_token = first_generated_token_id as i32;
     let decode_start = Instant::now();
     for _ in 0..decode_steps {
         let decode_input = Array::from_slice(&[next_token], &[1, 1]);
@@ -985,11 +1875,15 @@ fn run_prefill_decode_pass(
             Some(&mut cache),
             mamba_cache.as_mut(),
         )?;
-        next_token = argmax(&decode_logits.index((.., -1, ..)), None)?.item::<u32>() as i32;
+        next_token = argmax(decode_logits.index((.., -1, ..)), None)?.item::<u32>() as i32;
     }
     let decode_elapsed = decode_start.elapsed();
 
-    Ok((prefill_elapsed, decode_elapsed))
+    Ok(PrefillDecodePassResult {
+        prefill_elapsed,
+        decode_elapsed,
+        first_generated_token_id,
+    })
 }
 
 async fn benchmark_real_training(
@@ -1478,6 +2372,14 @@ fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
+fn max_abs_diff(reference: &[f32], candidate: &[f32]) -> f32 {
+    reference
+        .iter()
+        .zip(candidate.iter())
+        .map(|(lhs, rhs)| (lhs - rhs).abs())
+        .fold(0.0f32, f32::max)
+}
+
 fn print_workload_benchmark_report(report: &WorkloadBenchmarkReport, output: Option<&Path>) {
     println!("Workload Benchmark");
     println!("  Device:  {}", report.device.name);
@@ -1516,16 +2418,33 @@ fn print_workload_benchmark_report(report: &WorkloadBenchmarkReport, output: Opt
                 "  KV cache: {} ({})",
                 metrics.cache_mode, metrics.cache_mode_source
             );
+            if let Some(first_token_id) = metrics.first_generated_token_id {
+                println!(
+                    "  First token: {} ({:?})",
+                    first_token_id,
+                    metrics
+                        .first_generated_token_text
+                        .as_deref()
+                        .unwrap_or("<decode failed>")
+                );
+            }
             println!(
-                "  Prefill: {:.0} tok/s over {} prompt tokens ({} samples, {:.2} ms total)",
+                "  Prefill: {:.0} tok/s aggregate, {:.0} tok/s median over {} prompt tokens ({} samples, {} passes, {:.2} ms total)",
                 metrics.prefill_tok_per_sec,
+                metrics.median_prefill_tok_per_sec,
                 metrics.prompt_tokens,
                 metrics.prompt_samples,
+                metrics.measurement_passes,
                 metrics.total_prefill_ms
             );
             println!(
-                "  Decode:  {:.0} tok/s ({:.2} ms/token over {} steps/sample)",
-                metrics.decode_tok_per_sec, metrics.decode_ms_per_token, metrics.decode_steps
+                "  Decode:  {:.0} tok/s aggregate, {:.0} tok/s median ({:.2} ms/token aggregate, {:.2} ms/token median over {} steps/sample x {} repeats)",
+                metrics.decode_tok_per_sec,
+                metrics.median_decode_tok_per_sec,
+                metrics.decode_ms_per_token,
+                metrics.median_decode_ms_per_token,
+                metrics.decode_steps,
+                metrics.inference_repeats
             );
         }
         WorkloadBenchmarkSection::Skipped { reason } => {
@@ -1564,6 +2483,50 @@ fn print_workload_benchmark_report(report: &WorkloadBenchmarkReport, output: Opt
         WorkloadBenchmarkSection::Failed { error } => {
             println!("Training");
             println!("  Failed: {error}");
+        }
+    }
+
+    if let Some(path) = output {
+        println!();
+        println!("Report written to {}", path.display());
+    }
+}
+
+fn print_gdn_decode_benchmark_report(report: &GdnDecodeBenchmarkReport, output: Option<&Path>) {
+    println!("GDN Decode Benchmark");
+    println!("  Device:  {}", report.device.name);
+    println!("  Stage:   {}", report.stage);
+    println!("  Model:   {}", report.model_id);
+    println!("  Layer:   {}", report.layer_idx);
+    println!(
+        "  Shape:   batch={} seq={} input={} output={}",
+        report.batch_size, report.seq_len, report.input_dim, report.output_dim
+    );
+    println!("  Reference: {}", report.reference_backend);
+    println!();
+
+    for backend in &report.backends {
+        print!("{}: ", backend.name);
+        match &backend.outcome {
+            KernelBenchmarkOutcome::Completed {
+                min_ms,
+                median_ms,
+                mean_ms,
+            } => {
+                println!(
+                    "min {:.3} ms, median {:.3} ms, mean {:.3} ms",
+                    min_ms, median_ms, mean_ms
+                );
+                if let Some(max_abs_diff) = backend.max_abs_diff_vs_reference {
+                    println!("  max abs diff vs reference: {:.6}", max_abs_diff);
+                }
+            }
+            KernelBenchmarkOutcome::Skipped { reason } => {
+                println!("skipped ({reason})");
+            }
+            KernelBenchmarkOutcome::Failed { error } => {
+                println!("failed ({error})");
+            }
         }
     }
 
@@ -2874,7 +3837,7 @@ mod tests {
             benchmark_iterations: 5,
             device: KernelBenchmarkDevice {
                 name: "Test".to_string(),
-                tier: "base",
+                tier: "base".to_string(),
                 architecture_gen: 7,
                 gpu_core_count: 8,
                 ane_core_count: 16,
@@ -2882,7 +3845,7 @@ mod tests {
                 is_apple10_or_newer: false,
                 is_ultra_fusion: false,
                 memory_bandwidth_gbps: 100.0,
-                memory_bandwidth_source: "spec_table_fallback",
+                memory_bandwidth_source: "spec_table_fallback".to_string(),
             },
             summary: KernelBenchmarkSummary {
                 completed: 1,
@@ -2914,7 +3877,7 @@ mod tests {
             generated_at_unix_ms: 1,
             device: KernelBenchmarkDevice {
                 name: "Apple M4 Max".to_string(),
-                tier: "max",
+                tier: "max".to_string(),
                 architecture_gen: 9,
                 gpu_core_count: 40,
                 ane_core_count: 16,
@@ -2922,12 +3885,13 @@ mod tests {
                 is_apple10_or_newer: false,
                 is_ultra_fusion: false,
                 memory_bandwidth_gbps: 546.0,
-                memory_bandwidth_source: "measured_gpu_copy",
+                memory_bandwidth_source: "measured_gpu_copy".to_string(),
             },
             workload: WorkloadBenchmarkConfig {
                 preset: Some("dense-qwen3".to_string()),
                 model_id: "Qwen/Qwen3-0.6B".to_string(),
                 dataset_id: "TeichAI/gemini-3-pro-preview-high-reasoning-250x".to_string(),
+                experts_dir: None,
                 resolved_model_path: "/tmp/model".to_string(),
                 resolved_dataset_path: "/tmp/dataset".to_string(),
                 prompt_samples: 8,
@@ -2944,6 +3908,7 @@ mod tests {
                     sample_truncated_pct: 12.5,
                 },
                 decode_steps: 32,
+                inference_repeats: 3,
                 train_samples: 8,
                 train_steps: 4,
                 batch_size: 1,
@@ -2960,16 +3925,30 @@ mod tests {
             },
             inference: WorkloadBenchmarkSection::Completed(InferenceWorkloadMetrics {
                 prompt_samples: 8,
-                prompt_tokens: 4096,
+                measurement_passes: 24,
+                prompt_tokens: 12288,
                 max_prompt_tokens: 768,
                 decode_steps: 32,
+                inference_repeats: 3,
                 cache_mode: "fp16".to_string(),
                 cache_mode_source: "auto-fp16".to_string(),
-                total_prefill_ms: 100.0,
+                first_generated_token_id: Some(8160),
+                first_generated_token_text: Some("Here".to_string()),
+                total_prefill_ms: 300.0,
                 prefill_tok_per_sec: 40960.0,
-                total_decode_ms: 80.0,
+                mean_prefill_tok_per_sec: 40480.0,
+                median_prefill_tok_per_sec: 41000.0,
+                total_decode_ms: 240.0,
                 decode_tok_per_sec: 3200.0,
                 decode_ms_per_token: 2.5,
+                mean_decode_tok_per_sec: 3190.0,
+                median_decode_tok_per_sec: 3210.0,
+                mean_decode_ms_per_token: 2.52,
+                median_decode_ms_per_token: 2.49,
+                prefetch_hits: None,
+                prefetch_misses: None,
+                prefetch_total: None,
+                prefetch_hit_rate: None,
             }),
             training: WorkloadBenchmarkSection::Completed(TrainingWorkloadMetrics {
                 train_samples: 8,
@@ -2994,20 +3973,333 @@ mod tests {
         assert!(json.contains("\"median_step_ms\""));
         assert!(json.contains("\"inference_prompt_len\""));
         assert!(json.contains("\"training_seq_len\""));
+        assert!(json.contains("\"first_generated_token_id\": 8160"));
         assert!(json.contains("\"effective_max_seq_len\": 1792"));
         assert!(json.contains("\"effective_max_prompt_tokens\": 768"));
+    }
+
+    #[test]
+    fn gdn_decode_report_serializes_to_json() {
+        let report = GdnDecodeBenchmarkReport {
+            version: "test".to_string(),
+            generated_at_unix_ms: 1,
+            device: KernelBenchmarkDevice {
+                name: "Apple M4 Max".to_string(),
+                tier: "max".to_string(),
+                architecture_gen: 9,
+                gpu_core_count: 40,
+                ane_core_count: 16,
+                has_nax: false,
+                is_apple10_or_newer: false,
+                is_ultra_fusion: false,
+                memory_bandwidth_gbps: 546.0,
+                memory_bandwidth_source: "measured_gpu_copy".to_string(),
+            },
+            stage: "input-proj".to_string(),
+            model_id: "unsloth/Qwen3.5-0.8B".to_string(),
+            resolved_model_path: "/tmp/model".to_string(),
+            layer_idx: 0,
+            batch_size: 1,
+            seq_len: 1,
+            input_dim: 2048,
+            output_dim: 2320,
+            warmup_iterations: 10,
+            benchmark_iterations: 50,
+            reference_backend: "mlx_split".to_string(),
+            backends: vec![GdnDecodeBackendResult {
+                name: "accelerate_combined".to_string(),
+                max_abs_diff_vs_reference: Some(1e-6),
+                outcome: KernelBenchmarkOutcome::Completed {
+                    min_ms: 0.10,
+                    median_ms: 0.12,
+                    mean_ms: 0.13,
+                },
+            }],
+        };
+
+        let json = serde_json::to_string_pretty(&report).expect("serialize");
+        assert!(json.contains("\"stage\": \"input-proj\""));
+        assert!(json.contains("\"reference_backend\": \"mlx_split\""));
+        assert!(json.contains("\"accelerate_combined\""));
+        assert!(json.contains("\"max_abs_diff_vs_reference\""));
+    }
+
+    #[test]
+    fn accelerate_combined_projection_matches_mlx_reference() {
+        let batch_size = 1usize;
+        let seq_len = 1usize;
+        let hidden_size = 8usize;
+        let total_output_dim = 13usize;
+        let input_data: Vec<f32> = (0..batch_size * seq_len * hidden_size)
+            .map(deterministic_value)
+            .collect();
+        let weight_data: Vec<f32> = (0..total_output_dim * hidden_size)
+            .map(|index| deterministic_value(index + 97))
+            .collect();
+        let input = Array::from_slice(
+            &input_data,
+            &[batch_size as i32, seq_len as i32, hidden_size as i32],
+        );
+        let weight = Array::from_slice(
+            &weight_data,
+            &[total_output_dim as i32, hidden_size as i32],
+        );
+
+        let reference = mlx_linear_projection(&input, &weight).expect("mlx projection");
+        reference.eval().expect("eval");
+        let reference_data = reference.as_slice::<f32>().to_vec();
+        let accelerate = accelerate_combined_projection(
+            &input_data,
+            &weight_data,
+            batch_size * seq_len,
+            hidden_size,
+            total_output_dim,
+        );
+
+        assert!(max_abs_diff(&reference_data, &accelerate) < 1e-4);
+    }
+
+    #[test]
+    fn mlx_combined_split_projection_matches_reference_layout() {
+        let batch_size = 1usize;
+        let seq_len = 1usize;
+        let hidden_size = 8usize;
+        let conv_dim = 8usize;
+        let value_dim = 3usize;
+        let num_v_heads = 1usize;
+        let head_v_dim = 3usize;
+        let total_output_dim = conv_dim + value_dim + (num_v_heads * 2);
+        let input_data: Vec<f32> = (0..batch_size * seq_len * hidden_size)
+            .map(deterministic_value)
+            .collect();
+        let weight_data: Vec<f32> = (0..total_output_dim * hidden_size)
+            .map(|index| deterministic_value(index + 211))
+            .collect();
+        let input = Array::from_slice(
+            &input_data,
+            &[batch_size as i32, seq_len as i32, hidden_size as i32],
+        );
+        let combined_weight = Array::from_slice(
+            &weight_data,
+            &[total_output_dim as i32, hidden_size as i32],
+        );
+
+        let reference = mlx_linear_projection(&input, &combined_weight).expect("mlx projection");
+        reference.eval().expect("eval");
+        let (qkv, z, b_val, a) = mlx_combined_split_projection(
+            &input,
+            &combined_weight,
+            batch_size,
+            seq_len,
+            conv_dim,
+            value_dim,
+            num_v_heads,
+            head_v_dim,
+        )
+        .expect("split projection");
+        let z_flat = z
+            .reshape(&[batch_size as i32, seq_len as i32, value_dim as i32])
+            .expect("reshape");
+        let stitched = ops::concatenate_axis(&[&qkv, &z_flat, &b_val, &a], -1).expect("concat");
+        stitched.eval().expect("eval");
+
+        assert!(max_abs_diff(reference.as_slice::<f32>(), stitched.as_slice::<f32>()) < 1e-4);
+    }
+
+    #[test]
+    fn mlx_qkv_z_combined_split_projection_matches_reference_layout() {
+        let batch_size = 1usize;
+        let seq_len = 1usize;
+        let hidden_size = 8usize;
+        let conv_dim = 8usize;
+        let value_dim = 3usize;
+        let num_v_heads = 1usize;
+        let head_v_dim = 3usize;
+        let total_output_dim = conv_dim + value_dim + (num_v_heads * 2);
+        let input_data: Vec<f32> = (0..batch_size * seq_len * hidden_size)
+            .map(deterministic_value)
+            .collect();
+        let qkv_z_weight_data: Vec<f32> = (0..(conv_dim + value_dim) * hidden_size)
+            .map(|index| deterministic_value(index + 263))
+            .collect();
+        let b_weight_data: Vec<f32> = (0..num_v_heads * hidden_size)
+            .map(|index| deterministic_value(index + 911))
+            .collect();
+        let a_weight_data: Vec<f32> = (0..num_v_heads * hidden_size)
+            .map(|index| deterministic_value(index + 1223))
+            .collect();
+        let input = Array::from_slice(
+            &input_data,
+            &[batch_size as i32, seq_len as i32, hidden_size as i32],
+        );
+        let qkv_z_weight = Array::from_slice(
+            &qkv_z_weight_data,
+            &[(conv_dim + value_dim) as i32, hidden_size as i32],
+        );
+        let b_weight = Array::from_slice(
+            &b_weight_data,
+            &[num_v_heads as i32, hidden_size as i32],
+        );
+        let a_weight = Array::from_slice(
+            &a_weight_data,
+            &[num_v_heads as i32, hidden_size as i32],
+        );
+
+        let reference = mlx_split_projection(&input, &qkv_z_weight.index((..conv_dim as i32, ..)), &qkv_z_weight.index((conv_dim as i32.., ..)), &b_weight, &a_weight)
+            .expect("mlx split");
+        reference.eval().expect("eval");
+        let (qkv, z, b_val, a) = mlx_qkv_z_combined_split_projection(
+            &input,
+            &qkv_z_weight,
+            &b_weight,
+            &a_weight,
+            batch_size,
+            seq_len,
+            conv_dim,
+            value_dim,
+            num_v_heads,
+            head_v_dim,
+        )
+        .expect("split projection");
+        let z_flat = z
+            .reshape(&[batch_size as i32, seq_len as i32, value_dim as i32])
+            .expect("reshape");
+        let stitched = ops::concatenate_axis(&[&qkv, &z_flat, &b_val, &a], -1).expect("concat");
+        stitched.eval().expect("eval");
+
+        assert!(max_abs_diff(reference.as_slice::<f32>(), stitched.as_slice::<f32>()) < 1e-4);
+        assert_eq!(stitched.shape(), &[batch_size as i32, seq_len as i32, total_output_dim as i32]);
+    }
+
+    #[test]
+    fn accelerate_roundtrip_split_projection_matches_reference_layout() {
+        let batch_size = 1usize;
+        let seq_len = 1usize;
+        let hidden_size = 8usize;
+        let conv_dim = 8usize;
+        let value_dim = 3usize;
+        let num_v_heads = 1usize;
+        let head_v_dim = 3usize;
+        let total_output_dim = conv_dim + value_dim + (num_v_heads * 2);
+        let input_data: Vec<f32> = (0..batch_size * seq_len * hidden_size)
+            .map(deterministic_value)
+            .collect();
+        let weight_data: Vec<f32> = (0..total_output_dim * hidden_size)
+            .map(|index| deterministic_value(index + 307))
+            .collect();
+        let input = Array::from_slice(
+            &input_data,
+            &[batch_size as i32, seq_len as i32, hidden_size as i32],
+        );
+        let weight = Array::from_slice(
+            &weight_data,
+            &[total_output_dim as i32, hidden_size as i32],
+        );
+
+        let reference = mlx_linear_projection(&input, &weight).expect("mlx projection");
+        reference.eval().expect("eval");
+        let (qkv, z, b_val, a) = accelerate_roundtrip_split_projection(
+            &input,
+            &weight_data,
+            batch_size,
+            seq_len,
+            hidden_size,
+            total_output_dim,
+            conv_dim,
+            value_dim,
+            num_v_heads,
+            head_v_dim,
+        )
+        .expect("accelerate roundtrip");
+        let z_flat = z
+            .reshape(&[batch_size as i32, seq_len as i32, value_dim as i32])
+            .expect("reshape");
+        let stitched = ops::concatenate_axis(&[&qkv, &z_flat, &b_val, &a], -1).expect("concat");
+        stitched.eval().expect("eval");
+
+        assert!(max_abs_diff(reference.as_slice::<f32>(), stitched.as_slice::<f32>()) < 1e-4);
+    }
+
+    #[test]
+    fn accelerate_roundtrip_linear_projection_matches_reference() {
+        let batch_size = 1usize;
+        let seq_len = 1usize;
+        let input_dim = 6usize;
+        let output_dim = 10usize;
+        let input_data: Vec<f32> = (0..batch_size * seq_len * input_dim)
+            .map(deterministic_value)
+            .collect();
+        let weight_data: Vec<f32> = (0..output_dim * input_dim)
+            .map(|index| deterministic_value(index + 401))
+            .collect();
+        let input = Array::from_slice(
+            &input_data,
+            &[batch_size as i32, seq_len as i32, input_dim as i32],
+        );
+        let weight = Array::from_slice(
+            &weight_data,
+            &[output_dim as i32, input_dim as i32],
+        );
+
+        let reference = mlx_linear_projection(&input, &weight).expect("mlx projection");
+        reference.eval().expect("eval");
+        let projected = accelerate_roundtrip_linear_projection(
+            &input,
+            &weight_data,
+            batch_size,
+            seq_len,
+            input_dim,
+            output_dim,
+        )
+        .expect("roundtrip");
+        projected.eval().expect("eval");
+
+        assert!(max_abs_diff(reference.as_slice::<f32>(), projected.as_slice::<f32>()) < 1e-4);
     }
 
     #[test]
     fn hybrid_qwen3next_preset_uses_conservative_training_shape() {
         let preset = workload_preset_config(WorkloadBenchmarkPreset::HybridQwen3Next);
 
-        assert_eq!(preset.model_id, "unsloth/Qwen3.5-0.8B-Base");
+        assert_eq!(preset.model_id, "unsloth/Qwen3.5-0.8B");
         assert!(matches!(
             preset.inference_context,
             WorkloadInferenceContext::TextPrefix
         ));
+        assert_eq!(preset.inference_repeats, 1);
         assert_eq!(preset.max_seq_len, 0);
+        assert_eq!(preset.train_steps, 0);
+        assert_eq!(preset.train_samples, 0);
+    }
+
+    #[test]
+    fn hybrid_qwen35_steady_preset_prefers_longer_decode_measurement() {
+        let preset = workload_preset_config(WorkloadBenchmarkPreset::HybridQwen35Steady);
+
+        assert_eq!(preset.model_id, "unsloth/Qwen3.5-0.8B");
+        assert!(matches!(
+            preset.inference_context,
+            WorkloadInferenceContext::TextPrefix
+        ));
+        assert_eq!(preset.prompt_samples, 2);
+        assert_eq!(preset.decode_steps, 64);
+        assert_eq!(preset.inference_repeats, 3);
+        assert_eq!(preset.train_steps, 0);
+        assert_eq!(preset.train_samples, 0);
+    }
+
+    #[test]
+    fn moe_nemotronh_preset_is_inference_only() {
+        let preset = workload_preset_config(WorkloadBenchmarkPreset::MoeNemotronH);
+
+        assert_eq!(preset.model_id, "unsloth/NVIDIA-Nemotron-3-Nano-4B");
+        assert!(matches!(
+            preset.inference_context,
+            WorkloadInferenceContext::TextPrefix
+        ));
+        assert_eq!(preset.max_prompt_tokens, 512);
+        assert_eq!(preset.decode_steps, 4);
+        assert_eq!(preset.inference_repeats, 1);
         assert_eq!(preset.train_steps, 0);
         assert_eq!(preset.train_samples, 0);
     }

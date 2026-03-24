@@ -32,11 +32,20 @@ pub(crate) async fn run_serve(
 
     // Load model
     tracing::info!("Loading model from {:?}...", model_path);
-    let mut model = DynamicModel::load(&model_path)?;
+    let mut model = DynamicModel::load_with_options(
+        &model_path,
+        pmetal_models::dispatcher::DynamicModelLoadOptions {
+            prefer_expert_offload: experts_dir.is_some(),
+        },
+    )?;
 
     // Enable expert offloading if a packed experts directory is provided
     if let Some(ref experts_dir) = experts_dir {
         model.enable_expert_offloading(std::path::Path::new(experts_dir))?;
+    } else if model.requires_expert_offloading() {
+        anyhow::bail!(
+            "this model requires expert offloading; repack routed experts with `pmetal pack-experts` and pass --experts-dir <packed_dir>"
+        );
     }
 
     // Apply LoRA adapter if specified

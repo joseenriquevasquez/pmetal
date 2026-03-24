@@ -1,6 +1,145 @@
 use std::path::{Path, PathBuf};
 
-use pmetal_data::Tokenizer;
+use anyhow::Context;
+use mlx_rs::{
+    Array,
+    ops::indexing::{IndexOp, argmax},
+};
+use pmetal_models::{
+    DynamicModel,
+    architectures::{Qwen3NextForwardProfile, Qwen3NextLayerProfile},
+};
+
+#[derive(Debug, serde::Serialize)]
+struct HybridLayerProfileReport {
+    model: String,
+    architecture: String,
+    prompt_tokens: usize,
+    decode_token_id: u32,
+    decode_token_text: String,
+    prefill: Qwen3NextForwardProfile,
+    decode: Qwen3NextForwardProfile,
+}
+
+fn print_qwen3_next_profile_summary(label: &str, profile: &Qwen3NextForwardProfile) {
+    println!("\n=== {label} Profile ===");
+    println!(
+        "Total: {:.3} ms | Embed: {:.3} ms | Final norm: {:.3} ms | LM head: {:.3} ms",
+        profile.total_us as f64 / 1000.0,
+        profile.embedding_us as f64 / 1000.0,
+        profile.final_norm_us as f64 / 1000.0,
+        profile.lm_head_us as f64 / 1000.0
+    );
+
+    let mut layers: Vec<&Qwen3NextLayerProfile> = profile.layers.iter().collect();
+    layers.sort_by_key(|layer| std::cmp::Reverse(layer.total_us));
+    for layer in layers.into_iter().take(6) {
+        println!(
+            "Layer {:>2} {:>16}: {:7.3} ms",
+            layer.layer_idx,
+            layer.layer_kind,
+            layer.total_us as f64 / 1000.0
+        );
+        for section in layer.sections.iter().take(8) {
+            println!(
+                "  {:>24}: {:7.3} ms",
+                section.name,
+                section.elapsed_us as f64 / 1000.0
+            );
+        }
+    }
+}
+
+#[allow(clippy::needless_option_as_deref)]
+fn run_qwen3_next_layer_profile(
+    runner: &mut pmetal::inference_runner::InferenceRunner,
+    model_id: &str,
+    profile_output: Option<&Path>,
+) -> anyhow::Result<()> {
+    let prompt_token_ids = runner.state.input_ids().to_vec();
+    let prompt_ids_i32: Vec<i32> = prompt_token_ids.iter().map(|id| *id as i32).collect();
+    let prompt_input = Array::from_slice(&prompt_ids_i32, &[1, prompt_ids_i32.len() as i32]);
+    let tokenizer = &runner.tokenizer;
+
+    let (architecture, prefill_profile, decode_profile, decode_token_id) = runner
+        .state
+        .run_standard_model_with_state(|model, cache, mamba_cache| {
+            let mut mamba_cache = mamba_cache;
+            let architecture = model.architecture();
+            let DynamicModel::Qwen3Next(qwen) = model else {
+                return Err(mlx_rs::error::Exception::custom(format!(
+                    "--profile-layers currently supports Qwen 3.5 / qwen3_next only, got {architecture}"
+                )));
+            };
+
+            let prefill_mamba = mamba_cache.as_deref_mut();
+            let (prefill_logits, prefill_profile) = qwen.forward_with_cache_profiled(
+                &prompt_input,
+                None,
+                Some(cache),
+                prefill_mamba,
+                "prefill",
+            )?;
+
+            let last_logits = prefill_logits.index((.., -1, ..));
+            last_logits.eval()?;
+            let next_token = argmax(&last_logits, None)?;
+            next_token.eval()?;
+            let decode_token_id = next_token.item::<u32>();
+            let decode_input = Array::from_slice(&[decode_token_id as i32], &[1, 1]);
+
+            let decode_mamba = mamba_cache.as_deref_mut();
+            let (_decode_logits, decode_profile) = qwen.forward_with_cache_profiled(
+                &decode_input,
+                None,
+                Some(cache),
+                decode_mamba,
+                "decode",
+            )?;
+
+            Ok((architecture.to_string(), prefill_profile, decode_profile, decode_token_id))
+        })
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    let decode_token_text = tokenizer
+        .decode(&[decode_token_id])
+        .unwrap_or_else(|_| "<decode failed>".to_string());
+    let report = HybridLayerProfileReport {
+        model: model_id.to_string(),
+        architecture,
+        prompt_tokens: prompt_token_ids.len(),
+        decode_token_id,
+        decode_token_text,
+        prefill: prefill_profile,
+        decode: decode_profile,
+    };
+
+    println!("\n========================================");
+    println!("  PMetal Hybrid Layer Profile");
+    println!("========================================");
+    println!("Model:         {}", report.model);
+    println!("Architecture:  {}", report.architecture);
+    println!("Prompt tokens: {}", report.prompt_tokens);
+    println!(
+        "Decode token:  {} ({:?})",
+        report.decode_token_id, report.decode_token_text
+    );
+    print_qwen3_next_profile_summary("Prefill", &report.prefill);
+    print_qwen3_next_profile_summary("Decode", &report.decode);
+
+    if let Some(output_path) = profile_output {
+        let report_json = serde_json::to_string_pretty(&report)?;
+        std::fs::write(output_path, report_json).with_context(|| {
+            format!(
+                "failed to write profile report to {}",
+                output_path.display()
+            )
+        })?;
+        println!("\nProfile JSON written to {}", output_path.display());
+    }
+
+    Ok(())
+}
 
 /// Run inference with a model.
 ///
@@ -36,6 +175,8 @@ pub(crate) async fn run_inference(
     ane_real_time: bool,
     benchmark: bool,
     benchmark_iters: usize,
+    profile_layers: bool,
+    profile_output: Option<&Path>,
     kv_quant: Option<u8>,
     kv_k_bits: Option<u8>,
     kv_v_bits: Option<u8>,
@@ -72,6 +213,7 @@ pub(crate) async fn run_inference(
         experts_dir: experts_dir.map(|s| s.to_string()),
         fp8,
         prompt: prompt.to_string(),
+        chat_messages: None,
         system_message: system.map(|s| s.to_string()),
         chat,
         no_thinking,
@@ -95,6 +237,18 @@ pub(crate) async fn run_inference(
     let mut runner = InferenceRunner::prepare(runner_config)?;
     let use_chat = runner.is_chat();
     let gen_config = runner.state.gen_config();
+
+    if profile_layers {
+        if benchmark {
+            anyhow::bail!(
+                "--profile-layers and --benchmark are separate modes; run them separately"
+            );
+        }
+        if lora_path.is_some() {
+            anyhow::bail!("--profile-layers is only supported for standard models right now");
+        }
+        return run_qwen3_next_layer_profile(&mut runner, model_id, profile_output);
+    }
 
     // Print configuration
     println!("\n========================================");
@@ -429,406 +583,6 @@ pub(crate) async fn run_inference(
     }
 
     Ok(())
-}
-
-// NOTE: get_eos_tokens, is_instruction_tuned, apply_chat_template, and 15
-// per-template format_* functions have been removed. Their logic is now in
-// InferenceRunner::prepare() via the generic ChatTemplate::apply path.
-
-// NOTE: is_instruction_tuned moved to inference_runner.rs
-
-#[allow(dead_code)]
-pub(crate) fn is_instruction_tuned(model_path: &Path) -> bool {
-    // Primary: check for chat_template in tokenizer_config.json (authoritative)
-    let config_path = model_path.join("tokenizer_config.json");
-    if config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-                if config.get("chat_template").is_some() {
-                    return true;
-                }
-            }
-        }
-    }
-
-    // Fallback: only explicit instruct markers in model name
-    let path_str = model_path.to_string_lossy().to_lowercase();
-    path_str.contains("instruct")
-        || path_str.contains("-it-")
-        || path_str.contains("-it/")
-        || path_str.ends_with("-it")
-        || path_str.contains("chat")
-}
-
-/// Apply chat template to the prompt using unified detection.
-///
-/// Returns the formatted prompt string and the detected `ChatTemplateType` so the caller
-/// can select the right stop tokens.
-///
-/// If `no_thinking` is true, prefills empty thinking block to disable reasoning (ChatML/Phi4 only).
-/// Otherwise, the model decides when to use thinking based on query complexity.
-pub(crate) fn apply_chat_template(
-    _tokenizer: &Tokenizer,
-    user_message: &str,
-    system_message: Option<&str>,
-    model_path: &Path,
-    no_thinking: bool,
-    tools: Option<&[pmetal_data::chat_templates::ToolDefinition]>,
-) -> anyhow::Result<(String, pmetal_data::chat_templates::ChatTemplateType)> {
-    use pmetal_data::chat_templates::{ChatTemplateType, Message};
-
-    let detected = pmetal_data::chat_templates::detect_chat_template(
-        model_path,
-        &model_path.to_string_lossy(),
-    );
-
-    // When tools are provided, use the structured template system which handles
-    // tool injection into system prompts in the model-native format
-    if tools.is_some() {
-        let mut messages = Vec::new();
-
-        // Build system message with optional thinking control
-        let sys_content = match (system_message, no_thinking) {
-            (Some(sys), true) => Some(format!("{}\n/no_think", sys)),
-            (Some(sys), false) => Some(sys.to_string()),
-            (None, true) => Some("/no_think".to_string()),
-            (None, false) => None,
-        };
-        if let Some(sys) = sys_content {
-            messages.push(Message::system(sys));
-        }
-
-        messages.push(Message::user(user_message));
-
-        let formatted = detected.apply_with_tools(&messages, tools);
-
-        // The formatted text includes the assistant generation prompt
-        return Ok((formatted.text, detected.template_type));
-    }
-
-    // No tools — use the existing per-template formatting functions
-    let formatted = match detected.template_type {
-        ChatTemplateType::ChatMl | ChatTemplateType::Qwen => {
-            format_chatml(user_message, system_message, no_thinking)
-        }
-        ChatTemplateType::Llama3 => format_llama3(user_message, system_message),
-        ChatTemplateType::Llama2 => format_llama2_inference(user_message, system_message),
-        ChatTemplateType::Gemma => format_gemma_inference(user_message, system_message),
-        ChatTemplateType::Mistral => format_mistral_inference(user_message, system_message),
-        ChatTemplateType::Phi3 => format_phi3_inference(user_message, system_message),
-        ChatTemplateType::Phi4 => format_phi4_inference(user_message, system_message, no_thinking),
-        ChatTemplateType::GptOss => format_gpt_oss_inference(user_message, system_message),
-        ChatTemplateType::Llama4 => format_llama4_inference(user_message, system_message),
-        ChatTemplateType::DeepSeek => {
-            format_deepseek_inference(user_message, system_message, no_thinking)
-        }
-        ChatTemplateType::Cohere => format_cohere_inference(user_message, system_message),
-        // Alpaca, Vicuna, Zephyr, Custom — fall back to ChatML for inference
-        _ => format_chatml(user_message, system_message, no_thinking),
-    };
-
-    Ok((formatted, detected.template_type))
-}
-
-/// Format message using ChatML template (used by Qwen, many others).
-fn format_chatml(user_message: &str, system_message: Option<&str>, no_thinking: bool) -> String {
-    format_qwen3_chatml(user_message, system_message, no_thinking)
-}
-
-/// Format message using Qwen3 ChatML template.
-///
-/// By default, the model decides when to use `<think>` blocks based on query complexity.
-/// If `no_thinking` is true, prefills empty `<think></think>` to force non-thinking mode.
-fn format_qwen3_chatml(
-    user_message: &str,
-    system_message: Option<&str>,
-    no_thinking: bool,
-) -> String {
-    let mut result = String::new();
-
-    // Always include system block (can be empty per NemotronH template)
-    result.push_str("<|im_start|>system\n");
-    if let Some(sys) = system_message {
-        result.push_str(sys);
-    }
-    result.push_str("<|im_end|>\n");
-
-    result.push_str("<|im_start|>user\n");
-    result.push_str(user_message);
-    result.push_str("<|im_end|>\n");
-    result.push_str("<|im_start|>assistant\n");
-
-    if no_thinking {
-        // Force non-thinking: prefill empty think block without newlines
-        // This matches NemotronH's expected format
-        result.push_str("<think></think>");
-    } else {
-        // Prefill <think> to ensure clean thinking output
-        // Without this, model sometimes generates </think> first or skips thinking
-        result.push_str("<think>\n");
-    }
-
-    result
-}
-
-/// Format message using Llama 3 template.
-fn format_llama3(user_message: &str, system_message: Option<&str>) -> String {
-    let mut result = String::from("<|begin_of_text|>");
-
-    if let Some(sys) = system_message {
-        result.push_str("<|start_header_id|>system<|end_header_id|>\n\n");
-        result.push_str(sys);
-        result.push_str("<|eot_id|>");
-    }
-
-    result.push_str("<|start_header_id|>user<|end_header_id|>\n\n");
-    result.push_str(user_message);
-    result.push_str("<|eot_id|>");
-    result.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
-
-    result
-}
-
-/// Format message using Llama-2 template for inference.
-fn format_llama2_inference(user_message: &str, system_message: Option<&str>) -> String {
-    let mut result = String::from("<s>[INST] ");
-    if let Some(sys) = system_message {
-        result.push_str(&format!("<<SYS>>\n{}\n<</SYS>>\n\n", sys));
-    }
-    result.push_str(user_message);
-    result.push_str(" [/INST] ");
-    result
-}
-
-/// Format message using Gemma template for inference.
-fn format_gemma_inference(user_message: &str, system_message: Option<&str>) -> String {
-    let mut result = String::new();
-    if let Some(sys) = system_message {
-        // Gemma folds system into a user turn
-        result.push_str(&format!(
-            "<start_of_turn>user\n{}\n\n{}<end_of_turn>\n",
-            sys, user_message
-        ));
-    } else {
-        result.push_str(&format!(
-            "<start_of_turn>user\n{}<end_of_turn>\n",
-            user_message
-        ));
-    }
-    result.push_str("<start_of_turn>model\n");
-    result
-}
-
-/// Format message using Mistral template for inference.
-fn format_mistral_inference(user_message: &str, system_message: Option<&str>) -> String {
-    let mut result = String::from("[INST] ");
-    if let Some(sys) = system_message {
-        result.push_str(sys);
-        result.push_str("\n\n");
-    }
-    result.push_str(user_message);
-    result.push_str(" [/INST]");
-    result
-}
-
-/// Format message using Phi-3 template for inference.
-fn format_phi3_inference(user_message: &str, system_message: Option<&str>) -> String {
-    let mut result = String::new();
-    if let Some(sys) = system_message {
-        result.push_str("<|system|>\n");
-        result.push_str(sys);
-        result.push_str("<|end|>\n");
-    }
-    result.push_str("<|user|>\n");
-    result.push_str(user_message);
-    result.push_str("<|end|>\n");
-    result.push_str("<|assistant|>\n");
-    result
-}
-
-/// Format message using Phi-4 template for inference.
-///
-/// Phi-4 uses `<|im_sep|>` instead of the newline separator in standard ChatML.
-fn format_phi4_inference(
-    user_message: &str,
-    system_message: Option<&str>,
-    no_thinking: bool,
-) -> String {
-    let mut result = String::new();
-
-    if let Some(sys) = system_message {
-        result.push_str("<|im_start|>system<|im_sep|>");
-        result.push_str(sys);
-        result.push_str("<|im_end|>");
-    }
-
-    result.push_str("<|im_start|>user<|im_sep|>");
-    result.push_str(user_message);
-    result.push_str("<|im_end|>");
-    result.push_str("<|im_start|>assistant<|im_sep|>");
-
-    if no_thinking {
-        result.push_str("<think></think>");
-    }
-
-    result
-}
-
-/// Format message using GPT-OSS Harmony template for inference.
-fn format_gpt_oss_inference(user_message: &str, system_message: Option<&str>) -> String {
-    let mut result = String::new();
-    if let Some(sys) = system_message {
-        result.push_str("<|start|>system<|message|>");
-        result.push_str(sys);
-        result.push_str("<|end|>");
-    }
-    result.push_str("<|start|>user<|message|>");
-    result.push_str(user_message);
-    result.push_str("<|end|>");
-    result.push_str("<|start|>assistant<|channel|>final<|message|>");
-    result
-}
-
-/// Format message using Llama 4 template for inference.
-///
-/// Llama 4 uses `<|header_start|>`/`<|header_end|>` and `<|eot|>` (not Llama 3's tokens).
-fn format_llama4_inference(user_message: &str, system_message: Option<&str>) -> String {
-    let mut result = String::from("<|begin_of_text|>");
-
-    if let Some(sys) = system_message {
-        result.push_str("<|header_start|>system<|header_end|>\n\n");
-        result.push_str(sys);
-        result.push_str("<|eot|>");
-    }
-
-    result.push_str("<|header_start|>user<|header_end|>\n\n");
-    result.push_str(user_message);
-    result.push_str("<|eot|>");
-    result.push_str("<|header_start|>assistant<|header_end|>\n\n");
-
-    result
-}
-
-/// Format message using DeepSeek template for inference.
-///
-/// Uses full-width unicode characters in token names.
-/// V3.1+ supports thinking mode via `<think>` / `</think>` prefill.
-fn format_deepseek_inference(
-    user_message: &str,
-    system_message: Option<&str>,
-    no_thinking: bool,
-) -> String {
-    let mut result = String::from("<｜begin▁of▁sentence｜>");
-
-    if let Some(sys) = system_message {
-        result.push_str(sys);
-    }
-
-    result.push_str("<｜User｜>");
-    result.push_str(user_message);
-    result.push_str("<｜Assistant｜>");
-
-    if no_thinking {
-        result.push_str("</think>");
-    } else {
-        result.push_str("<think>\n");
-    }
-
-    result
-}
-
-/// Format message using Cohere Command R template for inference.
-fn format_cohere_inference(user_message: &str, system_message: Option<&str>) -> String {
-    let mut result = String::from("<BOS_TOKEN>");
-
-    if let Some(sys) = system_message {
-        result.push_str("<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>");
-        result.push_str(sys);
-        result.push_str("<|END_OF_TURN_TOKEN|>");
-    }
-
-    result.push_str("<|START_OF_TURN_TOKEN|><|USER_TOKEN|>");
-    result.push_str(user_message);
-    result.push_str("<|END_OF_TURN_TOKEN|>");
-    result.push_str("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>");
-
-    result
-}
-
-/// Get stop tokens appropriate for a given chat template type.
-///
-/// Encodes the template's EOS token via the tokenizer; falls back to the generic
-/// `get_eos_tokens` if encoding fails.
-#[allow(dead_code)]
-pub(crate) fn get_chat_stop_tokens(
-    template_type: pmetal_data::chat_templates::ChatTemplateType,
-    tokenizer: &Tokenizer,
-) -> Vec<u32> {
-    let eos_str = template_type.eos_token();
-    let mut tokens = Vec::new();
-
-    // Template-specific EOS
-    if let Ok(encoded) = tokenizer.encode(eos_str) {
-        if encoded.len() == 1 {
-            tokens.push(encoded[0]);
-        }
-    }
-
-    // Hardcoded fallbacks for common models
-    if tokens.is_empty() {
-        match template_type {
-            pmetal_data::chat_templates::ChatTemplateType::ChatMl
-            | pmetal_data::chat_templates::ChatTemplateType::Qwen
-            | pmetal_data::chat_templates::ChatTemplateType::Phi4 => {
-                tokens.push(151645); // <|im_end|>
-            }
-            pmetal_data::chat_templates::ChatTemplateType::Llama3 => {
-                tokens.push(128009); // <|eot_id|>
-            }
-            _ => {
-                if let Ok(encoded) = tokenizer.encode("</s>") {
-                    if encoded.len() == 1 {
-                        tokens.push(encoded[0]);
-                    }
-                }
-                if tokens.is_empty() {
-                    tokens.push(2);
-                }
-            }
-        }
-    }
-
-    // Also include the tokenizer's native EOS — critical for base models
-    // fine-tuned with LoRA that might emit either the chat EOS or the base EOS.
-    if let Some(eos) = tokenizer.eos_token_id() {
-        if !tokens.contains(&eos) {
-            tokens.push(eos);
-        }
-    }
-
-    // Probe well-known special tokens in vocabulary
-    let candidates = [
-        "<|im_end|>",
-        "<|eot_id|>",
-        "<|eot|>",
-        "<|endoftext|>",
-        "<|end_of_text|>",
-        "<end_of_turn>",
-        "<|end|>",
-        "<|return|>",
-        "<|END_OF_TURN_TOKEN|>",
-        "<｜end▁of▁sentence｜>",
-        "</s>",
-    ];
-    for candidate in &candidates {
-        if let Ok(encoded) = tokenizer.encode(candidate) {
-            if encoded.len() == 1 && !tokens.contains(&encoded[0]) {
-                tokens.push(encoded[0]);
-            }
-        }
-    }
-
-    tokens
 }
 
 /// Extract the final response after </think> tag, discarding thinking content.

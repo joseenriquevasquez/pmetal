@@ -40,6 +40,11 @@ pub struct InferenceRunnerConfig {
     // ── Prompt ───────────────────────────────────────────────────────────
     /// User prompt text.
     pub prompt: String,
+    /// Optional structured chat history for callers like the GUI.
+    ///
+    /// When present, the shared runner applies the detected chat template to
+    /// these messages directly instead of flattening them into ad-hoc text.
+    pub chat_messages: Option<Vec<Message>>,
     /// Optional system message.
     pub system_message: Option<String>,
     /// Apply chat template (auto-detected from model).
@@ -84,6 +89,7 @@ impl Default for InferenceRunnerConfig {
             experts_dir: None,
             fp8: false,
             prompt: String::new(),
+            chat_messages: None,
             system_message: None,
             chat: false,
             no_thinking: false,
@@ -167,7 +173,7 @@ impl InferenceRunner {
             .map_err(|e| Exception::custom(format!("tokenizer: {e}")))?;
 
         // 2. Determine chat mode (auto-detect instruction-tuned models)
-        let is_instruct = is_instruction_tuned(model_path);
+        let is_instruct = model_looks_instruction_tuned(model_path);
         let use_chat = config.chat || is_instruct || config.tools.is_some();
         let no_thinking = if !is_instruct && !config.no_thinking && use_chat {
             true // base models don't understand <think> tags
@@ -192,45 +198,62 @@ impl InferenceRunner {
             .unwrap_or(defaults.frequency_penalty);
         let presence_penalty = config.presence_penalty.unwrap_or(defaults.presence_penalty);
 
-        // 4. Apply chat template + tokenize
+        // 4. Prime the Metal runtime before MLX model construction. The stable
+        // benchmark path always initializes Metal first, and doing the same here
+        // avoids lazy Objective-C/Metal setup during Qwen 3.5 model loading.
+        #[cfg(feature = "metal")]
+        if let Err(err) = pmetal_metal::context::MetalContext::global() {
+            tracing::warn!("Metal context prewarm failed before model load: {err}");
+        }
+
+        // 5. For the standard path, load the model before prompt tokenization so
+        // the interactive inference path follows the same load ordering as the
+        // stable benchmark flow. LoRA still tokenizes first because its loader
+        // needs the final max_seq_len up front.
+        let mut preloaded_model = if config.lora_path.is_none() {
+            tracing::info!("Loading dynamic model");
+            let mut model = DynamicModel::load_with_options(
+                model_path,
+                pmetal_models::dispatcher::DynamicModelLoadOptions {
+                    prefer_expert_offload: config.experts_dir.is_some(),
+                },
+            )?;
+            tracing::info!(arch = %model.architecture(), "Model loaded");
+
+            if config.fp8 {
+                tracing::info!("Quantizing weights to FP8 E4M3");
+                model.quantize_fp8()?;
+            }
+
+            if let Some(ref experts_dir) = config.experts_dir {
+                model.enable_expert_offloading(Path::new(experts_dir))?;
+            } else if model.requires_expert_offloading() {
+                return Err(Exception::custom(
+                    "this model requires expert offloading; repack routed experts with `pmetal pack-experts` and pass --experts-dir <packed_dir>",
+                ));
+            }
+
+            Some(model)
+        } else {
+            None
+        };
+
+        // 6. Apply chat template + tokenize
         let (input_ids, template_type) = if use_chat {
             let detected = pmetal_data::chat_templates::detect_chat_template(
                 model_path,
                 &model_path.to_string_lossy(),
             );
 
-            let formatted = if config.tools.is_some() {
-                // Tool-calling path: structured template with tool injection
-                let mut msgs = Vec::new();
-                let sys_content = match (config.system_message.as_deref(), no_thinking) {
-                    (Some(sys), true) => Some(format!("{sys}\n/no_think")),
-                    (Some(sys), false) => Some(sys.to_string()),
-                    (None, true) => Some("/no_think".to_string()),
-                    (None, false) => None,
-                };
-                if let Some(sys) = sys_content {
-                    msgs.push(Message::system(sys));
-                }
-                msgs.push(Message::user(&config.prompt));
-                detected
-                    .apply_with_tools(&msgs, config.tools.as_deref())
-                    .text
-            } else {
-                // Standard chat path
-                let mut msgs = Vec::new();
-                if let Some(ref sys) = config.system_message {
-                    if !sys.is_empty() {
-                        let sys_text = if no_thinking {
-                            format!("{sys}\n/no_think")
-                        } else {
-                            sys.clone()
-                        };
-                        msgs.push(Message::system(sys_text));
-                    }
-                }
-                msgs.push(Message::user(&config.prompt));
-                detected.apply(&msgs).text
-            };
+            let messages = build_chat_messages(
+                config.chat_messages.as_ref(),
+                config.system_message.as_deref(),
+                &config.prompt,
+            );
+
+            let formatted = detected
+                .apply_inference(&messages, no_thinking, config.tools.as_deref())
+                .text;
 
             let ids = tokenizer
                 .encode_with_special_tokens(&formatted)
@@ -245,7 +268,7 @@ impl InferenceRunner {
 
         tracing::info!(tokens = input_ids.len(), "Prompt tokenized");
 
-        // 5. Collect stop tokens from all sources
+        // 7. Collect stop tokens from all sources
         let stop_tokens = pmetal_data::inference_config::collect_all_stop_tokens(
             model_path,
             &tokenizer,
@@ -253,7 +276,7 @@ impl InferenceRunner {
         );
         tracing::info!(count = stop_tokens.len(), "Stop tokens collected");
 
-        // 6. Build GenerationConfig
+        // 8. Build GenerationConfig
         let gen_config = if temperature < 1e-6 {
             GenerationConfig::greedy(config.max_tokens).with_stop_tokens(stop_tokens)
         } else {
@@ -271,7 +294,7 @@ impl InferenceRunner {
             gc
         };
 
-        // 7. Load model (standard or LoRA-merged)
+        // 9. Load model (standard or LoRA-merged)
         let max_seq_len = input_ids.len() + config.max_tokens + 64;
 
         let (model, cache, mamba_cache) = if let Some(ref lora_path) = config.lora_path {
@@ -280,20 +303,9 @@ impl InferenceRunner {
             log_cache_selection(&cache_selection, max_seq_len);
             (LoadedModel::Lora(lora_model), cache, mamba_cache)
         } else {
-            tracing::info!("Loading dynamic model");
-            let mut m = DynamicModel::load(model_path)?;
-            tracing::info!(arch = %m.architecture(), "Model loaded");
-
-            // 8. FP8 quantization (standard path only — LoRA models are already merged)
-            if config.fp8 {
-                tracing::info!("Quantizing weights to FP8 E4M3");
-                m.quantize_fp8()?;
-            }
-
-            // 9. Expert offloading
-            if let Some(ref experts_dir) = config.experts_dir {
-                m.enable_expert_offloading(Path::new(experts_dir))?;
-            }
+            let m = preloaded_model
+                .take()
+                .expect("standard path should preload the dynamic model");
 
             let base_cache_config = m.create_cache(max_seq_len).config().clone();
             tracing::info!(tokens = max_seq_len, "Base KV cache created");
@@ -416,6 +428,31 @@ impl InferenceGenState {
             };
 
         f(&mut fwd, cache)
+    }
+
+    /// Run a callback with mutable access to the standard DynamicModel and its caches.
+    ///
+    /// This is useful for opt-in diagnostics that need model-specific APIs while
+    /// preserving the shared inference setup. LoRA-merged models are rejected
+    /// because their wrapper does not expose the same architecture-specific
+    /// surfaces.
+    pub fn run_standard_model_with_state<F, R>(&mut self, f: F) -> Result<R, Exception>
+    where
+        F: FnOnce(&mut DynamicModel, &mut KVCache, Option<&mut MambaCache>) -> Result<R, Exception>,
+    {
+        let Self {
+            ref mut model,
+            ref mut cache,
+            ref mut mamba_cache,
+            ..
+        } = *self;
+
+        match model {
+            LoadedModel::Standard(dynamic_model) => f(dynamic_model, cache, mamba_cache.as_mut()),
+            LoadedModel::Lora(_) => Err(Exception::custom(
+                "this inference mode is only available for standard models",
+            )),
+        }
     }
 
     /// Forward pass through the model (for non-streaming generation paths).
@@ -887,20 +924,57 @@ fn find_compatible_group_size(head_dim: usize, preferred: usize) -> usize {
     }
     1
 }
-/// Check if a model directory looks like an instruction-tuned model.
-fn is_instruction_tuned(model_path: &Path) -> bool {
-    let name = model_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+/// Check if a model directory looks instruction-tuned and should default to chat.
+///
+/// Primary signal is `tokenizer_config.json` containing a `chat_template`,
+/// which is authoritative for modern HF checkpoints including Qwen 3.5 VLM
+/// wrappers. Name markers are only a fallback for older repos.
+fn model_looks_instruction_tuned(model_path: &Path) -> bool {
+    let config_path = model_path.join("tokenizer_config.json");
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+            if config.get("chat_template").is_some() {
+                return true;
+            }
+        }
+    }
 
-    // Common instruction-tuning suffixes
-    let instruct_markers = [
-        "instruct", "chat", "it", "-sft", "-rlhf", "-dpo", "-grpo", "-rl",
-    ];
+    let name = model_path.to_string_lossy().to_lowercase();
+    [
+        "instruct", "chat", "-it-", "-it/", "-it", "-sft", "-rlhf", "-dpo", "-grpo", "-rl",
+    ]
+    .iter()
+    .any(|marker| {
+        if *marker == "-it" {
+            name.ends_with(marker)
+        } else {
+            name.contains(marker)
+        }
+    })
+}
 
-    instruct_markers.iter().any(|m| name.contains(m))
+fn build_chat_messages(
+    history: Option<&Vec<Message>>,
+    system_message: Option<&str>,
+    prompt: &str,
+) -> Vec<Message> {
+    let mut messages = history.cloned().unwrap_or_default();
+
+    if let Some(system_message) = system_message.filter(|sys| !sys.is_empty()) {
+        if matches!(messages.first(), Some(msg) if msg.role == "system") {
+            messages[0] = Message::system(system_message);
+        } else {
+            messages.insert(0, Message::system(system_message));
+        }
+    }
+
+    let should_append_prompt = !prompt.is_empty()
+        && !matches!(messages.last(), Some(msg) if msg.role == "user" && msg.content == prompt);
+    if should_append_prompt {
+        messages.push(Message::user(prompt));
+    }
+
+    messages
 }
 
 #[cfg(test)]
@@ -1019,6 +1093,66 @@ mod tests {
         std::fs::write(dir.path().join("model.safetensors"), vec![0u8; 4000]).unwrap();
 
         assert_eq!(estimate_weight_bytes(dir.path(), 0, true), 2100);
+    }
+
+    #[test]
+    fn build_chat_messages_uses_structured_history() {
+        let history = vec![
+            Message::user("hello"),
+            Message::assistant("hi"),
+            Message::user("write fizzbuzz"),
+        ];
+
+        let messages =
+            build_chat_messages(Some(&history), Some("You are a helpful assistant."), "");
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[3].content, "write fizzbuzz");
+    }
+
+    #[test]
+    fn build_chat_messages_updates_existing_system_and_no_think() {
+        let history = vec![
+            Message::system("old"),
+            Message::user("hello"),
+            Message::assistant("hi"),
+        ];
+
+        let messages = build_chat_messages(Some(&history), Some("new"), "");
+
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[0].content, "new");
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn build_chat_messages_appends_prompt_when_missing() {
+        let messages = build_chat_messages(None, None, "write fizzbuzz");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "write fizzbuzz");
+    }
+
+    #[test]
+    fn instruction_tuned_detection_prefers_chat_template() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template":"{{ messages }}"}"#,
+        )
+        .unwrap();
+        assert!(model_looks_instruction_tuned(dir.path()));
+    }
+
+    #[test]
+    fn instruction_tuned_detection_falls_back_to_name_markers() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("my-model-instruct");
+        std::fs::create_dir(&path).unwrap();
+        assert!(model_looks_instruction_tuned(&path));
     }
 
     #[cfg(unix)]
