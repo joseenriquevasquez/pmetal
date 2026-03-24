@@ -2,7 +2,7 @@
 
 Run interactive inference with chat, tool use, thinking mode, and LoRA adapters.
 
-Run inference on a loaded model. Supports interactive chat, tool/function calling, thinking mode, FP8 quantization, and LoRA adapter loading.
+Run inference on a loaded model. Supports interactive chat, tool/function calling, thinking mode, FP8 quantization, LoRA adapter loading, and opt-in per-layer profiling for supported hybrid models.
 
 ## Usage
 
@@ -38,6 +38,14 @@ pmetal infer --model Qwen/Qwen3-0.6B --ane-max-seq-len 2048
 
 # JIT-compiled sampling
 pmetal infer --model Qwen/Qwen3-0.6B --compiled --chat
+
+# Profile Qwen 3.5 hybrid prefill + cached decode layers and write JSON
+pmetal infer \
+  --model unsloth/Qwen3.5-0.8B \
+  --prompt "write a fizzbuzz program in python" \
+  --chat --no-thinking --temperature 0 \
+  --profile-layers \
+  --profile-output .strategy/qwen35_layer_profile.json
 ```
 
 ## Parameters
@@ -59,10 +67,18 @@ pmetal infer --model Qwen/Qwen3-0.6B --compiled --chat
 | `--show-thinking` | `false` | Show reasoning content |
 | `--fp8` | `false` | FP8 weights (~2× mem reduction) |
 | `--compiled` | `false` | JIT-compiled sampling |
+| `--profile-layers` | `false` | Run an opt-in per-layer forward profile for supported hybrid models |
+| `--profile-output` | — | Write the layer profile report as pretty JSON |
 | `--no-ane` | `false` | Disable ANE inference |
 | `--ane-max-seq-len` | `1024` | Max ANE kernel sequence length |
 | `--tools` | — | Tool definitions file (OpenAI format) |
 | `--system` | — | System message |
+
+## Layer Profiling
+
+`--profile-layers` is currently implemented for standard `Qwen 3.5 / qwen3_next` inference. It runs one real prefill pass and one real cached decode pass using the shared inference runner, forcing MLX evaluation at each measured section so the report reflects actual wall time instead of only op scheduling overhead.
+
+Use `--profile-output <PATH>` to capture the full JSON report. The CLI summary prints the slowest layers and their main sections, which is useful for deciding whether the next decode optimization should target GDN input projection, GDN recurrence, full-attention preparation, or the LM head.
 
 ## Chat Mode
 
