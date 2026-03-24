@@ -98,9 +98,7 @@ pub struct ModelSpec {
     pub kv_cache_bits: Option<u8>,
 }
 
-/// Bytes per parameter for a given quantization format.
-///
-/// Based on llmfit's `quant_bytes_per_param` table, tuned for Apple Silicon / MLX.
+/// Bytes per parameter for a given quantization format, tuned for Apple Silicon / MLX.
 pub fn bytes_per_param(quantization: &str) -> f64 {
     match quantization.to_lowercase().as_str() {
         "fp32" | "f32" | "float32" => 4.0,
@@ -128,7 +126,7 @@ pub fn estimate_fit(model: &ModelSpec, device: &DeviceSpec) -> FitEstimate {
     // --- KV cache memory ---
     // Exact formula when we have architectural details:
     //   kv_cache = 2 * num_layers * 2 * num_kv_heads * head_dim * context_length * bytes / 1e9
-    // Approximate formula (from llmfit) when we don't:
+    // Approximate formula when we don't have architectural details:
     //   kv_cache = 0.000008 * params_b * context_length
     //
     // KV cache bytes per element: quantized modes reduce memory 2-8x.

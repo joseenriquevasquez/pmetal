@@ -37,7 +37,41 @@ License: MIT
 Reference: MLX: Benchmarking On-Device ML on Apple Silicon (https://arxiv.org/abs/2510.18921)
 
 
-2. flash-linear-attention (FLA)
+2. mlx-lm (Apple Inc.)
+-----------------------
+
+PMetal's Gated Delta Network implementation, Qwen 3.5 (qwen3_next) architecture,
+and NemotronH SSM forward pass are ported from or reference mlx-lm's Python
+implementations.
+
+    Copyright (c) 2023 Apple Inc.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+Source: https://github.com/ml-explore/mlx-lm
+License: MIT
+Files: crates/pmetal-mlx/src/kernels/gated_delta.rs,
+       crates/pmetal-models/src/architectures/qwen3_next.rs,
+       crates/pmetal-models/src/architectures/nemotron_h.rs
+
+
+3. flash-linear-attention (FLA)
 -------------------------------
 
 PMetal's fused_gdn.metal kernel is a Metal port of FLA's Triton
@@ -70,7 +104,7 @@ Reference: Gated Delta Networks: Improving Mamba2 with Delta Rule (https://arxiv
 File: crates/pmetal-metal/src/kernels/metal/fused_gdn.metal
 
 
-3. metal-flash-attention (Philip Turner)
+4. metal-flash-attention (Philip Turner)
 -----------------------------------------
 
 PMetal's flash_attention.metal is derived from the Metal FlashAttention
@@ -103,7 +137,7 @@ Reference: FlashAttention-2 (https://arxiv.org/abs/2307.08691)
 File: crates/pmetal-metal/src/kernels/metal/flash_attention.metal
 
 
-4. FlashAttention (Tri Dao)
+5. FlashAttention (Tri Dao)
 ---------------------------
 
 PMetal implements the FlashAttention-2 algorithm for Metal, based on the
@@ -145,7 +179,7 @@ License: BSD 3-Clause
 Reference: FlashAttention-2 (https://arxiv.org/abs/2307.08691)
 
 
-5. Unsloth (Unsloth AI, Inc.)
+6. Unsloth (Unsloth AI, Inc.)
 ------------------------------
 
 PMetal's fused linear cross-entropy and fused LoRA kernels are independent
@@ -174,3 +208,103 @@ References: LoRA: Low-Rank Adaptation of Large Language Models (https://arxiv.or
             Cut Your Losses in Large-Vocabulary Language Models (https://arxiv.org/abs/2411.09009)
 Files: crates/pmetal-metal/src/kernels/metal/fused_cross_entropy.metal,
        crates/pmetal-metal/src/kernels/metal/fused_lora.metal
+
+
+7. llama.cpp / GGML
+--------------------
+
+PMetal's GGUF quantization infrastructure (K-quant and IQ-quant block
+structures, quantization routines, and the dequantization Metal kernel)
+is based on the llama.cpp/GGML implementation.
+
+    Copyright (c) 2023-2026 The ggml authors
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+Source: https://github.com/ggerganov/llama.cpp
+License: MIT
+Files: crates/pmetal-gguf/src/k_quants.rs,
+       crates/pmetal-gguf/src/iq_quants.rs,
+       crates/pmetal-gguf/src/quantize.rs,
+       crates/pmetal-metal/src/kernels/metal/dequant.metal
+
+
+8. Candle (Hugging Face)
+-------------------------
+
+PMetal's GGUF quantization code is co-derived from Candle's quantized
+module alongside llama.cpp. The Whisper speech-to-text architecture is
+based on Candle's Whisper implementation.
+
+    Copyright (c) Hugging Face, Inc. and contributors.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+Source: https://github.com/huggingface/candle
+License: MIT / Apache 2.0
+Files: crates/pmetal-gguf/src/k_quants.rs,
+       crates/pmetal-gguf/src/quantize.rs,
+       crates/pmetal-models/src/architectures/whisper.rs
+
+
+9. Burn (Tracel AI)
+--------------------
+
+PMetal's distributed collective operations (ring all-reduce, tree reduce,
+broadcast) are based on Burn's collective framework.
+
+    Copyright (c) 2022 Nathaniel Simard & Burn Framework Contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+Source: https://github.com/tracel-ai/burn
+License: MIT / Apache 2.0
+File: crates/pmetal-distributed/src/collective.rs
