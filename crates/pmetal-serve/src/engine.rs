@@ -2,17 +2,21 @@
 
 use crate::error::{ServeError, ServeResult};
 use crate::types::ChatMessage;
-use mlx_rs::Array;
+use mlx_rs::module::ModuleParameters as _;
 use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::{Array, Dtype};
 use pmetal_data::chat_templates::{ChatTemplate, ChatTemplateType, detect_chat_template};
 use pmetal_data::inference_config::collect_all_stop_tokens;
-use pmetal_mlx::kv_cache::CacheMode;
+use pmetal_mlx::kv_cache::{CacheMode, KVCache, KVCacheConfig, MambaCache};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::{GenerationConfig, Sampler};
 use pmetal_models::{
     GenerationOutput, generate_cached_ane_streaming, generate_cached_hybrid_cpu_streaming,
     is_ane_inference_compatible, is_hybrid_cpu_compatible,
 };
+use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -73,6 +77,30 @@ enum PreferredGenerationBackend {
     Gpu,
     Ane,
     CpuHybrid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeCacheModeSource {
+    AutoFp16,
+    AutoQ8,
+}
+
+impl ServeCacheModeSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AutoFp16 => "auto-fp16",
+            Self::AutoQ8 => "auto-q8",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServeCacheModeSelection {
+    mode: CacheMode,
+    source: ServeCacheModeSource,
+    estimated_weight_bytes: u64,
+    estimated_fp16_kv_bytes: u64,
+    working_set_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -176,6 +204,165 @@ fn select_accelerated_backend(
     PreferredGenerationBackend::Gpu
 }
 
+fn select_serve_cache_mode(
+    model_path: &Path,
+    param_count: usize,
+    base_cache_config: &KVCacheConfig,
+) -> ServeCacheModeSelection {
+    let working_set_bytes = pmetal_metal::context::MetalContext::global()
+        .ok()
+        .map(|ctx| ctx.properties().recommended_working_set_size);
+    let estimated_weight_bytes = estimate_serve_weight_bytes(
+        model_path,
+        estimate_weight_bytes_from_param_count(param_count),
+    );
+
+    select_serve_cache_mode_with_working_set(
+        base_cache_config,
+        estimated_weight_bytes,
+        working_set_bytes,
+    )
+}
+
+fn select_serve_cache_mode_with_working_set(
+    base_cache_config: &KVCacheConfig,
+    estimated_weight_bytes: u64,
+    working_set_bytes: Option<u64>,
+) -> ServeCacheModeSelection {
+    let estimated_fp16_kv_bytes = estimate_fp16_kv_cache_bytes(base_cache_config);
+    let estimated_total_fp16 = estimated_weight_bytes.saturating_add(estimated_fp16_kv_bytes);
+    let prefer_q8 = working_set_bytes.is_some_and(|working_set| {
+        working_set > 0 && estimated_total_fp16 > ((working_set as f64) * 0.70) as u64
+    });
+
+    ServeCacheModeSelection {
+        mode: if prefer_q8 {
+            CacheMode::Quantized {
+                bits: 8,
+                group_size: 64,
+            }
+        } else {
+            CacheMode::Standard
+        },
+        source: if prefer_q8 {
+            ServeCacheModeSource::AutoQ8
+        } else {
+            ServeCacheModeSource::AutoFp16
+        },
+        estimated_weight_bytes,
+        estimated_fp16_kv_bytes,
+        working_set_bytes,
+    }
+}
+
+fn log_serve_cache_selection(selection: &ServeCacheModeSelection, max_seq_len: usize) {
+    let estimated_weight_gb = selection.estimated_weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let estimated_fp16_kv_gb =
+        selection.estimated_fp16_kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let working_set_gb = selection
+        .working_set_bytes
+        .map(|bytes| bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+
+    tracing::info!(
+        mode = %selection.mode.describe(),
+        source = selection.source.as_str(),
+        tokens = max_seq_len,
+        estimated_weight_gb = format!("{estimated_weight_gb:.2}"),
+        estimated_fp16_kv_gb = format!("{estimated_fp16_kv_gb:.2}"),
+        working_set_gb = working_set_gb.map(|value| format!("{value:.2}")),
+        "serve KV cache"
+    );
+}
+
+fn estimate_serve_weight_bytes(model_path: &Path, param_estimate: u64) -> u64 {
+    estimate_local_model_weight_bytes(model_path)
+        .map(|bytes| bytes.max(param_estimate))
+        .unwrap_or(param_estimate)
+}
+
+fn estimate_weight_bytes_from_param_count(param_count: usize) -> u64 {
+    (param_count as f64 * 2.0) as u64
+}
+
+fn estimate_local_model_weight_bytes(model_path: &Path) -> Option<u64> {
+    let mut total = 0u64;
+    let mut visited_dirs = HashSet::new();
+    let mut counted_files = HashSet::new();
+    accumulate_model_weight_file_bytes(
+        model_path,
+        &mut visited_dirs,
+        &mut counted_files,
+        &mut total,
+    );
+    (total > 0).then_some(total)
+}
+
+fn accumulate_model_weight_file_bytes(
+    path: &Path,
+    visited_dirs: &mut HashSet<PathBuf>,
+    counted_files: &mut HashSet<PathBuf>,
+    total: &mut u64,
+) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+
+    if metadata.is_dir() {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if !visited_dirs.insert(canonical) {
+            return;
+        }
+
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            accumulate_model_weight_file_bytes(&entry.path(), visited_dirs, counted_files, total);
+        }
+        return;
+    }
+
+    if !metadata.is_file() || !is_supported_model_weight_file(path) {
+        return;
+    }
+
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if counted_files.insert(canonical) {
+        *total = total.saturating_add(metadata.len());
+    }
+}
+
+fn is_supported_model_weight_file(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(|ext| ext.to_ascii_lowercase());
+    let file_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .map(|name| name.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match extension.as_deref() {
+        Some("safetensors") | Some("gguf") => true,
+        Some("bin") | Some("pt") | Some("pth") => {
+            file_name.contains("model")
+                || file_name.contains("pytorch")
+                || file_name.contains("consolidated")
+        }
+        _ => false,
+    }
+}
+
+fn estimate_fp16_kv_cache_bytes(base_cache_config: &KVCacheConfig) -> u64 {
+    base_cache_config
+        .clone()
+        .with_dtype(Dtype::Float16)
+        .with_mode(CacheMode::Standard)
+        .memory_footprint() as u64
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Inference engine
 // ────────────────────────────────────────────────────────────────────────────
@@ -218,6 +405,20 @@ struct ModelState {
 unsafe impl Send for ModelState {}
 
 impl InferenceEngine {
+    fn create_request_caches(
+        model: &DynamicModel,
+        model_path: &Path,
+        max_seq_len: usize,
+    ) -> (KVCache, Option<MambaCache>) {
+        let base_cache = model.create_cache(max_seq_len);
+        let selection =
+            select_serve_cache_mode(model_path, model.num_parameters(), base_cache.config());
+        log_serve_cache_selection(&selection, max_seq_len);
+        let cache = model.create_cache_with_mode(max_seq_len, selection.mode);
+        let mamba_cache = model.create_mamba_cache();
+        (cache, mamba_cache)
+    }
+
     /// Create a new inference engine from a loaded model and tokenizer.
     pub fn new(
         model: DynamicModel,
@@ -667,13 +868,8 @@ impl InferenceEngine {
             let stop_tokens = gen_config.stop_tokens.clone();
             let mut state = model_arc.lock().map_err(|_| ServeError::Busy)?;
             let model = &mut state.model;
-            let mut cache = model.create_cache_with_mode(
-                max_seq_len,
-                CacheMode::Quantized {
-                    bits: 8,
-                    group_size: 64,
-                },
-            );
+            let (mut cache, mut mamba_cache) =
+                Self::create_request_caches(model, &model_path, max_seq_len);
 
             // Build input array [1, seq_len] for prefill.
             let i32_ids: Vec<i32> = input_ids.iter().map(|&t| t as i32).collect();
@@ -684,7 +880,7 @@ impl InferenceEngine {
 
             // Prefill forward pass — produces logits for the first sample step.
             let mut logits = model
-                .forward_with_cache(&input_arr, None, Some(&mut cache))
+                .forward_with_hybrid_cache(&input_arr, None, Some(&mut cache), mamba_cache.as_mut())
                 .map_err(ServeError::Model)?;
             // Blocked on mlx_rs::eval_async — would allow GPU pipeline overlap
             // between eval and the next decode step for higher throughput.
@@ -726,7 +922,12 @@ impl InferenceEngine {
                 if i + 1 < max_tokens {
                     let next_input = Array::from_slice(&[next_token as i32], &[1, 1]);
                     logits = model
-                        .forward_with_cache(&next_input, None, Some(&mut cache))
+                        .forward_with_hybrid_cache(
+                            &next_input,
+                            None,
+                            Some(&mut cache),
+                            mamba_cache.as_mut(),
+                        )
                         .map_err(ServeError::Model)?;
                     // Sync eval required — lazy graph grows unbounded without it.
                     // Blocked on mlx_rs::eval_async for pipeline overlap.
@@ -822,13 +1023,8 @@ impl InferenceEngine {
             // the entire generation loop.
             let mut state = state_guard;
             let model = &mut state.model;
-            let mut cache = model.create_cache_with_mode(
-                max_seq_len,
-                CacheMode::Quantized {
-                    bits: 8,
-                    group_size: 64,
-                },
-            );
+            let (mut cache, mut mamba_cache) =
+                Self::create_request_caches(model, &model_path, max_seq_len);
 
             // Build prefill input array.
             let i32_ids: Vec<i32> = input_ids.iter().map(|&t| t as i32).collect();
@@ -838,7 +1034,12 @@ impl InferenceEngine {
             let start = Instant::now();
 
             // Prefill forward pass — produces logits for the first sample step.
-            let mut logits = match model.forward_with_cache(&input_arr, None, Some(&mut cache)) {
+            let mut logits = match model.forward_with_hybrid_cache(
+                &input_arr,
+                None,
+                Some(&mut cache),
+                mamba_cache.as_mut(),
+            ) {
                 Ok(l) => l,
                 Err(e) => {
                     send!(TokenEvent::Error(e.to_string()));
@@ -900,7 +1101,12 @@ impl InferenceEngine {
                 // This avoids the wasted forward pass after the last token.
                 if i + 1 < max_tokens {
                     let next_input = Array::from_slice(&[next_token as i32], &[1, 1]);
-                    logits = match model.forward_with_cache(&next_input, None, Some(&mut cache)) {
+                    logits = match model.forward_with_hybrid_cache(
+                        &next_input,
+                        None,
+                        Some(&mut cache),
+                        mamba_cache.as_mut(),
+                    ) {
                         Ok(l) => l,
                         Err(e) => {
                             send!(TokenEvent::Error(e.to_string()));
@@ -930,6 +1136,7 @@ impl InferenceEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_models::architectures::nemotron_h::{NemotronHConfig, NemotronHForCausalLM};
 
     fn dense_config(hidden_size: u64, num_layers: u64, vocab_size: u64) -> serde_json::Value {
         serde_json::json!({
@@ -940,6 +1147,51 @@ mod tests {
             "num_experts": 0,
             "num_local_experts": 0
         })
+    }
+
+    fn qwen3_cache_config(max_seq_len: usize) -> KVCacheConfig {
+        KVCacheConfig::new(28, max_seq_len, 8, 128)
+    }
+
+    fn tiny_nemotron_h_config() -> NemotronHConfig {
+        NemotronHConfig {
+            model_type: "nemotron_h".to_string(),
+            vocab_size: 1000,
+            hidden_size: 128,
+            intermediate_size: 256,
+            num_hidden_layers: 4,
+            max_position_embeddings: 512,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            attention_bias: false,
+            head_dim: Some(32),
+            mamba_num_heads: 4,
+            mamba_head_dim: 32,
+            mamba_proj_bias: false,
+            ssm_state_size: 16,
+            conv_kernel: 4,
+            n_groups: 2,
+            time_step_limit: (0.0, f32::INFINITY),
+            time_step_min: None,
+            time_step_max: None,
+            mlp_bias: false,
+            mlp_hidden_act: "relu2".to_string(),
+            layer_norm_epsilon: 1e-5,
+            use_bias: false,
+            use_conv_bias: true,
+            tie_word_embeddings: true,
+            hybrid_override_pattern: Some("M*-E".to_string()),
+            moe_intermediate_size: Some(64),
+            moe_shared_expert_intermediate_size: None,
+            n_group: None,
+            n_routed_experts: Some(2),
+            n_shared_experts: None,
+            topk_group: None,
+            num_experts_per_tok: Some(1),
+            norm_topk_prob: None,
+            routed_scaling_factor: None,
+            rope_theta: 10000.0,
+        }
     }
 
     #[test]
@@ -1014,5 +1266,46 @@ mod tests {
         assert!(config.ane_real_time);
         assert_eq!(config.seed, Some(7));
         assert_eq!(config.stop_tokens, vec![1, 2, 99]);
+    }
+
+    #[test]
+    fn serve_auto_cache_prefers_fp16_when_model_fits_comfortably() {
+        let selection = select_serve_cache_mode_with_working_set(
+            &qwen3_cache_config(256),
+            1_240_000_000,
+            Some(48 * 1024 * 1024 * 1024),
+        );
+
+        assert_eq!(selection.mode, CacheMode::Standard);
+        assert_eq!(selection.source, ServeCacheModeSource::AutoFp16);
+    }
+
+    #[test]
+    fn serve_auto_cache_prefers_q8_when_budget_is_tight() {
+        let selection = select_serve_cache_mode_with_working_set(
+            &qwen3_cache_config(8192),
+            14_000_000_000,
+            Some(18 * 1024 * 1024 * 1024),
+        );
+
+        assert_eq!(
+            selection.mode,
+            CacheMode::Quantized {
+                bits: 8,
+                group_size: 64,
+            }
+        );
+        assert_eq!(selection.source, ServeCacheModeSource::AutoQ8);
+    }
+
+    #[test]
+    fn create_request_caches_allocates_mamba_cache_for_hybrid_models() {
+        let model =
+            DynamicModel::NemotronH(NemotronHForCausalLM::new(tiny_nemotron_h_config()).unwrap());
+        let (cache, mamba_cache) =
+            InferenceEngine::create_request_caches(&model, std::env::temp_dir().as_path(), 64);
+
+        assert_eq!(cache.config().max_seq_len, 64);
+        assert!(mamba_cache.is_some());
     }
 }
