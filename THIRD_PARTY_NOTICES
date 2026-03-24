@@ -74,9 +74,9 @@ Files: crates/pmetal-mlx/src/kernels/gated_delta.rs,
 3. flash-linear-attention (FLA)
 -------------------------------
 
-PMetal's fused_gdn.metal kernel is a Metal port of FLA's Triton
-implementation of the fused recurrent gated delta rule forward kernel.
-The algorithm and structure are derived directly from the original source.
+PMetal's chunkwise Gated Delta implementation follows the WY-factorized
+algorithm used by FLA for efficient recurrent linear attention training.
+The implementation and comments in `gated_delta.rs` retain that attribution.
 
     Copyright (c) 2023-2025 Songlin Yang
 
@@ -101,7 +101,7 @@ The algorithm and structure are derived directly from the original source.
 Source: https://github.com/fla-org/flash-linear-attention
 License: MIT
 Reference: Gated Delta Networks: Improving Mamba2 with Delta Rule (https://arxiv.org/abs/2412.06464)
-File: crates/pmetal-metal/src/kernels/metal/fused_gdn.metal
+File: crates/pmetal-mlx/src/kernels/gated_delta.rs
 
 
 4. metal-flash-attention (Philip Turner)

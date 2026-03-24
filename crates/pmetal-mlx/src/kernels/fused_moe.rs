@@ -37,7 +37,6 @@ pub fn moe_combine_mlx(
     k: i32,
     batch_seq: i32,
 ) -> Result<Array, Exception> {
-    // Weight and sum expert outputs
     let y = expert_outs
         .multiply(&expert_weights.reshape(&[batch_seq, k, 1])?)?
         .sum_axis(-2, false)?;
@@ -122,4 +121,5 @@ mod tests {
         result.eval().unwrap();
         assert_eq!(result.shape(), &[batch_seq, dim]);
     }
+
 }
