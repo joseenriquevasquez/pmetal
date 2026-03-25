@@ -38,7 +38,16 @@ impl std::fmt::Display for ChatRole {
 }
 
 /// Inference settings that can be navigated with arrow keys.
-const SETTING_NAMES: &[&str] = &["Temperature", "Max Tokens", "Top-k", "Top-p"];
+const SETTING_NAMES: &[&str] = &[
+    "Temperature",
+    "Max Tokens",
+    "Top-k",
+    "Top-p",
+    "Rep Penalty",
+    "KV Cache",
+    "FP8",
+    "No Thinking",
+];
 
 /// Focus mode for the inference tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +72,11 @@ pub struct InferenceTab {
     pub max_tokens: usize,
     pub top_k: usize,
     pub top_p: f32,
+    pub repetition_penalty: f32,
+    /// KV cache quantization mode: 0=auto, 8=q8, 4=q4, 255=fp16, 108=tq8, 104=tq4.
+    pub kv_quant_mode: u8,
+    pub fp8: bool,
+    pub no_thinking: bool,
     pub focus: InferenceFocus,
     pub settings_selected: usize,
     message_scroll: usize,
@@ -97,6 +111,10 @@ impl InferenceTab {
             max_tokens: 2048,
             top_k: 50,
             top_p: 0.9,
+            repetition_penalty: 1.1,
+            kv_quant_mode: 0, // auto
+            fp8: false,
+            no_thinking: false,
             focus: InferenceFocus::Input,
             settings_selected: 0,
             message_scroll: 0,
@@ -337,6 +355,19 @@ impl InferenceTab {
             1 => self.max_tokens = (self.max_tokens + 64).min(8192),
             2 => self.top_k = (self.top_k + 10).min(500),
             3 => self.top_p = (self.top_p + 0.05).min(1.0),
+            4 => self.repetition_penalty = (self.repetition_penalty + 0.05).min(3.0),
+            5 => {
+                self.kv_quant_mode = match self.kv_quant_mode {
+                    0 => 8,
+                    8 => 4,
+                    4 => 108, // TQ8
+                    108 => 104, // TQ4
+                    104 => 255, // FP16
+                    _ => 0,
+                }
+            }
+            6 => self.fp8 = !self.fp8,
+            7 => self.no_thinking = !self.no_thinking,
             _ => {}
         }
     }
@@ -347,6 +378,19 @@ impl InferenceTab {
             1 => self.max_tokens = self.max_tokens.saturating_sub(64).max(1),
             2 => self.top_k = self.top_k.saturating_sub(10),
             3 => self.top_p = (self.top_p - 0.05).max(0.0),
+            4 => self.repetition_penalty = (self.repetition_penalty - 0.05).max(1.0),
+            5 => {
+                self.kv_quant_mode = match self.kv_quant_mode {
+                    0 => 255,
+                    255 => 104,
+                    104 => 108,
+                    108 => 4,
+                    4 => 8,
+                    _ => 0,
+                }
+            }
+            6 => self.fp8 = !self.fp8,
+            7 => self.no_thinking = !self.no_thinking,
             _ => {}
         }
     }
@@ -913,11 +957,22 @@ impl InferenceTab {
         lines.push(Line::from(""));
 
         // Editable settings
-        let setting_values: [String; 4] = [
+        let kv_label = match self.kv_quant_mode {
+            0 => "Auto".to_string(),
+            255 => "FP16".to_string(),
+            108 => "TQ8".to_string(),
+            104 => "TQ4".to_string(),
+            bits => format!("Q{bits}"),
+        };
+        let setting_values: [String; 8] = [
             format!("{:.1}", self.temperature),
             format!("{}", self.max_tokens),
             format!("{}", self.top_k),
             format!("{:.2}", self.top_p),
+            format!("{:.2}", self.repetition_penalty),
+            kv_label,
+            if self.fp8 { "On".to_string() } else { "Off".to_string() },
+            if self.no_thinking { "On".to_string() } else { "Off".to_string() },
         ];
 
         for (i, (name, val)) in SETTING_NAMES.iter().zip(setting_values.iter()).enumerate() {

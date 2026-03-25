@@ -394,6 +394,18 @@ pub struct InferenceConfig {
     pub no_thinking: Option<bool>,
     /// Path to packed expert weights directory for SSD-offloaded MoE inference.
     pub experts_dir: Option<String>,
+    /// KV cache quantization bits (8=q8_0, 4=q4_0, 0=fp16). None = auto.
+    pub kv_quant: Option<u8>,
+    /// Override key bits for asymmetric K/V quantization.
+    pub kv_k_bits: Option<u8>,
+    /// Override value bits for asymmetric K/V quantization.
+    pub kv_v_bits: Option<u8>,
+    /// KV cache quantization group size.
+    pub kv_group_size: Option<usize>,
+    /// Disable KV cache quantization entirely (force fp16).
+    pub no_kv_quant: Option<bool>,
+    /// Use TurboQuant KV cache instead of MLX affine quantization.
+    pub kv_turboquant: Option<bool>,
 }
 
 /// Merge config matching TS `MergeConfig`.
@@ -909,6 +921,15 @@ pub async fn list_cached_datasets(
     }
 
     Ok(datasets)
+}
+
+/// Download a dataset from HuggingFace Hub (or validate a local path).
+///
+/// Returns the resolved path to the dataset file on disk.
+#[tauri::command]
+pub async fn download_dataset(dataset_id: String) -> Result<String> {
+    let path = resolve_dataset_path(&dataset_id).await?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Peek at the first JSONL record in a file and return the available field names.
@@ -1556,7 +1577,7 @@ async fn run_inference_streaming(
     config: &InferenceConfig,
     cancel_flag: &std::sync::atomic::AtomicBool,
     app_handle: &AppHandle,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<serde_json::Value, String> {
     use pmetal::hub::resolve_model_path;
     use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig};
 
@@ -1594,18 +1615,31 @@ async fn run_inference_streaming(
         frequency_penalty: config.frequency_penalty,
         presence_penalty: config.presence_penalty,
         seed: config.seed,
-        ..InferenceRunnerConfig::default()
+        kv_quant: config.kv_quant,
+        kv_k_bits: config.kv_k_bits,
+        kv_v_bits: config.kv_v_bits,
+        kv_group_size: config.kv_group_size.unwrap_or(64),
+        kv_turboquant: config.kv_turboquant.unwrap_or(false),
+        no_kv_quant: config.no_kv_quant.unwrap_or(false),
     };
 
+    let prompt_tokens = runner_config.prompt.len(); // rough pre-tokenize hint
     let mut runner = InferenceRunner::prepare(runner_config).map_err(|e| e.to_string())?;
 
     let mut token_buf: Vec<u32> = Vec::new();
     let mut streamed_text = String::new();
+    let start = std::time::Instant::now();
+    let mut first_token_time: Option<std::time::Instant> = None;
+    let mut generated_tokens: usize = 0;
 
     // Split borrow: &runner.tokenizer captured by closure, runner.gen borrows the rest.
     let tokenizer = &runner.tokenizer;
     runner.state
         .generate_streaming(|token_id| {
+            generated_tokens += 1;
+            if first_token_time.is_none() {
+                first_token_time = Some(std::time::Instant::now());
+            }
             token_buf.push(token_id);
             if let Ok(text) = tokenizer.decode(&token_buf) {
                 if text.len() > streamed_text.len() {
@@ -1623,7 +1657,28 @@ async fn run_inference_streaming(
         })
         .map_err(|e| e.to_string())?;
 
-    Ok(())
+    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let ttft_ms = first_token_time
+        .map(|t| t.duration_since(start).as_secs_f64() * 1000.0);
+    let decode_ms = ttft_ms.map(|ttft| total_ms - ttft);
+    let decode_tokens = generated_tokens.saturating_sub(1);
+    let tok_per_sec = if let Some(dm) = decode_ms {
+        if dm > 0.0 && decode_tokens > 0 {
+            Some(decode_tokens as f64 / (dm / 1000.0))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(serde_json::json!({
+        "prompt_tokens": prompt_tokens,
+        "generated_tokens": generated_tokens,
+        "total_ms": total_ms,
+        "ttft_ms": ttft_ms,
+        "tok_per_sec": tok_per_sec,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1655,8 +1710,8 @@ pub async fn start_inference(
         .await;
 
         match result {
-            Ok(()) => {
-                let _ = app_handle.emit("inference-done", ());
+            Ok(metrics) => {
+                let _ = app_handle.emit("inference-done", metrics);
             }
             Err(e) => {
                 let _ = app_handle.emit(

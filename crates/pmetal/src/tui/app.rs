@@ -1686,6 +1686,31 @@ impl App {
         if self.inference.top_p < 1.0 {
             args.extend(["--top-p".to_string(), self.inference.top_p.to_string()]);
         }
+        if self.inference.repetition_penalty > 1.0 {
+            args.extend([
+                "--repetition-penalty".to_string(),
+                self.inference.repetition_penalty.to_string(),
+            ]);
+        }
+        match self.inference.kv_quant_mode {
+            255 => args.push("--no-kv-quant".to_string()),
+            bits @ (4 | 8) => {
+                args.extend(["--kv-quant".to_string(), bits.to_string()]);
+            }
+            tq @ (104 | 108) => {
+                args.push("--kv-turboquant".to_string());
+                args.extend(["--kv-quant".to_string(), (tq - 100).to_string()]);
+            }
+            _ => {} // 0 = auto (omit flag)
+        }
+        if self.inference.fp8 {
+            args.push("--fp8".to_string());
+        }
+        if self.inference.no_thinking {
+            args.push("--no-thinking".to_string());
+        }
+        // Always use chat mode in TUI
+        args.push("--chat".to_string());
         if let Some(ref experts_dir) = self.inference.experts_dir {
             args.extend(["--experts-dir".to_string(), experts_dir.clone()]);
         }

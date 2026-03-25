@@ -72,6 +72,7 @@ pub fn run() {
             search_hub_datasets,
             get_trending_datasets,
             list_cached_datasets,
+            download_dataset,
             peek_dataset_columns,
             // Training
             start_training,

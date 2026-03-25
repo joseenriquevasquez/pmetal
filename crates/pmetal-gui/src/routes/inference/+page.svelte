@@ -3,7 +3,7 @@
   import { page } from '$app/stores';
   import { modelsStore } from '$lib/stores.svelte';
   import { startInference, stopInference, onInferenceToken, onInferenceDone, onInferenceError, listTrainedAdapters, getModelDefaults } from '$lib/api';
-  import type { TrainedAdapter, ModelDefaults } from '$lib/api';
+  import type { TrainedAdapter, ModelDefaults, InferenceMetrics } from '$lib/api';
   import { renderMarkdown } from '$lib/utils';
   import type { UnlistenFn } from '@tauri-apps/api/event';
 
@@ -12,6 +12,7 @@
     content: string;
     thinking?: string;
     isStreaming?: boolean;
+    metrics?: InferenceMetrics;
   }
 
   // Model config
@@ -38,7 +39,14 @@
   let topP = $state(0.9);
   let maxTokens = $state(1024);
   let repetitionPenalty = $state(1.1);
+  let minP = $state<number | null>(null);
+  let frequencyPenalty = $state<number | null>(null);
+  let presencePenalty = $state<number | null>(null);
+  let seed = $state<number | null>(null);
+  let fp8 = $state(false);
+  let noThinking = $state(false);
   let expertsDir = $state('');
+  let kvQuant = $state<string>('auto'); // 'auto' | '0' | '4' | '8'
   let showParams = $state(false);
   let defaultsSource = $state(''); // which model the current defaults came from
 
@@ -141,11 +149,11 @@
         scrollToBottom();
       });
 
-      unlistenDone = await onInferenceDone(() => {
+      unlistenDone = await onInferenceDone((metrics) => {
         const { thinking, reply } = parseThinking(currentContent);
         messages = messages.map((m, i) => {
           if (i === messages.length - 1) {
-            return { ...m, content: reply, thinking: thinking ?? undefined, isStreaming: false };
+            return { ...m, content: reply, thinking: thinking ?? undefined, isStreaming: false, metrics: metrics ?? undefined };
           }
           return m;
         });
@@ -170,15 +178,21 @@
         temperature,
         top_k: topK,
         top_p: topP,
-        min_p: null,
+        min_p: minP,
         max_tokens: maxTokens,
         repetition_penalty: repetitionPenalty,
-        frequency_penalty: null,
-        presence_penalty: null,
-        seed: null,
-        fp8: null,
-        no_thinking: null,
+        frequency_penalty: frequencyPenalty,
+        presence_penalty: presencePenalty,
+        seed,
+        fp8: fp8 || null,
+        no_thinking: noThinking || null,
         experts_dir: expertsDir || null,
+        kv_quant: kvQuant.startsWith('tq') ? parseInt(kvQuant.slice(2)) : kvQuant === 'auto' ? null : parseInt(kvQuant),
+        kv_k_bits: null,
+        kv_v_bits: null,
+        kv_group_size: null,
+        no_kv_quant: kvQuant === '0' ? true : null,
+        kv_turboquant: kvQuant.startsWith('tq') ? true : null,
       });
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -326,30 +340,74 @@
 
     <!-- Generation params collapsible -->
     {#if showParams}
-      <div class="mt-3 pt-3 border-t border-surface-200 dark:border-surface-700 grid grid-cols-2 md:grid-cols-5 gap-4">
-        <div>
-          <label class="label" for="inf-temp">Temperature</label>
-          <input id="inf-temp" type="number" class="input text-sm" step="0.05" min="0" max="2" bind:value={temperature} />
+      <div class="mt-3 pt-3 border-t border-surface-200 dark:border-surface-700 space-y-3">
+        <!-- Row 1: core sampling -->
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-4">
+          <div>
+            <label class="label" for="inf-temp">Temperature</label>
+            <input id="inf-temp" type="number" class="input text-sm" step="0.05" min="0" max="2" bind:value={temperature} />
+          </div>
+          <div>
+            <label class="label" for="inf-topk">Top-K</label>
+            <input id="inf-topk" type="number" class="input text-sm" min="0" bind:value={topK} />
+          </div>
+          <div>
+            <label class="label" for="inf-topp">Top-P</label>
+            <input id="inf-topp" type="number" class="input text-sm" step="0.05" min="0" max="1" bind:value={topP} />
+          </div>
+          <div>
+            <label class="label" for="inf-minp">Min-P</label>
+            <input id="inf-minp" type="number" class="input text-sm" step="0.01" min="0" max="1" bind:value={minP} />
+          </div>
+          <div>
+            <label class="label" for="inf-maxtok">Max Tokens</label>
+            <input id="inf-maxtok" type="number" class="input text-sm" min="1" bind:value={maxTokens} />
+          </div>
         </div>
-        <div>
-          <label class="label" for="inf-topk">Top-K</label>
-          <input id="inf-topk" type="number" class="input text-sm" min="0" bind:value={topK} />
+        <!-- Row 2: penalties, seed, KV cache -->
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-4">
+          <div>
+            <label class="label" for="inf-rep">Rep. Penalty</label>
+            <input id="inf-rep" type="number" class="input text-sm" step="0.05" min="1" bind:value={repetitionPenalty} />
+          </div>
+          <div>
+            <label class="label" for="inf-freq">Freq. Penalty</label>
+            <input id="inf-freq" type="number" class="input text-sm" step="0.05" min="0" max="2" bind:value={frequencyPenalty} />
+          </div>
+          <div>
+            <label class="label" for="inf-pres">Pres. Penalty</label>
+            <input id="inf-pres" type="number" class="input text-sm" step="0.05" min="0" max="2" bind:value={presencePenalty} />
+          </div>
+          <div>
+            <label class="label" for="inf-seed">Seed</label>
+            <input id="inf-seed" type="number" class="input text-sm" min="0" placeholder="Random" bind:value={seed} />
+          </div>
+          <div>
+            <label class="label" for="inf-kvq">KV Cache</label>
+            <select id="inf-kvq" class="input text-sm" bind:value={kvQuant}>
+              <option value="auto">Auto</option>
+              <option value="0">FP16</option>
+              <option value="8">Q8</option>
+              <option value="4">Q4</option>
+              <option value="tq4">TurboQ4</option>
+              <option value="tq8">TurboQ8</option>
+            </select>
+          </div>
         </div>
-        <div>
-          <label class="label" for="inf-topp">Top-P</label>
-          <input id="inf-topp" type="number" class="input text-sm" step="0.05" min="0" max="1" bind:value={topP} />
-        </div>
-        <div>
-          <label class="label" for="inf-maxtok">Max Tokens</label>
-          <input id="inf-maxtok" type="number" class="input text-sm" min="1" bind:value={maxTokens} />
-        </div>
-        <div>
-          <label class="label" for="inf-rep">Rep. Penalty</label>
-          <input id="inf-rep" type="number" class="input text-sm" step="0.05" min="1" bind:value={repetitionPenalty} />
-        </div>
-        <div class="col-span-2">
-          <label class="label" for="inf-experts">Experts Dir</label>
-          <input id="inf-experts" type="text" class="input text-sm" placeholder="Path to packed experts (optional)" bind:value={expertsDir} />
+        <!-- Row 3: toggles + experts dir -->
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-4 items-end">
+          <label class="flex items-center gap-2 text-sm cursor-pointer">
+            <input type="checkbox" class="rounded" bind:checked={fp8} />
+            <span class="text-surface-600 dark:text-surface-400">FP8 weights</span>
+          </label>
+          <label class="flex items-center gap-2 text-sm cursor-pointer">
+            <input type="checkbox" class="rounded" bind:checked={noThinking} />
+            <span class="text-surface-600 dark:text-surface-400">Disable thinking</span>
+          </label>
+          <div class="col-span-2 md:col-span-3">
+            <label class="label" for="inf-experts">Experts Dir</label>
+            <input id="inf-experts" type="text" class="input text-sm" placeholder="Path to packed experts (optional)" bind:value={expertsDir} />
+          </div>
         </div>
       </div>
     {/if}
@@ -444,6 +502,19 @@
                 <span class="inline-block w-2 h-4 bg-primary-500 animate-pulse ml-0.5 align-text-bottom" aria-label="Generating..." aria-live="polite"></span>
               {/if}
             </div>
+            <!-- Inference metrics -->
+            {#if message.metrics && !message.isStreaming}
+              <div class="flex items-center gap-3 px-2 text-[10px] text-surface-400 dark:text-surface-500 font-mono">
+                {#if message.metrics.tok_per_sec != null}
+                  <span>{message.metrics.tok_per_sec.toFixed(1)} tok/s</span>
+                {/if}
+                {#if message.metrics.ttft_ms != null}
+                  <span>TTFT {message.metrics.ttft_ms.toFixed(0)}ms</span>
+                {/if}
+                <span>{message.metrics.generated_tokens} tokens</span>
+                <span>{(message.metrics.total_ms / 1000).toFixed(1)}s</span>
+              </div>
+            {/if}
           </div>
           <!-- Action buttons: copy + regenerate (hover reveal) -->
           {#if !message.isStreaming}

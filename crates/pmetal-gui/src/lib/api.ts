@@ -259,6 +259,18 @@ export interface InferenceConfig {
   no_thinking: boolean | null;
   /** Path to packed expert weights directory for SSD-offloaded MoE inference. */
   experts_dir: string | null;
+  /** KV cache quantization bits (8=q8_0, 4=q4_0, 0=fp16). null = auto. */
+  kv_quant: number | null;
+  /** Override key bits for asymmetric K/V quantization. */
+  kv_k_bits: number | null;
+  /** Override value bits for asymmetric K/V quantization. */
+  kv_v_bits: number | null;
+  /** KV cache quantization group size. */
+  kv_group_size: number | null;
+  /** Disable KV cache quantization entirely (force fp16). */
+  no_kv_quant: boolean | null;
+  /** Use TurboQuant KV cache instead of MLX affine quantization. */
+  kv_turboquant: boolean | null;
 }
 
 export interface InferenceMessage {
@@ -622,9 +634,17 @@ export function onInferenceToken(callback: (token: string) => void): Promise<Unl
   });
 }
 
-export function onInferenceDone(callback: () => void): Promise<UnlistenFn> {
-  return listen<null>('inference-done', () => {
-    callback();
+export interface InferenceMetrics {
+  prompt_tokens: number;
+  generated_tokens: number;
+  total_ms: number;
+  ttft_ms: number | null;
+  tok_per_sec: number | null;
+}
+
+export function onInferenceDone(callback: (metrics: InferenceMetrics | null) => void): Promise<UnlistenFn> {
+  return listen<InferenceMetrics | null>('inference-done', (event) => {
+    callback(event.payload);
   });
 }
 
