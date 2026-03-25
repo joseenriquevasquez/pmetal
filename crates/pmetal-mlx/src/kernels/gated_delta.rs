@@ -40,9 +40,30 @@ use mlx_rs::{
     stop_gradient,
 };
 
-/// Chunk size for the chunkwise parallel GDN algorithm.
+/// Default chunk size for the chunkwise parallel GDN algorithm.
 /// Sequences longer than this use the parallel chunk path.
-const GDN_CHUNK_SIZE: i32 = 64;
+const DEFAULT_GDN_CHUNK_SIZE: i32 = 64;
+const GDN_CHUNK_SIZE_ENV_VAR: &str = "PMETAL_GDN_CHUNK_SIZE";
+
+fn sanitize_gdn_chunk_size(chunk_size: i32) -> i32 {
+    chunk_size.clamp(16, 512)
+}
+
+fn configured_gdn_chunk_size() -> i32 {
+    std::env::var(GDN_CHUNK_SIZE_ENV_VAR)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .map(sanitize_gdn_chunk_size)
+        .unwrap_or(DEFAULT_GDN_CHUNK_SIZE)
+}
+
+fn resolve_chunk_size_override(chunk_size_override: Option<i32>) -> Option<i32> {
+    match chunk_size_override {
+        Some(value) if value <= 0 => None,
+        Some(value) => Some(sanitize_gdn_chunk_size(value)),
+        None => Some(configured_gdn_chunk_size()),
+    }
+}
 
 /// Compute gating decay: g = exp(-exp(A_log) * softplus(a + dt_bias))
 ///
@@ -330,7 +351,7 @@ fn chunk_decay_matrix(log_g: &Array) -> Result<Array, Exception> {
 
 /// Chunkwise parallel GDN implementation.
 ///
-/// Splits the sequence into chunks of size `GDN_CHUNK_SIZE` and uses the WY
+/// Splits the sequence into chunks of size `chunk_size` and uses the WY
 /// factorization to parallelize intra-chunk computation. Only inter-chunk
 /// state propagation remains sequential (O(T/C) steps instead of O(T)).
 ///
@@ -353,7 +374,8 @@ fn chunk_decay_matrix(log_g: &Array) -> Result<Array, Exception> {
 ///
 /// # Returns
 /// (output `[B, T, Hv, Dv]`, final_state `[B, Hv, Dv, Dk]`)
-fn gated_delta_chunk_ops(
+#[allow(clippy::too_many_arguments)]
+fn gated_delta_chunk_ops_impl(
     q: &Array,
     k: &Array,
     v: &Array,
@@ -361,6 +383,7 @@ fn gated_delta_chunk_ops(
     beta: &Array,
     state: &Array,
     mask: Option<&Array>,
+    chunk_size: i32,
 ) -> Result<(Array, Array), Exception> {
     let b = q.dim(0);
     let t = q.dim(1);
@@ -368,7 +391,7 @@ fn gated_delta_chunk_ops(
     let dk = q.dim(3);
     let hv = v.dim(2);
     let dv = v.dim(3);
-    let c = GDN_CHUNK_SIZE;
+    let c = sanitize_gdn_chunk_size(chunk_size);
 
     // Handle GQA: repeat q, k along head dim if Hv > Hk
     let repeat_factor = hv / hk;
@@ -594,6 +617,42 @@ fn gated_delta_chunk_ops(
     Ok((y, state))
 }
 
+#[cfg(test)]
+fn gated_delta_chunk_ops(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    mask: Option<&Array>,
+) -> Result<(Array, Array), Exception> {
+    gated_delta_chunk_ops_impl(q, k, v, g, beta, state, mask, DEFAULT_GDN_CHUNK_SIZE)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gated_delta_dispatch(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    mask: Option<&Array>,
+    training: bool,
+    chunk_size_override: Option<i32>,
+) -> Result<(Array, Array), Exception> {
+    if !training {
+        let t = q.dim(1);
+        if let Some(chunk_size) = resolve_chunk_size_override(chunk_size_override)
+            && t > chunk_size
+        {
+            return gated_delta_chunk_ops_impl(q, k, v, g, beta, state, mask, chunk_size);
+        }
+    }
+    gated_delta_ops(q, k, v, g, beta, Some(state), mask)
+}
+
 /// Top-level GDN update API.
 ///
 /// Computes the gated delta network recurrence for a sequence of tokens.
@@ -613,7 +672,7 @@ fn gated_delta_chunk_ops(
 /// * `mask` - Optional mask `[B, T]`
 /// * `training` - If true, forces sequential path (chunk path's `tri_inv` has no VJP
 ///   and produces NaN inside `value_and_grad`). If false, dispatches to the chunk path
-///   for sequences longer than `GDN_CHUNK_SIZE` for O(T/64) prefill.
+///   for sequences longer than the configured chunk size for O(T/C) prefill.
 ///
 /// # Returns
 /// (output `[B, T, Hv, Dv]`, final_state `[B, Hv, Dv, Dk]`)
@@ -629,6 +688,42 @@ pub fn gated_delta_update(
     state: Option<&Array>,
     mask: Option<&Array>,
     training: bool,
+) -> Result<(Array, Array), Exception> {
+    gated_delta_update_with_chunk_size_override(
+        q,
+        k,
+        v,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        state,
+        mask,
+        training,
+        None,
+    )
+}
+
+/// Variant of [`gated_delta_update`] that allows benchmarking or forcing a
+/// specific inference prefill chunk size.
+///
+/// `chunk_size_override` semantics:
+/// - `None`: use the configured runtime default (`PMETAL_GDN_CHUNK_SIZE` or 64)
+/// - `Some(n > 0)`: force chunked inference with size `n` (clamped to 16..=512)
+/// - `Some(0)` or negative: force the sequential path even for long inference prompts
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_update_with_chunk_size_override(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    a: &Array,
+    b: &Array,
+    a_log: &Array,
+    dt_bias: &Array,
+    state: Option<&Array>,
+    mask: Option<&Array>,
+    training: bool,
+    chunk_size_override: Option<i32>,
 ) -> Result<(Array, Array), Exception> {
     // beta = sigmoid(b)
     let beta = nn::sigmoid(b)?;
@@ -650,17 +745,17 @@ pub fn gated_delta_update(
         }
     };
 
-    // Training must use sequential path: tri_inv (CPU-only) has no VJP and produces
-    // NaN inside value_and_grad due to CPU↔GPU stream sync issues.
-    // Inference can use the fast chunk path (O(T/64) vs O(T) for prefill).
-    if !training {
-        let t = q.dim(1);
-
-        if t > GDN_CHUNK_SIZE {
-            return gated_delta_chunk_ops(q, k, v, &g, &beta, state_ref, mask);
-        }
-    }
-    gated_delta_ops(q, k, v, &g, &beta, Some(state_ref), mask)
+    gated_delta_dispatch(
+        q,
+        k,
+        v,
+        &g,
+        &beta,
+        state_ref,
+        mask,
+        training,
+        chunk_size_override,
+    )
 }
 
 #[cfg(test)]
@@ -1025,7 +1120,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_update_dispatches_chunk() {
-        // Verify gated_delta_update dispatches to chunk path for T > GDN_CHUNK_SIZE
+        // Verify gated_delta_update dispatches to chunk path for T > configured chunk size
         let b = 1;
         let t = 128;
         let hk = 2;
@@ -1197,4 +1292,116 @@ mod tests {
             "Decode-specialized state mismatch",
         );
     }
+
+    #[test]
+    #[serial]
+    fn test_chunk_size_override_zero_forces_sequential_path() {
+        let b = 1;
+        let t = 96;
+        let hk = 2;
+        let dk = 8;
+        let hv = 2;
+        let dv = 8;
+
+        mlx_rs::random::seed(808).unwrap();
+        let q = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
+        let k = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
+        let v = mlx_rs::random::normal::<f32>(&[b, t, hv, dv], None, None, None).unwrap();
+        let a = mlx_rs::random::normal::<f32>(&[b, t, hv], None, None, None).unwrap();
+        let b_in = mlx_rs::random::normal::<f32>(&[b, t, hv], None, None, None).unwrap();
+        let a_log = mlx_rs::random::normal::<f32>(&[hv], None, None, None)
+            .unwrap()
+            .abs()
+            .unwrap();
+        let dt_bias = mlx_rs::random::normal::<f32>(&[hv], None, None, None).unwrap();
+
+        let (y_seq, state_seq) = gated_delta_update_with_chunk_size_override(
+            &q, &k, &v, &a, &b_in, &a_log, &dt_bias, None, None, true, None,
+        )
+        .unwrap();
+        let (y_forced, state_forced) = gated_delta_update_with_chunk_size_override(
+            &q,
+            &k,
+            &v,
+            &a,
+            &b_in,
+            &a_log,
+            &dt_bias,
+            None,
+            None,
+            false,
+            Some(0),
+        )
+        .unwrap();
+
+        assert_close(
+            &y_forced,
+            &y_seq,
+            1e-3,
+            "Forced sequential output mismatch",
+        );
+        assert_close(
+            &state_forced,
+            &state_seq,
+            1e-3,
+            "Forced sequential state mismatch",
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_chunk_size_override_positive_matches_chunk_path() {
+        let b = 1;
+        let t = 128;
+        let hk = 2;
+        let dk = 8;
+        let hv = 2;
+        let dv = 8;
+
+        mlx_rs::random::seed(909).unwrap();
+        let q = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
+        let k = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
+        let v = mlx_rs::random::normal::<f32>(&[b, t, hv, dv], None, None, None).unwrap();
+        let a = mlx_rs::random::normal::<f32>(&[b, t, hv], None, None, None).unwrap();
+        let b_in = mlx_rs::random::normal::<f32>(&[b, t, hv], None, None, None).unwrap();
+        let a_log = mlx_rs::random::normal::<f32>(&[hv], None, None, None)
+            .unwrap()
+            .abs()
+            .unwrap();
+        let dt_bias = mlx_rs::random::normal::<f32>(&[hv], None, None, None).unwrap();
+        let g = compute_g(&a_log, &a, &dt_bias).unwrap();
+        let beta = nn::sigmoid(&b_in).unwrap();
+        let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
+
+        let (y_forced, state_forced) = gated_delta_update_with_chunk_size_override(
+            &q,
+            &k,
+            &v,
+            &a,
+            &b_in,
+            &a_log,
+            &dt_bias,
+            None,
+            None,
+            false,
+            Some(32),
+        )
+        .unwrap();
+        let (y_chunk, state_chunk) =
+            gated_delta_chunk_ops_impl(&q, &k, &v, &g, &beta, &state_init, None, 32).unwrap();
+
+        assert_close(
+            &y_forced,
+            &y_chunk,
+            1e-3,
+            "Forced chunk output mismatch",
+        );
+        assert_close(
+            &state_forced,
+            &state_chunk,
+            1e-3,
+            "Forced chunk state mismatch",
+        );
+    }
+
 }

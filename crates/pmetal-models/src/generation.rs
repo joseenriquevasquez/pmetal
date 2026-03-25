@@ -342,6 +342,60 @@ fn create_generation_stream() -> Stream {
     Stream::new_with_device(&Device::gpu())
 }
 
+/// Build a `[1, seq_len]` Int32 token array from token IDs.
+fn token_input_array(tokens: &[u32]) -> Array {
+    Array::from_slice(
+        &tokens.iter().map(|&t| t as i32).collect::<Vec<_>>(),
+        &[1, tokens.len() as i32],
+    )
+}
+
+/// Clear both compiled graph state and the general MLX allocation cache.
+#[inline]
+fn clear_generation_caches() {
+    mlx_rs::transforms::compile::clear_cache();
+    pmetal_mlx::memory::clear_cache();
+}
+
+/// Run cached prompt prefill, optionally chunking long prompts to bound peak memory.
+fn run_cached_prefill_chunks<F>(
+    input_ids: &[u32],
+    prefill_step_size: usize,
+    mut forward: F,
+) -> Result<Array, Exception>
+where
+    F: FnMut(&Array) -> Result<Array, Exception>,
+{
+    if input_ids.is_empty() {
+        return forward(&token_input_array(input_ids));
+    }
+
+    let step_size = if prefill_step_size == 0 {
+        input_ids.len()
+    } else {
+        prefill_step_size.max(1)
+    };
+
+    if input_ids.len() <= step_size {
+        return forward(&token_input_array(input_ids));
+    }
+
+    let mut last_logits = None;
+    for start in (0..input_ids.len()).step_by(step_size) {
+        let end = (start + step_size).min(input_ids.len());
+        let chunk_input = token_input_array(&input_ids[start..end]);
+        let logits = forward(&chunk_input)?;
+        if end < input_ids.len() {
+            logits.eval()?;
+            pmetal_mlx::memory::clear_cache();
+        } else {
+            last_logits = Some(logits);
+        }
+    }
+
+    last_logits.ok_or_else(|| Exception::custom("chunked prefill produced no output"))
+}
+
 /// Ensure logits are in Float32 format for sampling operations.
 /// Converts BFloat16/Float16 to Float32 if needed.
 /// Note: Does NOT call eval() - keeps operations lazy for GPU pipelining.
@@ -402,6 +456,8 @@ pub struct GenerationConfig {
     pub do_sample: bool,
     /// Use the experimental ANE real-time evaluation path when ANE generation is selected.
     pub ane_real_time: bool,
+    /// Maximum prompt tokens to process per cached-prefill chunk (0 = disable chunking).
+    pub prefill_step_size: usize,
 }
 
 impl Default for GenerationConfig {
@@ -419,6 +475,7 @@ impl Default for GenerationConfig {
             seed: None,
             do_sample: true,
             ane_real_time: false,
+            prefill_step_size: 2048,
         }
     }
 }
@@ -468,6 +525,7 @@ impl GenerationConfig {
             seed: None,
             do_sample: true,
             ane_real_time: false,
+            prefill_step_size: 2048,
         }
     }
 
@@ -488,6 +546,7 @@ impl GenerationConfig {
             seed: None,
             do_sample: true,
             ane_real_time: false,
+            prefill_step_size: 2048,
         }
     }
 
@@ -508,6 +567,7 @@ impl GenerationConfig {
             seed: None,
             do_sample: true,
             ane_real_time: false,
+            prefill_step_size: 2048,
         }
     }
 
@@ -526,6 +586,7 @@ impl GenerationConfig {
             seed: None,
             do_sample: true,
             ane_real_time: false,
+            prefill_step_size: 2048,
         }
     }
 
@@ -663,6 +724,14 @@ impl GenerationConfig {
     /// Enable or disable the experimental ANE real-time evaluation path.
     pub fn with_ane_real_time(mut self, enabled: bool) -> Self {
         self.ane_real_time = enabled;
+        self
+    }
+
+    /// Set the cached-prefill chunk size for long prompts.
+    ///
+    /// `0` disables chunking and processes the entire prompt in one forward pass.
+    pub fn with_prefill_step_size(mut self, step_size: usize) -> Self {
+        self.prefill_step_size = step_size;
         self
     }
 
@@ -1486,12 +1555,10 @@ where
     let mut sampler = Sampler::new(config.clone());
     let prompt_len = input_ids.len();
 
-    // Prefill: Process the entire prompt at once
-    let prompt_input = Array::from_slice(
-        &input_ids.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-        &[1, prompt_len as i32],
-    );
-    let logits = forward_fn(&prompt_input, cache)?;
+    // Prefill: process long prompts in chunks to bound peak allocator pressure.
+    let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+        forward_fn(chunk_input, cache)
+    })?;
     logits.eval()?;
 
     // Get logits for the last position and sample first new token
@@ -1626,15 +1693,11 @@ where
         logits.index((.., last_idx, ..)) // Returns [1, vocab]
     };
 
-    // Prefill: Process the entire prompt at once (INSIDE stream context)
-    let prompt_input = Array::from_slice(
-        &input_ids.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-        &[1, prompt_len as i32],
-    );
-
     let (mut current_y, mut current_logprobs) = {
-        let _stream_ctx = StreamContext::new(&generation_stream);
-        let logits = forward_fn(&prompt_input, cache)?;
+        let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+            let _stream_ctx = StreamContext::new(&generation_stream);
+            forward_fn(chunk_input, cache)
+        })?;
         let current_logits = extract_logits(&logits);
         sampler.sample_array(&current_logits)?
     };
@@ -1698,7 +1761,7 @@ where
 
         // Clear cache every 256 tokens (matches Python)
         if n % 256 == 0 && n > 0 {
-            mlx_rs::transforms::compile::clear_cache();
+            clear_generation_caches();
         }
 
         // 6. Swap if we have next
@@ -1749,15 +1812,11 @@ where
         logits.index((.., last_idx, ..))
     };
 
-    // Prefill
-    let prompt_input = Array::from_slice(
-        &input_ids.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-        &[1, prompt_len as i32],
-    );
-
     let (mut current_y, mut current_logprobs) = {
-        let _stream_ctx = StreamContext::new(&generation_stream);
-        let logits = forward_fn(&prompt_input, cache)?;
+        let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+            let _stream_ctx = StreamContext::new(&generation_stream);
+            forward_fn(chunk_input, cache)
+        })?;
         let current_logits = extract_logits(&logits);
         sampler.sample_array(&current_logits)?
     };
@@ -1816,7 +1875,7 @@ where
         }
 
         if n % 256 == 0 && n > 0 {
-            mlx_rs::transforms::compile::clear_cache();
+            clear_generation_caches();
         }
 
         if let Some((y, lp)) = next_pair {
@@ -1890,16 +1949,11 @@ where
     // Track token counts for frequency/presence penalties
     let mut token_counts: HashMap<u32, usize> = HashMap::new();
 
-    // Get vocab size from first forward pass (INSIDE stream context)
-    let prompt_input = Array::from_slice(
-        &input_ids.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-        &[1, prompt_len as i32],
-    );
-
-    let logits = {
+    // Get vocab size from the final prefill chunk output.
+    let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
         let _stream_ctx = StreamContext::new(&generation_stream);
-        forward_fn(&prompt_input, cache)?
-    };
+        forward_fn(chunk_input, cache)
+    })?;
     let vocab_size = logits.dim(-1) as usize;
 
     // Create Metal sampler with optional seed for reproducibility
@@ -2036,7 +2090,7 @@ where
 
         // Clear cache every 256 tokens (matches Python)
         if n % 256 == 0 && n > 0 {
-            mlx_rs::transforms::compile::clear_cache();
+            clear_generation_caches();
         }
     }
 
@@ -2081,12 +2135,10 @@ where
     let prompt_len = input_ids.len();
     let stop_tokens = &config.stop_tokens;
 
-    // Prefill (inside stream context)
-    let prompt_input = Array::from_slice(
-        &input_ids.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-        &[1, prompt_len as i32],
-    );
-    let mut y = step(&prompt_input, cache)?;
+    // Prefill (inside stream context), chunking long prompts to cap prompt-time memory.
+    let mut y = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+        step(chunk_input, cache)
+    })?;
 
     // async_eval is OUTSIDE stream context (like Python)
     async_eval([&y])?;
@@ -2137,7 +2189,7 @@ where
 
         // Clear cache periodically
         if n % 256 == 0 {
-            mlx_rs::transforms::compile::clear_cache();
+            clear_generation_caches();
         }
 
         // Swap
@@ -2208,15 +2260,11 @@ where
     // Create a standard sampler for stop token checking
     let sampler = Sampler::new(config.clone());
 
-    // Prefill: Process the entire prompt at once (INSIDE stream context)
-    let prompt_input = Array::from_slice(
-        &input_ids.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-        &[1, prompt_len as i32],
-    );
-
     let mut current_y = {
-        let _stream_ctx = StreamContext::new(&generation_stream);
-        let logits = forward_fn(&prompt_input, cache)?;
+        let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+            let _stream_ctx = StreamContext::new(&generation_stream);
+            forward_fn(chunk_input, cache)
+        })?;
         let last_idx = logits.dim(1) - 1;
         let current_logits = logits
             .index((.., last_idx..last_idx + 1, ..))
@@ -2271,7 +2319,7 @@ where
 
         // Clear cache every 256 tokens (matches Python mlx-lm)
         if n % 256 == 0 {
-            mlx_rs::transforms::compile::clear_cache();
+            clear_generation_caches();
         }
 
         if n >= config.max_new_tokens {
@@ -2673,6 +2721,7 @@ mod tests {
         assert_eq!(config.presence_penalty, 0.0);
         assert!(config.do_sample);
         assert!(!config.ane_real_time);
+        assert_eq!(config.prefill_step_size, 2048);
     }
 
     #[test]
@@ -2680,6 +2729,52 @@ mod tests {
         let config = GenerationConfig::greedy(100);
         assert_eq!(config.max_new_tokens, 100);
         assert!(!config.do_sample);
+    }
+
+    #[test]
+    fn test_generation_config_prefill_step_builder() {
+        let config = GenerationConfig::greedy(16).with_prefill_step_size(512);
+        assert_eq!(config.prefill_step_size, 512);
+    }
+
+    #[test]
+    fn test_chunked_prefill_splits_prompt_and_returns_last_chunk() {
+        let input_ids = vec![11, 22, 33, 44, 55];
+        let mut seen_chunks = Vec::new();
+
+        let logits = run_cached_prefill_chunks(&input_ids, 2, |chunk_input| {
+            let seq_len = chunk_input.dim(1);
+            seen_chunks.push(seq_len);
+
+            let last_token = chunk_input.index((0, seq_len - 1)).item::<i32>() as usize;
+            let vocab = 64usize;
+            let mut data = vec![-1000.0f32; seq_len as usize * vocab];
+            data[((seq_len as usize - 1) * vocab) + (last_token % vocab)] = 10.0;
+            Ok(Array::from_slice(&data, &[1, seq_len, vocab as i32]))
+        })
+        .unwrap();
+
+        logits.eval().unwrap();
+        assert_eq!(seen_chunks, vec![2, 2, 1]);
+        assert_eq!(logits.dim(1), 1);
+
+        let last_logits = logits.index((0, 0));
+        let token = greedy_sample(&last_logits).unwrap();
+        assert_eq!(token as usize, 55);
+    }
+
+    #[test]
+    fn test_chunked_prefill_zero_step_uses_single_pass() {
+        let input_ids = vec![1, 2, 3, 4];
+        let mut seen_chunks = Vec::new();
+
+        let _ = run_cached_prefill_chunks(&input_ids, 0, |chunk_input| {
+            seen_chunks.push(chunk_input.dim(1));
+            Array::zeros::<f32>(&[1, chunk_input.dim(1), 8])
+        })
+        .unwrap();
+
+        assert_eq!(seen_chunks, vec![4]);
     }
 
     #[test]
