@@ -8,7 +8,10 @@ use mlx_rs::{
     ops::indexing::{IndexOp, TryIndexMutOp},
 };
 
-use super::{CacheMode, KVCacheConfig, QuantizedKVCache, dtype_size};
+use super::{
+    CacheMode, KVCacheConfig, QuantizedKVCache, TurboQuantKvCache, create_turboquant_core,
+    dtype_size,
+};
 
 /// Pre-allocation step size in tokens (matches Python mlx-lm).
 /// Cache grows in chunks of this size to avoid per-token allocations.
@@ -85,6 +88,8 @@ pub struct KVCache {
     layer_caches: Vec<LayerCache>,
     /// Quantized per-layer caches (used when mode is Quantized or AsymmetricQuantized).
     quantized_layers: Option<Vec<QuantizedKVCache>>,
+    /// TurboQuant per-layer caches.
+    turboquant_layers: Option<Vec<TurboQuantKvCache>>,
     /// Total number of tokens processed.
     total_tokens: usize,
 }
@@ -114,11 +119,32 @@ impl KVCache {
             ),
             _ => None,
         };
+        let turboquant_layers = match config.mode {
+            CacheMode::TurboQuant {
+                key_bits,
+                value_bits,
+            } => {
+                let shared_core = create_turboquant_core(config.head_dim, key_bits, value_bits);
+                Some(
+                    (0..config.num_layers)
+                        .map(|_| {
+                            TurboQuantKvCache::new_with_core(
+                                key_bits,
+                                value_bits,
+                                shared_core.clone(),
+                            )
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        };
 
         Self {
             config,
             layer_caches,
             quantized_layers,
+            turboquant_layers,
             total_tokens: 0,
         }
     }
@@ -170,6 +196,7 @@ impl KVCache {
             config,
             layer_caches,
             quantized_layers: None,
+            turboquant_layers: None,
             total_tokens: 0,
         })
     }
@@ -183,6 +210,8 @@ impl KVCache {
     pub fn seq_len(&self) -> usize {
         if let Some(ref q_layers) = self.quantized_layers {
             q_layers.first().map(|c| c.len()).unwrap_or(0)
+        } else if let Some(ref tq_layers) = self.turboquant_layers {
+            tq_layers.first().map(|c| c.len()).unwrap_or(0)
         } else {
             self.layer_caches.first().map(|c| c.offset).unwrap_or(0)
         }
@@ -197,6 +226,8 @@ impl KVCache {
     pub fn is_empty(&self) -> bool {
         if let Some(ref q_layers) = self.quantized_layers {
             q_layers.iter().all(|c| c.is_empty())
+        } else if let Some(ref tq_layers) = self.turboquant_layers {
+            tq_layers.iter().all(|c| c.is_empty())
         } else {
             self.layer_caches.iter().all(|c| c.offset == 0)
         }
@@ -221,6 +252,10 @@ impl KVCache {
             for cache in q_layers {
                 cache.reset();
             }
+        } else if let Some(ref mut tq_layers) = self.turboquant_layers {
+            for cache in tq_layers {
+                cache.reset();
+            }
         } else if self.config.eager_allocate {
             for cache in &mut self.layer_caches {
                 cache.reset();
@@ -238,6 +273,16 @@ impl KVCache {
     /// Unlike `reset()`, this always deallocates the buffers even for
     /// eager-allocated caches. Use this to free memory when done.
     pub fn reset_full(&mut self) {
+        if let Some(ref mut q_layers) = self.quantized_layers {
+            for cache in q_layers {
+                cache.reset();
+            }
+        }
+        if let Some(ref mut tq_layers) = self.turboquant_layers {
+            for cache in tq_layers {
+                cache.reset();
+            }
+        }
         for cache in &mut self.layer_caches {
             cache.reset_full();
         }
@@ -266,6 +311,10 @@ impl KVCache {
         }
         if let Some(ref mut q_layers) = self.quantized_layers {
             for cache in q_layers {
+                cache.rollback(n);
+            }
+        } else if let Some(ref mut tq_layers) = self.turboquant_layers {
+            for cache in tq_layers {
                 cache.rollback(n);
             }
         } else {
@@ -310,6 +359,12 @@ impl KVCache {
                 self.total_tokens += new_keys.dim(2) as usize;
             }
             return q_layers[layer_idx].update_and_fetch(new_keys, new_values);
+        }
+        if let Some(ref mut tq_layers) = self.turboquant_layers {
+            if layer_idx == 0 {
+                self.total_tokens += new_keys.dim(2) as usize;
+            }
+            return tq_layers[layer_idx].update_and_fetch(new_keys, new_values);
         }
 
         let cache = &mut self.layer_caches[layer_idx];
@@ -400,6 +455,7 @@ impl KVCache {
             }
             CacheMode::Quantized { .. }
             | CacheMode::AsymmetricQuantized { .. }
+            | CacheMode::TurboQuant { .. }
             | CacheMode::Standard => {
                 if cache.offset > self.config.max_seq_len {
                     return Err(Exception::custom(format!(
@@ -466,6 +522,9 @@ impl KVCache {
         if let Some(ref q_layers) = self.quantized_layers {
             return q_layers.iter().map(|c| c.memory_usage()).sum();
         }
+        if let Some(ref tq_layers) = self.turboquant_layers {
+            return tq_layers.iter().map(|c| c.memory_usage()).sum();
+        }
         let mut total = 0;
         for cache in &self.layer_caches {
             if let Some(keys) = &cache.keys {
@@ -484,7 +543,9 @@ impl KVCache {
     pub fn max_memory_usage(&self) -> usize {
         // For quantized modes, use the config's memory_footprint calculation
         match self.config.mode {
-            CacheMode::Quantized { .. } | CacheMode::AsymmetricQuantized { .. } => {
+            CacheMode::Quantized { .. }
+            | CacheMode::AsymmetricQuantized { .. }
+            | CacheMode::TurboQuant { .. } => {
                 return self.config.memory_footprint();
             }
             _ => {}

@@ -493,6 +493,13 @@ fn test_create_quantized_cache() {
     assert!(cache.is_empty());
 }
 
+#[test]
+fn test_create_turboquant_cache() {
+    let cache = create_turboquant_cache(4, 3);
+    assert_eq!(cache.len(), 0);
+    assert!(cache.is_empty());
+}
+
 // =========================================================================
 // CacheMode Tests for New Modes
 // =========================================================================
@@ -521,6 +528,111 @@ fn test_cache_mode_quantized() {
             group_size: 64
         }
     );
+}
+
+#[test]
+fn test_cache_mode_turboquant() {
+    let config = KVCacheConfig::new(32, 2048, 8, 128).with_turboquant(4, 3);
+
+    assert_eq!(
+        config.mode,
+        CacheMode::TurboQuant {
+            key_bits: 4,
+            value_bits: 3
+        }
+    );
+}
+
+// =========================================================================
+// TurboQuantKvCache Tests
+// =========================================================================
+
+#[test]
+fn test_turboquant_cache_basic() {
+    let mut cache = TurboQuantKvCache::new(4, 3);
+
+    let keys = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
+    let values = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
+
+    let (cached_k, cached_v) = cache.update_and_fetch(&keys, &values).unwrap();
+
+    assert_eq!(cached_k.dim(2), 10);
+    assert_eq!(cached_v.dim(2), 10);
+    assert_eq!(cache.len(), 10);
+    assert!(!cache.is_empty());
+}
+
+#[test]
+fn test_turboquant_cache_accumulation() {
+    let mut cache = TurboQuantKvCache::new(4, 3);
+
+    let k1 = Array::ones::<f32>(&[1, 4, 10, 64]).unwrap();
+    let v1 = Array::ones::<f32>(&[1, 4, 10, 64]).unwrap();
+    cache.update_and_fetch(&k1, &v1).unwrap();
+
+    let k2 = Array::ones::<f32>(&[1, 4, 5, 64]).unwrap();
+    let v2 = Array::ones::<f32>(&[1, 4, 5, 64]).unwrap();
+    let (cached_k, cached_v) = cache.update_and_fetch(&k2, &v2).unwrap();
+
+    assert_eq!(cached_k.dim(2), 15);
+    assert_eq!(cached_v.dim(2), 15);
+    assert_eq!(cache.len(), 15);
+}
+
+#[test]
+fn test_turboquant_cache_reset() {
+    let mut cache = TurboQuantKvCache::new(4, 3);
+
+    let keys = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
+    let values = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
+    cache.update_and_fetch(&keys, &values).unwrap();
+
+    cache.reset();
+
+    assert!(cache.is_empty());
+    assert_eq!(cache.len(), 0);
+}
+
+#[test]
+fn test_turboquant_cache_rollback() {
+    let mut cache = TurboQuantKvCache::new(4, 3);
+
+    let keys = Array::ones::<f32>(&[1, 2, 10, 32]).unwrap();
+    let values = Array::ones::<f32>(&[1, 2, 10, 32]).unwrap();
+    cache.update_and_fetch(&keys, &values).unwrap();
+
+    cache.rollback(4);
+
+    assert_eq!(cache.len(), 6);
+    assert_eq!(cache.rope_offset(), 6);
+}
+
+#[test]
+fn test_turboquant_cache_memory_usage() {
+    let mut cache = TurboQuantKvCache::new(4, 3);
+    assert_eq!(cache.memory_usage(), 0);
+
+    let keys = Array::ones::<f32>(&[1, 2, 8, 32]).unwrap();
+    let values = Array::ones::<f32>(&[1, 2, 8, 32]).unwrap();
+    cache.update_and_fetch(&keys, &values).unwrap();
+
+    assert!(cache.memory_usage() > 0);
+}
+
+#[test]
+fn test_turboquant_cache_nonzero_inputs_stay_finite() {
+    let mut cache = TurboQuantKvCache::new(4, 3);
+
+    let data: Vec<f32> = (0..(2 * 16)).map(|idx| ((idx as f32) * 0.1).sin()).collect();
+    let keys = Array::from_slice(&data, &[1, 1, 2, 16]);
+    let values = Array::from_slice(&data, &[1, 1, 2, 16]);
+
+    let (cached_k, cached_v) = cache.update_and_fetch(&keys, &values).unwrap();
+    cached_k.eval().unwrap();
+    cached_v.eval().unwrap();
+
+    assert!(cached_k.as_slice::<f32>().iter().all(|value| value.is_finite()));
+    assert!(cached_v.as_slice::<f32>().iter().all(|value| value.is_finite()));
 }
 
 // =========================================================================

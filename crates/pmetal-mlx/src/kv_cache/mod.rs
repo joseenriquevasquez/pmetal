@@ -43,6 +43,7 @@ mod paged;
 mod quantized;
 mod rotating;
 mod standard;
+mod turboquant;
 #[cfg(test)]
 mod tests;
 
@@ -51,6 +52,7 @@ pub use paged::*;
 pub use quantized::*;
 pub use rotating::*;
 pub use standard::*;
+pub use turboquant::*;
 
 use mlx_rs::Dtype;
 
@@ -117,6 +119,13 @@ pub enum CacheMode {
         /// Group size for quantization (default: 64).
         group_size: usize,
     },
+    /// TurboQuant cache - random rotation + Lloyd-Max + QJL residual keys.
+    TurboQuant {
+        /// Total effective bits per key channel.
+        key_bits: u8,
+        /// Total effective bits per value channel.
+        value_bits: u8,
+    },
 }
 
 impl Default for CacheMode {
@@ -140,6 +149,10 @@ impl CacheMode {
             } => {
                 format!("K@q{key_bits},V@q{value_bits} (group={group_size})")
             }
+            CacheMode::TurboQuant {
+                key_bits,
+                value_bits,
+            } => format!("turboquant K@{key_bits}b,V@{value_bits}b"),
         }
     }
 }
@@ -234,6 +247,18 @@ impl KVCacheConfig {
         self
     }
 
+    /// Enable TurboQuant KV cache mode.
+    ///
+    /// Keys use TurboQuant's unbiased inner-product quantizer and values use
+    /// the MSE-optimized quantizer.
+    pub fn with_turboquant(mut self, key_bits: u8, value_bits: u8) -> Self {
+        self.mode = CacheMode::TurboQuant {
+            key_bits,
+            value_bits,
+        };
+        self
+    }
+
     /// Enable eager pre-allocation of the full context window.
     ///
     /// When enabled, the KV cache will allocate memory for the full `max_seq_len`
@@ -285,6 +310,24 @@ impl KVCacheConfig {
                 let k_per_token = (k_packed * 4 + num_groups * 4) * self.num_kv_heads;
                 let v_per_token = (v_packed * 4 + num_groups * 4) * self.num_kv_heads;
                 (k_per_token + v_per_token) * self.max_seq_len * self.num_layers
+            }
+            CacheMode::TurboQuant {
+                key_bits,
+                value_bits,
+            } => {
+                let rows_per_token = self.num_kv_heads;
+                let key_mse_bits = usize::from(key_bits.saturating_sub(1));
+                let key_bits_bytes = (self.head_dim * key_mse_bits).div_ceil(8);
+                let key_qjl_bytes = self.head_dim.div_ceil(8);
+                let key_meta_bytes = std::mem::size_of::<f32>() * 2;
+
+                let value_bits_bytes = (self.head_dim * usize::from(value_bits)).div_ceil(8);
+                let value_meta_bytes = std::mem::size_of::<f32>();
+
+                let per_token_bytes = rows_per_token
+                    * (key_bits_bytes + key_qjl_bytes + key_meta_bytes + value_bits_bytes
+                        + value_meta_bytes);
+                per_token_bytes * self.max_seq_len * self.num_layers
             }
             _ => {
                 let bytes_per_element = match self.dtype {
