@@ -25,8 +25,8 @@
 //! bytes into aligned GPU-visible buffers before dispatch.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -53,8 +53,10 @@ pub struct ExpertPrefetcher {
     /// Prefetch results: layer_idx → PrefetchResult.
     /// Background threads write here; try_get reads and removes.
     pending: Arc<Mutex<HashMap<usize, PrefetchResult>>>,
-    /// Layers with a currently in-flight prefetch request.
-    inflight_layers: Arc<Mutex<HashSet<usize>>>,
+    /// Layers with a currently in-flight prefetch request, scoped by generation.
+    inflight_layers: Arc<Mutex<HashMap<usize, u64>>>,
+    /// Generation counter used to invalidate stale prefetch results across phases.
+    generation: Arc<AtomicU64>,
     /// Persistent background worker pool for prefetch I/O.
     worker_pool: PrefetchIoWorkerPool,
     /// Hit/miss statistics.
@@ -65,6 +67,7 @@ struct PrefetchRequest {
     layer_idx: usize,
     predicted_indices: Vec<usize>,
     offload_ctx: Arc<ExpertOffloadContext>,
+    generation: u64,
 }
 
 struct PrefetchIoWorkerPool {
@@ -107,10 +110,15 @@ impl PrefetchStats {
 
 fn complete_prefetch(
     pending: &Arc<Mutex<HashMap<usize, PrefetchResult>>>,
+    generation: &Arc<AtomicU64>,
     layer_idx: usize,
     predicted_indices: Vec<usize>,
     buffers: Vec<Vec<u8>>,
+    request_generation: u64,
 ) {
+    if generation.load(AtomicOrdering::Relaxed) != request_generation {
+        return;
+    }
     let mut pending = pending.lock().unwrap();
     pending.insert(
         layer_idx,
@@ -121,19 +129,27 @@ fn complete_prefetch(
     );
 }
 
-fn try_mark_inflight(inflight: &Mutex<HashSet<usize>>, layer_idx: usize) -> bool {
+fn try_mark_inflight(inflight: &Mutex<HashMap<usize, u64>>, layer_idx: usize, generation: u64) -> bool {
     let mut inflight = inflight.lock().unwrap();
-    inflight.insert(layer_idx)
+    if inflight.get(&layer_idx).copied() == Some(generation) {
+        return false;
+    }
+    inflight.insert(layer_idx, generation);
+    true
 }
 
-fn clear_inflight(inflight: &Mutex<HashSet<usize>>, layer_idx: usize) {
-    inflight.lock().unwrap().remove(&layer_idx);
+fn clear_inflight(inflight: &Mutex<HashMap<usize, u64>>, layer_idx: usize, generation: u64) {
+    let mut inflight = inflight.lock().unwrap();
+    if inflight.get(&layer_idx).copied() == Some(generation) {
+        inflight.remove(&layer_idx);
+    }
 }
 
 impl PrefetchIoWorkerPool {
     fn new(
         pending: Arc<Mutex<HashMap<usize, PrefetchResult>>>,
-        inflight_layers: Arc<Mutex<HashSet<usize>>>,
+        inflight_layers: Arc<Mutex<HashMap<usize, u64>>>,
+        generation: Arc<AtomicU64>,
         num_workers: usize,
     ) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<PrefetchRequest>();
@@ -144,6 +160,7 @@ impl PrefetchIoWorkerPool {
             let request_rx = Arc::clone(&request_rx);
             let pending = Arc::clone(&pending);
             let inflight_layers = Arc::clone(&inflight_layers);
+            let generation = Arc::clone(&generation);
             let join = thread::Builder::new()
                 .name(format!("prefetch-io-{worker_idx}"))
                 .spawn(move || {
@@ -162,17 +179,23 @@ impl PrefetchIoWorkerPool {
                         {
                             Ok(bufs) => bufs,
                             Err(_) => {
-                                clear_inflight(&inflight_layers, request.layer_idx);
+                                clear_inflight(
+                                    &inflight_layers,
+                                    request.layer_idx,
+                                    request.generation,
+                                );
                                 continue;
                             }
                         };
                         complete_prefetch(
                             &pending,
+                            &generation,
                             request.layer_idx,
                             request.predicted_indices,
                             buffers,
+                            request.generation,
                         );
-                        clear_inflight(&inflight_layers, request.layer_idx);
+                        clear_inflight(&inflight_layers, request.layer_idx, request.generation);
                     }
                 })
                 .expect("Failed to spawn prefetch-io worker");
@@ -241,7 +264,8 @@ impl ExpertPrefetcher {
         top_k: usize,
     ) -> Self {
         let pending = Arc::new(Mutex::new(HashMap::new()));
-        let inflight_layers = Arc::new(Mutex::new(HashSet::new()));
+        let inflight_layers = Arc::new(Mutex::new(HashMap::new()));
+        let generation = Arc::new(AtomicU64::new(0));
         Self {
             gate_weights,
             num_experts,
@@ -250,10 +274,12 @@ impl ExpertPrefetcher {
             worker_pool: PrefetchIoWorkerPool::new(
                 Arc::clone(&pending),
                 Arc::clone(&inflight_layers),
+                Arc::clone(&generation),
                 prefetch_worker_count(),
             ),
             pending,
             inflight_layers,
+            generation,
             stats: Mutex::new(PrefetchStats::default()),
         }
     }
@@ -267,10 +293,11 @@ impl ExpertPrefetcher {
         if predicted_indices.is_empty() {
             return;
         }
+        let generation = self.generation.load(AtomicOrdering::Relaxed);
 
         // Multiple call sites can target the same layer. Keep only one
         // outstanding prefetch per target layer at a time.
-        if !try_mark_inflight(&self.inflight_layers, layer_idx) {
+        if !try_mark_inflight(&self.inflight_layers, layer_idx, generation) {
             return;
         }
 
@@ -278,9 +305,10 @@ impl ExpertPrefetcher {
             layer_idx,
             predicted_indices,
             offload_ctx: offload_ctx.clone(),
+            generation,
         };
         if !self.worker_pool.enqueue(request) {
-            clear_inflight(&self.inflight_layers, layer_idx);
+            clear_inflight(&self.inflight_layers, layer_idx, generation);
         }
     }
 
@@ -366,6 +394,13 @@ impl ExpertPrefetcher {
     /// Reset statistics counters.
     pub fn reset_stats(&self) {
         *self.stats.lock().unwrap() = PrefetchStats::default();
+    }
+
+    /// Drop any cached / in-flight prefetch state from a previous phase.
+    pub fn reset_pending(&self) {
+        self.generation.fetch_add(1, AtomicOrdering::Relaxed);
+        self.pending.lock().unwrap().clear();
+        self.inflight_layers.lock().unwrap().clear();
     }
 
     /// CPU-side top-k prediction over logically extracted gate rows.
@@ -604,15 +639,27 @@ mod tests {
     #[serial]
     fn test_complete_prefetch_replaces_prior_layer_result() {
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let generation = Arc::new(AtomicU64::new(0));
 
-        complete_prefetch(&pending, 7, vec![1], vec![vec![0x11; 4]]);
-        complete_prefetch(&pending, 7, vec![3], vec![vec![0x33; 4]]);
+        complete_prefetch(&pending, &generation, 7, vec![1], vec![vec![0x11; 4]], 0);
+        complete_prefetch(&pending, &generation, 7, vec![3], vec![vec![0x33; 4]], 0);
 
         let mut guard = pending.lock().unwrap();
         let result = guard.remove(&7).unwrap();
         assert_eq!(result.predicted_indices, vec![3]);
         assert_eq!(result.buffers.len(), 1);
         assert_eq!(result.buffers[0].as_ref().unwrap()[0], 0x33);
+    }
+
+    #[test]
+    #[serial]
+    fn test_complete_prefetch_ignores_stale_generation() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let generation = Arc::new(AtomicU64::new(1));
+
+        complete_prefetch(&pending, &generation, 7, vec![1], vec![vec![0x11; 4]], 0);
+
+        assert!(pending.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -657,12 +704,43 @@ mod tests {
     #[test]
     #[serial]
     fn test_try_mark_inflight_deduplicates_until_cleared() {
-        let inflight = Mutex::new(HashSet::new());
+        let inflight = Mutex::new(HashMap::new());
 
-        assert!(try_mark_inflight(&inflight, 11));
-        assert!(!try_mark_inflight(&inflight, 11));
+        assert!(try_mark_inflight(&inflight, 11, 0));
+        assert!(!try_mark_inflight(&inflight, 11, 0));
+        assert!(try_mark_inflight(&inflight, 11, 1));
 
-        clear_inflight(&inflight, 11);
-        assert!(try_mark_inflight(&inflight, 11));
+        clear_inflight(&inflight, 11, 0);
+        assert!(!try_mark_inflight(&inflight, 11, 1));
+        clear_inflight(&inflight, 11, 1);
+        assert!(try_mark_inflight(&inflight, 11, 1));
+    }
+
+    #[test]
+    #[serial]
+    fn test_reset_pending_clears_pending_and_advances_generation() {
+        let prefetcher = ExpertPrefetcher::new(HashMap::new(), 4, 16, 2);
+        {
+            let mut pending = prefetcher.pending.lock().unwrap();
+            pending.insert(
+                2,
+                PrefetchResult {
+                    predicted_indices: vec![0],
+                    buffers: vec![Some(vec![0xAB; 8])],
+                },
+            );
+        }
+        {
+            let mut inflight = prefetcher.inflight_layers.lock().unwrap();
+            inflight.insert(2, 0);
+        }
+
+        let before = prefetcher.generation.load(AtomicOrdering::Relaxed);
+        prefetcher.reset_pending();
+        let after = prefetcher.generation.load(AtomicOrdering::Relaxed);
+
+        assert_eq!(after, before + 1);
+        assert!(prefetcher.pending.lock().unwrap().is_empty());
+        assert!(prefetcher.inflight_layers.lock().unwrap().is_empty());
     }
 }
