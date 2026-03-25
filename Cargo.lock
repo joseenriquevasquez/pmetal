@@ -5263,6 +5263,7 @@ dependencies = [
  "pmetal-metal",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
+ "rand 0.10.0",
  "serde",
  "serde_json",
  "serial_test",
