@@ -9,6 +9,29 @@ use pmetal_models::{
     DynamicModel,
     architectures::{Qwen3NextForwardProfile, Qwen3NextLayerProfile},
 };
+use std::collections::BTreeMap;
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+struct HybridProfileSectionSummary {
+    name: String,
+    total_us: u64,
+}
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+struct HybridProfileKindSummary {
+    layer_kind: String,
+    layer_count: usize,
+    total_us: u64,
+    top_sections: Vec<HybridProfileSectionSummary>,
+}
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+struct HybridPhaseProfileSummary {
+    layer_total_us: u64,
+    non_layer_us: u64,
+    layer_kind_totals: Vec<HybridProfileKindSummary>,
+    top_sections: Vec<HybridProfileSectionSummary>,
+}
 
 #[derive(Debug, serde::Serialize)]
 struct HybridLayerProfileReport {
@@ -18,10 +41,68 @@ struct HybridLayerProfileReport {
     decode_token_id: u32,
     decode_token_text: String,
     prefill: Qwen3NextForwardProfile,
+    prefill_summary: HybridPhaseProfileSummary,
     decode: Qwen3NextForwardProfile,
+    decode_summary: HybridPhaseProfileSummary,
 }
 
-fn print_qwen3_next_profile_summary(label: &str, profile: &Qwen3NextForwardProfile) {
+fn build_qwen3_next_phase_summary(profile: &Qwen3NextForwardProfile) -> HybridPhaseProfileSummary {
+    let mut by_kind: BTreeMap<String, (usize, u64, BTreeMap<String, u64>)> = BTreeMap::new();
+    let mut overall_sections: BTreeMap<String, u64> = BTreeMap::new();
+    let mut layer_total_us = 0u64;
+
+    for layer in &profile.layers {
+        layer_total_us += layer.total_us;
+        let entry = by_kind
+            .entry(layer.layer_kind.clone())
+            .or_insert_with(|| (0, 0, BTreeMap::new()));
+        entry.0 += 1;
+        entry.1 += layer.total_us;
+        for section in &layer.sections {
+            *entry.2.entry(section.name.clone()).or_default() += section.elapsed_us;
+            *overall_sections.entry(section.name.clone()).or_default() += section.elapsed_us;
+        }
+    }
+
+    let mut layer_kind_totals: Vec<_> = by_kind
+        .into_iter()
+        .map(|(layer_kind, (layer_count, total_us, sections))| {
+            let mut top_sections: Vec<_> = sections
+                .into_iter()
+                .map(|(name, total_us)| HybridProfileSectionSummary { name, total_us })
+                .collect();
+            top_sections.sort_by_key(|section| std::cmp::Reverse(section.total_us));
+            top_sections.truncate(6);
+            HybridProfileKindSummary {
+                layer_kind,
+                layer_count,
+                total_us,
+                top_sections,
+            }
+        })
+        .collect();
+    layer_kind_totals.sort_by_key(|kind| std::cmp::Reverse(kind.total_us));
+
+    let mut top_sections: Vec<_> = overall_sections
+        .into_iter()
+        .map(|(name, total_us)| HybridProfileSectionSummary { name, total_us })
+        .collect();
+    top_sections.sort_by_key(|section| std::cmp::Reverse(section.total_us));
+    top_sections.truncate(10);
+
+    HybridPhaseProfileSummary {
+        layer_total_us,
+        non_layer_us: profile.total_us.saturating_sub(layer_total_us),
+        layer_kind_totals,
+        top_sections,
+    }
+}
+
+fn print_qwen3_next_profile_summary(
+    label: &str,
+    profile: &Qwen3NextForwardProfile,
+    summary: &HybridPhaseProfileSummary,
+) {
     println!("\n=== {label} Profile ===");
     println!(
         "Total: {:.3} ms | Embed: {:.3} ms | Final norm: {:.3} ms | LM head: {:.3} ms",
@@ -30,6 +111,41 @@ fn print_qwen3_next_profile_summary(label: &str, profile: &Qwen3NextForwardProfi
         profile.final_norm_us as f64 / 1000.0,
         profile.lm_head_us as f64 / 1000.0
     );
+    println!(
+        "Layer total: {:.3} ms | Non-layer / glue: {:.3} ms",
+        summary.layer_total_us as f64 / 1000.0,
+        summary.non_layer_us as f64 / 1000.0
+    );
+
+    if !summary.layer_kind_totals.is_empty() {
+        println!("By layer kind:");
+        for kind in &summary.layer_kind_totals {
+            println!(
+                "  {:>16}: {:7.3} ms across {} layer(s)",
+                kind.layer_kind,
+                kind.total_us as f64 / 1000.0,
+                kind.layer_count
+            );
+            for section in kind.top_sections.iter().take(4) {
+                println!(
+                    "    {:>22}: {:7.3} ms",
+                    section.name,
+                    section.total_us as f64 / 1000.0
+                );
+            }
+        }
+    }
+
+    if !summary.top_sections.is_empty() {
+        println!("Top sections overall:");
+        for section in summary.top_sections.iter().take(8) {
+            println!(
+                "  {:>24}: {:7.3} ms",
+                section.name,
+                section.total_us as f64 / 1000.0
+            );
+        }
+    }
 
     let mut layers: Vec<&Qwen3NextLayerProfile> = profile.layers.iter().collect();
     layers.sort_by_key(|layer| std::cmp::Reverse(layer.total_us));
@@ -104,6 +220,8 @@ fn run_qwen3_next_layer_profile(
     let decode_token_text = tokenizer
         .decode(&[decode_token_id])
         .unwrap_or_else(|_| "<decode failed>".to_string());
+    let prefill_summary = build_qwen3_next_phase_summary(&prefill_profile);
+    let decode_summary = build_qwen3_next_phase_summary(&decode_profile);
     let report = HybridLayerProfileReport {
         model: model_id.to_string(),
         architecture,
@@ -111,7 +229,9 @@ fn run_qwen3_next_layer_profile(
         decode_token_id,
         decode_token_text,
         prefill: prefill_profile,
+        prefill_summary,
         decode: decode_profile,
+        decode_summary,
     };
 
     println!("\n========================================");
@@ -124,8 +244,8 @@ fn run_qwen3_next_layer_profile(
         "Decode token:  {} ({:?})",
         report.decode_token_id, report.decode_token_text
     );
-    print_qwen3_next_profile_summary("Prefill", &report.prefill);
-    print_qwen3_next_profile_summary("Decode", &report.decode);
+    print_qwen3_next_profile_summary("Prefill", &report.prefill, &report.prefill_summary);
+    print_qwen3_next_profile_summary("Decode", &report.decode, &report.decode_summary);
 
     if let Some(output_path) = profile_output {
         let report_json = serde_json::to_string_pretty(&report)?;
@@ -181,6 +301,7 @@ pub(crate) async fn run_inference(
     kv_k_bits: Option<u8>,
     kv_v_bits: Option<u8>,
     kv_group_size: usize,
+    kv_turboquant: bool,
     no_kv_quant: bool,
     experts_dir: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -231,6 +352,7 @@ pub(crate) async fn run_inference(
         kv_k_bits,
         kv_v_bits,
         kv_group_size,
+        kv_turboquant,
         no_kv_quant,
     };
 
@@ -700,3 +822,79 @@ pub(crate) fn extract_thinking_content(text: &str) -> Option<String> {
 
 // NOTE: run_inference_with_lora has been removed — LoRA loading is now handled
 // by InferenceRunner::prepare() via the lora_path config field.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pmetal_models::architectures::Qwen3NextProfileSection;
+
+    #[test]
+    fn qwen3_next_phase_summary_groups_layer_kinds_and_sections() {
+        let profile = Qwen3NextForwardProfile {
+            phase: "prefill".to_string(),
+            input_shape: vec![1, 128],
+            embedding_us: 10,
+            layers: vec![
+                Qwen3NextLayerProfile {
+                    layer_idx: 0,
+                    layer_kind: "linear_attention".to_string(),
+                    sections: vec![
+                        Qwen3NextProfileSection {
+                            name: "gdn_input_qkv".to_string(),
+                            elapsed_us: 100,
+                        },
+                        Qwen3NextProfileSection {
+                            name: "gdn_recurrence".to_string(),
+                            elapsed_us: 80,
+                        },
+                    ],
+                    total_us: 220,
+                },
+                Qwen3NextLayerProfile {
+                    layer_idx: 1,
+                    layer_kind: "full_attention".to_string(),
+                    sections: vec![
+                        Qwen3NextProfileSection {
+                            name: "attn_sdpa".to_string(),
+                            elapsed_us: 140,
+                        },
+                        Qwen3NextProfileSection {
+                            name: "attn_out_proj".to_string(),
+                            elapsed_us: 40,
+                        },
+                    ],
+                    total_us: 210,
+                },
+                Qwen3NextLayerProfile {
+                    layer_idx: 2,
+                    layer_kind: "linear_attention".to_string(),
+                    sections: vec![Qwen3NextProfileSection {
+                        name: "gdn_input_qkv".to_string(),
+                        elapsed_us: 90,
+                    }],
+                    total_us: 120,
+                },
+            ],
+            final_norm_us: 20,
+            lm_head_us: 30,
+            total_us: 650,
+        };
+
+        let summary = build_qwen3_next_phase_summary(&profile);
+        assert_eq!(summary.layer_total_us, 550);
+        assert_eq!(summary.non_layer_us, 100);
+        assert_eq!(summary.layer_kind_totals.len(), 2);
+        assert_eq!(summary.layer_kind_totals[0].layer_kind, "linear_attention");
+        assert_eq!(summary.layer_kind_totals[0].layer_count, 2);
+        assert_eq!(summary.layer_kind_totals[0].total_us, 340);
+        assert_eq!(
+            summary.layer_kind_totals[0].top_sections[0],
+            HybridProfileSectionSummary {
+                name: "gdn_input_qkv".to_string(),
+                total_us: 190,
+            }
+        );
+        assert_eq!(summary.top_sections[0].name, "gdn_input_qkv");
+        assert_eq!(summary.top_sections[0].total_us, 190);
+    }
+}

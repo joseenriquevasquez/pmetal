@@ -77,6 +77,8 @@ pub struct InferenceRunnerConfig {
     pub kv_v_bits: Option<u8>,
     /// Quantization group size.
     pub kv_group_size: usize,
+    /// Use TurboQuant instead of MLX affine KV quantization.
+    pub kv_turboquant: bool,
     /// Disable KV cache quantization entirely.
     pub no_kv_quant: bool,
 }
@@ -107,6 +109,7 @@ impl Default for InferenceRunnerConfig {
             kv_k_bits: None,
             kv_v_bits: None,
             kv_group_size: 64,
+            kv_turboquant: false,
             no_kv_quant: false,
         }
     }
@@ -318,6 +321,7 @@ impl InferenceRunner {
                     kv_k_bits: config.kv_k_bits,
                     kv_v_bits: config.kv_v_bits,
                     kv_group_size: config.kv_group_size,
+                    kv_turboquant: config.kv_turboquant,
                     no_kv_quant: config.no_kv_quant,
                     fp8: config.fp8,
                 },
@@ -599,6 +603,7 @@ fn load_model_with_lora(
             kv_k_bits: config.kv_k_bits,
             kv_v_bits: config.kv_v_bits,
             kv_group_size: config.kv_group_size,
+            kv_turboquant: config.kv_turboquant,
             no_kv_quant: config.no_kv_quant,
             fp8: config.fp8,
         },
@@ -615,6 +620,7 @@ fn resolve_cache_mode(
     kv_k_bits: Option<u8>,
     kv_v_bits: Option<u8>,
     kv_group_size: usize,
+    kv_turboquant: bool,
     no_kv_quant: bool,
 ) -> CacheMode {
     if no_kv_quant || kv_quant == Some(0) {
@@ -622,16 +628,30 @@ fn resolve_cache_mode(
     }
     let kv_quant = kv_quant.unwrap_or(8);
     match (kv_k_bits, kv_v_bits) {
-        (Some(k), Some(v)) => CacheMode::AsymmetricQuantized {
-            key_bits: k,
-            value_bits: v,
-            group_size: kv_group_size,
-        },
+        (Some(k), Some(v)) => {
+            if kv_turboquant {
+                CacheMode::TurboQuant {
+                    key_bits: k,
+                    value_bits: v,
+                }
+            } else {
+                CacheMode::AsymmetricQuantized {
+                    key_bits: k,
+                    value_bits: v,
+                    group_size: kv_group_size,
+                }
+            }
+        }
         (Some(k), None) | (None, Some(k)) => {
             let v = kv_v_bits.unwrap_or(kv_quant);
             let k_final = kv_k_bits.unwrap_or(kv_quant);
             let _ = k; // suppress unused
-            if k_final == v {
+            if kv_turboquant {
+                CacheMode::TurboQuant {
+                    key_bits: k_final,
+                    value_bits: v,
+                }
+            } else if k_final == v {
                 CacheMode::Quantized {
                     bits: k_final,
                     group_size: kv_group_size,
@@ -644,10 +664,19 @@ fn resolve_cache_mode(
                 }
             }
         }
-        (None, None) => CacheMode::Quantized {
-            bits: kv_quant,
-            group_size: kv_group_size,
-        },
+        (None, None) => {
+            if kv_turboquant {
+                CacheMode::TurboQuant {
+                    key_bits: kv_quant,
+                    value_bits: kv_quant,
+                }
+            } else {
+                CacheMode::Quantized {
+                    bits: kv_quant,
+                    group_size: kv_group_size,
+                }
+            }
+        }
     }
 }
 
@@ -685,6 +714,7 @@ pub struct CacheModeRequest {
     pub kv_k_bits: Option<u8>,
     pub kv_v_bits: Option<u8>,
     pub kv_group_size: usize,
+    pub kv_turboquant: bool,
     pub no_kv_quant: bool,
     pub fp8: bool,
 }
@@ -726,13 +756,18 @@ fn select_cache_mode_with_working_set(
         };
     }
 
-    if request.kv_quant.is_some() || request.kv_k_bits.is_some() || request.kv_v_bits.is_some() {
+    if request.kv_turboquant
+        || request.kv_quant.is_some()
+        || request.kv_k_bits.is_some()
+        || request.kv_v_bits.is_some()
+    {
         return CacheModeSelection {
             mode: resolve_cache_mode(
                 request.kv_quant,
                 request.kv_k_bits,
                 request.kv_v_bits,
                 request.kv_group_size,
+                request.kv_turboquant,
                 false,
             ),
             source: CacheModeSource::Explicit,
@@ -894,11 +929,11 @@ fn build_cache_from_base_config(base_cache_config: &KVCacheConfig, mode: CacheMo
 fn sanitize_cache_mode(base_cache_config: &KVCacheConfig, mode: CacheMode) -> CacheMode {
     let head_dim = base_cache_config.head_dim;
     match mode {
-        CacheMode::Quantized { bits, group_size } if head_dim > 0 && head_dim % group_size != 0 => {
-            CacheMode::Quantized {
-                bits,
-                group_size: find_compatible_group_size(head_dim, group_size),
-            }
+            CacheMode::Quantized { bits, group_size } if head_dim > 0 && head_dim % group_size != 0 => {
+                CacheMode::Quantized {
+                    bits,
+                    group_size: find_compatible_group_size(head_dim, group_size),
+                }
         }
         CacheMode::AsymmetricQuantized {
             key_bits,
@@ -996,6 +1031,7 @@ mod tests {
                 kv_k_bits: None,
                 kv_v_bits: None,
                 kv_group_size: 64,
+                kv_turboquant: false,
                 no_kv_quant: false,
                 fp8: false,
             },
@@ -1016,6 +1052,7 @@ mod tests {
                 kv_k_bits: None,
                 kv_v_bits: None,
                 kv_group_size: 64,
+                kv_turboquant: false,
                 no_kv_quant: false,
                 fp8: false,
             },
@@ -1042,6 +1079,7 @@ mod tests {
                 kv_k_bits: None,
                 kv_v_bits: None,
                 kv_group_size: 64,
+                kv_turboquant: false,
                 no_kv_quant: false,
                 fp8: false,
             },
@@ -1059,6 +1097,60 @@ mod tests {
     }
 
     #[test]
+    fn explicit_turboquant_mode_uses_turboquant_variant() {
+        let selection = select_cache_mode_with_working_set(
+            &qwen3_cache_config(4096),
+            estimate_weight_bytes_from_param_count(620_000_000, false),
+            CacheModeRequest {
+                kv_quant: Some(4),
+                kv_k_bits: None,
+                kv_v_bits: Some(3),
+                kv_group_size: 64,
+                kv_turboquant: true,
+                no_kv_quant: false,
+                fp8: false,
+            },
+            Some(12 * 1024 * 1024 * 1024),
+        );
+
+        assert_eq!(
+            selection.mode,
+            CacheMode::TurboQuant {
+                key_bits: 4,
+                value_bits: 3
+            }
+        );
+        assert_eq!(selection.source, CacheModeSource::Explicit);
+    }
+
+    #[test]
+    fn turboquant_flag_without_bits_defaults_to_q8_turboquant() {
+        let selection = select_cache_mode_with_working_set(
+            &qwen3_cache_config(4096),
+            estimate_weight_bytes_from_param_count(620_000_000, false),
+            CacheModeRequest {
+                kv_quant: None,
+                kv_k_bits: None,
+                kv_v_bits: None,
+                kv_group_size: 64,
+                kv_turboquant: true,
+                no_kv_quant: false,
+                fp8: false,
+            },
+            Some(48 * 1024 * 1024 * 1024),
+        );
+
+        assert_eq!(
+            selection.mode,
+            CacheMode::TurboQuant {
+                key_bits: 8,
+                value_bits: 8
+            }
+        );
+        assert_eq!(selection.source, CacheModeSource::Explicit);
+    }
+
+    #[test]
     fn no_kv_quant_forces_fp16_even_when_budget_is_tight() {
         let selection = select_cache_mode_with_working_set(
             &qwen3_cache_config(4096),
@@ -1068,6 +1160,7 @@ mod tests {
                 kv_k_bits: None,
                 kv_v_bits: None,
                 kv_group_size: 64,
+                kv_turboquant: false,
                 no_kv_quant: true,
                 fp8: false,
             },
