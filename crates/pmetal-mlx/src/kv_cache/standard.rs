@@ -8,8 +8,10 @@ use mlx_rs::{
     ops::indexing::{IndexOp, TryIndexMutOp},
 };
 
+use crate::kernels::FusedAttentionConfig;
+
 use super::{
-    CacheMode, KVCacheConfig, QuantizedKVCache, TurboQuantKvCache, create_turboquant_core,
+    CacheMode, KVCacheConfig, QuantizedKVCache, TurboQuantKvCache, create_turboquant_runtime,
     dtype_size,
 };
 
@@ -44,17 +46,24 @@ impl LayerCache {
         batch_size: usize,
         num_kv_heads: usize,
         max_seq_len: usize,
-        head_dim: usize,
+        key_head_dim: usize,
+        value_head_dim: usize,
         dtype: Dtype,
     ) -> Result<Self, Exception> {
-        let shape = [
+        let k_shape = [
             batch_size as i32,
             num_kv_heads as i32,
             max_seq_len as i32,
-            head_dim as i32,
+            key_head_dim as i32,
         ];
-        let keys = Some(ops::zeros_dtype(&shape, dtype)?);
-        let values = Some(ops::zeros_dtype(&shape, dtype)?);
+        let v_shape = [
+            batch_size as i32,
+            num_kv_heads as i32,
+            max_seq_len as i32,
+            value_head_dim as i32,
+        ];
+        let keys = Some(ops::zeros_dtype(&k_shape, dtype)?);
+        let values = Some(ops::zeros_dtype(&v_shape, dtype)?);
 
         Ok(Self {
             keys,
@@ -120,19 +129,13 @@ impl KVCache {
             _ => None,
         };
         let turboquant_layers = match config.mode {
-            CacheMode::TurboQuant {
-                key_bits,
-                value_bits,
-            } => {
-                let shared_core = create_turboquant_core(config.head_dim, key_bits, value_bits);
+            CacheMode::TurboQuant { config: turboquant } => {
+                let shared_runtime =
+                    create_turboquant_runtime(config.head_dim, config.value_head_dim, turboquant);
                 Some(
                     (0..config.num_layers)
                         .map(|_| {
-                            TurboQuantKvCache::new_with_core(
-                                key_bits,
-                                value_bits,
-                                shared_core.clone(),
-                            )
+                            TurboQuantKvCache::new_with_runtime(turboquant, shared_runtime.clone())
                         })
                         .collect(),
                 )
@@ -178,6 +181,7 @@ impl KVCache {
                 config.num_kv_heads,
                 config.max_seq_len,
                 config.head_dim,
+                config.value_head_dim,
                 config.dtype,
             )?);
         }
@@ -388,14 +392,15 @@ impl KVCache {
             let n_steps = (CACHE_STEP_SIZE + new_seq_len - 1) / CACHE_STEP_SIZE;
             let new_alloc_len = n_steps * CACHE_STEP_SIZE;
 
-            // Get shape from new_keys [B, heads, _, head_dim]
+            // Get shapes from new keys/values [B, heads, _, head_dim]
             let batch = new_keys.dim(0);
             let heads = new_keys.dim(1);
-            let head_dim = new_keys.dim(3);
+            let key_head_dim = new_keys.dim(3);
+            let value_head_dim = new_values.dim(3);
 
             // Create new zero-filled buffer
-            let k_shape = [batch, heads, new_alloc_len as i32, head_dim];
-            let v_shape = [batch, heads, new_alloc_len as i32, head_dim];
+            let k_shape = [batch, heads, new_alloc_len as i32, key_head_dim];
+            let v_shape = [batch, heads, new_alloc_len as i32, value_head_dim];
             let new_k_buffer = ops::zeros_dtype(&k_shape, new_keys.dtype())?;
             let new_v_buffer = ops::zeros_dtype(&v_shape, new_values.dtype())?;
 
@@ -442,13 +447,37 @@ impl KVCache {
                 }
                 cache.offset
             }
-            CacheMode::Rotating { max_size, .. } => {
+            CacheMode::Rotating { max_size, keep } => {
                 if cache.offset > max_size {
-                    let shift = cache.offset - max_size;
+                    let keep = keep.min(max_size);
+                    let tail_len = max_size.saturating_sub(keep);
                     let k = cache.keys.as_ref().unwrap();
                     let v = cache.values.as_ref().unwrap();
-                    cache.keys = Some(k.index((.., .., shift as i32..cache.offset as i32, ..)));
-                    cache.values = Some(v.index((.., .., shift as i32..cache.offset as i32, ..)));
+
+                    let rotated_keys = if keep == 0 {
+                        let tail_start = cache.offset - max_size;
+                        k.index((.., .., tail_start as i32..cache.offset as i32, ..))
+                    } else if tail_len == 0 {
+                        k.index((.., .., ..keep as i32, ..))
+                    } else {
+                        let kept = k.index((.., .., ..keep as i32, ..));
+                        let tail_start = cache.offset - tail_len;
+                        let tail = k.index((.., .., tail_start as i32..cache.offset as i32, ..));
+                        concatenate_axis(&[&kept, &tail], 2)?
+                    };
+                    let rotated_values = if keep == 0 {
+                        let tail_start = cache.offset - max_size;
+                        v.index((.., .., tail_start as i32..cache.offset as i32, ..))
+                    } else if tail_len == 0 {
+                        v.index((.., .., ..keep as i32, ..))
+                    } else {
+                        let kept = v.index((.., .., ..keep as i32, ..));
+                        let tail_start = cache.offset - tail_len;
+                        let tail = v.index((.., .., tail_start as i32..cache.offset as i32, ..));
+                        concatenate_axis(&[&kept, &tail], 2)?
+                    };
+                    cache.keys = Some(rotated_keys);
+                    cache.values = Some(rotated_values);
                     cache.offset = max_size;
                 }
                 cache.offset
@@ -474,6 +503,40 @@ impl KVCache {
             k.index((.., .., ..final_offset as i32, ..)),
             v.index((.., .., ..final_offset as i32, ..)),
         ))
+    }
+
+    /// Try the TurboQuant direct-attention path for single-token decode.
+    ///
+    /// Returns `Ok(Some(output))` when the active cache mode is TurboQuant and
+    /// the inputs satisfy the decode-only fast-path constraints.
+    pub fn try_turboquant_attention(
+        &mut self,
+        layer_idx: usize,
+        queries: &Array,
+        new_keys: &Array,
+        new_values: &Array,
+        attn_config: &FusedAttentionConfig,
+    ) -> Result<Option<Array>, Exception> {
+        if layer_idx >= self.config.num_layers {
+            return Err(Exception::custom(format!(
+                "Layer index {} out of range (num_layers={})",
+                layer_idx, self.config.num_layers
+            )));
+        }
+
+        let Some(tq_layers) = self.turboquant_layers.as_mut() else {
+            return Ok(None);
+        };
+        if !tq_layers[layer_idx].can_direct_attention(queries, new_keys, new_values, attn_config) {
+            return Ok(None);
+        }
+
+        if layer_idx == 0 {
+            self.total_tokens += new_keys.dim(2) as usize;
+        }
+        tq_layers[layer_idx]
+            .append_and_compute_attention(queries, new_keys, new_values, attn_config)
+            .map(Some)
     }
 
     /// Legacy update method - DEPRECATED, use update_and_fetch instead.
@@ -514,7 +577,12 @@ impl KVCache {
     /// This is the starting position for new tokens when computing
     /// rotary embeddings during cached generation.
     pub fn rope_offset(&self) -> i32 {
-        self.seq_len() as i32
+        match self.config.mode {
+            CacheMode::SlidingWindow { .. } | CacheMode::Rotating { .. } => {
+                self.total_tokens as i32
+            }
+            _ => self.seq_len() as i32,
+        }
     }
 
     /// Estimate memory usage of the current cache in bytes.
@@ -555,9 +623,69 @@ impl KVCache {
             CacheMode::Rotating { max_size, .. } => max_size,
             _ => self.config.max_seq_len,
         };
-        let elements_per_layer = seq_len * self.config.num_kv_heads * self.config.head_dim;
-        let bytes_per_layer = elements_per_layer * dtype_size(self.config.dtype) * 2;
+        let key_elements = seq_len * self.config.num_kv_heads * self.config.head_dim;
+        let value_elements = seq_len * self.config.num_kv_heads * self.config.value_head_dim;
+        let bytes_per_layer = (key_elements + value_elements) * dtype_size(self.config.dtype);
         self.config.num_layers * bytes_per_layer
+    }
+
+    /// Fetch cached keys/values for a layer (for compiled decode).
+    ///
+    /// Returns the current cached keys/values up to the current offset.
+    /// The compiled closure will concatenate new K/V and return the full result.
+    pub fn fetch_for_compiled_decode(
+        &self,
+        layer_idx: usize,
+    ) -> Result<(Array, Array), Exception> {
+        let cache = &self.layer_caches[layer_idx];
+        if let (Some(k), Some(v)) = (&cache.keys, &cache.values) {
+            let offset = cache.offset as i32;
+            Ok((
+                k.index((.., .., ..offset, ..)),
+                v.index((.., .., ..offset, ..)),
+            ))
+        } else {
+            // No cache yet — return empty arrays with correct shape
+            Err(Exception::custom(format!(
+                "KV cache for layer {layer_idx} not initialized — run prefill first"
+            )))
+        }
+    }
+
+    /// Update cache from compiled decode outputs.
+    ///
+    /// The compiled closure returns full_keys/full_values (old + new concatenated).
+    /// We just replace the cache contents with these.
+    pub fn update_from_compiled_decode(
+        &mut self,
+        layer_idx: usize,
+        full_keys: &Array,
+        full_values: &Array,
+    ) -> Result<(), Exception> {
+        let cache = &mut self.layer_caches[layer_idx];
+        let new_seq_len = full_keys.dim(2) as usize;
+
+        // Ensure buffer is large enough
+        let needs_growth = cache.keys.is_none() || {
+            let allocated = cache.keys.as_ref().unwrap().dim(2) as usize;
+            new_seq_len > allocated
+        };
+        if needs_growth {
+            // Just store the full arrays directly
+            cache.keys = Some(full_keys.clone());
+            cache.values = Some(full_values.clone());
+        } else {
+            // In-place update into pre-allocated buffer
+            let k_buf = cache.keys.as_mut().unwrap();
+            let v_buf = cache.values.as_mut().unwrap();
+            k_buf.try_index_mut((.., .., ..new_seq_len as i32, ..), full_keys)?;
+            v_buf.try_index_mut((.., .., ..new_seq_len as i32, ..), full_values)?;
+        }
+        cache.offset = new_seq_len;
+        if layer_idx == 0 {
+            self.total_tokens = new_seq_len;
+        }
+        Ok(())
     }
 }
 

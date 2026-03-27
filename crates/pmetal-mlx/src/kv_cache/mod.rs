@@ -43,9 +43,9 @@ mod paged;
 mod quantized;
 mod rotating;
 mod standard;
-mod turboquant;
 #[cfg(test)]
 mod tests;
+mod turboquant;
 
 pub use mamba::*;
 pub use paged::*;
@@ -65,8 +65,10 @@ pub struct KVCacheConfig {
     pub max_seq_len: usize,
     /// Number of key-value heads (for GQA/MQA).
     pub num_kv_heads: usize,
-    /// Dimension per head.
+    /// Key dimension per head.
     pub head_dim: usize,
+    /// Value dimension per head. Defaults to `head_dim`.
+    pub value_head_dim: usize,
     /// Data type for cached tensors.
     pub dtype: Dtype,
     /// Cache mode.
@@ -121,10 +123,8 @@ pub enum CacheMode {
     },
     /// TurboQuant cache - random rotation + Lloyd-Max + QJL residual keys.
     TurboQuant {
-        /// Total effective bits per key channel.
-        key_bits: u8,
-        /// Total effective bits per value channel.
-        value_bits: u8,
+        /// TurboQuant K/V configuration.
+        config: TurboQuantConfig,
     },
 }
 
@@ -149,11 +149,23 @@ impl CacheMode {
             } => {
                 format!("K@q{key_bits},V@q{value_bits} (group={group_size})")
             }
-            CacheMode::TurboQuant {
-                key_bits,
-                value_bits,
-            } => format!("turboquant K@{key_bits}b,V@{value_bits}b"),
+            CacheMode::TurboQuant { config } => format!(
+                "turboquant K@{},V@{}",
+                describe_turboquant_tensor(config.keys),
+                describe_turboquant_tensor(config.values)
+            ),
         }
+    }
+}
+
+fn describe_turboquant_tensor(config: TurboQuantTensorConfig) -> String {
+    match config {
+        TurboQuantTensorConfig::Uniform { bits } => format!("{bits}b"),
+        TurboQuantTensorConfig::Mixed {
+            regular_bits,
+            outlier_bits,
+            outlier_count,
+        } => format!("{regular_bits}/{outlier_bits}b (+{outlier_count} outliers)"),
     }
 }
 
@@ -170,6 +182,7 @@ impl KVCacheConfig {
             max_seq_len,
             num_kv_heads,
             head_dim,
+            value_head_dim: head_dim,
             dtype: Dtype::Float32,
             mode: CacheMode::Standard,
             eager_allocate: false,
@@ -186,6 +199,12 @@ impl KVCacheConfig {
     /// Set the cache mode.
     pub fn with_mode(mut self, mode: CacheMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    /// Set a distinct value head dimension.
+    pub fn with_value_head_dim(mut self, value_head_dim: usize) -> Self {
+        self.value_head_dim = value_head_dim;
         self
     }
 
@@ -253,8 +272,36 @@ impl KVCacheConfig {
     /// the MSE-optimized quantizer.
     pub fn with_turboquant(mut self, key_bits: u8, value_bits: u8) -> Self {
         self.mode = CacheMode::TurboQuant {
-            key_bits,
-            value_bits,
+            config: TurboQuantConfig::uniform(key_bits, value_bits),
+        };
+        self
+    }
+
+    /// Enable TurboQuant with an explicit configuration.
+    pub fn with_turboquant_config(mut self, config: TurboQuantConfig) -> Self {
+        self.mode = CacheMode::TurboQuant { config };
+        self
+    }
+
+    /// Enable mixed-bit TurboQuant KV cache mode.
+    pub fn with_turboquant_mixed(
+        mut self,
+        key_regular_bits: u8,
+        key_outlier_bits: u8,
+        key_outlier_count: usize,
+        value_regular_bits: u8,
+        value_outlier_bits: u8,
+        value_outlier_count: usize,
+    ) -> Self {
+        self.mode = CacheMode::TurboQuant {
+            config: TurboQuantConfig::mixed(
+                key_regular_bits,
+                key_outlier_bits,
+                key_outlier_count,
+                value_regular_bits,
+                value_outlier_bits,
+                value_outlier_count,
+            ),
         };
         self
     }
@@ -288,14 +335,19 @@ impl KVCacheConfig {
     ///
     /// Useful for understanding memory requirements before allocation.
     pub fn memory_footprint(&self) -> usize {
+        let key_dim = self.head_dim;
+        let value_dim = self.value_head_dim;
         match self.mode {
             CacheMode::Quantized { bits, group_size } => {
                 let el_per_int = 32 / bits as usize;
-                let packed_dim = (self.head_dim + el_per_int - 1) / el_per_int;
-                let num_groups = (self.head_dim + group_size - 1) / group_size;
+                let k_packed = (key_dim + el_per_int - 1) / el_per_int;
+                let v_packed = (value_dim + el_per_int - 1) / el_per_int;
+                let k_groups = (key_dim + group_size - 1) / group_size;
+                let v_groups = (value_dim + group_size - 1) / group_size;
                 // packed u32 data + f16 scale + f16 bias per group
-                let per_token_bytes = (packed_dim * 4 + num_groups * 4) * self.num_kv_heads;
-                2 * per_token_bytes * self.max_seq_len * self.num_layers
+                let k_per_token_bytes = (k_packed * 4 + k_groups * 4) * self.num_kv_heads;
+                let v_per_token_bytes = (v_packed * 4 + v_groups * 4) * self.num_kv_heads;
+                (k_per_token_bytes + v_per_token_bytes) * self.max_seq_len * self.num_layers
             }
             CacheMode::AsymmetricQuantized {
                 key_bits,
@@ -304,29 +356,19 @@ impl KVCacheConfig {
             } => {
                 let k_el = 32 / key_bits as usize;
                 let v_el = 32 / value_bits as usize;
-                let k_packed = (self.head_dim + k_el - 1) / k_el;
-                let v_packed = (self.head_dim + v_el - 1) / v_el;
-                let num_groups = (self.head_dim + group_size - 1) / group_size;
-                let k_per_token = (k_packed * 4 + num_groups * 4) * self.num_kv_heads;
-                let v_per_token = (v_packed * 4 + num_groups * 4) * self.num_kv_heads;
+                let k_packed = (key_dim + k_el - 1) / k_el;
+                let v_packed = (value_dim + v_el - 1) / v_el;
+                let k_groups = (key_dim + group_size - 1) / group_size;
+                let v_groups = (value_dim + group_size - 1) / group_size;
+                let k_per_token = (k_packed * 4 + k_groups * 4) * self.num_kv_heads;
+                let v_per_token = (v_packed * 4 + v_groups * 4) * self.num_kv_heads;
                 (k_per_token + v_per_token) * self.max_seq_len * self.num_layers
             }
-            CacheMode::TurboQuant {
-                key_bits,
-                value_bits,
-            } => {
+            CacheMode::TurboQuant { config } => {
                 let rows_per_token = self.num_kv_heads;
-                let key_mse_bits = usize::from(key_bits.saturating_sub(1));
-                let key_bits_bytes = (self.head_dim * key_mse_bits).div_ceil(8);
-                let key_qjl_bytes = self.head_dim.div_ceil(8);
-                let key_meta_bytes = std::mem::size_of::<f32>() * 2;
-
-                let value_bits_bytes = (self.head_dim * usize::from(value_bits)).div_ceil(8);
-                let value_meta_bytes = std::mem::size_of::<f32>();
-
                 let per_token_bytes = rows_per_token
-                    * (key_bits_bytes + key_qjl_bytes + key_meta_bytes + value_bits_bytes
-                        + value_meta_bytes);
+                    * (turboquant_key_row_bytes(config.keys, key_dim)
+                        + turboquant_value_row_bytes(config.values, value_dim));
                 per_token_bytes * self.max_seq_len * self.num_layers
             }
             _ => {
@@ -335,10 +377,10 @@ impl KVCacheConfig {
                     Dtype::Float16 | Dtype::Bfloat16 => 2,
                     _ => 4,
                 };
-                2 * self.eager_batch_size.max(1)
+                self.eager_batch_size.max(1)
                     * self.num_kv_heads
                     * self.max_seq_len
-                    * self.head_dim
+                    * (key_dim + value_dim)
                     * bytes_per_element
                     * self.num_layers
             }
@@ -356,6 +398,49 @@ impl KVCacheConfig {
             format!("{:.2} KB", bytes as f64 / 1024.0)
         } else {
             format!("{} bytes", bytes)
+        }
+    }
+}
+
+fn turboquant_key_row_bytes(config: TurboQuantTensorConfig, head_dim: usize) -> usize {
+    match config {
+        TurboQuantTensorConfig::Uniform { bits } => {
+            let mse_bits = usize::from(bits.saturating_sub(1));
+            (head_dim * mse_bits).div_ceil(8)
+                + head_dim.div_ceil(8)
+                + (std::mem::size_of::<f32>() * 2)
+        }
+        TurboQuantTensorConfig::Mixed {
+            regular_bits,
+            outlier_bits,
+            outlier_count,
+        } => {
+            let regular_dim = head_dim - outlier_count;
+            (regular_dim * usize::from(regular_bits.saturating_sub(1))).div_ceil(8)
+                + regular_dim.div_ceil(8)
+                + (outlier_count * usize::from(outlier_bits.saturating_sub(1))).div_ceil(8)
+                + outlier_count.div_ceil(8)
+                + head_dim.div_ceil(8)
+                + (std::mem::size_of::<f32>() * 4)
+        }
+    }
+}
+
+fn turboquant_value_row_bytes(config: TurboQuantTensorConfig, head_dim: usize) -> usize {
+    match config {
+        TurboQuantTensorConfig::Uniform { bits } => {
+            (head_dim * usize::from(bits)).div_ceil(8) + std::mem::size_of::<f32>()
+        }
+        TurboQuantTensorConfig::Mixed {
+            regular_bits,
+            outlier_bits,
+            outlier_count,
+        } => {
+            let regular_dim = head_dim - outlier_count;
+            (regular_dim * usize::from(regular_bits)).div_ceil(8)
+                + (outlier_count * usize::from(outlier_bits)).div_ceil(8)
+                + head_dim.div_ceil(8)
+                + (std::mem::size_of::<f32>() * 2)
         }
     }
 }
