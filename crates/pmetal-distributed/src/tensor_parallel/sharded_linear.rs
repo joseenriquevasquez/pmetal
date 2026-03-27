@@ -16,8 +16,8 @@
 
 use crate::mlx_dist::group::DistributedGroup;
 use crate::mlx_dist::ops;
-use mlx_rs::error::Exception;
 use mlx_rs::Array;
+use mlx_rs::error::Exception;
 
 /// Forward pass for a column-sharded linear layer (AllToSharded).
 ///

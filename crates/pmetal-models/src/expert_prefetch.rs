@@ -24,15 +24,15 @@
 //! hits now preserve the aligned Metal expert path by copying the raw expert
 //! bytes into aligned GPU-visible buffers before dispatch.
 
-use std::collections::HashMap;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
 use mlx_rs::Array;
-use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Dtype;
+use mlx_rs::ops::indexing::IndexOp;
 
 use crate::expert_io::ExpertOffloadContext;
 
@@ -129,7 +129,11 @@ fn complete_prefetch(
     );
 }
 
-fn try_mark_inflight(inflight: &Mutex<HashMap<usize, u64>>, layer_idx: usize, generation: u64) -> bool {
+fn try_mark_inflight(
+    inflight: &Mutex<HashMap<usize, u64>>,
+    layer_idx: usize,
+    generation: u64,
+) -> bool {
     let mut inflight = inflight.lock().unwrap();
     if inflight.get(&layer_idx).copied() == Some(generation) {
         return false;
@@ -436,7 +440,10 @@ impl ExpertPrefetcher {
             .collect();
         scored.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
         scored.truncate(k);
-        Ok(scored.into_iter().map(|(_, expert_idx)| expert_idx).collect())
+        Ok(scored
+            .into_iter()
+            .map(|(_, expert_idx)| expert_idx)
+            .collect())
     }
 }
 
@@ -540,21 +547,11 @@ mod tests {
         let last_row = gate_logits.index((gate_logits.dim(0) - 1, ..));
         let last_row = last_row.as_type::<f32>().unwrap();
         let mut actual_scores: Vec<(f32, usize)> = (0..config.num_experts as usize)
-            .map(|expert_idx| {
-                (
-                    last_row.index(expert_idx as i32).item::<f32>(),
-                    expert_idx,
-                )
-            })
+            .map(|expert_idx| (last_row.index(expert_idx as i32).item::<f32>(), expert_idx))
             .collect();
-        actual_scores.sort_unstable_by(|a, b| {
-            b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal)
-        });
+        actual_scores.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
         actual_scores.truncate(config.num_experts_per_tok as usize);
-        let actual: Vec<usize> = actual_scores
-            .iter()
-            .map(|(_, idx)| *idx)
-            .collect();
+        let actual: Vec<usize> = actual_scores.iter().map(|(_, idx)| *idx).collect();
 
         assert_eq!(
             predicted.iter().copied().collect::<BTreeSet<_>>(),

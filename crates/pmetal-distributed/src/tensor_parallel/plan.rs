@@ -26,17 +26,45 @@ use anyhow::Result;
 ///
 /// Handles GQA: if `n_kv_heads < n_heads`, KV heads are repeated
 /// if N > n_kv_heads (standard MLX behavior).
-pub fn plan_attention(prefix: &str, _n_heads: usize, _n_kv_heads: usize) -> Vec<(String, ShardingDirective)> {
+pub fn plan_attention(
+    prefix: &str,
+    _n_heads: usize,
+    _n_kv_heads: usize,
+) -> Vec<(String, ShardingDirective)> {
     vec![
-        (format!("{prefix}.q_proj.weight"), ShardingDirective::AllToSharded { axis: 0 }),
-        (format!("{prefix}.k_proj.weight"), ShardingDirective::AllToSharded { axis: 0 }),
-        (format!("{prefix}.v_proj.weight"), ShardingDirective::AllToSharded { axis: 0 }),
-        (format!("{prefix}.o_proj.weight"), ShardingDirective::ShardedToAll { axis: 0 }),
+        (
+            format!("{prefix}.q_proj.weight"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
+        (
+            format!("{prefix}.k_proj.weight"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
+        (
+            format!("{prefix}.v_proj.weight"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
+        (
+            format!("{prefix}.o_proj.weight"),
+            ShardingDirective::ShardedToAll { axis: 0 },
+        ),
         // Biases (if present) follow the same pattern.
-        (format!("{prefix}.q_proj.bias"), ShardingDirective::AllToSharded { axis: 0 }),
-        (format!("{prefix}.k_proj.bias"), ShardingDirective::AllToSharded { axis: 0 }),
-        (format!("{prefix}.v_proj.bias"), ShardingDirective::AllToSharded { axis: 0 }),
-        (format!("{prefix}.o_proj.bias"), ShardingDirective::ShardedToAll { axis: 0 }),
+        (
+            format!("{prefix}.q_proj.bias"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
+        (
+            format!("{prefix}.k_proj.bias"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
+        (
+            format!("{prefix}.v_proj.bias"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
+        (
+            format!("{prefix}.o_proj.bias"),
+            ShardingDirective::ShardedToAll { axis: 0 },
+        ),
     ]
 }
 
@@ -45,9 +73,18 @@ pub fn plan_attention(prefix: &str, _n_heads: usize, _n_kv_heads: usize) -> Vec<
 /// gate_proj and up_proj are column-sharded; down_proj is row-sharded.
 pub fn plan_ffn(prefix: &str) -> Vec<(String, ShardingDirective)> {
     vec![
-        (format!("{prefix}.gate_proj.weight"), ShardingDirective::AllToSharded { axis: 0 }),
-        (format!("{prefix}.up_proj.weight"), ShardingDirective::AllToSharded { axis: 0 }),
-        (format!("{prefix}.down_proj.weight"), ShardingDirective::ShardedToAll { axis: 0 }),
+        (
+            format!("{prefix}.gate_proj.weight"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
+        (
+            format!("{prefix}.up_proj.weight"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
+        (
+            format!("{prefix}.down_proj.weight"),
+            ShardingDirective::ShardedToAll { axis: 0 },
+        ),
     ]
 }
 
@@ -62,20 +99,48 @@ pub fn plan_ffn(prefix: &str) -> Vec<(String, ShardingDirective)> {
 /// # Reference
 ///
 /// mlx-lm `qwen3_5.py` lines 393-440
-pub fn plan_gdn(prefix: &str, _key_dim: usize, _n_heads: usize) -> Vec<(String, ShardingDirective)> {
+pub fn plan_gdn(
+    prefix: &str,
+    _key_dim: usize,
+    _n_heads: usize,
+) -> Vec<(String, ShardingDirective)> {
     vec![
         // Input projections: column-shard
-        (format!("{prefix}.in_proj_qkv.weight"), ShardingDirective::AllToSharded { axis: 0 }),
-        (format!("{prefix}.in_proj_z.weight"), ShardingDirective::AllToSharded { axis: 0 }),
-        (format!("{prefix}.in_proj_b.weight"), ShardingDirective::AllToSharded { axis: 0 }),
-        (format!("{prefix}.in_proj_a.weight"), ShardingDirective::AllToSharded { axis: 0 }),
+        (
+            format!("{prefix}.in_proj_qkv.weight"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
+        (
+            format!("{prefix}.in_proj_z.weight"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
+        (
+            format!("{prefix}.in_proj_b.weight"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
+        (
+            format!("{prefix}.in_proj_a.weight"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
         // Conv1d (depthwise): shard along output channels (= key_dim * n_heads)
-        (format!("{prefix}.conv1d.weight"), ShardingDirective::AllToSharded { axis: 0 }),
+        (
+            format!("{prefix}.conv1d.weight"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
         // Output projection: row-shard
-        (format!("{prefix}.o_proj.weight"), ShardingDirective::ShardedToAll { axis: 0 }),
+        (
+            format!("{prefix}.o_proj.weight"),
+            ShardingDirective::ShardedToAll { axis: 0 },
+        ),
         // Per-head parameters: shard along head dimension (axis 0)
-        (format!("{prefix}.dt_bias"), ShardingDirective::AllToSharded { axis: 0 }),
-        (format!("{prefix}.A_log"), ShardingDirective::AllToSharded { axis: 0 }),
+        (
+            format!("{prefix}.dt_bias"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
+        (
+            format!("{prefix}.A_log"),
+            ShardingDirective::AllToSharded { axis: 0 },
+        ),
     ]
 }
 
@@ -127,7 +192,11 @@ pub fn plan_moe(prefix: &str, total_experts: usize) -> Vec<(String, ShardingDire
 /// - `"Qwen2MoeForCausalLM"` / `"qwen2_moe"` — MoE transformer
 /// - `"DeepseekV3ForCausalLM"` / `"deepseek_v3"` — MoE with shared expert
 /// - Generic fallback for standard transformer architectures
-pub fn build_plan(arch: &str, config: &serde_json::Value, world_size: usize) -> Result<ShardingPlan> {
+pub fn build_plan(
+    arch: &str,
+    config: &serde_json::Value,
+    world_size: usize,
+) -> Result<ShardingPlan> {
     if world_size <= 1 {
         return Ok(ShardingPlan::new());
     }
@@ -209,11 +278,12 @@ pub fn build_plan(arch: &str, config: &serde_json::Value, world_size: usize) -> 
         if num_experts > 0 {
             let moe = format!("{layer_prefix}.block_sparse_moe");
             // Try alternate naming conventions
-            let moe_prefix = if config.get("model_type").and_then(|v| v.as_str()) == Some("deepseek_v3") {
-                format!("{layer_prefix}.mlp")
-            } else {
-                moe
-            };
+            let moe_prefix =
+                if config.get("model_type").and_then(|v| v.as_str()) == Some("deepseek_v3") {
+                    format!("{layer_prefix}.mlp")
+                } else {
+                    moe
+                };
             for (name, dir) in plan_moe(&moe_prefix, num_experts) {
                 plan.add(name, dir);
             }
@@ -312,8 +382,14 @@ mod tests {
         assert!(plan.num_sharded() > 0);
 
         // Verify GDN layers got GDN directives (layers 0,1,2)
-        assert!(plan.directives.contains_key("model.layers.0.gdn.in_proj_qkv.weight"));
+        assert!(
+            plan.directives
+                .contains_key("model.layers.0.gdn.in_proj_qkv.weight")
+        );
         // Verify attention layer (layer 3) got attention directives
-        assert!(plan.directives.contains_key("model.layers.3.self_attn.q_proj.weight"));
+        assert!(
+            plan.directives
+                .contains_key("model.layers.3.self_attn.q_proj.weight")
+        );
     }
 }

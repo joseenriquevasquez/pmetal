@@ -360,7 +360,7 @@ impl InferenceTab {
                 self.kv_quant_mode = match self.kv_quant_mode {
                     0 => 8,
                     8 => 4,
-                    4 => 108, // TQ8
+                    4 => 108,   // TQ8
                     108 => 104, // TQ4
                     104 => 255, // FP16
                     _ => 0,
@@ -971,8 +971,16 @@ impl InferenceTab {
             format!("{:.2}", self.top_p),
             format!("{:.2}", self.repetition_penalty),
             kv_label,
-            if self.fp8 { "On".to_string() } else { "Off".to_string() },
-            if self.no_thinking { "On".to_string() } else { "Off".to_string() },
+            if self.fp8 {
+                "On".to_string()
+            } else {
+                "Off".to_string()
+            },
+            if self.no_thinking {
+                "On".to_string()
+            } else {
+                "Off".to_string()
+            },
         ];
 
         for (i, (name, val)) in SETTING_NAMES.iter().zip(setting_values.iter()).enumerate() {

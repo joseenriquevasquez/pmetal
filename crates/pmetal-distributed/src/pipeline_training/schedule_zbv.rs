@@ -64,7 +64,10 @@ pub fn schedule_zero_bubble(
         num_micro_batches,
         num_stages
     );
-    assert!(stage < num_stages, "stage {stage} >= num_stages {num_stages}");
+    assert!(
+        stage < num_stages,
+        "stage {stage} >= num_stages {num_stages}"
+    );
 
     let mut schedule = Vec::new();
     let is_first = stage == 0;
@@ -179,10 +182,22 @@ mod tests {
         for stage in 0..num_stages {
             let schedule = schedule_zero_bubble(num_stages, num_micro_batches, stage);
 
-            let fwd = schedule.iter().filter(|a| matches!(a, ZBAction::Forward(_))).count();
-            let bi = schedule.iter().filter(|a| matches!(a, ZBAction::BackwardInput(_))).count();
-            let bw = schedule.iter().filter(|a| matches!(a, ZBAction::BackwardWeight(_))).count();
-            let wu = schedule.iter().filter(|a| matches!(a, ZBAction::WeightUpdate)).count();
+            let fwd = schedule
+                .iter()
+                .filter(|a| matches!(a, ZBAction::Forward(_)))
+                .count();
+            let bi = schedule
+                .iter()
+                .filter(|a| matches!(a, ZBAction::BackwardInput(_)))
+                .count();
+            let bw = schedule
+                .iter()
+                .filter(|a| matches!(a, ZBAction::BackwardWeight(_)))
+                .count();
+            let wu = schedule
+                .iter()
+                .filter(|a| matches!(a, ZBAction::WeightUpdate))
+                .count();
 
             assert_eq!(fwd, num_micro_batches, "stage {stage} forward count");
             assert_eq!(bi, num_micro_batches, "stage {stage} backward-input count");
@@ -218,6 +233,9 @@ mod tests {
     fn zbv_bubble_less_than_1f1b() {
         let zbv = zbv_bubble_fraction(4, 8);
         let one_f1b = super::super::schedule_1f1b::bubble_fraction(4, 8);
-        assert!(zbv < one_f1b, "ZBV bubble {zbv} should be less than 1F1B {one_f1b}");
+        assert!(
+            zbv < one_f1b,
+            "ZBV bubble {zbv} should be less than 1F1B {one_f1b}"
+        );
     }
 }

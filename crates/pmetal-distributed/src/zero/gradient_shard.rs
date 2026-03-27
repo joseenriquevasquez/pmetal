@@ -140,8 +140,8 @@ pub async fn all_gather_params(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::state_partition::{ZeROPartitioner, ZeROStage};
+    use super::*;
 
     #[test]
     fn reduce_scatter_keeps_owned_only() {

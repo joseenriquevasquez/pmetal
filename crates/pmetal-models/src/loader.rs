@@ -924,11 +924,7 @@ where
         let shard_path = validate_shard_path(model_dir, shard_file)?;
         let shard_weights =
             Array::load_safetensors(&shard_path).map_err(|e| LoadError::Mlx(e.to_string()))?;
-        all_weights.extend(
-            shard_weights
-                .into_iter()
-                .filter(|(key, _)| keep_key(key)),
-        );
+        all_weights.extend(shard_weights.into_iter().filter(|(key, _)| keep_key(key)));
     }
 
     Ok(all_weights)
@@ -977,7 +973,7 @@ pub fn load_qwen3_next_weights_with_options(
             skip_routed_experts: options.skip_routed_experts,
         },
     )
-        .map_err(|e| LoadError::SafeTensors(format!("{:?}", e)))?;
+    .map_err(|e| LoadError::SafeTensors(format!("{:?}", e)))?;
 
     // Apply sanitized weights to model parameters
     let mut params = model.parameters_mut().flatten();
@@ -1586,7 +1582,10 @@ mod tests {
             "model.language_model.layers.0.mlp.experts.gate_up_proj",
             options
         ));
-        assert!(!should_keep_qwen3_next_raw_weight("model.visual.patch_embed.weight", options));
+        assert!(!should_keep_qwen3_next_raw_weight(
+            "model.visual.patch_embed.weight",
+            options
+        ));
         assert!(!should_keep_qwen3_next_raw_weight("mtp.fc.weight", options));
     }
 
@@ -1638,7 +1637,8 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_weights_filtered(model_dir, |key| !key.contains(".mlp.experts.")).unwrap();
+        let loaded =
+            load_weights_filtered(model_dir, |key| !key.contains(".mlp.experts.")).unwrap();
 
         assert_eq!(loaded.len(), 1);
         assert!(loaded.contains_key("model.embed_tokens.weight"));

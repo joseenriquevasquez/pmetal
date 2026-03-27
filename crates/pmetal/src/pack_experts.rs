@@ -102,15 +102,25 @@ impl ShardReader {
         let mut file =
             fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
         let mut header_len_bytes = [0u8; 8];
-        file.read_exact(&mut header_len_bytes)
-            .with_context(|| format!("Failed to read safetensors header from {}", path.display()))?;
+        file.read_exact(&mut header_len_bytes).with_context(|| {
+            format!("Failed to read safetensors header from {}", path.display())
+        })?;
         let header_len = u64::from_le_bytes(header_len_bytes) as usize;
 
         let mut header_bytes = vec![0u8; header_len];
-        file.read_exact(&mut header_bytes)
-            .with_context(|| format!("Failed to read safetensors JSON header from {}", path.display()))?;
-        let header: SafeTensorHeader = serde_json::from_slice(&header_bytes)
-            .with_context(|| format!("Failed to parse safetensors JSON header from {}", path.display()))?;
+        file.read_exact(&mut header_bytes).with_context(|| {
+            format!(
+                "Failed to read safetensors JSON header from {}",
+                path.display()
+            )
+        })?;
+        let header: SafeTensorHeader =
+            serde_json::from_slice(&header_bytes).with_context(|| {
+                format!(
+                    "Failed to parse safetensors JSON header from {}",
+                    path.display()
+                )
+            })?;
 
         Ok(Self {
             file,
@@ -205,11 +215,13 @@ impl ExpertTensorLayout {
 
         let single = model_dir.join("model.safetensors");
         if !single.exists() {
-            bail!("Could not detect expert tensor layout: no safetensors index or single-file model");
+            bail!(
+                "Could not detect expert tensor layout: no safetensors index or single-file model"
+            );
         }
 
-        let data = fs::read(&single)
-            .with_context(|| format!("Failed to read {}", single.display()))?;
+        let data =
+            fs::read(&single).with_context(|| format!("Failed to read {}", single.display()))?;
         let tensors = safetensors::SafeTensors::deserialize(&data)
             .map_err(|e| anyhow::anyhow!("safetensors parse error: {e}"))?;
         Self::detect_from_names(tensors.names())
@@ -469,13 +481,41 @@ pub fn pack_experts(model_dir: &Path, output_dir: &Path, bits: Option<u8>) -> Re
 
     // Component list in binary layout order (matches ExpertRecord::compute).
     let components: &[(ProjectionKind, ComponentField, &ExpertComponent)] = &[
-        (ProjectionKind::Gate, ComponentField::Weight, &record.gate_weight),
-        (ProjectionKind::Gate, ComponentField::Scales, &record.gate_scales),
-        (ProjectionKind::Gate, ComponentField::Biases, &record.gate_biases),
-        (ProjectionKind::Up, ComponentField::Weight, &record.up_weight),
-        (ProjectionKind::Up, ComponentField::Scales, &record.up_scales),
-        (ProjectionKind::Up, ComponentField::Biases, &record.up_biases),
-        (ProjectionKind::Down, ComponentField::Weight, &record.down_weight),
+        (
+            ProjectionKind::Gate,
+            ComponentField::Weight,
+            &record.gate_weight,
+        ),
+        (
+            ProjectionKind::Gate,
+            ComponentField::Scales,
+            &record.gate_scales,
+        ),
+        (
+            ProjectionKind::Gate,
+            ComponentField::Biases,
+            &record.gate_biases,
+        ),
+        (
+            ProjectionKind::Up,
+            ComponentField::Weight,
+            &record.up_weight,
+        ),
+        (
+            ProjectionKind::Up,
+            ComponentField::Scales,
+            &record.up_scales,
+        ),
+        (
+            ProjectionKind::Up,
+            ComponentField::Biases,
+            &record.up_biases,
+        ),
+        (
+            ProjectionKind::Down,
+            ComponentField::Weight,
+            &record.down_weight,
+        ),
         (
             ProjectionKind::Down,
             ComponentField::Scales,
@@ -860,7 +900,11 @@ fn collect_needed_shards(
     shard_map: &HashMap<String, String>,
     model_dir: &Path,
 ) -> Vec<String> {
-    let projections = [ProjectionKind::Gate, ProjectionKind::Up, ProjectionKind::Down];
+    let projections = [
+        ProjectionKind::Gate,
+        ProjectionKind::Up,
+        ProjectionKind::Down,
+    ];
     let mut fields = vec![ComponentField::Weight];
     if is_prequantized {
         fields.push(ComponentField::Scales);
@@ -1417,15 +1461,27 @@ mod tests {
 
             split_tensors.insert(
                 format!("model.layers.0.mlp.experts.{expert_idx}.gate_proj.weight"),
-                (vec![inter, hidden], safetensors::Dtype::BF16, bf16_bytes(&gate)),
+                (
+                    vec![inter, hidden],
+                    safetensors::Dtype::BF16,
+                    bf16_bytes(&gate),
+                ),
             );
             split_tensors.insert(
                 format!("model.layers.0.mlp.experts.{expert_idx}.up_proj.weight"),
-                (vec![inter, hidden], safetensors::Dtype::BF16, bf16_bytes(&up)),
+                (
+                    vec![inter, hidden],
+                    safetensors::Dtype::BF16,
+                    bf16_bytes(&up),
+                ),
             );
             split_tensors.insert(
                 format!("model.layers.0.mlp.experts.{expert_idx}.down_proj.weight"),
-                (vec![hidden, inter], safetensors::Dtype::BF16, bf16_bytes(&down)),
+                (
+                    vec![hidden, inter],
+                    safetensors::Dtype::BF16,
+                    bf16_bytes(&down),
+                ),
             );
 
             let gate_up_base = expert_idx * inter * 2 * hidden;
@@ -1472,7 +1528,10 @@ mod tests {
         let split_layout = ExpertPackLayout::load(&split_out).unwrap();
         let fused_layout = ExpertPackLayout::load(&fused_out).unwrap();
         assert_eq!(split_layout.expert_size, fused_layout.expert_size);
-        assert_eq!(split_layout.record.gate_weight.shape, fused_layout.record.gate_weight.shape);
+        assert_eq!(
+            split_layout.record.gate_weight.shape,
+            fused_layout.record.gate_weight.shape
+        );
 
         let split_layer = fs::read(split_out.join("layer_00.bin")).unwrap();
         let fused_layer = fs::read(fused_out.join("layer_00.bin")).unwrap();

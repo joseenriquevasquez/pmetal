@@ -28,6 +28,6 @@ pub mod capacity;
 pub mod dispatch;
 pub mod placement;
 
-pub use capacity::{apply_capacity, CapacityConfig, DropPolicy};
+pub use capacity::{CapacityConfig, DropPolicy, apply_capacity};
 pub use dispatch::ExpertDispatcher;
 pub use placement::ExpertPlacement;

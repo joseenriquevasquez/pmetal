@@ -181,14 +181,15 @@ impl ExpertIoPool {
                 size,
                 result_idx: i,
             };
-            self.task_tx.send(IoTask::Bytes(BytesIoTask {
-                work,
-                file: file.clone(),
-                result_tx: result_tx.clone(),
-            }))
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "IO pool shut down")
-            })?;
+            self.task_tx
+                .send(IoTask::Bytes(BytesIoTask {
+                    work,
+                    file: file.clone(),
+                    result_tx: result_tx.clone(),
+                }))
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "IO pool shut down")
+                })?;
         }
         drop(result_tx);
 
@@ -403,7 +404,8 @@ impl ExpertOffloadContext {
             {
                 let errors = &errors;
                 s.spawn(move || {
-                    for (i, (buf, &offset)) in buf_chunk.iter_mut().zip(idx_chunk.iter()).enumerate()
+                    for (i, (buf, &offset)) in
+                        buf_chunk.iter_mut().zip(idx_chunk.iter()).enumerate()
                     {
                         if let Err(e) = buf
                             .pread_range(fd, offset, 0, expert_size)
@@ -501,8 +503,7 @@ mod tests {
 
         let file_b = file.clone();
         let pool_b = pool.clone();
-        let t2 =
-            std::thread::spawn(move || pool_b.parallel_read(&file_b, &[256, 0], 256).unwrap());
+        let t2 = std::thread::spawn(move || pool_b.parallel_read(&file_b, &[256, 0], 256).unwrap());
 
         let r1 = t1.join().unwrap();
         let r2 = t2.join().unwrap();

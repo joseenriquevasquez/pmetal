@@ -43,7 +43,9 @@ pub fn all_sum(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exc
     // Keep the stream alive for the duration of the FFI call.
     let stream = Stream::new();
     unsafe {
-        let mut result = mlx_sys::mlx_array { ctx: std::ptr::null_mut() };
+        let mut result = mlx_sys::mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
         let status = mlx_sys::mlx_distributed_all_sum(
             &mut result,
             x.as_ptr(),
@@ -65,7 +67,9 @@ pub fn all_sum(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exc
 pub fn all_gather(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exception> {
     let stream = Stream::new();
     unsafe {
-        let mut result = mlx_sys::mlx_array { ctx: std::ptr::null_mut() };
+        let mut result = mlx_sys::mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
         let status = mlx_sys::mlx_distributed_all_gather(
             &mut result,
             x.as_ptr(),
@@ -84,7 +88,9 @@ pub fn all_gather(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, 
 pub fn all_max(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exception> {
     let stream = Stream::new();
     unsafe {
-        let mut result = mlx_sys::mlx_array { ctx: std::ptr::null_mut() };
+        let mut result = mlx_sys::mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
         let status = mlx_sys::mlx_distributed_all_max(
             &mut result,
             x.as_ptr(),
@@ -103,7 +109,9 @@ pub fn all_max(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exc
 pub fn all_min(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exception> {
     let stream = Stream::new();
     unsafe {
-        let mut result = mlx_sys::mlx_array { ctx: std::ptr::null_mut() };
+        let mut result = mlx_sys::mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
         let status = mlx_sys::mlx_distributed_all_min(
             &mut result,
             x.as_ptr(),
@@ -126,7 +134,9 @@ pub fn all_min(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exc
 pub fn sum_scatter(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exception> {
     let stream = Stream::new();
     unsafe {
-        let mut result = mlx_sys::mlx_array { ctx: std::ptr::null_mut() };
+        let mut result = mlx_sys::mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
         let status = mlx_sys::mlx_distributed_sum_scatter(
             &mut result,
             x.as_ptr(),
@@ -148,7 +158,9 @@ pub fn sum_scatter(x: &Array, group: Option<&DistributedGroup>) -> Result<Array,
 pub fn send(x: &Array, dst: i32, group: Option<&DistributedGroup>) -> Result<Array, Exception> {
     let stream = Stream::new();
     unsafe {
-        let mut result = mlx_sys::mlx_array { ctx: std::ptr::null_mut() };
+        let mut result = mlx_sys::mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
         let status = mlx_sys::mlx_distributed_send(
             &mut result,
             x.as_ptr(),
@@ -175,7 +187,9 @@ pub fn recv(
 ) -> Result<Array, Exception> {
     let stream = Stream::new();
     unsafe {
-        let mut result = mlx_sys::mlx_array { ctx: std::ptr::null_mut() };
+        let mut result = mlx_sys::mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
         let mlx_dtype = dtype.into();
         let status = mlx_sys::mlx_distributed_recv(
             &mut result,
@@ -205,7 +219,9 @@ pub fn recv_like(
 ) -> Result<Array, Exception> {
     let stream = Stream::new();
     unsafe {
-        let mut result = mlx_sys::mlx_array { ctx: std::ptr::null_mut() };
+        let mut result = mlx_sys::mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
         let status = mlx_sys::mlx_distributed_recv_like(
             &mut result,
             x.as_ptr(),

@@ -4,8 +4,8 @@
 //! imbalanced workloads where some experts are overloaded while
 //! others are idle.
 
-use mlx_rs::error::Exception;
 use mlx_rs::Array;
+use mlx_rs::error::Exception;
 
 /// Policy for handling tokens that exceed expert capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

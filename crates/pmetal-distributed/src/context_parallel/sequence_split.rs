@@ -2,8 +2,8 @@
 
 use crate::mlx_dist::group::DistributedGroup;
 use crate::mlx_dist::ops;
-use mlx_rs::error::Exception;
 use mlx_rs::Array;
+use mlx_rs::error::Exception;
 
 /// Extract a contiguous slice along `axis` using `take_axis`.
 ///
@@ -70,10 +70,7 @@ pub fn split_sequence(
 ///
 /// Each rank provides its local chunk; the result is the concatenation
 /// of all chunks in rank order along the sequence axis.
-pub fn gather_sequence(
-    local_chunk: &Array,
-    group: &DistributedGroup,
-) -> Result<Array, Exception> {
+pub fn gather_sequence(local_chunk: &Array, group: &DistributedGroup) -> Result<Array, Exception> {
     ops::all_gather(local_chunk, Some(group))
 }
 
@@ -139,7 +136,10 @@ mod tests {
 
         for rank in 0..world_size {
             let (start, len) = local_seq_range(seq_len, rank, world_size);
-            assert_eq!(start, prev_end, "rank {rank} start must follow previous end");
+            assert_eq!(
+                start, prev_end,
+                "rank {rank} start must follow previous end"
+            );
             total += len;
             prev_end = start + len;
         }

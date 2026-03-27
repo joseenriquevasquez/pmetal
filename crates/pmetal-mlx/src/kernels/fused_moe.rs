@@ -121,5 +121,4 @@ mod tests {
         result.eval().unwrap();
         assert_eq!(result.shape(), &[batch_seq, dim]);
     }
-
 }

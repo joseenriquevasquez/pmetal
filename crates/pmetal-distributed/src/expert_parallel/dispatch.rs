@@ -3,8 +3,8 @@
 use super::placement::ExpertPlacement;
 use crate::mlx_dist::group::DistributedGroup;
 use crate::mlx_dist::ops;
-use mlx_rs::error::Exception;
 use mlx_rs::Array;
+use mlx_rs::error::Exception;
 
 /// Slice a contiguous range along `axis` using `take_axis`.
 ///
@@ -221,7 +221,12 @@ fn scatter_row(x: &Array, row_idx: usize, value: &Array) -> Result<Array, Except
     }
     parts.push(value.clone());
     if row_idx + 1 < num_rows {
-        parts.push(narrow(x, 0, (row_idx + 1) as i32, (num_rows - row_idx - 1) as i32)?);
+        parts.push(narrow(
+            x,
+            0,
+            (row_idx + 1) as i32,
+            (num_rows - row_idx - 1) as i32,
+        )?);
     }
 
     mlx_rs::ops::concatenate_axis(&parts, 0)

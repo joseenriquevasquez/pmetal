@@ -153,7 +153,9 @@ pub fn shard_weight(
         ShardingDirective::ExpertSharded { total_experts } => {
             let shape = weight.shape();
             if shape.is_empty() {
-                return Err(Exception::custom("shard_weight: empty shape for ExpertSharded"));
+                return Err(Exception::custom(
+                    "shard_weight: empty shape for ExpertSharded",
+                ));
             }
 
             // Expert dimension is always axis 0: [num_experts, ...]

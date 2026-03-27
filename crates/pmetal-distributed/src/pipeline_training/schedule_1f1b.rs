@@ -60,7 +60,10 @@ pub fn schedule_1f1b(
         num_micro_batches,
         num_stages
     );
-    assert!(stage < num_stages, "stage {stage} >= num_stages {num_stages}");
+    assert!(
+        stage < num_stages,
+        "stage {stage} >= num_stages {num_stages}"
+    );
 
     let mut schedule = Vec::new();
     let is_first = stage == 0;
@@ -169,7 +172,9 @@ mod tests {
     fn first_stage_no_recv_activation() {
         let schedule = schedule_1f1b(3, 6, 0);
         assert!(
-            !schedule.iter().any(|a| matches!(a, MicroBatchAction::RecvActivation(_))),
+            !schedule
+                .iter()
+                .any(|a| matches!(a, MicroBatchAction::RecvActivation(_))),
             "first stage should never RecvActivation"
         );
     }
@@ -178,7 +183,9 @@ mod tests {
     fn last_stage_no_send_activation() {
         let schedule = schedule_1f1b(3, 6, 2);
         assert!(
-            !schedule.iter().any(|a| matches!(a, MicroBatchAction::SendActivation(_))),
+            !schedule
+                .iter()
+                .any(|a| matches!(a, MicroBatchAction::SendActivation(_))),
             "last stage should never SendActivation"
         );
     }
@@ -187,7 +194,9 @@ mod tests {
     fn last_stage_no_recv_gradient() {
         let schedule = schedule_1f1b(3, 6, 2);
         assert!(
-            !schedule.iter().any(|a| matches!(a, MicroBatchAction::RecvGradient(_))),
+            !schedule
+                .iter()
+                .any(|a| matches!(a, MicroBatchAction::RecvGradient(_))),
             "last stage should never RecvGradient"
         );
     }
