@@ -40,8 +40,8 @@ use pmetal_mlx::kernels::{
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache, MambaCacheEntry};
 use pmetal_models::ModelConfig;
 use pmetal_models::architectures::qwen3_next::{
-    Qwen3NextConfig, Qwen3NextRMSNormGated, Qwen3NextSanitizeOptions,
-    Qwen3NextSparseMoeBlock, sanitize_weights,
+    Qwen3NextConfig, Qwen3NextRMSNormGated, Qwen3NextSanitizeOptions, Qwen3NextSparseMoeBlock,
+    sanitize_weights,
 };
 
 use crate::{LoraError, LoraLinear};
@@ -247,6 +247,7 @@ impl Qwen3NextLoraAttention {
                 num_heads: self.n_heads,
                 num_kv_heads: self.n_kv_heads,
                 head_dim: self.head_dim,
+                value_head_dim: None,
                 scale: self.scale,
                 mask_type: AttentionMaskType::Causal,
                 logit_softcapping: None,
@@ -1607,15 +1608,13 @@ impl Qwen3NextLoraForCausalLM {
                         moe.gate.weight = Param::new(w.clone());
                     }
                     // Frozen stacked expert weights (post sanitize_weights)
-                    if let Some(w) = weights.get(&format!("{pfx}.mlp.switch_mlp_gate_proj"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.mlp.switch_mlp_gate_proj")) {
                         moe.switch_mlp_gate_proj = Param::new(w.clone());
                     }
                     if let Some(w) = weights.get(&format!("{pfx}.mlp.switch_mlp_up_proj")) {
                         moe.switch_mlp_up_proj = Param::new(w.clone());
                     }
-                    if let Some(w) = weights.get(&format!("{pfx}.mlp.switch_mlp_down_proj"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.mlp.switch_mlp_down_proj")) {
                         moe.switch_mlp_down_proj = Param::new(w.clone());
                     }
                     // Frozen shared expert gate

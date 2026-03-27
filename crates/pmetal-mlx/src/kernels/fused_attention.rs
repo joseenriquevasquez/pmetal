@@ -58,6 +58,7 @@ struct AttentionDispatchKey {
     query_seq_len: i32,
     kv_seq_len: i32,
     head_dim: i32,
+    value_head_dim: i32,
     mask_type: AttentionMaskType,
     softcap_bits: Option<u32>,
 }
@@ -105,6 +106,7 @@ impl AttentionDispatchKey {
             query_seq_len: q_shape[2],
             kv_seq_len: k_shape[2],
             head_dim: q_shape[3],
+            value_head_dim: config.effective_value_head_dim(),
             mask_type: config.mask_type,
             softcap_bits: config.logit_softcapping.map(f32::to_bits),
         })
@@ -112,7 +114,7 @@ impl AttentionDispatchKey {
 
     fn cache_key(&self) -> String {
         format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{:?}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{:?}",
             self.device_name,
             self.device_tier,
             self.dtype,
@@ -122,6 +124,7 @@ impl AttentionDispatchKey {
             self.query_seq_len,
             self.kv_seq_len,
             self.head_dim,
+            self.value_head_dim,
             self.mask_type,
             self.softcap_bits
         )
@@ -148,8 +151,11 @@ pub struct FusedAttentionConfig {
     pub num_heads: i32,
     /// Number of key-value heads (for GQA/MQA).
     pub num_kv_heads: i32,
-    /// Head dimension.
+    /// Head dimension (key/query dimension used for scoring).
     pub head_dim: i32,
+    /// Value head dimension. When `None`, defaults to `head_dim`.
+    /// Set this for architectures with asymmetric K/V dimensions (e.g. DeepSeek MLA).
+    pub value_head_dim: Option<i32>,
     /// Softmax scaling factor (default: 1/sqrt(head_dim)).
     pub scale: f32,
     /// Mask type.
@@ -165,10 +171,30 @@ impl FusedAttentionConfig {
             num_heads,
             num_kv_heads,
             head_dim,
+            value_head_dim: None,
             scale: 1.0 / (head_dim as f32).sqrt(),
             mask_type: AttentionMaskType::Causal,
             logit_softcapping: None,
         }
+    }
+
+    /// Set a distinct value head dimension (for architectures like DeepSeek MLA
+    /// where value projections have different width than key/query projections).
+    pub fn with_value_head_dim(mut self, value_head_dim: i32) -> Self {
+        self.value_head_dim = Some(value_head_dim);
+        self
+    }
+
+    /// Effective value head dimension (falls back to `head_dim` when unset).
+    #[must_use]
+    pub fn effective_value_head_dim(&self) -> i32 {
+        self.value_head_dim.unwrap_or(self.head_dim)
+    }
+
+    /// Whether key and value head dimensions differ.
+    #[must_use]
+    pub fn is_asymmetric(&self) -> bool {
+        self.value_head_dim.is_some_and(|v| v != self.head_dim)
     }
 
     /// Set custom scaling factor.
@@ -476,8 +502,9 @@ fn fast_fused_sdpa(
 
         // Sliding window - create custom mask
         (AttentionMaskType::SlidingWindow(window_size), None) => {
-            let seq_len = queries.dim(2);
-            let mask = create_sliding_window_mask(seq_len, *window_size)?;
+            let query_len = queries.dim(2);
+            let key_len = keys.dim(2);
+            let mask = create_sliding_window_mask(query_len, key_len, *window_size)?;
             scaled_dot_product_attention(queries, keys, values, config.scale, &mask, None)
         }
     }
@@ -541,6 +568,12 @@ fn flash_attention_supported(
         return false;
     }
 
+    // Metal flash attention kernels tile over head_dim and assume K_dim == V_dim.
+    // Asymmetric value dims (e.g. DeepSeek MLA) must fall through to MLX SDPA.
+    if q_shape[3] != v_shape[3] {
+        return false;
+    }
+
     matches!(q_shape[3] as usize, 64 | 80 | 96 | 128 | 256)
 }
 
@@ -582,7 +615,10 @@ fn run_metal_flash_attention(
 ) -> Result<Array, Exception> {
     let q_shape = queries.shape();
     let k_shape = keys.shape();
+    let v_shape = values.shape();
     let head_dim = q_shape[3] as usize;
+    // Output uses value dimension (may differ from key dim for asymmetric archs)
+    let out_head_dim = v_shape[3];
     let sliding_window = match config.mask_type {
         AttentionMaskType::SlidingWindow(window) => Some(window as usize),
         _ => None,
@@ -623,7 +659,8 @@ fn run_metal_flash_attention(
         }
     };
 
-    let output = metal_buffer_into_array_f16(output.output, q_shape)
+    let out_shape = &[q_shape[0], q_shape[1], q_shape[2], out_head_dim];
+    let output = metal_buffer_into_array_f16(output.output, out_shape)
         .map_err(|error| Exception::custom(error.to_string()))?;
 
     if queries.dtype() == Dtype::Float16 {
@@ -648,6 +685,8 @@ fn run_mpp_flash_attention(
 
     let q_shape = queries.shape();
     let k_shape = keys.shape();
+    let v_shape = values.shape();
+    let out_head_dim = v_shape[3];
     let mpp_config = MppFlashAttentionConfig {
         batch_size: q_shape[0] as usize,
         num_heads: q_shape[1] as usize,
@@ -683,7 +722,8 @@ fn run_mpp_flash_attention(
         .forward(&q_buffer, &k_buffer, &v_buffer)
         .map_err(|error| Exception::custom(error.to_string()))?;
 
-    let output = metal_buffer_into_array_f16(output.output, q_shape)
+    let out_shape = &[q_shape[0], q_shape[1], q_shape[2], out_head_dim];
+    let output = metal_buffer_into_array_f16(output.output, out_shape)
         .map_err(|error| Exception::custom(error.to_string()))?;
 
     if queries.dtype() == Dtype::Float16 {
@@ -712,7 +752,6 @@ fn manual_sdpa_with_softcapping(
     let batch = shape[0];
     let n_heads = shape[1];
     let q_seq_len = shape[2];
-    let head_dim = shape[3];
 
     let k_shape = keys.shape();
     let n_kv_heads = k_shape[1];
@@ -755,7 +794,7 @@ fn manual_sdpa_with_softcapping(
             scores.add(&mask)?
         }
         (AttentionMaskType::SlidingWindow(window_size), None) => {
-            let mask = create_sliding_window_mask(q_seq_len, *window_size)?;
+            let mask = create_sliding_window_mask(q_seq_len, kv_seq_len, *window_size)?;
             scores.add(&mask)?
         }
         (AttentionMaskType::None, None) => scores,
@@ -767,8 +806,9 @@ fn manual_sdpa_with_softcapping(
     // Attention output: weights @ V
     let output = weights.matmul(&values)?;
 
-    // Verify output shape
-    debug_assert_eq!(output.shape(), &[batch, n_heads, q_seq_len, head_dim]);
+    // Verify output shape — output uses value dimension, not key dimension
+    let v_head_dim = values.dim(3);
+    debug_assert_eq!(output.shape(), &[batch, n_heads, q_seq_len, v_head_dim]);
 
     Ok(output)
 }
@@ -812,12 +852,21 @@ fn create_causal_mask(query_len: i32, key_len: i32) -> Result<Array, Exception> 
 /// Create sliding window causal mask.
 ///
 /// Positions can only attend to positions within `window_size` distance.
-/// Shape: [1, 1, seq_len, seq_len] with -inf for masked positions.
-fn create_sliding_window_mask(seq_len: i32, window_size: i32) -> Result<Array, Exception> {
-    // Lower bound: cannot attend to positions too far in the past
-    // Upper bound: cannot attend to future positions (causal)
-    let lower = mlx_rs::ops::tri::<f32>(seq_len, None, Some(-window_size))?;
-    let upper = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;
+/// Shape: [1, 1, query_len, key_len] with -inf for masked positions.
+fn create_sliding_window_mask(
+    query_len: i32,
+    key_len: i32,
+    window_size: i32,
+) -> Result<Array, Exception> {
+    // Align the causal band to the bottom-right so decode queries attend to
+    // the most recent `window_size` cached tokens rather than broadcasting a
+    // square [query_len, query_len] mask over the full KV axis.
+    let lower = mlx_rs::ops::tri::<f32>(
+        query_len,
+        Some(key_len),
+        Some(key_len - query_len - window_size),
+    )?;
+    let upper = mlx_rs::ops::tri::<f32>(query_len, Some(key_len), Some(key_len - query_len))?;
 
     // Valid positions: where upper is 1 AND lower is 0
     let zero = Array::from_f32(0.0);
@@ -826,7 +875,7 @@ fn create_sliding_window_mask(seq_len: i32, window_size: i32) -> Result<Array, E
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let mask = mlx_rs::ops::r#where(&valid.eq(&zero)?, &neg_inf, &zero)?;
 
-    mask.reshape(&[1, 1, seq_len, seq_len])
+    mask.reshape(&[1, 1, query_len, key_len])
 }
 
 /// Memory-efficient attention for long sequences.
@@ -1175,10 +1224,29 @@ mod tests {
 
     #[test]
     fn test_sliding_window_mask() {
-        let mask = create_sliding_window_mask(8, 3).unwrap();
+        let mask = create_sliding_window_mask(8, 8, 3).unwrap();
         mask.eval().unwrap();
 
         assert_eq!(mask.shape(), &[1, 1, 8, 8]);
+    }
+
+    #[test]
+    fn test_sliding_window_mask_generation_alignment() {
+        let mask = create_sliding_window_mask(1, 6, 3).unwrap();
+        mask.eval().unwrap();
+
+        assert_eq!(mask.shape(), &[1, 1, 1, 6]);
+        assert_eq!(
+            mask.as_slice::<f32>(),
+            &[
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                0.0,
+                0.0,
+                0.0
+            ]
+        );
     }
 
     #[test]
@@ -1275,6 +1343,7 @@ mod tests {
             query_seq_len: 16,
             kv_seq_len: 16,
             head_dim: 64,
+            value_head_dim: 64,
             mask_type: AttentionMaskType::Causal,
             softcap_bits: None,
         };
@@ -1391,5 +1460,106 @@ mod tests {
             None,
             &props
         ));
+    }
+
+    #[test]
+    fn test_fused_sdpa_asymmetric_value_head_dim() {
+        // DeepSeek-style: key_dim=128, value_dim=64
+        let batch = 1;
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let seq_len = 8;
+        let key_dim = 128;
+        let value_dim = 64;
+
+        let queries = random_tensor(&[batch, n_heads, seq_len, key_dim]);
+        let keys = random_tensor(&[batch, n_kv_heads, seq_len, key_dim]);
+        let values = random_tensor(&[batch, n_kv_heads, seq_len, value_dim]);
+
+        let config =
+            FusedAttentionConfig::new(n_heads, n_kv_heads, key_dim).with_value_head_dim(value_dim);
+
+        assert!(config.is_asymmetric());
+        assert_eq!(config.effective_value_head_dim(), value_dim);
+
+        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
+        output.eval().unwrap();
+
+        // Output should use VALUE dimension, not key dimension
+        assert_eq!(output.shape(), &[batch, n_heads, seq_len, value_dim]);
+    }
+
+    #[test]
+    fn test_fused_sdpa_asymmetric_single_token_decode() {
+        // Single-token decode with asymmetric dims (the hot path for inference)
+        let batch = 1;
+        let n_heads = 8;
+        let n_kv_heads = 2;
+        let q_seq_len = 1;
+        let kv_seq_len = 32;
+        let key_dim = 128;
+        let value_dim = 64;
+
+        let queries = random_tensor(&[batch, n_heads, q_seq_len, key_dim]);
+        let keys = random_tensor(&[batch, n_kv_heads, kv_seq_len, key_dim]);
+        let values = random_tensor(&[batch, n_kv_heads, kv_seq_len, value_dim]);
+
+        let config =
+            FusedAttentionConfig::new(n_heads, n_kv_heads, key_dim).with_value_head_dim(value_dim);
+
+        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
+        output.eval().unwrap();
+
+        assert_eq!(output.shape(), &[batch, n_heads, q_seq_len, value_dim]);
+    }
+
+    #[test]
+    fn test_flash_attention_rejects_asymmetric_dims() {
+        let key_dim = 128;
+        let value_dim = 64;
+        let queries = random_tensor(&[1, 4, 8, key_dim]);
+        let keys = random_tensor(&[1, 4, 8, key_dim]);
+        let values = random_tensor(&[1, 4, 8, value_dim]);
+
+        // Metal flash attention should reject asymmetric dims
+        assert!(!flash_attention_supported(&queries, &keys, &values, None));
+
+        // Symmetric dims should pass (assuming head_dim is supported)
+        let values_sym = random_tensor(&[1, 4, 8, key_dim]);
+        assert!(flash_attention_supported(
+            &queries,
+            &keys,
+            &values_sym,
+            None
+        ));
+    }
+
+    #[test]
+    fn test_asymmetric_softcapping_output_shape() {
+        let batch = 1;
+        let n_heads = 4;
+        let seq_len = 8;
+        let key_dim = 64;
+        let value_dim = 32;
+
+        let queries = random_tensor(&[batch, n_heads, seq_len, key_dim]);
+        let keys = random_tensor(&[batch, n_heads, seq_len, key_dim]);
+        let values = random_tensor(&[batch, n_heads, seq_len, value_dim]);
+
+        let config = FusedAttentionConfig::new(n_heads, n_heads, key_dim)
+            .with_value_head_dim(value_dim)
+            .with_logit_softcapping(30.0);
+
+        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
+        output.eval().unwrap();
+
+        assert_eq!(output.shape(), &[batch, n_heads, seq_len, value_dim]);
+    }
+
+    #[test]
+    fn test_config_symmetric_by_default() {
+        let config = FusedAttentionConfig::new(4, 2, 64);
+        assert!(!config.is_asymmetric());
+        assert_eq!(config.effective_value_head_dim(), 64);
     }
 }

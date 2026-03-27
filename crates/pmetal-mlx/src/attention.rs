@@ -395,10 +395,13 @@ impl AttentionDispatcher {
                     (false, None) => crate::kernels::fused_attention::AttentionMaskType::None,
                 };
 
+                let v_dim = v.dim(3);
+                let q_dim = q.dim(3);
                 let fused_config = crate::kernels::fused_attention::FusedAttentionConfig {
                     num_heads: q.dim(1),
                     num_kv_heads: k.dim(1),
-                    head_dim: q.dim(3),
+                    head_dim: q_dim,
+                    value_head_dim: if v_dim != q_dim { Some(v_dim) } else { None },
                     scale,
                     mask_type,
                     logit_softcapping: config.has_softcap().then_some(config.softcap),

@@ -251,6 +251,7 @@ impl Qwen3LoraAttention {
                 num_heads: self.n_heads,
                 num_kv_heads: self.n_kv_heads,
                 head_dim: self.head_dim,
+                value_head_dim: None,
                 scale: self.scale,
                 mask_type: AttentionMaskType::Causal, // Qwen3 uses causal attention
                 logit_softcapping: None,
