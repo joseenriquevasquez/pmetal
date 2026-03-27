@@ -32,9 +32,13 @@
 //! - Chunkwise algorithm: Yang et al., "Gated Linear Attention Transformers with
 //!   Hardware-Efficient Training" (FLA, ICLR 2025).
 
+use std::sync::OnceLock;
+
 use mlx_rs::{
-    Array, Dtype, StreamOrDevice,
+    Array, Dtype, Stream, StreamOrDevice,
+    compile::{Closure, compile},
     error::Exception,
+    fast::{MetalKernel, MetalKernelConfig},
     linalg, nn,
     ops::{self, indexing::IndexOp},
     stop_gradient,
@@ -67,7 +71,7 @@ fn resolve_chunk_size_override(chunk_size_override: Option<i32>) -> Option<i32> 
 
 /// Compute gating decay: g = exp(-exp(A_log) * softplus(a + dt_bias))
 ///
-/// Operates in f32 for numerical stability, then casts back to input dtype.
+/// Uses `mx.compile(shapeless=True)` to fuse the 6 ops into a single kernel.
 ///
 /// # Arguments
 /// * `a_log` - Log of decay rates, shape `[Hv]`
@@ -77,6 +81,30 @@ fn resolve_chunk_size_override(chunk_size_override: Option<i32>) -> Option<i32> 
 /// # Returns
 /// Gating decay values, shape `[B, T, Hv]`
 pub fn compute_g(a_log: &Array, a: &Array, dt_bias: &Array) -> Result<Array, Exception> {
+    static COMPILED: OnceLock<Option<Closure>> = OnceLock::new();
+    let compiled = COMPILED.get_or_init(|| {
+        let closure = Closure::new(|inputs: &[Array]| -> Result<Vec<Array>, Exception> {
+            compute_g_impl(&inputs[0], &inputs[1], &inputs[2]).map(|g| vec![g])
+        });
+        compile(&closure, true).ok()
+    });
+
+    if let Some(compiled_fn) = compiled {
+        let outputs = compiled_fn.apply(&[a_log, a, dt_bias])?;
+        Ok(outputs.into_iter().next().unwrap())
+    } else {
+        compute_g_impl(a_log, a, dt_bias)
+    }
+}
+
+/// Raw (non-compiled) compute_g implementation.
+///
+/// Public so that callers embedding GDN inside an **outer** `mx.compile` closure
+/// can inline these ops directly, allowing the outer compile to fuse them with
+/// surrounding element-wise operations. Calling the compiled [`compute_g`] inside
+/// another compiled closure creates a fusion barrier (the inner `Compiled` primitive
+/// is opaque to the outer compile pass).
+pub fn compute_g_impl(a_log: &Array, a: &Array, dt_bias: &Array) -> Result<Array, Exception> {
     let input_dtype = a_log.dtype();
 
     // Upcast to f32 for stability
@@ -118,6 +146,35 @@ pub fn compute_g(a_log: &Array, a: &Array, dt_bias: &Array) -> Result<Array, Exc
 ///
 /// # Returns
 /// (output `[B, H, Dv]`, new_state `[B, H, Dv, Dk]`)
+/// Compiled GDN step — fuses ~15 ops into a single kernel via mx.compile.
+fn gated_delta_step_compiled(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+) -> Result<(Array, Array), Exception> {
+    static COMPILED: OnceLock<Option<Closure>> = OnceLock::new();
+    let compiled = COMPILED.get_or_init(|| {
+        let closure = Closure::new(|inputs: &[Array]| -> Result<Vec<Array>, Exception> {
+            let (y, s) = gated_delta_step_core_ops(
+                &inputs[0], &inputs[1], &inputs[2],
+                &inputs[3], &inputs[4], &inputs[5],
+            )?;
+            Ok(vec![y, s])
+        });
+        compile(&closure, false).ok()
+    });
+
+    if let Some(compiled_fn) = compiled {
+        let outputs = compiled_fn.apply(&[q, k, v, g, beta, state])?;
+        Ok((outputs[0].clone(), outputs[1].clone()))
+    } else {
+        gated_delta_step_core_ops(q, k, v, g, beta, state)
+    }
+}
+
 fn gated_delta_step_core_ops(
     q: &Array,
     k: &Array,
@@ -179,7 +236,7 @@ fn gated_delta_step_ops(
     mask: Option<&Array>,
 ) -> Result<(Array, Array), Exception> {
     let old_state = state.clone();
-    let (y, new_state) = gated_delta_step_core_ops(q, k, v, g, beta, state)?;
+    let (y, new_state) = gated_delta_step_compiled(q, k, v, g, beta, state)?;
 
     // Apply mask: if masked, keep old state
     let new_state = if let Some(mask) = mask {
@@ -236,7 +293,7 @@ fn gated_delta_decode_ops(
     };
     let beta_t = beta.reshape(&[b, hv])?;
 
-    let (y, new_state) = gated_delta_step_core_ops(&q_t, &k_t, &v_t, &g_t, &beta_t, state)?;
+    let (y, new_state) = gated_delta_step_compiled(&q_t, &k_t, &v_t, &g_t, &beta_t, state)?;
     Ok((y.reshape(&[b, 1, hv, dv])?, new_state))
 }
 
@@ -631,6 +688,197 @@ fn gated_delta_chunk_ops(
 }
 
 #[allow(clippy::too_many_arguments)]
+// ============================================================================
+// Fused Metal GDN kernel (single kernel launch per layer)
+// ============================================================================
+//
+// Fuses the entire GDN recurrence step into a single Metal dispatch.
+// Each thread handles Dk/32 elements of the key dimension, with SIMD
+// reductions across the 32-thread group. This eliminates ~15 separate
+// MLX op kernel launches per GDN layer per token.
+//
+// Grid: (32, Dv, B * Hv) — one SIMD group per (batch, value_head, value_dim)
+// Threadgroup: (32, 4, 1) — 32 threads = one SIMD group, 4 dv per threadgroup
+
+/// Metal source for the scalar-gated GDN step kernel.
+/// g shape: [B, T, Hv] — one scalar decay per value head.
+const GDN_KERNEL_SOURCE: &str = r#"
+    auto n = thread_position_in_grid.z;
+    auto b_idx = n / Hv;
+    auto hv_idx = n % Hv;
+    auto hk_idx = hv_idx / (Hv / Hk);
+    constexpr int n_per_t = Dk / 32;
+
+    // q, k: [B, T, Hk, Dk]
+    auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+    auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+    // v, y: [B, T, Hv, Dv]
+    auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+    y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+    auto dk_idx = thread_position_in_threadgroup.x;
+    auto dv_idx = thread_position_in_grid.y;
+
+    // state_in, state_out: [B, Hv, Dv, Dk]
+    auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+    auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+    float state[n_per_t];
+    for (int i = 0; i < n_per_t; ++i) {
+      auto s_idx = n_per_t * dk_idx + i;
+      state[i] = static_cast<float>(i_state[s_idx]);
+    }
+
+    // g: [B, T, Hv]
+    auto g_ = g + b_idx * T * Hv;
+    auto beta_ = beta + b_idx * T * Hv;
+
+    for (int t = 0; t < T; ++t) {
+      float kv_mem = 0.0f;
+      for (int i = 0; i < n_per_t; ++i) {
+        auto s_idx = n_per_t * dk_idx + i;
+        state[i] = state[i] * g_[hv_idx];
+        kv_mem += state[i] * k_[s_idx];
+      }
+      kv_mem = simd_sum(kv_mem);
+
+      auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+      float out = 0.0f;
+      for (int i = 0; i < n_per_t; ++i) {
+        auto s_idx = n_per_t * dk_idx + i;
+        state[i] = state[i] + k_[s_idx] * delta;
+        out += state[i] * q_[s_idx];
+      }
+      out = simd_sum(out);
+      if (thread_index_in_simdgroup == 0) {
+        y[dv_idx] = static_cast<InT>(out);
+      }
+      // Advance to next timestep
+      q_ += Hk * Dk;
+      k_ += Hk * Dk;
+      v_ += Hv * Dv;
+      y += Hv * Dv;
+      g_ += Hv;
+      beta_ += Hv;
+    }
+    for (int i = 0; i < n_per_t; ++i) {
+      auto s_idx = n_per_t * dk_idx + i;
+      o_state[s_idx] = static_cast<StT>(state[i]);
+    }
+"#;
+
+static GDN_METAL_KERNEL: OnceLock<Option<MetalKernel>> = OnceLock::new();
+
+fn get_gdn_metal_kernel() -> Option<&'static MetalKernel> {
+    GDN_METAL_KERNEL
+        .get_or_init(|| {
+            Some(MetalKernel::new(
+                "gated_delta_step",
+                &["q", "k", "v", "g", "beta", "state_in", "T"],
+                &["y", "state_out"],
+                GDN_KERNEL_SOURCE,
+                "",
+                true,
+                false,
+            ))
+        })
+        .as_ref()
+}
+
+/// Try the fused Metal GDN kernel. Returns None if conditions not met.
+///
+/// Public so that callers (e.g. compiled decode closures) can dispatch to the
+/// Metal kernel directly without going through `gated_delta_update` which
+/// would re-compute g/beta.
+pub fn try_gdn_metal_kernel(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    mask: Option<&Array>,
+) -> Result<Option<(Array, Array)>, Exception> {
+    // Metal kernel requires: no mask, Dk divisible by 32, Dk <= 256
+    if mask.is_some() {
+        return Ok(None);
+    }
+    let dk = q.dim(3) as usize;
+    if dk % 32 != 0 || dk > 256 || dk == 0 {
+        return Ok(None);
+    }
+    // Only scalar gating supported (g is 3D: [B, T, Hv])
+    if g.ndim() != 3 {
+        return Ok(None);
+    }
+
+    let Some(kernel) = get_gdn_metal_kernel() else {
+        return Ok(None);
+    };
+
+    let b = q.dim(0);
+    let t = q.dim(1);
+    let hk = q.dim(2) as usize;
+    let hv = v.dim(2) as usize;
+    let dv = v.dim(3) as usize;
+
+    let input_dtype = q.dtype();
+    let state_dtype = state.dtype();
+    let t_arr = Array::from_int(t);
+
+    let config = MetalKernelConfig::new()
+        .add_output_arg(&[b, t, hv as i32, dv as i32], input_dtype)
+        .add_output_arg(state.shape(), state_dtype)
+        .set_grid(32, dv as i32, b * hv as i32)
+        .set_thread_group(32, 4, 1)
+        .add_template_arg_dtype("InT", input_dtype)
+        .add_template_arg_dtype("StT", state_dtype)
+        .add_template_arg_int("Dk", dk as i32)
+        .add_template_arg_int("Dv", dv as i32)
+        .add_template_arg_int("Hk", hk as i32)
+        .add_template_arg_int("Hv", hv as i32);
+
+    let outputs = kernel.apply(
+        &[q, k, v, g, beta, state, &t_arr],
+        config,
+        &Stream::default(),
+    )?;
+
+    if outputs.len() == 2 {
+        Ok(Some((outputs[0].clone(), outputs[1].clone())))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Inference-only GDN dispatch with pre-computed g and beta.
+///
+/// Tries the fused Metal kernel first (single kernel launch per layer),
+/// then falls back to the ops-based path. This is the preferred entry point
+/// for compiled decode closures that have already computed g and beta.
+///
+/// Unlike [`gated_delta_update`], this does NOT recompute g/beta internally
+/// and does NOT use a separately-compiled closure, making it safe to call
+/// inside an outer `mx.compile` closure without creating fusion barriers.
+pub fn gated_delta_inference_dispatch(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    mask: Option<&Array>,
+) -> Result<(Array, Array), Exception> {
+    // Try fused Metal kernel first (single dispatch per layer)
+    if let Some(result) = try_gdn_metal_kernel(q, k, v, g, beta, state, mask)? {
+        return Ok(result);
+    }
+    // Fallback to ops-based path
+    gated_delta_ops(q, k, v, g, beta, Some(state), mask)
+}
+
 fn gated_delta_dispatch(
     q: &Array,
     k: &Array,
@@ -643,6 +891,11 @@ fn gated_delta_dispatch(
     chunk_size_override: Option<i32>,
 ) -> Result<(Array, Array), Exception> {
     if !training {
+        // For inference: try fused Metal kernel first (single dispatch per layer)
+        if let Some(result) = try_gdn_metal_kernel(q, k, v, g, beta, state, mask)? {
+            return Ok(result);
+        }
+
         let t = q.dim(1);
         if let Some(chunk_size) = resolve_chunk_size_override(chunk_size_override)
             && t > chunk_size
@@ -690,17 +943,7 @@ pub fn gated_delta_update(
     training: bool,
 ) -> Result<(Array, Array), Exception> {
     gated_delta_update_with_chunk_size_override(
-        q,
-        k,
-        v,
-        a,
-        b,
-        a_log,
-        dt_bias,
-        state,
-        mask,
-        training,
-        None,
+        q, k, v, a, b, a_log, dt_bias, state, mask, training, None,
     )
 }
 
@@ -1334,12 +1577,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_close(
-            &y_forced,
-            &y_seq,
-            1e-3,
-            "Forced sequential output mismatch",
-        );
+        assert_close(&y_forced, &y_seq, 1e-3, "Forced sequential output mismatch");
         assert_close(
             &state_forced,
             &state_seq,
@@ -1390,12 +1628,7 @@ mod tests {
         let (y_chunk, state_chunk) =
             gated_delta_chunk_ops_impl(&q, &k, &v, &g, &beta, &state_init, None, 32).unwrap();
 
-        assert_close(
-            &y_forced,
-            &y_chunk,
-            1e-3,
-            "Forced chunk output mismatch",
-        );
+        assert_close(&y_forced, &y_chunk, 1e-3, "Forced chunk output mismatch");
         assert_close(
             &state_forced,
             &state_chunk,
@@ -1403,5 +1636,4 @@ mod tests {
             "Forced chunk state mismatch",
         );
     }
-
 }

@@ -322,22 +322,54 @@ fn apply_activation(x: &Array, activation: GatedActivationType) -> Result<Array>
 /// * `gate_weight` - Gate projection [intermediate_size, hidden_size]
 /// * `up_weight` - Up projection [intermediate_size, hidden_size]
 /// * `down_weight` - Down projection [hidden_size, intermediate_size]
+/// Compiled SwiGLU activation: `silu(gate) * up`.
+///
+/// Matches mlx-lm's `@mx.compile(shapeless=True) def swiglu(gate, x)`.
+/// Fuses silu (sigmoid + multiply) + element-wise multiply into a single
+/// Metal kernel dispatch instead of 3 separate dispatches.
+fn compiled_swiglu(gate: &Array, up: &Array) -> Result<Array> {
+    use std::sync::OnceLock;
+    static COMPILED: OnceLock<Option<mlx_rs::compile::Closure>> = OnceLock::new();
+    let compiled = COMPILED.get_or_init(|| {
+        let closure = mlx_rs::compile::Closure::new(|inputs: &[Array]| {
+            let gate = &inputs[0];
+            let up = &inputs[1];
+            let activated = mlx_rs::nn::silu(gate)?.multiply(up)?;
+            Ok(vec![activated])
+        });
+        mlx_rs::compile::compile(&closure, true).ok()
+    });
+
+    if let Some(compiled_fn) = compiled {
+        let outputs = compiled_fn.apply(&[gate, up]).map_err(MlxError::from)?;
+        Ok(outputs.into_iter().next().unwrap())
+    } else {
+        // Fallback: uncompiled
+        let result = mlx_rs::nn::silu(gate).map_err(MlxError::from)?;
+        result.multiply(up).map_err(MlxError::from)
+    }
+}
+
+/// Fused SwiGLU MLP: `down_proj(silu(gate_proj(x)) * up_proj(x))`.
+///
+/// The activation portion (`silu(gate) * up`) is compiled via `mx.compile(shapeless=True)`
+/// matching mlx-lm's `@mx.compile def swiglu(gate, x)`. This fuses 3 element-wise ops
+/// (sigmoid, multiply, multiply) into 1 Metal dispatch, reducing total dispatches per
+/// MLP layer from 6 to 4.
 pub fn fused_swiglu_forward(
     x: &Array,
     gate_weight: &Array,
     up_weight: &Array,
     down_weight: &Array,
 ) -> Result<Array> {
-    // Gate and up projections (fused by MLX JIT)
+    // Gate and up projections (not fusable — matmul)
     let gate = x.matmul(&gate_weight.t())?;
     let up = x.matmul(&up_weight.t())?;
 
-    // SiLU activation: silu(x) = x * sigmoid(x)
-    let sigmoid_gate = mlx_rs::ops::sigmoid(&gate)?;
-    let silu_gate = gate.multiply(&sigmoid_gate)?;
+    // Compiled SwiGLU activation: silu(gate) * up → 1 dispatch instead of 3
+    let hidden = compiled_swiglu(&gate, &up)?;
 
-    // Element-wise multiply and down projection
-    let hidden = silu_gate.multiply(&up)?;
+    // Down projection
     Ok(hidden.matmul(&down_weight.t())?)
 }
 
