@@ -273,6 +273,7 @@ impl Qwen3MoEAttention {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
+        let mut cache = cache;
 
         // Project Q, K, V
         let mut q = self.q_proj.forward(x)?;
@@ -312,13 +313,6 @@ impl Qwen3MoEAttention {
             offset,
         )?;
 
-        // Update cache if provided
-        let (k, v) = if let Some((cache, layer_idx)) = cache {
-            cache.update_and_fetch(layer_idx, &k, &v)?
-        } else {
-            (k, v)
-        };
-
         // Use fused SDPA
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
             .with_scale(self.scale)
@@ -327,6 +321,25 @@ impl Qwen3MoEAttention {
             } else {
                 AttentionMaskType::Causal
             });
+
+        if mask.is_none() {
+            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
+                if let Some(output) =
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
+                {
+                    let output = output.transpose_axes(&[0, 2, 1, 3])?;
+                    let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
+                    return self.o_proj.forward(&output);
+                }
+            }
+        }
+
+        // Update cache if provided
+        let (k, v) = if let Some((cache, layer_idx)) = cache {
+            cache.update_and_fetch(layer_idx, &k, &v)?
+        } else {
+            (k, v)
+        };
 
         let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
 

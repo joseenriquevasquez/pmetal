@@ -14,7 +14,7 @@ use mlx_rs::nested::NestedHashMap;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{Array, nn};
 use pmetal_mlx::Builder;
-use pmetal_mlx::kernels::rope::apply_rope;
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_mlx::moe::{MoEConfig, MoELayer};
 use serde::{Deserialize, Serialize};
@@ -277,11 +277,7 @@ impl DeepSeekAttention {
             o_proj,
         })
     }
-    pub fn project_qkv(
-        &mut self,
-        x: &Array,
-        mut cache: Option<(&mut KVCache, usize)>,
-    ) -> Result<(Array, Array, Array)> {
+    fn project_qkv_uncached(&mut self, x: &Array, offset: i32) -> Result<(Array, Array, Array)> {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
@@ -314,14 +310,13 @@ impl DeepSeekAttention {
         let kv_split = kv.split_axis(&[self.config.qk_nope_head_dim as i32], Some(-1))?;
         let k_nope = &kv_split[0];
         let values = &kv_split[1];
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
         let q_pe = apply_rope(
             q_pe,
             self.config.qk_rope_head_dim,
             false,
             self.config.rope_theta,
             1.0,
-            offset as i32,
+            offset,
         )?;
         let k_pe = apply_rope(
             k_pe,
@@ -329,7 +324,7 @@ impl DeepSeekAttention {
             false,
             self.config.rope_theta,
             1.0,
-            offset as i32,
+            offset,
         )?;
         let k_pe_repeated = mlx_rs::ops::broadcast_to(
             &k_pe,
@@ -337,10 +332,20 @@ impl DeepSeekAttention {
         )?;
         let keys = mlx_rs::ops::concatenate_axis(&[k_nope, &k_pe_repeated], -1)?;
         let queries = mlx_rs::ops::concatenate_axis(&[q_nope, &q_pe], -1)?;
+        Ok((queries, keys, values.clone()))
+    }
+
+    pub fn project_qkv(
+        &mut self,
+        x: &Array,
+        mut cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<(Array, Array, Array)> {
+        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let (queries, keys, values) = self.project_qkv_uncached(x, offset)?;
         let (keys, values) = if let Some((ref mut cache, layer_idx)) = cache {
-            cache.update_and_fetch(layer_idx, &keys, values)?
+            cache.update_and_fetch(layer_idx, &keys, &values)?
         } else {
-            (keys, values.clone())
+            (keys, values)
         };
         Ok((queries, keys, values))
     }
@@ -350,9 +355,43 @@ impl DeepSeekAttention {
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array> {
-        let (queries, keys, values) = self.project_qkv(x, cache)?;
+        let mut cache = cache;
+        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let (queries, keys, values) = self.project_qkv_uncached(x, offset)?;
         let batch = queries.shape()[0];
         let seq_len = queries.shape()[2];
+        let attn_config =
+            FusedAttentionConfig::new(self.n_heads, self.n_heads, self.config.q_head_dim())
+                .with_scale(self.scale)
+                .with_mask_type(if mask.is_some() {
+                    AttentionMaskType::None
+                } else {
+                    AttentionMaskType::Causal
+                });
+
+        if mask.is_none() {
+            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
+                if let Some(output) = (*cache_ref).try_turboquant_attention(
+                    *layer_idx,
+                    &queries,
+                    &keys,
+                    &values,
+                    &attn_config,
+                )? {
+                    let output = output
+                        .transpose_axes(&[0, 2, 1, 3])?
+                        .reshape(&[batch, seq_len, -1])?;
+                    return self.o_proj.forward(&output);
+                }
+            }
+        }
+
+        let (keys, values) = if let Some((ref mut cache, layer_idx)) = cache {
+            cache.update_and_fetch(layer_idx, &keys, &values)?
+        } else {
+            (keys, values)
+        };
+
         let mut attn_weights = queries
             .matmul(&keys.transpose_axes(&[0, 1, 3, 2])?)?
             .multiply(&Array::from_f32(self.scale))?;
@@ -1179,12 +1218,15 @@ impl DeepSeek {
             .forward(&self.model.forward(input_ids, mask, cache)?)
     }
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
-        KVCache::new(pmetal_mlx::kv_cache::KVCacheConfig::new(
-            self.config.num_hidden_layers as usize,
-            max_seq_len,
-            self.config.num_attention_heads as usize,
-            self.config.q_head_dim() as usize,
-        ))
+        KVCache::new(
+            pmetal_mlx::kv_cache::KVCacheConfig::new(
+                self.config.num_hidden_layers as usize,
+                max_seq_len,
+                self.config.num_attention_heads as usize,
+                self.config.q_head_dim() as usize,
+            )
+            .with_value_head_dim(self.config.v_head_dim as usize),
+        )
     }
 
     pub fn init_stacked_moe(&mut self) -> Result<()> {
@@ -1307,5 +1349,41 @@ mod tests {
             max_diff.item::<f32>() < 1e-4,
             "deepseek full model drifted after stacked init"
         );
+    }
+
+    #[test]
+    fn test_deepseek_cache_uses_asymmetric_value_head_dim() {
+        let config = DeepSeekConfig::default();
+        let model = DeepSeek::new(config.clone()).unwrap();
+        let cache = model.create_cache(128);
+
+        assert_eq!(cache.config().head_dim, config.q_head_dim() as usize);
+        assert_eq!(cache.config().value_head_dim, config.v_head_dim as usize);
+    }
+
+    #[test]
+    #[serial]
+    fn test_deepseek_forward_with_turboquant_cache_handles_asymmetric_kv_dims() {
+        let config = tiny_deepseek_moe_config();
+        let mut model = DeepSeek::new(config).unwrap();
+        let base_cache = model.create_cache(16);
+        let mut cache = KVCache::new(base_cache.config().clone().with_turboquant(4, 3));
+
+        let first = Array::from_slice(&[1i32], &[1, 1]);
+        let second = Array::from_slice(&[2i32], &[1, 1]);
+
+        let first_logits = model.forward(&first, None, Some(&mut cache)).unwrap();
+        let second_logits = model.forward(&second, None, Some(&mut cache)).unwrap();
+        first_logits.eval().unwrap();
+        second_logits.eval().unwrap();
+
+        assert_eq!(cache.seq_len(), 2);
+        assert_eq!(cache.config().head_dim, model.config.q_head_dim() as usize);
+        assert_eq!(
+            cache.config().value_head_dim,
+            model.config.v_head_dim as usize
+        );
+        assert_eq!(first_logits.dim(0), 1);
+        assert_eq!(second_logits.dim(0), 1);
     }
 }

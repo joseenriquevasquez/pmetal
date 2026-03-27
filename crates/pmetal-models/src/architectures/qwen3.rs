@@ -459,6 +459,7 @@ impl Qwen3Attention {
         let shape = x.shape();
         let b = shape[0];
         let l = shape[1];
+        let mut cache = cache;
 
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
@@ -497,13 +498,6 @@ impl Qwen3Attention {
             offset,
         )?;
 
-        // Update KV cache with layer_idx (second element of tuple)
-        let (k, v) = if let Some((cache, layer_idx)) = cache {
-            cache.update_and_fetch(layer_idx, &k, &v)?
-        } else {
-            (k, v)
-        };
-
         // Fused SDPA with GQA-native path
         let mask_type = if mask.is_some() {
             AttentionMaskType::None
@@ -519,6 +513,28 @@ impl Qwen3Attention {
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
             .with_scale(self.scale)
             .with_mask_type(mask_type);
+
+        if mask.is_none() {
+            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
+                if let Some(out) =
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
+                {
+                    let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                        b,
+                        l,
+                        self.n_heads * self.head_dim,
+                    ])?;
+                    return self.o_proj.forward(&out);
+                }
+            }
+        }
+
+        // Update KV cache with layer_idx (second element of tuple)
+        let (k, v) = if let Some((cache, layer_idx)) = cache {
+            cache.update_and_fetch(layer_idx, &k, &v)?
+        } else {
+            (k, v)
+        };
 
         let out = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
         let out =

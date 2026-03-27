@@ -440,6 +440,7 @@ impl PhiAttention {
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, Exception> {
+        let mut cache = cache;
         let (batch, seq_len, _) = (x.dim(0), x.dim(1), x.dim(2));
 
         // Project Q, K, V
@@ -521,13 +522,6 @@ impl PhiAttention {
         let k_transposed = k.transpose_axes(&[0, 2, 1, 3])?;
         let v_transposed = v.transpose_axes(&[0, 2, 1, 3])?;
 
-        // Update KV cache
-        let (k, v) = if let Some((cache, layer_idx)) = cache {
-            cache.update_and_fetch(layer_idx, &k_transposed, &v_transposed)?
-        } else {
-            (k_transposed, v_transposed)
-        };
-
         // Use fused attention
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
             .with_scale(self.scale)
@@ -536,6 +530,30 @@ impl PhiAttention {
             } else {
                 AttentionMaskType::Causal
             });
+
+        if mask.is_none() {
+            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
+                if let Some(attn_output) = (*cache_ref).try_turboquant_attention(
+                    *layer_idx,
+                    &q,
+                    &k_transposed,
+                    &v_transposed,
+                    &attn_config,
+                )? {
+                    let attn_output = attn_output.transpose_axes(&[0, 2, 1, 3])?;
+                    let attn_output =
+                        attn_output.reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
+                    return self.o_proj.forward(&attn_output);
+                }
+            }
+        }
+
+        // Update KV cache
+        let (k, v) = if let Some((cache, layer_idx)) = cache {
+            cache.update_and_fetch(layer_idx, &k_transposed, &v_transposed)?
+        } else {
+            (k_transposed, v_transposed)
+        };
 
         let attn_output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
 

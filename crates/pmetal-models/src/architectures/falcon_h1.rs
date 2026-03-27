@@ -316,6 +316,7 @@ impl FalconH1Attention {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
+        let mut cache = cache;
 
         // Project Q, K, V
         let q = Module::forward(&mut self.q_proj, x)?;
@@ -344,18 +345,31 @@ impl FalconH1Attention {
         let q = apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, rope_offset)?;
         let k = apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, rope_offset)?;
 
+        // Fused SDPA (handles GQA head expansion internally)
+        let attn_config =
+            FusedAttentionConfig::new(self.num_heads, self.num_kv_heads, self.head_dim)
+                .with_scale(self.scale)
+                .with_mask_type(AttentionMaskType::Causal);
+
+        if mask.is_none() {
+            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
+                if let Some(output) =
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
+                {
+                    let output = output
+                        .transpose_axes(&[0, 2, 1, 3])?
+                        .reshape(&[batch, seq_len, -1])?;
+                    return Module::forward(&mut self.o_proj, &output);
+                }
+            }
+        }
+
         // Update KV cache if provided
         let (k, v) = if let Some((cache_ref, layer_idx)) = cache {
             cache_ref.update_and_fetch(layer_idx, &k, &v)?
         } else {
             (k, v)
         };
-
-        // Fused SDPA (handles GQA head expansion internally)
-        let attn_config =
-            FusedAttentionConfig::new(self.num_heads, self.num_kv_heads, self.head_dim)
-                .with_scale(self.scale)
-                .with_mask_type(AttentionMaskType::Causal);
 
         let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
 

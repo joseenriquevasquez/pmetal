@@ -409,6 +409,7 @@ impl GptOssAttention {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
+        let mut cache = cache;
 
         // Project Q, K, V
         let q = self.q_proj.forward(x)?;
@@ -430,13 +431,6 @@ impl GptOssAttention {
         let q = apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, offset)?;
         let k = apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, offset)?;
 
-        // Update cache if provided
-        let (k, v) = if let Some((cache, layer_idx)) = cache {
-            cache.update_and_fetch(layer_idx, &k, &v)?
-        } else {
-            (k, v)
-        };
-
         // Configure attention based on layer type
         let mask_type = match self.attention_type {
             AttentionType::SlidingAttention => {
@@ -454,6 +448,25 @@ impl GptOssAttention {
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
             .with_scale(self.scale)
             .with_mask_type(mask_type);
+
+        if mask.is_none() {
+            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
+                if let Some(output) =
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
+                {
+                    let output = output.transpose_axes(&[0, 2, 1, 3])?;
+                    let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
+                    return self.o_proj.forward(&output);
+                }
+            }
+        }
+
+        // Update cache if provided
+        let (k, v) = if let Some((cache, layer_idx)) = cache {
+            cache.update_and_fetch(layer_idx, &k, &v)?
+        } else {
+            (k, v)
+        };
 
         let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
 
@@ -1330,6 +1343,7 @@ impl GptOssLoraAttention {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
+        let mut cache = cache;
 
         // Project Q, K, V using LoRA layers
         let q = self.q_proj.forward(x)?;
@@ -1351,13 +1365,6 @@ impl GptOssLoraAttention {
         let q = apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, offset)?;
         let k = apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, offset)?;
 
-        // Update cache if provided
-        let (k, v) = if let Some((cache, layer_idx)) = cache {
-            cache.update_and_fetch(layer_idx, &k, &v)?
-        } else {
-            (k, v)
-        };
-
         // Configure attention based on layer type
         let mask_type = match self.attention_type {
             AttentionType::SlidingAttention => {
@@ -1375,6 +1382,25 @@ impl GptOssLoraAttention {
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
             .with_scale(self.scale)
             .with_mask_type(mask_type);
+
+        if mask.is_none() {
+            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
+                if let Some(output) =
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
+                {
+                    let output = output.transpose_axes(&[0, 2, 1, 3])?;
+                    let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
+                    return self.o_proj.forward(&output);
+                }
+            }
+        }
+
+        // Update cache if provided
+        let (k, v) = if let Some((cache, layer_idx)) = cache {
+            cache.update_and_fetch(layer_idx, &k, &v)?
+        } else {
+            (k, v)
+        };
 
         let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
 

@@ -423,6 +423,7 @@ impl GemmaAttention {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
+        let mut cache = cache;
 
         // Project to Q, K, V
         let queries = Module::forward(&mut self.q_proj, x)?;
@@ -441,7 +442,7 @@ impl GemmaAttention {
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Apply RoPE
-        let (queries, keys, values) = if let Some((ref cache_ref, _)) = cache {
+        let (queries, keys, values) = if let Some((cache_ref, _)) = cache.as_ref() {
             let offset = cache_ref.rope_offset();
             let queries = apply_rope(
                 &queries,
@@ -466,13 +467,6 @@ impl GemmaAttention {
             (queries, keys, values)
         };
 
-        // Handle KV cache update
-        let (keys, values) = if let Some((cache, layer_idx)) = cache {
-            cache.update_and_fetch(layer_idx, &keys, &values)?
-        } else {
-            (keys, values)
-        };
-
         // Build fused attention config with optional softcapping
         // Gemma2: even layers use sliding window, odd layers use full causal
         let mask_type = if mask.is_some() {
@@ -495,6 +489,30 @@ impl GemmaAttention {
         if let Some(cap) = self.logit_softcapping {
             attn_config = attn_config.with_logit_softcapping(cap);
         }
+
+        if mask.is_none() {
+            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
+                if let Some(output) = (*cache_ref).try_turboquant_attention(
+                    *layer_idx,
+                    &queries,
+                    &keys,
+                    &values,
+                    &attn_config,
+                )? {
+                    let output = output
+                        .transpose_axes(&[0, 2, 1, 3])?
+                        .reshape(&[batch, seq_len, -1])?;
+                    return Module::forward(&mut self.o_proj, &output);
+                }
+            }
+        }
+
+        // Handle KV cache update
+        let (keys, values) = if let Some((cache, layer_idx)) = cache {
+            cache.update_and_fetch(layer_idx, &keys, &values)?
+        } else {
+            (keys, values)
+        };
 
         // Fused SDPA with optional softcapping
         let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;

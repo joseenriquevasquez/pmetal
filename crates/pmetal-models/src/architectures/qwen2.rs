@@ -348,6 +348,7 @@ impl Qwen2Attention {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
+        let mut cache = cache;
 
         // Project to Q, K, V
         let queries = Module::forward(&mut self.q_proj, x)?;
@@ -366,7 +367,7 @@ impl Qwen2Attention {
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Get RoPE offset and apply RoPE
-        let (queries, keys, values) = if let Some((ref cache_ref, _layer_idx)) = cache {
+        let (queries, keys, values) = if let Some((cache_ref, _layer_idx)) = cache.as_ref() {
             let offset = cache_ref.rope_offset();
             let queries = apply_rope(
                 &queries,
@@ -391,14 +392,6 @@ impl Qwen2Attention {
             (queries, keys, values)
         };
 
-        // Handle KV cache update - keys/values are already in [B, heads, seq, head_dim] format
-        // No transpose needed - cache uses attention format directly (SOTA performance matching mlx_lm)
-        let (keys, values) = if let Some((cache, layer_idx)) = cache {
-            cache.update_and_fetch(layer_idx, &keys, &values)?
-        } else {
-            (keys, values)
-        };
-
         // Determine mask type for fused attention
         // Gate on use_sliding_window flag before checking sliding_window size
         let mask_type = if mask.is_some() {
@@ -417,6 +410,31 @@ impl Qwen2Attention {
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
             .with_scale(self.scale)
             .with_mask_type(mask_type);
+
+        if mask.is_none() {
+            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
+                if let Some(output) = (*cache_ref).try_turboquant_attention(
+                    *layer_idx,
+                    &queries,
+                    &keys,
+                    &values,
+                    &attn_config,
+                )? {
+                    let output = output
+                        .transpose_axes(&[0, 2, 1, 3])?
+                        .reshape(&[batch, seq_len, -1])?;
+                    return Module::forward(&mut self.o_proj, &output);
+                }
+            }
+        }
+
+        // Handle KV cache update - keys/values are already in [B, heads, seq, head_dim] format
+        // No transpose needed - cache uses attention format directly (SOTA performance matching mlx_lm)
+        let (keys, values) = if let Some((cache, layer_idx)) = cache {
+            cache.update_and_fetch(layer_idx, &keys, &values)?
+        } else {
+            (keys, values)
+        };
 
         // Fused SDPA
         let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;

@@ -5,8 +5,8 @@
 
 use crate::architectures::*;
 use crate::loader::{
-    load_bert_weights, load_falcon_h1_weights, load_generic_weights, load_nemotron_weights,
-    load_qwen3_next_weights_with_options, load_weights, Qwen3NextLoadOptions,
+    Qwen3NextLoadOptions, load_bert_weights, load_falcon_h1_weights, load_generic_weights,
+    load_nemotron_weights, load_qwen3_next_weights_with_options, load_weights,
 };
 use crate::traits::{CausalLMModel, ModelConfig};
 use mlx_rs::{
@@ -14,22 +14,59 @@ use mlx_rs::{
     error::Exception,
     module::{Module, ModuleParameters},
 };
-use pmetal_mlx::kv_cache::{CacheMode, KVCache, KVCacheConfig, MambaCache};
+use pmetal_mlx::kv_cache::{
+    CacheMode, KVCache, KVCacheConfig, MambaCache, TurboQuantConfig, TurboQuantTensorConfig,
+};
 use std::path::Path;
 
-/// Find the largest power-of-2 group size that divides `head_dim`,
-/// preferring the requested `preferred` if it already works.
-fn find_compatible_group_size(head_dim: usize, preferred: usize) -> usize {
-    if head_dim % preferred == 0 {
+fn group_size_supported_for_dims(
+    key_head_dim: usize,
+    value_head_dim: usize,
+    group_size: usize,
+) -> bool {
+    group_size > 0
+        && (key_head_dim == 0 || key_head_dim % group_size == 0)
+        && (value_head_dim == 0 || value_head_dim % group_size == 0)
+}
+
+fn find_compatible_group_size_pair(
+    key_head_dim: usize,
+    value_head_dim: usize,
+    preferred: usize,
+) -> usize {
+    if group_size_supported_for_dims(key_head_dim, value_head_dim, preferred) {
         return preferred;
     }
-    // Try common group sizes in decreasing order: 64, 32, 16, 8, 4, 2, 1
-    for gs in [64, 32, 16, 8, 4, 2, 1] {
-        if head_dim % gs == 0 {
+    for gs in [128, 64, 32, 16, 8, 4, 2, 1] {
+        if group_size_supported_for_dims(key_head_dim, value_head_dim, gs) {
             return gs;
         }
     }
-    1 // Fallback: per-element quantization (always works)
+    1
+}
+
+fn sanitize_turboquant_tensor(
+    head_dim: usize,
+    config: TurboQuantTensorConfig,
+) -> TurboQuantTensorConfig {
+    match config {
+        TurboQuantTensorConfig::Uniform { .. } => config,
+        TurboQuantTensorConfig::Mixed {
+            regular_bits,
+            outlier_bits,
+            outlier_count,
+        } => {
+            if head_dim <= 1 {
+                TurboQuantTensorConfig::uniform(outlier_bits.max(regular_bits))
+            } else {
+                TurboQuantTensorConfig::mixed(
+                    regular_bits,
+                    outlier_bits,
+                    outlier_count.clamp(1, head_dim - 1),
+                )
+            }
+        }
+    }
 }
 
 const PARAM_EVAL_BATCH_SIZE: usize = 128;
@@ -110,11 +147,7 @@ impl ModelArchitecture {
             "llama4" => Some(Self::Llama4),
             "llama" | "llama3" => Some(Self::Llama),
             "qwen3_moe" => Some(Self::Qwen3MoE),
-            "qwen3_next"
-            | "qwen3_5"
-            | "qwen3.5"
-            | "qwen3_5_text"
-            | "qwen3_5_moe"
+            "qwen3_next" | "qwen3_5" | "qwen3.5" | "qwen3_5_text" | "qwen3_5_moe"
             | "qwen3_5_moe_text" => Some(Self::Qwen3Next),
             "qwen3" => Some(Self::Qwen3),
             "qwen2" | "qwen2_5" => Some(Self::Qwen2),
@@ -549,18 +582,16 @@ impl DynamicModel {
                 let mut config: Qwen3NextConfig = serde_json::from_str(&text_config_str)
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 config.apply_rope_parameters();
-                let skip_routed_experts =
-                    options.prefer_expert_offload && config.num_experts > 0;
+                let skip_routed_experts = options.prefer_expert_offload && config.num_experts > 0;
                 let routed_expert_mode = if skip_routed_experts {
                     Qwen3NextRoutedExpertMode::Placeholder
                 } else {
                     Qwen3NextRoutedExpertMode::Resident
                 };
-                let mut model =
-                    Qwen3NextForCausalLM::new_with_routed_expert_mode(
-                        config.clone(),
-                        routed_expert_mode,
-                    )?;
+                let mut model = Qwen3NextForCausalLM::new_with_routed_expert_mode(
+                    config.clone(),
+                    routed_expert_mode,
+                )?;
                 let load_options = if skip_routed_experts {
                     Qwen3NextLoadOptions {
                         skip_routed_experts: true,
@@ -827,17 +858,19 @@ impl DynamicModel {
     pub fn create_cache_with_mode(&self, max_seq_len: usize, mode: CacheMode) -> KVCache {
         let base = self.create_cache(max_seq_len);
         let base_config = base.config();
-        let head_dim = base_config.head_dim;
+        let key_head_dim = base_config.head_dim;
+        let value_head_dim = base_config.value_head_dim;
 
         // Ensure group_size is compatible with head_dim (MLX quantize requires divisibility).
         // Models like Phi-3 mini (head_dim=96) or NemotronH (head_dim=32) need adjustment.
         let safe_mode = match mode {
             CacheMode::Quantized { bits, group_size }
-                if head_dim > 0 && head_dim % group_size != 0 =>
+                if !group_size_supported_for_dims(key_head_dim, value_head_dim, group_size) =>
             {
-                let safe_gs = find_compatible_group_size(head_dim, group_size);
+                let safe_gs =
+                    find_compatible_group_size_pair(key_head_dim, value_head_dim, group_size);
                 tracing::info!(
-                    "KV cache: adjusted group_size {group_size} → {safe_gs} (head_dim={head_dim})"
+                    "KV cache: adjusted group_size {group_size} → {safe_gs} (key_head_dim={key_head_dim}, value_head_dim={value_head_dim})"
                 );
                 CacheMode::Quantized {
                     bits,
@@ -848,10 +881,11 @@ impl DynamicModel {
                 key_bits,
                 value_bits,
                 group_size,
-            } if head_dim > 0 && head_dim % group_size != 0 => {
-                let safe_gs = find_compatible_group_size(head_dim, group_size);
+            } if !group_size_supported_for_dims(key_head_dim, value_head_dim, group_size) => {
+                let safe_gs =
+                    find_compatible_group_size_pair(key_head_dim, value_head_dim, group_size);
                 tracing::info!(
-                    "KV cache: adjusted group_size {group_size} → {safe_gs} (head_dim={head_dim})"
+                    "KV cache: adjusted group_size {group_size} → {safe_gs} (key_head_dim={key_head_dim}, value_head_dim={value_head_dim})"
                 );
                 CacheMode::AsymmetricQuantized {
                     key_bits,
@@ -859,6 +893,12 @@ impl DynamicModel {
                     group_size: safe_gs,
                 }
             }
+            CacheMode::TurboQuant { config } => CacheMode::TurboQuant {
+                config: TurboQuantConfig {
+                    keys: sanitize_turboquant_tensor(key_head_dim, config.keys),
+                    values: sanitize_turboquant_tensor(value_head_dim, config.values),
+                },
+            },
             other => other,
         };
 
@@ -893,6 +933,14 @@ impl DynamicModel {
 
     pub fn architecture(&self) -> ModelArchitecture {
         dispatch_architecture!(self)
+    }
+
+    /// Access the underlying Qwen3NextForCausalLM if this is a Qwen3.5 model.
+    pub fn as_qwen3_next_mut(&mut self) -> Option<&mut Qwen3NextForCausalLM> {
+        match self {
+            Self::Qwen3Next(m) => Some(m),
+            _ => None,
+        }
     }
 
     pub fn vocab_size(&self) -> i32 {
