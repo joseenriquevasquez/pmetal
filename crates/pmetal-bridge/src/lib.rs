@@ -12,9 +12,14 @@
 pub mod inline_array;
 pub use inline_array::InlineArray;
 
+pub mod optimizer;
+pub use optimizer::{AdamW, ParamClass, ParamSet};
+
 pub mod turboquant;
+pub mod training;
 
 pub mod qwen3_native;
+pub mod qwen3_train;
 pub mod deepseek_native;
 pub mod gpt_oss_native;
 pub mod llama4_native;

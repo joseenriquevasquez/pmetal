@@ -363,6 +363,28 @@ impl LayerWeight {
         }
     }
 
+    /// `x @ self + scale * (x @ A.T) @ B.T` — projection with LoRA adapter.
+    ///
+    /// Falls through to plain `matmul_from` when `adapter` is None.
+    /// Zero overhead when adapter is absent (same code path, no branch in graph).
+    #[inline(always)]
+    pub fn matmul_from_lora(
+        &self,
+        x: &InlineArray,
+        adapter: Option<&crate::qwen3_train::LoraAdapter>,
+    ) -> InlineArray {
+        let base = self.matmul_from(x);
+        match adapter {
+            None => base,
+            Some(a) => {
+                let xa = x.matmul(&a.lora_a.t());
+                let xab = xa.matmul(&a.lora_b.t());
+                let scale = InlineArray::from_f32(a.scale);
+                base.add(&xab.multiply(&scale))
+            }
+        }
+    }
+
     /// Apply `copy_fresh` to all arrays in this weight (add zero + eval + detach).
     pub fn copy_fresh(&self, zero: &InlineArray) -> Self {
         match self {
@@ -407,89 +429,72 @@ fn copy_fresh_arr(w: &InlineArray, _hint_zero: &InlineArray) -> InlineArray {
 // Per-layer weights
 // ============================================================================
 
-struct LayerWeights {
-    is_linear: bool,
+pub(crate) struct LayerWeights {
+    pub(crate) is_linear: bool,
 
     // Shared: layer norms (never quantized — 1D tensors)
-    input_ln_w: InlineArray,
-    input_ln_eps: f32,
-    post_ln_w: InlineArray,
-    post_ln_eps: f32,
+    pub(crate) input_ln_w: InlineArray,
+    pub(crate) input_ln_eps: f32,
+    pub(crate) post_ln_w: InlineArray,
+    pub(crate) post_ln_eps: f32,
 
     // Dense MLP (when !is_moe_layer)
-    // LayerWeight handles both dense [in, out] and quantized [out, in/g] + scales + biases.
-    mlp_gate_w: Option<LayerWeight>,
-    mlp_up_w: Option<LayerWeight>,
-    mlp_down_w: Option<LayerWeight>,
+    pub(crate) mlp_gate_w: Option<LayerWeight>,
+    pub(crate) mlp_up_w: Option<LayerWeight>,
+    pub(crate) mlp_down_w: Option<LayerWeight>,
 
     // MoE (when is_moe_layer)
-    // router is never quantized (small [num_experts, hidden] matrix).
-    // Expert stacked tensors: [E, in, out] dense or quantized.
-    moe_router_w: Option<InlineArray>,    // [hidden, num_experts] (pre-transposed, never quant)
-    moe_gate_w: Option<LayerWeight>,      // [E, hidden, moe_intermediate] — ready for gather_mm/qmm
-    moe_up_w: Option<LayerWeight>,        // [E, hidden, moe_intermediate]
-    moe_down_w: Option<LayerWeight>,      // [E, moe_intermediate, hidden]
-    shared_gate_w: Option<LayerWeight>,   // [hidden, shared_intermediate]
-    shared_up_w: Option<LayerWeight>,     // [hidden, shared_intermediate]
-    shared_down_w: Option<LayerWeight>,   // [shared_intermediate, hidden]
-    // shared_expert_gate is a tiny [hidden, 1] Linear — never quantized in practice.
-    shared_expert_gate_w: Option<InlineArray>,
+    pub(crate) moe_router_w: Option<InlineArray>,
+    pub(crate) moe_gate_w: Option<LayerWeight>,
+    pub(crate) moe_up_w: Option<LayerWeight>,
+    pub(crate) moe_down_w: Option<LayerWeight>,
+    pub(crate) shared_gate_w: Option<LayerWeight>,
+    pub(crate) shared_up_w: Option<LayerWeight>,
+    pub(crate) shared_down_w: Option<LayerWeight>,
+    pub(crate) shared_expert_gate_w: Option<InlineArray>,
 
-    // MoE config duplicated here to avoid borrowing config in the forward fn.
-    moe_top_k: i32,
-    moe_norm_topk_prob: bool,
-
-    // Whether this is an MoE layer (vs dense MLP).
-    is_moe_layer: bool,
+    pub(crate) moe_top_k: i32,
+    pub(crate) moe_norm_topk_prob: bool,
+    pub(crate) is_moe_layer: bool,
 
     // Attention-specific (only when !is_linear)
-    // q/k/v/o projections can be quantized.
-    attn_q_w: Option<LayerWeight>,
-    attn_k_w: Option<LayerWeight>,
-    attn_v_w: Option<LayerWeight>,
-    attn_o_w: Option<LayerWeight>,
-    // Q/K norms: 1D, never quantized.
-    attn_q_norm_w: Option<InlineArray>,
-    attn_q_norm_eps: f32,
-    attn_k_norm_w: Option<InlineArray>,
-    attn_k_norm_eps: f32,
-    attn_n_heads: i32,
-    attn_n_kv_heads: i32,
-    attn_head_dim: i32,
-    attn_scale: f32,
-    attn_rope_dims: i32,
-    attn_rope_base: f32,
-    attn_rope_scale: f32,
-    /// When `true`, the attention layer uses the Qwen3.5 gated output:
-    ///   output = o_proj(attn_out * sigmoid(gate))
-    /// When `false`, the Qwen3 standard path is used:
-    ///   output = o_proj(attn_out)
-    attn_gated: bool,
+    pub(crate) attn_q_w: Option<LayerWeight>,
+    pub(crate) attn_k_w: Option<LayerWeight>,
+    pub(crate) attn_v_w: Option<LayerWeight>,
+    pub(crate) attn_o_w: Option<LayerWeight>,
+    pub(crate) attn_q_norm_w: Option<InlineArray>,
+    pub(crate) attn_q_norm_eps: f32,
+    pub(crate) attn_k_norm_w: Option<InlineArray>,
+    pub(crate) attn_k_norm_eps: f32,
+    pub(crate) attn_n_heads: i32,
+    pub(crate) attn_n_kv_heads: i32,
+    pub(crate) attn_head_dim: i32,
+    pub(crate) attn_scale: f32,
+    pub(crate) attn_rope_dims: i32,
+    pub(crate) attn_rope_base: f32,
+    pub(crate) attn_rope_scale: f32,
+    pub(crate) attn_gated: bool,
 
     // GDN-specific (only when is_linear)
-    // in_proj and out_proj are large and can be quantized.
-    gdn_qkv_w: Option<LayerWeight>,  // in_proj_qkv
-    gdn_z_w: Option<LayerWeight>,    // in_proj_z
-    gdn_b_w: Option<LayerWeight>,    // in_proj_b
-    gdn_a_w: Option<LayerWeight>,    // in_proj_a
-    // conv1d weight is small and never quantized.
-    gdn_conv_w: Option<InlineArray>,
-    // Q/K norm weights: 1D, never quantized.
-    gdn_q_nw: Option<InlineArray>,
-    gdn_k_nw: Option<InlineArray>,
-    // a_log and dt_bias are GDN-specific scalars, never quantized.
-    gdn_a_log: Option<InlineArray>,
-    gdn_dt_bias: Option<InlineArray>,
-    gdn_norm_w: Option<InlineArray>,
-    gdn_norm_eps: f32,
-    gdn_out_w: Option<LayerWeight>,
-    gdn_nv: i32,
-    gdn_nk: i32,
-    gdn_dk: i32,
-    gdn_dv: i32,
-    gdn_kd: i32, // nk * dk  (total key dim)
-    gdn_cd: i32, // kd*2 + nv*dv  (conv projection dim)
-    gdn_ck: i32, // conv kernel size
+    pub(crate) gdn_qkv_w: Option<LayerWeight>,
+    pub(crate) gdn_z_w: Option<LayerWeight>,
+    pub(crate) gdn_b_w: Option<LayerWeight>,
+    pub(crate) gdn_a_w: Option<LayerWeight>,
+    pub(crate) gdn_conv_w: Option<InlineArray>,
+    pub(crate) gdn_q_nw: Option<InlineArray>,
+    pub(crate) gdn_k_nw: Option<InlineArray>,
+    pub(crate) gdn_a_log: Option<InlineArray>,
+    pub(crate) gdn_dt_bias: Option<InlineArray>,
+    pub(crate) gdn_norm_w: Option<InlineArray>,
+    pub(crate) gdn_norm_eps: f32,
+    pub(crate) gdn_out_w: Option<LayerWeight>,
+    pub(crate) gdn_nv: i32,
+    pub(crate) gdn_nk: i32,
+    pub(crate) gdn_dk: i32,
+    pub(crate) gdn_dv: i32,
+    pub(crate) gdn_kd: i32,
+    pub(crate) gdn_cd: i32,
+    pub(crate) gdn_ck: i32,
 }
 
 // ============================================================================
@@ -509,7 +514,7 @@ pub struct NativeWeights {
     pub tie_word_embeddings: bool,
     pub quantization_config: Option<QuantizationConfig>,
     /// Per-layer weights — opaque to callers; only accessed via [`forward_step`].
-    layers: Vec<LayerWeights>,
+    pub(crate) layers: Vec<LayerWeights>,
     /// Model activation dtype (e.g., 11 = bfloat16).
     pub model_dtype: i32,
 }
@@ -1439,6 +1444,99 @@ pub fn forward_step(
 }
 
 // ============================================================================
+// LoRA-aware forward step — training only
+// ============================================================================
+
+/// Forward pass with LoRA adapters applied at projection sites.
+///
+/// Identical to [`forward_step`] except each linear projection checks for a
+/// matching LoRA adapter in `lora.adapters` by key `"layers.{i}.{proj}"`.
+/// When no adapter exists for a projection, the call falls through to the
+/// base `matmul_from` with zero overhead.
+///
+/// GDN layers are always frozen (no LoRA) — only attention + dense MLP
+/// projections are adapted.
+///
+/// **The base `forward_step` function is completely untouched** — inference
+/// performance cannot regress.
+pub fn forward_step_lora(
+    weights: &NativeWeights,
+    token_ids: &InlineArray,
+    cache: &mut NativeCache,
+    lora: &crate::qwen3_train::Qwen3LoraWeights,
+) -> InlineArray {
+    let b = token_ids.dim(0);
+    let s = token_ids.dim(1);
+    let dtype = weights.model_dtype;
+
+    // Embedding lookup (no LoRA on embeddings)
+    let mut hidden = if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
+        let qcfg = weights.quantization_config.as_ref();
+        let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
+        let bits = qcfg.map(|q| q.bits).unwrap_or(4);
+        let w_rows = weights.embed_w.take_axis(token_ids, 0);
+        let s_rows = scales.take_axis(token_ids, 0);
+        let b_rows = biases.take_axis(token_ids, 0);
+        w_rows.dequantize(&s_rows, &b_rows, gs, bits)
+    } else {
+        weights.embed_w.take_axis(token_ids, 0)
+    };
+
+    let mut gdn_slot = 0usize;
+    let mut attn_slot = 0usize;
+
+    for (layer_idx, lw) in weights.layers.iter().enumerate() {
+        let normed = hidden.rms_norm(Some(&lw.input_ln_w), lw.input_ln_eps);
+
+        let r = if lw.is_linear {
+            // GDN layers: frozen, no LoRA
+            let result = gdn_forward(lw, &normed, b, s, &mut cache.gdn_caches[gdn_slot], dtype);
+            gdn_slot += 1;
+            result
+        } else {
+            // Attention: apply LoRA adapters at q/k/v/o projections
+            let result = attn_forward_lora(
+                lw, &normed, b, s,
+                &mut cache.kv_caches[attn_slot],
+                cache.rope_offset, dtype,
+                layer_idx, &lora.adapters,
+            );
+            attn_slot += 1;
+            result
+        };
+
+        let h = hidden.add(&r);
+
+        let mlp_in = h.rms_norm(Some(&lw.post_ln_w), lw.post_ln_eps);
+        let mlp_out = if lw.is_moe_layer {
+            // MoE: routed experts frozen, shared expert gets LoRA
+            moe_forward_lora(lw, &mlp_in, layer_idx, &lora.adapters)
+        } else {
+            // Dense MLP: apply LoRA at gate/up/down
+            dense_mlp_forward_lora(lw, &mlp_in, layer_idx, &lora.adapters)
+        };
+
+        hidden = h.add(&mlp_out);
+    }
+
+    cache.rope_offset += s;
+
+    let hidden = hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps);
+    if weights.tie_word_embeddings {
+        if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
+            let qcfg = weights.quantization_config.as_ref();
+            let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
+            let bits = qcfg.map(|q| q.bits).unwrap_or(4);
+            hidden.quantized_matmul(&weights.embed_w, scales, Some(biases), true, gs, bits)
+        } else {
+            hidden.matmul(&weights.embed_w.t())
+        }
+    } else {
+        hidden.matmul(weights.lm_head_w.as_ref().unwrap())
+    }
+}
+
+// ============================================================================
 // Dense MLP forward
 // ============================================================================
 
@@ -1448,6 +1546,22 @@ fn dense_mlp_forward(lw: &LayerWeights, mlp_in: &InlineArray) -> InlineArray {
     let up   = lw.mlp_up_w.as_ref().unwrap().matmul_from(mlp_in);
     let activated = InlineArray::fused_swiglu(&gate, &up);
     lw.mlp_down_w.as_ref().unwrap().matmul_from(&activated)
+}
+
+#[inline(always)]
+fn dense_mlp_forward_lora(
+    lw: &LayerWeights,
+    mlp_in: &InlineArray,
+    layer_idx: usize,
+    adapters: &std::collections::HashMap<String, crate::qwen3_train::LoraAdapter>,
+) -> InlineArray {
+    let gate = lw.mlp_gate_w.as_ref().unwrap().matmul_from_lora(
+        mlp_in, adapters.get(&format!("layers.{layer_idx}.gate_proj")));
+    let up = lw.mlp_up_w.as_ref().unwrap().matmul_from_lora(
+        mlp_in, adapters.get(&format!("layers.{layer_idx}.up_proj")));
+    let activated = InlineArray::fused_swiglu(&gate, &up);
+    lw.mlp_down_w.as_ref().unwrap().matmul_from_lora(
+        &activated, adapters.get(&format!("layers.{layer_idx}.down_proj")))
 }
 
 // ============================================================================
@@ -1762,6 +1876,166 @@ fn attn_forward(
         // Qwen3 standard output: o_proj(attn_out)
         o_proj.matmul_from(&output)
     }
+}
+
+// ============================================================================
+// LoRA-aware attention forward
+// ============================================================================
+
+fn attn_forward_lora(
+    lw: &LayerWeights,
+    normed: &InlineArray,
+    b: i32, s: i32,
+    cache: &mut KvLayerCache,
+    rope_offset: i32,
+    dtype: i32,
+    layer_idx: usize,
+    adapters: &std::collections::HashMap<String, crate::qwen3_train::LoraAdapter>,
+) -> InlineArray {
+    let n_heads    = lw.attn_n_heads;
+    let n_kv_heads = lw.attn_n_kv_heads;
+    let head_dim   = lw.attn_head_dim;
+    let scale      = lw.attn_scale;
+
+    // Q projection with LoRA
+    let q_proj_out = lw.attn_q_w.as_ref().unwrap().matmul_from_lora(
+        normed, adapters.get(&format!("layers.{layer_idx}.q_proj")));
+
+    let (queries, gate_opt) = if lw.attn_gated {
+        let q_gate = q_proj_out.reshape(&[b, s, n_heads, head_dim * 2]);
+        let mut qg_parts = q_gate.split(&[head_dim], -1);
+        let gate    = qg_parts.pop().unwrap().reshape(&[b, s, n_heads * head_dim]);
+        let queries = qg_parts.pop().unwrap();
+        (queries, Some(gate))
+    } else {
+        let queries = q_proj_out.reshape(&[b, s, n_heads, head_dim]);
+        (queries, None)
+    };
+
+    // K, V projections with LoRA
+    let new_keys = lw.attn_k_w.as_ref().unwrap().matmul_from_lora(
+        normed, adapters.get(&format!("layers.{layer_idx}.k_proj")));
+    let new_values = lw.attn_v_w.as_ref().unwrap().matmul_from_lora(
+        normed, adapters.get(&format!("layers.{layer_idx}.v_proj")));
+
+    // Q/K norms
+    let queries = queries.rms_norm(lw.attn_q_norm_w.as_ref(), lw.attn_q_norm_eps);
+    let keys    = new_keys.reshape(&[b, s, n_kv_heads, head_dim])
+        .rms_norm(lw.attn_k_norm_w.as_ref(), lw.attn_k_norm_eps);
+    let values  = new_values.reshape(&[b, s, n_kv_heads, head_dim]);
+
+    // Transpose to [B, H, S, D]
+    let queries = queries.transpose_axes(&[0, 2, 1, 3]);
+    let keys    = keys.transpose_axes(&[0, 2, 1, 3]);
+    let values  = values.transpose_axes(&[0, 2, 1, 3]);
+
+    // RoPE
+    let queries = queries.rope(lw.attn_rope_dims, false, lw.attn_rope_base, lw.attn_rope_scale, rope_offset);
+    let keys = keys.rope(lw.attn_rope_dims, false, lw.attn_rope_base, lw.attn_rope_scale, rope_offset);
+
+    // KV cache (same as base attn_forward)
+    let prev = cache.offset;
+    let num_new = keys.dim(2);
+    let next = prev + num_new;
+
+    if cache.keys.is_none() {
+        let alloc = 256i32;
+        cache.keys   = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
+        cache.values = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
+    } else {
+        let allocated = cache.keys.as_ref().unwrap().dim(2);
+        if next > allocated {
+            let old_k = cache.keys.take().unwrap();
+            let old_v = cache.values.take().unwrap();
+            let ext_k = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
+            let ext_v = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
+            cache.keys   = Some(old_k.kv_cache_append(&ext_k, 2));
+            cache.values = Some(old_v.kv_cache_append(&ext_v, 2));
+        }
+    }
+
+    let output = if let Some(ref mut tq_cache) = cache.turboquant {
+        tq_cache.append(&keys, &values).ok();
+        let full_keys = tq_cache.dequantize_keys().unwrap_or_else(|| keys.clone());
+        let full_values = tq_cache.dequantize_values().unwrap_or_else(|| values.clone());
+        cache.offset = next;
+        queries.sdpa(&full_keys, &full_values, scale, "causal")
+    } else {
+        let start = [0, 0, prev, 0];
+        let stop  = [b, n_kv_heads, next, head_dim];
+        let k_buf = cache.keys.take().unwrap();
+        let v_buf = cache.values.take().unwrap();
+        cache.keys   = Some(k_buf.slice_set(&keys, &start, &stop));
+        cache.values = Some(v_buf.slice_set(&values, &start, &stop));
+        cache.offset = next;
+        let valid_keys = cache.keys.as_ref().unwrap()
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+        let valid_values = cache.values.as_ref().unwrap()
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+        queries.sdpa(&valid_keys, &valid_values, scale, "causal")
+    };
+
+    // Output projection with LoRA
+    let output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[b, s, n_heads * head_dim]);
+    let o_proj = lw.attn_o_w.as_ref().unwrap();
+    let o_adapter = adapters.get(&format!("layers.{layer_idx}.o_proj"));
+    if let Some(gate) = gate_opt {
+        let gated = output.multiply(&gate.sigmoid());
+        o_proj.matmul_from_lora(&gated, o_adapter)
+    } else {
+        o_proj.matmul_from_lora(&output, o_adapter)
+    }
+}
+
+// ============================================================================
+// LoRA-aware MoE forward (LoRA on shared expert only)
+// ============================================================================
+
+fn moe_forward_lora(
+    lw: &LayerWeights,
+    x: &InlineArray,
+    layer_idx: usize,
+    adapters: &std::collections::HashMap<String, crate::qwen3_train::LoraAdapter>,
+) -> InlineArray {
+    // Routed experts: frozen (no LoRA — too many experts, too few tokens)
+    // Same as base moe_forward for the routed path
+    let b = x.dim(0);
+    let t = x.dim(1);
+    let h = x.dim(2);
+    let s = b * t;
+    let top_k = lw.moe_top_k;
+
+    let x_flat = x.reshape(&[s, h]);
+    let gates = x_flat.matmul(lw.moe_router_w.as_ref().unwrap()).softmax_precise(-1);
+    let all_inds = gates.argpartition(-top_k, -1);
+    let ne = gates.dim(1);
+    let inds = all_inds.slice(&[0, ne - top_k], &[s, ne]);
+    let mut scores = gates.take_along_axis(&inds, -1);
+    if lw.moe_norm_topk_prob {
+        let score_sum = scores.sum_axis(-1, true);
+        scores = scores.divide(&score_sum);
+    }
+
+    let x_gate_exp = lw.moe_gate_w.as_ref().unwrap().gather_mm_from(&x_flat, None, Some(&inds), false);
+    let x_up_exp   = lw.moe_up_w.as_ref().unwrap().gather_mm_from(&x_flat, None, Some(&inds), false);
+    let x_act = InlineArray::fused_swiglu(&x_gate_exp, &x_up_exp);
+    let y_exp = lw.moe_down_w.as_ref().unwrap().gather_mm_from(&x_act, None, Some(&inds), false);
+    let scores_exp = scores.reshape(&[s, top_k, 1]);
+    let y_routed = y_exp.multiply(&scores_exp).sum_axis(-2, false);
+
+    // Shared expert: LoRA-adapted
+    let sh_gate = lw.shared_gate_w.as_ref().unwrap().matmul_from_lora(
+        &x_flat, adapters.get(&format!("layers.{layer_idx}.gate_proj")));
+    let sh_up = lw.shared_up_w.as_ref().unwrap().matmul_from_lora(
+        &x_flat, adapters.get(&format!("layers.{layer_idx}.up_proj")));
+    let sh_act = InlineArray::fused_swiglu(&sh_gate, &sh_up);
+    let sh_out = lw.shared_down_w.as_ref().unwrap().matmul_from_lora(
+        &sh_act, adapters.get(&format!("layers.{layer_idx}.down_proj")));
+
+    let sh_scale = x_flat.matmul(lw.shared_expert_gate_w.as_ref().unwrap()).sigmoid();
+    let y_shared = sh_out.multiply(&sh_scale);
+
+    y_routed.add(&y_shared).reshape(&[b, t, h])
 }
 
 // ============================================================================
