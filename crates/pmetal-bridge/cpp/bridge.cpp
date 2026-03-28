@@ -7,7 +7,9 @@
 #include <typeinfo>
 #include <cstring>
 #include <cstdlib>
+#include <numeric>
 #include <unordered_set>
+#include <numeric>
 #include <sys/sysctl.h>
 
 using mlx::core::array;
@@ -1839,6 +1841,312 @@ void mlx_inline_qwen35_decode_step(
     fprintf(stderr, "[C++ EXCEPTION] qwen35_decode_step: %s\n", e.what());
     new (dst_logits->buf) array(0.0f);  // safe fallback
   }
+}
+
+// ── Training ops: random ─────────────────────────────────────────────────────
+
+void mlx_inline_random_normal(mlx_inline_array* dst, const int* shape, int ndim, int dtype) {
+    new (dst->buf) array(mlx::core::random::normal(
+        {shape, shape + ndim}, dtype_from_int(dtype)));
+}
+
+void mlx_inline_random_uniform(mlx_inline_array* dst, const int* shape, int ndim, int dtype) {
+    new (dst->buf) array(mlx::core::random::uniform(
+        {shape, shape + ndim}, dtype_from_int(dtype)));
+}
+
+void mlx_inline_random_bernoulli(mlx_inline_array* dst, const mlx_inline_array* p, const int* shape, int ndim) {
+    new (dst->buf) array(mlx::core::random::bernoulli(
+        as_arr(p), {shape, shape + ndim}));
+}
+
+void mlx_inline_random_seed(uint64_t seed) {
+    mlx::core::random::seed(seed);
+}
+
+void mlx_inline_random_randint(mlx_inline_array* dst, int low, int high, const int* shape, int ndim, int dtype) {
+    new (dst->buf) array(mlx::core::random::randint(
+        low, high, {shape, shape + ndim}, dtype_from_int(dtype)));
+}
+
+// ── Training ops: math ───────────────────────────────────────────────────────
+
+void mlx_inline_mean_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims) {
+    new (dst->buf) array(mlx::core::mean(as_arr(a), axis, keepdims));
+}
+
+void mlx_inline_mean_all(mlx_inline_array* dst, const mlx_inline_array* a) {
+    new (dst->buf) array(mlx::core::mean(as_arr(a)));
+}
+
+void mlx_inline_var_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims) {
+    new (dst->buf) array(mlx::core::var(as_arr(a), axis, keepdims));
+}
+
+void mlx_inline_pow(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
+    new (dst->buf) array(mlx::core::power(as_arr(a), as_arr(b)));
+}
+
+void mlx_inline_reciprocal(mlx_inline_array* dst, const mlx_inline_array* a) {
+    new (dst->buf) array(mlx::core::reciprocal(as_arr(a)));
+}
+
+void mlx_inline_sin(mlx_inline_array* dst, const mlx_inline_array* a) {
+    new (dst->buf) array(mlx::core::sin(as_arr(a)));
+}
+
+void mlx_inline_cos(mlx_inline_array* dst, const mlx_inline_array* a) {
+    new (dst->buf) array(mlx::core::cos(as_arr(a)));
+}
+
+void mlx_inline_clip(mlx_inline_array* dst, const mlx_inline_array* a,
+                     const mlx_inline_array* lo, const mlx_inline_array* hi) {
+    auto low_opt  = lo ? std::optional<array>(as_arr(lo)) : std::nullopt;
+    auto high_opt = hi ? std::optional<array>(as_arr(hi)) : std::nullopt;
+    new (dst->buf) array(mlx::core::clip(as_arr(a), low_opt, high_opt));
+}
+
+void mlx_inline_log_softmax(mlx_inline_array* dst, const mlx_inline_array* a, int axis) {
+    // log_softmax(x) = x - logsumexp(x, axis, keepdims=true)
+    const auto& x = as_arr(a);
+    auto lse = mlx::core::logsumexp(x, axis, true);
+    new (dst->buf) array(mlx::core::subtract(x, lse));
+}
+
+void mlx_inline_cross_entropy(mlx_inline_array* dst, const mlx_inline_array* logits,
+                               const mlx_inline_array* targets, int axis) {
+    // cross_entropy = -sum(targets * log_softmax(logits), axis=axis)
+    const auto& l = as_arr(logits);
+    auto lse      = mlx::core::logsumexp(l, axis, true);
+    auto log_probs = mlx::core::subtract(l, lse);
+    new (dst->buf) array(mlx::core::negative(
+        mlx::core::sum(mlx::core::multiply(as_arr(targets), log_probs), axis, false)));
+}
+
+void mlx_inline_square(mlx_inline_array* dst, const mlx_inline_array* a) {
+    new (dst->buf) array(mlx::core::square(as_arr(a)));
+}
+
+// ── Training ops: creation ───────────────────────────────────────────────────
+
+void mlx_inline_full(mlx_inline_array* dst, const int* shape, int ndim, float val, int dtype) {
+    new (dst->buf) array(mlx::core::full(
+        {shape, shape + ndim}, val, dtype_from_int(dtype)));
+}
+
+void mlx_inline_eye(mlx_inline_array* dst, int n, int dtype) {
+    // eye(n, m=n, k=0, dtype)
+    new (dst->buf) array(mlx::core::eye(n, n, 0, dtype_from_int(dtype)));
+}
+
+void mlx_inline_tri(mlx_inline_array* dst, int n, int m, int k, int dtype) {
+    new (dst->buf) array(mlx::core::tri(n, m, k, dtype_from_int(dtype)));
+}
+
+// ── Training ops: shape ──────────────────────────────────────────────────────
+
+void mlx_inline_broadcast_to(mlx_inline_array* dst, const mlx_inline_array* a,
+                              const int* shape, int ndim) {
+    new (dst->buf) array(mlx::core::broadcast_to(
+        as_arr(a), {shape, shape + ndim}));
+}
+
+void mlx_inline_flatten(mlx_inline_array* dst, const mlx_inline_array* a,
+                        int start_axis, int end_axis) {
+    new (dst->buf) array(mlx::core::flatten(as_arr(a), start_axis, end_axis));
+}
+
+// ── Training ops: sort/reduction ─────────────────────────────────────────────
+
+void mlx_inline_argsort(mlx_inline_array* dst, const mlx_inline_array* a, int axis) {
+    new (dst->buf) array(mlx::core::argsort(as_arr(a), axis));
+}
+
+void mlx_inline_sum_all(mlx_inline_array* dst, const mlx_inline_array* a) {
+    new (dst->buf) array(mlx::core::sum(as_arr(a)));
+}
+
+void mlx_inline_max_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims) {
+    new (dst->buf) array(mlx::core::max(as_arr(a), axis, keepdims));
+}
+
+void mlx_inline_min_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims) {
+    new (dst->buf) array(mlx::core::min(as_arr(a), axis, keepdims));
+}
+
+void mlx_inline_minimum(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
+    new (dst->buf) array(mlx::core::minimum(as_arr(a), as_arr(b)));
+}
+
+// ── Training ops: activation ─────────────────────────────────────────────────
+
+void mlx_inline_relu(mlx_inline_array* dst, const mlx_inline_array* a) {
+    new (dst->buf) array(mlx::core::maximum(as_arr(a), array(0.0f)));
+}
+
+void mlx_inline_gelu(mlx_inline_array* dst, const mlx_inline_array* a) {
+    // GELU fast approx: x * sigmoid(1.702 * x)
+    const auto& x = as_arr(a);
+    new (dst->buf) array(mlx::core::multiply(
+        x, mlx::core::sigmoid(mlx::core::multiply(array(1.702f), x))));
+}
+
+// ── Training ops: comparison ─────────────────────────────────────────────────
+
+void mlx_inline_equal(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
+    new (dst->buf) array(mlx::core::equal(as_arr(a), as_arr(b)));
+}
+
+void mlx_inline_not_equal(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
+    new (dst->buf) array(mlx::core::not_equal(as_arr(a), as_arr(b)));
+}
+
+void mlx_inline_greater(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
+    new (dst->buf) array(mlx::core::greater(as_arr(a), as_arr(b)));
+}
+
+void mlx_inline_less(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
+    new (dst->buf) array(mlx::core::less(as_arr(a), as_arr(b)));
+}
+
+void mlx_inline_greater_equal(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
+    new (dst->buf) array(mlx::core::greater_equal(as_arr(a), as_arr(b)));
+}
+
+void mlx_inline_less_equal(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
+    new (dst->buf) array(mlx::core::less_equal(as_arr(a), as_arr(b)));
+}
+
+// ── Training ops: serialization ──────────────────────────────────────────────
+
+void mlx_inline_save_safetensors(const char* path, const char** keys,
+                                  const mlx_inline_array* arrays, int count) {
+    std::unordered_map<std::string, array> map;
+    map.reserve(count);
+    for (int i = 0; i < count; i++) {
+        map.emplace(std::string(keys[i]), as_arr(&arrays[i]));
+    }
+    mlx::core::save_safetensors(std::string(path), std::move(map));
+}
+
+// ── Training ops: quantize ───────────────────────────────────────────────────
+
+void mlx_inline_quantize(mlx_inline_array* dst_w, mlx_inline_array* dst_scales,
+                          mlx_inline_array* dst_biases,
+                          const mlx_inline_array* a, int group_size, int bits) {
+    auto result = mlx::core::quantize(as_arr(a), group_size, bits);
+    new (dst_w->buf)      array(std::move(result[0]));
+    new (dst_scales->buf) array(std::move(result[1]));
+    new (dst_biases->buf) array(std::move(result[2]));
+}
+
+// ── Training ops: multi-axis sum/mean ────────────────────────────────────────
+
+void mlx_inline_sum_axes(mlx_inline_array* dst, const mlx_inline_array* a,
+                          const int* axes, int num_axes, bool keepdims) {
+    new (dst->buf) array(mlx::core::sum(
+        as_arr(a), {axes, axes + num_axes}, keepdims));
+}
+
+void mlx_inline_mean_axes(mlx_inline_array* dst, const mlx_inline_array* a,
+                           const int* axes, int num_axes, bool keepdims) {
+    new (dst->buf) array(mlx::core::mean(
+        as_arr(a), {axes, axes + num_axes}, keepdims));
+}
+
+// ── Training ops: misc ───────────────────────────────────────────────────────
+
+size_t mlx_inline_size(const mlx_inline_array* a) {
+    return as_arr(a).size();
+}
+
+size_t mlx_inline_nbytes(const mlx_inline_array* a) {
+    return as_arr(a).nbytes();
+}
+
+int mlx_inline_data_ptr(const mlx_inline_array* a, const void** out_ptr) {
+    *out_ptr = as_arr(a).data<void>();
+    return 0;
+}
+
+void mlx_inline_stop_gradient(mlx_inline_array* dst, const mlx_inline_array* a) {
+    new (dst->buf) array(mlx::core::stop_gradient(as_arr(a)));
+}
+
+// ── Autograd: value_and_grad ─────────────────────────────────────────────────
+//
+// Callback-based autograd bridge. The Rust caller provides a function pointer
+// that builds the MLX computation graph through InlineArray ops (the forward
+// pass). MLX traces this graph and differentiates it w.r.t. the first
+// n_params inputs.
+//
+// forward_fn signature (called from C++):
+//   - all_arrays[0..n_params-1]   — parameters being differentiated
+//   - all_arrays[n_params..n_total-1] — additional non-differentiated inputs
+//   - loss_out                    — write the scalar loss here
+//
+// Returns: loss → loss_out, gradients → grads_out[0..n_params-1]
+// (mlx_rust_forward_fn typedef is declared in bridge.h)
+
+void mlx_inline_value_and_grad(
+    mlx_rust_forward_fn forward_fn,
+    void* ctx,
+    const mlx_inline_array* const* all_arrays,
+    int n_params,
+    int n_total,
+    mlx_inline_array* loss_out,
+    mlx_inline_array** grads_out
+) {
+    // Snapshot input arrays (they will be moved into the lambda capture).
+    std::vector<array> inputs;
+    inputs.reserve(n_total);
+    for (int i = 0; i < n_total; i++) {
+        inputs.push_back(as_arr(all_arrays[i]));
+    }
+
+    // C++ closure that calls back into Rust to build the forward graph.
+    // The lambda takes a std::vector<array> (MLX convention) and returns one.
+    auto cpp_forward = [&](std::vector<array> args) -> std::vector<array> {
+        // Wrap each array in a temporary InlineArray so Rust can read them.
+        std::vector<mlx_inline_array> bufs(args.size());
+        std::vector<const mlx_inline_array*> ptrs(args.size());
+        for (size_t i = 0; i < args.size(); i++) {
+            new (bufs[i].buf) array(args[i]);
+            ptrs[i] = &bufs[i];
+        }
+
+        mlx_inline_array loss_buf;
+        mlx_inline_init_empty(&loss_buf);
+        forward_fn(ptrs.data(), (int)ptrs.size(), &loss_buf, ctx);
+
+        array result = as_arr(&loss_buf);
+
+        // Destroy temporaries (arrays, not loss_buf which we've already copied).
+        for (auto& b : bufs) {
+            as_arr(&b).~array();
+        }
+        as_arr(&loss_buf).~array();
+
+        return {result};
+    };
+
+    // argnums: differentiate w.r.t. the first n_params inputs.
+    std::vector<int> argnums(n_params);
+    std::iota(argnums.begin(), argnums.end(), 0);
+
+    // mlx::core::value_and_grad returns a function that produces
+    // pair<vector<array>, vector<array>> = (values, grads).
+    auto vg_fn = mlx::core::value_and_grad(
+        std::function<std::vector<array>(std::vector<array>)>(cpp_forward),
+        argnums);
+    auto result = vg_fn(inputs);
+    auto& values = result.first;
+    auto& grads = result.second;
+
+    new (loss_out->buf) array(values[0]);
+    for (int i = 0; i < n_params; i++) {
+        new (grads_out[i]->buf) array(grads[i]);
+    }
 }
 
 } // extern "C" (qwen35 full forward)

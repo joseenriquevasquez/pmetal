@@ -525,6 +525,93 @@ size_t mlx_inline_get_cache_memory(void);    // Bytes freed but held in buffer c
 size_t mlx_inline_get_peak_memory(void);     // High-water mark of active memory
 void   mlx_inline_reset_peak_memory(void);   // Reset peak tracking
 
+// ── Training ops: random ──
+void mlx_inline_random_normal(mlx_inline_array* dst, const int* shape, int ndim, int dtype);
+void mlx_inline_random_uniform(mlx_inline_array* dst, const int* shape, int ndim, int dtype);
+void mlx_inline_random_bernoulli(mlx_inline_array* dst, const mlx_inline_array* p, const int* shape, int ndim);
+void mlx_inline_random_seed(uint64_t seed);
+void mlx_inline_random_randint(mlx_inline_array* dst, int low, int high, const int* shape, int ndim, int dtype);
+
+// ── Training ops: math ──
+void mlx_inline_mean_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims);
+void mlx_inline_mean_all(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_var_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims);
+void mlx_inline_pow(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b);
+void mlx_inline_reciprocal(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_sin(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_cos(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_clip(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* lo, const mlx_inline_array* hi);
+void mlx_inline_log_softmax(mlx_inline_array* dst, const mlx_inline_array* a, int axis);
+void mlx_inline_cross_entropy(mlx_inline_array* dst, const mlx_inline_array* logits, const mlx_inline_array* targets, int axis);
+void mlx_inline_square(mlx_inline_array* dst, const mlx_inline_array* a);
+
+// ── Training ops: creation ──
+void mlx_inline_full(mlx_inline_array* dst, const int* shape, int ndim, float val, int dtype);
+void mlx_inline_eye(mlx_inline_array* dst, int n, int dtype);
+void mlx_inline_tri(mlx_inline_array* dst, int n, int m, int k, int dtype);
+
+// ── Training ops: shape ──
+void mlx_inline_broadcast_to(mlx_inline_array* dst, const mlx_inline_array* a, const int* shape, int ndim);
+void mlx_inline_flatten(mlx_inline_array* dst, const mlx_inline_array* a, int start_axis, int end_axis);
+
+// ── Training ops: sort/reduction ──
+void mlx_inline_argsort(mlx_inline_array* dst, const mlx_inline_array* a, int axis);
+void mlx_inline_sum_all(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_max_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims);
+void mlx_inline_min_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims);
+void mlx_inline_minimum(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b);
+
+// ── Training ops: activation ──
+void mlx_inline_relu(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_gelu(mlx_inline_array* dst, const mlx_inline_array* a);
+
+// ── Training ops: comparison ──
+void mlx_inline_equal(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b);
+void mlx_inline_not_equal(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b);
+void mlx_inline_greater(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b);
+void mlx_inline_less(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b);
+void mlx_inline_greater_equal(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b);
+void mlx_inline_less_equal(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b);
+
+// ── Training ops: serialization ──
+void mlx_inline_save_safetensors(const char* path, const char** keys, const mlx_inline_array* arrays, int count);
+
+// ── Training ops: quantize ──
+void mlx_inline_quantize(mlx_inline_array* dst_w, mlx_inline_array* dst_scales, mlx_inline_array* dst_biases,
+    const mlx_inline_array* a, int group_size, int bits);
+
+// ── Training ops: multi-axis sum/mean ──
+void mlx_inline_sum_axes(mlx_inline_array* dst, const mlx_inline_array* a, const int* axes, int num_axes, bool keepdims);
+void mlx_inline_mean_axes(mlx_inline_array* dst, const mlx_inline_array* a, const int* axes, int num_axes, bool keepdims);
+
+// ── Training ops: misc ──
+size_t mlx_inline_size(const mlx_inline_array* a);
+size_t mlx_inline_nbytes(const mlx_inline_array* a);
+int mlx_inline_data_ptr(const mlx_inline_array* a, const void** out_ptr);
+void mlx_inline_stop_gradient(mlx_inline_array* dst, const mlx_inline_array* a);
+
+// ── Autograd: value_and_grad ──
+// Callback type for Rust forward function
+typedef void (*mlx_rust_forward_fn)(
+    const mlx_inline_array* const* all_arrays,
+    int n_total,
+    mlx_inline_array* loss_out,
+    void* ctx
+);
+
+// Compute loss + gradients via callback-based autograd.
+// forward_fn is called ONCE with traced arrays to build the computation graph.
+// Gradients are computed w.r.t. the first n_params arrays.
+void mlx_inline_value_and_grad(
+    mlx_rust_forward_fn forward_fn,
+    void* ctx,
+    const mlx_inline_array* const* all_arrays,
+    int n_params,
+    int n_total,
+    mlx_inline_array* loss_out,
+    mlx_inline_array** grads_out
+);
+
 #ifdef __cplusplus
 }
 #endif
