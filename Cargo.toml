@@ -2,6 +2,7 @@
 resolver = "2"
 exclude = ["fuzz", "crates/pmetal-gui/src-tauri"]
 members = [
+    "crates/pmetal-bridge",
     "crates/pmetal-core",
     "crates/pmetal-metal",
     "crates/pmetal-mlx",
@@ -33,6 +34,7 @@ categories = ["science", "algorithms"]
 
 [workspace.dependencies]
 # Internal crates
+pmetal-bridge = { path = "crates/pmetal-bridge", version = "0.4.0" }
 pmetal-core = { path = "crates/pmetal-core", version = "0.4.0", default-features = false }
 pmetal-metal = { path = "crates/pmetal-metal", version = "0.4.0", default-features = false }
 pmetal-mlx = { path = "crates/pmetal-mlx", version = "0.4.0" }
@@ -51,8 +53,8 @@ pmetal-serve = { path = "crates/pmetal-serve", version = "0.4.0" }
 pmetal-mcp = { path = "crates/pmetal-mcp", version = "0.4.0" }
 
 # MLX bindings - pmetal-maintained fork (unblocks crates.io publishing)
-mlx-rs = { version = "0.25.8", package = "pmetal-mlx-rs", features = ["safetensors"] }
-mlx-sys = { version = "=0.2.4", package = "pmetal-mlx-sys" }
+mlx-rs = { path = "../reference/mlx-rs/mlx-rs", package = "pmetal-mlx-rs", features = ["safetensors"] }
+mlx-sys = { path = "../reference/mlx-rs/mlx-sys", package = "pmetal-mlx-sys" }
 
 # Async runtime
 tokio = { version = "1.50", features = ["full"] }
