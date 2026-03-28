@@ -13,3 +13,6 @@ pub mod inline_array;
 pub use inline_array::InlineArray;
 
 pub mod qwen3_native;
+pub mod deepseek_native;
+pub mod gpt_oss_native;
+pub mod llama4_native;
