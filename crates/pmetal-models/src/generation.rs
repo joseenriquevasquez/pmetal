@@ -1694,10 +1694,11 @@ where
     };
 
     let (mut current_y, mut current_logprobs) = {
-        let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
-            let _stream_ctx = StreamContext::new(&generation_stream);
-            forward_fn(chunk_input, cache)
-        })?;
+        let logits =
+            run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+                let _stream_ctx = StreamContext::new(&generation_stream);
+                forward_fn(chunk_input, cache)
+            })?;
         let current_logits = extract_logits(&logits);
         sampler.sample_array(&current_logits)?
     };
@@ -1813,14 +1814,20 @@ where
     };
 
     let (mut current_y, mut current_logprobs) = {
-        let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
-            let _stream_ctx = StreamContext::new(&generation_stream);
-            forward_fn(chunk_input, cache)
-        })?;
+        let logits =
+            run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+                let _stream_ctx = StreamContext::new(&generation_stream);
+                forward_fn(chunk_input, cache)
+            })?;
         let current_logits = extract_logits(&logits);
         sampler.sample_array(&current_logits)?
     };
     async_eval([&current_y, &current_logprobs])?;
+
+    // Enable MLX compilation for the decode loop — fuses ops to reduce GPU kernel count.
+    mlx_rs::inline_array::enable_compile();
+
+
 
     let mut n = 0;
 
@@ -1835,6 +1842,10 @@ where
                 let next_logits = next_output.index((.., 0, ..));
                 sampler.sample_array(&next_logits)?
             };
+            if n > 0 && n <= 3 {
+                let nodes = mlx_rs::inline_array::graph_node_count(&y);
+                eprintln!("[gen {n}] graph nodes: {nodes}");
+            }
             async_eval([&y, &lp])?;
             Some((y, lp))
         } else {
@@ -2261,10 +2272,11 @@ where
     let sampler = Sampler::new(config.clone());
 
     let mut current_y = {
-        let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
-            let _stream_ctx = StreamContext::new(&generation_stream);
-            forward_fn(chunk_input, cache)
-        })?;
+        let logits =
+            run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+                let _stream_ctx = StreamContext::new(&generation_stream);
+                forward_fn(chunk_input, cache)
+            })?;
         let last_idx = logits.dim(1) - 1;
         let current_logits = logits
             .index((.., last_idx..last_idx + 1, ..))

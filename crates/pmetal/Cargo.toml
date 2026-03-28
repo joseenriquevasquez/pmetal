@@ -27,7 +27,9 @@ mhc = ["dep:pmetal-mhc", "core", "metal"]
 
 # MLX-dependent crates
 mlx = ["dep:pmetal-mlx", "dep:mlx-rs", "core", "metal"]
-models = ["dep:pmetal-models", "core", "gguf", "metal", "mlx"]
+models = ["dep:pmetal-models", "dep:pmetal-bridge", "core", "gguf", "metal", "mlx"]
+# Native-only: uses pmetal-bridge exclusively, NO mlx-rs/mlx-sys (single libmlx.a)
+native-only = ["dep:pmetal-bridge", "core", "metal"]
 lora = ["dep:pmetal-lora", "core", "gguf", "metal", "mlx", "models"]
 # Opt-in: enables fused Metal kernels for ~2x LoRA training speedup (requires Float16 inputs)
 lora-metal-fused = ["lora", "pmetal-lora/metal-fused"]
@@ -77,6 +79,7 @@ pmetal-distributed = { workspace = true, optional = true }
 pmetal-mhc = { workspace = true, optional = true }
 pmetal-mlx = { workspace = true, optional = true }
 pmetal-models = { workspace = true, optional = true }
+pmetal-bridge = { workspace = true, optional = true }
 pmetal-lora = { workspace = true, optional = true }
 pmetal-data = { workspace = true, optional = true }
 pmetal-trainer = { workspace = true, optional = true }

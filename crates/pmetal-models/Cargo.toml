@@ -10,6 +10,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+pmetal-bridge = { path = "../pmetal-bridge" }
 pmetal-core = { workspace = true }
 pmetal-gguf = { workspace = true }
 pmetal-metal = { workspace = true }
