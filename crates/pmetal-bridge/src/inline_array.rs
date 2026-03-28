@@ -295,6 +295,35 @@ unsafe extern "C" {
         state_in: *const RawBuf, t: i32,
     );
 
+    // ── TurboQuant fused Metal kernels ──
+    //
+    // Encode: nearest-centroid search; eliminates the [N,D,C] intermediate.
+    // input: [N,D] f32 (normalised+rotated).  codebook: [C] f32 (C <= 16).
+    // out_indices: [N,D] uint32.  out_norms: reserved (pass null ptr).
+    // Returns 0 on success, 1 if Metal unavailable.
+    fn mlx_inline_turboquant_encode(
+        out_indices: *mut RawBuf,
+        out_norms:   *mut RawBuf,   // reserved — pass std::ptr::null_mut()
+        input:       *const RawBuf,
+        codebook:    *const RawBuf,
+        dim:         u32,
+        n_centroids: u32,
+        n_rows:      u32,
+    ) -> i32;
+
+    // Decode: codebook lookup → [N,D] f32 centroid values (un-scaled).
+    // indices: [N,D] uint32.  norms: reserved (pass null ptr).  codebook: [C] f32.
+    // Returns 0 on success, 1 if Metal unavailable.
+    fn mlx_inline_turboquant_decode(
+        out:         *mut RawBuf,
+        indices:     *const RawBuf,
+        norms:       *const RawBuf,  // reserved — pass std::ptr::null_mut()
+        codebook:    *const RawBuf,
+        dim:         u32,
+        n_centroids: u32,
+        n_rows:      u32,
+    ) -> i32;
+
     // ── Fused compiled ops (match Python's @mx.compile) ──
     fn mlx_inline_fused_swiglu(dst: *mut RawBuf, gate: *const RawBuf, up: *const RawBuf);
     fn mlx_inline_fused_silu(dst: *mut RawBuf, x: *const RawBuf);
@@ -1238,6 +1267,85 @@ impl InlineArray {
                 &state.raw, t,
             );
             (Self { raw: dst_y.assume_init() }, Self { raw: dst_state.assume_init() })
+        }
+    }
+
+    // ── TurboQuant fused Metal kernels ──────────────────────────────────
+
+    /// Fused TurboQuant encode: nearest-centroid search over a tiny codebook.
+    ///
+    /// Replaces the expand_dims+subtract+square+argmin chain that allocates a
+    /// huge `[N, D, C]` intermediate tensor.  For D=128, C=8 (3-bit MSE), N=100
+    /// the old intermediate is 409 600 f32 elements per call; this kernel uses
+    /// only registers (n_centroids ≤ 16).
+    ///
+    /// - `input`: `[N, D]` f32 — already normalised onto the unit sphere AND
+    ///   rotated by the orthogonal projection matrix.
+    /// - `codebook`: `[C]` f32, C ≤ 16.
+    /// - Returns `indices [N, D]` uint32 on success, `None` if Metal unavailable.
+    ///
+    /// Norm computation (`keys.norm_l2(-1, true)`) and the rotation matmul are
+    /// handled by the caller before calling this function.
+    pub fn turboquant_encode(
+        input: &Self,
+        codebook: &Self,
+        dim: u32,
+        n_centroids: u32,
+        n_rows: u32,
+    ) -> Option<Self> {
+        let mut out_indices = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_encode(
+                out_indices.as_mut_ptr(),
+                std::ptr::null_mut(),   // norms: reserved
+                &input.raw,
+                &codebook.raw,
+                dim,
+                n_centroids,
+                n_rows,
+            )
+        };
+        if rc == 0 {
+            Some(Self { raw: unsafe { out_indices.assume_init() } })
+        } else {
+            None
+        }
+    }
+
+    /// Fused TurboQuant decode: codebook lookup producing `[N, D]` f32 centroid
+    /// values in the rotated domain.
+    ///
+    /// Replaces: `take(codebook, flat_indices, 0).reshape(orig_shape)`.
+    /// The result is **un-scaled** (no norm multiplication) and in the *rotated*
+    /// domain.  The caller multiplies by norms and matmuls with the rotation
+    /// matrix to recover the original input-space vectors.
+    ///
+    /// - `indices`: `[N, D]` uint32.
+    /// - `codebook`: `[C]` f32, C ≤ 16.
+    /// - Returns `output [N, D]` f32 on success, `None` if Metal unavailable.
+    pub fn turboquant_decode(
+        indices: &Self,
+        codebook: &Self,
+        dim: u32,
+        n_centroids: u32,
+        n_rows: u32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_decode(
+                out.as_mut_ptr(),
+                &indices.raw,
+                std::ptr::null_mut(),   // norms: reserved
+                &codebook.raw,
+                dim,
+                n_centroids,
+                n_rows,
+            )
+        };
+        if rc == 0 {
+            Some(Self { raw: unsafe { out.assume_init() } })
+        } else {
+            None
         }
     }
 

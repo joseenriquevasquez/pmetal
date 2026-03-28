@@ -438,6 +438,56 @@ void mlx_inline_qwen35_decode_step(
     int                            num_config_floats
 );
 
+// ── TurboQuant fused Metal kernels ──────────────────────────────────────────
+//
+// These replace the expand_dims+subtract+square+argmin chain (which allocates
+// a [N, D, C] intermediate tensor) with single-dispatch Metal kernels that
+// keep everything in thread registers.
+//
+// Pipeline split:
+//   The Rust caller handles norm computation (keys.norm_l2) and rotation
+//   (keys.matmul(rot_t)) — both are standard MLX ops with no intermediates.
+//   These kernels handle ONLY the innermost bottleneck:
+//
+// turboquant_encode:
+//   input [N, D] f32  — already normalised + rotated
+//   codebook [C] f32  — sorted Lloyd-Max centroids (C = 2^bits, max 16)
+//   → indices [N, D] uint32 — nearest centroid index per coordinate
+//   (out_norms is reserved for ABI symmetry but not written by the kernel)
+//
+// turboquant_decode:
+//   indices [N, D] uint32   — centroid indices
+//   norms [N] f32           — reserved for ABI symmetry (not read by kernel)
+//   codebook [C] f32        — same centroids used at encode time
+//   → output [N, D] f32     — centroid values in the rotated domain
+//   (caller multiply-by-norms and matmul-with-rotation happen outside)
+//
+// Both return 0 on success, 1 if Metal kernel is unavailable.
+
+// Fused encode: nearest-centroid search over a small codebook.
+// input: [N, D] f32 (normalised+rotated).  codebook: [C] f32 (C <= 16).
+// out_indices: [N, D] uint32.  out_norms: reserved (may be NULL).
+int mlx_inline_turboquant_encode(
+    mlx_inline_array*       out_indices,   // [N, D] uint32  (written)
+    mlx_inline_array*       out_norms,     // reserved — may be NULL
+    const mlx_inline_array* input,         // [N, D] f32
+    const mlx_inline_array* codebook,      // [C]    f32
+    uint32_t                dim,
+    uint32_t                n_centroids,
+    uint32_t                n_rows);
+
+// Fused decode: codebook lookup → [N, D] f32 centroid values.
+// indices: [N, D] uint32.  norms: reserved (may be NULL).  codebook: [C] f32.
+// out: [N, D] f32 centroid values in the rotated domain (un-scaled by norm).
+int mlx_inline_turboquant_decode(
+    mlx_inline_array*       out,           // [N, D] f32      (written)
+    const mlx_inline_array* indices,       // [N, D] uint32
+    const mlx_inline_array* norms,         // reserved — may be NULL
+    const mlx_inline_array* codebook,      // [C]    f32
+    uint32_t                dim,
+    uint32_t                n_centroids,
+    uint32_t                n_rows);
+
 // Load a single array from a safetensors file by key name.
 // Returns 0 on success, 1 on error (key not found, file not found, etc.)
 int mlx_inline_load_safetensors_key(mlx_inline_array* dst, const char* path, const char* key);

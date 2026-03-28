@@ -703,7 +703,59 @@ static const char* GDN_METAL_SOURCE = R"(
     }
 )";
 
-// Cached Metal kernel function (created once, reused)
+// ── TurboQuant fused Metal kernel sources ───────────────────────────────────
+//
+// ENCODE: for each (row, dim) pair, find the nearest centroid in the codebook.
+// The input is already normalised onto the unit sphere AND rotated.
+// Input dtype is f32 (post-normalise + matmul path ensures f32).
+//
+// Grid: (D, N)  — x = dim index, y = row index.
+// Threadgroup: (min(D,256), 1).
+//
+// n_centroids is a kernel constant (≤16), so the inner comparison loop is
+// fully unrolled by the Metal compiler.  For 4-bit (C=16) that is 15 fma ops
+// per thread — fits in registers with zero threadgroup memory.
+//
+// This replaces the ops chain:
+//   expand_dims(rotated, -1) → subtract(codebook) → square → argmin
+// which allocates a [N, D, C] intermediate (409 KB for typical inference step).
+static const char* TURBOQUANT_ENCODE_SOURCE = R"(
+    uint row = thread_position_in_grid.y;
+    uint d   = thread_position_in_grid.x;
+    if (d >= dim || row >= n_rows) return;
+
+    float x = input[row * dim + d];
+
+    // Nearest-centroid search over the tiny codebook (n_centroids <= 16).
+    // Fully register-resident — no shared memory needed.
+    float best_dist = (x - codebook[0]) * (x - codebook[0]);
+    uint  best_idx  = 0u;
+    for (uint c = 1u; c < n_centroids; ++c) {
+        float dist = (x - codebook[c]) * (x - codebook[c]);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_idx  = c;
+        }
+    }
+
+    indices[row * dim + d] = best_idx;
+)";
+
+// DECODE: for each (row, dim) pair, look up the centroid.
+// Grid: (D, N), threadgroup: (min(D,256), 1).
+// Output is f32 in the rotated domain.  The caller is responsible for the
+// subsequent matmul(rotation) to get back to the original input space.
+// Norm rescaling is done OUTSIDE the kernel (by the matmul + multiply in Rust)
+// to keep the kernel minimal and avoid a dependency on the norms shape layout.
+static const char* TURBOQUANT_DECODE_SOURCE = R"(
+    uint row = thread_position_in_grid.y;
+    uint d   = thread_position_in_grid.x;
+    if (d >= dim || row >= n_rows) return;
+
+    output[row * dim + d] = codebook[indices[row * dim + d]];
+)";
+
+// Cached Metal kernel functions (created once per process)
 static mlx::core::fast::CustomKernelFunction& get_gdn_kernel() {
     static auto kernel = mlx::core::fast::metal_kernel(
         "gated_delta_step",
@@ -715,6 +767,118 @@ static mlx::core::fast::CustomKernelFunction& get_gdn_kernel() {
         false  // atomic_outputs
     );
     return kernel;
+}
+
+// ── TurboQuant kernel getters ────────────────────────────────────────────────
+
+static mlx::core::fast::CustomKernelFunction& get_turboquant_encode_kernel() {
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "turboquant_encode",
+        {"input", "codebook"},
+        {"indices"},
+        TURBOQUANT_ENCODE_SOURCE,
+        "",    // no header
+        true,  // ensure_row_contiguous
+        false  // atomic_outputs
+    );
+    return kernel;
+}
+
+static mlx::core::fast::CustomKernelFunction& get_turboquant_decode_kernel() {
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "turboquant_decode",
+        {"indices", "codebook"},
+        {"output"},
+        TURBOQUANT_DECODE_SOURCE,
+        "",    // no header
+        true,  // ensure_row_contiguous
+        false  // atomic_outputs
+    );
+    return kernel;
+}
+
+// ── TurboQuant C bridge functions ───────────────────────────────────────────
+//
+// encode: input is already normalised+rotated f32 [N, D].
+//         codebook is f32 [C], C <= 16.
+//         Output: indices [N, D] uint32.
+//
+// decode: indices [N, D] uint32.  codebook [C] f32.
+//         Output: centroid values [N, D] f32 (in rotated domain, un-scaled).
+//         The caller multiplies by the original L2 norms.
+
+int mlx_inline_turboquant_encode(
+    mlx_inline_array*       out_indices,
+    mlx_inline_array*       /*out_norms — unused, kept for ABI symmetry*/,
+    const mlx_inline_array* input,
+    const mlx_inline_array* codebook,
+    uint32_t                dim,
+    uint32_t                n_centroids,
+    uint32_t                n_rows)
+{
+    using namespace mlx::core;
+
+    if (n_centroids > 16 || dim == 0 || n_rows == 0) return 1;
+
+    const array& inp = as_arr(input);
+    const array& cb  = as_arr(codebook);
+
+    // Input must be f32 (normalised+rotated via matmul produces f32).
+    // Codebook is always f32.
+    try {
+        auto& kernel = get_turboquant_encode_kernel();
+        auto outputs = kernel(
+            {inp, cb},
+            {{(int)n_rows, (int)dim}},   // output shape: [N, D]
+            {uint32},                     // output dtype: uint32
+            {(int)dim, (int)n_rows, 1},  // grid (x=D, y=N, z=1)
+            {(int)std::min(dim, 256u), 1, 1},
+            {{"dim",         (int)dim},
+             {"n_centroids", (int)n_centroids},
+             {"n_rows",      (int)n_rows}},
+            std::nullopt, false, {}
+        );
+        new (out_indices->buf) array(outputs[0]);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+int mlx_inline_turboquant_decode(
+    mlx_inline_array*       out,
+    const mlx_inline_array* indices,
+    const mlx_inline_array* /*norms — unused, kept for ABI symmetry*/,
+    const mlx_inline_array* codebook,
+    uint32_t                dim,
+    uint32_t                n_centroids,
+    uint32_t                n_rows)
+{
+    using namespace mlx::core;
+
+    if (n_centroids > 16 || dim == 0 || n_rows == 0) return 1;
+
+    const array& idx = as_arr(indices);
+    const array& cb  = as_arr(codebook);
+
+    try {
+        auto& kernel = get_turboquant_decode_kernel();
+        auto outputs = kernel(
+            {idx, cb},
+            {{(int)n_rows, (int)dim}},
+            {float32},
+            {(int)dim, (int)n_rows, 1},
+            {(int)std::min(dim, 256u), 1, 1},
+            {{"dim",         (int)dim},
+             {"n_centroids", (int)n_centroids},
+             {"n_rows",      (int)n_rows}},
+            std::nullopt, false, {}
+        );
+        new (out->buf) array(outputs[0]);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
 }
 
 int mlx_inline_gdn_update(

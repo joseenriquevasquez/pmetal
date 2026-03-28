@@ -309,36 +309,91 @@ impl TurboQuantCore {
         self.codebook_arrs.get(usize::from(bits))?.as_ref()
     }
 
-    /// GPU-native nearest-centroid quantisation.
+    /// GPU-native nearest-centroid quantisation via fused Metal kernel.
     ///
-    /// `rotated`: [N, D] f32 InlineArray of already-rotated (and normalised) vectors.
-    /// Returns a uint32 InlineArray of shape [N, D] holding the codebook index per coordinate.
+    /// `rotated`: `[N, D]` f32 — already normalised and rotated.
+    /// Returns `[N, D]` uint32 indices on success.
     ///
-    /// Algorithm: expand rotated → [N, D, 1], subtract codebook [C] → [N, D, C],
-    /// take squared diff, argmin along axis=-1 → [N, D].
+    /// The fused kernel eliminates the `[N, D, C]` intermediate tensor that
+    /// the old expand_dims+subtract+square+argmin chain allocated.  Falls back
+    /// to the ops-based path if Metal is unavailable or n_centroids > 16.
     fn gpu_quantize_mse(&self, rotated: &InlineArray, bits: u8) -> Option<InlineArray> {
         let cb_arr = self.codebook_arr(bits)?;
-        // rotated: [..., D]  →  expanded: [..., D, 1]
+        let shape = rotated.shape();
+        let ndim = shape.len();
+        // Compute flat N = product of all dimensions except last.
+        let n_rows: i32 = shape[..ndim - 1].iter().product();
+        let dim = shape[ndim - 1] as u32;
+        let n_centroids = cb_arr.shape()[0] as u32;
+
+        // Reshape to [N, D] for the kernel (kernel expects exactly 2-D input).
+        // The caller may pass higher-rank tensors like [B, H, S, D].
+        let flat = if ndim == 2 {
+            // Already [N, D] — no copy.
+            None
+        } else {
+            Some(rotated.reshape(&[n_rows, dim as i32]))
+        };
+        let input_2d = flat.as_ref().unwrap_or(rotated);
+
+        if let Some(indices_2d) = InlineArray::turboquant_encode(
+            input_2d, cb_arr, dim, n_centroids, n_rows as u32,
+        ) {
+            // Reshape back to original leading dims + D.
+            if ndim == 2 {
+                return Some(indices_2d);
+            }
+            let mut out_shape: Vec<i32> = shape[..ndim - 1].iter().map(|&x| x as i32).collect();
+            out_shape.push(dim as i32);
+            return Some(indices_2d.reshape(&out_shape));
+        }
+
+        // Ops fallback — original expand_dims+argmin path.
+        let cb_arr = self.codebook_arr(bits)?;
         let expanded = rotated.expand_dims(-1);
-        // broadcast subtract: [..., D, C]
         let diffs = expanded.subtract(cb_arr);
-        // squared distances (cheaper than abs for MSE nearest-centroid)
         let sq = diffs.multiply(&diffs);
-        // argmin over codebook dimension → [..., D] uint32
         Some(sq.argmin(-1))
     }
 
-    /// GPU-native codebook reconstruction.
+    /// GPU-native codebook reconstruction via fused Metal kernel.
     ///
-    /// `indices`: [..., D] uint32.  Returns [..., D] f32 of gathered centroid values.
+    /// `indices`: `[..., D]` uint32.  Returns `[..., D]` f32 of centroid values.
+    ///
+    /// The fused kernel eliminates the flatten→take→reshape round-trip.
+    /// Falls back to the ops-based take_axis path if Metal is unavailable.
     fn gpu_reconstruct_mse(&self, indices: &InlineArray, bits: u8) -> Option<InlineArray> {
         let cb_arr = self.codebook_arr(bits)?;
-        // take(codebook [C], indices [..., D], axis=0) → [..., D] f32
-        // Flatten indices to 1-D, gather, reshape back.
-        let orig_shape = indices.shape().to_vec();
+        let shape = indices.shape();
+        let ndim = shape.len();
+        let n_rows: i32 = shape[..ndim - 1].iter().product();
+        let dim = shape[ndim - 1] as u32;
+        let n_centroids = cb_arr.shape()[0] as u32;
+
+        let flat = if ndim == 2 {
+            None
+        } else {
+            Some(indices.reshape(&[n_rows, dim as i32]))
+        };
+        let indices_2d = flat.as_ref().unwrap_or(indices);
+
+        if let Some(recon_2d) = InlineArray::turboquant_decode(
+            indices_2d, cb_arr, dim, n_centroids, n_rows as u32,
+        ) {
+            if ndim == 2 {
+                return Some(recon_2d);
+            }
+            let mut out_shape: Vec<i32> = shape[..ndim - 1].iter().map(|&x| x as i32).collect();
+            out_shape.push(dim as i32);
+            return Some(recon_2d.reshape(&out_shape));
+        }
+
+        // Ops fallback — original take_axis+reshape path.
+        let cb_arr = self.codebook_arr(bits)?;
+        let orig_shape: Vec<i32> = shape.iter().map(|&x| x as i32).collect();
         let n: i32 = orig_shape.iter().product();
-        let flat = indices.reshape(&[n]);
-        let gathered = cb_arr.take_axis(&flat, 0);
+        let flat_idx = indices.reshape(&[n]);
+        let gathered = cb_arr.take_axis(&flat_idx, 0);
         Some(gathered.reshape(&orig_shape))
     }
 
