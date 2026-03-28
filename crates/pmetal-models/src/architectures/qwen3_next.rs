@@ -40,7 +40,7 @@ use pmetal_mlx::{
         AttentionMaskType, FusedAttentionConfig,
         fused_moe::moe_combine_mlx,
         fused_sdpa,
-        gated_delta::gated_delta_update,
+        gated_delta::{self, gated_delta_update},
         metal_swiglu::fused_swiglu_forward,
         rope::{RopeScaling, apply_rope},
     },
@@ -459,6 +459,48 @@ pub struct Qwen3NextRMSNormGated {
     pub eps: f32,
 }
 
+/// Compiled _precise_swiglu: `(silu(gate.f32()) * norm_out.f32()).as(dtype)`.
+///
+/// Matches mlx-lm's `@partial(mx.compile, shapeless=True) def _precise_swiglu(h, gate, x)`.
+/// Fuses 6 element-wise ops (2 casts, sigmoid, 2 multiplies, cast) into 1 Metal dispatch.
+fn compiled_precise_swiglu(
+    norm_out: &Array,
+    gate: &Array,
+    out_dtype: mlx_rs::Dtype,
+) -> Result<Array, Exception> {
+    use std::sync::OnceLock;
+    static COMPILED: OnceLock<Option<mlx_rs::compile::Closure>> = OnceLock::new();
+    let compiled = COMPILED.get_or_init(|| {
+        let closure = mlx_rs::compile::Closure::new(|inputs: &[Array]| {
+            let norm_out = &inputs[0];
+            let gate = &inputs[1];
+            let gate_f32 = nn::silu(&gate.as_type::<f32>()?)?;
+            let norm_f32 = norm_out.as_type::<f32>()?;
+            let result = gate_f32.multiply(&norm_f32)?;
+            // Cast back to original dtype
+            Ok(vec![result.as_dtype(norm_out.dtype())?])
+        });
+        mlx_rs::compile::compile(&closure, true).ok()
+    });
+
+    if let Some(compiled_fn) = compiled {
+        // Pass norm_out first so its dtype can be recovered inside the closure
+        let outputs = compiled_fn.apply(&[norm_out, gate])?;
+        let result = outputs.into_iter().next().unwrap();
+        // The compiled closure casts to norm_out.dtype(), but we need out_dtype
+        if result.dtype() != out_dtype {
+            result.as_dtype(out_dtype)
+        } else {
+            Ok(result)
+        }
+    } else {
+        // Fallback: uncompiled
+        let gate_f32 = nn::silu(&gate.as_type::<f32>()?)?;
+        let norm_f32 = norm_out.as_type::<f32>()?;
+        gate_f32.multiply(&norm_f32)?.as_dtype(out_dtype)
+    }
+}
+
 impl Qwen3NextRMSNormGated {
     pub fn new(hidden_size: i32, eps: f32) -> Result<Self, Exception> {
         let weight = Array::ones::<f32>(&[hidden_size])?;
@@ -471,7 +513,10 @@ impl Qwen3NextRMSNormGated {
     pub fn forward(&self, x: &Array, gate: Option<&Array>) -> Result<Array, Exception> {
         let normed = mlx_rs::fast::rms_norm(x, self.weight.as_ref(), self.eps)?;
         if let Some(g) = gate {
-            normed.multiply(&nn::silu(g)?)
+            // Compiled _precise_swiglu: matches mlx-lm's @mx.compile(shapeless=True).
+            // Fuses silu(gate.f32()) * norm.f32() → cast_back into 1 Metal dispatch
+            // instead of 6 separate dispatches (2 casts + silu(2 ops) + mul + cast).
+            compiled_precise_swiglu(&normed, g, x.dtype())
         } else {
             Ok(normed)
         }
@@ -610,6 +655,7 @@ impl Qwen3NextAttention {
         let b = shape[0];
         let l = shape[1];
         let cache_active = cache.is_some();
+        let mut cache = cache;
 
         // Project Q (with gate) and K, V
         let q_proj_out = self.q_proj.forward(x)?;
@@ -656,17 +702,37 @@ impl Qwen3NextAttention {
             offset,
         )?;
 
+        // Fused SDPA with GQA
+        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
+            .with_scale(self.scale)
+            .with_mask_type(Self::mask_type_for_call(mask, cache_active, l));
+
+        if mask.is_none() {
+            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
+                if let Some(output) = (*cache_ref).try_turboquant_attention(
+                    *layer_idx,
+                    &queries,
+                    &keys,
+                    &values,
+                    &attn_config,
+                )? {
+                    let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                        b,
+                        l,
+                        self.n_heads * self.head_dim,
+                    ])?;
+                    let gated = output.multiply(&nn::sigmoid(&gate)?)?;
+                    return self.o_proj.forward(&gated);
+                }
+            }
+        }
+
         // Update KV cache
         let (keys, values) = if let Some((cache, layer_idx)) = cache {
             cache.update_and_fetch(layer_idx, &keys, &values)?
         } else {
             (keys, values)
         };
-
-        // Fused SDPA with GQA
-        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
-            .with_scale(self.scale)
-            .with_mask_type(Self::mask_type_for_call(mask, cache_active, l));
 
         let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
         let output =
@@ -690,6 +756,7 @@ impl Qwen3NextAttention {
         let b = shape[0];
         let l = shape[1];
         let cache_active = cache.is_some();
+        let mut cache = cache;
 
         let prep_start = Instant::now();
         let q_proj_out = self.q_proj.forward(x)?;
@@ -733,6 +800,38 @@ impl Qwen3NextAttention {
             self.rope_scale,
             offset,
         )?;
+        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
+            .with_scale(self.scale)
+            .with_mask_type(Self::mask_type_for_call(mask, cache_active, l));
+        if mask.is_none() {
+            let turbo_attn_start = Instant::now();
+            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
+                if let Some(output) = (*cache_ref).try_turboquant_attention(
+                    *layer_idx,
+                    &queries,
+                    &keys,
+                    &values,
+                    &attn_config,
+                )? {
+                    queries.eval()?;
+                    output.eval()?;
+                    layer_profile.push_section("attn_rope_cache", rope_cache_start);
+                    layer_profile.push_section("attn_sdpa", turbo_attn_start);
+
+                    let out_start = Instant::now();
+                    let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                        b,
+                        l,
+                        self.n_heads * self.head_dim,
+                    ])?;
+                    let gated = output.multiply(&nn::sigmoid(&gate)?)?;
+                    let projected = self.o_proj.forward(&gated)?;
+                    projected.eval()?;
+                    layer_profile.push_section("attn_out_proj", out_start);
+                    return Ok(projected);
+                }
+            }
+        }
         let (keys, values) = if let Some((cache, layer_idx)) = cache {
             cache.update_and_fetch(layer_idx, &keys, &values)?
         } else {
@@ -744,9 +843,6 @@ impl Qwen3NextAttention {
         layer_profile.push_section("attn_rope_cache", rope_cache_start);
 
         let sdpa_start = Instant::now();
-        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
-            .with_scale(self.scale)
-            .with_mask_type(Self::mask_type_for_call(mask, cache_active, l));
         let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
         output.eval()?;
         layer_profile.push_section("attn_sdpa", sdpa_start);
@@ -813,6 +909,40 @@ pub struct Qwen3NextGatedDeltaNet {
     pub conv_kernel_size: i32,
     pub combined_in_proj_weight: Option<Array>,
     pub combined_in_proj_signature: Option<Vec<usize>>,
+    /// Cached qkvz combined weight (qkv + z concatenated, matching Python's in_proj_qkvz)
+    pub combined_qkvz_weight: Option<Array>,
+    /// Cached ba combined weight (b + a concatenated, matching Python's in_proj_ba)
+    pub combined_ba_weight: Option<Array>,
+    /// Pre-computed rms_norm weight for Q normalization: ones * inv_scale²
+    pub q_norm_weight: Array,
+    /// Pre-computed rms_norm weight for K normalization: ones * inv_scale
+    pub k_norm_weight: Array,
+    /// Cached InlineArray weights for zero-alloc decode. Lazily initialized on first decode.
+    pub inline_weights: Option<GdnInlineWeights>,
+    /// Compiled decode closure (mx.compile). Lazily initialized on first decode.
+    pub compiled_decode: Option<mlx_rs::compile::Closure>,
+}
+
+/// Pre-cached InlineArray weights for the GDN decode hot path.
+/// All weights are pre-transposed and ready for matmul — zero allocation per token.
+pub struct GdnInlineWeights {
+    pub qkv_wt: mlx_rs::inline_array::InlineArray,   // in_proj_qkv.weight.T
+    pub z_wt: mlx_rs::inline_array::InlineArray,      // in_proj_z.weight.T
+    pub b_wt: mlx_rs::inline_array::InlineArray,      // in_proj_b.weight.T
+    pub a_wt: mlx_rs::inline_array::InlineArray,      // in_proj_a.weight.T
+    pub conv_w: mlx_rs::inline_array::InlineArray,     // conv1d weight
+    pub out_wt: mlx_rs::inline_array::InlineArray,     // out_proj.weight.T
+    pub q_norm_w: mlx_rs::inline_array::InlineArray,   // q normalization weight
+    pub k_norm_w: mlx_rs::inline_array::InlineArray,   // k normalization weight
+    pub a_log: mlx_rs::inline_array::InlineArray,      // decay log
+    pub dt_bias: mlx_rs::inline_array::InlineArray,    // dt bias
+    pub norm_w: mlx_rs::inline_array::InlineArray,     // gated norm weight
+}
+
+impl std::fmt::Debug for GdnInlineWeights {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GdnInlineWeights").finish_non_exhaustive()
+    }
 }
 
 impl Qwen3NextGatedDeltaNet {
@@ -884,7 +1014,42 @@ impl Qwen3NextGatedDeltaNet {
             conv_kernel_size,
             combined_in_proj_weight: None,
             combined_in_proj_signature: None,
+            combined_qkvz_weight: None,
+            combined_ba_weight: None,
+            q_norm_weight: {
+                let inv = (head_k_dim as f32).sqrt().recip();
+                Array::ones::<f32>(&[head_k_dim])?.multiply(&Array::from_f32(inv * inv))?
+            },
+            k_norm_weight: {
+                let inv = (head_k_dim as f32).sqrt().recip();
+                Array::ones::<f32>(&[head_k_dim])?.multiply(&Array::from_f32(inv))?
+            },
+            inline_weights: None,
+            compiled_decode: None,
         })
+    }
+
+    /// Lazily prepare InlineArray weights for zero-alloc decode.
+    fn ensure_inline_weights(&mut self) {
+        if self.inline_weights.is_some() {
+            return;
+        }
+        use mlx_rs::inline_array::InlineArray;
+        // Pre-transpose weights via InlineArray.t() (no Result overhead)
+        let iw = GdnInlineWeights {
+            qkv_wt: InlineArray::from_array(self.in_proj_qkv.weight.as_ref()).t(),
+            z_wt: InlineArray::from_array(self.in_proj_z.weight.as_ref()).t(),
+            b_wt: InlineArray::from_array(self.in_proj_b.weight.as_ref()).t(),
+            a_wt: InlineArray::from_array(self.in_proj_a.weight.as_ref()).t(),
+            conv_w: InlineArray::from_array(self.conv1d.weight.as_ref()),
+            out_wt: InlineArray::from_array(self.out_proj.weight.as_ref()).t(),
+            q_norm_w: InlineArray::from_array(&self.q_norm_weight),
+            k_norm_w: InlineArray::from_array(&self.k_norm_weight),
+            a_log: InlineArray::from_array(self.a_log.as_ref()),
+            dt_bias: InlineArray::from_array(self.dt_bias.as_ref()),
+            norm_w: InlineArray::from_array(self.norm.weight.as_ref()),
+        };
+        self.inline_weights = Some(iw);
     }
 
     fn current_input_proj_signature(&self) -> Vec<usize> {
@@ -918,6 +1083,34 @@ impl Qwen3NextGatedDeltaNet {
         Ok(self.combined_in_proj_weight.as_ref().unwrap().clone())
     }
 
+    /// Cached qkvz weight = concat(qkv_w, z_w, axis=0).
+    /// Matches Python's `in_proj_qkvz` (key_dim*2 + value_dim*2 output dim).
+    pub fn ensure_combined_qkvz_weight(&mut self) -> Result<Array, Exception> {
+        if self.combined_qkvz_weight.is_none() {
+            let w = ops::concatenate_axis(
+                &[self.in_proj_qkv.weight.as_ref(), self.in_proj_z.weight.as_ref()],
+                0,
+            )?;
+            w.eval()?;
+            self.combined_qkvz_weight = Some(w);
+        }
+        Ok(self.combined_qkvz_weight.as_ref().unwrap().clone())
+    }
+
+    /// Cached ba weight = concat(b_w, a_w, axis=0).
+    /// Matches Python's `in_proj_ba` (num_v_heads*2 output dim).
+    pub fn ensure_combined_ba_weight(&mut self) -> Result<Array, Exception> {
+        if self.combined_ba_weight.is_none() {
+            let w = ops::concatenate_axis(
+                &[self.in_proj_b.weight.as_ref(), self.in_proj_a.weight.as_ref()],
+                0,
+            )?;
+            w.eval()?;
+            self.combined_ba_weight = Some(w);
+        }
+        Ok(self.combined_ba_weight.as_ref().unwrap().clone())
+    }
+
     fn combined_input_projection(
         &mut self,
         inputs: &Array,
@@ -938,21 +1131,31 @@ impl Qwen3NextGatedDeltaNet {
         let b_end = z_end + self.num_v_heads;
 
         let qkv = if s == 1 {
-            projected.index((.., ..qkv_end)).reshape(&[b, s, self.conv_dim])?
+            projected
+                .index((.., ..qkv_end))
+                .reshape(&[b, s, self.conv_dim])?
         } else {
             projected.index((.., .., ..qkv_end))
         };
         let z = if s == 1 {
-            projected
-                .index((.., qkv_end..z_end))
-                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?
+            projected.index((.., qkv_end..z_end)).reshape(&[
+                b,
+                s,
+                self.num_v_heads,
+                self.head_v_dim,
+            ])?
         } else {
-            projected
-                .index((.., .., qkv_end..z_end))
-                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?
+            projected.index((.., .., qkv_end..z_end)).reshape(&[
+                b,
+                s,
+                self.num_v_heads,
+                self.head_v_dim,
+            ])?
         };
         let b_val = if s == 1 {
-            projected.index((.., z_end..b_end)).reshape(&[b, s, self.num_v_heads])?
+            projected
+                .index((.., z_end..b_end))
+                .reshape(&[b, s, self.num_v_heads])?
         } else {
             projected.index((.., .., z_end..b_end))
         };
@@ -985,9 +1188,7 @@ impl Qwen3NextGatedDeltaNet {
     }
 
     fn should_use_flattened_decode_proj(&self, inputs: &Array, mask: Option<&Array>) -> bool {
-        mask.is_none()
-            && inputs.dim(1) == 1
-            && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
+        mask.is_none() && inputs.dim(1) == 1 && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
     }
 
     fn should_use_combined_input_proj(&self, inputs: &Array, mask: Option<&Array>) -> bool {
@@ -996,18 +1197,192 @@ impl Qwen3NextGatedDeltaNet {
             && self.hidden_size <= Self::COMBINED_INPUT_PROJ_MAX_HIDDEN
     }
 
+    /// Decode forward (T=1) — compiled via mx.compile for fused GPU evaluation.
+    ///
+    /// MLX traces the function on the first call and replays the cached trace on
+    /// subsequent calls. This fuses intermediate ops, dramatically reducing
+    /// Metal kernel dispatch count during eval (from ~30 kernels to ~5 per layer).
     fn forward_cached_decode(
         &mut self,
         inputs: &Array,
         cache: &mut MambaCacheEntry,
     ) -> Result<Array, Exception> {
-        let shape = inputs.shape();
-        let b = shape[0];
-        let s = shape[1];
-        let (qkv, z, b_val, a) = self.combined_input_projection(inputs)?;
-        let conv_input = cache.update_conv_state(&qkv, self.conv_kernel_size)?;
-        let conv_out = nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?;
-        self.finish_forward_from_conv_out(&conv_out, b, s, &z, &a, &b_val, None, Some(cache))
+        let b = inputs.dim(0);
+
+        // Extract cache state as explicit arrays for the pure compiled closure
+        let conv_state = cache.conv_state.as_ref().cloned().unwrap_or_else(|| {
+            ops::zeros_dtype(
+                &[b, self.conv_kernel_size - 1, self.conv_dim],
+                inputs.dtype(),
+            )
+            .unwrap()
+        });
+        let ssm_state = cache.ssm_state.take().unwrap_or_else(|| {
+            ops::zeros_dtype(
+                &[b, self.num_v_heads, self.head_v_dim, self.head_k_dim],
+                inputs.dtype(),
+            )
+            .unwrap()
+        });
+
+        // Direct decode: uses Metal GDN kernel (1 dispatch for recurrence) +
+        // individually dispatched ops for projections/conv/norm.
+        // No per-layer mx.compile — relies on MLX global compile for element-wise fusion.
+        // This matches Python's mlx-lm pattern (no @mx.compile on the layer forward).
+        let b_dim = inputs.dim(0);
+        let s = 1i32;
+
+        // 2 combined matmuls matching Python's in_proj_qkvz + in_proj_ba
+        let qkvz_w = self.ensure_combined_qkvz_weight()?;
+        let ba_w = self.ensure_combined_ba_weight()?;
+        let qkvz = ops::matmul(inputs, &qkvz_w.t())?;
+        let ba = ops::matmul(inputs, &ba_w.t())?;
+
+        // Split qkvz → qkv (conv_dim) + z (value_dim)
+        let qkv = qkvz.index((.., .., ..self.conv_dim));
+        let z = qkvz.index((.., .., self.conv_dim..)).reshape(&[b_dim, s, self.num_v_heads, self.head_v_dim])?;
+
+        // Split ba → b_val + a
+        let b_val = ba.index((.., .., ..self.num_v_heads));
+        let a = ba.index((.., .., self.num_v_heads..));
+
+        // Conv: concat old state + new, apply conv1d + silu
+        let conv_input_arr = ops::concatenate_axis(&[&conv_state, &qkv], 1)?;
+        let new_conv = conv_input_arr.index((.., (-(self.conv_kernel_size - 1)).., ..));
+        let conv_out = nn::silu(&self.conv1d.forward(&conv_input_arr)?)?;
+
+        // Split conv output → q, k, v
+        let parts = conv_out.split_axis(&[self.key_dim, self.key_dim * 2], -1)?;
+        let q = parts[0].reshape(&[b_dim, s, self.num_k_heads, self.head_k_dim])?;
+        let k = parts[1].reshape(&[b_dim, s, self.num_k_heads, self.head_k_dim])?;
+        let v = parts[2].reshape(&[b_dim, s, self.num_v_heads, self.head_v_dim])?;
+
+        // Q/K normalization (fused fast:: ops)
+        let q = mlx_rs::fast::rms_norm(&q, &self.q_norm_weight, 1e-6)?;
+        let k = mlx_rs::fast::rms_norm(&k, &self.k_norm_weight, 1e-6)?;
+
+        // GDN recurrence via Metal kernel (1 dispatch) or ops fallback
+        let (out, new_ssm) = gated_delta_update(
+            &q, &k, &v, &a, &b_val,
+            self.a_log.as_ref(), self.dt_bias.as_ref(),
+            Some(&ssm_state), None, false,
+        )?;
+
+        // Gated norm (f32 precision)
+        let out_n = self.norm.forward(&out, Some(&z))?;
+        let result = self.out_proj.forward(&out_n.reshape(&[b_dim, s, -1])?)?;
+        let outputs = vec![result, new_conv, new_ssm];
+
+        cache.conv_state = Some(outputs[1].clone());
+        cache.ssm_state = Some(outputs[2].clone());
+
+        Ok(outputs[0].clone())
+    }
+
+    /// Build the compiled GDN decode closure. Called once per layer.
+    fn ensure_compiled_decode(&mut self) {
+        if self.compiled_decode.is_some() {
+            return;
+        }
+
+        // Combine projection weights to match Python's 2-matmul layout:
+        //   in_proj_qkvz = concat(qkv_w, z_w, axis=0)  → [key_dim*2+value_dim*2, hidden]
+        //   in_proj_ba   = concat(b_w, a_w, axis=0)     → [num_v_heads*2, hidden]
+        // This reduces 4 matmuls to 2, saving 2 Metal dispatches per GDN layer.
+        let qkvz_w = ops::concatenate_axis(
+            &[self.in_proj_qkv.weight.as_ref(), self.in_proj_z.weight.as_ref()],
+            0,
+        ).unwrap();
+        qkvz_w.eval().unwrap();
+        let ba_w = ops::concatenate_axis(
+            &[self.in_proj_b.weight.as_ref(), self.in_proj_a.weight.as_ref()],
+            0,
+        ).unwrap();
+        ba_w.eval().unwrap();
+
+        let conv_w = self.conv1d.weight.as_ref().clone();
+        let out_w = self.out_proj.weight.as_ref().clone();
+        let q_nw = self.q_norm_weight.clone();
+        let k_nw = self.k_norm_weight.clone();
+        let a_log = self.a_log.as_ref().clone();
+        let dt_bias = self.dt_bias.as_ref().clone();
+        let norm_w = self.norm.weight.as_ref().clone();
+        let nv = self.num_v_heads;
+        let nk = self.num_k_heads;
+        let dk = self.head_k_dim;
+        let dv = self.head_v_dim;
+        let kd = self.key_dim;
+        let cd = self.conv_dim;
+        let ck = self.conv_kernel_size;
+
+        let closure = mlx_rs::compile::Closure::new(
+            move |inputs: &[Array]| -> Result<Vec<Array>, Exception> {
+                let x = &inputs[0];       // [B, 1, hidden]
+                let conv_st = &inputs[1];  // [B, kernel-1, conv_dim]
+                let ssm_st = &inputs[2];   // [B, Hv, Dv, Dk]
+                let b = x.dim(0);
+                let s = 1i32;
+
+                // 2 matmuls matching Python's in_proj_qkvz + in_proj_ba
+                let qkvz = ops::matmul(x, &qkvz_w.t())?; // [B, 1, key_dim*2+value_dim*2]
+                let ba = ops::matmul(x, &ba_w.t())?;       // [B, 1, num_v_heads*2]
+
+                // Split qkvz → qkv (conv_dim) + z (value_dim)
+                let qkv = qkvz.index((.., .., ..cd));
+                let z = qkvz.index((.., .., cd..)).reshape(&[b, s, nv, dv])?;
+
+                // Split ba → b_val + a (each num_v_heads)
+                let b_val = ba.index((.., .., ..nv));
+                let a = ba.index((.., .., nv..));
+
+                // Conv: concat old state + new input, extract new state, apply conv1d
+                let conv_in = ops::concatenate_axis(&[conv_st, &qkv], 1)?;
+                let new_conv = conv_in.index((.., (-(ck - 1)).., ..));
+                let conv_out = nn::silu(&ops::conv1d(&conv_in, &conv_w, None, None, None, Some(cd))?)?;
+
+                // Split + reshape
+                let parts = conv_out.split_axis(&[kd, kd * 2], -1)?;
+                let q = parts[0].reshape(&[b, s, nk, dk])?;
+                let k = parts[1].reshape(&[b, s, nk, dk])?;
+                let v = parts[2].reshape(&[b, s, nv, dv])?;
+
+                // Q/K normalization
+                let q = mlx_rs::fast::rms_norm(&q, &q_nw, 1e-6)?;
+                let k = mlx_rs::fast::rms_norm(&k, &k_nw, 1e-6)?;
+
+                // GDN recurrence — uses Metal kernel (1 dispatch) instead of ops (~15 nodes).
+                // compute_g inlined (not via separately-compiled closure) so the outer
+                // compile can fuse sigmoid/exp/softplus with surrounding element-wise ops.
+                let beta = nn::sigmoid(&b_val)?;
+                let g = gated_delta::compute_g_impl(&a_log, &a, &dt_bias)?;
+                // Metal kernel dispatch: tries fused Metal kernel first, falls back to ops
+                let (out, new_ssm) = gated_delta::gated_delta_inference_dispatch(
+                    &q, &k, &v, &g, &beta, ssm_st, None,
+                )?;
+
+                // Gated norm + out projection (f32 precision for gate multiply,
+                // matching mlx-lm _precise_swiglu)
+                let out_n = mlx_rs::fast::rms_norm(&out, &norm_w, 1e-6)?;
+                let gate_f32 = nn::silu(&z.as_type::<f32>()?)?;
+                let out_f32 = out_n.as_type::<f32>()?;
+                let gated = gate_f32.multiply(&out_f32)?.as_dtype(x.dtype())?;
+                let result = ops::matmul(&gated.reshape(&[b, s, -1])?, &out_w.t())?;
+
+                Ok(vec![result, new_conv, new_ssm])
+            },
+        );
+
+        // Compile the closure — MLX traces it and caches the fused graph
+        self.compiled_decode = Some(match mlx_rs::compile::compile(&closure, false) {
+            Ok(compiled) => {
+                eprintln!("[GDN] mx.compile OK");
+                compiled
+            }
+            Err(e) => {
+                eprintln!("[GDN] mx.compile FAILED: {e}, using uncompiled");
+                closure
+            }
+        });
     }
 
     fn forward_cached_decode_profiled(
@@ -1058,43 +1433,23 @@ impl Qwen3NextGatedDeltaNet {
         mask: Option<&Array>,
         cache: Option<&mut MambaCacheEntry>,
     ) -> Result<Array, Exception> {
-        // Split conv output — simple positional split on last dim (Python line 156-163)
-        // Split at [key_dim, 2*key_dim] into q, k, v
-        let q_conv = conv_out.index((.., .., ..self.key_dim));
-        let k_conv = conv_out.index((.., .., self.key_dim..self.key_dim * 2));
-        let v_conv = conv_out.index((.., .., self.key_dim * 2..));
+        // Split conv output into q, k, v using mx.split (1 op vs 3 index ops).
+        // Matches mlx-lm qwen3_5.py line 163: mx.split(conv_out, [...], -1)
+        let splits = conv_out.split_axis(&[self.key_dim, self.key_dim * 2], -1)?;
+        let (q_conv, k_conv, v_conv) = (&splits[0], &splits[1], &splits[2]);
 
-        // Take only the last S timesteps (conv adds padding)
-        let out_len = q_conv.dim(1);
-        let q_conv = q_conv.index((.., (out_len - seq_len).., ..)).reshape(&[
-            batch,
-            seq_len,
-            self.num_k_heads,
-            self.head_k_dim,
-        ])?;
-        let k_conv = k_conv.index((.., (out_len - seq_len).., ..)).reshape(&[
-            batch,
-            seq_len,
-            self.num_k_heads,
-            self.head_k_dim,
-        ])?;
-        let v_conv = v_conv.index((.., (out_len - seq_len).., ..)).reshape(&[
-            batch,
-            seq_len,
-            self.num_v_heads,
-            self.head_v_dim,
-        ])?;
+        // Reshape to head dimensions.
+        // For T=1 decode, conv output seq_len already matches (no trim needed).
+        let q_conv = q_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim])?;
+        let k_conv = k_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim])?;
+        let v_conv = v_conv.reshape(&[batch, seq_len, self.num_v_heads, self.head_v_dim])?;
 
-        // Match the upstream Qwen 3.5 GDN contract: l2-normalize Q/K per head,
-        // then scale Q by 1/sqrt(dk) before the recurrent update.
-        let q_normed = l2norm_last_dim(&q_conv, 1e-6)?
-            .multiply(&Array::from_f32((self.head_k_dim as f32).sqrt().recip()))?;
-        let k_normed = l2norm_last_dim(&k_conv, 1e-6)?;
+        // Q/K normalization: fast::rms_norm (fused Metal op) with pre-baked scale weights.
+        let q_normed = mlx_rs::fast::rms_norm(&q_conv, &self.q_norm_weight, 1e-6)?;
+        let k_normed = mlx_rs::fast::rms_norm(&k_conv, &self.k_norm_weight, 1e-6)?;
 
-        // Get SSM state from cache
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
 
-        // Run GDN recurrence with already-normalized Q/K.
         let (out, new_state) = gated_delta_update(
             &q_normed,
             &k_normed,
@@ -1105,20 +1460,16 @@ impl Qwen3NextGatedDeltaNet {
             self.dt_bias.as_ref(),
             ssm_state,
             mask,
-            false, // inference: use fast chunk path for long sequences
+            false,
         )?;
 
-        // Update SSM state in cache
         if let Some(cache) = cache {
             cache.ssm_state = Some(new_state);
         }
 
         // Apply gated norm and output projection
         let out = self.norm.forward(&out, Some(z))?;
-        if mask.is_none()
-            && seq_len == 1
-            && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
-        {
+        if mask.is_none() && seq_len == 1 && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN {
             self.decode_out_projection(&out, batch)
         } else {
             self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])?)
@@ -1160,9 +1511,15 @@ impl Qwen3NextGatedDeltaNet {
             self.num_v_heads,
             self.head_v_dim,
         ])?;
-        let q_normed = l2norm_last_dim(&q_conv, 1e-6)?
-            .multiply(&Array::from_f32((self.head_k_dim as f32).sqrt().recip()))?;
-        let k_normed = l2norm_last_dim(&k_conv, 1e-6)?;
+        // Q/K normalization: use fast::rms_norm (1 fused Metal op) instead of
+        // l2norm_last_dim (5 separate ops). Matches mlx-lm's qwen3_5.py exactly.
+        // Pass ones weight since mlx-rs binding requires a weight array.
+        // Q/K normalization: fast::rms_norm (1 fused Metal op) with pre-baked
+        // scale factors. inv_scale = 1/sqrt(dk).
+        // q gets inv_scale² (because rms_norm divides by sqrt(mean) not sqrt(sum)),
+        // k gets inv_scale.
+        let q_normed = mlx_rs::fast::rms_norm(&q_conv, &self.q_norm_weight, 1e-6)?;
+        let k_normed = mlx_rs::fast::rms_norm(&k_conv, &self.k_norm_weight, 1e-6)?;
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
         let (out, new_state) = gated_delta_update(
             &q_normed,
@@ -1191,7 +1548,8 @@ impl Qwen3NextGatedDeltaNet {
         {
             self.decode_out_projection(&out, batch)?
         } else {
-            self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])?)?
+            self.out_proj
+                .forward(&out.reshape(&[batch, seq_len, -1])?)?
         };
         projected.eval()?;
         layer_profile.push_section("gdn_out_proj", out_proj_start);
@@ -1224,12 +1582,20 @@ impl Qwen3NextGatedDeltaNet {
                 .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?
         };
         let b_val = if decode_linear {
-            Self::decode_linear_projection(inputs, self.in_proj_b.weight.as_ref(), self.num_v_heads)?
+            Self::decode_linear_projection(
+                inputs,
+                self.in_proj_b.weight.as_ref(),
+                self.num_v_heads,
+            )?
         } else {
             self.in_proj_b.forward(inputs)?
         };
         let a = if decode_linear {
-            Self::decode_linear_projection(inputs, self.in_proj_a.weight.as_ref(), self.num_v_heads)?
+            Self::decode_linear_projection(
+                inputs,
+                self.in_proj_a.weight.as_ref(),
+                self.num_v_heads,
+            )?
         } else {
             self.in_proj_a.forward(inputs)?
         };
@@ -1261,7 +1627,9 @@ impl Qwen3NextGatedDeltaNet {
         mask: Option<&Array>,
         cache: Option<&mut MambaCacheEntry>,
     ) -> Result<Array, Exception> {
-        if self.should_use_combined_input_proj(inputs, mask) && let Some(cache) = cache {
+        if self.should_use_combined_input_proj(inputs, mask)
+            && let Some(cache) = cache
+        {
             return self.forward_cached_decode(inputs, cache);
         }
         self.forward_general(inputs, mask, cache)
@@ -1274,7 +1642,9 @@ impl Qwen3NextGatedDeltaNet {
         mut cache: Option<&mut MambaCacheEntry>,
         layer_profile: &mut Qwen3NextLayerProfile,
     ) -> Result<Array, Exception> {
-        if self.should_use_combined_input_proj(inputs, mask) && let Some(cache) = cache {
+        if self.should_use_combined_input_proj(inputs, mask)
+            && let Some(cache) = cache
+        {
             return self.forward_cached_decode_profiled(inputs, cache, layer_profile);
         }
 
@@ -1306,7 +1676,11 @@ impl Qwen3NextGatedDeltaNet {
 
         let b_start = Instant::now();
         let b_val = if decode_linear {
-            Self::decode_linear_projection(inputs, self.in_proj_b.weight.as_ref(), self.num_v_heads)?
+            Self::decode_linear_projection(
+                inputs,
+                self.in_proj_b.weight.as_ref(),
+                self.num_v_heads,
+            )?
         } else {
             self.in_proj_b.forward(inputs)?
         };
@@ -1315,7 +1689,11 @@ impl Qwen3NextGatedDeltaNet {
 
         let a_start = Instant::now();
         let a = if decode_linear {
-            Self::decode_linear_projection(inputs, self.in_proj_a.weight.as_ref(), self.num_v_heads)?
+            Self::decode_linear_projection(
+                inputs,
+                self.in_proj_a.weight.as_ref(),
+                self.num_v_heads,
+            )?
         } else {
             self.in_proj_a.forward(inputs)?
         };
@@ -1534,13 +1912,14 @@ impl Qwen3NextSparseMoeBlock {
             self.shared_combined_in_proj_signature = Some(signature);
         }
 
-        Ok(self.shared_combined_in_proj_weight.as_ref().unwrap().clone())
+        Ok(self
+            .shared_combined_in_proj_weight
+            .as_ref()
+            .unwrap()
+            .clone())
     }
 
-    fn forward_shared_expert_and_gate(
-        &mut self,
-        x: &Array,
-    ) -> Result<(Array, Array), Exception> {
+    fn forward_shared_expert_and_gate(&mut self, x: &Array) -> Result<(Array, Array), Exception> {
         let shape = x.shape();
         let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
         let hidden = shape[shape.len() - 1];
@@ -1683,9 +2062,8 @@ impl Qwen3NextSparseMoeBlock {
         // Top-k selection via argpartition: O(E) vs O(E log E) argsort.
         // argpartition(-gates, -k, -1) places the k largest at the end.
         let k = self.top_k;
-        let neg_gates = gates.negative()?;
         let neg_k = -k;
-        let part_indices = ops::argpartition_axis(&neg_gates, neg_k, -1)?;
+        let part_indices = ops::argpartition_axis(&gates.negative()?, neg_k, -1)?;
         let top_indices = part_indices.index((.., neg_k..));
         let top_weights = gates.take_along_axis(&top_indices, -1)?;
 
@@ -1701,7 +2079,6 @@ impl Qwen3NextSparseMoeBlock {
         // x_flat: [N, D], indices: [N, k]
         let top_indices_i32 = top_indices.as_type::<i32>()?;
 
-        // For each expert slot, gather expert weights and compute
         // gather_mm: batch matmul with expert selection
         let gate_out = gather_mm(
             &x_flat,
@@ -1720,15 +2097,16 @@ impl Qwen3NextSparseMoeBlock {
 
         let activated = nn::silu(&gate_out)?.multiply(&up_out)?;
 
-        // Down projection
+        // Down projection — gather_mm handles [N, k, intermediate] directly with
+        // rhs_indices [N, k], selecting per-expert weight for each (token, slot) pair.
+        // No reshape needed (saves 3 graph nodes per MoE layer).
         let down_out = gather_mm(
-            &activated.reshape(&[batch_seq * k, -1])?,
+            &activated,
             self.switch_mlp_down_proj.as_ref(),
             None,
-            Some(&top_indices_i32.reshape(&[batch_seq * k, 1])?),
+            Some(&top_indices_i32),
             false,
-        )?
-        .reshape(&[batch_seq, k, hidden])?;
+        )?;
 
         // Shared expert forward + gate logit
         let (shared_y, shared_gate_logit) = self.forward_shared_expert_and_gate(&x_flat)?;
@@ -1842,14 +2220,11 @@ impl Qwen3NextSparseMoeBlock {
             let record = &ctx.layout.record;
             let prefill_window_tokens = self.prefill_expert_window_tokens;
 
-            let mut window_outputs = Vec::with_capacity(
-                batch_seq as usize / prefill_window_tokens + 1,
-            );
+            let mut window_outputs =
+                Vec::with_capacity(batch_seq as usize / prefill_window_tokens + 1);
 
-            for window_start in (0..batch_seq as usize).step_by(prefill_window_tokens)
-            {
-                let window_end =
-                    (window_start + prefill_window_tokens).min(batch_seq as usize);
+            for window_start in (0..batch_seq as usize).step_by(prefill_window_tokens) {
+                let window_end = (window_start + prefill_window_tokens).min(batch_seq as usize);
                 let window_len = (window_end - window_start) as i32;
                 let window_input = x_flat
                     .index((window_start as i32..window_end as i32, ..))
@@ -1892,10 +2267,10 @@ impl Qwen3NextSparseMoeBlock {
                         Exception::custom("forward_offloaded: expert_intermediate not initialized")
                     })?;
                     let pool = self.buffer_pool.as_ref().unwrap();
-                    let mut unique_bufs: Vec<pmetal_metal::expert_buffer::AlignedBuffer> =
-                        (0..unique_experts.len())
-                            .map(|_| pool.acquire_blocking())
-                            .collect();
+                    let mut unique_bufs: Vec<pmetal_metal::expert_buffer::AlignedBuffer> = (0
+                        ..unique_experts.len())
+                        .map(|_| pool.acquire_blocking())
+                        .collect();
 
                     let io_start = Instant::now();
                     let aligned_load = if miss_plan.len() == unique_experts.len() {
@@ -1981,7 +2356,8 @@ impl Qwen3NextSparseMoeBlock {
                         .submit(&cmd_buf)
                         .map_err(|e| Exception::custom(e.to_string()))?;
                     if let Some(profile) = layer_profile.as_deref_mut() {
-                        profile.push_section("moe_prefill_expert_encode_submit", encode_submit_start);
+                        profile
+                            .push_section("moe_prefill_expert_encode_submit", encode_submit_start);
                     }
                     aligned_release_bufs = Some(unique_bufs);
                     cmd_buf
@@ -1992,8 +2368,10 @@ impl Qwen3NextSparseMoeBlock {
                     let intermediate = self.expert_intermediate.as_ref().ok_or_else(|| {
                         Exception::custom("forward_offloaded: expert_intermediate not initialized")
                     })?;
-                    let miss_ids: Vec<usize> =
-                        miss_plan.iter().map(|(_, expert_idx)| *expert_idx).collect();
+                    let miss_ids: Vec<usize> = miss_plan
+                        .iter()
+                        .map(|(_, expert_idx)| *expert_idx)
+                        .collect();
                     let io_start = Instant::now();
                     let miss_bufs = if !miss_ids.is_empty() {
                         ctx.read_experts(layer_idx, &miss_ids).map_err(|e| {
@@ -2060,7 +2438,8 @@ impl Qwen3NextSparseMoeBlock {
                         .submit(&cmd_buf)
                         .map_err(|e| Exception::custom(e.to_string()))?;
                     if let Some(profile) = layer_profile.as_deref_mut() {
-                        profile.push_section("moe_prefill_expert_encode_submit", encode_submit_start);
+                        profile
+                            .push_section("moe_prefill_expert_encode_submit", encode_submit_start);
                     }
                     cmd_buf
                 };
@@ -2731,7 +3110,9 @@ impl Qwen3NextModel {
     ) -> Result<Self, Exception> {
         let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)?;
         let layers = (0..config.num_hidden_layers as usize)
-            .map(|i| Qwen3NextDecoderLayer::new_with_routed_expert_mode(config, i, routed_expert_mode))
+            .map(|i| {
+                Qwen3NextDecoderLayer::new_with_routed_expert_mode(config, i, routed_expert_mode)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let norm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
@@ -2906,6 +3287,12 @@ pub struct Qwen3NextForCausalLM {
     #[param]
     pub lm_head: Option<nn::Linear>,
     pub config: Qwen3NextConfig,
+    /// Compiled whole-model decode closure. Built lazily on first decode call.
+    pub compiled_model_decode: Option<mlx_rs::compile::Closure>,
+    /// InlineArray weights for zero-overhead decode. Built lazily on first decode call.
+    pub inline_weights: Option<super::qwen3_next_inline::InlineModelWeights>,
+    /// Persistent InlineArray cache — lives across decode steps, zero conversion overhead.
+    pub inline_cache: Option<super::qwen3_next_inline::InlineCache>,
 }
 
 impl Qwen3NextForCausalLM {
@@ -2931,6 +3318,9 @@ impl Qwen3NextForCausalLM {
             model,
             lm_head,
             config,
+            compiled_model_decode: None,
+            inline_weights: None,
+            inline_cache: None,
         })
     }
 
@@ -2964,10 +3354,432 @@ impl Qwen3NextForCausalLM {
         kv_cache: Option<&mut KVCache>,
         mamba_cache: Option<&mut MambaCache>,
     ) -> Result<Array, Exception> {
+        // Decode (T=1): use InlineArray path for zero-overhead graph build
+        if mask.is_none()
+            && input_ids.dim(1) == 1
+            && kv_cache.is_some()
+            && mamba_cache.is_some()
+        {
+            // Lazily build InlineArray weights on first decode
+            if self.inline_weights.is_none() {
+                eprintln!("[INLINE] Building InlineArray weights...");
+                match super::qwen3_next_inline::InlineModelWeights::from_model(self) {
+                    Ok(w) => {
+                        eprintln!("[INLINE] InlineArray weights ready ({} layers)", w.layers.len());
+                        self.inline_weights = Some(w);
+                    }
+                    Err(e) => {
+                        eprintln!("[INLINE] Failed to build InlineArray weights: {e}, falling back");
+                    }
+                }
+            }
+            if let Some(ref weights) = self.inline_weights {
+                // Bootstrap InlineCache on first decode (from mlx-rs caches, called once)
+                if self.inline_cache.is_none() {
+                    eprintln!("[INLINE] Bootstrapping InlineCache from mlx-rs caches...");
+                    self.inline_cache = Some(super::qwen3_next_inline::InlineCache::from_caches(
+                        kv_cache.as_ref().unwrap(),
+                        mamba_cache.as_ref().unwrap(),
+                        &weights.layers,
+                    ));
+                }
+
+                // Pure InlineArray decode — ZERO mlx-rs per step
+                let token = super::qwen3_next_inline::ia_from_array(input_ids);
+                let logits = super::qwen3_next_inline::inline_decode_step_pure(
+                    weights,
+                    &token,
+                    self.inline_cache.as_mut().unwrap(),
+                );
+                return Ok(super::qwen3_next_inline::ia_to_array(&logits));
+
+                // NOTE: mlx-rs KV/Mamba caches are NOT updated — the InlineCache
+                // owns the state now. write_back() is called only if we need to
+                // switch back to the standard path.
+                #[allow(unreachable_code)]
+                return super::qwen3_next_inline::inline_decode_step(
+                    weights,
+                    input_ids,
+                    kv_cache.unwrap(),
+                    mamba_cache.unwrap(),
+                );
+            }
+        }
         let h = self
             .model
             .forward_with_cache(input_ids, mask, kv_cache, mamba_cache)?;
         self.lm_head_forward(&h)
+    }
+
+    /// Compiled whole-model decode: wraps the ENTIRE model forward in one
+    /// `mx.compile(shapeless=true)` closure, eliminating per-op FFI overhead.
+    fn forward_compiled_decode(
+        &mut self,
+        input_ids: &Array,
+        kv_cache: &mut KVCache,
+        mamba_cache: &mut MambaCache,
+    ) -> Result<Array, Exception> {
+        self.ensure_compiled_model_decode()?;
+
+        // Collect dynamic inputs: token + GDN states + attention KV
+        let mut inputs: Vec<Array> = Vec::with_capacity(52);
+        inputs.push(input_ids.clone());
+
+        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+            if layer.is_linear {
+                let entry = mamba_cache.get(layer_idx)
+                    .ok_or_else(|| Exception::custom(format!("missing mamba cache for layer {layer_idx}")))?;
+                let b = input_ids.dim(0);
+                let gdn = layer.linear_attn.as_ref().unwrap();
+                let conv_state = entry.conv_state.as_ref().cloned().unwrap_or_else(|| {
+                    ops::zeros_dtype(&[b, gdn.conv_kernel_size - 1, gdn.conv_dim], input_ids.dtype()).unwrap()
+                });
+                let ssm_state = entry.ssm_state.as_ref().cloned().unwrap_or_else(|| {
+                    ops::zeros_dtype(&[b, gdn.num_v_heads, gdn.head_v_dim, gdn.head_k_dim], input_ids.dtype()).unwrap()
+                });
+                inputs.push(conv_state);
+                inputs.push(ssm_state);
+            } else {
+                let (keys, values) = kv_cache.fetch_for_compiled_decode(layer_idx)?;
+                inputs.push(keys);
+                inputs.push(values);
+            }
+        }
+
+        let outputs = self.compiled_model_decode.as_ref().unwrap()
+            .apply(&inputs.iter().collect::<Vec<_>>())?;
+
+        // Unpack outputs: logits + cache updates
+        let mut out_idx = 1;
+        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+            if layer.is_linear {
+                let entry = mamba_cache.get_mut(layer_idx).unwrap();
+                entry.conv_state = Some(outputs[out_idx].clone());
+                entry.ssm_state = Some(outputs[out_idx + 1].clone());
+                out_idx += 2;
+            } else {
+                // Attention returns new K/V [B, H, 1, D] — insert into cache
+                kv_cache.update_and_fetch(layer_idx, &outputs[out_idx], &outputs[out_idx + 1])?;
+                out_idx += 2;
+            }
+        }
+
+        Ok(outputs[0].clone())
+    }
+
+    /// Build the compiled whole-model decode closure. Called once.
+    fn ensure_compiled_model_decode(&mut self) -> Result<(), Exception> {
+        if self.compiled_model_decode.is_some() {
+            return Ok(());
+        }
+
+        // Capture all weights and model structure
+        let embed_weight = self.model.embed_tokens.weight.as_ref().clone();
+        let final_norm_weight = self.model.norm.weight.as_ref().clone();
+        let final_norm_eps = self.model.norm.eps;
+        let tie_word_embeddings = self.config.tie_word_embeddings;
+        let lm_head_weight = self.lm_head.as_ref().map(|l| l.weight.as_ref().clone());
+
+        // Capture per-layer weights
+        struct LayerWeights {
+            is_linear: bool,
+            input_ln_w: Array,
+            input_ln_eps: f32,
+            post_ln_w: Array,
+            post_ln_eps: f32,
+            // Attention weights (if !is_linear)
+            q_proj_w: Option<Array>,
+            k_proj_w: Option<Array>,
+            v_proj_w: Option<Array>,
+            o_proj_w: Option<Array>,
+            q_norm_w: Option<Array>,
+            q_norm_eps: Option<f32>,
+            k_norm_w: Option<Array>,
+            k_norm_eps: Option<f32>,
+            n_heads: i32,
+            n_kv_heads: i32,
+            head_dim: i32,
+            scale: f32,
+            rope_dims: i32,
+            effective_base: f32,
+            rope_scale: f32,
+            // GDN weights (if is_linear)
+            gdn_qkvz_w: Option<Array>,
+            gdn_ba_w: Option<Array>,
+            gdn_conv_w: Option<Array>,
+            gdn_q_nw: Option<Array>,
+            gdn_k_nw: Option<Array>,
+            gdn_a_log: Option<Array>,
+            gdn_dt_bias: Option<Array>,
+            gdn_norm_w: Option<Array>,
+            gdn_norm_eps: Option<f32>,
+            gdn_out_w: Option<Array>,
+            gdn_num_v_heads: i32,
+            gdn_num_k_heads: i32,
+            gdn_head_k_dim: i32,
+            gdn_head_v_dim: i32,
+            gdn_key_dim: i32,
+            gdn_conv_dim: i32,
+            gdn_conv_kernel_size: i32,
+            // MLP weights (both layer types)
+            mlp_gate_w: Array,
+            mlp_up_w: Array,
+            mlp_down_w: Array,
+        }
+
+        let mut layer_weights: Vec<LayerWeights> = Vec::with_capacity(self.model.layers.len());
+        for layer in &mut self.model.layers {
+            let mut lw = LayerWeights {
+                is_linear: layer.is_linear,
+                input_ln_w: layer.input_layernorm.weight.as_ref().clone(),
+                input_ln_eps: layer.input_layernorm.eps,
+                post_ln_w: layer.post_attention_layernorm.weight.as_ref().clone(),
+                post_ln_eps: layer.post_attention_layernorm.eps,
+                q_proj_w: None, k_proj_w: None, v_proj_w: None, o_proj_w: None,
+                q_norm_w: None, q_norm_eps: None, k_norm_w: None, k_norm_eps: None,
+                n_heads: 0, n_kv_heads: 0, head_dim: 0, scale: 0.0,
+                rope_dims: 0, effective_base: 0.0, rope_scale: 0.0,
+                gdn_qkvz_w: None, gdn_ba_w: None, gdn_conv_w: None,
+                gdn_q_nw: None, gdn_k_nw: None,
+                gdn_a_log: None, gdn_dt_bias: None,
+                gdn_norm_w: None, gdn_norm_eps: None, gdn_out_w: None,
+                gdn_num_v_heads: 0, gdn_num_k_heads: 0,
+                gdn_head_k_dim: 0, gdn_head_v_dim: 0,
+                gdn_key_dim: 0, gdn_conv_dim: 0, gdn_conv_kernel_size: 0,
+                mlp_gate_w: Array::from_f32(0.0),
+                mlp_up_w: Array::from_f32(0.0),
+                mlp_down_w: Array::from_f32(0.0),
+            };
+
+            if layer.is_linear {
+                let gdn = layer.linear_attn.as_mut().unwrap();
+                // Combine projection weights (2 matmuls matching Python)
+                lw.gdn_qkvz_w = Some(gdn.ensure_combined_qkvz_weight()?);
+                lw.gdn_ba_w = Some(gdn.ensure_combined_ba_weight()?);
+                lw.gdn_conv_w = Some(gdn.conv1d.weight.as_ref().clone());
+                lw.gdn_q_nw = Some(gdn.q_norm_weight.clone());
+                lw.gdn_k_nw = Some(gdn.k_norm_weight.clone());
+                lw.gdn_a_log = Some(gdn.a_log.as_ref().clone());
+                lw.gdn_dt_bias = Some(gdn.dt_bias.as_ref().clone());
+                lw.gdn_norm_w = Some(gdn.norm.weight.as_ref().clone());
+                lw.gdn_norm_eps = Some(gdn.norm.eps);
+                lw.gdn_out_w = Some(gdn.out_proj.weight.as_ref().clone());
+                lw.gdn_num_v_heads = gdn.num_v_heads;
+                lw.gdn_num_k_heads = gdn.num_k_heads;
+                lw.gdn_head_k_dim = gdn.head_k_dim;
+                lw.gdn_head_v_dim = gdn.head_v_dim;
+                lw.gdn_key_dim = gdn.key_dim;
+                lw.gdn_conv_dim = gdn.conv_dim;
+                lw.gdn_conv_kernel_size = gdn.conv_kernel_size;
+            } else {
+                let attn = layer.self_attn.as_ref().unwrap();
+                lw.q_proj_w = Some(attn.q_proj.weight.as_ref().clone());
+                lw.k_proj_w = Some(attn.k_proj.weight.as_ref().clone());
+                lw.v_proj_w = Some(attn.v_proj.weight.as_ref().clone());
+                lw.o_proj_w = Some(attn.o_proj.weight.as_ref().clone());
+                lw.q_norm_w = Some(attn.q_norm.weight.as_ref().clone());
+                lw.q_norm_eps = Some(attn.q_norm.eps);
+                lw.k_norm_w = Some(attn.k_norm.weight.as_ref().clone());
+                lw.k_norm_eps = Some(attn.k_norm.eps);
+                lw.n_heads = attn.n_heads;
+                lw.n_kv_heads = attn.n_kv_heads;
+                lw.head_dim = attn.head_dim;
+                lw.scale = attn.scale;
+                lw.rope_dims = attn.rope_dims;
+                lw.effective_base = attn.effective_base;
+                lw.rope_scale = attn.rope_scale;
+            }
+
+            // MLP weights (dense path only for now)
+            match &layer.mlp {
+                Qwen3NextFeedForward::Dense(mlp) => {
+                    lw.mlp_gate_w = mlp.gate_proj.weight.as_ref().clone();
+                    lw.mlp_up_w = mlp.up_proj.weight.as_ref().clone();
+                    lw.mlp_down_w = mlp.down_proj.weight.as_ref().clone();
+                }
+                Qwen3NextFeedForward::MoE(_) => {
+                    // MoE layers fall back to uncompiled path
+                    return Ok(());
+                }
+            }
+
+            layer_weights.push(lw);
+        }
+
+        let n_layers = layer_weights.len();
+
+        let closure = mlx_rs::compile::Closure::new(
+            move |inputs: &[Array]| -> Result<Vec<Array>, Exception> {
+                let token_id = &inputs[0]; // [1, 1]
+                let b = token_id.dim(0);
+                let s = 1i32;
+
+                // Embedding lookup: weight[token_id]
+                let mut hidden = embed_weight.index(token_id);
+
+                let mut outputs: Vec<Array> = Vec::with_capacity(1 + n_layers * 2);
+                let mut inp_idx = 1; // cursor into dynamic inputs (skip token)
+
+                for lw in &layer_weights {
+                    // Input LayerNorm
+                    let normed = mlx_rs::fast::rms_norm(&hidden, &lw.input_ln_w, lw.input_ln_eps)?;
+
+                    // Attention / GDN
+                    let r = if lw.is_linear {
+                        // GDN forward (inline)
+                        let conv_st = &inputs[inp_idx];
+                        let ssm_st = &inputs[inp_idx + 1];
+                        inp_idx += 2;
+
+                        let qkvz_w = lw.gdn_qkvz_w.as_ref().unwrap();
+                        let ba_w = lw.gdn_ba_w.as_ref().unwrap();
+                        let conv_w = lw.gdn_conv_w.as_ref().unwrap();
+                        let nv = lw.gdn_num_v_heads;
+                        let nk = lw.gdn_num_k_heads;
+                        let dk = lw.gdn_head_k_dim;
+                        let dv = lw.gdn_head_v_dim;
+                        let kd = lw.gdn_key_dim;
+                        let cd = lw.gdn_conv_dim;
+                        let ck = lw.gdn_conv_kernel_size;
+
+                        let qkvz = ops::matmul(&normed, &qkvz_w.t())?;
+                        let ba = ops::matmul(&normed, &ba_w.t())?;
+                        let qkv = qkvz.index((.., .., ..cd));
+                        let z = qkvz.index((.., .., cd..)).reshape(&[b, s, nv, dv])?;
+                        let b_val = ba.index((.., .., ..nv));
+                        let a = ba.index((.., .., nv..));
+
+                        let conv_in = ops::concatenate_axis(&[conv_st, &qkv], 1)?;
+                        let new_conv = conv_in.index((.., (-(ck - 1)).., ..));
+                        let conv_out = nn::silu(&ops::conv1d(&conv_in, conv_w, None, None, None, Some(cd))?)?;
+
+                        // Use Slice instead of split_axis (Split::output_shapes
+                        // not implemented in MLX for shapeless compile)
+                        let q = conv_out.index((.., .., ..kd)).reshape(&[b, s, nk, dk])?;
+                        let k = conv_out.index((.., .., kd..kd * 2)).reshape(&[b, s, nk, dk])?;
+                        let v = conv_out.index((.., .., kd * 2..)).reshape(&[b, s, nv, dv])?;
+
+                        let q = mlx_rs::fast::rms_norm(&q, lw.gdn_q_nw.as_ref().unwrap(), 1e-6)?;
+                        let k = mlx_rs::fast::rms_norm(&k, lw.gdn_k_nw.as_ref().unwrap(), 1e-6)?;
+
+                        // GDN: dispatch to Metal kernel (1 dispatch) or ops fallback
+                        let (out, new_ssm) = gated_delta_update(
+                            &q, &k, &v, &a, &b_val,
+                            lw.gdn_a_log.as_ref().unwrap(),
+                            lw.gdn_dt_bias.as_ref().unwrap(),
+                            Some(ssm_st), None, false,
+                        )?;
+
+                        // Gated norm (f32 precision)
+                        let norm_w = lw.gdn_norm_w.as_ref().unwrap();
+                        let out_n = mlx_rs::fast::rms_norm(&out, norm_w, lw.gdn_norm_eps.unwrap_or(1e-6))?;
+                        let gate_f32 = nn::silu(&z.as_type::<f32>()?)?;
+                        let norm_f32 = out_n.as_type::<f32>()?;
+                        let gated = gate_f32.multiply(&norm_f32)?.as_dtype(hidden.dtype())?;
+                        let result = ops::matmul(&gated.reshape(&[b, s, -1])?, &lw.gdn_out_w.as_ref().unwrap().t())?;
+
+                        outputs.push(new_conv);
+                        outputs.push(new_ssm);
+                        result
+                    } else {
+                        // Full attention forward (inline)
+                        let cached_keys = &inputs[inp_idx];
+                        let cached_values = &inputs[inp_idx + 1];
+                        inp_idx += 2;
+
+                        let q_w = lw.q_proj_w.as_ref().unwrap();
+                        let k_w = lw.k_proj_w.as_ref().unwrap();
+                        let v_w = lw.v_proj_w.as_ref().unwrap();
+                        let o_w = lw.o_proj_w.as_ref().unwrap();
+
+                        let q_proj_out = ops::matmul(&normed, &q_w.t())?;
+                        let q_gate = q_proj_out.reshape(&[b, s, lw.n_heads, lw.head_dim * 2])?;
+                        let queries = q_gate.index((.., .., .., ..lw.head_dim));
+                        let gate = q_gate.index((.., .., .., lw.head_dim..)).reshape(&[
+                            b, s, lw.n_heads * lw.head_dim,
+                        ])?;
+
+                        let new_keys = ops::matmul(&normed, &k_w.t())?;
+                        let new_values = ops::matmul(&normed, &v_w.t())?;
+
+                        let queries = mlx_rs::fast::rms_norm(&queries, lw.q_norm_w.as_ref().unwrap(), lw.q_norm_eps.unwrap())?;
+                        let keys_shaped = mlx_rs::fast::rms_norm(
+                            &new_keys.reshape(&[b, s, lw.n_kv_heads, lw.head_dim])?,
+                            lw.k_norm_w.as_ref().unwrap(),
+                            lw.k_norm_eps.unwrap(),
+                        )?;
+                        let values_shaped = new_values.reshape(&[b, s, lw.n_kv_heads, lw.head_dim])?;
+
+                        let mut queries = queries.transpose_axes(&[0, 2, 1, 3])?;
+                        let mut keys = keys_shaped.transpose_axes(&[0, 2, 1, 3])?;
+                        let values = values_shaped.transpose_axes(&[0, 2, 1, 3])?;
+
+                        // RoPE offset = number of cached tokens (the position of the new token)
+                        let rope_off = cached_keys.dim(2);
+                        queries = apply_rope(&queries, lw.rope_dims, false, lw.effective_base, lw.rope_scale, rope_off)?;
+                        keys = apply_rope(&keys, lw.rope_dims, false, lw.effective_base, lw.rope_scale, rope_off)?;
+
+                        // Concatenate new K/V with cached history
+                        let full_keys = ops::concatenate_axis(&[cached_keys, &keys], 2)?;
+                        let full_values = ops::concatenate_axis(&[cached_values, &values], 2)?;
+
+                        // SDPA
+                        let attn_config = FusedAttentionConfig::new(lw.n_heads, lw.n_kv_heads, lw.head_dim)
+                            .with_scale(lw.scale)
+                            .with_mask_type(AttentionMaskType::Causal);
+                        let attn_out = fused_sdpa(&queries, &full_keys, &full_values, &attn_config, None)?;
+
+                        let output = attn_out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, lw.n_heads * lw.head_dim])?;
+                        let gated = output.multiply(&nn::sigmoid(&gate)?)?;
+                        let result = ops::matmul(&gated, &o_w.t())?;
+
+                        // Return new K/V (single-token) for cache insertion
+                        outputs.push(keys);
+                        outputs.push(values);
+                        result
+                    };
+
+                    // Residual + MLP
+                    let h = hidden.add(&r)?;
+                    let mlp_in = mlx_rs::fast::rms_norm(&h, &lw.post_ln_w, lw.post_ln_eps)?;
+
+                    // SwiGLU MLP
+                    let gate_out = ops::matmul(&mlp_in, &lw.mlp_gate_w.t())?;
+                    let up_out = ops::matmul(&mlp_in, &lw.mlp_up_w.t())?;
+                    let activated = nn::silu(&gate_out)?.multiply(&up_out)?;
+                    let mlp_out = ops::matmul(&activated, &lw.mlp_down_w.t())?;
+
+                    hidden = h.add(&mlp_out)?;
+                }
+
+                // Final norm + LM head
+                let hidden = mlx_rs::fast::rms_norm(&hidden, &final_norm_weight, final_norm_eps)?;
+                let logits = if tie_word_embeddings {
+                    ops::matmul(&hidden, &embed_weight.t())?
+                } else {
+                    ops::matmul(&hidden, &lm_head_weight.as_ref().unwrap().t())?
+                };
+
+                // Output: logits first, then cache states
+                let mut result = vec![logits];
+                result.extend(outputs);
+                Ok(result)
+            },
+        );
+
+        self.compiled_model_decode = Some(
+            match mlx_rs::compile::compile(&closure, true) {
+                Ok(compiled) => {
+                    eprintln!("[MODEL] Whole-model compiled decode OK ({n_layers} layers)");
+                    compiled
+                }
+                Err(e) => {
+                    eprintln!("[MODEL] Whole-model compile FAILED: {e}, using uncompiled");
+                    closure
+                }
+            }
+        );
+        Ok(())
     }
 
     pub fn forward_with_cache_profiled(
@@ -3453,9 +4265,18 @@ mod tests {
 
     #[test]
     fn test_prefill_expert_window_tokens_is_sanitized() {
-        assert_eq!(Qwen3NextSparseMoeBlock::sanitize_prefill_expert_window_tokens(0), 1);
-        assert_eq!(Qwen3NextSparseMoeBlock::sanitize_prefill_expert_window_tokens(8), 8);
-        assert_eq!(Qwen3NextSparseMoeBlock::sanitize_prefill_expert_window_tokens(64), 32);
+        assert_eq!(
+            Qwen3NextSparseMoeBlock::sanitize_prefill_expert_window_tokens(0),
+            1
+        );
+        assert_eq!(
+            Qwen3NextSparseMoeBlock::sanitize_prefill_expert_window_tokens(8),
+            8
+        );
+        assert_eq!(
+            Qwen3NextSparseMoeBlock::sanitize_prefill_expert_window_tokens(64),
+            32
+        );
     }
 
     #[test]
@@ -3560,9 +4381,18 @@ mod tests {
             max_qkv_diff < 1e-5,
             "combined qkv projection diverged: {max_qkv_diff}"
         );
-        assert!(max_z_diff < 1e-5, "combined z projection diverged: {max_z_diff}");
-        assert!(max_b_diff < 1e-5, "combined b projection diverged: {max_b_diff}");
-        assert!(max_a_diff < 1e-5, "combined a projection diverged: {max_a_diff}");
+        assert!(
+            max_z_diff < 1e-5,
+            "combined z projection diverged: {max_z_diff}"
+        );
+        assert!(
+            max_b_diff < 1e-5,
+            "combined b projection diverged: {max_b_diff}"
+        );
+        assert!(
+            max_a_diff < 1e-5,
+            "combined a projection diverged: {max_a_diff}"
+        );
     }
 
     #[test]
@@ -3794,7 +4624,10 @@ mod tests {
             .max(None)
             .unwrap()
             .item::<f32>();
-        assert!(max_diff < 1e-5, "decode out projection diverged: {max_diff}");
+        assert!(
+            max_diff < 1e-5,
+            "decode out projection diverged: {max_diff}"
+        );
     }
 
     #[test]
@@ -4129,8 +4962,8 @@ mod tests {
             Qwen3NextRoutedExpertMode::Placeholder,
         )
         .unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 2, config.hidden_size], None, None, None)
-            .unwrap();
+        let x =
+            mlx_rs::random::normal::<f32>(&[1, 2, config.hidden_size], None, None, None).unwrap();
         let err = block.forward(&x).unwrap_err().to_string();
         assert!(err.contains("enable expert offloading"));
     }

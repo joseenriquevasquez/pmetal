@@ -25,6 +25,7 @@ pub mod qwen2_vl;
 pub mod qwen3;
 pub mod qwen3_moe;
 pub mod qwen3_next;
+pub mod qwen3_next_inline;
 pub mod recurrentgemma;
 pub mod starcoder2;
 pub mod t5;

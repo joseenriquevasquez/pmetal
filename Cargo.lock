@@ -4056,8 +4056,6 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a7c4444d624bf6b93db5cc22ebff4fdfa13593fd56154fe33b1f302a557c2c6"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -4069,8 +4067,6 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a819ee8b4434690572b6feb9c3ef0b6e90137e4190b340cf00150703b410aaf9"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -4983,6 +4979,7 @@ dependencies = [
  "indicatif",
  "libc",
  "parquet",
+ "pmetal-bridge",
  "pmetal-core",
  "pmetal-data",
  "pmetal-distill",
@@ -5016,6 +5013,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "walkdir",
+]
+
+[[package]]
+name = "pmetal-bridge"
+version = "0.4.0"
+dependencies = [
+ "cc",
+ "cmake",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -5276,8 +5283,6 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-rs"
 version = "0.25.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a05ebac612098d1324f0027bc7934e9794475c6642ab5bc923025fb4b74ca5f5"
 dependencies = [
  "bytemuck",
  "dyn-clone",
@@ -5302,8 +5307,6 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-sys"
 version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ed70541570cb839c7e50ec2833079c5d8f52316bc16e8f810aad367aad935be"
 dependencies = [
  "bindgen",
  "cc",
@@ -5317,6 +5320,7 @@ dependencies = [
  "json5",
  "objc2",
  "objc2-metal",
+ "pmetal-bridge",
  "pmetal-core",
  "pmetal-gguf",
  "pmetal-metal",

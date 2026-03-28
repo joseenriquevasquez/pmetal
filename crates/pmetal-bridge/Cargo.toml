@@ -1,0 +1,25 @@
+[package]
+name = "pmetal-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Zero-allocation MLX bridge — standalone C++ layer that replaces mlx-rs"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["accelerate", "metal"]
+accelerate = []
+metal = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+
+[build-dependencies]
+cc = "1"
+cmake = "0.1"
