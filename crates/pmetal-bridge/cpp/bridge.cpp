@@ -223,6 +223,47 @@ int mlx_inline_dtype(const mlx_inline_array* a) {
 float mlx_inline_item_f32(mlx_inline_array* a) { as_arr(a).eval(); return as_arr(a).item<float>(); }
 uint32_t mlx_inline_item_u32(mlx_inline_array* a) { as_arr(a).eval(); return as_arr(a).item<uint32_t>(); }
 
+void mlx_inline_sign(mlx_inline_array* dst, const mlx_inline_array* a) {
+    new (dst->buf) array(mlx::core::sign(as_arr(a)));
+}
+
+void mlx_inline_from_f32_slice(mlx_inline_array* dst, const float* data, const int* shape, int ndim) {
+    mlx::core::Shape s(shape, shape + ndim);
+    size_t n = 1;
+    for (int i = 0; i < ndim; ++i) n *= shape[i];
+    new (dst->buf) array(data, s, mlx::core::float32);
+}
+
+// Copy the evaluated f32 data of an array into a caller-provided buffer.
+// The array is cast to float32 and eval'd first.  `n` must equal the total
+// element count (product of all dimensions).  Returns 0 on success, -1 on
+// dtype error (non-finite cast or wrong count).
+int mlx_inline_to_f32_slice(mlx_inline_array* a, float* out, size_t n) {
+    array& src = as_arr(a);
+    // Cast to f32 if needed, then eval to materialise on CPU.
+    array f32_arr = src.dtype() == mlx::core::float32
+        ? src
+        : mlx::core::astype(src, mlx::core::float32);
+    f32_arr.eval();
+    if ((size_t)f32_arr.size() != n) return -1;
+    std::memcpy(out, f32_arr.data<float>(), n * sizeof(float));
+    return 0;
+}
+
+void mlx_inline_stack(mlx_inline_array* dst, const mlx_inline_array* arrays, int num, int axis) {
+    std::vector<array> arrs;
+    arrs.reserve(num);
+    for (int i = 0; i < num; ++i) {
+        arrs.push_back(*reinterpret_cast<const array*>(arrays[i].buf));
+    }
+    new (dst->buf) array(mlx::core::stack(arrs, axis));
+}
+
+void mlx_inline_norm_l2(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims) {
+    new (dst->buf) array(mlx::core::sqrt(mlx::core::sum(
+        mlx::core::square(as_arr(a)), axis, keepdims)));
+}
+
 // Conv1d
 void mlx_inline_conv1d(mlx_inline_array* dst, const mlx_inline_array* input,
                          const mlx_inline_array* weight, int stride, int padding,

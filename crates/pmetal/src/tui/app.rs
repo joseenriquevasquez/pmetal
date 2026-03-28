@@ -1686,11 +1686,29 @@ impl App {
         if self.inference.top_p < 1.0 {
             args.extend(["--top-p".to_string(), self.inference.top_p.to_string()]);
         }
+        if self.inference.min_p > 0.0 {
+            args.extend(["--min-p".to_string(), self.inference.min_p.to_string()]);
+        }
         if self.inference.repetition_penalty > 1.0 {
             args.extend([
                 "--repetition-penalty".to_string(),
                 self.inference.repetition_penalty.to_string(),
             ]);
+        }
+        if self.inference.frequency_penalty > 0.0 {
+            args.extend([
+                "--frequency-penalty".to_string(),
+                self.inference.frequency_penalty.to_string(),
+            ]);
+        }
+        if self.inference.presence_penalty > 0.0 {
+            args.extend([
+                "--presence-penalty".to_string(),
+                self.inference.presence_penalty.to_string(),
+            ]);
+        }
+        if let Some(seed) = self.inference.seed {
+            args.extend(["--seed".to_string(), seed.to_string()]);
         }
         match self.inference.kv_quant_mode {
             255 => args.push("--no-kv-quant".to_string()),
@@ -1700,6 +1718,20 @@ impl App {
             tq @ (104 | 108) => {
                 args.push("--kv-turboquant".to_string());
                 args.extend(["--kv-quant".to_string(), (tq - 100).to_string()]);
+            }
+            125 => {
+                // TQ2.5 preset
+                args.extend([
+                    "--kv-turboquant-preset".to_string(),
+                    "q2_5".to_string(),
+                ]);
+            }
+            135 => {
+                // TQ3.5 preset
+                args.extend([
+                    "--kv-turboquant-preset".to_string(),
+                    "q3_5".to_string(),
+                ]);
             }
             _ => {} // 0 = auto (omit flag)
         }

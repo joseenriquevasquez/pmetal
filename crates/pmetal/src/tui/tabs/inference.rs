@@ -43,7 +43,11 @@ const SETTING_NAMES: &[&str] = &[
     "Max Tokens",
     "Top-k",
     "Top-p",
+    "Min-p",
     "Rep Penalty",
+    "Freq Penalty",
+    "Pres Penalty",
+    "Seed",
     "KV Cache",
     "FP8",
     "No Thinking",
@@ -72,8 +76,12 @@ pub struct InferenceTab {
     pub max_tokens: usize,
     pub top_k: usize,
     pub top_p: f32,
+    pub min_p: f32,
     pub repetition_penalty: f32,
-    /// KV cache quantization mode: 0=auto, 8=q8, 4=q4, 255=fp16, 108=tq8, 104=tq4.
+    pub frequency_penalty: f32,
+    pub presence_penalty: f32,
+    pub seed: Option<u64>,
+    /// KV cache quantization mode: 0=auto, 8=q8, 4=q4, 255=fp16, 108=tq8, 104=tq4, 125=tq2.5, 135=tq3.5.
     pub kv_quant_mode: u8,
     pub fp8: bool,
     pub no_thinking: bool,
@@ -111,7 +119,11 @@ impl InferenceTab {
             max_tokens: 2048,
             top_k: 50,
             top_p: 0.9,
+            min_p: 0.0,
             repetition_penalty: 1.1,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            seed: None,
             kv_quant_mode: 0, // auto
             fp8: false,
             no_thinking: false,
@@ -243,6 +255,12 @@ impl InferenceTab {
         if let Some(v) = json.get("top_p").and_then(|v| v.as_f64()) {
             self.top_p = v as f32;
         }
+        if let Some(v) = json.get("min_p").and_then(|v| v.as_f64()) {
+            self.min_p = v as f32;
+        }
+        if let Some(v) = json.get("repetition_penalty").and_then(|v| v.as_f64()) {
+            self.repetition_penalty = v as f32;
+        }
         let max_tokens = json
             .get("max_new_tokens")
             .and_then(|v| v.as_u64())
@@ -355,19 +373,25 @@ impl InferenceTab {
             1 => self.max_tokens = (self.max_tokens + 64).min(8192),
             2 => self.top_k = (self.top_k + 10).min(500),
             3 => self.top_p = (self.top_p + 0.05).min(1.0),
-            4 => self.repetition_penalty = (self.repetition_penalty + 0.05).min(3.0),
-            5 => {
+            4 => self.min_p = (self.min_p + 0.01).min(1.0),
+            5 => self.repetition_penalty = (self.repetition_penalty + 0.05).min(3.0),
+            6 => self.frequency_penalty = (self.frequency_penalty + 0.05).min(2.0),
+            7 => self.presence_penalty = (self.presence_penalty + 0.05).min(2.0),
+            8 => self.seed = Some(self.seed.map_or(42, |s| s.saturating_add(1))),
+            9 => {
                 self.kv_quant_mode = match self.kv_quant_mode {
                     0 => 8,
                     8 => 4,
                     4 => 108,   // TQ8
                     108 => 104, // TQ4
-                    104 => 255, // FP16
+                    104 => 125, // TQ2.5
+                    125 => 135, // TQ3.5
+                    135 => 255, // FP16
                     _ => 0,
                 }
             }
-            6 => self.fp8 = !self.fp8,
-            7 => self.no_thinking = !self.no_thinking,
+            10 => self.fp8 = !self.fp8,
+            11 => self.no_thinking = !self.no_thinking,
             _ => {}
         }
     }
@@ -378,19 +402,30 @@ impl InferenceTab {
             1 => self.max_tokens = self.max_tokens.saturating_sub(64).max(1),
             2 => self.top_k = self.top_k.saturating_sub(10),
             3 => self.top_p = (self.top_p - 0.05).max(0.0),
-            4 => self.repetition_penalty = (self.repetition_penalty - 0.05).max(1.0),
-            5 => {
+            4 => self.min_p = (self.min_p - 0.01).max(0.0),
+            5 => self.repetition_penalty = (self.repetition_penalty - 0.05).max(1.0),
+            6 => self.frequency_penalty = (self.frequency_penalty - 0.05).max(0.0),
+            7 => self.presence_penalty = (self.presence_penalty - 0.05).max(0.0),
+            8 => {
+                self.seed = match self.seed {
+                    Some(0) | None => None,
+                    Some(s) => Some(s.saturating_sub(1)),
+                };
+            }
+            9 => {
                 self.kv_quant_mode = match self.kv_quant_mode {
                     0 => 255,
-                    255 => 104,
+                    255 => 135,
+                    135 => 125,
+                    125 => 104,
                     104 => 108,
                     108 => 4,
                     4 => 8,
                     _ => 0,
                 }
             }
-            6 => self.fp8 = !self.fp8,
-            7 => self.no_thinking = !self.no_thinking,
+            10 => self.fp8 = !self.fp8,
+            11 => self.no_thinking = !self.no_thinking,
             _ => {}
         }
     }
@@ -962,14 +997,24 @@ impl InferenceTab {
             255 => "FP16".to_string(),
             108 => "TQ8".to_string(),
             104 => "TQ4".to_string(),
+            125 => "TQ2.5".to_string(),
+            135 => "TQ3.5".to_string(),
             bits => format!("Q{bits}"),
         };
-        let setting_values: [String; 8] = [
+        let seed_label = match self.seed {
+            Some(s) => format!("{s}"),
+            None => "Random".to_string(),
+        };
+        let setting_values: [String; 12] = [
             format!("{:.1}", self.temperature),
             format!("{}", self.max_tokens),
             format!("{}", self.top_k),
             format!("{:.2}", self.top_p),
+            format!("{:.2}", self.min_p),
             format!("{:.2}", self.repetition_penalty),
+            format!("{:.2}", self.frequency_penalty),
+            format!("{:.2}", self.presence_penalty),
+            seed_label,
             kv_label,
             if self.fp8 {
                 "On".to_string()

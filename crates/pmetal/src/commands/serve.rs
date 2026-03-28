@@ -9,6 +9,10 @@ pub(crate) async fn run_serve(
     host: String,
     max_seq_len: usize,
     experts_dir: Option<String>,
+    fp8: bool,
+    kv_quant: Option<u8>,
+    no_kv_quant: bool,
+    kv_group_size: usize,
     kv_turboquant: bool,
     kv_turboquant_preset: Option<String>,
     ane_enabled: bool,
@@ -43,6 +47,12 @@ pub(crate) async fn run_serve(
         },
     )?;
 
+    // Quantize to FP8 if requested
+    if fp8 {
+        tracing::info!("Quantizing model weights to FP8 E4M3...");
+        model.quantize_fp8()?;
+    }
+
     // Enable expert offloading if a packed experts directory is provided
     if let Some(ref experts_dir) = experts_dir {
         model.enable_expert_offloading(std::path::Path::new(experts_dir))?;
@@ -71,7 +81,7 @@ pub(crate) async fn run_serve(
         let config = match kv_turboquant_preset.as_deref() {
             Some("q2_5") => {
                 tracing::info!("TurboQuant KV cache: q2.5 preset (2.5 bits, ~6.4x compression)");
-                TurboQuantConfig::preset_q2_5(128) // head_dim refined by dispatcher sanitization
+                TurboQuantConfig::preset_q2_5(128)
             }
             Some("q3_5") => {
                 tracing::info!(
@@ -85,8 +95,17 @@ pub(crate) async fn run_serve(
             }
         };
         Some(CacheMode::TurboQuant { config })
+    } else if no_kv_quant {
+        tracing::info!("KV cache: FP16 (no quantization)");
+        Some(CacheMode::Standard)
+    } else if let Some(bits) = kv_quant {
+        tracing::info!("KV cache: Q{bits} quantization (group_size={kv_group_size})");
+        Some(CacheMode::Quantized {
+            bits,
+            group_size: kv_group_size,
+        })
     } else {
-        None
+        None // auto-select
     };
 
     // Create inference engine

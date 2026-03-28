@@ -93,6 +93,23 @@ int mlx_inline_dtype(const mlx_inline_array* a);
 float mlx_inline_item_f32(mlx_inline_array* a);
 uint32_t mlx_inline_item_u32(mlx_inline_array* a);
 
+// Sign: returns -1, 0, or +1 per element
+void mlx_inline_sign(mlx_inline_array* dst, const mlx_inline_array* a);
+
+// Create array from float32 data slice
+void mlx_inline_from_f32_slice(mlx_inline_array* dst, const float* data, const int* shape, int ndim);
+
+// Copy evaluated f32 data out of an array into a caller-provided buffer.
+// Array is cast to float32 and eval'd. n must equal the total element count.
+// Returns 0 on success, -1 on size mismatch.
+int mlx_inline_to_f32_slice(mlx_inline_array* a, float* out, size_t n);
+
+// Stack arrays along a new axis
+void mlx_inline_stack(mlx_inline_array* dst, const mlx_inline_array* arrays, int num, int axis);
+
+// L2 norm along last axis (keepdims=true)
+void mlx_inline_norm_l2(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims);
+
 // Conv1d
 void mlx_inline_conv1d(mlx_inline_array* dst, const mlx_inline_array* input,
     const mlx_inline_array* weight, int stride, int padding, int dilation, int groups);

@@ -10,6 +10,7 @@ fn main() {
     let mut max_tokens: usize = 200;
     let mut temperature: f32 = 0.0;
     let mut use_cpp = false;
+    let mut tq_bits: Option<u8> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -18,13 +19,14 @@ fn main() {
             "--max-tokens" => { i += 1; max_tokens = args[i].parse().unwrap(); }
             "--temperature" => { i += 1; temperature = args[i].parse().unwrap(); }
             "--cpp" => { use_cpp = true; }
+            "--turboquant" => { i += 1; tq_bits = Some(args[i].parse().unwrap()); }
             _ => {}
         }
         i += 1;
     }
 
     if model_path.is_empty() {
-        eprintln!("Usage: native_qwen35 --model <path> [--max-tokens N] [--temperature T] [--cpp]");
+        eprintln!("Usage: native_qwen35 --model <path> [--max-tokens N] [--temperature T] [--cpp] [--turboquant BITS]");
         std::process::exit(1);
     }
 
@@ -45,7 +47,13 @@ fn main() {
 
     // Dummy prefill with a few tokens (no tokenizer in this example)
     let token_ids: Vec<i32> = vec![151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13];
-    let mut cache = pmetal_bridge::qwen3_native::NativeCache::new_empty(&weights);
+    let mut cache = if let Some(bits) = tq_bits {
+        let tq_config = pmetal_bridge::turboquant::TurboQuantConfig::uniform(bits, bits);
+        eprintln!("TurboQuant: {bits}-bit KV cache compression");
+        pmetal_bridge::qwen3_native::NativeCache::new_with_turboquant(&weights, Some(tq_config))
+    } else {
+        pmetal_bridge::qwen3_native::NativeCache::new_empty(&weights)
+    };
 
     let input = pmetal_bridge::InlineArray::from_i32_slice(&token_ids)
         .reshape(&[1, token_ids.len() as i32]);

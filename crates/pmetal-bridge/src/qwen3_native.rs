@@ -377,6 +377,8 @@ pub struct KvLayerCache {
     pub keys: Option<InlineArray>,   // [B, H, MAX_T, D] pre-allocated
     pub values: Option<InlineArray>, // [B, H, MAX_T, D] pre-allocated
     pub offset: i32,                 // number of valid tokens
+    /// TurboQuant compressed cache (replaces keys/values when enabled)
+    pub turboquant: Option<crate::turboquant::QuantizedKvCache>,
 }
 
 /// Full model cache — both GDN and KV layers.
@@ -384,6 +386,8 @@ pub struct NativeCache {
     pub gdn_caches: Vec<GdnCache>,
     pub kv_caches: Vec<KvLayerCache>,
     pub rope_offset: i32,
+    /// Shared TurboQuant state (rotation matrices, codebooks) — None = bf16 cache
+    pub turboquant_state: Option<std::sync::Arc<crate::turboquant::TurboQuantState>>,
 }
 
 impl NativeCache {
@@ -411,8 +415,26 @@ impl NativeCache {
 
     /// Create a fresh, empty cache for the given weight set.
     pub fn new_empty(weights: &NativeWeights) -> Self {
+        Self::new_with_turboquant(weights, None)
+    }
+
+    /// Create cache with optional TurboQuant KV compression.
+    pub fn new_with_turboquant(
+        weights: &NativeWeights,
+        tq_config: Option<crate::turboquant::TurboQuantConfig>,
+    ) -> Self {
         let mut gdn_caches = Vec::new();
         let mut kv_caches = Vec::new();
+
+        // Build shared TurboQuant state if enabled
+        let tq_state = tq_config.map(|cfg| {
+            // Use the first attention layer's head_dim for key/value dims
+            let head_dim = weights.layers.iter()
+                .find(|lw| !lw.is_linear)
+                .map(|lw| lw.attn_head_dim as usize)
+                .unwrap_or(128);
+            crate::turboquant::build_state(head_dim, head_dim, cfg)
+        });
 
         for lw in &weights.layers {
             if lw.is_linear {
@@ -421,10 +443,17 @@ impl NativeCache {
                     ssm_state: None,
                 });
             } else {
+                let tq_cache = tq_state.as_ref().map(|state| {
+                    crate::turboquant::new_cache_with_state(
+                        tq_config.unwrap(),
+                        state.clone(),
+                    )
+                });
                 kv_caches.push(KvLayerCache {
                     keys: None,
                     values: None,
                     offset: 0,
+                    turboquant: tq_cache,
                 });
             }
         }
@@ -433,6 +462,7 @@ impl NativeCache {
             gdn_caches,
             kv_caches,
             rope_offset: 0,
+            turboquant_state: tq_state,
         }
     }
 }
@@ -1333,26 +1363,35 @@ fn attn_forward(
         }
     }
 
-    let start = [0, 0, prev, 0];
-    let stop  = [b, n_kv_heads, next, head_dim];
-    let k_buf = cache.keys.take().unwrap();
-    let v_buf = cache.values.take().unwrap();
-    cache.keys   = Some(k_buf.slice_set(&keys, &start, &stop));
-    cache.values = Some(v_buf.slice_set(&values, &start, &stop));
-    cache.offset = next;
+    // KV cache update + SDPA
+    let output = if let Some(ref mut tq_cache) = cache.turboquant {
+        // TurboQuant path: quantize new K,V and store compressed
+        tq_cache.append(&keys, &values).ok();
+        // Dequantize full cache for SDPA
+        let full_keys = tq_cache.dequantize_keys()
+            .unwrap_or_else(|| keys.clone());
+        let full_values = tq_cache.dequantize_values()
+            .unwrap_or_else(|| values.clone());
+        cache.offset = next;
+        queries.sdpa(&full_keys, &full_values, scale, "causal")
+    } else {
+        // Standard bf16 path
+        let start = [0, 0, prev, 0];
+        let stop  = [b, n_kv_heads, next, head_dim];
+        let k_buf = cache.keys.take().unwrap();
+        let v_buf = cache.values.take().unwrap();
+        cache.keys   = Some(k_buf.slice_set(&keys, &start, &stop));
+        cache.values = Some(v_buf.slice_set(&values, &start, &stop));
+        cache.offset = next;
 
-    // SDPA on the valid portion of the buffer
-    let valid_keys = cache
-        .keys
-        .as_ref()
-        .unwrap()
-        .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
-    let valid_values = cache
-        .values
-        .as_ref()
-        .unwrap()
-        .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
-    let output = queries.sdpa(&valid_keys, &valid_values, scale, "causal");
+        let valid_keys = cache
+            .keys.as_ref().unwrap()
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+        let valid_values = cache
+            .values.as_ref().unwrap()
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+        queries.sdpa(&valid_keys, &valid_values, scale, "causal")
+    };
 
     // Output projection
     let output = output

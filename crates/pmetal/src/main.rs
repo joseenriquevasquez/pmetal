@@ -1264,6 +1264,23 @@ enum Commands {
         #[arg(long)]
         experts_dir: Option<String>,
 
+        /// Quantize weights to FP8 E4M3 at load time (~2x memory savings).
+        #[arg(long)]
+        fp8: bool,
+
+        /// KV cache quantization bits: 8 = q8_0, 4 = q4_0, 0 = fp16.
+        /// Omit for auto-selection based on model size and device memory budget.
+        #[arg(long)]
+        kv_quant: Option<u8>,
+
+        /// Disable KV cache quantization (use fp16 KV cache).
+        #[arg(long)]
+        no_kv_quant: bool,
+
+        /// Quantization group size for KV cache.
+        #[arg(long, default_value = "64")]
+        kv_group_size: usize,
+
         /// Enable TurboQuant KV cache compression (provably near-optimal, data-oblivious).
         /// Reduces KV cache memory 4-6x with near-zero quality loss.
         #[arg(long)]
@@ -2457,6 +2474,10 @@ async fn tokio_main() -> anyhow::Result<()> {
             host,
             max_seq_len,
             experts_dir,
+            fp8,
+            kv_quant,
+            no_kv_quant,
+            kv_group_size,
             kv_turboquant,
             kv_turboquant_preset,
             #[cfg(feature = "ane")]
@@ -2487,6 +2508,10 @@ async fn tokio_main() -> anyhow::Result<()> {
                 host,
                 max_seq_len,
                 experts_dir,
+                fp8,
+                kv_quant,
+                no_kv_quant,
+                kv_group_size,
                 kv_turboquant,
                 kv_turboquant_preset,
                 ane_enabled,

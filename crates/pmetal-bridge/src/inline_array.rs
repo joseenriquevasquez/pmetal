@@ -101,6 +101,12 @@ unsafe extern "C" {
     fn mlx_inline_item_f32(a: *mut RawBuf) -> f32;
     fn mlx_inline_item_u32(a: *mut RawBuf) -> u32;
 
+    fn mlx_inline_sign(dst: *mut RawBuf, a: *const RawBuf);
+    fn mlx_inline_from_f32_slice(dst: *mut RawBuf, data: *const f32, shape: *const i32, ndim: i32);
+    fn mlx_inline_to_f32_slice(a: *mut RawBuf, out: *mut f32, n: usize) -> i32;
+    fn mlx_inline_stack(dst: *mut RawBuf, arrays: *const RawBuf, num: i32, axis: i32);
+    fn mlx_inline_norm_l2(dst: *mut RawBuf, a: *const RawBuf, axis: i32, keepdims: bool);
+
     fn mlx_inline_conv1d(
         dst: *mut RawBuf,
         input: *const RawBuf,
@@ -753,6 +759,16 @@ impl InlineArray {
     unop!(t, mlx_inline_transpose);
     unop!(softplus, mlx_inline_softplus);
     unop!(log, mlx_inline_log);
+    unop!(sign, mlx_inline_sign);
+
+    /// L2 norm along an axis.
+    pub fn norm_l2(&self, axis: i32, keepdims: bool) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_norm_l2(dst.as_mut_ptr(), &self.raw, axis, keepdims);
+            Self { raw: dst.assume_init() }
+        }
+    }
 
     pub fn softmax(&self, axis: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
@@ -1083,6 +1099,34 @@ impl InlineArray {
                 None
             }
         }
+    }
+
+    /// Create an array from a flat f32 slice with an explicit shape.
+    ///
+    /// Zero-copy on the C++ side: MLX creates the array pointing at the data
+    /// which is then eval'd into a Metal buffer.  `shape` must satisfy
+    /// `shape.iter().product() == data.len()`.
+    pub fn from_f32_slice(data: &[f32], shape: &[i32]) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_from_f32_slice(
+                dst.as_mut_ptr(),
+                data.as_ptr(),
+                shape.as_ptr(),
+                shape.len() as i32,
+            );
+            Self { raw: dst.assume_init() }
+        }
+    }
+
+    /// Copy all f32 values out of this array into a `Vec<f32>`.
+    ///
+    /// The array is cast to f32 and evaluated (GPU → CPU sync) before copying.
+    /// Returns `None` when the element count doesn't match `n` or on dtype error.
+    pub fn to_f32_vec(&mut self, n: usize) -> Option<Vec<f32>> {
+        let mut out = vec![0.0f32; n];
+        let rc = unsafe { mlx_inline_to_f32_slice(&mut self.raw, out.as_mut_ptr(), n) };
+        if rc == 0 { Some(out) } else { None }
     }
 
     /// Create a 1-D int32 array from a Rust slice — zero copy for token IDs.
