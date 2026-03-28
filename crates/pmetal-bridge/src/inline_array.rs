@@ -102,6 +102,7 @@ unsafe extern "C" {
     fn mlx_inline_item_u32(a: *mut RawBuf) -> u32;
 
     fn mlx_inline_sign(dst: *mut RawBuf, a: *const RawBuf);
+    fn mlx_inline_dequantize(dst: *mut RawBuf, w: *const RawBuf, scales: *const RawBuf, biases: *const RawBuf, group_size: i32, bits: i32);
     fn mlx_inline_from_f32_slice(dst: *mut RawBuf, data: *const f32, shape: *const i32, ndim: i32);
     fn mlx_inline_to_f32_slice(a: *mut RawBuf, out: *mut f32, n: usize) -> i32;
     fn mlx_inline_stack(dst: *mut RawBuf, arrays: *const RawBuf, num: i32, axis: i32);
@@ -793,6 +794,15 @@ impl InlineArray {
     unop!(softplus, mlx_inline_softplus);
     unop!(log, mlx_inline_log);
     unop!(sign, mlx_inline_sign);
+
+    /// Dequantize packed integer weights using per-group scales and biases.
+    pub fn dequantize(&self, scales: &Self, biases: &Self, group_size: i32, bits: i32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_dequantize(dst.as_mut_ptr(), &self.raw, &scales.raw, &biases.raw, group_size, bits);
+            Self { raw: dst.assume_init() }
+        }
+    }
 
     /// L2 norm along an axis.
     pub fn norm_l2(&self, axis: i32, keepdims: bool) -> Self {

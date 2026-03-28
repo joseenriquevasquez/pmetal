@@ -193,8 +193,15 @@ void mlx_inline_take_along_axis(mlx_inline_array* dst, const mlx_inline_array* a
 }
 
 // Eval
-void mlx_inline_eval(mlx_inline_array* a) { as_arr(a).eval(); }
-void mlx_inline_async_eval(mlx_inline_array* a) { mlx::core::async_eval(as_arr(a)); }
+void mlx_inline_eval(mlx_inline_array* a) {
+    try { as_arr(a).eval(); }
+    catch (const std::exception& e) { fprintf(stderr, "[C++ EVAL EXCEPTION] %s\n", e.what()); }
+    catch (...) { fprintf(stderr, "[C++ EVAL EXCEPTION] unknown exception\n"); }
+}
+void mlx_inline_async_eval(mlx_inline_array* a) {
+    try { mlx::core::async_eval(as_arr(a)); }
+    catch (const std::exception& e) { fprintf(stderr, "[C++ ASYNC_EVAL EXCEPTION] %s\n", e.what()); }
+}
 
 // Factory
 void mlx_inline_from_f32(mlx_inline_array* dst, float val) { new (dst->buf) array(val); }
@@ -220,11 +227,29 @@ int mlx_inline_dtype(const mlx_inline_array* a) {
 }
 
 // Item extraction
-float mlx_inline_item_f32(mlx_inline_array* a) { as_arr(a).eval(); return as_arr(a).item<float>(); }
-uint32_t mlx_inline_item_u32(mlx_inline_array* a) { as_arr(a).eval(); return as_arr(a).item<uint32_t>(); }
+float mlx_inline_item_f32(mlx_inline_array* a) {
+    try { as_arr(a).eval(); return as_arr(a).item<float>(); }
+    catch (const std::exception& e) { fprintf(stderr, "[C++ ITEM_F32 EXCEPTION] %s\n", e.what()); return 0.0f; }
+}
+uint32_t mlx_inline_item_u32(mlx_inline_array* a) {
+    try { as_arr(a).eval(); return as_arr(a).item<uint32_t>(); }
+    catch (const std::exception& e) { fprintf(stderr, "[C++ ITEM_U32 EXCEPTION] %s\n", e.what()); return 0; }
+}
 
 void mlx_inline_sign(mlx_inline_array* dst, const mlx_inline_array* a) {
     new (dst->buf) array(mlx::core::sign(as_arr(a)));
+}
+
+void mlx_inline_dequantize(mlx_inline_array* dst, const mlx_inline_array* w,
+    const mlx_inline_array* scales, const mlx_inline_array* biases,
+    int group_size, int bits) {
+    try {
+        new (dst->buf) array(mlx::core::dequantize(
+            as_arr(w), as_arr(scales), as_arr(biases), group_size, bits));
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[C++ EXCEPTION] dequantize: %s\n", e.what());
+        new (dst->buf) array(0.0f);
+    }
 }
 
 void mlx_inline_from_f32_slice(mlx_inline_array* dst, const float* data, const int* shape, int ndim) {
@@ -619,12 +644,17 @@ void mlx_inline_quantized_matmul(mlx_inline_array* dst,
                                    const mlx_inline_array* x, const mlx_inline_array* w,
                                    const mlx_inline_array* scales, const mlx_inline_array* biases,
                                    bool transpose, int group_size, int bits) {
-    auto biases_opt = biases
-        ? std::optional<array>(as_arr(biases))
-        : std::optional<array>(std::nullopt);
-    new (dst->buf) array(mlx::core::quantized_matmul(
-        as_arr(x), as_arr(w), as_arr(scales), biases_opt,
-        transpose, group_size, bits));
+    try {
+        auto biases_opt = biases
+            ? std::optional<array>(as_arr(biases))
+            : std::optional<array>(std::nullopt);
+        new (dst->buf) array(mlx::core::quantized_matmul(
+            as_arr(x), as_arr(w), as_arr(scales), biases_opt,
+            transpose, group_size, bits));
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[C++ EXCEPTION] quantized_matmul: %s\n", e.what());
+        new (dst->buf) array(0.0f);
+    }
 }
 
 void mlx_inline_gather_qmm(mlx_inline_array* dst,

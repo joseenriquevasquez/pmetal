@@ -28,6 +28,12 @@ use crate::inline_array::RawBuf;
 fn default_rms_norm_eps() -> f32 {
     1e-6
 }
+fn default_quantization_bits() -> i32 {
+    4
+}
+fn default_quantization_group_size() -> i32 {
+    64
+}
 fn default_rope_theta() -> f64 {
     1_000_000.0
 }
@@ -119,6 +125,22 @@ pub struct Qwen3Config {
     /// Layer indices that use dense MLP even when MoE is active.
     #[serde(default)]
     pub mlp_only_layers: Vec<usize>,
+
+    /// Optional quantization config — present in 4-bit quantized checkpoints.
+    #[serde(default)]
+    pub quantization_config: Option<QuantizationConfig>,
+}
+
+/// Weight quantization parameters (from `quantization_config` in config.json).
+///
+/// Present in models quantized with `mlx_lm.convert --q-bits 4` or similar.
+/// The `mode` field is informational only — we always use affine dequant.
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuantizationConfig {
+    #[serde(default = "default_quantization_bits")]
+    pub bits: i32,
+    #[serde(default = "default_quantization_group_size")]
+    pub group_size: i32,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -243,6 +265,14 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<Qwen3Config, String> {
                 tc["model_type"] = mt.clone();
             }
         }
+        // Promote `quantization_config` from the outer JSON into text_config when
+        // present at the top level but absent from the nested config.  MLX-LM
+        // places it at the outer level for Qwen3.5 VLM checkpoints.
+        if tc.get("quantization_config").is_none() {
+            if let Some(qc) = json.get("quantization_config") {
+                tc["quantization_config"] = qc.clone();
+            }
+        }
         serde_json::to_string(&tc).map_err(|e| e.to_string())?
     } else {
         text
@@ -255,33 +285,155 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<Qwen3Config, String> {
 }
 
 // ============================================================================
+// Quantized / dense weight discriminant
+// ============================================================================
+
+/// A projection weight that is either a dense bf16 tensor or a 4-bit
+/// quantized triple (`weight`, `scales`, `biases`).
+///
+/// - **Dense**: single `InlineArray`, used with `x.matmul(w)`.
+/// - **Quantized**: three `InlineArray`s loaded from `{key}.weight`,
+///   `{key}.scales`, `{key}.biases`; used with
+///   `x.quantized_matmul(w, scales, biases, transpose=true, group_size, bits)`.
+///
+/// The `transpose=true` flag is standard: MLX stores quantized weights in
+/// row-major `[out, in/group_size]` layout and expects the caller to signal
+/// that the weight logically needs transposing for the matmul (i.e. the same
+/// semantic as storing the dense weight transposed as `[in, out]`).
+///
+/// Dense weights are pre-transposed at load time (`w.t()`); quantized weights
+/// are stored as-is from the checkpoint and the `transpose=true` flag handles
+/// the layout internally inside `mx.quantized_matmul`.
+#[derive(Clone)]
+pub enum LayerWeight {
+    Dense(InlineArray),
+    Quantized {
+        weight: InlineArray,   // packed uint32: shape [out, in/(32/bits)]
+        scales: InlineArray,   // per-group scale: shape [out, in/group_size]
+        biases: InlineArray,   // per-group bias:  shape [out, in/group_size]
+        group_size: i32,
+        bits: i32,
+    },
+}
+
+impl LayerWeight {
+    /// Get the underlying weight tensor (for use in copy_fresh or pointer export).
+    pub fn weight_arr(&self) -> &InlineArray {
+        match self {
+            LayerWeight::Dense(w) => w,
+            LayerWeight::Quantized { weight, .. } => weight,
+        }
+    }
+
+    /// `x @ self` — dispatches to `quantized_matmul` or `matmul` as appropriate.
+    ///
+    /// For dense weights: `x.matmul(w)` — weight is pre-transposed `[in, out]`.
+    /// For quantized:    `x.quantized_matmul(w, scales, biases, true, gs, bits)`.
+    #[inline(always)]
+    pub fn matmul_from(&self, x: &InlineArray) -> InlineArray {
+        match self {
+            LayerWeight::Dense(w) => x.matmul(w),
+            LayerWeight::Quantized { weight, scales, biases, group_size, bits } => {
+                x.quantized_matmul(weight, scales, Some(biases), true, *group_size, *bits)
+            }
+        }
+    }
+
+    /// Gather-matmul: `gather_mm` for dense, `gather_qmm` for quantized.
+    ///
+    /// Used by MoE expert dispatch.  All expert tensors in a layer must have
+    /// the same variant — mixing dense and quantized experts is not supported.
+    #[inline(always)]
+    pub fn gather_mm_from(
+        &self,
+        x: &InlineArray,
+        lhs_indices: Option<&InlineArray>,
+        rhs_indices: Option<&InlineArray>,
+        sorted: bool,
+    ) -> InlineArray {
+        match self {
+            LayerWeight::Dense(w) => x.gather_mm(w, lhs_indices, rhs_indices, sorted),
+            LayerWeight::Quantized { weight, scales, biases, group_size, bits } => {
+                x.gather_qmm(
+                    weight, scales, Some(biases),
+                    lhs_indices, rhs_indices,
+                    true, *group_size, *bits, sorted,
+                )
+            }
+        }
+    }
+
+    /// Apply `copy_fresh` to all arrays in this weight (add zero + eval + detach).
+    pub fn copy_fresh(&self, zero: &InlineArray) -> Self {
+        match self {
+            LayerWeight::Dense(w) => LayerWeight::Dense(copy_fresh_arr(w, zero)),
+            LayerWeight::Quantized { weight, scales, biases, group_size, bits } => {
+                // For quantized weights the zero must be int32 (weight dtype)
+                // for the weight tensor and float for scales/biases.
+                // Use add-zero on each independently via eval+detach.
+                let w2 = copy_fresh_arr(weight, zero);
+                let s2 = copy_fresh_arr(scales, zero);
+                let b2 = copy_fresh_arr(biases, zero);
+                LayerWeight::Quantized {
+                    weight: w2, scales: s2, biases: b2,
+                    group_size: *group_size, bits: *bits,
+                }
+            }
+        }
+    }
+}
+
+/// Force a single array into a fresh Metal buffer (add zero + eval + detach).
+/// This is the implementation detail shared by `LayerWeight::copy_fresh`.
+fn copy_fresh_arr(w: &InlineArray, _hint_zero: &InlineArray) -> InlineArray {
+    // For quantized weights (uint32 packed), skip copy_fresh — they're already
+    // loaded directly through pmetal-bridge's MLX and don't need data duplication.
+    let dt = w.dtype_raw();
+    if dt == 3 /* uint32 */ {
+        // Just eval + detach without add
+        let mut fresh = w.clone();
+        fresh.eval();
+        fresh.detach();
+        return fresh;
+    }
+    let own_zero = InlineArray::zeros(&[1], dt);
+    let mut fresh = w.add(&own_zero);
+    fresh.eval();
+    fresh.detach();
+    fresh
+}
+
+// ============================================================================
 // Per-layer weights
 // ============================================================================
 
 struct LayerWeights {
     is_linear: bool,
 
-    // Shared: layer norms
+    // Shared: layer norms (never quantized — 1D tensors)
     input_ln_w: InlineArray,
     input_ln_eps: f32,
     post_ln_w: InlineArray,
     post_ln_eps: f32,
 
     // Dense MLP (when !is_moe_layer)
-    mlp_gate_w: Option<InlineArray>, // pre-transposed [in, out]
-    mlp_up_w: Option<InlineArray>,   // pre-transposed [in, out]
-    mlp_down_w: Option<InlineArray>, // pre-transposed [in, out]
+    // LayerWeight handles both dense [in, out] and quantized [out, in/g] + scales + biases.
+    mlp_gate_w: Option<LayerWeight>,
+    mlp_up_w: Option<LayerWeight>,
+    mlp_down_w: Option<LayerWeight>,
 
     // MoE (when is_moe_layer)
-    // Expert weights stacked: [E, in, out] (pre-transposed for gather_mm).
-    moe_router_w: Option<InlineArray>,    // [hidden, num_experts] (pre-transposed)
-    moe_gate_w: Option<InlineArray>,      // [E, hidden, moe_intermediate] — ready for gather_mm
-    moe_up_w: Option<InlineArray>,        // [E, hidden, moe_intermediate]
-    moe_down_w: Option<InlineArray>,      // [E, moe_intermediate, hidden]
-    shared_gate_w: Option<InlineArray>,   // [hidden, shared_intermediate]
-    shared_up_w: Option<InlineArray>,     // [hidden, shared_intermediate]
-    shared_down_w: Option<InlineArray>,   // [shared_intermediate, hidden]
-    shared_expert_gate_w: Option<InlineArray>, // [hidden, 1]
+    // router is never quantized (small [num_experts, hidden] matrix).
+    // Expert stacked tensors: [E, in, out] dense or quantized.
+    moe_router_w: Option<InlineArray>,    // [hidden, num_experts] (pre-transposed, never quant)
+    moe_gate_w: Option<LayerWeight>,      // [E, hidden, moe_intermediate] — ready for gather_mm/qmm
+    moe_up_w: Option<LayerWeight>,        // [E, hidden, moe_intermediate]
+    moe_down_w: Option<LayerWeight>,      // [E, moe_intermediate, hidden]
+    shared_gate_w: Option<LayerWeight>,   // [hidden, shared_intermediate]
+    shared_up_w: Option<LayerWeight>,     // [hidden, shared_intermediate]
+    shared_down_w: Option<LayerWeight>,   // [shared_intermediate, hidden]
+    // shared_expert_gate is a tiny [hidden, 1] Linear — never quantized in practice.
+    shared_expert_gate_w: Option<InlineArray>,
 
     // MoE config duplicated here to avoid borrowing config in the forward fn.
     moe_top_k: i32,
@@ -291,10 +443,12 @@ struct LayerWeights {
     is_moe_layer: bool,
 
     // Attention-specific (only when !is_linear)
-    attn_q_w: Option<InlineArray>,      // pre-transposed
-    attn_k_w: Option<InlineArray>,
-    attn_v_w: Option<InlineArray>,
-    attn_o_w: Option<InlineArray>,
+    // q/k/v/o projections can be quantized.
+    attn_q_w: Option<LayerWeight>,
+    attn_k_w: Option<LayerWeight>,
+    attn_v_w: Option<LayerWeight>,
+    attn_o_w: Option<LayerWeight>,
+    // Q/K norms: 1D, never quantized.
     attn_q_norm_w: Option<InlineArray>,
     attn_q_norm_eps: f32,
     attn_k_norm_w: Option<InlineArray>,
@@ -313,18 +467,22 @@ struct LayerWeights {
     attn_gated: bool,
 
     // GDN-specific (only when is_linear)
-    gdn_qkv_w: Option<InlineArray>,  // in_proj_qkv, pre-transposed [hidden, conv_dim]
-    gdn_z_w: Option<InlineArray>,    // in_proj_z, pre-transposed [hidden, value_dim]
-    gdn_b_w: Option<InlineArray>,    // in_proj_b, pre-transposed [hidden, num_v_heads]
-    gdn_a_w: Option<InlineArray>,    // in_proj_a, pre-transposed [hidden, num_v_heads]
+    // in_proj and out_proj are large and can be quantized.
+    gdn_qkv_w: Option<LayerWeight>,  // in_proj_qkv
+    gdn_z_w: Option<LayerWeight>,    // in_proj_z
+    gdn_b_w: Option<LayerWeight>,    // in_proj_b
+    gdn_a_w: Option<LayerWeight>,    // in_proj_a
+    // conv1d weight is small and never quantized.
     gdn_conv_w: Option<InlineArray>,
+    // Q/K norm weights: 1D, never quantized.
     gdn_q_nw: Option<InlineArray>,
     gdn_k_nw: Option<InlineArray>,
+    // a_log and dt_bias are GDN-specific scalars, never quantized.
     gdn_a_log: Option<InlineArray>,
     gdn_dt_bias: Option<InlineArray>,
     gdn_norm_w: Option<InlineArray>,
     gdn_norm_eps: f32,
-    gdn_out_w: Option<InlineArray>, // pre-transposed
+    gdn_out_w: Option<LayerWeight>,
     gdn_nv: i32,
     gdn_nk: i32,
     gdn_dk: i32,
@@ -341,11 +499,15 @@ struct LayerWeights {
 /// All model weights as InlineArray. Zero dependency on mlx-rs.
 pub struct NativeWeights {
     pub embed_w: InlineArray,
+    /// Quantized embedding: scales + biases (None for dense models)
+    pub embed_scales: Option<InlineArray>,
+    pub embed_biases: Option<InlineArray>,
     pub final_norm_w: InlineArray,
     pub final_norm_eps: f32,
     /// None when `tie_word_embeddings = true`.
     pub lm_head_w: Option<InlineArray>,
     pub tie_word_embeddings: bool,
+    pub quantization_config: Option<QuantizationConfig>,
     /// Per-layer weights — opaque to callers; only accessed via [`forward_step`].
     layers: Vec<LayerWeights>,
     /// Model activation dtype (e.g., 11 = bfloat16).
@@ -480,6 +642,66 @@ impl std::fmt::Debug for NativeCache {
 // ============================================================================
 // Weight loading
 // ============================================================================
+
+// ============================================================================
+// Diagnostics helpers
+// ============================================================================
+
+/// Returns `true` if any projection weight in the loaded layers is `Quantized`.
+/// Used to confirm at load time that quantized models were loaded correctly.
+fn weights_are_quantized(layers: &[LayerWeights]) -> bool {
+    for lw in layers {
+        if let Some(LayerWeight::Quantized { .. }) = lw.mlp_gate_w { return true; }
+        if let Some(LayerWeight::Quantized { .. }) = lw.attn_q_w   { return true; }
+        if let Some(LayerWeight::Quantized { .. }) = lw.gdn_qkv_w  { return true; }
+    }
+    false
+}
+
+// ============================================================================
+// MoE quantized expert stacking helper
+// ============================================================================
+
+/// Load pre-stacked MoE expert weights as a `LayerWeight`.
+///
+/// After Step 3e, the stacked weight tensor lives at `{base_key}.weight`.
+/// For quantized models the stacking loop also stored:
+///   `{base_key}.scales`  — [E, out, in/group_size] stacked scales
+///   `{base_key}.biases`  — [E, out, in/group_size] stacked biases
+///
+/// If both scales and biases are present → `LayerWeight::Quantized`.
+/// Otherwise → `LayerWeight::Dense` (the weight is already in [E, in, out] form
+/// from the stacking step, so no additional transpose is needed).
+fn get_stacked_expert_weight(
+    raw: &std::collections::HashMap<String, InlineArray>,
+    base_key: &str,
+    group_size: i32,
+    bits: i32,
+) -> Result<LayerWeight, String> {
+    let w_key = format!("{base_key}.weight");
+    let s_key = format!("{base_key}.scales");
+    let b_key = format!("{base_key}.biases");
+
+    let w = raw.get(&w_key).cloned().ok_or_else(|| {
+        format!("missing stacked expert weight: {w_key}")
+    })?;
+
+    match (raw.get(&s_key), raw.get(&b_key)) {
+        (Some(scales), Some(biases)) => {
+            Ok(LayerWeight::Quantized {
+                weight: w,
+                scales: scales.clone(),
+                biases: biases.clone(),
+                group_size,
+                bits,
+            })
+        }
+        _ => {
+            // Dense — already [E, in, out]; no transpose needed.
+            Ok(LayerWeight::Dense(w))
+        }
+    }
+}
 
 /// Load model weights from a directory containing safetensors shards.
 ///
@@ -661,11 +883,18 @@ pub fn load_model(
     //   to_join = [weights[f"{prefix}.experts.{e}.{n}.weight"] for e in range(E)]
     //   weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(to_join)
     //
-    // `gather_mm` in SwitchLinear calls `weight.swapaxes(-1,-2)` at forward
-    // time (so it uses [E, in, out] at runtime).  We pre-transpose to
-    // [E, in, out] here so the forward pass can call gather_mm directly
-    // without the extra transpose node.  For down_proj the stacked shape is
-    // [E, moe_intermediate, hidden]; transposed → [E, hidden, moe_intermediate].
+    // For dense weights:
+    //   `gather_mm` in SwitchLinear calls `weight.swapaxes(-1,-2)` at forward
+    //   time (so it uses [E, in, out] at runtime).  We pre-transpose to
+    //   [E, in, out] here so the forward pass can call gather_mm directly
+    //   without the extra transpose node.
+    //
+    // For quantized weights:
+    //   Each expert has `.weight`, `.scales`, `.biases`.
+    //   We stack weight: [E, out, in_packed] — no transpose (gather_qmm handles layout).
+    //   We stack scales: [E, out, in/group_size].
+    //   We stack biases: [E, out, in/group_size].
+    //   These are stored under "switch_mlp.{proj}.weight/.scales/.biases".
     //
     // We store the stacked tensors under "switch_mlp.{n}.weight" keys matching
     // the post-sanitize Python layout for clarity, then look them up by layer.
@@ -676,26 +905,65 @@ pub fn load_model(
             }
             let prefix = format!("model.layers.{li}.mlp");
             for proj in &["gate_proj", "up_proj", "down_proj"] {
-                // Collect all E per-expert tensors.
-                let mut shards: Vec<InlineArray> =
-                    Vec::with_capacity(config.num_experts as usize);
-                for e in 0..config.num_experts as usize {
-                    let key = format!("{prefix}.experts.{e}.{proj}.weight");
-                    let w = raw.remove(&key).ok_or_else(|| {
-                        format!("MoE: missing expert weight {key}")
-                    })?;
-                    shards.push(w);
+                // Detect whether first expert is quantized.
+                let is_quantized = raw.contains_key(
+                    &format!("{prefix}.experts.0.{proj}.scales")
+                );
+
+                if is_quantized {
+                    // Quantized: stack weight, scales, biases separately.
+                    let mut w_shards: Vec<InlineArray> = Vec::with_capacity(config.num_experts as usize);
+                    let mut s_shards: Vec<InlineArray> = Vec::with_capacity(config.num_experts as usize);
+                    let mut b_shards: Vec<InlineArray> = Vec::with_capacity(config.num_experts as usize);
+
+                    for e in 0..config.num_experts as usize {
+                        let wk = format!("{prefix}.experts.{e}.{proj}.weight");
+                        let sk = format!("{prefix}.experts.{e}.{proj}.scales");
+                        let bk = format!("{prefix}.experts.{e}.{proj}.biases");
+                        w_shards.push(raw.remove(&wk).ok_or_else(|| format!("MoE quant: missing {wk}"))?);
+                        s_shards.push(raw.remove(&sk).ok_or_else(|| format!("MoE quant: missing {sk}"))?);
+                        b_shards.push(raw.remove(&bk).ok_or_else(|| format!("MoE quant: missing {bk}"))?);
+                    }
+
+                    // Stack: weight [E, out, in_packed], scales [E, out, in/g], biases same.
+                    // For quantized gather_qmm the weight layout is [E, out, in_packed]
+                    // (no pre-transpose — gather_qmm handles the implicit transpose via
+                    // the `transpose=true` flag we pass in LayerWeight::gather_mm_from).
+                    let w_stacked = stack_arrays(w_shards, 0)?;
+                    let s_stacked = stack_arrays(s_shards, 0)?;
+                    let b_stacked = stack_arrays(b_shards, 0)?;
+
+                    raw.insert(format!("{prefix}.switch_mlp.{proj}.weight"), w_stacked);
+                    raw.insert(format!("{prefix}.switch_mlp.{proj}.scales"), s_stacked);
+                    raw.insert(format!("{prefix}.switch_mlp.{proj}.biases"), b_stacked);
+                } else {
+                    // Dense: collect and pre-transpose to [E, in, out] for gather_mm.
+                    let mut shards: Vec<InlineArray> =
+                        Vec::with_capacity(config.num_experts as usize);
+                    for e in 0..config.num_experts as usize {
+                        let key = format!("{prefix}.experts.{e}.{proj}.weight");
+                        let w = raw.remove(&key).ok_or_else(|| {
+                            format!("MoE: missing expert weight {key}")
+                        })?;
+                        shards.push(w);
+                    }
+                    // Stack [E, out, in] → then transpose to [E, in, out] for gather_mm.
+                    let stacked = stack_arrays(shards, 0)?;
+                    let transposed = stacked.transpose_axes(&[0, 2, 1]);
+                    raw.insert(format!("{prefix}.switch_mlp.{proj}.weight"), transposed);
                 }
-                // Stack [E, out, in] → then transpose to [E, in, out] for gather_mm.
-                let stacked = stack_arrays(shards, 0)?;
-                // stacked: [E, out, in] → transpose last two axes → [E, in, out]
-                let transposed = stacked.transpose_axes(&[0, 2, 1]);
-                raw.insert(format!("{prefix}.switch_mlp.{proj}.weight"), transposed);
             }
         }
     }
 
     // ── Step 4: Build per-layer weight structs ──────────────────────────────
+    // Quantization params — present only in quantized checkpoints.
+    let (q_bits, q_group_size) = config
+        .quantization_config
+        .as_ref()
+        .map(|qc| (qc.bits, qc.group_size))
+        .unwrap_or((4, 64));
+
     let get = |key: &str| -> Result<InlineArray, String> {
         raw.get(key)
             .cloned()
@@ -711,7 +979,40 @@ pub fn load_model(
             })
     };
 
+    // Load a projection weight as `LayerWeight`, auto-detecting quantized format.
+    //
+    // For a dense weight stored at `{base_key}.weight`, looks up sibling keys
+    // `{base_key}.scales` and `{base_key}.biases`.  When both are present the
+    // weight is loaded as `LayerWeight::Quantized` (no transpose — the caller
+    // passes `transpose=true` to `quantized_matmul` at runtime).  Otherwise
+    // falls back to `LayerWeight::Dense` with the weight pre-transposed.
+    //
+    // `base_key` is the full key WITHOUT the trailing `.weight` suffix.
+    let get_layer_weight = |base_key: &str| -> Result<LayerWeight, String> {
+        let w_key = format!("{base_key}.weight");
+        let s_key = format!("{base_key}.scales");
+        let b_key = format!("{base_key}.biases");
+        match (raw.get(&w_key), raw.get(&s_key), raw.get(&b_key)) {
+            (Some(w), Some(s), Some(b)) => {
+                Ok(LayerWeight::Quantized {
+                    weight: w.clone(),
+                    scales: s.clone(),
+                    biases: b.clone(),
+                    group_size: q_group_size,
+                    bits: q_bits,
+                })
+            }
+            _ => {
+                // Dense path: load `.weight` and pre-transpose for matmul.
+                let w = get(&w_key)?;
+                Ok(LayerWeight::Dense(w.t()))
+            }
+        }
+    };
+
     let embed_w = get("model.embed_tokens.weight")?;
+    let embed_scales = get("model.embed_tokens.scales").ok();
+    let embed_biases = get("model.embed_tokens.biases").ok();
     let final_norm_w = get("model.norm.weight")?;
     let final_norm_eps = config.rms_norm_eps;
     let lm_head_w = if config.tie_word_embeddings {
@@ -769,18 +1070,27 @@ pub fn load_model(
         ) = if is_moe_layer {
             // MoE layer: router + stacked experts + shared expert.
             // router gate: stored as [num_experts, hidden]; transpose to [hidden, num_experts].
+            // The router is a tiny matrix and is never quantized.
             let router = get(&format!("{p}.mlp.gate.weight"))?.t();
-            let moe_gate = get(&format!("{p}.mlp.switch_mlp.gate_proj.weight"))?;
-            let moe_up = get(&format!("{p}.mlp.switch_mlp.up_proj.weight"))?;
-            let moe_down = get(&format!("{p}.mlp.switch_mlp.down_proj.weight"))?;
-            // Shared expert weights — stored [out, in]; transpose for matmul.
-            let sh_gate = get(&format!("{p}.mlp.shared_expert.gate_proj.weight"))?.t();
-            let sh_up = get(&format!("{p}.mlp.shared_expert.up_proj.weight"))?.t();
-            let sh_down = get(&format!("{p}.mlp.shared_expert.down_proj.weight"))?.t();
-            // Shared expert gate: [1, hidden]; squeeze to [hidden, 1] or keep as [1, hidden].
-            // Python: sigmoid(self.shared_expert_gate(x)) — x: [B*T, hidden],
-            //   shared_expert_gate is Linear(hidden, 1), output: [B*T, 1].
-            // We store as [1, hidden] (stored) → .t() → [hidden, 1].
+
+            // Stacked expert weights were placed under "switch_mlp.{proj}.weight" during
+            // Step 3e above.  For quantized models the stacking loop also placed
+            // "switch_mlp.{proj}.scales" and ".biases" — check for those here.
+            let moe_gate = get_stacked_expert_weight(
+                &raw, &format!("{p}.mlp.switch_mlp.gate_proj"), q_group_size, q_bits,
+            )?;
+            let moe_up = get_stacked_expert_weight(
+                &raw, &format!("{p}.mlp.switch_mlp.up_proj"), q_group_size, q_bits,
+            )?;
+            let moe_down = get_stacked_expert_weight(
+                &raw, &format!("{p}.mlp.switch_mlp.down_proj"), q_group_size, q_bits,
+            )?;
+
+            // Shared expert weights — may be quantized.
+            let sh_gate = get_layer_weight(&format!("{p}.mlp.shared_expert.gate_proj"))?;
+            let sh_up   = get_layer_weight(&format!("{p}.mlp.shared_expert.up_proj"))?;
+            let sh_down = get_layer_weight(&format!("{p}.mlp.shared_expert.down_proj"))?;
+            // Shared expert gate: [1, hidden]; tiny matrix, never quantized.
             let sh_eg = get(&format!("{p}.mlp.shared_expert_gate.weight"))?.t();
             (
                 None, None, None,
@@ -794,10 +1104,10 @@ pub fn load_model(
                 Some(sh_eg),
             )
         } else {
-            // Dense MLP.
-            let gate = get(&format!("{p}.mlp.gate_proj.weight"))?.t();
-            let up   = get(&format!("{p}.mlp.up_proj.weight"))?.t();
-            let down = get(&format!("{p}.mlp.down_proj.weight"))?.t();
+            // Dense MLP — may be quantized.
+            let gate = get_layer_weight(&format!("{p}.mlp.gate_proj"))?;
+            let up   = get_layer_weight(&format!("{p}.mlp.up_proj"))?;
+            let down = get_layer_weight(&format!("{p}.mlp.down_proj"))?;
             (
                 Some(gate), Some(up), Some(down),
                 None, None, None, None, None, None, None, None,
@@ -865,10 +1175,12 @@ pub fn load_model(
 
         if is_linear {
             let la = format!("{p}.linear_attn");
-            lw.gdn_qkv_w = Some(get(&format!("{la}.in_proj_qkv.weight"))?.t());
-            lw.gdn_z_w   = Some(get(&format!("{la}.in_proj_z.weight"))?.t());
-            lw.gdn_b_w   = Some(get(&format!("{la}.in_proj_b.weight"))?.t());
-            lw.gdn_a_w   = Some(get(&format!("{la}.in_proj_a.weight"))?.t());
+            // in_proj and out_proj are large matrices — can be quantized.
+            lw.gdn_qkv_w = Some(get_layer_weight(&format!("{la}.in_proj_qkv"))?);
+            lw.gdn_z_w   = Some(get_layer_weight(&format!("{la}.in_proj_z"))?);
+            lw.gdn_b_w   = Some(get_layer_weight(&format!("{la}.in_proj_b"))?);
+            lw.gdn_a_w   = Some(get_layer_weight(&format!("{la}.in_proj_a"))?);
+            // conv1d weight is a small 3D tensor — never quantized.
             lw.gdn_conv_w = Some(get(&format!("{la}.conv1d.weight"))?);
 
             // Q/K scale weights are SYNTHETIC — not present in safetensors.
@@ -901,7 +1213,8 @@ pub fn load_model(
             lw.gdn_a_log   = Some(get(&format!("{la}.a_log"))?);
             lw.gdn_dt_bias = Some(get(&format!("{la}.dt_bias"))?);
             lw.gdn_norm_w  = Some(get(&format!("{la}.norm.weight"))?);
-            lw.gdn_out_w   = Some(get(&format!("{la}.out_proj.weight"))?.t());
+            // out_proj is a large matrix — can be quantized.
+            lw.gdn_out_w   = Some(get_layer_weight(&format!("{la}.out_proj"))?);
             lw.gdn_nv = nv;
             lw.gdn_nk = nk;
             lw.gdn_dk = dk;
@@ -922,10 +1235,11 @@ pub fn load_model(
             //   Qwen3.5: [n_heads * head_dim * 2, hidden]  (queries + gate concatenated)
             // We just load whatever is in the checkpoint; the forward pass
             // uses `attn_gated` to decide how to interpret the output.
-            lw.attn_q_w      = Some(get(&format!("{sa}.q_proj.weight"))?.t());
-            lw.attn_k_w      = Some(get(&format!("{sa}.k_proj.weight"))?.t());
-            lw.attn_v_w      = Some(get(&format!("{sa}.v_proj.weight"))?.t());
-            lw.attn_o_w      = Some(get(&format!("{sa}.o_proj.weight"))?.t());
+            lw.attn_q_w      = Some(get_layer_weight(&format!("{sa}.q_proj"))?);
+            lw.attn_k_w      = Some(get_layer_weight(&format!("{sa}.k_proj"))?);
+            lw.attn_v_w      = Some(get_layer_weight(&format!("{sa}.v_proj"))?);
+            lw.attn_o_w      = Some(get_layer_weight(&format!("{sa}.o_proj"))?);
+            // Q/K norms are 1D scale vectors — never quantized.
             lw.attn_q_norm_w = Some(get(&format!("{sa}.q_norm.weight"))?);
             lw.attn_k_norm_w = Some(get(&format!("{sa}.k_norm.weight"))?);
             lw.attn_n_heads    = n_heads;
@@ -942,67 +1256,81 @@ pub fn load_model(
 
     // ── Step 5: copy_fresh — force all weights into fresh Metal buffers ─────
     //
-    // `w.add(zero).eval().detach()` creates a new buffer with use_count=1.
-    // Without this, weights share data with the raw tensors (use_count=2),
-    // preventing optimal Metal buffer scheduling. Detach severs the graph
-    // chains accumulated by the transpose/add ops above.
+    // For dense InlineArray weights: `w.add(zero).eval().detach()` creates a
+    // new buffer with use_count=1.  Without this, weights share data with the
+    // raw tensors (use_count=2), preventing optimal Metal buffer scheduling.
+    //
+    // For LayerWeight: `LayerWeight::copy_fresh` handles each tensor (weight,
+    // scales, biases) independently using a same-dtype zero.
     let zero = InlineArray::from_f32(0.0).as_dtype(model_dtype);
-    let copy_fresh = |w: &InlineArray| -> InlineArray {
-        let mut fresh = w.add(&zero);
-        fresh.eval();
-        fresh.detach();
-        fresh
-    };
+    let cf_arr = |w: &InlineArray| -> InlineArray { copy_fresh_arr(w, &zero) };
+    let cf_lw  = |w: &LayerWeight| -> LayerWeight  { w.copy_fresh(&zero) };
 
-    let embed_w = copy_fresh(&embed_w);
-    let final_norm_w = copy_fresh(&final_norm_w);
-    let lm_head_w = lm_head_w.map(|w| copy_fresh(&w));
+    let embed_w = cf_arr(&embed_w);
+    let final_norm_w = cf_arr(&final_norm_w);
+    let lm_head_w = lm_head_w.map(|w| cf_arr(&w));
 
     for lw in &mut layers {
-        lw.input_ln_w = copy_fresh(&lw.input_ln_w);
-        lw.post_ln_w  = copy_fresh(&lw.post_ln_w);
-        // Dense MLP
-        if let Some(ref w) = lw.mlp_gate_w { lw.mlp_gate_w = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.mlp_up_w   { lw.mlp_up_w   = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.mlp_down_w { lw.mlp_down_w = Some(copy_fresh(w)); }
-        // MoE
-        if let Some(ref w) = lw.moe_router_w       { lw.moe_router_w       = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.moe_gate_w         { lw.moe_gate_w         = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.moe_up_w           { lw.moe_up_w           = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.moe_down_w         { lw.moe_down_w         = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.shared_gate_w      { lw.shared_gate_w      = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.shared_up_w        { lw.shared_up_w        = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.shared_down_w      { lw.shared_down_w      = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.shared_expert_gate_w { lw.shared_expert_gate_w = Some(copy_fresh(w)); }
-        // Attention
-        if let Some(ref w) = lw.attn_q_w      { lw.attn_q_w      = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.attn_k_w      { lw.attn_k_w      = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.attn_v_w      { lw.attn_v_w      = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.attn_o_w      { lw.attn_o_w      = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.attn_q_norm_w { lw.attn_q_norm_w = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.attn_k_norm_w { lw.attn_k_norm_w = Some(copy_fresh(w)); }
-        // GDN
-        if let Some(ref w) = lw.gdn_qkv_w    { lw.gdn_qkv_w    = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.gdn_z_w      { lw.gdn_z_w      = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.gdn_b_w      { lw.gdn_b_w      = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.gdn_a_w      { lw.gdn_a_w      = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.gdn_conv_w   { lw.gdn_conv_w   = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.gdn_q_nw     { lw.gdn_q_nw     = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.gdn_k_nw     { lw.gdn_k_nw     = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.gdn_a_log    { lw.gdn_a_log    = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.gdn_dt_bias  { lw.gdn_dt_bias  = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.gdn_norm_w   { lw.gdn_norm_w   = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.gdn_out_w    { lw.gdn_out_w    = Some(copy_fresh(w)); }
+        lw.input_ln_w = cf_arr(&lw.input_ln_w);
+        lw.post_ln_w  = cf_arr(&lw.post_ln_w);
+        // Dense MLP (LayerWeight)
+        if let Some(ref w) = lw.mlp_gate_w { lw.mlp_gate_w = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.mlp_up_w   { lw.mlp_up_w   = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.mlp_down_w { lw.mlp_down_w = Some(cf_lw(w)); }
+        // MoE — router is InlineArray; stacked expert weights are LayerWeight
+        if let Some(ref w) = lw.moe_router_w       { lw.moe_router_w       = Some(cf_arr(w)); }
+        if let Some(ref w) = lw.moe_gate_w         { lw.moe_gate_w         = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.moe_up_w           { lw.moe_up_w           = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.moe_down_w         { lw.moe_down_w         = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.shared_gate_w      { lw.shared_gate_w      = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.shared_up_w        { lw.shared_up_w        = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.shared_down_w      { lw.shared_down_w      = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.shared_expert_gate_w { lw.shared_expert_gate_w = Some(cf_arr(w)); }
+        // Attention projections (LayerWeight); norms are InlineArray
+        if let Some(ref w) = lw.attn_q_w      { lw.attn_q_w      = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.attn_k_w      { lw.attn_k_w      = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.attn_v_w      { lw.attn_v_w      = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.attn_o_w      { lw.attn_o_w      = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.attn_q_norm_w { lw.attn_q_norm_w = Some(cf_arr(w)); }
+        if let Some(ref w) = lw.attn_k_norm_w { lw.attn_k_norm_w = Some(cf_arr(w)); }
+        // GDN projections (LayerWeight); small tensors are InlineArray
+        if let Some(ref w) = lw.gdn_qkv_w    { lw.gdn_qkv_w    = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.gdn_z_w      { lw.gdn_z_w      = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.gdn_b_w      { lw.gdn_b_w      = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.gdn_a_w      { lw.gdn_a_w      = Some(cf_lw(w)); }
+        if let Some(ref w) = lw.gdn_conv_w   { lw.gdn_conv_w   = Some(cf_arr(w)); }
+        if let Some(ref w) = lw.gdn_q_nw     { lw.gdn_q_nw     = Some(cf_arr(w)); }
+        if let Some(ref w) = lw.gdn_k_nw     { lw.gdn_k_nw     = Some(cf_arr(w)); }
+        if let Some(ref w) = lw.gdn_a_log    { lw.gdn_a_log    = Some(cf_arr(w)); }
+        if let Some(ref w) = lw.gdn_dt_bias  { lw.gdn_dt_bias  = Some(cf_arr(w)); }
+        if let Some(ref w) = lw.gdn_norm_w   { lw.gdn_norm_w   = Some(cf_arr(w)); }
+        if let Some(ref w) = lw.gdn_out_w    { lw.gdn_out_w    = Some(cf_lw(w)); }
     }
 
-    eprintln!("[NATIVE] load_model: force-copied all weights into fresh Metal buffers");
+    // Determine quantization mode for diagnostic output.
+    let quant_mode = if let Some(ref qc) = config.quantization_config {
+        // Inspect the first projection weight to confirm quantized loading succeeded.
+        let confirmed = weights_are_quantized(&layers);
+        format!(
+            "quantized {}-bit (group_size={}) confirmed={}",
+            qc.bits, qc.group_size, confirmed,
+        )
+    } else {
+        "dense bf16".to_string()
+    };
+    eprintln!(
+        "[NATIVE] load_model: force-copied all weights into fresh Metal buffers ({quant_mode})"
+    );
 
     Ok(NativeWeights {
         embed_w,
+        embed_scales,
+        embed_biases,
         final_norm_w,
         final_norm_eps,
         lm_head_w,
         tie_word_embeddings: config.tie_word_embeddings,
+        quantization_config: config.quantization_config.clone(),
         layers,
         model_dtype,
     })
@@ -1027,8 +1355,21 @@ pub fn forward_step(
     let s = token_ids.dim(1);
     let dtype = weights.model_dtype;
 
+    // Debug removed
     // Embedding lookup: [B, T, hidden]
-    let mut hidden = weights.embed_w.take_axis(token_ids, 0);
+    // For quantized models: index into weight/scales/biases rows, then dequantize.
+    // Matches Python's QuantizedEmbedding: dequantize(weight[x], scales[x], biases[x])
+    let mut hidden = if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
+        let qcfg = weights.quantization_config.as_ref();
+        let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
+        let bits = qcfg.map(|q| q.bits).unwrap_or(4);
+        let w_rows = weights.embed_w.take_axis(token_ids, 0);  // [B, T, hidden/pack]
+        let s_rows = scales.take_axis(token_ids, 0);             // [B, T, hidden/group_size]
+        let b_rows = biases.take_axis(token_ids, 0);             // [B, T, hidden/group_size]
+        w_rows.dequantize(&s_rows, &b_rows, gs, bits)           // [B, T, hidden] bf16
+    } else {
+        weights.embed_w.take_axis(token_ids, 0)
+    };
 
     let mut gdn_slot = 0usize;
     let mut attn_slot = 0usize;
@@ -1083,7 +1424,15 @@ pub fn forward_step(
     // Final norm + LM head
     let hidden = hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps);
     if weights.tie_word_embeddings {
-        hidden.matmul(&weights.embed_w.t())
+        // For quantized models: use quantized_matmul with the packed embedding weight
+        if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
+            let qcfg = weights.quantization_config.as_ref();
+            let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
+            let bits = qcfg.map(|q| q.bits).unwrap_or(4);
+            hidden.quantized_matmul(&weights.embed_w, scales, Some(biases), true, gs, bits)
+        } else {
+            hidden.matmul(&weights.embed_w.t())
+        }
     } else {
         hidden.matmul(weights.lm_head_w.as_ref().unwrap())
     }
@@ -1095,10 +1444,10 @@ pub fn forward_step(
 
 #[inline(always)]
 fn dense_mlp_forward(lw: &LayerWeights, mlp_in: &InlineArray) -> InlineArray {
-    let gate = mlp_in.matmul(lw.mlp_gate_w.as_ref().unwrap());
-    let up   = mlp_in.matmul(lw.mlp_up_w.as_ref().unwrap());
+    let gate = lw.mlp_gate_w.as_ref().unwrap().matmul_from(mlp_in);
+    let up   = lw.mlp_up_w.as_ref().unwrap().matmul_from(mlp_in);
     let activated = InlineArray::fused_swiglu(&gate, &up);
-    activated.matmul(lw.mlp_down_w.as_ref().unwrap())
+    lw.mlp_down_w.as_ref().unwrap().matmul_from(&activated)
 }
 
 // ============================================================================
@@ -1151,7 +1500,7 @@ fn moe_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
         scores = scores.divide(&score_sum);
     }
 
-    // ── Expert dispatch via gather_mm ────────────────────────────────────────
+    // ── Expert dispatch via gather_mm / gather_qmm ───────────────────────────
     //
     // SwitchGLU: x_up = gather_mm(x, up_w, rhs_indices=inds)
     //            x_gate = gather_mm(x, gate_w, rhs_indices=inds)
@@ -1160,19 +1509,24 @@ fn moe_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
     //
     // gather_mm(a [S, in], b [E, in, out], rhs_indices [S, k]) → [S, k, out]
     //
-    // All expert weight tensors are already pre-transposed to [E, in, out].
+    // For dense expert weights: [E, in, out] pre-transposed.
+    // For quantized: gather_qmm dispatches to mx.gather_qmm with transpose=true.
+    //
     // The `sorted` flag is omitted (false) for simplicity — matches Python's
     // do_sort=True only when indices.size >= 64. For the common decode case
     // (S=1, top_k=8, indices.size=8) do_sort is false in Python too.
-    let x_gate_exp = x_flat.gather_mm(lw.moe_gate_w.as_ref().unwrap(), None, Some(&inds), false);
-    let x_up_exp   = x_flat.gather_mm(lw.moe_up_w.as_ref().unwrap(),   None, Some(&inds), false);
+    let x_gate_exp = lw.moe_gate_w.as_ref().unwrap()
+        .gather_mm_from(&x_flat, None, Some(&inds), false);
+    let x_up_exp   = lw.moe_up_w.as_ref().unwrap()
+        .gather_mm_from(&x_flat, None, Some(&inds), false);
 
     // Fused swiglu: silu(gate) * up
     let x_act = InlineArray::fused_swiglu(&x_gate_exp, &x_up_exp);
 
     // gather_mm for down projection: [S, k, moe_intermediate] × [E, moe_intermediate, hidden]
     // → [S, k, hidden]
-    let y_exp = x_act.gather_mm(lw.moe_down_w.as_ref().unwrap(), None, Some(&inds), false);
+    let y_exp = lw.moe_down_w.as_ref().unwrap()
+        .gather_mm_from(&x_act, None, Some(&inds), false);
 
     // Weighted sum over top_k: [S, k, hidden] * [S, k, 1] → sum(-2) → [S, hidden]
     let scores_exp = scores.reshape(&[s, top_k, 1]);
@@ -1182,10 +1536,10 @@ fn moe_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
     //
     // shared_expert(x): standard SwiGLU MLP with its own gate/up/down weights.
     // shared_expert_gate: Linear(hidden, 1) → sigmoid → scales shared output.
-    let sh_gate = x_flat.matmul(lw.shared_gate_w.as_ref().unwrap());
-    let sh_up   = x_flat.matmul(lw.shared_up_w.as_ref().unwrap());
+    let sh_gate = lw.shared_gate_w.as_ref().unwrap().matmul_from(&x_flat);
+    let sh_up   = lw.shared_up_w.as_ref().unwrap().matmul_from(&x_flat);
     let sh_act  = InlineArray::fused_swiglu(&sh_gate, &sh_up);
-    let sh_out  = sh_act.matmul(lw.shared_down_w.as_ref().unwrap());
+    let sh_out  = lw.shared_down_w.as_ref().unwrap().matmul_from(&sh_act);
 
     // shared_expert_gate: [S, 1] sigmoid gate
     let sh_scale = x_flat.matmul(lw.shared_expert_gate_w.as_ref().unwrap()).sigmoid();
@@ -1226,10 +1580,10 @@ fn gdn_forward(
     //   5. gdn_metal_step (CustomKernel, outside any compile boundary)
     //   6. fused_precise_swiglu (shapeless=True compiled — opaque Compiled node)
     //   7. out_proj matmul
-    let qkv   = normed.matmul(lw.gdn_qkv_w.as_ref().unwrap());
-    let z     = normed.matmul(lw.gdn_z_w.as_ref().unwrap()).reshape(&[b, s, nv, dv]);
-    let b_val = normed.matmul(lw.gdn_b_w.as_ref().unwrap());
-    let a_val = normed.matmul(lw.gdn_a_w.as_ref().unwrap());
+    let qkv   = lw.gdn_qkv_w.as_ref().unwrap().matmul_from(normed);
+    let z     = lw.gdn_z_w.as_ref().unwrap().matmul_from(normed).reshape(&[b, s, nv, dv]);
+    let b_val = lw.gdn_b_w.as_ref().unwrap().matmul_from(normed);
+    let a_val = lw.gdn_a_w.as_ref().unwrap().matmul_from(normed);
 
     // Conv state: concat previous state + new QKV, take new state, apply conv1d + silu
     let conv_state = cache
@@ -1274,7 +1628,8 @@ fn gdn_forward(
     // Output: rms_norm → precise_swiglu → reshape → out_proj
     let out_n = out.rms_norm(lw.gdn_norm_w.as_ref(), lw.gdn_norm_eps);
     let gated = InlineArray::fused_precise_swiglu(&out_n, &z);
-    gated.reshape(&[b, s, -1]).matmul(lw.gdn_out_w.as_ref().unwrap())
+    let flat  = gated.reshape(&[b, s, -1]);
+    lw.gdn_out_w.as_ref().unwrap().matmul_from(&flat)
 }
 
 // ============================================================================
@@ -1303,7 +1658,7 @@ fn attn_forward(
     //
     // Qwen3 (standard): q_proj output width = n_heads * head_dim.
     //   Reshape to [B,S,H,D] directly, no gate split.
-    let q_proj_out = normed.matmul(lw.attn_q_w.as_ref().unwrap());
+    let q_proj_out = lw.attn_q_w.as_ref().unwrap().matmul_from(normed);
 
     let (queries, gate_opt) = if lw.attn_gated {
         // Gated path (Qwen3.5)
@@ -1319,8 +1674,8 @@ fn attn_forward(
     };
 
     // K, V projections
-    let new_keys   = normed.matmul(lw.attn_k_w.as_ref().unwrap());
-    let new_values = normed.matmul(lw.attn_v_w.as_ref().unwrap());
+    let new_keys   = lw.attn_k_w.as_ref().unwrap().matmul_from(normed);
+    let new_values = lw.attn_v_w.as_ref().unwrap().matmul_from(normed);
 
     // Q/K norms
     let queries = queries.rms_norm(lw.attn_q_norm_w.as_ref(), lw.attn_q_norm_eps);
@@ -1398,13 +1753,14 @@ fn attn_forward(
         .transpose_axes(&[0, 2, 1, 3])
         .reshape(&[b, s, n_heads * head_dim]);
 
+    let o_proj = lw.attn_o_w.as_ref().unwrap();
     if let Some(gate) = gate_opt {
         // Qwen3.5 gated output: o_proj(attn_out * sigmoid(gate))
         let gated = output.multiply(&gate.sigmoid());
-        gated.matmul(lw.attn_o_w.as_ref().unwrap())
+        o_proj.matmul_from(&gated)
     } else {
         // Qwen3 standard output: o_proj(attn_out)
-        output.matmul(lw.attn_o_w.as_ref().unwrap())
+        o_proj.matmul_from(&output)
     }
 }
 
@@ -1550,9 +1906,10 @@ pub fn generate_cpp(
     temperature: f32,
     mut on_token: impl FnMut(u32) -> bool,
 ) -> Vec<u32> {
-    // The C++ bridge only handles Qwen3.5 dense (no MoE weights in the layout).
-    // For all other variants fall through to the Rust path.
-    if config.is_moe() || config.is_qwen3_dense() {
+    // The C++ bridge only handles Qwen3.5 dense (no MoE, no quantized weights).
+    // For all other variants fall through to the Rust path which supports both.
+    let is_quantized = config.quantization_config.is_some();
+    if config.is_moe() || config.is_qwen3_dense() || is_quantized {
         return generate(weights, cache, first_token, max_tokens, temperature, on_token);
     }
 
@@ -1832,28 +2189,41 @@ pub unsafe fn build_cpp_forward_state(
         push_real(&mut weight_ptrs, &lw.input_ln_w);
         push_real(&mut weight_ptrs, &lw.post_ln_w);
 
-        // MLP slots (dense only; MoE layers leave these as sentinel)
+        // MLP slots (dense only; MoE layers leave these as sentinel).
+        // For quantized models we still expose the weight tensor (scales/biases
+        // are not used by the C++ path — quantized models fall back to Rust path
+        // before reaching here, but we handle it defensively).
         for opt in [&lw.mlp_gate_w, &lw.mlp_up_w, &lw.mlp_down_w] {
-            if let Some(w) = opt { push_real(&mut weight_ptrs, w); }
+            if let Some(w) = opt { push_real(&mut weight_ptrs, w.weight_arr()); }
             else { push_sent(&mut weight_ptrs, &mut weight_storage); }
         }
 
         if lw.is_linear {
-            // GDN slots
+            // GDN slots — mixed types: LayerWeight for projections, InlineArray for small tensors.
+            // Projections (LayerWeight):
+            for opt in [&lw.gdn_qkv_w, &lw.gdn_z_w, &lw.gdn_b_w, &lw.gdn_a_w] {
+                if let Some(w) = opt { push_real(&mut weight_ptrs, w.weight_arr()); }
+                else { push_sent(&mut weight_ptrs, &mut weight_storage); }
+            }
+            // Small tensors (InlineArray):
             for opt in [
-                &lw.gdn_qkv_w, &lw.gdn_z_w, &lw.gdn_b_w, &lw.gdn_a_w,
                 &lw.gdn_conv_w, &lw.gdn_q_nw, &lw.gdn_k_nw, &lw.gdn_a_log,
-                &lw.gdn_dt_bias, &lw.gdn_norm_w, &lw.gdn_out_w,
+                &lw.gdn_dt_bias, &lw.gdn_norm_w,
             ] {
                 if let Some(w) = opt { push_real(&mut weight_ptrs, w); }
                 else { push_sent(&mut weight_ptrs, &mut weight_storage); }
             }
+            // out_proj (LayerWeight):
+            if let Some(w) = &lw.gdn_out_w { push_real(&mut weight_ptrs, w.weight_arr()); }
+            else { push_sent(&mut weight_ptrs, &mut weight_storage); }
         } else {
-            // Attention slots
-            for opt in [
-                &lw.attn_q_w, &lw.attn_k_w, &lw.attn_v_w, &lw.attn_o_w,
-                &lw.attn_q_norm_w, &lw.attn_k_norm_w,
-            ] {
+            // Attention projection slots (LayerWeight):
+            for opt in [&lw.attn_q_w, &lw.attn_k_w, &lw.attn_v_w, &lw.attn_o_w] {
+                if let Some(w) = opt { push_real(&mut weight_ptrs, w.weight_arr()); }
+                else { push_sent(&mut weight_ptrs, &mut weight_storage); }
+            }
+            // Norm slots (InlineArray):
+            for opt in [&lw.attn_q_norm_w, &lw.attn_k_norm_w] {
                 if let Some(w) = opt { push_real(&mut weight_ptrs, w); }
                 else { push_sent(&mut weight_ptrs, &mut weight_storage); }
             }

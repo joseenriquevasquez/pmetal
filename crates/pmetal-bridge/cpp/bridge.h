@@ -96,6 +96,11 @@ uint32_t mlx_inline_item_u32(mlx_inline_array* a);
 // Sign: returns -1, 0, or +1 per element
 void mlx_inline_sign(mlx_inline_array* dst, const mlx_inline_array* a);
 
+// Dequantize: reconstruct float from packed int + scales + biases
+void mlx_inline_dequantize(mlx_inline_array* dst, const mlx_inline_array* w,
+    const mlx_inline_array* scales, const mlx_inline_array* biases,
+    int group_size, int bits);
+
 // Create array from float32 data slice
 void mlx_inline_from_f32_slice(mlx_inline_array* dst, const float* data, const int* shape, int ndim);
 

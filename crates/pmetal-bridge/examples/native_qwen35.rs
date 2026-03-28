@@ -57,7 +57,9 @@ fn main() {
 
     let input = pmetal_bridge::InlineArray::from_i32_slice(&token_ids)
         .reshape(&[1, token_ids.len() as i32]);
+    eprintln!("Running prefill...");
     let logits = pmetal_bridge::qwen3_native::forward_step(&weights, &input, &mut cache);
+    eprintln!("Prefill graph built. Evaluating...");
 
     let seq_len = token_ids.len() as i32;
     let vocab = weights.embed_w.dim(0);
