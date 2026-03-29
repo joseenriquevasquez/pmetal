@@ -1,7 +1,6 @@
 //! Rotary Position Embedding (RoPE) with extended context support.
 //!
-//! Re-exports the optimized mlx-rs RoPE implementation and provides
-//! additional utilities for rotary embeddings, including:
+//! Provides additional utilities for rotary embeddings, including:
 //!
 //! - **Linear Scaling**: Simple position scaling for 2-4x context extension
 //! - **Dynamic NTK**: Neural Tangent Kernel-aware scaling for better quality
@@ -25,8 +24,7 @@
 //! This preserves high-frequency positional information while extending
 //! the effective context length.
 
-// Re-export the mlx-rs implementation
-pub use mlx_rs::nn::{Rope, RopeBuilder, RopeInput};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops, fast};
 
 /// RoPE scaling type for extended context.
 #[derive(Debug, Clone)]
@@ -245,14 +243,14 @@ impl YarnConfig {
 /// # Returns
 /// Tensor with rotary embeddings applied.
 pub fn apply_rope(
-    x: &mlx_rs::Array,
+    x: &Array,
     dims: i32,
     traditional: bool,
     base: f32,
     scale: f32,
     offset: i32,
-) -> mlx_rs::error::Result<mlx_rs::Array> {
-    mlx_rs::fast::rope(x, dims, traditional, base, scale, offset, None)
+) -> Result<Array, Exception> {
+    Ok(fast::rope(x, dims, traditional, base, scale, offset))
 }
 
 /// Apply RoPE with explicit position IDs.
@@ -267,6 +265,7 @@ pub fn apply_rope(
 /// * `x` - Input tensor of shape [batch, heads, seq_len, head_dim]
 /// * `position_ids` - Position indices of shape [seq_len]
 /// * `dims` - Number of dimensions to apply RoPE to (usually head_dim)
+/// * `traditional` - If true, use traditional (interleaved) RoPE
 /// * `base` - Base frequency for the embeddings (default 10000.0)
 /// * `scale` - Scale factor for positions (default 1.0)
 ///
@@ -278,56 +277,55 @@ pub fn apply_rope(
 /// // Packed sequences: [seq1_tok1, seq1_tok2, seq2_tok1, seq2_tok2, seq2_tok3]
 /// // Position IDs:     [0,         1,         0,         1,         2]
 /// let x = Array::zeros::<f32>(&[1, 4, 5, 64]); // batch=1, heads=4, seq=5, dim=64
-/// let position_ids = Array::from_slice(&[0_i32, 1, 0, 1, 2], &[5]);
+/// let position_ids = Array::from_i32_slice(&[0_i32, 1, 0, 1, 2], &[5]);
 /// let output = apply_rope_with_positions(&x, &position_ids, 64, false, 10000.0, 1.0)?;
 /// ```
 pub fn apply_rope_with_positions(
-    x: &mlx_rs::Array,
-    position_ids: &mlx_rs::Array,
+    x: &Array,
+    position_ids: &Array,
     dims: i32,
     traditional: bool,
     base: f32,
     scale: f32,
-) -> mlx_rs::error::Result<mlx_rs::Array> {
-    use mlx_rs::ops::{arange, concatenate_axis};
-
+) -> Result<Array, Exception> {
     // x shape: [batch, heads, seq_len, head_dim]
     let shape = x.shape();
     let head_dim = shape[3];
     let half_dims = dims / 2;
 
     // Compute inverse frequencies: inv_freq[i] = 1.0 / (base^(2i/dims))
-    // This is equivalent to: base^(-2i/dims)
-    let indices = arange::<_, f32>(0, half_dims, None)?;
-    let exponents = indices.multiply(mlx_rs::Array::from_f32(-2.0 / dims as f32))?;
-    let inv_freq = mlx_rs::Array::from_f32(base).power(&exponents)?;
+    // indices: [0, 1, ..., half_dims-1] as float
+    let indices = ops::arange_range(0, half_dims); // [half_dims] float32
+    let neg_two_over_dims = Array::from_f32(-2.0 / dims as f32);
+    let exponents = indices.multiply(&neg_two_over_dims);
+    let base_arr = Array::from_f32(base);
+    let inv_freq = base_arr.pow(&exponents); // [half_dims]
 
-    // position_ids: [seq_len] as i32
-    // Convert to float and scale
-    let pos_float = position_ids.as_dtype(mlx_rs::Dtype::Float32)?;
-    let scaled_pos = pos_float.multiply(mlx_rs::Array::from_f32(scale))?;
+    // position_ids: [seq_len] as i32 → float and scale
+    let pos_float = position_ids.as_dtype(Dtype::Float32.as_i32());
+    let scale_arr = Array::from_f32(scale);
+    let scaled_pos = pos_float.multiply(&scale_arr); // [seq_len]
 
-    // Compute angles: [seq_len] outer [half_dims] -> [seq_len, half_dims]
-    // angles[i, j] = scaled_pos[i] * inv_freq[j]
-    let pos_expanded = scaled_pos.expand_dims_axes(&[-1])?; // [seq_len, 1]
-    let inv_freq_expanded = inv_freq.expand_dims_axes(&[0])?; // [1, half_dims]
-    let angles = pos_expanded.multiply(&inv_freq_expanded)?; // [seq_len, half_dims]
+    // Compute angles: [seq_len, half_dims]
+    let pos_expanded = scaled_pos.expand_dims(-1); // [seq_len, 1]
+    let inv_freq_expanded = inv_freq.expand_dims(0); // [1, half_dims]
+    let angles = pos_expanded.multiply(&inv_freq_expanded); // [seq_len, half_dims]
 
     // Compute cos and sin
-    let cos_theta = angles.cos()?; // [seq_len, half_dims]
-    let sin_theta = angles.sin()?; // [seq_len, half_dims]
+    let cos_theta = angles.cos(); // [seq_len, half_dims]
+    let sin_theta = angles.sin(); // [seq_len, half_dims]
 
     // Reshape for broadcasting with x: [1, 1, seq_len, half_dims]
-    let cos_theta = cos_theta.reshape(&[1, 1, -1, half_dims])?;
-    let sin_theta = sin_theta.reshape(&[1, 1, -1, half_dims])?;
+    let cos_theta = cos_theta.reshape(&[1, 1, -1, half_dims]);
+    let sin_theta = sin_theta.reshape(&[1, 1, -1, half_dims]);
 
     if traditional {
         // Traditional (interleaved) RoPE: pairs are (x[0], x[1]), (x[2], x[3]), ...
         // x shape: [batch, heads, seq_len, head_dim]
-        use mlx_rs::ops::indexing::IndexOp;
 
         let x_rope = if dims < head_dim {
-            let parts = x.split_axis(&[dims], -1)?;
+            // Split off only the RoPE portion
+            let parts = x.split(&[dims], -1);
             parts[0].clone()
         } else {
             x.clone()
@@ -338,36 +336,37 @@ pub fn apply_rope_with_positions(
         let batch = rope_shape[0];
         let heads = rope_shape[1];
         let seq_len = rope_shape[2];
-        let x_pairs = x_rope.reshape(&[batch, heads, seq_len, half_dims, 2])?;
+        let x_pairs = x_rope.reshape(&[batch, heads, seq_len, half_dims, 2]);
 
-        // Extract even and odd elements
-        let x_even = x_pairs.index((.., .., .., .., 0));
-        let x_odd = x_pairs.index((.., .., .., .., 1));
+        // Extract even (index 0) and odd (index 1) elements along last dim
+        // Use slice: [batch, heads, seq_len, half_dims, 0..1] then squeeze(-1)
+        let x_even = x_pairs.slice(&[0, 0, 0, 0, 0], &[batch, heads, seq_len, half_dims, 1])
+            .squeeze(-1); // [batch, heads, seq_len, half_dims]
+        let x_odd = x_pairs.slice(&[0, 0, 0, 0, 1], &[batch, heads, seq_len, half_dims, 2])
+            .squeeze(-1); // [batch, heads, seq_len, half_dims]
 
         // Apply rotation
-        let r_even = x_even
-            .multiply(&cos_theta)?
-            .subtract(&x_odd.multiply(&sin_theta)?)?;
-        let r_odd = x_even
-            .multiply(&sin_theta)?
-            .add(&x_odd.multiply(&cos_theta)?)?;
+        let r_even = x_even.multiply(&cos_theta).subtract(&x_odd.multiply(&sin_theta));
+        let r_odd = x_even.multiply(&sin_theta).add(&x_odd.multiply(&cos_theta));
 
         // Interleave back: stack along last dim then reshape
-        let stacked = mlx_rs::ops::stack_axis(&[r_even, r_odd], -1)?; // [..., half_dims, 2]
-        let x_rotated = stacked.reshape(&[batch, heads, seq_len, dims])?;
+        let stacked = ops::stack_axis(vec![r_even, r_odd].as_slice(), -1); // [..., half_dims, 2]
+        let x_rotated = stacked.reshape(&[batch, heads, seq_len, dims]);
 
         if dims < head_dim {
-            let parts = x.split_axis(&[dims], -1)?;
-            concatenate_axis(&[x_rotated, parts[1].clone()], -1)
+            let parts = x.split(&[dims], -1);
+            Ok(ops::concatenate_axis(&[&x_rotated, &parts[1]], -1))
         } else {
             Ok(x_rotated)
         }
     } else {
         // Non-traditional (split-half) RoPE: first half and second half
         let parts = if dims == head_dim {
-            x.split(2, -1)?
+            // Split into 2 equal halves: split at [half_dims]
+            x.split(&[half_dims], -1)
         } else {
-            x.split_axis(&[half_dims, dims], -1)?
+            // Split at [half_dims, dims]: produces 3 parts
+            x.split(&[half_dims, dims], -1)
         };
 
         let x1 = &parts[0]; // [batch, heads, seq_len, half_dims]
@@ -376,16 +375,14 @@ pub fn apply_rope_with_positions(
         // Apply rotation:
         // rx1 = x1 * cos - x2 * sin
         // rx2 = x1 * sin + x2 * cos
-        let rx1 = x1
-            .multiply(&cos_theta)?
-            .subtract(&x2.multiply(&sin_theta)?)?;
-        let rx2 = x1.multiply(&sin_theta)?.add(&x2.multiply(&cos_theta)?)?;
+        let rx1 = x1.multiply(&cos_theta).subtract(&x2.multiply(&sin_theta));
+        let rx2 = x1.multiply(&sin_theta).add(&x2.multiply(&cos_theta));
 
-        let x_rotated = concatenate_axis(&[rx1, rx2], -1)?;
+        let x_rotated = ops::concatenate_axis(&[&rx1, &rx2], -1);
 
         if dims < head_dim && parts.len() > 2 {
             let x_pass = &parts[2];
-            concatenate_axis(&[x_rotated, x_pass.clone()], -1)
+            Ok(ops::concatenate_axis(&[&x_rotated, x_pass], -1))
         } else {
             Ok(x_rotated)
         }
@@ -405,61 +402,16 @@ pub fn apply_rope_with_positions(
 /// # Returns
 /// Tensor with scaled rotary embeddings applied.
 pub fn apply_rope_scaled(
-    x: &mlx_rs::Array,
+    x: &Array,
     dims: i32,
     traditional: bool,
     base: f32,
     offset: i32,
     scaling: &RopeScaling,
-) -> mlx_rs::error::Result<mlx_rs::Array> {
+) -> Result<Array, Exception> {
     let effective_base = scaling.effective_base(base, dims);
     let scale = scaling.scale();
-
-    mlx_rs::fast::rope(x, dims, traditional, effective_base, scale, offset, None)
-}
-
-/// Create a RoPE module with scaling configuration.
-pub fn create_rope(dims: i32, base: f32, scaling: RopeScaling, traditional: bool) -> Rope {
-    use mlx_rs::builder::Builder;
-
-    let scale = scaling.scale();
-    let effective_base = scaling.effective_base(base, dims);
-
-    RopeBuilder::new(dims)
-        .traditional(traditional)
-        .base(effective_base)
-        .scale(scale)
-        .build()
-        .expect("Infallible")
-}
-
-/// Create a RoPE module configured for a specific context extension.
-///
-/// Automatically selects the best scaling method based on extension factor:
-/// - 1x-2x: No scaling
-/// - 2x-4x: Linear scaling
-/// - 4x-8x: NTK-aware scaling
-/// - 8x+: YaRN scaling
-pub fn create_rope_for_context(
-    dims: i32,
-    base: f32,
-    original_max_position: i32,
-    target_max_position: i32,
-    traditional: bool,
-) -> Rope {
-    let factor = target_max_position as f32 / original_max_position as f32;
-
-    let scaling = if factor <= 1.0 {
-        RopeScaling::None
-    } else if factor <= 2.0 {
-        RopeScaling::Linear { factor }
-    } else if factor <= 4.0 {
-        RopeScaling::NtkAware { factor, alpha: 1.0 }
-    } else {
-        RopeScaling::Yarn(YarnConfig::new(factor, original_max_position))
-    };
-
-    create_rope(dims, base, scaling, traditional)
+    Ok(fast::rope(x, dims, traditional, effective_base, scale, offset))
 }
 
 /// Compute the effective maximum context length after scaling.
@@ -478,34 +430,14 @@ pub fn effective_context_length(original: i32, scaling: &RopeScaling) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::builder::Builder;
+    use pmetal_bridge::compat::{Array, Dtype, random};
 
     #[test]
     fn test_rope_functional() {
-        let x = mlx_rs::random::normal::<f32>(&[2, 8, 4, 64], None, None, None).unwrap();
-        let x_reshaped = x.reshape(&[-1, x.dim(-2), x.dim(-1)]).unwrap();
-
-        let output = apply_rope(&x_reshaped, 64, false, 10000.0, 1.0, 0).unwrap();
+        let x = random::normal(&[8, 4, 64], Dtype::Float32);
+        let output = apply_rope(&x, 64, false, 10000.0, 1.0, 0).unwrap();
         assert_eq!(output.shape()[1], 4); // seq_len
         assert_eq!(output.shape()[2], 64); // head_dim
-    }
-
-    #[test]
-    fn test_rope_module() {
-        use mlx_rs::module::Module;
-
-        let mut rope = RopeBuilder::new(64)
-            .traditional(false)
-            .base(10000.0)
-            .scale(1.0)
-            .build()
-            .unwrap();
-
-        // Input shape: [batch, seq_len, num_heads, head_dim]
-        let x = mlx_rs::random::normal::<f32>(&[2, 8, 4, 64], None, None, None).unwrap();
-        let output = rope.forward(&x).unwrap();
-
-        assert_eq!(output.shape(), x.shape());
     }
 
     #[test]
@@ -513,9 +445,6 @@ mod tests {
         let scaling = RopeScaling::Linear { factor: 2.0 };
         assert_eq!(scaling.scale(), 0.5);
         assert_eq!(scaling.effective_base(10000.0, 64), 10000.0);
-
-        let rope = create_rope(64, 10000.0, scaling, false);
-        assert_eq!(rope.scale, 0.5);
     }
 
     #[test]
@@ -576,7 +505,6 @@ mod tests {
 
         // Lower dimensions (high frequency) should have smaller scale (more interpolation)
         // Higher dimensions (low frequency) should have larger scale (less interpolation)
-        // This is a sanity check - actual values depend on wavelength calculations
         assert!(mscale[0] > 0.0);
         assert!(mscale[0] <= 1.0);
     }
@@ -595,26 +523,11 @@ mod tests {
 
     #[test]
     fn test_apply_rope_scaled() {
-        let x = mlx_rs::random::normal::<f32>(&[8, 4, 64], None, None, None).unwrap();
+        let x = random::normal(&[8, 4, 64], Dtype::Float32);
         let scaling = RopeScaling::Linear { factor: 2.0 };
 
         let output = apply_rope_scaled(&x, 64, false, 10000.0, 0, &scaling).unwrap();
         assert_eq!(output.shape(), x.shape());
-    }
-
-    #[test]
-    fn test_create_rope_for_context() {
-        // 2x extension -> Linear
-        let rope = create_rope_for_context(64, 10000.0, 4096, 8192, false);
-        assert_eq!(rope.scale, 0.5);
-
-        // 4x extension -> NTK-aware
-        let rope = create_rope_for_context(64, 10000.0, 4096, 16384, false);
-        assert!(rope.base > 10000.0); // NTK modifies base
-
-        // 8x extension -> YaRN
-        let rope = create_rope_for_context(64, 10000.0, 4096, 32768, false);
-        assert!(rope.base > 10000.0);
     }
 
     #[test]

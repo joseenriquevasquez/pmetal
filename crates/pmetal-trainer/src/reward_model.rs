@@ -34,7 +34,7 @@
 //! ).unwrap();
 //! ```
 
-use mlx_rs::{Array, ops::indexing::IndexOp};
+use pmetal_bridge::compat::{Array, ops, ops::indexing::IndexOp};
 use pmetal_data::Tokenizer;
 use std::path::Path;
 use std::sync::Mutex;
@@ -375,7 +375,7 @@ impl MLRewardModel {
                     GrpoError::Reward(format!("Score head transpose failed: {}", e))
                 })?;
                 // [1, vocab_size] × [vocab_size, 1] → [1, 1]
-                let score = mlx_rs::ops::matmul(&last_token_vec, &w_t)
+                let score = ops::matmul(&last_token_vec, &w_t)
                     .map_err(|e| GrpoError::Reward(format!("Score head matmul failed: {}", e)))?;
 
                 let score = if let Some(b) = &self.score_bias {

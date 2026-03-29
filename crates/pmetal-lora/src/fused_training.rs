@@ -17,7 +17,7 @@
 //! When Metal is not available (or the feature is disabled), the module
 //! provides a pure MLX fallback that maintains API compatibility.
 
-use mlx_rs::{Array, error::Exception};
+use pmetal_bridge::compat::{Array, Exception};
 use tracing::{debug, warn};
 
 #[cfg(feature = "metal-fused")]
@@ -528,7 +528,7 @@ impl FusedLoraTrainer {
         let dx_lora = dy_ba.multiply(&scale_arr)?;
 
         // Combined gradient
-        Ok(dx_base.add(&dx_lora)?)
+        Ok(dx_base.add(&dx_lora))
     }
 }
 
@@ -652,21 +652,18 @@ mod tests {
 
         // Fused Metal kernels operate in f16 with 2D [batch, features] input
         let batch_size = 16;
-        let x = mlx_rs::random::normal::<f32>(&[batch_size, 32], None, None, None)
-            .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float16)
+        let x = pmetal_bridge::compat::random::normal(&[batch_size, 32], pmetal_bridge::compat::Dtype::Float32)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float16)
             .unwrap();
-        let weight = mlx_rs::random::normal::<f32>(&[64, 32], None, None, None)
-            .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float16)
+        let weight = pmetal_bridge::compat::random::normal(&[64, 32], pmetal_bridge::compat::Dtype::Float32)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float16)
             .unwrap();
-        let lora_a = mlx_rs::random::normal::<f32>(&[4, 32], None, None, None)
-            .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float16)
+        let lora_a = pmetal_bridge::compat::random::normal(&[4, 32], pmetal_bridge::compat::Dtype::Float32)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float16)
             .unwrap();
-        let lora_b = mlx_rs::ops::zeros::<f32>(&[64, 4])
+        let lora_b = pmetal_bridge::compat::ops::zeros(&[64, 4], pmetal_bridge::compat::Dtype::Float32)
             .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float16)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float16)
             .unwrap();
 
         let output = trainer.forward(&x, &weight, &lora_a, &lora_b).unwrap();
@@ -683,30 +680,25 @@ mod tests {
 
         let batch_size = 16;
         // Fused Metal kernels operate in f16
-        let x = mlx_rs::random::normal::<f32>(&[batch_size, 32], None, None, None)
-            .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float16)
+        let x = pmetal_bridge::compat::random::normal(&[batch_size, 32], pmetal_bridge::compat::Dtype::Float32)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float16)
             .unwrap();
-        let weight = mlx_rs::random::normal::<f32>(&[64, 32], None, None, None)
-            .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float16)
+        let weight = pmetal_bridge::compat::random::normal(&[64, 32], pmetal_bridge::compat::Dtype::Float32)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float16)
             .unwrap();
-        let lora_a = mlx_rs::random::normal::<f32>(&[4, 32], None, None, None)
-            .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float16)
+        let lora_a = pmetal_bridge::compat::random::normal(&[4, 32], pmetal_bridge::compat::Dtype::Float32)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float16)
             .unwrap();
-        let lora_b = mlx_rs::random::normal::<f32>(&[64, 4], None, None, None)
-            .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float16)
+        let lora_b = pmetal_bridge::compat::random::normal(&[64, 4], pmetal_bridge::compat::Dtype::Float32)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float16)
             .unwrap();
 
         // Forward
         let output = trainer.forward(&x, &weight, &lora_a, &lora_b).unwrap();
 
         // Fake gradient
-        let grad_output = mlx_rs::random::normal::<f32>(&[batch_size, 64], None, None, None)
-            .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float16)
+        let grad_output = pmetal_bridge::compat::random::normal(&[batch_size, 64], pmetal_bridge::compat::Dtype::Float32)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float16)
             .unwrap();
 
         // Backward for LoRA params
@@ -730,21 +722,17 @@ mod tests {
 
         let batch_size = 16;
         // Fused Metal kernels operate in f16
-        let weight = mlx_rs::random::normal::<f32>(&[64, 32], None, None, None)
-            .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float16)
+        let weight = pmetal_bridge::compat::random::normal(&[64, 32], pmetal_bridge::compat::Dtype::Float32)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float16)
             .unwrap();
-        let lora_a = mlx_rs::random::normal::<f32>(&[4, 32], None, None, None)
-            .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float16)
+        let lora_a = pmetal_bridge::compat::random::normal(&[4, 32], pmetal_bridge::compat::Dtype::Float32)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float16)
             .unwrap();
-        let lora_b = mlx_rs::random::normal::<f32>(&[64, 4], None, None, None)
-            .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float16)
+        let lora_b = pmetal_bridge::compat::random::normal(&[64, 4], pmetal_bridge::compat::Dtype::Float32)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float16)
             .unwrap();
-        let grad_output = mlx_rs::random::normal::<f32>(&[batch_size, 64], None, None, None)
-            .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float16)
+        let grad_output = pmetal_bridge::compat::random::normal(&[batch_size, 64], pmetal_bridge::compat::Dtype::Float32)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float16)
             .unwrap();
 
         let grad_x = trainer

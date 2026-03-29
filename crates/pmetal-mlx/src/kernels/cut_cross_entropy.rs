@@ -31,9 +31,8 @@
 //!
 //! - Apple ML: https://github.com/apple/ml-cross-entropy
 
-use mlx_rs::error::{Exception, Result};
-use mlx_rs::ops::indexing::TryIndexOp;
-use mlx_rs::{Array, Dtype};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
+use crate::ArrayDtypeExt;
 
 /// Configuration for Cut Cross Entropy.
 #[derive(Debug, Clone)]
@@ -143,9 +142,10 @@ pub struct CutCrossEntropyOutput {
 
 impl CutCrossEntropyOutput {
     /// Get the loss value.
-    pub fn loss_value(&self) -> Result<f32> {
-        self.loss.eval()?;
-        Ok(self.loss.item::<f32>())
+    pub fn loss_value(&self) -> Result<f32, Exception> {
+        let mut loss_eval = self.loss.clone();
+        loss_eval.eval();
+        Ok(loss_eval.item_f32())
     }
 }
 
@@ -189,7 +189,7 @@ impl CutCrossEntropy {
         lm_head_weight: &Array,
         targets: &Array,
         lm_head_bias: Option<&Array>,
-    ) -> Result<CutCrossEntropyOutput> {
+    ) -> Result<CutCrossEntropyOutput, Exception> {
         let hidden_shape = hidden_states.shape();
         let _n_tokens = hidden_shape[0] as usize;
         let hidden_dim = hidden_shape[1] as usize;
@@ -206,9 +206,8 @@ impl CutCrossEntropy {
         }
 
         // Step 1: Compute target logits directly (only for target tokens)
-        // This is O(n_tokens * hidden_dim) instead of O(n_tokens * vocab_size * hidden_dim)
         let target_logits =
-            self.compute_target_logits(hidden_states, lm_head_weight, targets, lm_head_bias)?;
+            self.compute_target_logits(hidden_states, lm_head_weight, targets, lm_head_bias);
 
         // Step 2: Compute logsumexp in chunks
         let logsumexp = self.compute_chunked_logsumexp(
@@ -216,20 +215,20 @@ impl CutCrossEntropy {
             lm_head_weight,
             lm_head_bias,
             vocab_size,
-        )?;
+        );
 
         // Step 3: Compute per-token loss
         // loss[i] = logsumexp[i] - target_logits[i]
-        let per_token_loss = logsumexp.subtract(&target_logits)?;
+        let per_token_loss = logsumexp.subtract(&target_logits);
 
         // Step 4: Apply ignore index masking
-        let (masked_loss, n_valid) = self.apply_mask(&per_token_loss, targets)?;
+        let (masked_loss, n_valid) = self.apply_mask(&per_token_loss, targets);
 
-        // Step 5: Compute mean loss — guard against division by zero when all tokens are
-        // ignored (n_valid == 0), which can happen with all-masked batches.
+        // Step 5: Compute mean loss
         let safe_n_valid = n_valid.max(1);
-        let n_valid_arr = Array::from_int(safe_n_valid as i32);
-        let loss = masked_loss.sum(None)?.divide(&n_valid_arr)?;
+        let n_valid_arr = Array::from_i32(safe_n_valid as i32)
+            .as_dtype(Dtype::Float32.as_i32());
+        let loss = masked_loss.sum_all().divide(&n_valid_arr);
 
         // Cache for backward if needed
         let (cached_lse, cached_target) = if self.config.compute_grad {
@@ -252,168 +251,141 @@ impl CutCrossEntropy {
     }
 
     /// Compute target logits by direct indexing.
-    ///
-    /// Instead of computing all logits and indexing:
-    /// `logits = hidden @ W.T; target_logits = logits[:, targets]`
-    ///
-    /// We compute directly:
-    /// `target_logits[i] = hidden[i] @ W[targets[i]]`
-    ///
-    /// This is O(n * d) instead of O(n * V * d).
     fn compute_target_logits(
         &self,
         hidden_states: &Array,
         lm_head_weight: &Array,
         targets: &Array,
         lm_head_bias: Option<&Array>,
-    ) -> Result<Array> {
+    ) -> Array {
         // Clamp targets to valid indices before gather.
-        // Ignored positions (e.g. -100) would cause out-of-bounds access in take_axis.
-        // The `apply_mask` step zeroes out the corresponding loss values, so gathering
-        // index 0 for ignored positions is safe — those contributions are masked away.
-        let zero = Array::from_int(0_i32);
-        let safe_targets = mlx_rs::ops::maximum(targets, &zero)?;
+        let zero = Array::from_i32(0_i32);
+        let targets_i32 = targets.as_dtype(Dtype::Int32.as_i32());
+        let safe_targets = targets_i32.maximum(&zero);
 
         // Gather target embeddings: W[safe_targets, :] -> [n_tokens, hidden_dim]
-        let target_weights = lm_head_weight.take_axis(&safe_targets, 0)?;
+        let target_weights = lm_head_weight.take_axis(&safe_targets, 0);
 
         // Compute dot product: sum(hidden * target_weights, axis=-1)
-        let product = hidden_states.multiply(&target_weights)?;
-        let mut target_logits = product.sum_axis(-1, false)?;
+        let product = hidden_states.multiply(&target_weights);
+        let mut target_logits = product.sum_axis(-1, false);
 
-        // Add bias if present (use safe_targets to avoid out-of-bounds)
+        // Add bias if present
         if let Some(bias) = lm_head_bias {
-            let target_bias = bias.take_axis(&safe_targets, 0)?;
-            target_logits = target_logits.add(&target_bias)?;
+            let target_bias = bias.take_axis(&safe_targets, 0);
+            target_logits = target_logits.add(&target_bias);
         }
 
         // Apply logit transforms
-        target_logits = self.apply_logit_transforms(&target_logits)?;
-
-        Ok(target_logits)
+        self.apply_logit_transforms(target_logits)
     }
 
     /// Compute logsumexp in chunks using online algorithm.
-    ///
-    /// The online logsumexp algorithm maintains running max and sum:
-    /// ```text
-    /// For each chunk:
-    ///   m_new = max(m, max(chunk))
-    ///   s_new = s * exp(m - m_new) + sum(exp(chunk - m_new))
-    /// logsumexp = m + log(s)
-    /// ```
-    ///
-    /// This never allocates more than chunk_size * hidden_dim memory.
     fn compute_chunked_logsumexp(
         &self,
         hidden_states: &Array,
         lm_head_weight: &Array,
         lm_head_bias: Option<&Array>,
         vocab_size: usize,
-    ) -> Result<Array> {
-        let n_tokens = hidden_states.dim(0) as usize;
+    ) -> Array {
+        let n_tokens = hidden_states.dim(0);
+        let hidden_dim = lm_head_weight.dim(1);
         let chunk_size = self.config.vocab_chunk_size;
         let n_chunks = (vocab_size + chunk_size - 1) / chunk_size;
 
         // Initialize online logsumexp accumulators
-        // m: running max, s: running sum of exp(x - m)
-        let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-        let mut running_max = mlx_rs::ops::broadcast_to(&neg_inf, &[n_tokens as i32])?;
-        let zero = Array::from_f32(0.0);
-        let mut running_sum = mlx_rs::ops::broadcast_to(&zero, &[n_tokens as i32])?;
+        let neg_inf_arr = Array::from_f32(f32::NEG_INFINITY);
+        let mut running_max = neg_inf_arr.broadcast_to(&[n_tokens]);
+        let zero_arr = Array::from_f32(0.0);
+        let mut running_sum = zero_arr.broadcast_to(&[n_tokens]);
 
         for chunk_idx in 0..n_chunks {
             let start = chunk_idx * chunk_size;
             let end = ((chunk_idx + 1) * chunk_size).min(vocab_size);
 
             // Get weight chunk: W[start:end, :]
-            let weight_chunk = lm_head_weight.try_index(start as i32..end as i32)?;
+            let weight_chunk = lm_head_weight.slice(&[start as i32, 0], &[end as i32, hidden_dim]);
 
             // Compute chunk logits: hidden @ W_chunk.T
             let weight_t = weight_chunk.t();
-            let mut chunk_logits = hidden_states.matmul(&weight_t)?;
+            let mut chunk_logits = hidden_states.matmul(&weight_t);
 
             // Add bias if present
             if let Some(bias) = lm_head_bias {
-                let bias_chunk = bias.try_index(start as i32..end as i32)?;
-                chunk_logits = chunk_logits.add(&bias_chunk)?;
+                let bias_chunk = bias.slice(&[start as i32], &[end as i32]);
+                chunk_logits = chunk_logits.add(&bias_chunk);
             }
 
             // Apply logit transforms to chunk
-            chunk_logits = self.apply_logit_transforms(&chunk_logits)?;
+            chunk_logits = self.apply_logit_transforms(chunk_logits);
 
             // Online logsumexp update
-            // chunk_max [n_tokens]
-            let chunk_max = chunk_logits.max_axis(-1, false)?;
-
-            // new_max = max(running_max, chunk_max)
-            let new_max = mlx_rs::ops::maximum(&running_max, &chunk_max)?;
+            let chunk_max = chunk_logits.max_axis(-1, false);
+            let new_max = running_max.maximum(&chunk_max);
 
             // Update running_sum: s_new = s * exp(m - m_new) + sum(exp(chunk - m_new))
-            let max_diff = running_max.subtract(&new_max)?;
-            let scaled_sum = running_sum.multiply(&mlx_rs::ops::exp(&max_diff)?)?;
+            let max_diff = running_max.subtract(&new_max);
+            let scaled_sum = running_sum.multiply(&max_diff.exp());
 
-            let chunk_shifted = chunk_logits.subtract(&new_max.reshape(&[-1, 1])?)?;
-            let chunk_exp = mlx_rs::ops::exp(&chunk_shifted)?;
-            let chunk_sum = chunk_exp.sum_axis(-1, false)?;
+            let new_max_expanded = new_max.reshape(&[-1, 1]);
+            let chunk_shifted = chunk_logits.subtract(&new_max_expanded);
+            let chunk_exp = chunk_shifted.exp();
+            let chunk_sum = chunk_exp.sum_axis(-1, false);
 
-            running_sum = scaled_sum.add(&chunk_sum)?;
+            running_sum = scaled_sum.add(&chunk_sum);
             running_max = new_max;
 
             // Evaluate to avoid building huge lazy graph
-            running_sum.eval()?;
-            running_max.eval()?;
+            running_sum.eval();
+            running_max.eval();
         }
 
         // Final logsumexp = m + log(s)
-        let log_sum = mlx_rs::ops::log(&running_sum)?;
+        let log_sum = running_sum.log();
         running_max.add(&log_sum)
     }
 
     /// Apply logit transformations (softcapping, scaling).
-    fn apply_logit_transforms(&self, logits: &Array) -> Result<Array> {
-        let mut result = logits.clone();
+    fn apply_logit_transforms(&self, logits: Array) -> Array {
+        let mut result = logits;
 
         // Apply scaling (Cohere)
         if self.config.logit_scale != 1.0 {
             let scale = Array::from_f32(self.config.logit_scale);
-            result = result.multiply(&scale)?;
+            result = result.multiply(&scale);
         }
 
         // Apply softcapping (Gemma2): softcap * tanh(logits / softcap)
         if self.config.softcap > 0.0 {
             let softcap = Array::from_f32(self.config.softcap);
-            let scaled = result.divide(&softcap)?;
-            let tanh_scaled = mlx_rs::ops::tanh(&scaled)?;
-            result = tanh_scaled.multiply(&softcap)?;
+            let scaled = result.divide(&softcap);
+            let tanh_scaled = ops::tanh(&scaled);
+            result = tanh_scaled.multiply(&softcap);
         }
 
-        Ok(result)
+        result
     }
 
     /// Apply ignore index masking.
-    fn apply_mask(&self, loss: &Array, targets: &Array) -> Result<(Array, usize)> {
-        let ignore_arr = Array::from_int(self.config.ignore_index);
-        let valid_mask = targets.ne(&ignore_arr)?;
-        let valid_mask_f32 = valid_mask.as_dtype(Dtype::Float32)?;
+    fn apply_mask(&self, loss: &Array, targets: &Array) -> (Array, usize) {
+        let ignore_arr = Array::from_i32(self.config.ignore_index);
+        let targets_i32 = targets.as_dtype(Dtype::Int32.as_i32());
+        let valid_mask = targets_i32.not_equal(&ignore_arr);
+        let valid_mask_f32 = valid_mask.as_dtype(Dtype::Float32.as_i32());
 
         // Count valid tokens
-        let n_valid_arr = valid_mask_f32.sum(None)?;
-        n_valid_arr.eval()?;
-        let n_valid = n_valid_arr.item::<f32>() as usize;
+        let n_valid_arr = valid_mask_f32.sum_all();
+        let mut n_valid_eval = n_valid_arr.clone();
+        n_valid_eval.eval();
+        let n_valid = n_valid_eval.item_f32() as usize;
 
         // Zero out ignored positions
-        let masked_loss = loss.multiply(&valid_mask_f32)?;
+        let masked_loss = loss.multiply(&valid_mask_f32);
 
-        Ok((masked_loss, n_valid))
+        (masked_loss, n_valid)
     }
 
     /// Compute backward pass (gradient of loss w.r.t. hidden states).
-    ///
-    /// The gradient is:
-    /// `dL/dh = (softmax(logits) - one_hot(target)) @ W`
-    ///
-    /// We compute this in chunks to avoid materializing full softmax.
     pub fn backward(
         &self,
         hidden_states: &Array,
@@ -421,9 +393,9 @@ impl CutCrossEntropy {
         targets: &Array,
         output: &CutCrossEntropyOutput,
         grad_loss: &Array,
-    ) -> Result<Array> {
-        let n_tokens = hidden_states.dim(0) as usize;
-        let hidden_dim = hidden_states.dim(1) as usize;
+    ) -> Result<Array, Exception> {
+        let n_tokens = hidden_states.dim(0);
+        let hidden_dim = hidden_states.dim(1);
         let vocab_size = lm_head_weight.dim(0) as usize;
         let chunk_size = self.config.vocab_chunk_size;
         let n_chunks = (vocab_size + chunk_size - 1) / chunk_size;
@@ -436,12 +408,13 @@ impl CutCrossEntropy {
 
         // Initialize gradient accumulator
         let zero = Array::from_f32(0.0);
-        let mut grad_hidden =
-            mlx_rs::ops::broadcast_to(&zero, &[n_tokens as i32, hidden_dim as i32])?;
+        let mut grad_hidden = zero.broadcast_to(&[n_tokens, hidden_dim]);
 
         // Expand grad_loss and logsumexp for broadcasting
-        let grad_expanded = grad_loss.reshape(&[-1, 1])?;
-        let lse_expanded = logsumexp.reshape(&[-1, 1])?;
+        let grad_expanded = grad_loss.reshape(&[-1, 1]);
+        let lse_expanded = logsumexp.reshape(&[-1, 1]);
+
+        let targets_i32 = targets.as_dtype(Dtype::Int32.as_i32());
 
         for chunk_idx in 0..n_chunks {
             let start = chunk_idx * chunk_size;
@@ -449,62 +422,57 @@ impl CutCrossEntropy {
             let chunk_len = end - start;
 
             // Get weight chunk
-            let weight_chunk = lm_head_weight.try_index(start as i32..end as i32)?;
+            let weight_chunk =
+                lm_head_weight.slice(&[start as i32, 0], &[end as i32, hidden_dim]);
 
             // Compute chunk logits
             let weight_t = weight_chunk.t();
-            let chunk_logits = hidden_states.matmul(&weight_t)?;
+            let chunk_logits = hidden_states.matmul(&weight_t);
 
-            // Compute softmax for this chunk
-            // softmax_chunk = exp(logits - logsumexp)
-            let shifted = chunk_logits.subtract(&lse_expanded)?;
-            let softmax_chunk = mlx_rs::ops::exp(&shifted)?;
+            // Compute softmax for this chunk: softmax_chunk = exp(logits - logsumexp)
+            let shifted = chunk_logits.subtract(&lse_expanded);
+            let softmax_chunk = shifted.exp();
 
             // Subtract 1 at target positions if target is in this chunk
-            // Create mask for targets in this chunk range
-            let start_arr = Array::from_int(start as i32);
-            let end_arr = Array::from_int(end as i32);
-            let in_chunk = targets
-                .ge(&start_arr)?
-                .logical_and(&targets.lt(&end_arr)?)?;
+            let start_arr = Array::from_i32(start as i32);
+            let end_arr = Array::from_i32(end as i32);
+            let in_chunk = targets_i32.greater_equal(&start_arr)
+                .multiply(&targets_i32.less(&end_arr));
 
-            // For tokens where target is in this chunk, subtract 1 from softmax at target position
-            // This is tricky - we need scatter subtract
-            let local_targets = targets.subtract(&start_arr)?;
-            // Clamp local targets to valid range
-            let zero = Array::from_int(0);
-            let max_idx = Array::from_int((chunk_len - 1) as i32);
-            let local_targets_clipped = mlx_rs::ops::maximum(&local_targets, &zero)?;
-            let local_targets_clipped = mlx_rs::ops::minimum(&local_targets_clipped, &max_idx)?;
+            // Local targets (clamped)
+            let local_targets = targets_i32.subtract(&start_arr);
+            let zero_i = Array::from_i32(0);
+            let max_idx = Array::from_i32((chunk_len - 1) as i32);
+            let local_targets_clipped = local_targets.maximum(&zero_i).minimum(&max_idx);
 
-            // Create one-hot for targets in this chunk using identity matrix
-            let in_chunk_f32 = in_chunk.as_dtype(Dtype::Float32)?;
-            let identity = mlx_rs::ops::eye::<f32>(chunk_len as i32, None, None)?;
-            let one_hot = identity.take_axis(&local_targets_clipped, 0)?;
-            let masked_one_hot = one_hot.multiply(&in_chunk_f32.reshape(&[-1, 1])?)?;
+            // Create one-hot for targets in this chunk
+            let in_chunk_f32 = in_chunk.as_dtype(Dtype::Float32.as_i32());
+            let identity = Array::eye(chunk_len as i32, Dtype::Float32.as_i32());
+            let one_hot = identity.take_axis(&local_targets_clipped, 0);
+            let masked_one_hot = one_hot.multiply(&in_chunk_f32.reshape(&[-1, 1]));
 
             // Gradient: (softmax - one_hot) * grad_loss
-            let grad_chunk = softmax_chunk.subtract(&masked_one_hot)?;
-            let grad_chunk_scaled = grad_chunk.multiply(&grad_expanded)?;
+            let grad_chunk = softmax_chunk.subtract(&masked_one_hot);
+            let grad_chunk_scaled = grad_chunk.multiply(&grad_expanded);
 
             // Accumulate: grad_hidden += grad_chunk @ weight_chunk
-            let chunk_contrib = grad_chunk_scaled.matmul(&weight_chunk)?;
-            grad_hidden = grad_hidden.add(&chunk_contrib)?;
+            let chunk_contrib = grad_chunk_scaled.matmul(&weight_chunk);
+            grad_hidden = grad_hidden.add(&chunk_contrib);
 
             // Evaluate to avoid huge graph
-            grad_hidden.eval()?;
+            grad_hidden.eval();
         }
 
         // Apply ignore mask
-        let ignore_arr = Array::from_int(self.config.ignore_index);
-        let valid_mask = targets.ne(&ignore_arr)?;
-        let valid_mask_f32 = valid_mask.as_dtype(Dtype::Float32)?.reshape(&[-1, 1])?;
+        let ignore_arr = Array::from_i32(self.config.ignore_index);
+        let valid_mask = targets_i32.not_equal(&ignore_arr);
+        let valid_mask_f32 = valid_mask.as_dtype(Dtype::Float32.as_i32()).reshape(&[-1, 1]);
 
-        // Scale by 1/n_valid — guard against zero (all-masked batch)
+        // Scale by 1/n_valid
         let safe_n_valid = output.n_valid.max(1);
-        let n_valid = Array::from_int(safe_n_valid as i32);
-        let grad_hidden = grad_hidden.multiply(&valid_mask_f32)?;
-        grad_hidden.divide(&n_valid)
+        let n_valid = Array::from_i32(safe_n_valid as i32).as_dtype(Dtype::Float32.as_i32());
+        let grad_hidden = grad_hidden.multiply(&valid_mask_f32);
+        Ok(grad_hidden.divide(&n_valid))
     }
 }
 
@@ -522,23 +490,12 @@ impl CutCrossEntropy {
 /// # Returns
 ///
 /// Scalar loss value.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let loss = cut_cross_entropy_loss(
-///     &hidden_states,
-///     &lm_head_weight,
-///     &targets,
-///     -100,
-/// )?;
-/// ```
 pub fn cut_cross_entropy_loss(
     hidden_states: &Array,
     lm_head_weight: &Array,
     targets: &Array,
     ignore_index: i32,
-) -> Result<Array> {
+) -> Result<Array, Exception> {
     let config = CutCrossEntropyConfig::new().with_ignore_index(ignore_index);
     let cce = CutCrossEntropy::new(config);
     let output = cce.forward(hidden_states, lm_head_weight, targets, None)?;
@@ -552,7 +509,7 @@ pub fn cut_cross_entropy_loss_gemma(
     targets: &Array,
     ignore_index: i32,
     softcap: f32,
-) -> Result<Array> {
+) -> Result<Array, Exception> {
     let config = CutCrossEntropyConfig::new()
         .with_ignore_index(ignore_index)
         .with_softcap(softcap);
@@ -564,6 +521,7 @@ pub fn cut_cross_entropy_loss_gemma(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_bridge::compat::Array;
 
     #[test]
     fn test_config_default() {
@@ -587,51 +545,47 @@ mod tests {
 
     #[test]
     fn test_cut_cross_entropy_basic() {
-        // Small test case
-        let n_tokens = 4;
-        let hidden_dim = 8;
-        let vocab_size = 16;
+        let n_tokens: i32 = 4;
+        let hidden_dim: i32 = 8;
+        let vocab_size: i32 = 16;
 
-        // Random-ish hidden states
-        let hidden_data: Vec<f32> = (0..n_tokens * hidden_dim)
+        let hidden_data: Vec<f32> = (0..(n_tokens * hidden_dim) as usize)
             .map(|i| ((i * 7 + 3) % 10) as f32 / 10.0)
             .collect();
-        let hidden = Array::from_slice(&hidden_data, &[n_tokens as i32, hidden_dim as i32]);
+        let hidden = Array::from_f32_slice(&hidden_data, &[n_tokens, hidden_dim]);
 
-        // Random-ish weights
-        let weight_data: Vec<f32> = (0..vocab_size * hidden_dim)
+        let weight_data: Vec<f32> = (0..(vocab_size * hidden_dim) as usize)
             .map(|i| ((i * 11 + 5) % 10) as f32 / 10.0 - 0.5)
             .collect();
-        let weight = Array::from_slice(&weight_data, &[vocab_size as i32, hidden_dim as i32]);
+        let weight = Array::from_f32_slice(&weight_data, &[vocab_size, hidden_dim]);
 
-        // Targets
-        let targets = Array::from_slice(&[0i32, 5, 10, 15], &[4]);
+        let targets = Array::from_i32_slice(&[0i32, 5, 10, 15]).reshape(&[4]);
 
-        let config = CutCrossEntropyConfig::new().with_vocab_chunk_size(4); // Small chunks for testing
+        let config = CutCrossEntropyConfig::new().with_vocab_chunk_size(4);
         let cce = CutCrossEntropy::new(config);
 
         let output = cce.forward(&hidden, &weight, &targets, None).unwrap();
-        output.loss.eval().unwrap();
+        let mut loss_eval = output.loss.clone();
+        loss_eval.eval();
 
-        let loss_value = output.loss.item::<f32>();
+        let loss_value = loss_eval.item_f32();
         assert!(loss_value.is_finite());
-        assert!(loss_value > 0.0); // CE is always positive
+        assert!(loss_value > 0.0);
     }
 
     #[test]
     fn test_cut_cross_entropy_ignore_index() {
-        let n_tokens = 4;
-        let hidden_dim = 8;
-        let vocab_size = 16;
+        let n_tokens: i32 = 4;
+        let hidden_dim: i32 = 8;
+        let vocab_size: i32 = 16;
 
-        let hidden_data: Vec<f32> = vec![0.5; n_tokens * hidden_dim];
-        let hidden = Array::from_slice(&hidden_data, &[n_tokens as i32, hidden_dim as i32]);
+        let hidden_data: Vec<f32> = vec![0.5; (n_tokens * hidden_dim) as usize];
+        let hidden = Array::from_f32_slice(&hidden_data, &[n_tokens, hidden_dim]);
 
-        let weight_data: Vec<f32> = vec![0.1; vocab_size * hidden_dim];
-        let weight = Array::from_slice(&weight_data, &[vocab_size as i32, hidden_dim as i32]);
+        let weight_data: Vec<f32> = vec![0.1; (vocab_size * hidden_dim) as usize];
+        let weight = Array::from_f32_slice(&weight_data, &[vocab_size, hidden_dim]);
 
-        // Two valid, two ignored
-        let targets = Array::from_slice(&[0i32, -100, 5, -100], &[4]);
+        let targets = Array::from_i32_slice(&[0i32, -100, 5, -100]).reshape(&[4]);
 
         let config = CutCrossEntropyConfig::new()
             .with_ignore_index(-100)
@@ -645,61 +599,58 @@ mod tests {
 
     #[test]
     fn test_cut_cross_entropy_softcap() {
-        let n_tokens = 2;
-        let hidden_dim = 4;
-        let vocab_size = 8;
+        let n_tokens: i32 = 2;
+        let hidden_dim: i32 = 4;
+        let vocab_size: i32 = 8;
 
-        // Large hidden states to test softcapping
-        let hidden_data: Vec<f32> = vec![10.0; n_tokens * hidden_dim];
-        let hidden = Array::from_slice(&hidden_data, &[n_tokens as i32, hidden_dim as i32]);
+        let hidden_data: Vec<f32> = vec![10.0; (n_tokens * hidden_dim) as usize];
+        let hidden = Array::from_f32_slice(&hidden_data, &[n_tokens, hidden_dim]);
 
-        let weight_data: Vec<f32> = vec![1.0; vocab_size * hidden_dim];
-        let weight = Array::from_slice(&weight_data, &[vocab_size as i32, hidden_dim as i32]);
+        let weight_data: Vec<f32> = vec![1.0; (vocab_size * hidden_dim) as usize];
+        let weight = Array::from_f32_slice(&weight_data, &[vocab_size, hidden_dim]);
 
-        let targets = Array::from_slice(&[0i32, 1], &[2]);
+        let targets = Array::from_i32_slice(&[0i32, 1]).reshape(&[2]);
 
-        // Without softcap
         let config_no_cap = CutCrossEntropyConfig::new().with_vocab_chunk_size(4);
         let cce_no_cap = CutCrossEntropy::new(config_no_cap);
-        let output_no_cap = cce_no_cap
-            .forward(&hidden, &weight, &targets, None)
-            .unwrap();
-        output_no_cap.loss.eval().unwrap();
+        let output_no_cap = cce_no_cap.forward(&hidden, &weight, &targets, None).unwrap();
+        let mut loss_eval_no_cap = output_no_cap.loss.clone();
+        loss_eval_no_cap.eval();
 
-        // With softcap
         let config_cap = CutCrossEntropyConfig::new()
             .with_softcap(30.0)
             .with_vocab_chunk_size(4);
         let cce_cap = CutCrossEntropy::new(config_cap);
         let output_cap = cce_cap.forward(&hidden, &weight, &targets, None).unwrap();
-        output_cap.loss.eval().unwrap();
+        let mut loss_eval_cap = output_cap.loss.clone();
+        loss_eval_cap.eval();
 
-        // Both should be finite
-        assert!(output_no_cap.loss.item::<f32>().is_finite());
-        assert!(output_cap.loss.item::<f32>().is_finite());
+        assert!(loss_eval_no_cap.item_f32().is_finite());
+        assert!(loss_eval_cap.item_f32().is_finite());
     }
 
     #[test]
     fn test_convenience_function() {
-        let n_tokens = 4;
-        let hidden_dim = 8;
-        let vocab_size = 16;
+        let n_tokens: i32 = 4;
+        let hidden_dim: i32 = 8;
+        let vocab_size: i32 = 16;
 
-        let hidden_data: Vec<f32> = (0..n_tokens * hidden_dim)
+        let hidden_data: Vec<f32> = (0..(n_tokens * hidden_dim) as usize)
             .map(|i| (i as f32) / 32.0)
             .collect();
-        let hidden = Array::from_slice(&hidden_data, &[n_tokens as i32, hidden_dim as i32]);
+        let hidden = Array::from_f32_slice(&hidden_data, &[n_tokens, hidden_dim]);
 
-        let weight_data: Vec<f32> = (0..vocab_size * hidden_dim)
+        let weight_data: Vec<f32> = (0..(vocab_size * hidden_dim) as usize)
             .map(|i| (i as f32) / 128.0 - 0.5)
             .collect();
-        let weight = Array::from_slice(&weight_data, &[vocab_size as i32, hidden_dim as i32]);
+        let weight = Array::from_f32_slice(&weight_data, &[vocab_size, hidden_dim]);
 
-        let targets = Array::from_slice(&[0i32, 5, 10, 15], &[4]);
+        let targets = Array::from_i32_slice(&[0i32, 5, 10, 15]).reshape(&[4]);
 
         let loss = cut_cross_entropy_loss(&hidden, &weight, &targets, -100).unwrap();
-        loss.eval().unwrap();
+        let mut loss_eval = loss.clone();
+        loss_eval.eval();
 
-        assert!(loss.item::<f32>().is_finite());
+        assert!(loss_eval.item_f32().is_finite());
     }
 }

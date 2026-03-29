@@ -10,7 +10,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result};
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 
 /// Linear merge implementation.
 #[derive(Debug, Clone, Default)]
@@ -70,11 +70,11 @@ impl MergeMethod for LinearMerge {
         };
 
         // Compute weighted sum
-        let mut result = tensors[0].multiply(Array::from_f32(weights[0]))?;
+        let mut result = tensors[0].multiply(&Array::from_f32(weights[0]));
 
         for (tensor, weight) in tensors[1..].iter().zip(&weights[1..]) {
-            let weighted = tensor.multiply(Array::from_f32(*weight))?;
-            result = result.add(&weighted)?;
+            let weighted = tensor.multiply(&Array::from_f32(*weight));
+            result = result.add(&weighted);
         }
 
         Ok(result)
@@ -89,8 +89,8 @@ mod tests {
     fn test_linear_merge_equal_weights() {
         let merge = LinearMerge::new();
 
-        let t1 = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t2 = Array::from_slice(&[4.0_f32, 5.0, 6.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t2 = Array::from_f32_slice(&[4.0_f32, 5.0, 6.0], &[3]);
 
         let params = vec![
             MergeParameters {
@@ -108,8 +108,8 @@ mod tests {
             ..Default::default()
         };
 
-        let result = merge.merge(&[t1, t2], None, &params, &global).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = merge.merge(&[t1, t2], None, &params, &global).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
 
         // Average of [1,2,3] and [4,5,6] = [2.5, 3.5, 4.5]
         assert!((result_slice[0] - 2.5).abs() < 1e-5);
@@ -121,8 +121,8 @@ mod tests {
     fn test_linear_merge_unequal_weights() {
         let merge = LinearMerge::new();
 
-        let t1 = Array::from_slice(&[1.0_f32, 0.0], &[2]);
-        let t2 = Array::from_slice(&[0.0_f32, 1.0], &[2]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 0.0], &[2]);
+        let t2 = Array::from_f32_slice(&[0.0_f32, 1.0], &[2]);
 
         let params = vec![
             MergeParameters {
@@ -140,8 +140,8 @@ mod tests {
             ..Default::default()
         };
 
-        let result = merge.merge(&[t1, t2], None, &params, &global).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = merge.merge(&[t1, t2], None, &params, &global).unwrap();
+        let result_slice = result.to_f32_vec(2).unwrap();
 
         // Weighted average: 0.75 * [1,0] + 0.25 * [0,1] = [0.75, 0.25]
         assert!((result_slice[0] - 0.75).abs() < 1e-5);

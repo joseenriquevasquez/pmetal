@@ -1,7 +1,7 @@
 //! Mel filterbank and mel spectrogram computation.
 
 use crate::error::Result;
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, ops};
 
 /// Mel filterbank configuration.
 #[derive(Debug, Clone)]
@@ -162,7 +162,7 @@ pub fn mel_filterbank(config: &MelConfig) -> Result<Array> {
         }
     }
 
-    Ok(Array::from_slice(&filterbank, &[config.n_mels, n_freqs]))
+    Ok(Array::from_f32_slice(&filterbank, &[config.n_mels, n_freqs]))
 }
 
 /// Compute mel spectrogram from audio.
@@ -200,19 +200,14 @@ pub fn mel_spectrogram(
     // Transpose magnitude: [freq, frames] or [batch, freq, frames]
     // mel_fb @ magnitude for [n_mels, freq] @ [freq, frames] -> [n_mels, frames]
     if magnitude.ndim() == 2 {
-        Ok(mel_fb.matmul(&magnitude)?)
+        Ok(mel_fb.matmul(&magnitude))
     } else {
         // Batched: [batch, freq, frames]
-        // Need to apply mel_fb to each batch element
-        // This can be done with broadcasting or einsum
-        let _batch_size = magnitude.dim(0);
-        let _frames = magnitude.dim(2);
-
         // Transpose to [batch, frames, freq], then matmul, then transpose back
-        let mag_t = magnitude.transpose_axes(&[0, 2, 1])?; // [batch, frames, freq]
-        let mel_fb_t = mel_fb.transpose_axes(&[1, 0])?; // [freq, n_mels]
-        let mel_spec = mag_t.matmul(&mel_fb_t)?; // [batch, frames, n_mels]
-        Ok(mel_spec.transpose_axes(&[0, 2, 1])?) // [batch, n_mels, frames]
+        let mag_t = magnitude.transpose_axes(&[0, 2, 1]); // [batch, frames, freq]
+        let mel_fb_t = mel_fb.transpose_axes(&[1, 0]); // [freq, n_mels]
+        let mel_spec = mag_t.matmul(&mel_fb_t); // [batch, frames, n_mels]
+        Ok(mel_spec.transpose_axes(&[0, 2, 1])) // [batch, n_mels, frames]
     }
 }
 
@@ -226,8 +221,8 @@ pub fn mel_spectrogram(
 /// Log-compressed mel spectrogram
 pub fn log_mel_spectrogram(mel_spec: &Array, clip_val: Option<f32>) -> Result<Array> {
     let clip = Array::from_f32(clip_val.unwrap_or(1e-5));
-    let clipped = mlx_rs::ops::maximum(mel_spec, &clip)?;
-    Ok(clipped.log()?)
+    let clipped = ops::maximum(mel_spec, &clip);
+    Ok(clipped.log())
 }
 
 /// Dynamic range compression for mel spectrogram.
@@ -248,12 +243,12 @@ pub fn dynamic_range_compression(
     let clip = Array::from_f32(clip_val.unwrap_or(1e-5));
     let c_arr = Array::from_f32(c);
 
-    let clipped = mlx_rs::ops::maximum(mel_spec, &clip)?;
+    let clipped = ops::maximum(mel_spec, &clip);
     // log(1 + c * x) / log(1 + c)
     let one = Array::from_f32(1.0);
-    let numerator = one.add(&clipped.multiply(&c_arr)?)?.log()?;
+    let numerator = one.add(&clipped.multiply(&c_arr)).log();
     let denominator = (1.0 + c).ln();
-    Ok(numerator.divide(Array::from_f32(denominator))?)
+    Ok(numerator.divide(&Array::from_f32(denominator)))
 }
 
 #[cfg(test)]
@@ -296,10 +291,11 @@ mod tests {
         };
 
         let fb = mel_filterbank(&config).unwrap();
-        fb.eval().unwrap();
+        let mut fb2 = fb.clone();
+        fb2.eval();
 
         // Should be [n_mels, n_fft/2+1] = [80, 513]
-        assert_eq!(fb.shape(), &[80, 513]);
+        assert_eq!(fb2.shape(), &[80, 513]);
     }
 
     #[test]
@@ -315,11 +311,13 @@ mod tests {
         };
 
         let fb = mel_filterbank(&config).unwrap();
-        fb.eval().unwrap();
+        let mut fb2 = fb.clone();
+        fb2.eval();
 
         // Sum of each filter should be reasonable (not all zeros)
-        let row_sums = fb.sum_axis(1, None).unwrap();
-        row_sums.eval().unwrap();
+        let row_sums = fb2.sum_axis(1, false);
+        let mut rs2 = row_sums.clone();
+        rs2.eval();
 
         // Each mel filter should sum to something positive
         // (Slaney normalization makes area = 2)

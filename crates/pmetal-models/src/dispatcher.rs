@@ -3,17 +3,13 @@
 //! This module provides automatic architecture detection and model loading,
 //! eliminating the need for hardcoded model types in application code.
 
+use pmetal_bridge::compat::{Array, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, ModuleParametersExt, nn, transforms};
 use crate::architectures::*;
 use crate::loader::{
     Qwen3NextLoadOptions, load_bert_weights, load_falcon_h1_weights, load_generic_weights,
     load_nemotron_weights, load_qwen3_next_weights_with_options, load_weights,
 };
 use crate::traits::{CausalLMModel, ModelConfig};
-use mlx_rs::{
-    Array,
-    error::Exception,
-    module::{Module, ModuleParameters},
-};
 use pmetal_mlx::kv_cache::{
     CacheMode, KVCache, KVCacheConfig, MambaCache, TurboQuantConfig, TurboQuantTensorConfig,
 };
@@ -76,12 +72,12 @@ pub struct DynamicModelLoadOptions {
     pub prefer_expert_offload: bool,
 }
 
-fn eval_module_parameters_batched(module: &impl ModuleParameters) -> Result<(), Exception> {
-    let params = module.parameters().flatten();
-    let arrays: Vec<&Array> = params.values().copied().collect();
+fn eval_module_parameters_batched(module: &impl ModuleParametersExt) -> Result<(), Exception> {
+    let params = module.flatten_params();
+    let arrays: Vec<Array> = params.values().cloned().collect();
 
     for chunk in arrays.chunks(PARAM_EVAL_BATCH_SIZE) {
-        mlx_rs::transforms::eval(chunk.iter().copied())?;
+        pmetal_bridge::compat::transforms::eval(chunk.iter())?;
     }
 
     Ok(())
@@ -481,7 +477,7 @@ impl DynamicModel {
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 eval_module_parameters_batched(&model)?;
                 let mut model = Self::Qwen3MoE(model);
-                model.init_post_load_fast_paths()?;
+                model.init_post_load_fast_paths();
                 Ok(model)
             }
             ModelArchitecture::Gemma => {
@@ -535,7 +531,7 @@ impl DynamicModel {
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 eval_module_parameters_batched(&model)?;
                 let mut model = Self::DeepSeek(model);
-                model.init_post_load_fast_paths()?;
+                model.init_post_load_fast_paths();
                 Ok(model)
             }
             ModelArchitecture::Cohere => {
@@ -564,7 +560,7 @@ impl DynamicModel {
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 eval_module_parameters_batched(&model)?;
                 let mut model = Self::NemotronH(model);
-                model.init_post_load_fast_paths()?;
+                model.init_post_load_fast_paths();
                 Ok(model)
             }
             ModelArchitecture::Qwen3Next => {
@@ -1055,15 +1051,15 @@ impl DynamicModel {
 }
 
 impl ModuleParameters for DynamicModel {
-    fn parameters(&self) -> mlx_rs::module::ModuleParamRef<'_> {
+    fn parameters(&self) -> pmetal_bridge::compat::module::ModuleParamRef<'_> {
         dispatch_uniform!(self, parameters)
     }
 
-    fn trainable_parameters(&self) -> mlx_rs::module::ModuleParamRef<'_> {
+    fn trainable_parameters(&self) -> pmetal_bridge::compat::module::ModuleParamRef<'_> {
         dispatch_uniform!(self, trainable_parameters)
     }
 
-    fn parameters_mut(&mut self) -> mlx_rs::module::ModuleParamMut<'_> {
+    fn parameters_mut(&mut self) -> pmetal_bridge::compat::module::ModuleParamMut<'_> {
         dispatch_uniform!(self, parameters_mut)
     }
 
@@ -1257,7 +1253,7 @@ mod tests {
     #[test]
     #[serial]
     fn qwen3_moe_post_load_fast_paths_initialize_stacked_experts() {
-        let mut model = DynamicModel::Qwen3MoE(Qwen3MoE::new(tiny_qwen3_moe_config()).unwrap());
+        let mut model = DynamicModel::Qwen3MoE(Qwen3MoE::new(tiny_qwen3_moe_config()).unwrap())?;
         model.init_post_load_fast_paths().unwrap();
 
         let DynamicModel::Qwen3MoE(model) = &model else {
@@ -1272,7 +1268,7 @@ mod tests {
     #[test]
     #[serial]
     fn deepseek_post_load_fast_paths_initialize_stacked_experts() {
-        let mut model = DynamicModel::DeepSeek(DeepSeek::new(tiny_deepseek_config()).unwrap());
+        let mut model = DynamicModel::DeepSeek(DeepSeek::new(tiny_deepseek_config()).unwrap())?;
         model.init_post_load_fast_paths().unwrap();
 
         let DynamicModel::DeepSeek(model) = &model else {

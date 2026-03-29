@@ -27,9 +27,8 @@
 //! - "Proximal Policy Optimization Algorithms" (Schulman et al., 2017)
 //! - Standard RLHF implementations
 
-use mlx_rs::Array;
-use mlx_rs::error::Exception;
-use mlx_rs::ops::indexing::IndexOp;
+use pmetal_bridge::compat::{Array, Exception, ops, nn, ops::indexing::IndexOp};
+type Result<T> = std::result::Result<T, Exception>;
 use pmetal_core::TrainingConfig;
 
 /// Error type for PPO training.
@@ -378,21 +377,21 @@ impl PpoTrainer {
         // Clipped objective
         let eps = Array::from_f32(self.config.clip_eps as f32);
         let one = Array::from_f32(1.0);
-        let clip_low = one.subtract(&eps)?;
-        let clip_high = one.add(&eps)?;
+        let clip_low = one.subtract(&eps);
+        let clip_high = one.add(&eps);
         // Use maximum/minimum to clip ratio to [1-eps, 1+eps]
-        let clipped_ratio = mlx_rs::ops::maximum(&ratio, &clip_low)?;
-        let clipped_ratio = mlx_rs::ops::minimum(&clipped_ratio, &clip_high)?;
+        let clipped_ratio = ops::maximum(&ratio, &clip_low);
+        let clipped_ratio = ops::minimum(&clipped_ratio, &clip_high);
 
         // Surrogate objectives
-        let surr1 = ratio.multiply(advantages)?;
-        let surr2 = clipped_ratio.multiply(advantages)?;
-        let policy_loss = mlx_rs::ops::minimum(&surr1, &surr2)?;
-        let masked_policy_loss = policy_loss.multiply(mask)?;
+        let surr1 = ratio.multiply(advantages);
+        let surr2 = clipped_ratio.multiply(advantages);
+        let policy_loss = ops::minimum(&surr1, &surr2);
+        let masked_policy_loss = policy_loss.multiply(mask);
         let mean_policy_loss = masked_policy_loss
-            .sum(None)?
-            .divide(&mask.sum(None)?)?
-            .negative()?;
+            .sum(None)
+            .divide(&mask.sum(None))
+            .negative();
 
         // Value loss (optional)
         let value_loss = if self.config.use_value_head {
@@ -400,28 +399,28 @@ impl PpoTrainer {
                 let vf_loss = if let Some(vf_clip) = self.config.vf_clip {
                     // Clipped value loss
                     let clip = Array::from_f32(vf_clip as f32);
-                    let v_diff = new_v.subtract(old_v)?;
-                    let clipped_diff_low = mlx_rs::ops::maximum(&v_diff, &clip.negative()?)?;
-                    let clipped_diff = mlx_rs::ops::minimum(&clipped_diff_low, &clip)?;
-                    let v_clipped = old_v.add(&clipped_diff)?;
+                    let v_diff = new_v.subtract(old_v);
+                    let clipped_diff_low = ops::maximum(&v_diff, &clip.negative());
+                    let clipped_diff = ops::minimum(&clipped_diff_low, &clip);
+                    let v_clipped = old_v.add(&clipped_diff);
 
-                    let loss1 = new_v.subtract(ret)?.square()?;
-                    let loss2 = v_clipped.subtract(ret)?.square()?;
-                    mlx_rs::ops::maximum(&loss1, &loss2)?
+                    let loss1 = new_v.subtract(ret).square();
+                    let loss2 = v_clipped.subtract(ret).square();
+                    ops::maximum(&loss1, &loss2)
                 } else {
                     // Simple MSE loss
-                    new_v.subtract(ret)?.square()?
+                    new_v.subtract(ret).square()
                 };
 
-                let masked_vf = vf_loss.multiply(mask)?;
+                let masked_vf = vf_loss.multiply(mask);
                 let vf_coef = Array::from_f32(self.config.vf_coef as f32);
                 let half = Array::from_f32(0.5);
                 Some(
                     masked_vf
-                        .sum(None)?
-                        .divide(&mask.sum(None)?)?
-                        .multiply(&vf_coef)?
-                        .multiply(&half)?,
+                        .sum(None)
+                        .divide(&mask.sum(None))
+                        .multiply(&vf_coef)
+                        .multiply(&half),
                 )
             } else {
                 None
@@ -439,10 +438,10 @@ impl PpoTrainer {
                 let entropy_coef = Array::from_f32(self.config.entropy_coef as f32);
                 Some(
                     entropy_per_token
-                        .multiply(mask)?
-                        .sum(None)?
-                        .divide(&mask.sum(None)?)?
-                        .multiply(&entropy_coef)?,
+                        .multiply(mask)
+                        .sum(None)
+                        .divide(&mask.sum(None))
+                        .multiply(&entropy_coef),
                 )
             } else {
                 None
@@ -452,20 +451,20 @@ impl PpoTrainer {
         };
 
         // KL divergence (approximate)
-        let kl = ratio.subtract(&one)?.subtract(&log_ratio)?;
-        let mean_kl = kl.multiply(mask)?.sum(None)?.divide(&mask.sum(None)?)?;
+        let kl = ratio.subtract(&one).subtract(&log_ratio);
+        let mean_kl = kl.multiply(mask).sum(None).divide(&mask.sum(None));
 
         // Total loss
         let mut total_loss = mean_policy_loss.clone();
         if let Some(ref vl) = value_loss {
-            total_loss = total_loss.add(vl)?;
+            total_loss = total_loss.add(vl);
         }
         if let Some(ref ent) = entropy {
-            total_loss = total_loss.subtract(ent)?; // Subtract because we want to maximize entropy
+            total_loss = total_loss.subtract(ent); // Subtract because we want to maximize entropy
         }
         if self.kl_coef > 0.0 {
-            let kl_penalty = mean_kl.multiply(&Array::from_f32(self.kl_coef as f32))?;
-            total_loss = total_loss.add(&kl_penalty)?;
+            let kl_penalty = mean_kl.multiply(&Array::from_f32(self.kl_coef as f32));
+            total_loss = total_loss.add(&kl_penalty);
         }
 
         Ok((total_loss, mean_policy_loss, value_loss, entropy, mean_kl))
@@ -743,8 +742,8 @@ mod tests {
         policy_loss.eval().unwrap();
         kl.eval().unwrap();
 
-        assert!(loss.item::<f32>().is_finite());
-        assert!(kl.item::<f32>() >= 0.0);
+        assert!(loss\.item_f32().is_finite());
+        assert!(kl\.item_f32() >= 0.0);
     }
 
     #[test]

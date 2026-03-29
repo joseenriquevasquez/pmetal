@@ -10,16 +10,16 @@
 //! use pmetal_models::weight_format::{WeightLoader, WeightFormat};
 //!
 //! // Auto-detect format and load
-//! let weights = WeightLoader::load("./model")?;
+//! let weights = WeightLoader::load("./model");
 //!
 //! // Or load specific format
-//! let weights = WeightLoader::load_gguf("./model.gguf")?;
+//! let weights = WeightLoader::load_gguf("./model.gguf");
 //! ```
 
+use pmetal_bridge::compat::{Array, Dtype, Exception};
 use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_rs::{Array, Dtype};
 
 /// Error type for weight loading.
 #[derive(Debug, thiserror::Error)]
@@ -44,10 +44,10 @@ pub enum WeightFormatError {
     MissingWeight(String),
     /// MLX error.
     #[error("MLX error: {0}")]
-    Mlx(#[from] mlx_rs::error::Exception),
+    Mlx(#[from] pmetal_bridge::compat::Exception),
     /// MLX IO error.
     #[error("MLX IO error: {0}")]
-    MlxIo(#[from] mlx_rs::error::IoError),
+    MlxIo(#[from] pmetal_bridge::compat::IoError),
     /// JSON error.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
@@ -145,17 +145,21 @@ impl WeightLoader {
 
         if path.is_file() {
             // Single file
-            let loaded = Array::load_safetensors(path)?;
-            for (name, array) in loaded {
-                weights.insert(name, Self::convert_dtype_for_training(array)?);
+            let path_str = path.to_str().unwrap_or_default();
+            if let Some(pairs) = pmetal_bridge::inline_array::load_safetensors_shard(path_str) {
+                for (name, array) in pairs {
+                    weights.insert(name, Self::convert_dtype_for_training(array)?);
+                }
             }
         } else if path.is_dir() {
             // Directory - check for single file or sharded
             let single_file = path.join("model.safetensors");
             if single_file.exists() {
-                let loaded = Array::load_safetensors(&single_file)?;
-                for (name, array) in loaded {
-                    weights.insert(name, Self::convert_dtype_for_training(array)?);
+                let path_str = single_file.to_str().unwrap_or_default();
+                if let Some(pairs) = pmetal_bridge::inline_array::load_safetensors_shard(path_str) {
+                    for (name, array) in pairs {
+                        weights.insert(name, Self::convert_dtype_for_training(array)?);
+                    }
                 }
             } else {
                 // Load sharded model
@@ -182,9 +186,11 @@ impl WeightLoader {
                 // Load each shard
                 for shard_file in shard_files {
                     let shard_path = path.join(shard_file);
-                    let loaded = Array::load_safetensors(&shard_path)?;
-                    for (name, array) in loaded {
-                        weights.insert(name, Self::convert_dtype_for_training(array)?);
+                    let path_str = shard_path.to_str().unwrap_or_default();
+                    if let Some(pairs) = pmetal_bridge::inline_array::load_safetensors_shard(path_str) {
+                        for (name, array) in pairs {
+                            weights.insert(name, Self::convert_dtype_for_training(array)?);
+                        }
                     }
                 }
             }
@@ -225,8 +231,8 @@ impl WeightLoader {
                     "No .gguf file found in: {}",
                     path.display()
                 ))
-            })?
-        };
+            })
+        }?;
 
         // Read GGUF content
         let content = pmetal_gguf::GgufContent::from_file(&gguf_path)
@@ -286,7 +292,7 @@ impl WeightLoader {
         match array.dtype() {
             Dtype::Bfloat16 => {
                 // Convert BF16 to F32 for training compatibility
-                Ok(array.as_dtype(Dtype::Float32)?)
+                Ok(array.as_dtype(Dtype::Float32.as_i32()))
             }
             // Keep other dtypes as-is
             _ => Ok(array),
@@ -384,20 +390,20 @@ impl GgufModelConfig {
         // Helper to get metadata with architecture prefix
         let get_u32 = |key: &str| -> Option<u32> {
             let full_key = format!("{}.{}", arch, key);
-            match content.get_metadata(&full_key)? {
-                pmetal_gguf::MetadataValue::Uint32(v) => Some(*v),
-                pmetal_gguf::MetadataValue::Int32(v) => Some(*v as u32),
-                pmetal_gguf::MetadataValue::Uint64(v) => Some(*v as u32),
-                pmetal_gguf::MetadataValue::Int64(v) => Some(*v as u32),
+            match content.get_metadata(&full_key) {
+                Some(pmetal_gguf::MetadataValue::Uint32(v)) => Some(*v),
+                Some(pmetal_gguf::MetadataValue::Int32(v)) => Some(*v as u32),
+                Some(pmetal_gguf::MetadataValue::Uint64(v)) => Some(*v as u32),
+                Some(pmetal_gguf::MetadataValue::Int64(v)) => Some(*v as u32),
                 _ => None,
             }
         };
 
         let get_f32 = |key: &str| -> Option<f32> {
             let full_key = format!("{}.{}", arch, key);
-            match content.get_metadata(&full_key)? {
-                pmetal_gguf::MetadataValue::Float32(v) => Some(*v),
-                pmetal_gguf::MetadataValue::Float64(v) => Some(*v as f32),
+            match content.get_metadata(&full_key) {
+                Some(pmetal_gguf::MetadataValue::Float32(v)) => Some(*v),
+                Some(pmetal_gguf::MetadataValue::Float64(v)) => Some(*v as f32),
                 _ => None,
             }
         };
@@ -579,8 +585,8 @@ pub fn get_gguf_architecture(path: impl AsRef<Path>) -> Result<Option<String>, W
                 "No .gguf file found in: {}",
                 path.display()
             ))
-        })?
-    };
+        })
+    }?;
 
     let content = pmetal_gguf::GgufContent::from_file(&gguf_path)
         .map_err(|e| WeightFormatError::Gguf(e.to_string()))?;

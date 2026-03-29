@@ -10,7 +10,7 @@
 #![allow(clippy::clone_on_copy)]
 #![allow(clippy::manual_range_contains)]
 
-use mlx_rs::optimizers::Sgd;
+use pmetal_bridge::compat::optimizers::Sgd;
 use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_data::{DataLoaderConfig, Sample, TrainingDataset};
 use pmetal_lora::LlamaLoraForCausalLM;

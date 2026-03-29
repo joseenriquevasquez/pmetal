@@ -14,17 +14,10 @@
 //!
 //! Reference: https://arxiv.org/abs/2504.03624
 
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, Param, indexing, nn, ops};
+use pmetal_bridge::impl_module_params;
 use std::collections::HashMap;
 
-use mlx_rs::{
-    Array, Dtype,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, ModuleParameters as ModuleParametersTrait, Param},
-    nn,
-    ops::indexing::IndexOp,
-};
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use serde::{Deserialize, Serialize};
@@ -34,13 +27,13 @@ fn materialize_linear_weight(
     weight_scale: Option<&Array>,
 ) -> Result<Array, Exception> {
     let weight = if weight.dtype() == Dtype::Uint8 {
-        mlx_rs::ops::from_fp8(weight, Dtype::Bfloat16)?
+        pmetal_bridge::compat::ops::from_fp8(weight, Dtype::Bfloat16)?
     } else {
         weight.clone()
     };
 
     if let Some(scale) = weight_scale {
-        weight.multiply(scale)
+        Ok(weight.multiply(scale))
     } else {
         Ok(weight)
     }
@@ -54,14 +47,14 @@ fn linear_forward_with_optional_fp8(
 ) -> Result<Array, Exception> {
     let weight = materialize_linear_weight(weight, weight_scale)?;
     let x = if weight.dtype() == Dtype::Bfloat16 && x.dtype() != Dtype::Bfloat16 {
-        x.as_dtype(Dtype::Bfloat16)?
+        x.as_dtype(Dtype::Bfloat16.as_i32())
     } else {
         x.clone()
     };
 
-    let output = x.matmul(&weight.t())?;
+    let output = x.matmul(&weight.t());
     if let Some(bias) = bias {
-        output.add(bias)
+        Ok(output.add(bias))
     } else {
         Ok(output)
     }
@@ -71,13 +64,13 @@ fn linear_module_forward(linear: &mut nn::Linear, x: &Array) -> Result<Array, Ex
     linear_forward_with_optional_fp8(
         x,
         linear.weight.as_ref(),
-        linear.bias.as_ref().as_ref(),
+        linear.bias.as_ref(),
         None,
     )
 }
 
 fn quantize_linear_weights_fp8(linear: &mut nn::Linear) -> Result<(), Exception> {
-    let quantized = mlx_rs::ops::to_fp8(linear.weight.as_ref())?;
+    let quantized = pmetal_bridge::compat::ops::to_fp8(linear.weight.as_ref())?;
     linear.weight = Param::new(quantized);
     Ok(())
 }
@@ -106,7 +99,7 @@ pub struct QuantizedLinear {
 impl QuantizedLinear {
     /// Create a new quantized linear layer.
     pub fn new(in_features: i32, out_features: i32) -> Result<Self, Exception> {
-        let weight = Array::zeros::<f32>(&[out_features, in_features])?;
+        let weight = Array::zeros_f32(&[out_features, in_features]);
         Ok(Self {
             weight: Param::new(weight),
             bias: None,
@@ -161,7 +154,7 @@ impl MambaRMSNormGated {
     /// * `n_groups` - Number of groups to divide hidden_size into
     pub fn new(hidden_size: i32, eps: f32, n_groups: i32) -> Result<Self, Exception> {
         let group_size = hidden_size / n_groups;
-        let weight = Array::ones::<f32>(&[hidden_size])?;
+        let weight = Array::ones_f32(&[hidden_size]);
         Ok(Self {
             weight,
             eps,
@@ -181,8 +174,8 @@ impl MambaRMSNormGated {
     pub fn forward(&self, x: &Array, gate: Option<&Array>) -> Result<Array, Exception> {
         // Apply gating if provided: x = x * silu(gate)
         let x = if let Some(g) = gate {
-            let gate_activated = nn::silu(g)?;
-            x.multiply(&gate_activated)?
+            let gate_activated = nn::silu(&g);
+            x.multiply(&gate_activated)
         } else {
             x.clone()
         };
@@ -193,21 +186,21 @@ impl MambaRMSNormGated {
         let num_groups = self.hidden_size / self.group_size;
 
         // Reshape to groups: [B, L, hidden] -> [B, L, num_groups, group_size]
-        let x_grouped = x.reshape(&[batch, seq_len, num_groups, self.group_size])?;
+        let x_grouped = x.reshape(&[batch, seq_len, num_groups, self.group_size]);
 
         // Compute RMS norm within each group (axis -1)
         // RMS = sqrt(mean(x^2) + eps)
-        let x_sq = x_grouped.square()?;
-        let mean_sq = x_sq.mean_axis(-1, true)?;
-        let rms = mean_sq.add(&Array::from_f32(self.eps))?.sqrt()?;
+        let x_sq = x_grouped.square();
+        let mean_sq = x_sq.mean_axis(-1, true);
+        let rms = mean_sq.add(&Array::from_f32(self.eps)).sqrt();
 
-        let x_normed = x_grouped.divide(&rms)?;
+        let x_normed = x_grouped.divide(&rms);
 
         // Flatten back: [B, L, num_groups, group_size] -> [B, L, hidden]
-        let x_flat = x_normed.reshape(&[batch, seq_len, self.hidden_size])?;
+        let x_flat = x_normed.reshape(&[batch, seq_len, self.hidden_size]);
 
         // Apply learned weight
-        let result = x_flat.multiply(&self.weight)?;
+        let result = x_flat.multiply(&self.weight);
 
         Ok(result)
     }
@@ -224,31 +217,30 @@ fn compute_dt(
     time_step_min: f32,
     time_step_max: f32,
 ) -> Result<Array, Exception> {
-    let dt_biased = dt.add(dt_bias)?;
-    let dt_soft = nn::softplus(&dt_biased)?;
-    mlx_rs::ops::clip(
+    let dt_biased = dt.add(dt_bias);
+    let dt_soft = nn::softplus(&dt_biased);
+    Ok(pmetal_bridge::compat::ops::clip(
         &dt_soft,
-        (
-            &Array::from_f32(time_step_min),
-            &Array::from_f32(time_step_max),
-        ),
-    )
+        Some(&Array::from_f32(time_step_min)),
+        Some(&Array::from_f32(time_step_max)),
+    ))
 }
 
 /// Segmented cumulative sum for SSM decay computation.
 /// Computes cumsum along axis for attention-like SSM formulation.
 fn segsum(x: &Array) -> Result<Array, Exception> {
-    let l = x.shape()[x.ndim() - 1];
+    let ndim = x.ndim() as usize;
+    let l = x.shape()[ndim - 1];
 
     // Repeat x along new axis: [B, H, L] -> [B, H, L, L]
-    let x_expanded = mlx_rs::ops::expand_dims(x, -1)?;
-    let x_repeated = mlx_rs::ops::tile(&x_expanded, &[1, 1, 1, l as i32])?;
+    let x_expanded = pmetal_bridge::compat::ops::expand_dims(x, -1);
+    let x_repeated = pmetal_bridge::compat::ops::tile(&x_expanded, &[1, 1, 1, l as i32]);
 
     // Create lower triangular mask (shifted by -1)
-    let x_tril = mlx_rs::ops::tril(&x_repeated, -1)?;
+    let x_tril = pmetal_bridge::compat::ops::tril(&x_repeated, -1);
 
     // Cumsum along axis -2
-    x_tril.cumsum(-2, None, None)
+    Ok(pmetal_bridge::compat::ops::cumsum(&x_tril, -2))
 }
 
 /// Optimized SSM update for single-token decode (seq_len=1).
@@ -295,68 +287,68 @@ pub fn ssm_update_single(
 
     // Compute dt with bias and clipping: dt = clip(softplus(dt + dt_bias), min, max)
     // dt: [B, 1, H] -> squeeze to [B, H]
-    let dt_squeezed = dt.squeeze_axes(&[1])?;
+    let dt_squeezed = dt.squeeze_axes(&[1]);
     let dt_full = compute_dt(&dt_squeezed, dt_bias, time_step_limit.0, time_step_limit.1)?;
 
     // Compute A = -exp(A_log): [H]
-    let a = mlx_rs::ops::negative(&mlx_rs::ops::exp(a_log)?)?;
-    let a = a.as_dtype(dt_full.dtype())?;
+    let a = pmetal_bridge::compat::ops::negative(&pmetal_bridge::compat::ops::exp(a_log));
+    let a = a.as_dtype(dt_full.dtype().as_i32());
 
     // dA = exp(A * dt): [B, H] - decay factor
-    let dt_a = dt_full.multiply(&a.reshape(&[1, num_heads])?)?;
-    let d_a = mlx_rs::ops::exp(&dt_a)?;
+    let dt_a = dt_full.multiply(&a.reshape(&[1, num_heads]));
+    let d_a = pmetal_bridge::compat::ops::exp(&dt_a);
 
     // x squeezed: [B, 1, H, D] -> [B, H, D]
-    let x_squeezed = x.squeeze_axes(&[1])?;
+    let x_squeezed = x.squeeze_axes(&[1]);
 
     // dt expanded for multiplication: [B, H] -> [B, H, 1]
-    let dt_expanded = mlx_rs::ops::expand_dims(&dt_full, -1)?;
+    let dt_expanded = pmetal_bridge::compat::ops::expand_dims(&dt_full, -1);
 
     // dtx = x * dt: [B, H, D]
-    let dtx = x_squeezed.multiply(&dt_expanded)?;
+    let dtx = x_squeezed.multiply(&dt_expanded);
 
     // B squeezed: [B, 1, G, N] -> [B, G, N]
-    let b_squeezed = b.squeeze_axes(&[1])?;
+    let b_squeezed = b.squeeze_axes(&[1]);
 
     // Repeat B to all heads: [B, G, N] -> [B, H, N]
-    let b_expanded = mlx_rs::ops::expand_dims(&b_squeezed, 2)?; // [B, G, 1, N]
-    let b_tiled = mlx_rs::ops::tile(&b_expanded, &[1, 1, repeats, 1])?; // [B, G, repeats, N]
-    let b_heads = b_tiled.reshape(&[batch, num_heads, state_dim])?; // [B, H, N]
+    let b_expanded = pmetal_bridge::compat::ops::expand_dims(&b_squeezed, 2); // [B, G, 1, N]
+    let b_tiled = pmetal_bridge::compat::ops::tile(&b_expanded, &[1, 1, repeats, 1]); // [B, G, repeats, N]
+    let b_heads = b_tiled.reshape(&[batch, num_heads, state_dim]); // [B, H, N]
 
     // dB_by_x = dtx * B: [B, H, D, 1] @ [B, H, 1, N] -> [B, H, D, N]
     // Using outer product: dtx[:,:,:,None] * B[:,:,None,:]
-    let dtx_expanded = mlx_rs::ops::expand_dims(&dtx, -1)?; // [B, H, D, 1]
-    let b_expanded2 = mlx_rs::ops::expand_dims(&b_heads, 2)?; // [B, H, 1, N]
-    let db_by_x = dtx_expanded.multiply(&b_expanded2)?; // [B, H, D, N]
+    let dtx_expanded = pmetal_bridge::compat::ops::expand_dims(&dtx, -1); // [B, H, D, 1]
+    let b_expanded2 = pmetal_bridge::compat::ops::expand_dims(&b_heads, 2); // [B, H, 1, N]
+    let db_by_x = dtx_expanded.multiply(&b_expanded2); // [B, H, D, N]
 
     // dA expanded for state: [B, H] -> [B, H, 1, 1]
-    let d_a_expanded = mlx_rs::ops::expand_dims(&d_a, -1)?;
-    let d_a_expanded = mlx_rs::ops::expand_dims(&d_a_expanded, -1)?;
+    let d_a_expanded = pmetal_bridge::compat::ops::expand_dims(&d_a, -1);
+    let d_a_expanded = pmetal_bridge::compat::ops::expand_dims(&d_a_expanded, -1);
 
     // New state = dA * old_state + dB_by_x: [B, H, D, N]
-    let new_state = state.multiply(&d_a_expanded)?.add(&db_by_x)?;
+    let new_state = state.multiply(&d_a_expanded).add(&db_by_x);
 
     // C squeezed: [B, 1, G, N] -> [B, G, N]
-    let c_squeezed = c.squeeze_axes(&[1])?;
+    let c_squeezed = c.squeeze_axes(&[1]);
 
     // Repeat C to all heads: [B, G, N] -> [B, H, N]
-    let c_expanded = mlx_rs::ops::expand_dims(&c_squeezed, 2)?;
-    let c_tiled = mlx_rs::ops::tile(&c_expanded, &[1, 1, repeats, 1])?;
-    let c_heads = c_tiled.reshape(&[batch, num_heads, state_dim])?;
+    let c_expanded = pmetal_bridge::compat::ops::expand_dims(&c_squeezed, 2);
+    let c_tiled = pmetal_bridge::compat::ops::tile(&c_expanded, &[1, 1, repeats, 1]);
+    let c_heads = c_tiled.reshape(&[batch, num_heads, state_dim]);
 
     // Output = state @ C: [B, H, D, N] @ [B, H, N, 1] -> [B, H, D, 1] -> [B, H, D]
     // Or using einsum-like: sum over N: state * C
-    let c_expanded2 = mlx_rs::ops::expand_dims(&c_heads, 2)?; // [B, H, 1, N]
-    let state_c = new_state.multiply(&c_expanded2)?; // [B, H, D, N]
-    let y = state_c.sum_axis(-1, false)?; // [B, H, D]
+    let c_expanded2 = pmetal_bridge::compat::ops::expand_dims(&c_heads, 2); // [B, H, 1, N]
+    let state_c = new_state.multiply(&c_expanded2); // [B, H, D, N]
+    let y = state_c.sum_axis(-1, false); // [B, H, D]
 
     // Add skip connection: y + x * D
-    let d_expanded = d.reshape(&[1, num_heads, 1])?;
-    let skip = x_squeezed.multiply(&d_expanded)?;
-    let y = y.add(&skip)?;
+    let d_expanded = d.reshape(&[1, num_heads, 1]);
+    let skip = x_squeezed.multiply(&d_expanded);
+    let y = y.add(&skip);
 
     // Expand output to [B, 1, H, D]
-    let y = mlx_rs::ops::expand_dims(&y, 1)?;
+    let y = pmetal_bridge::compat::ops::expand_dims(&y, 1);
 
     Ok((y, new_state))
 }
@@ -406,109 +398,109 @@ pub fn ssm_attention(
     let dt_full = compute_dt(dt, dt_bias, time_step_limit.0, time_step_limit.1)?;
 
     // Compute A = -exp(A_log) and cast to dt dtype
-    let a = mlx_rs::ops::negative(&mlx_rs::ops::exp(a_log)?)?;
-    let a = a.as_dtype(dt_full.dtype())?;
+    let a = pmetal_bridge::compat::ops::negative(&pmetal_bridge::compat::ops::exp(a_log));
+    let a = a.as_dtype(dt_full.dtype().as_i32());
 
     // Compute dtA = dt * A: [B, L, H]
-    let dt_a = dt_full.multiply(&a.reshape(&[1, 1, num_heads])?)?;
+    let dt_a = dt_full.multiply(&a.reshape(&[1, 1, num_heads]));
 
     // Compute dtx = dt * x: [B, L, H, D]
-    let dt_expanded = dt_full.reshape(&[batch, seq_len, num_heads, 1])?;
-    let dtx = x.multiply(&dt_expanded)?;
+    let dt_expanded = dt_full.reshape(&[batch, seq_len, num_heads, 1]);
+    let dtx = x.multiply(&dt_expanded);
 
     // B: [B, L, G, N] -> [B, G, N, L]
-    let b_t = b.transpose_axes(&[0, 2, 3, 1])?;
+    let b_t = b.transpose_axes(&[0, 2, 3, 1]);
 
     // CB = C.swapaxes(1,2) @ B_t: [B, G, L, N] @ [B, G, N, L] = [B, G, L, L]
-    let c_t = c.transpose_axes(&[0, 2, 1, 3])?;
-    let cb = c_t.matmul(&b_t)?;
+    let c_t = c.transpose_axes(&[0, 2, 1, 3]);
+    let cb = c_t.matmul(&b_t);
 
     // Repeat CB to all heads: [B, G, L, L] -> [B, H, L, L]
-    let cb_expanded = mlx_rs::ops::expand_dims(&cb, 2)?;
-    let cb_tiled = mlx_rs::ops::tile(&cb_expanded, &[1, 1, repeats, 1, 1])?;
-    let cb_heads = cb_tiled.reshape(&[batch, num_heads, seq_len, seq_len])?;
+    let cb_expanded = pmetal_bridge::compat::ops::expand_dims(&cb, 2);
+    let cb_tiled = pmetal_bridge::compat::ops::tile(&cb_expanded, &[1, 1, repeats, 1, 1]);
+    let cb_heads = cb_tiled.reshape(&[batch, num_heads, seq_len, seq_len]);
 
     // Compute decay = exp(segsum(dtA.swapaxes(1,2))): [B, H, L, L]
-    let dt_a_t = dt_a.transpose_axes(&[0, 2, 1])?;
+    let dt_a_t = dt_a.transpose_axes(&[0, 2, 1]);
     let segsum_result = segsum(&dt_a_t)?;
-    let decay = mlx_rs::ops::exp(&segsum_result)?;
+    let decay = pmetal_bridge::compat::ops::exp(&segsum_result);
 
     // Surrogate attention = tril(CB * decay)
-    let attn_weights = cb_heads.multiply(&decay)?;
-    let attn_weights = mlx_rs::ops::tril(&attn_weights, 0)?;
+    let attn_weights = cb_heads.multiply(&decay);
+    let attn_weights = pmetal_bridge::compat::ops::tril(&attn_weights, 0);
 
     // y = attn @ dtx.swapaxes(1,2): [B, H, L, L] @ [B, H, L, D] = [B, H, L, D]
-    let dtx_t = dtx.transpose_axes(&[0, 2, 1, 3])?;
-    let mut y = attn_weights.matmul(&dtx_t)?;
+    let dtx_t = dtx.transpose_axes(&[0, 2, 1, 3]);
+    let mut y = attn_weights.matmul(&dtx_t);
 
     // Compute new state for caching
     // decay_last: [B, H, 1, L] -> [B, L, H, 1]
-    let decay_last = decay.index((.., .., (seq_len - 1)..seq_len, ..));
-    let decay_last = decay_last.transpose_axes(&[0, 3, 1, 2])?;
+    let decay_last = pmetal_bridge::compat::ops::slice_axis(&decay, 2, (seq_len as i32) - 1, seq_len as i32);
+    let decay_last = decay_last.transpose_axes(&[0, 3, 1, 2]);
 
     // B_expanded: [B, G, N, L] -> repeat to [B, H, N, L] -> [B, H, L, N]
-    let b_expanded = mlx_rs::ops::expand_dims(&b_t, 2)?;
-    let b_tiled = mlx_rs::ops::tile(&b_expanded, &[1, 1, repeats, 1, 1])?;
-    let b_heads = b_tiled.reshape(&[batch, num_heads, state_dim, seq_len])?;
-    let b_heads = b_heads.transpose_axes(&[0, 1, 3, 2])?; // [B, H, L, N]
+    let b_expanded = pmetal_bridge::compat::ops::expand_dims(&b_t, 2);
+    let b_tiled = pmetal_bridge::compat::ops::tile(&b_expanded, &[1, 1, repeats, 1, 1]);
+    let b_heads = b_tiled.reshape(&[batch, num_heads, state_dim, seq_len]);
+    let b_heads = b_heads.transpose_axes(&[0, 1, 3, 2]); // [B, H, L, N]
 
     // dtxdecay = dtx * decay_last: [B, L, H, D]
-    let dtxdecay = dtx.multiply(&decay_last)?;
+    let dtxdecay = dtx.multiply(&decay_last);
 
     // dtxdecay: [B, L, H, D] -> [B, H, D, L]
-    let dtxdecay_t = dtxdecay.transpose_axes(&[0, 2, 3, 1])?;
+    let dtxdecay_t = dtxdecay.transpose_axes(&[0, 2, 3, 1]);
 
     // next_state = dtxdecay @ B_heads: [B, H, D, L] @ [B, H, L, N] = [B, H, D, N]
-    let mut next_state = dtxdecay_t.matmul(&b_heads)?;
+    let mut next_state = dtxdecay_t.matmul(&b_heads);
 
     // If we have previous state, incorporate it
     if let Some(prev_state) = state {
         // exp_dtA_cumsum = exp(cumsum(dtA, axis=-2)): [B, L, H]
-        let exp_dta_cumsum = mlx_rs::ops::exp(&dt_a.cumsum(-2, None, None)?)?;
+        let exp_dta_cumsum = pmetal_bridge::compat::ops::exp(&pmetal_bridge::compat::ops::cumsum(&dt_a, -2));
 
         // exp_dta_last: [B, 1, H] -> [B, H, 1, 1]
-        let exp_dta_last = exp_dta_cumsum.index((.., (seq_len - 1)..seq_len, ..));
-        let exp_dta_last = exp_dta_last.transpose_axes(&[0, 2, 1])?;
-        let exp_dta_last = mlx_rs::ops::expand_dims(&exp_dta_last, -1)?;
+        let exp_dta_last = pmetal_bridge::compat::ops::slice_axis(&exp_dta_cumsum, 1, (seq_len as i32) - 1, seq_len as i32);
+        let exp_dta_last = exp_dta_last.transpose_axes(&[0, 2, 1]);
+        let exp_dta_last = pmetal_bridge::compat::ops::expand_dims(&exp_dta_last, -1);
 
         // next_state += exp_dta_last * prev_state
-        let state_decay = prev_state.multiply(&exp_dta_last)?;
-        next_state = next_state.add(&state_decay)?;
+        let state_decay = prev_state.multiply(&exp_dta_last);
+        next_state = next_state.add(&state_decay);
 
         // Compute contribution from previous state to y
         // prev_state: [B, H, D, N]
         // Reshape for group-wise processing:
         // state_grouped: [B, G, repeats, D, N] -> [B, 1, G, repeats, D, N]
-        let state_grouped = prev_state.reshape(&[batch, n_groups, repeats, head_dim, state_dim])?;
-        let state_grouped = mlx_rs::ops::expand_dims(&state_grouped, 1)?;
+        let state_grouped = prev_state.reshape(&[batch, n_groups, repeats, head_dim, state_dim]);
+        let state_grouped = pmetal_bridge::compat::ops::expand_dims(&state_grouped, 1);
 
         // C_grouped: [B, L, G, N] -> [B, L, G, 1, N, 1]
-        let c_grouped = c.reshape(&[batch, seq_len, n_groups, 1, state_dim, 1])?;
+        let c_grouped = c.reshape(&[batch, seq_len, n_groups, 1, state_dim, 1]);
 
         // y_prev = state_grouped @ C_grouped: [B, 1, G, repeats, D, N] @ [B, L, G, 1, N, 1]
-        let y_prev_raw = state_grouped.matmul(&c_grouped)?; // [B, L, G, repeats, D, 1]
+        let y_prev_raw = state_grouped.matmul(&c_grouped); // [B, L, G, repeats, D, 1]
 
         let y_prev = y_prev_raw
-            .squeeze_axes(&[-1])?
-            .reshape(&[batch, seq_len, num_heads, head_dim])?;
+            .squeeze_axes(&[-1])
+            .reshape(&[batch, seq_len, num_heads, head_dim]);
 
         // exp_dta_cumsum: [B, L, H] -> [B, L, H, 1]
-        let exp_dta_expanded = mlx_rs::ops::expand_dims(&exp_dta_cumsum, -1)?;
+        let exp_dta_expanded = pmetal_bridge::compat::ops::expand_dims(&exp_dta_cumsum, -1);
 
         // y_prev contribution: y += exp_dta_cumsum * y_prev
-        let y_prev_t = y_prev.transpose_axes(&[0, 2, 1, 3])?; // [B, H, L, D]
-        let exp_dta_t = exp_dta_expanded.transpose_axes(&[0, 2, 1, 3])?; // [B, H, L, 1]
-        let y_contribution = y_prev_t.multiply(&exp_dta_t)?;
+        let y_prev_t = y_prev.transpose_axes(&[0, 2, 1, 3]); // [B, H, L, D]
+        let exp_dta_t = exp_dta_expanded.transpose_axes(&[0, 2, 1, 3]); // [B, H, L, 1]
+        let y_contribution = y_prev_t.multiply(&exp_dta_t);
 
-        y = y.add(&y_contribution)?;
+        y = y.add(&y_contribution);
     }
 
     // y = y.swapaxes(1,2): [B, L, H, D]
-    let y = y.transpose_axes(&[0, 2, 1, 3])?;
+    let y = y.transpose_axes(&[0, 2, 1, 3]);
 
     // Add skip connection: y += x * D
-    let d_expanded = d.reshape(&[1, 1, num_heads, 1])?;
-    let y = y.add(&x.multiply(&d_expanded)?)?;
+    let d_expanded = d.reshape(&[1, 1, num_heads, 1]);
+    let y = y.add(&x.multiply(&d_expanded));
 
     Ok((y, next_state))
 }
@@ -518,11 +510,9 @@ pub fn ssm_attention(
 // ============================================================================
 
 /// Single expert MLP with optional FP8 quantization support.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Expert {
-    #[param]
     pub up_proj: nn::Linear,
-    #[param]
     pub down_proj: nn::Linear,
     /// FP8 scale factors (not parameters, just data)
     pub up_proj_weight_scale: Option<Array>,
@@ -530,6 +520,8 @@ pub struct Expert {
     pub down_proj_weight_scale: Option<Array>,
     pub down_proj_input_scale: Option<Array>,
 }
+impl_module_params!(Expert; up_proj, down_proj);
+
 
 impl Expert {
     /// Create a new expert.
@@ -557,24 +549,24 @@ impl Expert {
         let up = linear_forward_with_optional_fp8(
             x,
             self.up_proj.weight.as_ref(),
-            self.up_proj.bias.as_ref().as_ref(),
+            self.up_proj.bias.as_ref(),
             self.up_proj_weight_scale.as_ref(),
         )?;
 
         // ReLU² activation
-        let activated = nn::relu(&up)?.square()?;
+        let activated = nn::relu(&up).square();
 
         linear_forward_with_optional_fp8(
             &activated,
             self.down_proj.weight.as_ref(),
-            self.down_proj.bias.as_ref().as_ref(),
+            self.down_proj.bias.as_ref(),
             self.down_proj_weight_scale.as_ref(),
         )
     }
 
     pub fn quantize_fp8_weights(&mut self) -> Result<(), Exception> {
-        quantize_linear_weights_fp8(&mut self.up_proj)?;
-        quantize_linear_weights_fp8(&mut self.down_proj)?;
+        quantize_linear_weights_fp8(&mut self.up_proj);
+        quantize_linear_weights_fp8(&mut self.down_proj);
         self.up_proj_weight_scale = None;
         self.up_proj_input_scale = None;
         self.down_proj_weight_scale = None;
@@ -592,9 +584,8 @@ impl Expert {
 /// 4. Select top-k experts within selected groups
 /// 5. Optionally normalize scores (norm_topk_prob)
 /// 6. Apply routed_scaling_factor
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct MoERouter {
-    #[param]
     pub gate: nn::Linear,
     /// Score correction bias for expert selection (shape: [num_experts])
     pub e_score_correction_bias: Array,
@@ -609,6 +600,8 @@ pub struct MoERouter {
     /// Scaling factor applied to routing weights after normalization.
     pub routed_scaling_factor: f32,
 }
+impl_module_params!(MoERouter; gate);
+
 
 impl MoERouter {
     /// Create a new router.
@@ -625,7 +618,7 @@ impl MoERouter {
             .bias(false)
             .build()?;
         // Initialize e_score_correction_bias to zeros
-        let e_score_correction_bias = Array::zeros::<f32>(&[num_experts])?;
+        let e_score_correction_bias = Array::zeros_f32(&[num_experts]);
         Ok(Self {
             gate,
             e_score_correction_bias,
@@ -647,58 +640,58 @@ impl MoERouter {
         let logits = linear_module_forward(&mut self.gate, x)?;
 
         // Apply sigmoid (not softmax) for scoring
-        let logits_f32 = logits.as_dtype(Dtype::Float32)?;
-        let orig_scores = mlx_rs::ops::sigmoid(&logits_f32)?;
+        let logits_f32 = logits.as_dtype(Dtype::Float32.as_i32());
+        let orig_scores = pmetal_bridge::compat::ops::sigmoid(&logits_f32);
 
         // Add bias for selection (but use original scores for final weights)
-        let scores_for_selection = orig_scores.add(&self.e_score_correction_bias)?;
+        let scores_for_selection = orig_scores.add(&self.e_score_correction_bias);
 
         // Group-based selection when n_group > 1
         let scores_for_selection = if self.n_group > 1 {
             let experts_per_group = self.num_experts / self.n_group;
             // Reshape to groups: [B*L, n_group, experts_per_group]
-            let grouped = scores_for_selection.reshape(&[-1, self.n_group, experts_per_group])?;
+            let grouped = scores_for_selection.reshape(&[-1, self.n_group, experts_per_group]);
 
             // Get top-2 scores per group and sum them to get group scores
-            let top2_scores = mlx_rs::ops::indexing::topk_axis(&grouped, 2, -1)?;
-            let group_scores = top2_scores.sum_axis(-1, true)?;
+            let top2_scores = pmetal_bridge::compat::indexing::topk_axis(&grouped, 2, -1);
+            let group_scores = top2_scores.sum_axis(-1, true);
 
             // Zero out non-selected groups (keep top topk_group groups)
             let k = self.n_group - self.topk_group;
-            let group_idx = mlx_rs::ops::argpartition_axis(&group_scores, k - 1, -2)?;
-            let group_idx = group_idx.index((.., ..k, ..));
+            let group_idx = pmetal_bridge::compat::ops::argpartition_axis(&group_scores, k - 1, -2);
+            let group_idx = pmetal_bridge::compat::ops::slice_axis(&group_idx, 1, 0, k as i32);
 
             // Zero out bottom groups using put_along_axis
             let zeros = Array::from_f32(0.0);
-            let group_idx_sg = mlx_rs::stop_gradient(&group_idx)?;
+            let group_idx_sg = pmetal_bridge::compat::stop_gradient(&group_idx)?;
             let grouped =
-                mlx_rs::ops::indexing::put_along_axis(&grouped, &group_idx_sg, &zeros, Some(-2))?;
+                pmetal_bridge::compat::indexing::put_along_axis(&grouped, &group_idx_sg, &zeros, Some(-2));
 
             // Flatten back: [B*L, num_experts]
-            grouped.reshape(&[-1, self.num_experts])?
+            grouped.reshape(&[-1, self.num_experts])
         } else {
             scores_for_selection
         };
 
         // Get top-k indices (negate for argpartition which returns smallest)
-        let neg_scores = scores_for_selection.negative()?;
+        let neg_scores = scores_for_selection.negative();
         let k = self.top_k - 1;
-        let inds = mlx_rs::ops::argpartition_axis(&neg_scores, k, -1)?;
-        let inds = inds.index((.., ..self.top_k));
+        let inds = pmetal_bridge::compat::ops::argpartition_axis(&neg_scores, k, -1);
+        let inds = pmetal_bridge::compat::ops::slice_last_to(&inds, self.top_k as i32);
 
         // Get original scores for selected experts (not bias-corrected)
-        let scores = orig_scores.take_along_axis(&inds, -1)?;
+        let scores = orig_scores.take_along_axis(&inds, -1);
 
         // Optionally normalize scores
         let scores = if self.top_k > 1 && self.norm_topk_prob {
-            let denom = scores.sum_axis(-1, true)?.add(&Array::from_f32(1e-20))?;
-            scores.divide(&denom)?
+            let denom = scores.sum_axis(-1, true).add(&Array::from_f32(1e-20));
+            scores.divide(&denom)
         } else {
             scores
         };
 
         // Apply routed_scaling_factor
-        let weights = scores.multiply(&Array::from_f32(self.routed_scaling_factor))?;
+        let weights = scores.multiply(&Array::from_f32(self.routed_scaling_factor));
 
         Ok((weights, inds))
     }
@@ -709,17 +702,16 @@ impl MoERouter {
 }
 
 /// Mixture of Experts layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct MoELayer {
-    #[param]
     pub router: MoERouter,
-    #[param]
     pub experts: Vec<Expert>,
-    #[param]
     pub shared_expert: Option<Expert>,
     pub num_experts: i32,
     pub top_k: i32,
 }
+impl_module_params!(MoELayer; router, experts, shared_expert);
+
 
 impl MoELayer {
     /// Create a new MoE layer.
@@ -783,53 +775,53 @@ impl MoELayer {
         let num_tokens = batch * seq_len;
 
         // Flatten batch and sequence for routing: [B, L, H] -> [B*L, H]
-        let x_flat = x.reshape(&[num_tokens, hidden_size])?;
+        let x_flat = x.reshape(&[num_tokens, hidden_size]);
 
         // Get routing weights and indices: weights [B*L, top_k], indices [B*L, top_k]
-        let (weights, indices) = self.router.forward(&x_flat)?;
+        let (weights, mut indices) = self.router.forward(&x_flat)?;
 
         // Initialize output with zeros
-        let mut output = mlx_rs::ops::zeros_like(&x_flat)?;
+        let mut output = pmetal_bridge::compat::ops::zeros_like(&x_flat);
 
         // For decode (single token), we can sync once and call only selected experts
         // This reduces from 128 to 4 expert calls (32x reduction)
         if num_tokens == 1 {
             // Single sync to get all routing decisions
-            indices.eval()?;
+            indices.eval();
             let indices_flat: Vec<u32> = indices.as_slice().to_vec();
 
             // Process each top-k slot
             for (k, &expert_idx_u32) in indices_flat.iter().take(self.top_k as usize).enumerate() {
                 let expert_idx = expert_idx_u32 as usize;
                 let ki = k as i32;
-                let expert_weight = weights.index((.., ki..ki + 1));
+                let expert_weight = pmetal_bridge::compat::ops::slice_axis(&weights, -1, ki, ki + 1);
 
                 // Call only the selected expert
                 let expert_out = self.experts[expert_idx].forward(&x_flat)?;
-                let weighted_out = expert_out.multiply(&expert_weight)?;
-                output = output.add(&weighted_out)?;
+                let weighted_out = expert_out.multiply(&expert_weight);
+                output = output.add(&weighted_out);
             }
         } else {
             // For larger batches, use lazy evaluation with masking
             // Build the entire computation graph first, then let MLX optimize
             for k in 0..self.top_k {
-                let expert_indices = indices.index((.., k..k + 1)).squeeze_axes(&[1])?;
-                let expert_weights = weights.index((.., k..k + 1));
+                let expert_indices = pmetal_bridge::compat::ops::select_axis(&indices, -1, k);
+                let expert_weights = pmetal_bridge::compat::ops::slice_axis(&weights, -1, k, k + 1);
 
                 // Process each expert with masking
                 for expert_idx in 0..self.num_experts {
                     // Create mask for tokens routed to this expert
-                    let mask = expert_indices.eq(&Array::from_int(expert_idx))?;
+                    let mask = expert_indices.equal(&Array::from_int(expert_idx));
 
                     // Process tokens through expert (MLX will optimize if mask is all false)
                     let expert_out = self.experts[expert_idx as usize].forward(&x_flat)?;
 
                     // Weight and mask the output using where (lazy)
-                    let weighted = expert_out.multiply(&expert_weights)?;
-                    let zeros = mlx_rs::ops::zeros_like(&weighted)?;
-                    let mask_expanded = mask.reshape(&[-1, 1])?;
-                    let masked_weighted = mlx_rs::ops::r#where(&mask_expanded, &weighted, &zeros)?;
-                    output = output.add(&masked_weighted)?;
+                    let weighted = expert_out.multiply(&expert_weights);
+                    let zeros = pmetal_bridge::compat::ops::zeros_like(&weighted);
+                    let mask_expanded = mask.reshape(&[-1, 1]);
+                    let masked_weighted = pmetal_bridge::compat::ops::where_fn(&mask_expanded, &weighted, &zeros);
+                    output = output.add(&masked_weighted);
                 }
             }
         }
@@ -837,11 +829,11 @@ impl MoELayer {
         // Add shared expert if present (always processes all tokens)
         if let Some(ref mut shared) = self.shared_expert {
             let shared_out = shared.forward(&x_flat)?;
-            output = output.add(&shared_out)?;
+            output = output.add(&shared_out);
         }
 
         // Reshape back to [B, L, H]
-        output.reshape(&[batch, seq_len, hidden_size])
+        Ok(output.reshape(&[batch, seq_len, hidden_size]))
     }
 
     /// Convert this MoELayer to use stacked weights for gather_mm optimization.
@@ -860,11 +852,10 @@ impl MoELayer {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let up_weight_refs: Vec<&Array> = up_weights.iter().collect();
 
         // Stack along new first dimension: [num_experts, intermediate, hidden]
         // Note: Linear weights are stored transposed as [out_features, in_features]
-        let stacked_up = mlx_rs::ops::stack_axis(&up_weight_refs, 0)?;
+        let stacked_up = pmetal_bridge::compat::ops::stack_axis(&up_weights, 0);
 
         // Collect all down_proj weights: [intermediate, hidden] for each expert
         let down_weights: Vec<Array> = self
@@ -877,9 +868,8 @@ impl MoELayer {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let down_weight_refs: Vec<&Array> = down_weights.iter().collect();
 
-        let stacked_down = mlx_rs::ops::stack_axis(&down_weight_refs, 0)?;
+        let stacked_down = pmetal_bridge::compat::ops::stack_axis(&down_weights, 0);
 
         tracing::debug!(
             "Stacked MoE weights: up={:?}, down={:?}, num_experts={}",
@@ -892,12 +882,12 @@ impl MoELayer {
     }
 
     pub fn quantize_fp8_weights(&mut self) -> Result<(), Exception> {
-        self.router.quantize_fp8_weights()?;
+        self.router.quantize_fp8_weights();
         for expert in &mut self.experts {
-            expert.quantize_fp8_weights()?;
+            expert.quantize_fp8_weights();
         }
         if let Some(shared_expert) = &mut self.shared_expert {
-            shared_expert.quantize_fp8_weights()?;
+            shared_expert.quantize_fp8_weights();
         }
         Ok(())
     }
@@ -919,7 +909,7 @@ impl MoELayer {
         let num_tokens = batch * seq_len;
 
         // Flatten batch and sequence: [B, L, H] -> [B*L, H]
-        let x_flat = x.reshape(&[num_tokens, hidden_size])?;
+        let x_flat = x.reshape(&[num_tokens, hidden_size]);
 
         // Get routing weights and indices: weights [B*L, top_k], indices [B*L, top_k]
         let (weights, indices) = self.router.forward(&x_flat)?;
@@ -931,11 +921,11 @@ impl MoELayer {
         // Result: [B*L, top_k, intermediate]
 
         // Expand x for batched expert computation: [B*L, 1, 1, hidden]
-        let x_expanded = x_flat.reshape(&[num_tokens, 1, 1, hidden_size])?;
+        let x_expanded = x_flat.reshape(&[num_tokens, 1, 1, hidden_size]);
 
         // Transpose stacked weights for matmul: [num_experts, out, in] -> [num_experts, in, out]
-        let up_t = stacked_up.swap_axes(-1, -2)?;
-        let down_t = stacked_down.swap_axes(-1, -2)?;
+        let up_t = stacked_up.transpose_axes(&[0, 2, 1]);
+        let down_t = stacked_down.transpose_axes(&[0, 2, 1]);
 
         // Use gather_mm for up projection: selects expert weights based on indices
         // x_expanded: [B*L, 1, 1, hidden]
@@ -945,7 +935,7 @@ impl MoELayer {
         let up_out = gather_mm(&x_expanded, &up_t, None, Some(&indices), false)?;
 
         // Apply relu2 activation (relu squared)
-        let activated = mlx_rs::nn::relu(&up_out)?.square()?;
+        let activated = pmetal_bridge::compat::nn::relu(&up_out).square();
 
         // Use gather_mm for down projection
         // activated: [B*L, top_k, intermediate]
@@ -955,20 +945,20 @@ impl MoELayer {
 
         // Weight and sum over top_k experts: [B*L, top_k, hidden] -> [B*L, hidden]
         // weights: [B*L, top_k] -> expand to [B*L, top_k, 1]
-        let weights_expanded = weights.reshape(&[num_tokens, self.top_k, 1])?;
-        let weighted = down_out.multiply(&weights_expanded)?;
-        let output = weighted.sum_axis(1, None)?; // Sum over top_k
+        let weights_expanded = weights.reshape(&[num_tokens, self.top_k, 1]);
+        let weighted = down_out.multiply(&weights_expanded);
+        let output = weighted.sum_axis(1, false); // Sum over top_k
 
         // Add shared expert if present
         let output = if let Some(ref mut shared) = self.shared_expert {
             let shared_out = shared.forward(&x_flat)?;
-            output.add(&shared_out)?
+            output.add(&shared_out)
         } else {
             output
         };
 
         // Reshape back to [B, L, H]
-        output.reshape(&[batch, seq_len, hidden_size])
+        Ok(output.reshape(&[batch, seq_len, hidden_size]))
     }
 }
 
@@ -1204,17 +1194,14 @@ impl NemotronHConfig {
 ///
 /// The field name `mixer` matches HuggingFace's weight naming convention.
 /// Internally dispatches to the appropriate implementation based on block type.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct NemotronHMixer {
     /// Block type: 'M' (Mamba), '*' (Attention), 'E' (MoE), '-' (MLP).
     pub block_type: char,
 
     // Mamba components (only used for 'M' blocks)
-    #[param]
     pub in_proj: Option<nn::Linear>,
-    #[param]
     pub conv1d: Option<nn::Conv1d>,
-    #[param]
     pub out_proj: Option<nn::Linear>,
 
     // FP8 scale factors for Mamba projections
@@ -1234,23 +1221,16 @@ pub struct NemotronHMixer {
     pub gated_norm: Option<MambaRMSNormGated>,
 
     // Attention components (only used for '*' blocks)
-    #[param]
     pub q_proj: Option<nn::Linear>,
-    #[param]
     pub k_proj: Option<nn::Linear>,
-    #[param]
     pub v_proj: Option<nn::Linear>,
-    #[param]
     pub o_proj: Option<nn::Linear>,
 
     // MLP components (only used for '-' blocks)
-    #[param]
     pub up_proj: Option<nn::Linear>,
-    #[param]
     pub down_proj: Option<nn::Linear>,
 
     // MoE components (only used for 'E' blocks)
-    #[param]
     pub moe_layer: Option<MoELayer>,
     /// Stacked MoE up_proj weights: [num_experts, intermediate, hidden]
     pub stacked_moe_up: Option<Array>,
@@ -1275,6 +1255,8 @@ pub struct NemotronHMixer {
     pub time_step_min: f32,
     pub time_step_max: f32,
 }
+impl_module_params!(NemotronHMixer; in_proj, conv1d, out_proj, q_proj, k_proj, v_proj, o_proj, up_proj, down_proj, moe_layer);
+
 
 impl NemotronHMixer {
     /// Create a new Mamba mixer.
@@ -1316,9 +1298,9 @@ impl NemotronHMixer {
             .build()?;
 
         // SSM parameters - initialized with defaults, loaded from weights later
-        let a_log = Some(Array::zeros::<f32>(&[mamba_num_heads])?);
-        let d = Some(Array::ones::<f32>(&[mamba_num_heads])?);
-        let dt_bias = Some(Array::ones::<f32>(&[mamba_num_heads])?);
+        let a_log = Some(Array::zeros_f32(&[mamba_num_heads]));
+        let d = Some(Array::ones_f32(&[mamba_num_heads]));
+        let dt_bias = Some(Array::ones_f32(&[mamba_num_heads]));
 
         // Internal gated RMS norm with group-wise normalization
         let gated_norm = Some(MambaRMSNormGated::new(
@@ -1600,14 +1582,14 @@ impl NemotronHMixer {
         let projected = linear_forward_with_optional_fp8(
             x,
             in_proj.weight.as_ref(),
-            in_proj.bias.as_ref().as_ref(),
+            in_proj.bias.as_ref(),
             self.in_proj_weight_scale.as_ref(),
         )?;
 
         // Use split_sections for efficient splitting (optimization #1)
         // Split at: [intermediate_size, intermediate_size + conv_dim]
         let split_indices = &[intermediate_size, intermediate_size + conv_dim];
-        let parts = mlx_rs::ops::split_sections(&projected, split_indices, -1)?;
+        let parts = pmetal_bridge::compat::ops::split_sections(&projected, split_indices, -1);
         let gate = &parts[0]; // [B, L, intermediate_size]
         let conv_input = &parts[1]; // [B, L, conv_dim]
         let dt = &parts[2]; // [B, L, num_heads]
@@ -1621,40 +1603,40 @@ impl NemotronHMixer {
             // Output is [B, padded_len, conv_dim], truncate to [B, seq_len, conv_dim]
             let out_len = conv_out.dim(1);
 
-            let conv_out = conv_out.index((.., (out_len - seq_len).., ..));
-            nn::silu(&conv_out)?
+            let conv_out = pmetal_bridge::compat::ops::slice_axis_from(&conv_out, 1, (out_len - seq_len) as i32);
+            nn::silu(&conv_out)
         } else {
             // No cache: use CAUSAL PADDING for full sequence
             // Pad (kernel_size - 1) zeros on the left of the sequence
             // This matches reference: mx.pad(conv_input, [(0, 0), (kernel_size - 1, 0), (0, 0)])
             let pad_amount = (conv_kernel - 1) as i32;
-            let padded_input = mlx_rs::ops::pad(
+            let padded_input = pmetal_bridge::compat::ops::pad(
                 conv_input,
                 &[(0i32, 0i32), (pad_amount, 0), (0, 0)],
-                Array::from_int(0), // pad value = 0
                 None,               // mode = Constant (default)
-            )?;
+                Some(0.0),          // pad value = 0
+            );
             let conv_out = Module::forward(conv1d, &padded_input)?;
             // Conv output has same length as padded input minus (kernel_size - 1)
             // So conv_out length = (seq_len + pad_amount) - pad_amount = seq_len
-            nn::silu(&conv_out)?
+            nn::silu(&conv_out)
         };
 
         // Split conv output with split_sections (optimization #1)
         let bc_size = n_groups * ssm_state_size;
         let conv_split_indices = &[intermediate_size, intermediate_size + bc_size];
-        let conv_parts = mlx_rs::ops::split_sections(&conv_activated, conv_split_indices, -1)?;
+        let conv_parts = pmetal_bridge::compat::ops::split_sections(&conv_activated, conv_split_indices, -1);
         let hidden_states = &conv_parts[0]; // [B, L, intermediate_size]
         let b_proj = &conv_parts[1]; // [B, L, n_groups * ssm_state_size]
         let c_proj = &conv_parts[2]; // [B, L, n_groups * ssm_state_size]
 
         // Reshape for multi-head processing (combined reshape - optimization #2)
         // hidden_states: [B, L, num_heads * head_dim] -> [B, L, num_heads, head_dim]
-        let x_heads = hidden_states.reshape(&[batch, seq_len, num_heads, head_dim])?;
+        let x_heads = hidden_states.reshape(&[batch, seq_len, num_heads, head_dim]);
 
         // B, C: [B, L, n_groups * ssm_state_size] -> [B, L, n_groups, ssm_state_size]
-        let b_reshaped = b_proj.reshape(&[batch, seq_len, n_groups, ssm_state_size])?;
-        let c_reshaped = c_proj.reshape(&[batch, seq_len, n_groups, ssm_state_size])?;
+        let b_reshaped = b_proj.reshape(&[batch, seq_len, n_groups, ssm_state_size]);
+        let c_reshaped = c_proj.reshape(&[batch, seq_len, n_groups, ssm_state_size]);
 
         // Get previous SSM state from cache
         let prev_state = cache.as_ref().and_then(|c| c.get_ssm_state());
@@ -1695,7 +1677,7 @@ impl NemotronHMixer {
         }
 
         // Reshape back to [B, L, intermediate_size]
-        let y = y.reshape(&[batch, seq_len, intermediate_size])?;
+        let y = y.reshape(&[batch, seq_len, intermediate_size]);
 
         // Gated RMS norm with group-wise normalization
         // This handles: y = norm(y * silu(gate)) with groups
@@ -1706,7 +1688,7 @@ impl NemotronHMixer {
         linear_forward_with_optional_fp8(
             &y_normed,
             out_proj.weight.as_ref(),
-            out_proj.bias.as_ref().as_ref(),
+            out_proj.bias.as_ref(),
             self.out_proj_weight_scale.as_ref(),
         )
     }
@@ -1733,14 +1715,14 @@ impl NemotronHMixer {
         let v = linear_module_forward(v_proj, x)?;
 
         // Reshape for multi-head attention [B, L, heads, head_dim]
-        let q = q.reshape(&[batch, seq_len, self.num_heads, self.head_dim])?;
-        let k = k.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
-        let v = v.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
+        let q = q.reshape(&[batch, seq_len, self.num_heads, self.head_dim]);
+        let k = k.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim]);
+        let v = v.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim]);
 
         // Transpose for attention: [B, heads, L, head_dim]
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        let q = q.transpose_axes(&[0, 2, 1, 3]);
+        let k = k.transpose_axes(&[0, 2, 1, 3]);
+        let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Apply RoPE
         let (q, k, v) = if let Some((cache_ref, _)) = cache.as_ref() {
@@ -1763,11 +1745,10 @@ impl NemotronHMixer {
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
                 if let Some(output) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
-                {
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)? {
                     let output = output
-                        .transpose_axes(&[0, 2, 1, 3])?
-                        .reshape(&[batch, seq_len, -1])?;
+                        .transpose_axes(&[0, 2, 1, 3])
+                        .reshape(&[batch, seq_len, -1]);
                     return linear_module_forward(o_proj, &output);
                 }
             }
@@ -1784,8 +1765,8 @@ impl NemotronHMixer {
 
         // Reshape and project output
         let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
         linear_module_forward(o_proj, &output)
     }
 
@@ -1795,7 +1776,7 @@ impl NemotronHMixer {
 
         let up = linear_module_forward(up_proj, x)?;
         // relu2 = relu(x)^2
-        let activated = nn::relu(&up)?.square()?;
+        let activated = nn::relu(&up).square();
         linear_module_forward(down_proj, &activated)
     }
 
@@ -1816,10 +1797,10 @@ impl NemotronHMixer {
     /// Call this after model loading to enable fast MoE inference.
     pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
         if let Some(ref moe_layer) = self.moe_layer {
-            let (stacked_up, stacked_down) = moe_layer.stack_expert_weights()?;
+            let (mut stacked_up, mut stacked_down) = moe_layer.stack_expert_weights()?;
             // Evaluate the stacked weights once
-            stacked_up.eval()?;
-            stacked_down.eval()?;
+            stacked_up.eval();
+            stacked_down.eval();
             self.stacked_moe_up = Some(stacked_up);
             self.stacked_moe_down = Some(stacked_down);
             tracing::info!("Initialized stacked MoE weights for layer");
@@ -1831,10 +1812,10 @@ impl NemotronHMixer {
         match self.block_type {
             'M' => {
                 if let Some(in_proj) = &mut self.in_proj {
-                    quantize_linear_weights_fp8(in_proj)?;
+                    quantize_linear_weights_fp8(in_proj);
                 }
                 if let Some(out_proj) = &mut self.out_proj {
-                    quantize_linear_weights_fp8(out_proj)?;
+                    quantize_linear_weights_fp8(out_proj);
                 }
                 self.in_proj_weight_scale = None;
                 self.in_proj_input_scale = None;
@@ -1843,31 +1824,31 @@ impl NemotronHMixer {
             }
             '*' => {
                 if let Some(q_proj) = &mut self.q_proj {
-                    quantize_linear_weights_fp8(q_proj)?;
+                    quantize_linear_weights_fp8(q_proj);
                 }
                 if let Some(k_proj) = &mut self.k_proj {
-                    quantize_linear_weights_fp8(k_proj)?;
+                    quantize_linear_weights_fp8(k_proj);
                 }
                 if let Some(v_proj) = &mut self.v_proj {
-                    quantize_linear_weights_fp8(v_proj)?;
+                    quantize_linear_weights_fp8(v_proj);
                 }
                 if let Some(o_proj) = &mut self.o_proj {
-                    quantize_linear_weights_fp8(o_proj)?;
+                    quantize_linear_weights_fp8(o_proj);
                 }
             }
             '-' => {
                 if let Some(up_proj) = &mut self.up_proj {
-                    quantize_linear_weights_fp8(up_proj)?;
+                    quantize_linear_weights_fp8(up_proj);
                 }
                 if let Some(down_proj) = &mut self.down_proj {
-                    quantize_linear_weights_fp8(down_proj)?;
+                    quantize_linear_weights_fp8(down_proj);
                 }
             }
             'E' => {
                 if let Some(moe_layer) = &mut self.moe_layer {
-                    moe_layer.quantize_fp8_weights()?;
+                    moe_layer.quantize_fp8_weights();
                 }
-                self.init_stacked_moe()?;
+                self.init_stacked_moe();
             }
             _ => {}
         }
@@ -1877,13 +1858,13 @@ impl NemotronHMixer {
 }
 
 /// Nemotron-H hybrid block.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct NemotronHBlock {
-    #[param]
     pub norm: nn::RmsNorm,
-    #[param]
     pub mixer: NemotronHMixer,
 }
+impl_module_params!(NemotronHBlock; norm, mixer);
+
 
 impl NemotronHBlock {
     pub fn new(config: &NemotronHConfig, block_type: char) -> Result<Self, Exception> {
@@ -1908,7 +1889,7 @@ impl NemotronHBlock {
             .mixer
             .forward_with_cache(&hidden, mask, kv_cache, mamba_cache)?;
         // Residual connection
-        x.add(&output)
+        Ok(x.add(&output))
     }
 
     pub fn block_type(&self) -> char {
@@ -1917,16 +1898,15 @@ impl NemotronHBlock {
 }
 
 /// Nemotron-H model backbone.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct NemotronHModel {
-    #[param]
     pub embeddings: nn::Embedding,
-    #[param]
     pub layers: Vec<NemotronHBlock>,
-    #[param]
     pub norm_f: nn::RmsNorm,
     pub config: NemotronHConfig,
 }
+impl_module_params!(NemotronHModel; embeddings, layers, norm_f);
+
 
 impl NemotronHModel {
     pub fn new(config: NemotronHConfig) -> Result<Self, Exception> {
@@ -1956,7 +1936,7 @@ impl NemotronHModel {
     pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
         let mut moe_count = 0;
         for layer in &mut self.layers {
-            layer.mixer.init_stacked_moe()?;
+            layer.mixer.init_stacked_moe();
             if layer.mixer.moe_layer.is_some() {
                 moe_count += 1;
             }
@@ -2017,13 +1997,13 @@ impl NemotronHModel {
 }
 
 /// Nemotron-H for causal language modeling.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct NemotronHForCausalLM {
-    #[param]
     pub backbone: NemotronHModel,
-    #[param]
     pub lm_head: Option<nn::Linear>,
 }
+impl_module_params!(NemotronHForCausalLM; backbone, lm_head);
+
 
 impl NemotronHForCausalLM {
     pub fn new(config: NemotronHConfig) -> Result<Self, Exception> {
@@ -2059,7 +2039,7 @@ impl NemotronHForCausalLM {
             Module::forward(lm_head, &hidden)
         } else {
             // Tie weights: use embedding weight transposed
-            self.backbone.embeddings.as_linear(&hidden)
+            Ok(self.backbone.embeddings.as_linear(&hidden))
         }
     }
 
@@ -2084,7 +2064,7 @@ impl NemotronHForCausalLM {
             Module::forward(lm_head, &hidden)?
         } else {
             // Tie weights: use embedding weight transposed
-            self.backbone.embeddings.as_linear(&hidden)?
+            self.backbone.embeddings.as_linear(&hidden)
         };
 
         Ok(logits)
@@ -2092,11 +2072,7 @@ impl NemotronHForCausalLM {
 
     /// Evaluate all parameters to materialize them on device.
     pub fn eval(&self) -> Result<(), Exception> {
-        let params = self.parameters().flatten();
-        for (_, param) in params {
-            param.eval()?;
-        }
-        Ok(())
+        pmetal_bridge::compat::ModuleParametersExt::eval(self)
     }
 
     pub fn quantize_fp8_weights(&mut self) -> Result<(), Exception> {
@@ -2140,19 +2116,19 @@ pub fn load_nemotron_weights(
         match block_type {
             'M' => {
                 // Mamba layer
-                load_mamba_weights(&mut layer.mixer, weights, &prefix)?;
+                load_mamba_weights(&mut layer.mixer, weights, &prefix);
             }
             '*' => {
                 // Attention layer
-                load_attention_weights(&mut layer.mixer, weights, &prefix)?;
+                load_attention_weights(&mut layer.mixer, weights, &prefix);
             }
             '-' => {
                 // MLP layer
-                load_mlp_weights(&mut layer.mixer, weights, &prefix)?;
+                load_mlp_weights(&mut layer.mixer, weights, &prefix);
             }
             'E' => {
                 // MoE layer
-                load_moe_weights(&mut layer.mixer, weights, &prefix)?;
+                load_moe_weights(&mut layer.mixer, weights, &prefix);
             }
             _ => {}
         }
@@ -2211,7 +2187,7 @@ fn load_mamba_weights(
     if let Some(ref mut conv1d) = mixer.conv1d {
         if let Some(w) = weights.get(&format!("{prefix}.mixer.conv1d.weight")) {
             // Transpose axes 1 and 2 to convert from PyTorch to MLX format
-            let w_transposed = w.transpose_axes(&[0, 2, 1])?;
+            let w_transposed = w.transpose_axes(&[0, 2, 1]);
             conv1d.weight = Param::new(w_transposed);
         }
         if let Some(b) = weights.get(&format!("{prefix}.mixer.conv1d.bias")) {
@@ -2518,7 +2494,7 @@ mod tests {
         let mut model = NemotronHForCausalLM::new(config).unwrap();
         model.quantize_fp8_weights().unwrap();
 
-        let input_ids = Array::zeros::<i32>(&[1, 8]).unwrap();
+        let input_ids = Array::zeros_i32(&[1, 8]);
         let logits = model.forward(&input_ids, None).unwrap();
         logits.eval().unwrap();
         assert_eq!(logits.shape(), &[1, 8, 1000]);

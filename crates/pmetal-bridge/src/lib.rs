@@ -12,6 +12,8 @@
 pub mod inline_array;
 pub use inline_array::InlineArray;
 
+pub mod compat;
+
 pub mod optimizer;
 pub use optimizer::{AdamW, ParamClass, ParamSet};
 

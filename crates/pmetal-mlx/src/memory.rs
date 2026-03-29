@@ -1,6 +1,6 @@
 //! Memory management utilities for Apple Silicon.
 //!
-//! Re-exports MLX's Metal memory management from `mlx_rs::memory` and adds
+//! Re-exports MLX Metal memory management via pmetal-bridge and adds
 //! pmetal-specific helpers (RSS tracking, system memory queries, estimation
 //! functions, and training-oriented diagnostics).
 
@@ -12,13 +12,23 @@ use std::sync::OnceLock;
 use pmetal_core::MemoryStats;
 
 // ---------------------------------------------------------------------------
-// Re-export MLX Metal memory management (from pmetal-mlx-rs 0.25.8+)
+// Re-export MLX Metal memory management via pmetal-bridge
 // ---------------------------------------------------------------------------
 
-pub use mlx_rs::memory::{
-    clear_cache, get_active_memory, get_cache_memory, get_memory_limit, get_peak_memory,
-    reset_peak_memory, set_cache_limit, set_memory_limit, set_wired_limit,
+pub use pmetal_bridge::inline_array::{
+    clear_cache, get_active_memory, get_cache_memory, get_peak_memory,
+    reset_peak_memory, set_cache_limit, set_wired_limit,
 };
+
+/// Get the current memory limit (returns maximum recommended working set size).
+pub fn get_memory_limit() -> usize {
+    pmetal_bridge::inline_array::get_max_recommended_size()
+}
+
+/// Set the memory limit. Maps to set_wired_limit in the bridge.
+pub fn set_memory_limit(limit: usize) -> usize {
+    pmetal_bridge::inline_array::set_wired_limit(limit)
+}
 
 #[cfg(target_os = "macos")]
 static SYSTEM_MEMORY_BYTES: OnceLock<Option<u64>> = OnceLock::new();

@@ -37,7 +37,7 @@
 //! let output = mlp.forward(&input, &gate_weight, &up_weight, &down_weight)?;
 //! ```
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, Dtype, random};
 
 use crate::error::MlxError;
 
@@ -176,15 +176,15 @@ impl FusedSwiGLUMlx {
         down_weight: &Array,
     ) -> Result<FusedSwiGLUOutput> {
         // Gate and up projections
-        let gate = x.matmul(&gate_weight.t())?;
-        let up = x.matmul(&up_weight.t())?;
+        let gate = x.matmul(&gate_weight.t());
+        let up = x.matmul(&up_weight.t());
 
         // Apply gated activation
-        let activated_gate = apply_activation(&gate, self.config.activation)?;
-        let hidden = activated_gate.multiply(&up)?;
+        let activated_gate = apply_activation(&gate, self.config.activation);
+        let hidden = activated_gate.multiply(&up);
 
         // Down projection
-        let output = hidden.matmul(&down_weight.t())?;
+        let output = hidden.matmul(&down_weight.t());
 
         Ok(FusedSwiGLUOutput {
             output,
@@ -203,15 +203,15 @@ impl FusedSwiGLUMlx {
         down_weight: &Array,
     ) -> Result<FusedSwiGLUOutput> {
         // Gate and up projections
-        let gate = x.matmul(&gate_weight.t())?;
-        let up = x.matmul(&up_weight.t())?;
+        let gate = x.matmul(&gate_weight.t());
+        let up = x.matmul(&up_weight.t());
 
         // Apply gated activation
-        let activated_gate = apply_activation(&gate, self.config.activation)?;
-        let hidden = activated_gate.multiply(&up)?;
+        let activated_gate = apply_activation(&gate, self.config.activation);
+        let hidden = activated_gate.multiply(&up);
 
         // Down projection
-        let output = hidden.matmul(&down_weight.t())?;
+        let output = hidden.matmul(&down_weight.t());
 
         Ok(FusedSwiGLUOutput {
             output,
@@ -249,36 +249,36 @@ impl FusedSwiGLUMlx {
 
         // Gate projection with LoRA
         let gate = if let Some((a, b)) = gate_lora {
-            let base = x.matmul(&gate_weight.t())?;
-            let lora = x.matmul(&a.t())?.matmul(&b.t())?;
-            let scaled_lora = lora.multiply(&Array::from_f32(scale))?;
-            base.add(&scaled_lora)?
+            let base = x.matmul(&gate_weight.t());
+            let lora = x.matmul(&a.t()).matmul(&b.t());
+            let scaled_lora = lora.multiply(&Array::from_f32(scale));
+            base.add(&scaled_lora)
         } else {
-            x.matmul(&gate_weight.t())?
+            x.matmul(&gate_weight.t())
         };
 
         // Up projection with LoRA
         let up = if let Some((a, b)) = up_lora {
-            let base = x.matmul(&up_weight.t())?;
-            let lora = x.matmul(&a.t())?.matmul(&b.t())?;
-            let scaled_lora = lora.multiply(&Array::from_f32(scale))?;
-            base.add(&scaled_lora)?
+            let base = x.matmul(&up_weight.t());
+            let lora = x.matmul(&a.t()).matmul(&b.t());
+            let scaled_lora = lora.multiply(&Array::from_f32(scale));
+            base.add(&scaled_lora)
         } else {
-            x.matmul(&up_weight.t())?
+            x.matmul(&up_weight.t())
         };
 
         // Apply gated activation
-        let activated_gate = apply_activation(&gate, self.config.activation)?;
-        let hidden = activated_gate.multiply(&up)?;
+        let activated_gate = apply_activation(&gate, self.config.activation);
+        let hidden = activated_gate.multiply(&up);
 
         // Down projection with LoRA
         let output = if let Some((a, b)) = down_lora {
-            let base = hidden.matmul(&down_weight.t())?;
-            let lora = hidden.matmul(&a.t())?.matmul(&b.t())?;
-            let scaled_lora = lora.multiply(&Array::from_f32(scale))?;
-            base.add(&scaled_lora)?
+            let base = hidden.matmul(&down_weight.t());
+            let lora = hidden.matmul(&a.t()).matmul(&b.t());
+            let scaled_lora = lora.multiply(&Array::from_f32(scale));
+            base.add(&scaled_lora)
         } else {
-            hidden.matmul(&down_weight.t())?
+            hidden.matmul(&down_weight.t())
         };
 
         Ok(FusedSwiGLUOutput {
@@ -289,20 +289,17 @@ impl FusedSwiGLUMlx {
 }
 
 /// Apply gated activation function.
-fn apply_activation(x: &Array, activation: GatedActivationType) -> Result<Array> {
+fn apply_activation(x: &Array, activation: GatedActivationType) -> Array {
     match activation {
         GatedActivationType::SwiGLU => {
             // silu(x) = x * sigmoid(x)
-            let sigmoid = mlx_rs::ops::sigmoid(x)?;
-            Ok(x.multiply(&sigmoid)?)
+            x.silu()
         }
         GatedActivationType::GEGLU => {
-            // gelu(x)
-            Ok(mlx_rs::nn::gelu(x)?)
+            x.gelu()
         }
         GatedActivationType::ReGLU => {
-            // relu(x)
-            Ok(mlx_rs::nn::relu(x)?)
+            x.relu()
         }
     }
 }
@@ -311,51 +308,9 @@ fn apply_activation(x: &Array, activation: GatedActivationType) -> Result<Array>
 // Functional API (convenient wrappers)
 // =============================================================================
 
-/// Fused SwiGLU MLP forward pass (functional version).
-///
-/// Computes: `down_proj(silu(gate_proj(x)) * up_proj(x))`
-///
-/// This is the recommended API for inference when you just need the output.
-///
-/// # Arguments
-/// * `x` - Input tensor [batch, seq_len, hidden_size]
-/// * `gate_weight` - Gate projection [intermediate_size, hidden_size]
-/// * `up_weight` - Up projection [intermediate_size, hidden_size]
-/// * `down_weight` - Down projection [hidden_size, intermediate_size]
-/// Compiled SwiGLU activation: `silu(gate) * up`.
-///
-/// Matches mlx-lm's `@mx.compile(shapeless=True) def swiglu(gate, x)`.
-/// Fuses silu (sigmoid + multiply) + element-wise multiply into a single
-/// Metal kernel dispatch instead of 3 separate dispatches.
-fn compiled_swiglu(gate: &Array, up: &Array) -> Result<Array> {
-    use std::sync::OnceLock;
-    static COMPILED: OnceLock<Option<mlx_rs::compile::Closure>> = OnceLock::new();
-    let compiled = COMPILED.get_or_init(|| {
-        let closure = mlx_rs::compile::Closure::new(|inputs: &[Array]| {
-            let gate = &inputs[0];
-            let up = &inputs[1];
-            let activated = mlx_rs::nn::silu(gate)?.multiply(up)?;
-            Ok(vec![activated])
-        });
-        mlx_rs::compile::compile(&closure, true).ok()
-    });
-
-    if let Some(compiled_fn) = compiled {
-        let outputs = compiled_fn.apply(&[gate, up]).map_err(MlxError::from)?;
-        Ok(outputs.into_iter().next().unwrap())
-    } else {
-        // Fallback: uncompiled
-        let result = mlx_rs::nn::silu(gate).map_err(MlxError::from)?;
-        result.multiply(up).map_err(MlxError::from)
-    }
-}
-
 /// Fused SwiGLU MLP: `down_proj(silu(gate_proj(x)) * up_proj(x))`.
 ///
-/// The activation portion (`silu(gate) * up`) is compiled via `mx.compile(shapeless=True)`
-/// matching mlx-lm's `@mx.compile def swiglu(gate, x)`. This fuses 3 element-wise ops
-/// (sigmoid, multiply, multiply) into 1 Metal dispatch, reducing total dispatches per
-/// MLP layer from 6 to 4.
+/// The activation portion (`silu(gate) * up`) uses the bridge's fused silu operation.
 pub fn fused_swiglu_forward(
     x: &Array,
     gate_weight: &Array,
@@ -363,14 +318,14 @@ pub fn fused_swiglu_forward(
     down_weight: &Array,
 ) -> Result<Array> {
     // Gate and up projections (not fusable — matmul)
-    let gate = x.matmul(&gate_weight.t())?;
-    let up = x.matmul(&up_weight.t())?;
+    let gate = x.matmul(&gate_weight.t());
+    let up = x.matmul(&up_weight.t());
 
-    // Compiled SwiGLU activation: silu(gate) * up → 1 dispatch instead of 3
-    let hidden = compiled_swiglu(&gate, &up)?;
+    // SwiGLU activation: silu(gate) * up
+    let hidden = gate.silu().multiply(&up);
 
     // Down projection
-    Ok(hidden.matmul(&down_weight.t())?)
+    Ok(hidden.matmul(&down_weight.t()))
 }
 
 /// Fused GEGLU MLP forward pass (functional version).
@@ -382,13 +337,13 @@ pub fn fused_geglu_forward(
     up_weight: &Array,
     down_weight: &Array,
 ) -> Result<Array> {
-    let gate = x.matmul(&gate_weight.t())?;
-    let up = x.matmul(&up_weight.t())?;
+    let gate = x.matmul(&gate_weight.t());
+    let up = x.matmul(&up_weight.t());
 
-    let gelu_gate = mlx_rs::nn::gelu(&gate)?;
-    let hidden = gelu_gate.multiply(&up)?;
+    let gelu_gate = gate.gelu();
+    let hidden = gelu_gate.multiply(&up);
 
-    Ok(hidden.matmul(&down_weight.t())?)
+    Ok(hidden.matmul(&down_weight.t()))
 }
 
 /// Fused SwiGLU with LoRA (functional version).
@@ -424,24 +379,23 @@ pub fn fused_swiglu_lora_forward(
     let scale_arr = Array::from_f32(scale);
 
     // Gate projection with LoRA: gate = x @ W_g.T + scale * (x @ A_g.T) @ B_g.T
-    let gate_base = x.matmul(&gate_weight.t())?;
-    let gate_lora = x.matmul(&gate_lora_a.t())?.matmul(&gate_lora_b.t())?;
-    let gate = gate_base.add(&gate_lora.multiply(&scale_arr)?)?;
+    let gate_base = x.matmul(&gate_weight.t());
+    let gate_lora = x.matmul(&gate_lora_a.t()).matmul(&gate_lora_b.t());
+    let gate = gate_base.add(&gate_lora.multiply(&scale_arr));
 
     // Up projection with LoRA
-    let up_base = x.matmul(&up_weight.t())?;
-    let up_lora = x.matmul(&up_lora_a.t())?.matmul(&up_lora_b.t())?;
-    let up = up_base.add(&up_lora.multiply(&scale_arr)?)?;
+    let up_base = x.matmul(&up_weight.t());
+    let up_lora = x.matmul(&up_lora_a.t()).matmul(&up_lora_b.t());
+    let up = up_base.add(&up_lora.multiply(&scale_arr));
 
     // SiLU and multiply
-    let sigmoid_gate = mlx_rs::ops::sigmoid(&gate)?;
-    let silu_gate = gate.multiply(&sigmoid_gate)?;
-    let hidden = silu_gate.multiply(&up)?;
+    let silu_gate = gate.silu();
+    let hidden = silu_gate.multiply(&up);
 
     // Down projection with LoRA
-    let down_base = hidden.matmul(&down_weight.t())?;
-    let down_lora = hidden.matmul(&down_lora_a.t())?.matmul(&down_lora_b.t())?;
-    Ok(down_base.add(&down_lora.multiply(&scale_arr)?)?)
+    let down_base = hidden.matmul(&down_weight.t());
+    let down_lora = hidden.matmul(&down_lora_a.t()).matmul(&down_lora_b.t());
+    Ok(down_base.add(&down_lora.multiply(&scale_arr)))
 }
 
 // =============================================================================
@@ -475,17 +429,10 @@ mod tests {
         let hidden_size = 64;
         let intermediate_size = 128;
 
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden_size], None, None, None)
-            .unwrap();
-        let gate_weight =
-            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
-                .unwrap();
-        let up_weight =
-            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
-                .unwrap();
-        let down_weight =
-            mlx_rs::random::normal::<f32>(&[hidden_size, intermediate_size], None, None, None)
-                .unwrap();
+        let x = random::normal(&[batch, seq_len, hidden_size], Dtype::Float32);
+        let gate_weight = random::normal(&[intermediate_size, hidden_size], Dtype::Float32);
+        let up_weight = random::normal(&[intermediate_size, hidden_size], Dtype::Float32);
+        let down_weight = random::normal(&[hidden_size, intermediate_size], Dtype::Float32);
 
         let output = fused_swiglu_forward(&x, &gate_weight, &up_weight, &down_weight).unwrap();
         assert_eq!(output.shape(), &[batch, seq_len, hidden_size]);
@@ -498,17 +445,10 @@ mod tests {
         let hidden_size = 64;
         let intermediate_size = 128;
 
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden_size], None, None, None)
-            .unwrap();
-        let gate_weight =
-            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
-                .unwrap();
-        let up_weight =
-            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
-                .unwrap();
-        let down_weight =
-            mlx_rs::random::normal::<f32>(&[hidden_size, intermediate_size], None, None, None)
-                .unwrap();
+        let x = random::normal(&[batch, seq_len, hidden_size], Dtype::Float32);
+        let gate_weight = random::normal(&[intermediate_size, hidden_size], Dtype::Float32);
+        let up_weight = random::normal(&[intermediate_size, hidden_size], Dtype::Float32);
+        let down_weight = random::normal(&[hidden_size, intermediate_size], Dtype::Float32);
 
         let output = fused_geglu_forward(&x, &gate_weight, &up_weight, &down_weight).unwrap();
         assert_eq!(output.shape(), &[batch, seq_len, hidden_size]);
@@ -524,17 +464,10 @@ mod tests {
         let config = FusedSwiGLUConfig::new(hidden_size as usize, intermediate_size as usize);
         let mlp = FusedSwiGLUMlx::new(config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden_size], None, None, None)
-            .unwrap();
-        let gate_weight =
-            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
-                .unwrap();
-        let up_weight =
-            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
-                .unwrap();
-        let down_weight =
-            mlx_rs::random::normal::<f32>(&[hidden_size, intermediate_size], None, None, None)
-                .unwrap();
+        let x = random::normal(&[batch, seq_len, hidden_size], Dtype::Float32);
+        let gate_weight = random::normal(&[intermediate_size, hidden_size], Dtype::Float32);
+        let up_weight = random::normal(&[intermediate_size, hidden_size], Dtype::Float32);
+        let down_weight = random::normal(&[hidden_size, intermediate_size], Dtype::Float32);
 
         let result = mlp
             .forward(&x, &gate_weight, &up_weight, &down_weight)
@@ -558,33 +491,18 @@ mod tests {
         );
         let mlp = FusedSwiGLUMlx::new(config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden_size], None, None, None)
-            .unwrap();
-        let gate_weight =
-            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
-                .unwrap();
-        let up_weight =
-            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
-                .unwrap();
-        let down_weight =
-            mlx_rs::random::normal::<f32>(&[hidden_size, intermediate_size], None, None, None)
-                .unwrap();
+        let x = random::normal(&[batch, seq_len, hidden_size], Dtype::Float32);
+        let gate_weight = random::normal(&[intermediate_size, hidden_size], Dtype::Float32);
+        let up_weight = random::normal(&[intermediate_size, hidden_size], Dtype::Float32);
+        let down_weight = random::normal(&[hidden_size, intermediate_size], Dtype::Float32);
 
         // LoRA matrices
-        let gate_a =
-            mlx_rs::random::normal::<f32>(&[lora_rank, hidden_size], None, None, None).unwrap();
-        let gate_b =
-            mlx_rs::random::normal::<f32>(&[intermediate_size, lora_rank], None, None, None)
-                .unwrap();
-        let up_a =
-            mlx_rs::random::normal::<f32>(&[lora_rank, hidden_size], None, None, None).unwrap();
-        let up_b = mlx_rs::random::normal::<f32>(&[intermediate_size, lora_rank], None, None, None)
-            .unwrap();
-        let down_a =
-            mlx_rs::random::normal::<f32>(&[lora_rank, intermediate_size], None, None, None)
-                .unwrap();
-        let down_b =
-            mlx_rs::random::normal::<f32>(&[hidden_size, lora_rank], None, None, None).unwrap();
+        let gate_a = random::normal(&[lora_rank, hidden_size], Dtype::Float32);
+        let gate_b = random::normal(&[intermediate_size, lora_rank], Dtype::Float32);
+        let up_a = random::normal(&[lora_rank, hidden_size], Dtype::Float32);
+        let up_b = random::normal(&[intermediate_size, lora_rank], Dtype::Float32);
+        let down_a = random::normal(&[lora_rank, intermediate_size], Dtype::Float32);
+        let down_b = random::normal(&[hidden_size, lora_rank], Dtype::Float32);
 
         let result = mlp
             .forward_with_lora(
@@ -603,18 +521,18 @@ mod tests {
 
     #[test]
     fn test_activation_types() {
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 64], None, None, None).unwrap();
+        let x = random::normal(&[2, 4, 64], Dtype::Float32);
 
         // Test SwiGLU activation
-        let silu = apply_activation(&x, GatedActivationType::SwiGLU).unwrap();
+        let silu = apply_activation(&x, GatedActivationType::SwiGLU);
         assert_eq!(silu.shape(), x.shape());
 
         // Test GEGLU activation
-        let gelu = apply_activation(&x, GatedActivationType::GEGLU).unwrap();
+        let gelu = apply_activation(&x, GatedActivationType::GEGLU);
         assert_eq!(gelu.shape(), x.shape());
 
         // Test ReGLU activation
-        let relu = apply_activation(&x, GatedActivationType::ReGLU).unwrap();
+        let relu = apply_activation(&x, GatedActivationType::ReGLU);
         assert_eq!(relu.shape(), x.shape());
     }
 }

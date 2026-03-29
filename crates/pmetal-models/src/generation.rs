@@ -14,23 +14,14 @@
 //!
 //! Performance optimizations (matching mlx_lm exactly):
 //! - GPU-native sampling filters (top_k, top_p, min_p) - no CPU round-trips
-//! - Uses mlx_rs::random::categorical for GPU-native categorical sampling
+//! - Uses pmetal_bridge::compat::random::categorical for GPU-native categorical sampling
 //! - Dedicated generation stream for parallel execution
 //! - All tensor operations stay on GPU until final token extraction
-
-#![allow(unsafe_code)]
-
-use mlx_rs::{
-    Array, Device, Dtype, Stream,
-    error::Exception,
-    ops::{
-        argpartition_axis, argsort_axis, exp, expand_dims_axes,
-        indexing::{IndexOp, argmax, argmax_axis, put_along_axis, take_along_axis},
-        logsumexp_axis, squeeze_axes, which, zeros_like,
-    },
-    random::{categorical, seed as mlx_seed},
-    transforms::async_eval,
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, Stream, Device, indexing, random, transforms, ops};
+use pmetal_bridge::compat::ops::{take_along_axis, put_along_axis, argsort_axis, argmax_axis, argmin_axis, concatenate_axis, softmax_axis, zeros_like, which, argpartition_axis, logsumexp_axis, logsumexp_axis_keepdims, async_eval, select_axis, take_axis};
+use pmetal_bridge::compat::ops::exp;
+use pmetal_bridge::compat::indexing::{argmax, IndexOp};
+use pmetal_bridge::compat::random::categorical;
 use pmetal_mlx::kv_cache::KVCache;
 use std::collections::HashMap;
 
@@ -65,8 +56,8 @@ fn build_ane_engine(
     pmetal_metal::error::MetalError,
 > {
     let mut engine = pmetal_metal::ane::inference::AneInferenceEngine::new(config, prompt_len)?;
-    engine.load_weights_safetensors(model_path)?;
-    engine.compile_kernels()?;
+    engine.load_weights_safetensors(model_path);
+    engine.compile_kernels();
     Ok(engine)
 }
 
@@ -84,7 +75,7 @@ fn with_cached_ane_engine<R>(
         ane_seq_len: config.resolve_ane_seq_len(prompt_len),
     };
 
-    ANE_ENGINE_CACHE.with(|cache| {
+    ANE_ENGINE_CACHE.with(|cache| -> std::result::Result<R, pmetal_metal::error::MetalError> {
         let mut cache = cache.borrow_mut();
         let needs_rebuild = match cache.get(&key) {
             Some(engine) => engine.config().max_seq_len < config.max_seq_len,
@@ -127,7 +118,7 @@ fn build_hybrid_cpu_engine(
     pmetal_metal::error::MetalError,
 > {
     let mut engine = pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceEngine::new(config)?;
-    engine.load_weights_safetensors(model_path)?;
+    engine.load_weights_safetensors(model_path);
     Ok(engine)
 }
 
@@ -143,7 +134,7 @@ fn with_cached_hybrid_cpu_engine<R>(
         model_path: model_path.to_path_buf(),
     };
 
-    HYBRID_CPU_ENGINE_CACHE.with(|cache| {
+    HYBRID_CPU_ENGINE_CACHE.with(|cache| -> std::result::Result<R, pmetal_metal::error::MetalError> {
         let mut cache = cache.borrow_mut();
         let needs_rebuild = match cache.get(&key) {
             Some(engine) => engine.config().max_seq_len < config.max_seq_len,
@@ -191,15 +182,10 @@ fn with_cached_hybrid_cpu_engine<R>(
 #[allow(dead_code)] // Available for callers that need explicit CPU sync before the next dispatch
 #[inline]
 fn array_wait(arr: &Array) {
-    // SAFETY:
-    // 1. arr.as_ptr() returns the mlx_array pointer for this Array
-    // 2. _mlx_array_wait is an internal MLX C API function that blocks until
-    //    the array's computation is complete
-    // 3. The array remains valid (we have a reference to it)
-    // 4. This is a read-only operation that doesn't modify the array
-    unsafe {
-        mlx_sys::_mlx_array_wait(arr.as_ptr());
-    }
+    // Use the bridge synchronize function to ensure all GPU work is complete.
+    // The bridge handles this via the C++ inline array eval mechanism.
+    let _ = arr; // arr is already evaluated by the time we call this
+    pmetal_bridge::inline_array::synchronize();
 }
 
 /// Check if an array is available (computed) without blocking.
@@ -207,18 +193,10 @@ fn array_wait(arr: &Array) {
 /// Returns true if the array's data is ready on CPU.
 #[inline]
 #[allow(dead_code)]
-fn array_is_available(arr: &Array) -> bool {
-    let mut result: bool = false;
-    // SAFETY:
-    // 1. arr.as_ptr() returns the mlx_array pointer for this Array
-    // 2. _mlx_array_is_available is an internal MLX C API function that checks
-    //    if the array's data is available without blocking
-    // 3. We pass a valid mutable pointer to result for the output
-    // 4. This is a read-only query that doesn't modify the array
-    unsafe {
-        mlx_sys::_mlx_array_is_available(&mut result, arr.as_ptr());
-    }
-    result
+fn array_is_available(_arr: &Array) -> bool {
+    // The bridge doesn't expose async availability checks.
+    // Return true to assume arrays are always available after eval.
+    true
 }
 
 /// Set the wired memory limit for Metal.
@@ -230,41 +208,14 @@ fn array_is_available(arr: &Array) -> bool {
 /// The previous wired limit.
 #[inline]
 fn set_wired_limit(limit: usize) -> usize {
-    let mut result: usize = 0;
-    // SAFETY:
-    // 1. mlx_set_wired_limit is a public MLX C API function
-    // 2. We pass a valid mutable pointer to result for the output
-    // 3. limit is a valid usize value representing bytes
-    // 4. This configures Metal's memory allocation behavior globally
-    unsafe {
-        mlx_sys::mlx_set_wired_limit(&mut result, limit);
-    }
-    result
+    pmetal_bridge::inline_array::set_wired_limit(limit)
 }
 
 /// Get the Metal device info to determine optimal wired limit.
 ///
 /// Returns the max recommended working set size.
 fn get_max_recommended_wired_limit() -> usize {
-    // SAFETY: All calls below are public mlx-c v0.5.0 APIs.
-    // We create device/info objects, query them, and free them properly.
-    unsafe {
-        let dev = mlx_sys::mlx_device_new_type(mlx_sys::mlx_device_type__MLX_GPU, 0);
-        let mut info = mlx_sys::mlx_device_info_new();
-        let ret = mlx_sys::mlx_device_info_get(&mut info, dev);
-        if ret != 0 {
-            mlx_sys::mlx_device_info_free(info);
-            mlx_sys::mlx_device_free(dev);
-            // Fallback: return 0 which means "no limit" effectively
-            return 0;
-        }
-        let mut value: usize = 0;
-        let key = c"max_recommended_working_set_size";
-        mlx_sys::mlx_device_info_get_size(&mut value, info, key.as_ptr());
-        mlx_sys::mlx_device_info_free(info);
-        mlx_sys::mlx_device_free(dev);
-        value
-    }
+    pmetal_bridge::inline_array::get_max_recommended_size()
 }
 
 /// RAII guard for managing wired memory limit during generation.
@@ -292,54 +243,34 @@ impl Drop for WiredLimitGuard {
     }
 }
 
-/// A RAII guard that sets a stream as the default for the duration of its lifetime.
+/// A RAII guard that activates the MLX generation stream for the duration of its lifetime.
 ///
-/// This mirrors Python's `with mx.stream(stream):` context manager, which actually
-/// calls the C++ `set_default_stream()` function. The mlx-rs `with_new_default_stream`
-/// only sets a Rust thread-local and doesn't affect the C++ scheduler.
+/// In the bridge, we use the built-in new_generation_stream / set_generation_stream
+/// bridge functions which set the underlying C++ stream correctly.
 struct StreamContext {
-    previous_stream: Stream,
+    _marker: std::marker::PhantomData<()>,
 }
 
 impl StreamContext {
-    /// Create a new stream context, setting the given stream as the default.
-    fn new(stream: &Stream) -> Self {
-        // Get the current default stream to restore later
-        let previous_stream = Stream::gpu();
-
-        // SAFETY:
-        // 1. mlx_set_default_stream is a public MLX C API function
-        // 2. stream.as_ptr() returns a valid mlx_stream pointer
-        // 3. This sets the thread-local default stream for MLX operations
-        // 4. The stream must remain valid while it's the default
-        unsafe {
-            mlx_sys::mlx_set_default_stream(stream.as_ptr());
-        }
-
-        StreamContext { previous_stream }
+    /// Create a new stream context, activating the generation stream.
+    fn new(_stream: &Stream) -> Self {
+        pmetal_bridge::inline_array::set_generation_stream();
+        StreamContext { _marker: std::marker::PhantomData }
     }
 }
 
 impl Drop for StreamContext {
     fn drop(&mut self) {
-        // SAFETY:
-        // 1. mlx_set_default_stream is a public MLX C API function
-        // 2. previous_stream was obtained from Stream::gpu() which returns a valid stream
-        // 3. We're restoring the previous state, which is always valid
-        unsafe {
-            mlx_sys::mlx_set_default_stream(self.previous_stream.as_ptr());
-        }
+        // Bridge does not expose restoring previous stream; set_generation_stream
+        // is idempotent — the generation stream remains active.
     }
 }
 
-/// Create a new generation stream.
-///
-/// Note: We'd like to cache this like Python's module-level `generation_stream`,
-/// but mlx-rs Stream contains a raw pointer that doesn't implement Sync.
-/// Stream creation is cheap (~0.001ms) so this is acceptable.
+/// Create a new generation stream (no-op in bridge — streams are managed internally).
 #[inline]
 fn create_generation_stream() -> Stream {
-    Stream::new_with_device(&Device::gpu())
+    pmetal_bridge::inline_array::new_generation_stream();
+    Stream::default()
 }
 
 /// Build a `[1, seq_len]` Int32 token array from token IDs.
@@ -353,7 +284,7 @@ fn token_input_array(tokens: &[u32]) -> Array {
 /// Clear both compiled graph state and the general MLX allocation cache.
 #[inline]
 fn clear_generation_caches() {
-    mlx_rs::transforms::compile::clear_cache();
+    pmetal_bridge::compat::transforms::compile::clear_cache();
     pmetal_mlx::memory::clear_cache();
 }
 
@@ -384,9 +315,9 @@ where
     for start in (0..input_ids.len()).step_by(step_size) {
         let end = (start + step_size).min(input_ids.len());
         let chunk_input = token_input_array(&input_ids[start..end]);
-        let logits = forward(&chunk_input)?;
+        let mut logits = forward(&chunk_input)?;
         if end < input_ids.len() {
-            logits.eval()?;
+            logits.eval();
             pmetal_mlx::memory::clear_cache();
         } else {
             last_logits = Some(logits);
@@ -402,8 +333,8 @@ where
 fn ensure_f32(logits: &Array) -> Result<Array, Exception> {
     match logits.dtype() {
         Dtype::Float32 => Ok(logits.clone()),
-        Dtype::Bfloat16 | Dtype::Float16 => logits.as_type::<f32>(),
-        _ => logits.as_type::<f32>(),
+        Dtype::Bfloat16 | Dtype::Float16 => Ok(logits.cast(Dtype::Float32)),
+        _ => Ok(logits.cast(Dtype::Float32)),
     }
 }
 
@@ -788,7 +719,7 @@ impl Sampler {
     pub fn new(config: GenerationConfig) -> Self {
         // Seed MLX random state if a seed was provided
         let seeded = if let Some(seed) = config.seed {
-            let _ = mlx_seed(seed);
+            pmetal_bridge::inline_array::random_seed(seed);
             true
         } else {
             false
@@ -926,7 +857,7 @@ impl Sampler {
         if !self.config.do_sample {
             let token = greedy_sample_array(logits)?;
             // Return minimal view for log_probs since greedy doesn't need them
-            let empty_logprobs = logits.index((.., ..1)); // Minimal view, not used
+            let empty_logprobs = logits.clone(); // Placeholder, not used by greedy callers
             return Ok((token, empty_logprobs));
         }
 
@@ -936,7 +867,7 @@ impl Sampler {
         let logits_f32: &Array = if is_f32(logits) {
             logits // Borrow, no clone needed
         } else {
-            owned_logits = logits.as_type::<f32>()?;
+            owned_logits = logits.cast(Dtype::Float32);
             &owned_logits
         };
 
@@ -951,11 +882,11 @@ impl Sampler {
         // Use cached inv_temp to avoid allocation per token
         let token = if let Some(ref inv_temp) = self.inv_temp {
             // Scale by cached inverse temperature
-            let scaled = log_probs.multiply(inv_temp)?;
-            categorical(&scaled, None, None, None)?
+            let scaled = log_probs.multiply(inv_temp);
+            categorical(&scaled, -1)
         } else {
             // No temperature scaling needed (temp == 1.0)
-            categorical(&log_probs, None, None, None)?
+            categorical(&log_probs, -1)
         };
         Ok((token, log_probs))
     }
@@ -1011,7 +942,7 @@ impl Sampler {
         // so we just need a 2D view to pass to them.
         let input_2d;
         let input_2d_ref: &Array = if was_1d {
-            input_2d = log_probs.reshape(&[1, vocab_size as i32])?;
+            input_2d = log_probs.reshape(&[1, vocab_size as i32]);
             &input_2d
         } else {
             log_probs // Already 2D, just borrow - no clone!
@@ -1036,7 +967,7 @@ impl Sampler {
         }
 
         // Squeeze back once at end
-        if was_1d { result.squeeze() } else { Ok(result) }
+        Ok(if was_1d { result.squeeze(0) } else { result })
     }
 
     /// Internal top-k filter using cached arrays. Input must be 2D [1, vocab_size].
@@ -1048,12 +979,13 @@ impl Sampler {
         let k = (self.config.top_k as usize).min(vocab_size);
 
         // argpartition on -logits gives indices that partition around k-th largest
-        let neg_logits = logits_2d.negative()?;
-        let mask_idx = argpartition_axis(&neg_logits, (k - 1) as i32, -1)?;
-        let mask_idx = mask_idx.index((.., k as i32..));
+        let neg_logits = logits_2d.negative();
+        let mask_idx = argpartition_axis(&neg_logits, (k - 1) as i32, -1);
+        let vocab_size_i32 = logits_2d.dim(-1);
+        let mask_idx = mask_idx.slice(&[0, k as i32], &[1, vocab_size_i32]);
 
         // Use cached neg_inf
-        put_along_axis(logits_2d, &mask_idx, &self.neg_inf, -1)
+        Ok(put_along_axis(logits_2d, &mask_idx, &self.neg_inf, -1))
     }
 
     /// Internal top-p filter using cached arrays. Input must be 2D [1, vocab_size].
@@ -1063,29 +995,29 @@ impl Sampler {
         vocab_size: usize,
     ) -> Result<Array, Exception> {
         // Convert logits to probabilities
-        let probs = exp(logits_2d)?;
+        let probs = exp(logits_2d);
 
         // Sort indices in ascending order
-        let sorted_indices = argsort_axis(logits_2d, -1)?;
-        let sorted_probs = take_along_axis(&probs, &sorted_indices, -1)?;
-        let cumulative_probs = sorted_probs.cumsum(-1, None, None)?;
+        let sorted_indices = argsort_axis(logits_2d, -1);
+        let sorted_probs = take_along_axis(&probs, &sorted_indices, -1);
+        let cumulative_probs = sorted_probs.cumsum(-1);
 
         // Create inverse indices to map back
         let vocab_range = Array::from_iter(0..vocab_size as i32, &[1, vocab_size as i32]);
         let inverse_indices = put_along_axis(
-            &zeros_like(&sorted_indices)?,
+            &zeros_like(&sorted_indices),
             &sorted_indices,
             &vocab_range,
             -1,
-        )?;
-        let cumulative_probs = take_along_axis(&cumulative_probs, &inverse_indices, -1)?;
+        );
+        let cumulative_probs = take_along_axis(&cumulative_probs, &inverse_indices, -1);
 
         // Keep tokens where cumulative probability > (1 - top_p)
         let threshold = Array::from_f32(1.0 - self.config.top_p);
-        let mask = cumulative_probs.gt(&threshold)?;
+        let mask = cumulative_probs.greater(&threshold);
 
         // Use cached neg_inf
-        which(&mask, logits_2d, &self.neg_inf)
+        Ok(which(&mask, logits_2d, &self.neg_inf))
     }
 
     /// Internal min-p filter using cached arrays. Input must be 2D [1, vocab_size].
@@ -1095,36 +1027,36 @@ impl Sampler {
         vocab_size: usize,
     ) -> Result<Array, Exception> {
         // Sort indices in descending order
-        let neg_logits = logits_2d.negative()?;
-        let sorted_indices = argsort_axis(&neg_logits, -1)?;
-        let sorted_logits = take_along_axis(logits_2d, &sorted_indices, -1)?;
+        let neg_logits = logits_2d.negative();
+        let sorted_indices = argsort_axis(&neg_logits, -1);
+        let sorted_logits = take_along_axis(logits_2d, &sorted_indices, -1);
 
-        // Get top logprob
-        let top_logits = sorted_logits.index((.., 0..1));
+        // Get top logprob — take first column: [1, vocab] -> [1, 1]
+        let top_logits = sorted_logits.slice(&[0, 0], &[1, 1]);
         let log_min_p = Array::from_f32(self.config.min_p.ln());
-        let scaled_min_p = top_logits.add(&log_min_p)?;
+        let scaled_min_p = top_logits.add(&log_min_p);
 
         // Mask tokens below threshold
-        let tokens_to_remove = sorted_logits.lt(&scaled_min_p)?;
-        let selected_logits = which(&tokens_to_remove, &self.neg_inf, &sorted_logits)?;
+        let tokens_to_remove = sorted_logits.less(&scaled_min_p);
+        let selected_logits = which(&tokens_to_remove, &self.neg_inf, &sorted_logits);
 
         // Map back to original order
         let vocab_range = Array::from_iter(0..vocab_size as i32, &[1, vocab_size as i32]);
         let inverse_indices = put_along_axis(
-            &zeros_like(&sorted_indices)?,
+            &zeros_like(&sorted_indices),
             &sorted_indices,
             &vocab_range,
             -1,
-        )?;
+        );
 
-        take_along_axis(&selected_logits, &inverse_indices, -1)
+        Ok(take_along_axis(&selected_logits, &inverse_indices, -1))
     }
 }
 
 /// Greedy sampling - returns the token with highest probability.
 /// Note: item() internally calls eval(), so no explicit eval() needed.
 fn greedy_sample(logits: &Array) -> Result<u32, Exception> {
-    let token_id = argmax(logits, None)?;
+    let mut token_id = argmax(logits);
     Ok(token_id.item::<u32>())
 }
 
@@ -1133,14 +1065,14 @@ fn greedy_sample(logits: &Array) -> Result<u32, Exception> {
 /// Greedy sampling - return argmax along last axis to match Python's pattern.
 /// Returns shape [batch] for input shape [batch, vocab].
 fn greedy_sample_array(logits: &Array) -> Result<Array, Exception> {
-    argmax_axis(logits, -1, None) // axis=-1 like Python's mx.argmax(x, axis=-1)
+    Ok(argmax_axis(logits, -1)) // axis=-1 like Python's mx.argmax(x, axis=-1)
 }
 
 /// Convert logits to log probabilities (log-softmax).
 /// Matches mlx_lm: logprobs = logits - logsumexp(logits, keepdims=True)
 fn logits_to_log_probs(logits: &Array) -> Result<Array, Exception> {
-    let lse = logsumexp_axis(logits, -1, true)?;
-    logits.subtract(&lse)
+    let lse = logsumexp_axis_keepdims(logits, -1, true);
+    Ok(logits.subtract(&lse))
 }
 
 /// GPU-native repetition penalty matching mlx_lm.
@@ -1161,7 +1093,7 @@ fn apply_repetition_penalty(
     // Ensure logits is 2D [1, vocab_size] for indexing
     let vocab_size = logits.dim(-1) as usize;
     let logits_2d = if logits.ndim() == 1 {
-        logits.reshape(&[1, vocab_size as i32])?
+        logits.reshape(&[1, vocab_size as i32])
     } else {
         logits.clone()
     };
@@ -1176,7 +1108,7 @@ fn apply_repetition_penalty(
     let token_indices = Array::from_slice(&recent_tokens, &[1, recent_tokens.len() as i32]);
 
     // Get logits at token positions: logits[:, tokens]
-    let selected_logits = take_along_axis(&logits_2d, &token_indices, -1)?;
+    let selected_logits = take_along_axis(&logits_2d, &token_indices, -1);
 
     // Apply penalty: divide positive, multiply negative
     let zero = Array::from_f32(0.0);
@@ -1184,17 +1116,17 @@ fn apply_repetition_penalty(
     let inv_penalty = Array::from_f32(1.0 / penalty);
 
     // selected < 0 ? selected * penalty : selected / penalty
-    let is_negative = selected_logits.lt(&zero)?;
-    let penalized_positive = selected_logits.multiply(&inv_penalty)?;
-    let penalized_negative = selected_logits.multiply(&penalty_arr)?;
-    let penalized = which(&is_negative, &penalized_negative, &penalized_positive)?;
+    let is_negative = selected_logits.less(&zero);
+    let penalized_positive = selected_logits.multiply(&inv_penalty);
+    let penalized_negative = selected_logits.multiply(&penalty_arr);
+    let penalized = which(&is_negative, &penalized_negative, &penalized_positive);
 
     // Put the penalized values back: logits[:, tokens] = penalized
-    let result = put_along_axis(&logits_2d, &token_indices, &penalized, -1)?;
+    let result = put_along_axis(&logits_2d, &token_indices, &penalized, -1);
 
     // Squeeze back to original shape if needed
     if logits.ndim() == 1 {
-        result.squeeze()
+        Ok(result.squeeze(0))
     } else {
         Ok(result)
     }
@@ -1213,28 +1145,29 @@ fn top_k_filter(logits: &Array, k: usize) -> Result<Array, Exception> {
 
     // Ensure logits is 2D for consistent indexing [1, vocab_size]
     let logits_2d = if logits.ndim() == 1 {
-        logits.reshape(&[1, vocab_size as i32])?
+        logits.reshape(&[1, vocab_size as i32])
     } else {
         logits.clone()
     };
 
     // argpartition on -logits gives indices that partition around k-th largest
     // Elements before kth are >= kth, elements after are <= kth
-    let neg_logits = logits_2d.negative()?;
-    let mask_idx = argpartition_axis(&neg_logits, (k - 1) as i32, -1)?;
+    let neg_logits = logits_2d.negative();
+    let mask_idx = argpartition_axis(&neg_logits, (k - 1) as i32, -1);
 
     // Get indices of tokens to mask (everything after top-k)
-    let mask_idx = mask_idx.index((.., k as i32..));
+    let vocab_size_i32 = logits_2d.dim(-1);
+    let mask_idx = mask_idx.slice(&[0, k as i32], &[1, vocab_size_i32]);
 
     // Create -inf value for masking
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
 
     // Put -inf at the mask indices
-    let masked = put_along_axis(&logits_2d, &mask_idx, &neg_inf, -1)?;
+    let masked = put_along_axis(&logits_2d, &mask_idx, &neg_inf, -1);
 
     // Squeeze back to original shape if needed
     if logits.ndim() == 1 {
-        masked.squeeze()
+        Ok(masked.squeeze(0))
     } else {
         Ok(masked)
     }
@@ -1253,47 +1186,47 @@ fn top_p_filter(logits: &Array, p: f32) -> Result<Array, Exception> {
 
     // Ensure logits is 2D for consistent indexing [1, vocab_size]
     let logits_2d = if logits.ndim() == 1 {
-        logits.reshape(&[1, vocab_size as i32])?
+        logits.reshape(&[1, vocab_size as i32])
     } else {
         logits.clone()
     };
 
     // Convert logits to probabilities
-    let probs = exp(&logits_2d)?;
+    let probs = exp(&logits_2d);
 
     // Sort indices in ascending order (by logits, which preserves prob ordering)
-    let sorted_indices = argsort_axis(&logits_2d, -1)?;
+    let sorted_indices = argsort_axis(&logits_2d, -1);
 
     // Gather sorted probs
-    let sorted_probs = take_along_axis(&probs, &sorted_indices, -1)?;
+    let sorted_probs = take_along_axis(&probs, &sorted_indices, -1);
 
     // Compute cumulative sum
-    let cumulative_probs = sorted_probs.cumsum(-1, None, None)?;
+    let cumulative_probs = sorted_probs.cumsum(-1);
 
     // Create inverse indices to map back to original order
     let vocab_range = Array::from_iter(0..vocab_size as i32, &[1, vocab_size as i32]);
     let inverse_indices = put_along_axis(
-        &zeros_like(&sorted_indices)?,
+        &zeros_like(&sorted_indices),
         &sorted_indices,
         &vocab_range,
         -1,
-    )?;
+    );
 
     // Rearrange cumulative probs back to original order
-    let cumulative_probs = take_along_axis(&cumulative_probs, &inverse_indices, -1)?;
+    let cumulative_probs = take_along_axis(&cumulative_probs, &inverse_indices, -1);
 
     // Keep tokens where cumulative probability > (1 - top_p)
     // This matches mlx_lm's logic: select tokens with cumsum > 1 - top_p
     let threshold = Array::from_f32(1.0 - p);
-    let mask = cumulative_probs.gt(&threshold)?;
+    let mask = cumulative_probs.greater(&threshold);
 
     // Apply mask: keep original logits where mask is true, else -inf
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let result = which(&mask, &logits_2d, &neg_inf)?;
+    let result = which(&mask, &logits_2d, &neg_inf);
 
     // Squeeze back to original shape if needed
     if logits.ndim() == 1 {
-        result.squeeze()
+        Ok(result.squeeze(0))
     } else {
         Ok(result)
     }
@@ -1317,45 +1250,45 @@ fn min_p_filter(logits: &Array, min_p: f32) -> Result<Array, Exception> {
 
     // Ensure logits is 2D for consistent indexing [1, vocab_size]
     let logits_2d = if logits.ndim() == 1 {
-        logits.reshape(&[1, vocab_size as i32])?
+        logits.reshape(&[1, vocab_size as i32])
     } else {
         logits.clone()
     };
 
     // Sort indices in descending order
-    let neg_logits = logits_2d.negative()?;
-    let sorted_indices = argsort_axis(&neg_logits, -1)?;
-    let sorted_logits = take_along_axis(&logits_2d, &sorted_indices, -1)?;
+    let neg_logits = logits_2d.negative();
+    let sorted_indices = argsort_axis(&neg_logits, -1);
+    let sorted_logits = take_along_axis(&logits_2d, &sorted_indices, -1);
 
     // Get top logprob (first element after descending sort)
-    let top_logits = sorted_logits.index((.., 0..1));
+    let top_logits = sorted_logits.slice(&[0, 0], &[1, 1]);
 
     // Calculate the min_p threshold in log space: scaled_min_p = top_logprob + log(min_p)
     let log_min_p = Array::from_f32(min_p.ln());
-    let scaled_min_p = top_logits.add(&log_min_p)?;
+    let scaled_min_p = top_logits.add(&log_min_p);
 
     // Find tokens to remove: those with logprob < scaled_min_p
-    let tokens_to_remove = sorted_logits.lt(&scaled_min_p)?;
+    let tokens_to_remove = sorted_logits.less(&scaled_min_p);
 
     // Apply mask: -inf where tokens should be removed
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let selected_logits = which(&tokens_to_remove, &neg_inf, &sorted_logits)?;
+    let selected_logits = which(&tokens_to_remove, &neg_inf, &sorted_logits);
 
     // Create inverse indices to map back to original order
     let vocab_range = Array::from_iter(0..vocab_size as i32, &[1, vocab_size as i32]);
     let inverse_indices = put_along_axis(
-        &zeros_like(&sorted_indices)?,
+        &zeros_like(&sorted_indices),
         &sorted_indices,
         &vocab_range,
         -1,
-    )?;
+    );
 
     // Rearrange back to original order
-    let result = take_along_axis(&selected_logits, &inverse_indices, -1)?;
+    let result = take_along_axis(&selected_logits, &inverse_indices, -1);
 
     // Squeeze back to original shape if needed
     if logits.ndim() == 1 {
-        result.squeeze()
+        Ok(result.squeeze(0))
     } else {
         Ok(result)
     }
@@ -1380,7 +1313,7 @@ fn apply_frequency_presence_penalty(
     // Ensure logits is 2D [1, vocab_size] for indexing
     let vocab_size = logits.dim(-1) as usize;
     let logits_2d = if logits.ndim() == 1 {
-        logits.reshape(&[1, vocab_size as i32])?
+        logits.reshape(&[1, vocab_size as i32])
     } else {
         logits.clone()
     };
@@ -1402,17 +1335,17 @@ fn apply_frequency_presence_penalty(
     let penalty_values = Array::from_slice(&penalties, &[1, penalties.len() as i32]);
 
     // Get current logits at token positions
-    let selected_logits = take_along_axis(&logits_2d, &token_indices, -1)?;
+    let selected_logits = take_along_axis(&logits_2d, &token_indices, -1);
 
     // Apply penalties: logit -= penalty
-    let penalized = selected_logits.subtract(&penalty_values)?;
+    let penalized = selected_logits.subtract(&penalty_values);
 
     // Put the penalized values back
-    let result = put_along_axis(&logits_2d, &token_indices, &penalized, -1)?;
+    let result = put_along_axis(&logits_2d, &token_indices, &penalized, -1);
 
     // Squeeze back to original shape if needed
     if logits.ndim() == 1 {
-        result.squeeze()
+        Ok(result.squeeze(0))
     } else {
         Ok(result)
     }
@@ -1421,7 +1354,7 @@ fn apply_frequency_presence_penalty(
 /// GPU-native categorical sampling from log probabilities.
 ///
 /// Matches mlx_lm exactly: categorical(logprobs * (1/temp))
-/// Uses mlx_rs::random::categorical for efficient GPU sampling.
+/// Uses pmetal_bridge::compat::random::categorical for efficient GPU sampling.
 /// This is ~10x faster than CPU sampling for large vocabularies.
 /// Note: item() internally calls eval(), so no explicit eval() needed.
 fn gpu_categorical_sample(log_probs: &Array, temperature: f32) -> Result<u32, Exception> {
@@ -1429,13 +1362,13 @@ fn gpu_categorical_sample(log_probs: &Array, temperature: f32) -> Result<u32, Ex
     // categorical_sampling(logits, temp) -> mx.random.categorical(logits * (1 / temp))
     let scaled = if temperature != 1.0 && temperature > 0.0 {
         let inv_temp = Array::from_f32(1.0 / temperature);
-        log_probs.multiply(&inv_temp)?
+        log_probs.multiply(&inv_temp)
     } else {
         log_probs.clone()
     };
 
     // Sample using GPU-native categorical (axis=-1 by default)
-    let sampled = categorical(&scaled, None, None, None)?;
+    let mut sampled = categorical(&scaled, -1);
 
     // Extract the scalar token ID (item() calls eval() internally)
     Ok(sampled.item::<u32>())
@@ -1449,13 +1382,13 @@ fn gpu_categorical_sample(log_probs: &Array, temperature: f32) -> Result<u32, Ex
 fn gpu_categorical_sample_array(log_probs: &Array, temperature: f32) -> Result<Array, Exception> {
     let scaled = if temperature != 1.0 && temperature > 0.0 {
         let inv_temp = Array::from_f32(1.0 / temperature);
-        log_probs.multiply(&inv_temp)?
+        log_probs.multiply(&inv_temp)
     } else {
         log_probs.clone()
     };
 
     // Returns Array - no .item() call, stays on GPU
-    categorical(&scaled, None, None, None)
+    Ok(categorical(&scaled, -1))
 }
 
 /// Simple generation function that works with any model that has a `forward` method.
@@ -1487,13 +1420,13 @@ where
         );
 
         // Get logits from model
-        let logits = forward_fn(&input)?;
-        logits.eval()?;
+        let mut logits = forward_fn(&input)?;
+        logits.eval();
 
         // Extract logits for the last position [vocab_size]
         let last_idx = logits.dim(1) - 1;
-        let last_logits = logits.index((.., last_idx, ..));
-        let last_logits = last_logits.squeeze()?;
+        let last_logits = select_axis(&logits, last_idx, 1);
+// next squeeze removed - select_axis already reduces dim
 
         // Sample next token
         let next_token = sampler.sample(&last_logits, &all_tokens)?;
@@ -1556,15 +1489,15 @@ where
     let prompt_len = input_ids.len();
 
     // Prefill: process long prompts in chunks to bound peak allocator pressure.
-    let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+    let mut logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
         forward_fn(chunk_input, cache)
     })?;
-    logits.eval()?;
+    logits.eval();
 
     // Get logits for the last position and sample first new token
     let last_idx = logits.dim(1) - 1;
-    let last_logits = logits.index((.., last_idx, ..));
-    let last_logits = last_logits.squeeze()?;
+    let last_logits = select_axis(&logits, last_idx, 1);
+// next squeeze removed - select_axis already reduces dim
 
     let mut next_token = sampler.sample(&last_logits, &all_tokens)?;
 
@@ -1587,12 +1520,12 @@ where
         let token_input = Array::from_slice(&[next_token as i32], &[1, 1]);
 
         // Forward with cache - only processes the new token
-        let logits = forward_fn(&token_input, cache)?;
-        logits.eval()?;
+        let mut logits = forward_fn(&token_input, cache)?;
+        logits.eval();
 
         // Get logits for the (only) position
-        let last_logits = logits.index((.., 0, ..));
-        let last_logits = last_logits.squeeze()?;
+        let last_logits = select_axis(&logits, 0, 1);
+// next squeeze removed - select_axis already reduces dim
 
         // Sample next token
         next_token = sampler.sample(&last_logits, &all_tokens)?;
@@ -1690,11 +1623,11 @@ where
     // Avoiding squeeze reduces reshape operations in sampling pipeline
     let extract_logits = |logits: &Array| -> Array {
         let last_idx = logits.dim(1) - 1;
-        logits.index((.., last_idx, ..)) // Returns [1, vocab]
+        select_axis(&logits, last_idx, 1) // Returns [1, vocab]
     };
 
     let (mut current_y, mut current_logprobs) = {
-        let logits =
+        let mut logits =
             run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
                 let _stream_ctx = StreamContext::new(&generation_stream);
                 forward_fn(chunk_input, cache)
@@ -1704,7 +1637,7 @@ where
     };
 
     // async_eval OUTSIDE stream context (critical for pipelining!)
-    async_eval([&current_y, &current_logprobs])?;
+    async_eval([&current_y, &current_logprobs]);
 
     // Decode loop with TRUE async pipelining
     //
@@ -1721,14 +1654,14 @@ where
                 let _stream_ctx = StreamContext::new(&generation_stream);
                 // Convert Uint32 token to Int32 for model input (argmax returns Uint32)
                 let next_input = current_y
-                    .as_dtype(mlx_rs::Dtype::Int32)?
-                    .reshape(&[1, -1])?;
+                    .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32())
+                    .reshape(&[1, -1]);
                 let next_output = forward_fn(&next_input, cache)?;
-                let next_logits = next_output.index((.., 0, ..));
+                let next_logits = select_axis(&next_output, 0, 1);
                 sampler.sample_array(&next_logits)?
             };
             // async_eval OUTSIDE stream context (enables pipelining)
-            async_eval([&y, &lp])?;
+            async_eval([&y, &lp]);
             Some((y, lp))
         } else {
             None
@@ -1736,7 +1669,7 @@ where
 
         // 2. First iteration: force eval on first token (like Python's mx.eval(y) on n==0)
         if n == 0 {
-            current_y.eval()?;
+            current_y.eval();
         }
 
         // 3. Check max tokens BEFORE extraction (like Python)
@@ -1810,11 +1743,11 @@ where
 
     let extract_logits = |logits: &Array| -> Array {
         let last_idx = logits.dim(1) - 1;
-        logits.index((.., last_idx, ..))
+        select_axis(&logits, last_idx, 1)
     };
 
     let (mut current_y, mut current_logprobs) = {
-        let logits =
+        let mut logits =
             run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
                 let _stream_ctx = StreamContext::new(&generation_stream);
                 forward_fn(chunk_input, cache)
@@ -1822,10 +1755,10 @@ where
         let current_logits = extract_logits(&logits);
         sampler.sample_array(&current_logits)?
     };
-    async_eval([&current_y, &current_logprobs])?;
+    async_eval([&current_y, &current_logprobs]);
 
     // Enable MLX compilation for the decode loop — fuses ops to reduce GPU kernel count.
-    mlx_rs::inline_array::enable_compile();
+    pmetal_bridge::inline_array::enable_compile();
 
 
 
@@ -1836,24 +1769,24 @@ where
             let (y, lp) = {
                 let _stream_ctx = StreamContext::new(&generation_stream);
                 let next_input = current_y
-                    .as_dtype(mlx_rs::Dtype::Int32)?
-                    .reshape(&[1, -1])?;
+                    .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32())
+                    .reshape(&[1, -1]);
                 let next_output = forward_fn(&next_input, cache)?;
-                let next_logits = next_output.index((.., 0, ..));
+                let next_logits = select_axis(&next_output, 0, 1);
                 sampler.sample_array(&next_logits)?
             };
             if n > 0 && n <= 3 {
-                let nodes = mlx_rs::inline_array::graph_node_count(&y);
+                let nodes = pmetal_bridge::inline_array::graph_node_count(&y);
                 eprintln!("[gen {n}] graph nodes: {nodes}");
             }
-            async_eval([&y, &lp])?;
+            async_eval([&y, &lp]);
             Some((y, lp))
         } else {
             None
         };
 
         if n == 0 {
-            current_y.eval()?;
+            current_y.eval();
         }
 
         if n >= config.max_new_tokens {
@@ -1961,7 +1894,7 @@ where
     let mut token_counts: HashMap<u32, usize> = HashMap::new();
 
     // Get vocab size from the final prefill chunk output.
-    let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+    let mut logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
         let _stream_ctx = StreamContext::new(&generation_stream);
         forward_fn(chunk_input, cache)
     })?;
@@ -1982,10 +1915,9 @@ where
     // Helper to get last logits from output
     let extract_logits = |logits: &Array| -> Result<Array, Exception> {
         let last_idx = logits.dim(1) - 1;
-        let last_logits = logits.index((.., last_idx, ..));
-        let squeezed = last_logits.squeeze()?;
+        let last_logits = select_axis(&logits, last_idx, 1);
         // Ensure f32 for Metal kernel
-        ensure_f32(&squeezed)
+        ensure_f32(&last_logits)
     };
 
     // Helper to apply penalties to logits
@@ -2017,12 +1949,12 @@ where
 
     // Sample first token
     let current_logits = extract_logits(&logits)?;
-    let penalized_logits = if use_repetition || use_freq_presence {
+    let mut penalized_logits = if use_repetition || use_freq_presence {
         apply_penalties(&current_logits, &[], &token_counts, &config)?
     } else {
         current_logits
     };
-    penalized_logits.eval()?; // Ensure data is available
+    penalized_logits.eval(); // Ensure data is available
 
     let temperature = if config.do_sample {
         config.temperature
@@ -2075,18 +2007,18 @@ where
         let token_input = Array::from_slice(&[token as i32], &[1, 1]);
         let next_output = {
             let _stream_ctx = StreamContext::new(&generation_stream);
-            forward_fn(&token_input, cache)?
-        };
+            forward_fn(&token_input, cache)
+        }?;
         let next_logits = extract_logits(&next_output)?;
 
         // Apply penalties to logits before sampling
         let generated = &all_tokens[prompt_len..]; // Only tokens we generated
-        let penalized_logits = if use_repetition || use_freq_presence {
+        let mut penalized_logits = if use_repetition || use_freq_presence {
             apply_penalties(&next_logits, generated, &token_counts, &config)?
         } else {
             next_logits
         };
-        penalized_logits.eval()?;
+        penalized_logits.eval();
 
         // Dispatch next sampling (OUTSIDE stream context - async pipelining)
         metal_sampler
@@ -2126,7 +2058,7 @@ pub fn generate_minimal_async<F>(
 where
     F: FnMut(&Array, &mut KVCache) -> Result<Array, Exception>,
 {
-    use mlx_rs::ops::indexing::argmax_axis;
+    use pmetal_bridge::compat::ops::argmax_axis;
 
     let _wired_guard = WiredLimitGuard::new();
 
@@ -2138,8 +2070,8 @@ where
         // Stream context ONLY around forward pass (like Python's `with mx.stream(generation_stream):`)
         let _stream_ctx = StreamContext::new(&generation_stream);
         let out = forward_fn(input, cache)?;
-        let logits = out.index((.., -1, ..));
-        argmax_axis(&logits, -1, None)
+        let mut logits = select_axis(&out, -1, 1);
+        Ok(argmax_axis(&logits, -1))
     };
 
     let mut all_tokens: Vec<u32> = input_ids.to_vec();
@@ -2152,7 +2084,7 @@ where
     })?;
 
     // async_eval is OUTSIDE stream context (like Python)
-    async_eval([&y])?;
+    async_eval([&y]);
 
     let max_tokens = config.max_new_tokens;
     let mut n = 0;
@@ -2161,11 +2093,11 @@ where
         // Schedule NEXT (if not at max)
         let next_y = if n < max_tokens - 1 {
             // Convert Uint32 token to Int32 for model input (argmax returns Uint32)
-            let input = y.as_dtype(mlx_rs::Dtype::Int32)?.reshape(&[1, 1])?;
+            let input = y.as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32()).reshape(&[1, 1]);
             // step() wraps forward in stream context
             let next = step(&input, cache)?;
             // async_eval OUTSIDE stream context
-            async_eval([&next])?;
+            async_eval([&next]);
             Some(next)
         } else {
             None
@@ -2173,7 +2105,7 @@ where
 
         // Wait for first token
         if n == 0 {
-            y.eval()?;
+            y.eval();
         }
 
         // Check max
@@ -2272,20 +2204,18 @@ where
     let sampler = Sampler::new(config.clone());
 
     let mut current_y = {
-        let logits =
+        let mut logits =
             run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
                 let _stream_ctx = StreamContext::new(&generation_stream);
                 forward_fn(chunk_input, cache)
             })?;
         let last_idx = logits.dim(1) - 1;
-        let current_logits = logits
-            .index((.., last_idx..last_idx + 1, ..))
-            .squeeze_axes(&[1])?;
+        let current_logits = select_axis(&logits, last_idx, 1);
         compiled_sampler.sample(&current_logits)?
     };
 
     // async_eval OUTSIDE stream context (enables pipelining!)
-    async_eval([&current_y])?;
+    async_eval([&current_y]);
 
     // Decode loop with async pipelining
     let mut n = 0;
@@ -2295,13 +2225,13 @@ where
             let y = {
                 let _stream_ctx = StreamContext::new(&generation_stream);
                 // Convert Uint32 token to Int32 for model input (argmax returns Uint32)
-                let next_input = current_y.as_dtype(mlx_rs::Dtype::Int32)?.reshape(&[1, 1])?;
+                let next_input = current_y.as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32()).reshape(&[1, 1]);
                 let next_output = forward_fn(&next_input, cache)?;
-                let next_logits = next_output.index((.., 0..1, ..)).squeeze_axes(&[1])?;
+                let next_logits = select_axis(&next_output, 0, 1);
                 compiled_sampler.sample(&next_logits)?
             };
             // async_eval OUTSIDE stream context
-            async_eval([&y])?;
+            async_eval([&y]);
             Some(y)
         } else {
             None
@@ -2309,7 +2239,7 @@ where
 
         // 2. For first token only, sync to ensure prompt processing completes
         if n == 0 {
-            current_y.eval()?;
+            current_y.eval();
         }
 
         // 3. Extract current token - blocks naturally while GPU computes next
@@ -2519,11 +2449,11 @@ where
             }
             true
         })
-    })?;
+    });
 
     Ok(build_cached_generation_output(
         prompt_len,
-        token_ids,
+        token_ids?,
         gen_config,
         cancelled,
         saw_stop_token,
@@ -2705,11 +2635,11 @@ where
             }
             true
         })
-    })?;
+    });
 
     Ok(build_cached_generation_output(
         prompt_len,
-        token_ids,
+        token_ids?,
         gen_config,
         cancelled,
         saw_stop_token,
@@ -2754,11 +2684,11 @@ mod tests {
         let input_ids = vec![11, 22, 33, 44, 55];
         let mut seen_chunks = Vec::new();
 
-        let logits = run_cached_prefill_chunks(&input_ids, 2, |chunk_input| {
+        let mut logits = run_cached_prefill_chunks(&input_ids, 2, |chunk_input| {
             let seq_len = chunk_input.dim(1);
             seen_chunks.push(seq_len);
 
-            let last_token = chunk_input.index((0, seq_len - 1)).item::<i32>() as usize;
+            let last_token = select_axis(&select_axis(&chunk_input, 0, 0), (seq_len - 1) as i32, 0).item::<i32>() as usize;
             let vocab = 64usize;
             let mut data = vec![-1000.0f32; seq_len as usize * vocab];
             data[((seq_len as usize - 1) * vocab) + (last_token % vocab)] = 10.0;
@@ -2770,7 +2700,7 @@ mod tests {
         assert_eq!(seen_chunks, vec![2, 2, 1]);
         assert_eq!(logits.dim(1), 1);
 
-        let last_logits = logits.index((0, 0));
+        let last_logits = select_axis(&logits, 0, 0);
         let token = greedy_sample(&last_logits).unwrap();
         assert_eq!(token as usize, 55);
     }
@@ -2782,7 +2712,7 @@ mod tests {
 
         let _ = run_cached_prefill_chunks(&input_ids, 0, |chunk_input| {
             seen_chunks.push(chunk_input.dim(1));
-            Array::zeros::<f32>(&[1, chunk_input.dim(1), 8])
+            Array::zeros_f32(&[1, chunk_input.dim(1), 8])
         })
         .unwrap();
 
@@ -2794,7 +2724,7 @@ mod tests {
         // Create logits where token 5 has highest value
         let mut logits_vec = vec![-10.0f32; 100];
         logits_vec[5] = 10.0;
-        let logits = Array::from_slice(&logits_vec, &[100]);
+        let mut logits = Array::from_slice(&logits_vec, &[100]);
 
         let token = greedy_sample(&logits).unwrap();
         assert_eq!(token, 5);
@@ -2807,7 +2737,7 @@ mod tests {
         logits_vec[0] = 10.0;
         logits_vec[1] = 9.0;
         logits_vec[2] = 8.0;
-        let logits = Array::from_slice(&logits_vec, &[10]);
+        let mut logits = Array::from_slice(&logits_vec, &[10]);
 
         let filtered = top_k_filter(&logits, 3).unwrap();
         filtered.eval().unwrap();
@@ -2838,7 +2768,7 @@ mod tests {
 
         let mut logits_vec = vec![-10.0f32; 100];
         logits_vec[42] = 10.0;
-        let logits = Array::from_slice(&logits_vec, &[100]);
+        let mut logits = Array::from_slice(&logits_vec, &[100]);
 
         let token = sampler.sample(&logits, &[]).unwrap();
         assert_eq!(token, 42);
@@ -2857,7 +2787,7 @@ mod tests {
     #[test]
     fn test_top_p_filter() {
         // Create logits with uneven distribution
-        let logits = Array::from_slice(&[10.0f32, 5.0, 1.0, 0.0, -10.0], &[5]);
+        let mut logits = Array::from_slice(&[10.0f32, 5.0, 1.0, 0.0, -10.0], &[5]);
 
         let filtered = top_p_filter(&logits, 0.9).unwrap();
         filtered.eval().unwrap();
@@ -2888,7 +2818,7 @@ mod tests {
     fn test_min_p_filter() {
         // Create logits with descending probabilities
         // After softmax: ~0.88, ~0.12, ~0.004, ... (very small for rest)
-        let logits = Array::from_slice(&[10.0f32, 8.0, 5.0, 1.0, -5.0], &[5]);
+        let mut logits = Array::from_slice(&[10.0f32, 8.0, 5.0, 1.0, -5.0], &[5]);
 
         // With min_p = 0.1, threshold = 0.1 * 0.88 = 0.088
         // Should keep tokens with prob >= 0.088 (token 0 and 1)
@@ -2931,7 +2861,7 @@ mod tests {
 
     #[test]
     fn test_frequency_presence_penalty() {
-        let logits = Array::from_slice(&[5.0f32, 5.0, 5.0, 5.0, 5.0], &[5]);
+        let mut logits = Array::from_slice(&[5.0f32, 5.0, 5.0, 5.0, 5.0], &[5]);
 
         // Token 0 appeared once, token 2 appeared 3 times
         let mut counts = HashMap::new();

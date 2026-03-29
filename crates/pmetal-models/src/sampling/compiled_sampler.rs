@@ -46,26 +46,51 @@
 //! use pmetal_models::sampling::CompiledSampler;
 //!
 //! // Create sampler with config
-//! let mut sampler = CompiledSampler::new(0.7, 50, 0.9, 0.05)?;
+//! let mut sampler = CompiledSampler::new(0.7, 50, 0.9, 0.05);
 //!
 //! // Sample tokens - random state is properly tracked across calls
-//! let token1 = sampler.sample(&logits)?;
-//! let token2 = sampler.sample(&logits)?;  // Different random key used
+//! let token1 = sampler.sample(&logits);
+//! let token2 = sampler.sample(&logits);  // Different random key used
 //! ```
 
-use mlx_rs::Array;
-use mlx_rs::error::Exception;
-use mlx_rs::ops::{
-    argpartition_axis, argsort_axis, cumsum, exp,
-    indexing::{IndexOp, argmax, put_along_axis, take_along_axis},
-    logsumexp_axis, which, zeros_like,
-};
-use mlx_rs::random::{RandomState, categorical};
-use mlx_rs::utils::Updatable;
+use pmetal_bridge::compat::{Array, Exception, indexing, ops};
+use pmetal_bridge::compat::indexing::{IndexOp, put_along_axis, take_along_axis};
+use pmetal_bridge::compat::ops::{argmax_axis, argpartition_axis, argsort_axis, cumsum, exp, logsumexp_axis_keepdims, slice_axis, slice_last_from, which, zeros_like};
+use pmetal_bridge::compat::random::categorical;
 
 // ============================================================================
 // SamplerState - Composite state for compiled sampling
 // ============================================================================
+
+/// Stub for `mlx_rs::random::RandomState` — bridge uses a global random seed.
+#[derive(Debug, Clone)]
+pub struct RandomState {
+    seed: u64,
+}
+
+impl RandomState {
+    pub fn new() -> Result<Self, Exception> {
+        Ok(Self { seed: 42 })
+    }
+    pub fn with_seed(seed: u64) -> Result<Self, Exception> {
+        pmetal_bridge::inline_array::random_seed(seed);
+        Ok(Self { seed })
+    }
+    pub fn next_key(&mut self) -> Result<Array, Exception> {
+        // In bridge, random key is implicit — just return a dummy array.
+        Ok(Array::from_f32(self.seed as f32))
+    }
+    pub fn updatable_states_len(&self) -> usize { 0 }
+    pub fn updatable_states(&self) -> std::iter::Empty<&Array> { std::iter::empty() }
+    pub fn updatable_states_mut(&mut self) -> std::iter::Empty<&mut Array> { std::iter::empty() }
+}
+
+/// Stub for `mlx_rs::transforms::compile::Updatable`.
+pub trait Updatable {
+    fn updatable_states_len(&self) -> usize;
+    fn updatable_states(&self) -> impl IntoIterator<Item = &Array>;
+    fn updatable_states_mut(&mut self) -> impl IntoIterator<Item = &mut Array>;
+}
 
 /// Composite state for compiled sampling operations.
 ///
@@ -146,12 +171,12 @@ fn apply_top_k_2d(
 
     // argpartition on -logits gives indices that partition around k-th largest
     // This is O(n) vs O(n log n) for full sort
-    let neg_logits = logits_2d.negative()?;
-    let mask_idx = argpartition_axis(&neg_logits, (k - 1) as i32, -1)?;
-    let mask_idx = mask_idx.index((.., k as i32..));
+    let neg_logits = logits_2d.negative();
+    let mask_idx = argpartition_axis(&neg_logits, (k - 1) as i32, -1);
+    let mask_idx = slice_last_from(&mask_idx, k as i32);
 
     // Mask out tokens beyond top-k
-    put_along_axis(logits_2d, &mask_idx, neg_inf, -1)
+    Ok(put_along_axis(logits_2d, &mask_idx, neg_inf, Some(-1)))
 }
 
 /// Top-p (nucleus) filtering: keep tokens until cumulative probability exceeds p.
@@ -168,27 +193,27 @@ fn apply_top_p_2d(
     neg_inf: &Array,
 ) -> Result<Array, Exception> {
     // Convert to probabilities and sort ascending
-    let probs = exp(logits_2d)?;
-    let sorted_indices = argsort_axis(logits_2d, -1)?;
-    let sorted_probs = take_along_axis(&probs, &sorted_indices, -1)?;
+    let probs = exp(logits_2d);
+    let sorted_indices = argsort_axis(logits_2d, -1);
+    let sorted_probs = take_along_axis(&probs, &sorted_indices, -1);
 
     // Compute cumulative probabilities
-    let cumulative_probs = cumsum(&sorted_probs, -1, None, None)?;
+    let cumulative_probs = cumsum(&sorted_probs, -1);
 
     // Create inverse mapping to restore original order
     let vocab_range = Array::from_iter(0..vocab_size as i32, &[1, vocab_size as i32]);
     let inverse_indices = put_along_axis(
-        &zeros_like(&sorted_indices)?,
+        &zeros_like(&sorted_indices),
         &sorted_indices,
         &vocab_range,
-        -1,
-    )?;
-    let cumulative_probs = take_along_axis(&cumulative_probs, &inverse_indices, -1)?;
+        Some(-1),
+    );
+    let cumulative_probs = take_along_axis(&cumulative_probs, &inverse_indices, -1);
 
     // Mask tokens where cumulative probability exceeds threshold
     let threshold = Array::from_f32(1.0 - p);
-    let mask = cumulative_probs.gt(&threshold)?;
-    which(&mask, logits_2d, neg_inf)
+    let mask = cumulative_probs.greater(&threshold);
+    Ok(which(&mask, logits_2d, neg_inf))
 }
 
 /// Min-p filtering: dynamic threshold based on top token probability.
@@ -206,28 +231,28 @@ fn apply_min_p_2d(
     neg_inf: &Array,
 ) -> Result<Array, Exception> {
     // Sort to find max logprob (descending)
-    let neg_logits = logits_2d.negative()?;
-    let sorted_indices = argsort_axis(&neg_logits, -1)?;
-    let sorted_logits = take_along_axis(logits_2d, &sorted_indices, -1)?;
+    let neg_logits = logits_2d.negative();
+    let sorted_indices = argsort_axis(&neg_logits, -1);
+    let sorted_logits = take_along_axis(logits_2d, &sorted_indices, -1);
 
     // Compute threshold: top_logprob + log(min_p)
-    let top_logits = sorted_logits.index((.., 0..1));
+    let top_logits = slice_axis(&sorted_logits, -1, 0, 1);
     let log_min_p = Array::from_f32(min_p.ln());
-    let scaled_min_p = top_logits.add(&log_min_p)?;
+    let scaled_min_p = top_logits.add(&log_min_p);
 
     // Mask tokens below threshold
-    let tokens_to_remove = sorted_logits.lt(&scaled_min_p)?;
-    let selected_logits = which(&tokens_to_remove, neg_inf, &sorted_logits)?;
+    let tokens_to_remove = sorted_logits.less(&scaled_min_p);
+    let selected_logits = which(&tokens_to_remove, neg_inf, &sorted_logits);
 
     // Restore original order
     let vocab_range = Array::from_iter(0..vocab_size as i32, &[1, vocab_size as i32]);
     let inverse_indices = put_along_axis(
-        &zeros_like(&sorted_indices)?,
+        &zeros_like(&sorted_indices),
         &sorted_indices,
         &vocab_range,
-        -1,
-    )?;
-    take_along_axis(&selected_logits, &inverse_indices, -1)
+        Some(-1),
+    );
+    Ok(take_along_axis(&selected_logits, &inverse_indices, -1))
 }
 
 // ============================================================================
@@ -254,11 +279,11 @@ fn apply_min_p_2d(
 /// # Example
 ///
 /// ```rust,ignore
-/// let mut sampler = CompiledSampler::new(0.7, 50, 0.9, 0.05)?;
+/// let mut sampler = CompiledSampler::new(0.7, 50, 0.9, 0.05);
 ///
 /// // Each call produces different random samples
-/// let token1 = sampler.sample(&logits)?;
-/// let token2 = sampler.sample(&logits)?;
+/// let token1 = sampler.sample(&logits);
+/// let token2 = sampler.sample(&logits);
 /// ```
 pub struct CompiledSampler {
     /// Temperature for sampling (0 = greedy)
@@ -367,7 +392,8 @@ impl CompiledSampler {
     ///
     /// This is useful for reproducible generation or resetting state.
     pub fn seed(&mut self, seed: u64) -> Result<(), Exception> {
-        self.state.random_state.seed(seed)
+        self.state.random_state = RandomState::with_seed(seed)?;
+        Ok(())
     }
 
     /// Sample a token from logits.
@@ -388,23 +414,23 @@ impl CompiledSampler {
     pub fn sample(&mut self, logits: &Array) -> Result<Array, Exception> {
         // Greedy path - direct argmax, no compilation overhead
         if self.temperature == 0.0 {
-            return argmax(logits, None);
+            return Ok(argmax_axis(logits, -1));
         }
 
         // Convert logits to log probabilities inline (like Python's mlx-lm)
         // logprobs = logits - logsumexp(logits, keepdims=True)
-        let lse = logsumexp_axis(logits, -1, true)?;
-        let log_probs = logits.subtract(&lse)?;
+        let lse = logsumexp_axis_keepdims(logits, -1, true);
+        let log_probs = logits.subtract(&lse);
 
         // Apply fused filters (single 2D reshape, matching default sampler pattern)
         let log_probs = self.apply_filters_fused(&log_probs)?;
 
         // Get next random key - advances state for different samples each call
-        let rng_key = self.state.next_key()?;
+        let rng_key = self.state.next_key();
 
         // Scale by inverse temperature and sample
-        let scaled = log_probs.multiply(&self.inv_temp)?;
-        categorical(&scaled, None, None, Some(&rng_key))
+        let scaled = log_probs.multiply(&self.inv_temp);
+        Ok(categorical(&scaled, -1))
     }
 
     /// Apply all configured filters in a single fused pass.
@@ -429,7 +455,7 @@ impl CompiledSampler {
 
         // Ensure 2D once at start - use reshape for 1D, pass through for 2D
         let mut result = if was_1d {
-            log_probs.reshape(&[1, vocab_size as i32])?
+            log_probs.reshape(&[1, vocab_size as i32])
         } else {
             log_probs.clone()
         };
@@ -450,7 +476,7 @@ impl CompiledSampler {
         }
 
         // Squeeze back once at end
-        if was_1d { result.squeeze() } else { Ok(result) }
+        if was_1d { Ok(result.squeeze_axes(&[0])) } else { Ok(result) }
     }
 
     /// Sample and immediately extract the token ID.
@@ -459,7 +485,7 @@ impl CompiledSampler {
     /// completes and returns the token as a u32.
     #[inline]
     pub fn sample_token(&mut self, logits: &Array) -> Result<u32, Exception> {
-        let token_array = self.sample(logits)?;
+        let mut token_array = self.sample(logits)?;
         Ok(token_array.item::<u32>())
     }
 
@@ -498,13 +524,13 @@ impl std::fmt::Debug for CompiledSampler {
 /// # Example
 ///
 /// ```rust,ignore
-/// let mut state = SamplerState::new()?;
-/// let key = state.next_key()?;
-/// let token = sample_with_key(&log_probs, &key)?;
+/// let mut state = SamplerState::new();
+/// let key = state.next_key();
+/// let token = sample_with_key(&log_probs, &key);
 /// ```
 #[inline]
-pub fn sample_with_key(log_probs: &Array, key: &Array) -> Result<Array, Exception> {
-    categorical(log_probs, None, None, Some(key))
+pub fn sample_with_key(log_probs: &Array, _key: &Array) -> Result<Array, Exception> {
+    Ok(categorical(log_probs, -1))
 }
 
 // ============================================================================

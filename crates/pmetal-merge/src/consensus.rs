@@ -10,8 +10,7 @@
 //! (Yadav et al., NeurIPS 2023, Algorithm 1 step 3).
 
 use crate::Result;
-use mlx_rs::Array;
-use mlx_rs::ops::sign;
+use pmetal_bridge::compat::{Array, Dtype};
 
 /// Compute sign consensus mask across multiple tensors.
 ///
@@ -41,36 +40,36 @@ pub fn sign_consensus(tensors: &[Array], weights: &[f32]) -> Result<Array> {
 
     if tensors.len() == 1 {
         // Single tensor is always its own majority; return it scaled by its weight.
-        let weighted = tensors[0].multiply(Array::from_f32(weights[0]))?;
+        let weighted = tensors[0].multiply(&Array::from_f32(weights[0]));
         return Ok(weighted);
     }
 
     // Step 1: Compute the majority sign at each position.
     // majority_sign[i] = sign( sum_m( weight_m * sign(tensor_m[i]) ) )
-    let mut weighted_signs = Array::zeros::<f32>(tensors[0].shape())?;
+    let mut weighted_signs = Array::zeros(tensors[0].shape(), Dtype::Float32.as_i32());
     for (tensor, weight) in tensors.iter().zip(weights.iter()) {
-        let s = sign(tensor)?;
-        weighted_signs = weighted_signs.add(&s.multiply(Array::from_f32(*weight))?)?;
+        let s = tensor.sign();
+        weighted_signs = weighted_signs.add(&s.multiply(&Array::from_f32(*weight)));
     }
     // The majority sign at each position (+1, -1, or 0 when tied).
-    let maj_sign = sign(&weighted_signs)?;
+    let maj_sign = weighted_signs.sign();
 
     // Step 2: For each model, keep only the elements whose sign matches the majority.
     // A contribution agrees when sign(tensor[i]) == majority_sign[i].
     // Equivalently: sign(tensor[i]) * majority_sign[i] > 0.
     // We zero out elements where the signs differ (product <= 0).
-    let mut result = Array::zeros::<f32>(tensors[0].shape())?;
+    let mut result = Array::zeros(tensors[0].shape(), Dtype::Float32.as_i32());
     for (tensor, weight) in tensors.iter().zip(weights.iter()) {
-        let s = sign(tensor)?;
+        let s = tensor.sign();
         // agreement[i] = 1 if sign(tensor[i]) == majority_sign[i] else 0
         // sign product > 0 means agreement; <= 0 means disagreement or zero.
-        let product = s.multiply(&maj_sign)?;
+        let product = s.multiply(&maj_sign);
         let zero = Array::from_f32(0.0);
-        let agrees = product.gt(&zero)?.as_type::<f32>()?;
+        let agrees = product.greater(&zero).as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
 
         // Add weight * tensor where the model agrees with the majority sign.
-        let contribution = tensor.multiply(Array::from_f32(*weight))?;
-        result = result.add(&contribution.multiply(&agrees)?)?;
+        let contribution = tensor.multiply(&Array::from_f32(*weight));
+        result = result.add(&contribution.multiply(&agrees));
     }
 
     Ok(result)
@@ -93,16 +92,16 @@ pub fn majority_sign(tensors: &[Array], weights: &[f32]) -> Result<Array> {
     }
 
     // Compute weighted sum of signs
-    let mut weighted_signs = Array::zeros::<f32>(tensors[0].shape())?;
+    let mut weighted_signs = Array::zeros(tensors[0].shape(), Dtype::Float32.as_i32());
 
     for (tensor, weight) in tensors.iter().zip(weights.iter()) {
-        let signs = sign(tensor)?;
-        let weighted = signs.multiply(Array::from_f32(*weight))?;
-        weighted_signs = weighted_signs.add(&weighted)?;
+        let signs = tensor.sign();
+        let weighted = signs.multiply(&Array::from_f32(*weight));
+        weighted_signs = weighted_signs.add(&weighted);
     }
 
     // Return sign of the weighted sum
-    Ok(sign(&weighted_signs)?)
+    Ok(weighted_signs.sign())
 }
 
 /// Compute element-wise agreement mask.
@@ -121,21 +120,21 @@ pub fn unanimous_agreement(tensors: &[Array]) -> Result<Array> {
     }
 
     if tensors.len() == 1 {
-        let ones = Array::ones::<f32>(tensors[0].shape())?;
+        let ones = Array::ones(tensors[0].shape(), Dtype::Float32.as_i32());
         return Ok(ones);
     }
 
     // Get sign of first tensor
-    let first_sign = sign(&tensors[0])?;
+    let first_sign = tensors[0].sign();
 
     // Check if all other tensors have the same sign
-    let mut agreement = Array::ones::<f32>(tensors[0].shape())?;
+    let mut agreement = Array::ones(tensors[0].shape(), Dtype::Float32.as_i32());
 
     for tensor in &tensors[1..] {
-        let tensor_sign = sign(tensor)?;
-        let same = first_sign.eq(&tensor_sign)?;
-        let same_f32 = same.as_type::<f32>()?;
-        agreement = agreement.multiply(&same_f32)?;
+        let tensor_sign = tensor.sign();
+        let same = first_sign.equal(&tensor_sign);
+        let same_f32 = same.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+        agreement = agreement.multiply(&same_f32);
     }
 
     Ok(agreement)
@@ -149,12 +148,12 @@ mod tests {
     fn test_sign_consensus_all_agree() {
         // t1=[1, -1, 1], t2=[2, -2, 3] - all have the same sign per position.
         // Both models agree, so both contribute. Result = w1*t1 + w2*t2 = t1 + t2.
-        let t1 = Array::from_slice(&[1.0_f32, -1.0, 1.0], &[3]);
-        let t2 = Array::from_slice(&[2.0_f32, -2.0, 3.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, -1.0, 1.0], &[3]);
+        let t2 = Array::from_f32_slice(&[2.0_f32, -2.0, 3.0], &[3]);
         let weights = vec![1.0, 1.0];
 
-        let result = sign_consensus(&[t1, t2], &weights).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = sign_consensus(&[t1, t2], &weights).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
 
         // All positions agree: sum = t1 + t2
         assert!((result_slice[0] - 3.0).abs() < 1e-5); // 1 + 2
@@ -170,12 +169,12 @@ mod tests {
         //   Result at position 0 = 0.
         // Position 1: t1=-1, t2=-1; majority = -1. Both agree. Result = -1 + -1 = -2.
         // Position 2: t1=+1, t2=+1; majority = +1. Both agree. Result = 1 + 1 = 2.
-        let t1 = Array::from_slice(&[1.0_f32, -1.0, 1.0], &[3]);
-        let t2 = Array::from_slice(&[-1.0_f32, -1.0, 1.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, -1.0, 1.0], &[3]);
+        let t2 = Array::from_f32_slice(&[-1.0_f32, -1.0, 1.0], &[3]);
         let weights = vec![1.0, 1.0];
 
-        let result = sign_consensus(&[t1, t2], &weights).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = sign_consensus(&[t1, t2], &weights).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
 
         // Position 0: tied majority (0), both models disagree - zeroed out.
         assert!((result_slice[0]).abs() < 1e-5);
@@ -191,33 +190,33 @@ mod tests {
         // Majority sign = sign(1 - 1 + 1) = sign(1) = +1.
         // t1 and t3 agree (+1); t2 disagrees (-1).
         // Result = 1.0*t1 + 1.0*t3 = 1 + 1 = 2 (t2 is discarded).
-        let t1 = Array::from_slice(&[1.0_f32], &[1]);
-        let t2 = Array::from_slice(&[-1.0_f32], &[1]);
-        let t3 = Array::from_slice(&[1.0_f32], &[1]);
+        let t1 = Array::from_f32_slice(&[1.0_f32], &[1]);
+        let t2 = Array::from_f32_slice(&[-1.0_f32], &[1]);
+        let t3 = Array::from_f32_slice(&[1.0_f32], &[1]);
 
-        let result =
+        let mut result =
             sign_consensus(&[t1.clone(), t2.clone(), t3.clone()], &[1.0, 1.0, 1.0]).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let result_slice = result.to_f32_vec(1).unwrap();
         // Only t1 and t3 contribute (both agree with majority +1).
         assert!((result_slice[0] - 2.0).abs() < 1e-5);
 
         // With higher weight on t2: vote = 1 - 2 + 1 = 0 (tied).
         // Tied majority = sign(0) = 0. No model agrees with 0.
         // Result = 0.
-        let result = sign_consensus(&[t1, t2, t3], &[1.0, 2.0, 1.0]).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = sign_consensus(&[t1, t2, t3], &[1.0, 2.0, 1.0]).unwrap();
+        let result_slice = result.to_f32_vec(1).unwrap();
         assert!((result_slice[0]).abs() < 1e-5);
     }
 
     #[test]
     fn test_majority_sign() {
-        let t1 = Array::from_slice(&[1.0_f32, -1.0], &[2]);
-        let t2 = Array::from_slice(&[1.0_f32, 1.0], &[2]);
-        let t3 = Array::from_slice(&[1.0_f32, 1.0], &[2]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, -1.0], &[2]);
+        let t2 = Array::from_f32_slice(&[1.0_f32, 1.0], &[2]);
+        let t3 = Array::from_f32_slice(&[1.0_f32, 1.0], &[2]);
         let weights = vec![1.0, 1.0, 1.0];
 
-        let signs = majority_sign(&[t1, t2, t3], &weights).unwrap();
-        let signs_slice: Vec<f32> = signs.as_slice().to_vec();
+        let mut signs = majority_sign(&[t1, t2, t3], &weights).unwrap();
+        let signs_slice = signs.to_f32_vec(2).unwrap();
 
         // First position: all +1 = +3, sign = +1
         assert_eq!(signs_slice[0], 1.0);
@@ -227,11 +226,11 @@ mod tests {
 
     #[test]
     fn test_unanimous_agreement() {
-        let t1 = Array::from_slice(&[1.0_f32, -1.0, 1.0], &[3]);
-        let t2 = Array::from_slice(&[2.0_f32, -2.0, -1.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, -1.0, 1.0], &[3]);
+        let t2 = Array::from_f32_slice(&[2.0_f32, -2.0, -1.0], &[3]);
 
-        let agreement = unanimous_agreement(&[t1, t2]).unwrap();
-        let agreement_slice: Vec<f32> = agreement.as_slice().to_vec();
+        let mut agreement = unanimous_agreement(&[t1, t2]).unwrap();
+        let agreement_slice = agreement.to_f32_vec(3).unwrap();
 
         // First: both positive, agree
         assert_eq!(agreement_slice[0], 1.0);

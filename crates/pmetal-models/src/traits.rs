@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::{Array, error::Exception};
+use pmetal_bridge::compat::{Array, Exception};
 
 /// Configuration common to all causal LM architectures.
 ///

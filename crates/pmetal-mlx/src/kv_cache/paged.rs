@@ -1,11 +1,6 @@
 //! Paged KV cache - block-based memory management for batched inference.
 
-use mlx_rs::{
-    Array, Dtype,
-    error::Exception,
-    ops::concatenate_axis,
-    ops::indexing::{IndexOp, TryIndexMutOp},
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 
 use super::dtype_size;
 
@@ -365,9 +360,19 @@ impl PagedKVCache {
 
         // Now update blocks
         for (i, (block_idx, offset)) in block_offsets.into_iter().enumerate() {
-            // Slice the single token from input
-            let k_token = new_keys.index((.., .., i as i32..=i as i32, ..));
-            let v_token = new_values.index((.., .., i as i32..=i as i32, ..));
+            // Slice the single token from input: [1, heads, 1, dim]
+            let kh = new_keys.dim(1) as usize;
+            let kd = new_keys.dim(3) as usize;
+            let vd = new_values.dim(3) as usize;
+            let kb = new_keys.dim(0) as usize;
+            let k_token = new_keys.slice(
+                &[0, 0, i as i32, 0],
+                &[kb as i32, kh as i32, (i + 1) as i32, kd as i32],
+            );
+            let v_token = new_values.slice(
+                &[0, 0, i as i32, 0],
+                &[kb as i32, kh as i32, (i + 1) as i32, vd as i32],
+            );
 
             // Update block at offset
             self.update_block_at_offset(layer_idx, block_idx, offset, &k_token, &v_token)?;
@@ -404,14 +409,24 @@ impl PagedKVCache {
                 &self.key_blocks[layer_idx][block_idx],
                 &self.value_blocks[layer_idx][block_idx],
             ) {
-                // Slice the valid portion of the block
+                // Slice the valid portion of the block [heads, tokens, dim]
                 let k_slice = if tokens_in_block < block_size {
-                    k_block.index((.., ..tokens_in_block as i32, ..))
+                    let h = k_block.dim(0) as usize;
+                    let d = k_block.dim(2) as usize;
+                    k_block.slice(
+                        &[0, 0, 0],
+                        &[h as i32, tokens_in_block as i32, d as i32],
+                    )
                 } else {
                     k_block.clone()
                 };
                 let v_slice = if tokens_in_block < block_size {
-                    v_block.index((.., ..tokens_in_block as i32, ..))
+                    let h = v_block.dim(0) as usize;
+                    let d = v_block.dim(2) as usize;
+                    v_block.slice(
+                        &[0, 0, 0],
+                        &[h as i32, tokens_in_block as i32, d as i32],
+                    )
                 } else {
                     v_block.clone()
                 };
@@ -431,16 +446,13 @@ impl PagedKVCache {
             return Err(Exception::custom("No blocks to fetch"));
         }
 
-        let key_refs: Vec<&Array> = key_parts.iter().collect();
-        let value_refs: Vec<&Array> = value_parts.iter().collect();
-
-        // Reshape to [batch=1, heads, seq, dim] format expected by attention
-        let keys = concatenate_axis(&key_refs, 1)?;
-        let values = concatenate_axis(&value_refs, 1)?;
+        // Concatenate [heads, seq, dim] blocks, then expand to [1, heads, seq, dim]
+        let keys = ops::concatenate_owned_axis(&key_parts, 1);
+        let values = ops::concatenate_owned_axis(&value_parts, 1);
 
         // Reshape from [heads, seq, dim] to [1, heads, seq, dim]
-        let keys = keys.expand_dims(0)?;
-        let values = values.expand_dims(0)?;
+        let keys = keys.expand_dims(0);
+        let values = values.expand_dims(0);
 
         Ok((keys, values))
     }
@@ -495,8 +507,8 @@ impl PagedKVCache {
 
         for layer_idx in 0..self.config.num_layers {
             if self.key_blocks[layer_idx][block_idx].is_none() {
-                self.key_blocks[layer_idx][block_idx] = Some(Array::zeros::<f32>(&shape)?);
-                self.value_blocks[layer_idx][block_idx] = Some(Array::zeros::<f32>(&shape)?);
+                self.key_blocks[layer_idx][block_idx] = Some(ops::zeros(&shape, Dtype::Float32));
+                self.value_blocks[layer_idx][block_idx] = Some(ops::zeros(&shape, Dtype::Float32));
             }
         }
         Ok(())
@@ -511,21 +523,36 @@ impl PagedKVCache {
         key: &Array,
         value: &Array,
     ) -> Result<(), Exception> {
-        // Get or create the block as mutable
+        // Get or create the block
         let k_block = self.key_blocks[layer_idx][block_idx]
-            .as_mut()
+            .take()
             .ok_or_else(|| Exception::custom("Block not allocated"))?;
         let v_block = self.value_blocks[layer_idx][block_idx]
-            .as_mut()
+            .take()
             .ok_or_else(|| Exception::custom("Block not allocated"))?;
 
         // Remove batch dimension from input [1, heads, 1, dim] -> [heads, 1, dim]
-        let k_squeezed = key.squeeze_axes(&[0])?;
-        let v_squeezed = value.squeeze_axes(&[0])?;
+        let k_squeezed = key.squeeze(0);
+        let v_squeezed = value.squeeze(0);
 
-        // In-place update using TryIndexMutOp (SOTA O(1) update)
-        k_block.try_index_mut((.., offset as i32..=offset as i32, ..), &k_squeezed)?;
-        v_block.try_index_mut((.., offset as i32..=offset as i32, ..), &v_squeezed)?;
+        // In-place update using slice_set: block[.., offset..offset+1, ..] = squeezed
+        let h = k_block.dim(0) as usize;
+        let kd = k_block.dim(2) as usize;
+        let vd = v_block.dim(2) as usize;
+
+        let new_k = k_block.slice_set(
+            &k_squeezed,
+            &[0, offset as i32, 0],
+            &[h as i32, (offset + 1) as i32, kd as i32],
+        );
+        let new_v = v_block.slice_set(
+            &v_squeezed,
+            &[0, offset as i32, 0],
+            &[h as i32, (offset + 1) as i32, vd as i32],
+        );
+
+        self.key_blocks[layer_idx][block_idx] = Some(new_k);
+        self.value_blocks[layer_idx][block_idx] = Some(new_v);
 
         Ok(())
     }

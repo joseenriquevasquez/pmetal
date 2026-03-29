@@ -54,7 +54,7 @@ pub use rotating::*;
 pub use standard::*;
 pub use turboquant::*;
 
-use mlx_rs::Dtype;
+use pmetal_bridge::compat::Dtype;
 
 /// Configuration for KV cache.
 #[derive(Debug, Clone)]
@@ -449,7 +449,6 @@ fn turboquant_value_row_bytes(config: TurboQuantTensorConfig, head_dim: usize) -
 pub(crate) fn dtype_size(dtype: Dtype) -> usize {
     match dtype {
         Dtype::Float32 => 4,
-        Dtype::Float64 => 8,
         Dtype::Float16 | Dtype::Bfloat16 => 2,
         Dtype::Int32 => 4,
         Dtype::Int64 => 8,

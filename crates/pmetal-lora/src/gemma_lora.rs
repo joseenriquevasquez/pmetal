@@ -9,22 +9,18 @@
 //! # Performance Optimizations (SOTA)
 //!
 //! This implementation uses several state-of-the-art optimizations:
-//! - **Compiled GELU**: Uses `mlx_rs::nn::gelu_approximate()` with kernel fusion
-//! - **Fast RMS Norm**: Uses `mlx_rs::fast::rms_norm()` for optimized normalization
+//! - **Compiled GELU**: Uses `pmetal_bridge::compat::nn::gelu()` with kernel fusion
+//! - **Fast RMS Norm**: Uses `pmetal_bridge::compat::fast::rms_norm()` for optimized normalization
 //! - **Gemma norm**: Efficient +1 weight offset handling
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    fast,
-    module::{Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param},
-    nested::NestedValue,
-    nn,
+use pmetal_bridge::compat::{
+    Array, Exception, nn, Param,
+    ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
 };
+use pmetal_bridge::compat as fast;
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
@@ -41,7 +37,7 @@ use crate::{LoraError, LoraLinear};
 
 /// Gemma-style RMSNorm with +1 offset.
 ///
-/// Uses `mlx_rs::fast::rms_norm()` for optimized fused kernel execution,
+/// Uses `pmetal_bridge::compat::fast::rms_norm()` for optimized fused kernel execution,
 /// Gemma models compute the output as:
 /// `output = rms_norm(x) * (1 + weight)`
 #[derive(Debug)]
@@ -57,7 +53,7 @@ pub struct GemmaRmsNorm {
 impl GemmaRmsNorm {
     /// Create a new GemmaRmsNorm layer.
     pub fn new(hidden_size: i32, eps: f32) -> Result<Self, Exception> {
-        let weight = mlx_rs::ops::zeros::<f32>(&[hidden_size])?;
+        let weight = pmetal_bridge::compat::ops::zeros(&[hidden_size], pmetal_bridge::compat::Dtype::Float32);
         Ok(Self {
             weight: Param::new(weight),
             weight_plus_one: None,
@@ -69,15 +65,15 @@ impl GemmaRmsNorm {
     ///
     /// This implementation:
     /// 1. Pre-computes `weight + 1` on first call (Gemma-specific offset)
-    /// 2. Uses `mlx_rs::fast::rms_norm()` which is a fused kernel
+    /// 2. Uses `pmetal_bridge::compat::fast::rms_norm()` which is a fused kernel
     pub fn forward(&self, x: &Array) -> Result<Array, Exception> {
         // Compute weight + 1 for Gemma's +1 offset
         // Note: We compute this each time because the weight could be updated during training
         // For inference, consider using update_weight_cache() for better performance
-        let weight_with_offset = self.weight.as_ref().add(&Array::from_f32(1.0))?;
+        let weight_with_offset = self.weight.as_ref().add(&Array::from_f32(1.0));
 
         // Use the optimized fused RMS norm kernel
-        fast::rms_norm(x, weight_with_offset, self.eps)
+        Ok(fast::rms_norm(x, &weight_with_offset, self.eps))
     }
 
     /// Update the cached weight+1 array after weight changes.
@@ -85,8 +81,9 @@ impl GemmaRmsNorm {
     /// Call this after loading weights or at the start of inference
     /// to avoid recomputing weight+1 on every forward pass.
     pub fn update_weight_cache(&mut self) -> Result<(), Exception> {
-        let weight_with_offset = self.weight.as_ref().add(&Array::from_f32(1.0))?;
-        weight_with_offset.eval()?;
+        let weight_with_offset = self.weight.as_ref().add(&Array::from_f32(1.0));
+        let mut w = weight_with_offset.clone();
+        w.eval();
         self.weight_plus_one = Some(weight_with_offset);
         Ok(())
     }
@@ -96,7 +93,7 @@ impl GemmaRmsNorm {
     /// Requires `update_weight_cache()` to be called first.
     pub fn forward_cached(&self, x: &Array) -> Result<Array, Exception> {
         if let Some(ref cached_weight) = self.weight_plus_one {
-            fast::rms_norm(x, cached_weight, self.eps)
+            Ok(fast::rms_norm(x, cached_weight, self.eps))
         } else {
             // Fall back to regular forward if cache not initialized
             self.forward(x)
@@ -210,13 +207,13 @@ impl GemmaLoraAttention {
         let values = self.v_proj.forward(x)?;
 
         let queries = queries
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
         let keys = keys
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
         let values = values
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Apply RoPE
@@ -238,24 +235,24 @@ impl GemmaLoraAttention {
         };
 
         // Scaled dot-product attention
-        let mut scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2])?)?;
+        let mut scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]))?;
         scores = scores.multiply(Array::from_f32(self.scale))?;
 
         // Apply logit softcapping (Gemma2)
         if let Some(cap) = self.logit_softcapping {
             let cap_val = Array::from_f32(cap);
             scores = scores.divide(&cap_val)?;
-            scores = mlx_rs::ops::tanh(&scores)?;
+            scores = pmetal_bridge::compat::ops::tanh(&scores)?;
             scores = scores.multiply(&cap_val)?;
         }
 
         let scores = if let Some(m) = mask {
-            scores.add(m)?
+            scores.add(m)
         } else {
             scores
         };
 
-        let weights = mlx_rs::ops::softmax_axis(&scores, -1, None)?;
+        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1, None)?;
         let output = weights.matmul(&values)?;
 
         let output = output
@@ -360,7 +357,7 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
     let head_dim = shape[3];
 
     let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
-    let x = mlx_rs::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
+    let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
     x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])
 }
 
@@ -475,7 +472,7 @@ impl GemmaLoraDecoderLayer {
 
         let normed = self.post_attention_layernorm.forward(&h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out)?)
+        Ok(h.add(&mlp_out))
     }
 
     /// Forward pass with KV cache for efficient inference.
@@ -498,7 +495,7 @@ impl GemmaLoraDecoderLayer {
         // Pre-norm + MLP + residual
         let normed = self.post_attention_layernorm.forward(&h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out)?)
+        Ok(h.add(&mlp_out))
     }
 
     /// Get number of trainable parameters.
@@ -560,7 +557,7 @@ impl Gemma2LoraDecoderLayer {
         let mlp_out = self.mlp.forward(&normed)?;
         // Post-feedforward norm before residual (Gemma2 specific)
         let mlp_out = self.post_feedforward_layernorm.forward(&mlp_out)?;
-        Ok(h.add(&mlp_out)?)
+        Ok(h.add(&mlp_out))
     }
 
     /// Forward pass with KV cache for efficient inference.
@@ -587,7 +584,7 @@ impl Gemma2LoraDecoderLayer {
         let mlp_out = self.mlp.forward(&normed)?;
         // Post-feedforward norm before residual (Gemma2 specific)
         let mlp_out = self.post_feedforward_layernorm.forward(&mlp_out)?;
-        Ok(h.add(&mlp_out)?)
+        Ok(h.add(&mlp_out))
     }
 
     /// Get number of trainable parameters.
@@ -1524,10 +1521,10 @@ impl ModuleParameters for GemmaLoraForCausalLM {
 crate::impl_trainable_model!(GemmaLoraForCausalLM);
 
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;
+    let mask = pmetal_bridge::compat::ops::tri::<f32>(seq_len, None, None)?;
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
-    mlx_rs::ops::r#where(&mask.eq(&zero)?, &neg_inf, &zero)
+    pmetal_bridge::compat::ops::where_fn(&mask.eq(&zero), &neg_inf, &zero)
 }
 
 #[cfg(test)]
@@ -1575,7 +1572,7 @@ mod tests {
         let lora_config = small_lora_config();
         let mut attn = GemmaLoraAttention::new(&config, &lora_config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1587,7 +1584,7 @@ mod tests {
         let lora_config = small_lora_config();
         let mut model = GemmaLoraForCausalLM::new(config, lora_config).unwrap();
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]);
@@ -1637,7 +1634,7 @@ mod tests {
             _ => panic!("Expected Gemma2 layers"),
         }
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]);
@@ -1650,7 +1647,7 @@ mod tests {
         let layer = Gemma2LoraDecoderLayer::new(&config, &lora_config).unwrap();
 
         // Verify Gemma2 has extra normalization layers
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
 
         // Check pre-feedforward norm works
         let normed = layer.pre_feedforward_layernorm.forward(&x).unwrap();

@@ -5,8 +5,7 @@
 //! and adding synchronization barriers (4x eval() + waitUntilCompleted) made the
 //! Metal path 5-20x slower than the MLX ops it replaced.
 
-use mlx_rs::Array;
-use mlx_rs::error::Exception;
+use pmetal_bridge::compat::{Array, Dtype, Exception, random};
 
 /// MoE combine: residual + weighted expert sum + sigmoid-gated shared expert.
 ///
@@ -38,15 +37,15 @@ pub fn moe_combine_mlx(
     batch_seq: i32,
 ) -> Result<Array, Exception> {
     let y = expert_outs
-        .multiply(&expert_weights.reshape(&[batch_seq, k, 1])?)?
-        .sum_axis(-2, false)?;
+        .multiply(&expert_weights.reshape(&[batch_seq, k, 1]))
+        .sum_axis(-2, false);
 
     // Shared expert with gate
-    let shared_gate = mlx_rs::nn::sigmoid(shared_gate_logit)?;
-    let shared_y = shared_gate.multiply(shared_out)?;
+    let shared_gate = shared_gate_logit.sigmoid();
+    let shared_y = shared_gate.multiply(shared_out);
 
-    let result = y.add(&shared_y)?;
-    result.add(residual)
+    let result = y.add(&shared_y);
+    Ok(result.add(residual))
 }
 
 #[cfg(test)]
@@ -61,12 +60,12 @@ mod tests {
         let k = 4i32;
         let batch_seq = 1i32;
 
-        let residual = mlx_rs::random::normal::<f32>(&[batch_seq, dim], None, None, None).unwrap();
+        let residual = random::normal(&[batch_seq, dim], Dtype::Float32);
         let expert_outs =
-            mlx_rs::random::normal::<f32>(&[batch_seq, k, dim], None, None, None).unwrap();
-        let expert_weights = Array::from_slice(&[0.3f32, 0.25, 0.25, 0.2], &[batch_seq, k]);
+            random::normal(&[batch_seq, k, dim], Dtype::Float32);
+        let expert_weights = Array::from_f32_slice(&[0.3f32, 0.25, 0.25, 0.2], &[batch_seq, k]);
         let shared_out =
-            mlx_rs::random::normal::<f32>(&[batch_seq, dim], None, None, None).unwrap();
+            random::normal(&[batch_seq, dim], Dtype::Float32);
         let shared_gate_logit = Array::from_f32(0.5);
 
         let result = moe_combine_mlx(
@@ -80,7 +79,7 @@ mod tests {
         )
         .unwrap();
 
-        result.eval().unwrap();
+        result.eval();
         assert_eq!(result.shape(), &[batch_seq, dim]);
 
         // Verify no NaN
@@ -97,15 +96,15 @@ mod tests {
         let k = 2i32;
         let batch_seq = 4i32;
 
-        let residual = mlx_rs::random::normal::<f32>(&[batch_seq, dim], None, None, None).unwrap();
+        let residual = random::normal(&[batch_seq, dim], Dtype::Float32);
         let expert_outs =
-            mlx_rs::random::normal::<f32>(&[batch_seq, k, dim], None, None, None).unwrap();
+            random::normal(&[batch_seq, k, dim], Dtype::Float32);
         let expert_weights =
-            mlx_rs::random::normal::<f32>(&[batch_seq, k], None, None, None).unwrap();
+            random::normal(&[batch_seq, k], Dtype::Float32);
         let shared_out =
-            mlx_rs::random::normal::<f32>(&[batch_seq, dim], None, None, None).unwrap();
+            random::normal(&[batch_seq, dim], Dtype::Float32);
         let shared_gate_logit =
-            mlx_rs::random::normal::<f32>(&[batch_seq, 1], None, None, None).unwrap();
+            random::normal(&[batch_seq, 1], Dtype::Float32);
 
         let result = moe_combine_mlx(
             &residual,
@@ -118,7 +117,7 @@ mod tests {
         )
         .unwrap();
 
-        result.eval().unwrap();
+        result.eval();
         assert_eq!(result.shape(), &[batch_seq, dim]);
     }
 }

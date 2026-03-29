@@ -25,7 +25,7 @@
 //! Explicit `eval()` calls can be used to control when tensors are materialized.
 //! This module provides utilities to work with MLX's memory model effectively.
 
-use mlx_rs::{Array, error::Exception};
+use pmetal_bridge::compat::{Array, Exception};
 
 /// Configuration for gradient checkpointing.
 #[derive(Debug, Clone)]
@@ -91,7 +91,8 @@ pub fn checkpoint_boundary(arrays: &[&Array], config: &CheckpointConfig) -> Resu
         // Evaluate arrays to materialize them
         // This breaks the computation graph, allowing earlier parts to be freed
         for arr in arrays {
-            arr.eval()?;
+            let mut owned = (*arr).clone();
+            owned.eval();
         }
     }
     Ok(())
@@ -124,14 +125,14 @@ pub fn checkpointed_forward<F>(
 where
     F: FnMut(&Array) -> Result<Array, Exception>,
 {
-    let output = layer_fn(input)?;
+    let mut output = layer_fn(input)?;
 
     // Check if this is a checkpoint boundary
     if config.enabled && (layer_idx + 1) % config.layers_per_block == 0 && config.eval_at_boundaries
     {
         // Force evaluation to materialize the tensor
         // This breaks the computation graph at this point
-        output.eval()?;
+        output.eval();
     }
 
     Ok(output)
@@ -222,7 +223,8 @@ impl CheckpointContext {
     /// Apply checkpointing to output tensor if at boundary.
     pub fn maybe_checkpoint(&self, output: &Array) -> Result<(), Exception> {
         if self.is_checkpoint_boundary() && self.checkpoint_config.eval_at_boundaries {
-            output.eval()?;
+            let mut owned = output.clone();
+            owned.eval();
         }
         Ok(())
     }
@@ -330,7 +332,7 @@ mod tests {
         let config = CheckpointConfig::enabled().with_layers_per_block(2);
 
         // Simple identity layer for testing
-        let input = mlx_rs::Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let input = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
 
         let output = checkpointed_forward(|x| Ok(x.clone()), &input, 0, &config).unwrap();
         output.eval().unwrap();
@@ -342,8 +344,8 @@ mod tests {
     fn test_checkpoint_boundary() {
         let config = CheckpointConfig::enabled();
 
-        let arr1 = mlx_rs::Array::from_f32(1.0);
-        let arr2 = mlx_rs::Array::from_f32(2.0);
+        let arr1 = Array::from_f32(1.0);
+        let arr2 = Array::from_f32(2.0);
 
         // Should not error
         checkpoint_boundary(&[&arr1, &arr2], &config).unwrap();
@@ -370,11 +372,11 @@ mod tests {
     fn test_checkpoint_sequential() {
         let config = CheckpointConfig::enabled().with_layers_per_block(2);
 
-        let input = mlx_rs::Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let input = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
 
         // Create simple "layers" that add 1.0 to input
         let add_one = |x: &Array| -> Result<Array, Exception> {
-            let one = mlx_rs::Array::from_f32(1.0);
+            let one = Array::from_f32(1.0);
             x.add(&one)
         };
 
@@ -392,7 +394,7 @@ mod tests {
         hidden.eval().unwrap();
 
         // After 3 add operations, values should be [4, 5, 6, 7]
-        let expected = mlx_rs::Array::from_slice(&[4.0f32, 5.0, 6.0, 7.0], &[2, 2]);
+        let expected = Array::from_slice(&[4.0f32, 5.0, 6.0, 7.0], &[2, 2]);
         let diff = hidden.subtract(&expected).unwrap();
         let sum = diff.abs().unwrap().sum(None).unwrap();
         sum.eval().unwrap();

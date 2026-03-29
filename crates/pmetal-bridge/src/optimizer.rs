@@ -268,6 +268,48 @@ impl AdamW {
             }
         }
     }
+
+    /// Update a single parameter in-place given its gradient.
+    pub fn step_single(&mut self, name: &str, gradient: &InlineArray, parameter: &mut InlineArray) {
+        self.step_count_inner += 1;
+        let t = self.step_count_inner as f32;
+
+        let class = (self.classifier)(name);
+        let lr = self.lr_for(class);
+        let wd = self.wd_for(class);
+
+        let state = self.states.entry(name.to_string()).or_insert_with(|| {
+            let shape = parameter.shape().to_vec();
+            let dtype = parameter.dtype_raw();
+            AdamState {
+                m: InlineArray::zeros(&shape, dtype),
+                v: InlineArray::zeros(&shape, dtype),
+            }
+        });
+
+        let b1 = InlineArray::from_f32(self.beta1);
+        let one_minus_b1 = InlineArray::from_f32(1.0 - self.beta1);
+        let b2 = InlineArray::from_f32(self.beta2);
+        let one_minus_b2 = InlineArray::from_f32(1.0 - self.beta2);
+
+        state.m = state.m.multiply(&b1).add(&gradient.multiply(&one_minus_b1));
+        state.v = state.v.multiply(&b2).add(&gradient.square().multiply(&one_minus_b2));
+
+        let bc1 = InlineArray::from_f32(1.0 - self.beta1.powf(t));
+        let bc2 = InlineArray::from_f32(1.0 - self.beta2.powf(t));
+        let m_hat = state.m.divide(&bc1);
+        let v_hat = state.v.divide(&bc2);
+
+        let eps_arr = InlineArray::from_f32(self.eps);
+        let adaptive_step = m_hat.divide(&v_hat.sqrt().add(&eps_arr));
+        let lr_arr = InlineArray::from_f32(lr);
+        *parameter = parameter.subtract(&adaptive_step.multiply(&lr_arr));
+
+        if wd > 0.0 {
+            let wd_lr_arr = InlineArray::from_f32(wd * lr);
+            *parameter = parameter.subtract(&parameter.clone().multiply(&wd_lr_arr));
+        }
+    }
 }
 
 /// Default parameter classifier based on common naming conventions.

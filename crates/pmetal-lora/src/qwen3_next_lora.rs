@@ -18,15 +18,11 @@ use std::rc::Rc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    module::{Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param},
-    nested::NestedValue,
-    nn,
-    ops::{self, indexing::IndexOp},
+use pmetal_bridge::compat::{
+    Array, Exception, nn, Param,
+    ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
 };
+use pmetal_bridge::compat::ops;
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gather_mm;
@@ -263,15 +259,15 @@ impl Qwen3NextLoraAttention {
                 (keys, values)
             };
 
-            let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2])?)?;
+            let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]))?;
             let scores = scores.multiply(Array::from_f32(self.scale))?;
             let scores = if let Some(m) = mask {
-                scores.add(m)?
+                scores.add(m)
             } else {
                 scores
             };
             let weights = ops::softmax_axis(&scores, -1, None)?;
-            weights.matmul(&values)?
+            weights.matmul(&values)
         };
 
         // [B, heads, L, head_dim] -> [B, L, n_heads * head_dim]
@@ -281,7 +277,7 @@ impl Qwen3NextLoraAttention {
                 .reshape(&[b, l, self.n_heads * self.head_dim])?;
 
         // Gated output: o_proj(output * sigmoid(gate))
-        let gated = output.multiply(&nn::sigmoid(&gate)?)?;
+        let gated = output.multiply(&nn::sigmoid(&gate))?;
         self.o_proj.forward(&gated)
     }
 
@@ -355,7 +351,7 @@ impl Qwen3NextLoraAttention {
                 .transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[b, l, self.n_heads * self.head_dim])?;
 
-        let gated = output.multiply(&nn::sigmoid(&gate)?)?;
+        let gated = output.multiply(&nn::sigmoid(&gate))?;
         self.o_proj.forward(&gated)
     }
 
@@ -442,12 +438,10 @@ impl Qwen3NextLoraGDN {
             .map_err(LoraError::Mlx)?;
 
         // Frozen SSM parameters
-        let dt_bias = Param::new(Array::ones::<f32>(&[num_v_heads]).map_err(LoraError::Mlx)?);
+        let dt_bias = Param::new(pmetal_bridge::compat::ops::ones(&[num_v_heads], pmetal_bridge::compat::Dtype::Float32));
         let a_log = Param::new(
-            mlx_rs::random::uniform::<_, f32>(0.0, 16.0, &[num_v_heads], None)
-                .map_err(LoraError::Mlx)?
-                .log()
-                .map_err(LoraError::Mlx)?,
+            pmetal_bridge::compat::random::uniform_range(0.0, 16.0, &[num_v_heads], pmetal_bridge::compat::Dtype::Float32)
+                .log(),
         );
 
         // Frozen norm
@@ -534,7 +528,7 @@ impl Qwen3NextLoraGDN {
             None
         };
         let conv_state = conv_state.unwrap_or_else(|| {
-            Array::zeros::<f32>(&[b, self.conv_kernel_size - 1, self.conv_dim]).unwrap()
+            pmetal_bridge::compat::ops::zeros(&[b, self.conv_kernel_size - 1, self.conv_dim], pmetal_bridge::compat::Dtype::Float32)
         });
 
         // Mask QKV BEFORE conv (Python line 149-150)
@@ -585,12 +579,13 @@ impl Qwen3NextLoraGDN {
 
         // Q/K RMS normalization with scaling (frozen, using identity weight)
         let inv_scale = (self.head_k_dim as f32).powf(-0.5);
+        let ones_weight = pmetal_bridge::compat::ops::ones(&[self.head_k_dim], pmetal_bridge::compat::Dtype::Float32);
         let q_normed =
-            mlx_rs::fast::rms_norm(&q_conv, &Array::ones::<f32>(&[self.head_k_dim])?, 1e-6)?
-                .multiply(&Array::from_f32(inv_scale * inv_scale))?;
+            pmetal_bridge::compat::fast::rms_norm(&q_conv, &ones_weight, 1e-6)
+                .multiply(&Array::from_f32(inv_scale * inv_scale));
         let k_normed =
-            mlx_rs::fast::rms_norm(&k_conv, &Array::ones::<f32>(&[self.head_k_dim])?, 1e-6)?
-                .multiply(&Array::from_f32(inv_scale))?;
+            pmetal_bridge::compat::fast::rms_norm(&k_conv, &ones_weight, 1e-6)
+                .multiply(&Array::from_f32(inv_scale));
 
         // Get SSM state from cache
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
@@ -619,7 +614,7 @@ impl Qwen3NextLoraGDN {
 
         // Gated norm then LoRA'd out_proj
         let out = self.norm.forward(&out, Some(&z))?;
-        self.out_proj.forward(&out.reshape(&[b, s, -1])?)
+        self.out_proj.forward(&out.reshape(&[b, s, -1]))
     }
 
     pub fn num_trainable_params(&self) -> usize {
@@ -752,11 +747,11 @@ impl Qwen3NextLoraSparseMoE {
 
         // Stacked expert weights — frozen
         let gate_proj =
-            Array::zeros::<f32>(&[num_experts, intermediate_size, dim]).map_err(LoraError::Mlx)?;
+            pmetal_bridge::compat::ops::zeros(&[num_experts, intermediate_size, dim], pmetal_bridge::compat::Dtype::Float32);
         let up_proj =
-            Array::zeros::<f32>(&[num_experts, intermediate_size, dim]).map_err(LoraError::Mlx)?;
+            pmetal_bridge::compat::ops::zeros(&[num_experts, intermediate_size, dim], pmetal_bridge::compat::Dtype::Float32);
         let down_proj =
-            Array::zeros::<f32>(&[num_experts, dim, intermediate_size]).map_err(LoraError::Mlx)?;
+            pmetal_bridge::compat::ops::zeros(&[num_experts, dim, intermediate_size], pmetal_bridge::compat::Dtype::Float32);
 
         let shared_expert_gate = nn::LinearBuilder::new(dim, 1)
             .bias(false)
@@ -787,7 +782,7 @@ impl Qwen3NextLoraSparseMoE {
         // Routing
         let gate_logits = Module::forward(&mut self.gate, &x_flat)?;
         let gates = ops::softmax_axis(
-            &if gate_logits.dtype() != mlx_rs::Dtype::Float32 {
+            &if gate_logits.dtype() != pmetal_bridge::compat::Dtype::Float32 {
                 gate_logits.as_type::<f32>()?
             } else {
                 gate_logits
@@ -805,7 +800,7 @@ impl Qwen3NextLoraSparseMoE {
         let top_weights = if self.norm_topk_prob {
             let weight_sum = top_weights.sum_axis(-1, Some(true))?;
             let safe_sum = ops::maximum(&weight_sum, &Array::from_f32(1e-8))?;
-            top_weights.divide(&safe_sum)?
+            top_weights.divide(&safe_sum)
         } else {
             top_weights
         };
@@ -831,16 +826,16 @@ impl Qwen3NextLoraSparseMoE {
         let activated = nn::silu(&gate_out)?.multiply(&up_out)?;
 
         let down_out = gather_mm(
-            &activated.reshape(&[batch_seq * k, -1])?,
+            &activated.reshape(&[batch_seq * k, -1]),
             self.switch_mlp_down_proj.as_ref(),
             None,
-            Some(&top_indices_i32.reshape(&[batch_seq * k, 1])?),
+            Some(&top_indices_i32.reshape(&[batch_seq * k, 1])),
             false,
         )?
         .reshape(&[batch_seq, k, hidden])?;
 
         let y = down_out
-            .multiply(&top_weights.reshape(&[batch_seq, k, 1])?)?
+            .multiply(&top_weights.reshape(&[batch_seq, k, 1]))?
             .sum_axis(-2, false)?;
 
         // LoRA'd shared expert with sigmoid gate
@@ -975,7 +970,7 @@ impl Qwen3NextLoraDecoderLayer {
         let h = x.add(&r)?;
 
         let mlp_in = Module::forward(&mut self.post_attention_layernorm, &h)?;
-        Ok(h.add(&self.mlp.forward(&mlp_in)?)?)
+        Ok(h.add(&self.mlp.forward(&mlp_in))?)
     }
 
     /// Cache-aware forward for inference.
@@ -1002,7 +997,7 @@ impl Qwen3NextLoraDecoderLayer {
         let h = x.add(&r)?;
 
         let mlp_in = Module::forward(&mut self.post_attention_layernorm, &h)?;
-        Ok(h.add(&self.mlp.forward(&mlp_in)?)?)
+        Ok(h.add(&self.mlp.forward(&mlp_in))?)
     }
 
     pub fn num_trainable_params(&self) -> usize {
@@ -2269,7 +2264,7 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, LoraError> {
 
     let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
     let x = ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
-    Ok(x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])?)
+    Ok(x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim]))
 }
 
 // ============================================================================

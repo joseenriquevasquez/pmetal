@@ -50,7 +50,7 @@
 
 use std::cell::RefCell;
 
-use mlx_rs::{Array, error::Exception};
+use pmetal_bridge::compat::{Array, Exception};
 use pmetal_core::LoraConfig;
 use pmetal_mlx::quantization::{
     NF4Config, NF4Quantizer, QuantScheme, QuantizedTensor, QuantizerOps,
@@ -244,7 +244,7 @@ impl QBLoraLinear {
         let quantizer = NF4Quantizer::with_config(nf4_config);
 
         // Cast weight to Float32 if needed
-        let weight_f32 = if weight.dtype() != mlx_rs::Dtype::Float32 {
+        let weight_f32 = if weight.dtype() != pmetal_bridge::compat::Dtype::Float32 {
             weight.as_type::<f32>()?
         } else {
             weight.clone()
@@ -273,23 +273,13 @@ impl QBLoraLinear {
         let (input_proj, lora_a_in_dim) = if let Some(proj_dim) = config.input_proj_dim {
             let bound = (3.0_f32 / in_features as f32).sqrt();
             let proj = if config.learnable_projections {
-                mlx_rs::random::uniform::<_, f32>(
-                    -bound,
-                    bound,
-                    &[in_features, proj_dim as i32],
-                    None,
-                )?
+                pmetal_bridge::compat::random::uniform_range(-bound, bound, &[in_features, proj_dim as i32], pmetal_bridge::compat::Dtype::Float32)
             } else {
                 // Random orthogonal-ish projection (fixed)
-                let proj = mlx_rs::random::normal::<f32>(
-                    &[in_features, proj_dim as i32],
-                    None,
-                    None,
-                    None,
-                )?;
+                let proj = pmetal_bridge::compat::random::normal(&[in_features, proj_dim as i32], pmetal_bridge::compat::Dtype::Float32);
                 // Normalize columns for stability
-                let norm = proj.square()?.sum_axis(0, true)?.sqrt()?;
-                proj.divide(&norm)?
+                let norm = proj.square().sum_axis(0, true).sqrt()?;
+                proj.divide(&norm)
             };
             (Some(proj), proj_dim as i32)
         } else {
@@ -300,21 +290,11 @@ impl QBLoraLinear {
         let (output_proj, lora_b_out_dim) = if let Some(proj_dim) = config.output_proj_dim {
             let bound = (3.0_f32 / proj_dim as f32).sqrt();
             let proj = if config.learnable_projections {
-                mlx_rs::random::uniform::<_, f32>(
-                    -bound,
-                    bound,
-                    &[proj_dim as i32, out_features],
-                    None,
-                )?
+                pmetal_bridge::compat::random::uniform_range(-bound, bound, &[proj_dim as i32, out_features], pmetal_bridge::compat::Dtype::Float32)
             } else {
-                let proj = mlx_rs::random::normal::<f32>(
-                    &[proj_dim as i32, out_features],
-                    None,
-                    None,
-                    None,
-                )?;
-                let norm = proj.square()?.sum_axis(1, true)?.sqrt()?;
-                proj.divide(&norm)?
+                let proj = pmetal_bridge::compat::random::normal(&[proj_dim as i32, out_features], pmetal_bridge::compat::Dtype::Float32);
+                let norm = proj.square().sum_axis(1, true).sqrt()?;
+                proj.divide(&norm)
             };
             (Some(proj), proj_dim as i32)
         } else {
@@ -323,15 +303,10 @@ impl QBLoraLinear {
 
         // Initialize LoRA A with Kaiming uniform
         let bound = (3.0_f32 / lora_a_in_dim as f32).sqrt();
-        let lora_a = mlx_rs::random::uniform::<_, f32>(
-            -bound,
-            bound,
-            &[effective_rank, lora_a_in_dim],
-            None,
-        )?;
+        let lora_a = pmetal_bridge::compat::random::uniform_range(-bound, bound, &[effective_rank, lora_a_in_dim], pmetal_bridge::compat::Dtype::Float32);
 
         // Initialize LoRA B with zeros
-        let lora_b = mlx_rs::ops::zeros::<f32>(&[lora_b_out_dim, effective_rank])?;
+        let lora_b = pmetal_bridge::compat::ops::zeros(&[lora_b_out_dim, effective_rank], pmetal_bridge::compat::Dtype::Float32);
 
         Ok(Self {
             in_features,
@@ -362,10 +337,10 @@ impl QBLoraLinear {
     ) -> Result<Self, LoraError> {
         let bound = (3.0_f32 / in_features as f32).sqrt();
         let weight =
-            mlx_rs::random::uniform::<_, f32>(-bound, bound, &[out_features, in_features], None)?;
+            pmetal_bridge::compat::random::uniform_range(-bound, bound, &[out_features, in_features], pmetal_bridge::compat::Dtype::Float32);
 
         let bias = if use_bias {
-            Some(mlx_rs::ops::zeros::<f32>(&[out_features])?)
+            Some(pmetal_bridge::compat::ops::zeros(&[out_features], pmetal_bridge::compat::Dtype::Float32))
         } else {
             None
         };
@@ -421,7 +396,7 @@ impl QBLoraLinear {
 
         // Q-BLoRA forward with optional projections
         let x_proj = if let Some(ref p_in) = self.input_proj {
-            x.matmul(p_in)?
+            x.matmul(p_in)
         } else {
             x.clone()
         };
@@ -434,7 +409,7 @@ impl QBLoraLinear {
         // p_out: [proj_dim, out_features], xab: [batch, proj_dim]
         // xab @ p_out = [batch, out_features]
         let y_lora_unscaled = if let Some(ref p_out) = self.output_proj {
-            xab.matmul(p_out)?
+            xab.matmul(p_out)
         } else {
             xab
         };
@@ -448,7 +423,7 @@ impl QBLoraLinear {
 
         // Add bias if present
         if let Some(ref bias) = self.bias {
-            Ok(y.add(bias)?)
+            Ok(y.add(bias))
         } else {
             Ok(y)
         }
@@ -548,7 +523,7 @@ mod tests {
     #[test]
     fn test_qblora_creation() {
         let config = default_config();
-        let qblora = QBLoraLinear::new(64, 128, &config, false).unwrap();
+        let qblora = QBLoraLinear::new(64, 128, &config, false);
 
         assert_eq!(qblora.in_features, 64);
         assert_eq!(qblora.out_features, 128);
@@ -561,10 +536,10 @@ mod tests {
     #[test]
     fn test_qblora_forward() {
         let config = default_config();
-        let qblora = QBLoraLinear::new(32, 64, &config, false).unwrap();
+        let qblora = QBLoraLinear::new(32, 64, &config, false);
 
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 32], None, None, None).unwrap();
-        let output = qblora.forward(&x).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 32], pmetal_bridge::compat::Dtype::Float32);
+        let output = qblora.forward(&x);
 
         assert_eq!(output.shape(), &[2, 4, 64]);
     }
@@ -572,13 +547,13 @@ mod tests {
     #[test]
     fn test_qblora_with_input_proj() {
         let config = default_config().with_input_proj(16);
-        let qblora = QBLoraLinear::new(64, 128, &config, false).unwrap();
+        let qblora = QBLoraLinear::new(64, 128, &config, false);
 
         assert!(qblora.has_input_proj());
         assert!(!qblora.has_output_proj());
 
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 64], None, None, None).unwrap();
-        let output = qblora.forward(&x).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let output = qblora.forward(&x);
 
         assert_eq!(output.shape(), &[2, 4, 128]);
     }
@@ -586,13 +561,13 @@ mod tests {
     #[test]
     fn test_qblora_with_output_proj() {
         let config = default_config().with_output_proj(32);
-        let qblora = QBLoraLinear::new(64, 128, &config, false).unwrap();
+        let qblora = QBLoraLinear::new(64, 128, &config, false);
 
         assert!(!qblora.has_input_proj());
         assert!(qblora.has_output_proj());
 
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 64], None, None, None).unwrap();
-        let output = qblora.forward(&x).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let output = qblora.forward(&x);
 
         assert_eq!(output.shape(), &[2, 4, 128]);
     }
@@ -600,13 +575,13 @@ mod tests {
     #[test]
     fn test_qblora_with_both_projections() {
         let config = default_config().with_input_proj(16).with_output_proj(32);
-        let qblora = QBLoraLinear::new(64, 128, &config, false).unwrap();
+        let qblora = QBLoraLinear::new(64, 128, &config, false);
 
         assert!(qblora.has_input_proj());
         assert!(qblora.has_output_proj());
 
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 64], None, None, None).unwrap();
-        let output = qblora.forward(&x).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let output = qblora.forward(&x);
 
         assert_eq!(output.shape(), &[2, 4, 128]);
     }
@@ -615,14 +590,14 @@ mod tests {
     fn test_qblora_higher_rank() {
         // With 4x rank multiplier
         let config = default_config().with_rank_multiplier(4.0);
-        let qblora = QBLoraLinear::new(64, 128, &config, false).unwrap();
+        let qblora = QBLoraLinear::new(64, 128, &config, false);
 
         // Effective rank = 8 * 4.0 = 32
         assert_eq!(qblora.rank, 32);
 
         // More trainable params due to higher rank
         let standard_config = default_config();
-        let standard = QBLoraLinear::new(64, 128, &standard_config, false).unwrap();
+        let standard = QBLoraLinear::new(64, 128, &standard_config, false);
 
         assert!(qblora.num_trainable_params() > standard.num_trainable_params());
     }
@@ -632,7 +607,7 @@ mod tests {
         let config = default_config()
             .with_input_proj(16)
             .with_fixed_projections();
-        let qblora = QBLoraLinear::new(64, 128, &config, false).unwrap();
+        let qblora = QBLoraLinear::new(64, 128, &config, false);
 
         // With fixed projections, trainable params should not include projection
         let (_, _, p_in, p_out) = qblora.trainable_params();
@@ -643,7 +618,7 @@ mod tests {
     #[test]
     fn test_qblora_param_count() {
         let config = default_config();
-        let qblora = QBLoraLinear::new(512, 1024, &config, false).unwrap();
+        let qblora = QBLoraLinear::new(512, 1024, &config, false);
 
         // Effective rank = 16
         // Trainable: A (16 * 512) + B (1024 * 16) = 8192 + 16384 = 24576

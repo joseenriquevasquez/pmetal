@@ -3,18 +3,9 @@
 //! Implementation of CLIP (Contrastive Language-Image Pre-training) text encoder.
 //! Based on the architecture from OpenAI and used in Flux.1.
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, Param},
-    nn,
-    ops::{
-        indexing::{IndexOp, argmax_axis, take_along_axis},
-        tri,
-    },
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ModuleParameters, Param, fast, nn, ops};
+use pmetal_bridge::compat::ops::{argmax_axis, slice_axis, take_along_axis, tri};
+use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 /// CLIP text encoder configuration.
@@ -47,20 +38,18 @@ impl Default for CLIPConfig {
 }
 
 /// CLIP Attention layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct CLIPAttention {
-    #[param]
     pub q_proj: nn::Linear,
-    #[param]
     pub k_proj: nn::Linear,
-    #[param]
     pub v_proj: nn::Linear,
-    #[param]
     pub out_proj: nn::Linear,
     pub num_heads: usize,
     pub head_dim: usize,
     pub scale: f32,
 }
+impl_module_params!(CLIPAttention; q_proj, k_proj, v_proj, out_proj);
+
 
 impl CLIPAttention {
     pub fn new(config: &CLIPConfig) -> Self {
@@ -70,17 +59,13 @@ impl CLIPAttention {
         let scale = (head_dim as f32).sqrt().recip();
 
         let q_proj = nn::LinearBuilder::new(dim, dim)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
         let k_proj = nn::LinearBuilder::new(dim, dim)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
         let v_proj = nn::LinearBuilder::new(dim, dim)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
         let out_proj = nn::LinearBuilder::new(dim, dim)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
 
         Self {
             q_proj,
@@ -97,51 +82,48 @@ impl CLIPAttention {
         let b = x.dim(0);
         let l = x.dim(1);
 
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let q = self.q_proj.forward(x);
+        let k = self.k_proj.forward(x);
+        let v = self.v_proj.forward(x);
 
         let q = q
-            .reshape(&[b, l, self.num_heads as i32, self.head_dim as i32])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[b, l, self.num_heads as i32, self.head_dim as i32])
+            .transpose_axes(&[0, 2, 1, 3]);
         let k = k
-            .reshape(&[b, l, self.num_heads as i32, self.head_dim as i32])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[b, l, self.num_heads as i32, self.head_dim as i32])
+            .transpose_axes(&[0, 2, 1, 3]);
         let v = v
-            .reshape(&[b, l, self.num_heads as i32, self.head_dim as i32])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[b, l, self.num_heads as i32, self.head_dim as i32])
+            .transpose_axes(&[0, 2, 1, 3]);
 
-        let out = mlx_rs::fast::scaled_dot_product_attention(
+        let out = pmetal_bridge::compat::fast::scaled_dot_product_attention_masked(
             &q,
             &k,
             &v,
             self.scale,
-            mask.map(Into::into),
-            None,
-        )?;
-        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, l, -1])?;
-        self.out_proj.forward(&out)
+            mask,
+        );
+        let out = out.transpose_axes(&[0, 2, 1, 3]).reshape(&[b, l, -1]);
+        Ok(self.out_proj.forward(&out))
     }
 }
 
 /// CLIP MLP layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct CLIPMLP {
-    #[param]
     pub fc1: nn::Linear,
-    #[param]
     pub fc2: nn::Linear,
     pub use_quick_gelu: bool,
 }
+impl_module_params!(CLIPMLP; fc1, fc2);
+
 
 impl CLIPMLP {
     pub fn new(config: &CLIPConfig) -> Self {
         let fc1 = nn::LinearBuilder::new(config.embed_dim as i32, config.intermediate_size as i32)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
         let fc2 = nn::LinearBuilder::new(config.intermediate_size as i32, config.embed_dim as i32)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
         Self {
             fc1,
             fc2,
@@ -150,34 +132,32 @@ impl CLIPMLP {
     }
 
     fn quick_gelu(x: &Array) -> Result<Array, Exception> {
-        x.multiply(&mlx_rs::ops::sigmoid(
-            &x.multiply(&Array::from_f32(1.702))?,
-        )?)
+        Ok(x.multiply(&pmetal_bridge::compat::ops::sigmoid(
+            &x.multiply(&Array::from_f32(1.702)),
+        )))
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let x = self.fc1.forward(x)?;
+        let x = self.fc1.forward(x);
         let x = if self.use_quick_gelu {
             Self::quick_gelu(&x)?
         } else {
-            nn::gelu(&x)?
+            nn::gelu(&x)
         };
-        self.fc2.forward(&x)
+        Ok(self.fc2.forward(&x))
     }
 }
 
 /// CLIP Encoder Layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct CLIPEncoderLayer {
-    #[param]
     pub attn: CLIPAttention,
-    #[param]
     pub mlp: CLIPMLP,
-    #[param]
     pub norm1: nn::LayerNorm,
-    #[param]
     pub norm2: nn::LayerNorm,
 }
+impl_module_params!(CLIPEncoderLayer; attn, mlp, norm1, norm2);
+
 
 impl CLIPEncoderLayer {
     pub fn new(config: &CLIPConfig) -> Self {
@@ -185,12 +165,10 @@ impl CLIPEncoderLayer {
         let mlp = CLIPMLP::new(config);
         let norm1 = nn::LayerNormBuilder::new(config.embed_dim as i32)
             .eps(config.layer_norm_eps)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
         let norm2 = nn::LayerNormBuilder::new(config.embed_dim as i32)
             .eps(config.layer_norm_eps)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
         Self {
             attn,
             mlp,
@@ -201,49 +179,45 @@ impl CLIPEncoderLayer {
 
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
         let residual = x;
-        let x = self.norm1.forward(x)?;
+        let x = self.norm1.forward(x);
         let x = self.attn.forward(&x, mask)?;
-        let x = residual.add(&x)?;
+        let x = residual.add(&x);
 
         let residual = &x;
-        let x = self.norm2.forward(&x)?;
+        let x = self.norm2.forward(&x);
         let x = self.mlp.forward(&x)?;
-        residual.add(&x)
+        Ok(residual.add(&x))
     }
 }
 
 /// CLIP Text Model.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct CLIPTextModel {
-    #[param]
     pub token_embedding: nn::Embedding,
-    #[param]
     pub position_embedding: Param<Array>,
-    #[param]
     pub layers: Vec<CLIPEncoderLayer>,
-    #[param]
     pub final_layer_norm: nn::LayerNorm,
 }
+impl_module_params!(CLIPTextModel; token_embedding, position_embedding, layers, final_layer_norm);
+
 
 impl CLIPTextModel {
     pub fn new(config: CLIPConfig) -> Self {
         let token_embedding = nn::Embedding::new(config.vocab_size as i32, config.embed_dim as i32)
-            .expect("Infallible");
+            .unwrap();
         let position_embedding = Param::new(
-            mlx_rs::ops::zeros::<f32>(&[
+            pmetal_bridge::compat::ops::zeros(&[
                 1,
                 config.max_position_embeddings as i32,
                 config.embed_dim as i32,
-            ])
-            .expect("Infallible"),
+            ], Dtype::Float32),
         );
         let layers = (0..config.num_layers)
             .map(|_| CLIPEncoderLayer::new(&config))
             .collect();
         let final_layer_norm = nn::LayerNormBuilder::new(config.embed_dim as i32)
             .eps(config.layer_norm_eps)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
 
         Self {
             token_embedding,
@@ -254,16 +228,17 @@ impl CLIPTextModel {
     }
 
     fn create_causal_mask(l: i32) -> Result<Array, Exception> {
-        let mask = tri::<f32>(l, None, None)?;
+        let mask = tri(l, l, 0, Dtype::Float32);
         let neg_inf = Array::from_f32(f32::NEG_INFINITY);
         let zero = Array::from_f32(0.0);
-        mlx_rs::ops::r#where(&mask.eq(&zero)?, &neg_inf, &zero)
+        Ok(pmetal_bridge::compat::ops::where_fn(&mask.equal(&zero), &neg_inf, &zero))
     }
 
     pub fn forward(&mut self, input_ids: &Array) -> Result<(Array, Array), Exception> {
         let l = input_ids.dim(1);
-        let mut x = self.token_embedding.forward(input_ids)?;
-        x = x.add(&self.position_embedding.as_ref().index((.., ..l as i32, ..)))?;
+        let mut x = self.token_embedding.forward(input_ids);
+        let pos_emb = self.position_embedding.as_ref();
+        x = x.add(&slice_axis(&pos_emb, 1, 0, l as i32));
 
         let mask = Self::create_causal_mask(l)?;
 
@@ -280,15 +255,15 @@ impl CLIPTextModel {
             }
         }
 
-        let x = self.final_layer_norm.forward(&x)?;
+        let x = self.final_layer_norm.forward(&x);
 
         // Pooled output: HuggingFace CLIP pools at the EOS token position,
         // which is at argmax(input_ids) since EOS has the highest token ID.
         let b = x.dim(0);
-        let eos_positions = argmax_axis(input_ids, -1, None)?;
-        let eos_idx = eos_positions.reshape(&[b, 1, 1])?;
-        let eos_idx = mlx_rs::ops::broadcast_to(&eos_idx, &[b, 1, x.dim(2)])?;
-        let pooled_output = take_along_axis(&x, &eos_idx, 1)?.squeeze_axes(&[1])?;
+        let eos_positions = argmax_axis(input_ids, -1);
+        let eos_idx = eos_positions.reshape(&[b, 1, 1]);
+        let eos_idx = pmetal_bridge::compat::ops::broadcast_to(&eos_idx, &[b, 1, x.dim(2)]);
+        let pooled_output = take_along_axis(&x, &eos_idx, 1).squeeze(1);
 
         Ok((pooled_output, hidden_state))
     }

@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 use serde::{Deserialize, Serialize};
 
 use crate::{Result, SftError};

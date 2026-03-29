@@ -2,9 +2,7 @@
 
 use crate::error::{ServeError, ServeResult};
 use crate::types::ChatMessage;
-use mlx_rs::module::ModuleParameters as _;
-use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{Array, Dtype};
+use pmetal_mlx::{Array, Dtype, ModuleParameters as _};
 use pmetal_data::chat_templates::{ChatTemplate, ChatTemplateType, detect_chat_template};
 use pmetal_data::inference_config::collect_all_stop_tokens;
 use pmetal_mlx::kv_cache::{CacheMode, KVCache, KVCacheConfig, MambaCache};
@@ -861,15 +859,17 @@ impl InferenceEngine {
     ///
     /// Model outputs have shape `[1, seq_len, vocab_size]` (after prefill) or
     /// `[1, 1, vocab_size]` (after decode steps). We extract the last position
-    /// and squeeze to a 1-D array of shape `[vocab_size]` suitable for
+    /// and flatten to a 1-D array of shape `[vocab_size]` suitable for
     /// `Sampler::sample`.
     fn extract_last_logits(logits: &Array) -> ServeResult<Array> {
         // Shape: [batch=1, seq_len, vocab_size]
-        // Index last position along seq_len dim → [1, vocab_size]
         let last_idx = logits.dim(1) - 1;
-        let last = logits.index((.., last_idx, ..));
-        // Squeeze batch dim → [vocab_size]
-        last.squeeze().map_err(ServeError::Model)
+        let vocab_size = logits.dim(2);
+        // take_axis with a 1-element index array extracts position last_idx
+        // along axis 1 → [1, 1, vocab_size].  reshape flattens to [vocab_size].
+        let idx = Array::from_slice(&[last_idx], &[1]);
+        let last = logits.take_axis(&idx, 1).map_err(ServeError::Model)?;
+        last.reshape(&[vocab_size]).map_err(ServeError::Model)
     }
 
     /// Generate tokens from input IDs (non-streaming).

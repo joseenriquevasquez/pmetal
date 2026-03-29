@@ -1,13 +1,8 @@
 //! Standard KV cache implementation with lazy and eager allocation.
 
-use mlx_rs::{
-    Array, Dtype,
-    error::Exception,
-    ops,
-    ops::concatenate_axis,
-    ops::indexing::{IndexOp, TryIndexMutOp},
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 
+use crate::array_ext::ArrayDtypeExt;
 use crate::kernels::FusedAttentionConfig;
 
 use super::{
@@ -49,7 +44,7 @@ impl LayerCache {
         key_head_dim: usize,
         value_head_dim: usize,
         dtype: Dtype,
-    ) -> Result<Self, Exception> {
+    ) -> Self {
         let k_shape = [
             batch_size as i32,
             num_kv_heads as i32,
@@ -62,14 +57,14 @@ impl LayerCache {
             max_seq_len as i32,
             value_head_dim as i32,
         ];
-        let keys = Some(ops::zeros_dtype(&k_shape, dtype)?);
-        let values = Some(ops::zeros_dtype(&v_shape, dtype)?);
+        let keys = Some(ops::zeros(&k_shape, dtype));
+        let values = Some(ops::zeros(&v_shape, dtype));
 
-        Ok(Self {
+        Self {
             keys,
             values,
             offset: 0,
-        })
+        }
     }
 
     fn reset(&mut self) {
@@ -183,16 +178,16 @@ impl KVCache {
                 config.head_dim,
                 config.value_head_dim,
                 config.dtype,
-            )?);
+            ));
         }
 
         // Evaluate all allocations to materialize them on device
-        for cache in &layer_caches {
-            if let Some(ref k) = cache.keys {
-                k.eval()?;
+        for cache in &mut layer_caches {
+            if let Some(ref mut k) = cache.keys {
+                k.eval();
             }
-            if let Some(ref v) = cache.values {
-                v.eval()?;
+            if let Some(ref mut v) = cache.values {
+                v.eval();
             }
         }
 
@@ -398,16 +393,16 @@ impl KVCache {
             let key_head_dim = new_keys.dim(3);
             let value_head_dim = new_values.dim(3);
 
-            // Create new zero-filled buffer
+            // Create new zero-filled buffer with matching dtype
             let k_shape = [batch, heads, new_alloc_len as i32, key_head_dim];
             let v_shape = [batch, heads, new_alloc_len as i32, value_head_dim];
-            let new_k_buffer = ops::zeros_dtype(&k_shape, new_keys.dtype())?;
-            let new_v_buffer = ops::zeros_dtype(&v_shape, new_values.dtype())?;
+            let new_k_buffer = ops::zeros(&k_shape, new_keys.dtype());
+            let new_v_buffer = ops::zeros(&v_shape, new_values.dtype());
 
             if let (Some(existing_k), Some(existing_v)) = (&cache.keys, &cache.values) {
                 // Concatenate existing data with new buffer
-                cache.keys = Some(concatenate_axis(&[existing_k, &new_k_buffer], 2)?);
-                cache.values = Some(concatenate_axis(&[existing_v, &new_v_buffer], 2)?);
+                cache.keys = Some(ops::concatenate_axis(&[existing_k, &new_k_buffer], 2));
+                cache.values = Some(ops::concatenate_axis(&[existing_v, &new_v_buffer], 2));
             } else {
                 cache.keys = Some(new_k_buffer);
                 cache.values = Some(new_v_buffer);
@@ -418,31 +413,45 @@ impl KVCache {
         cache.offset = prev_offset + new_seq_len;
 
         // In-place slice assignment: cache[..., prev:offset, :] = new_keys
-        // Use TryIndexMutOp for O(1) update instead of concatenate
-        let k_buf = cache.keys.as_mut().unwrap();
-        let v_buf = cache.values.as_mut().unwrap();
+        // Use slice_set for O(1) update instead of concatenate.
+        // slice_set takes explicit start/stop for every dimension.
+        let k_buf = cache.keys.take().unwrap();
+        let v_buf = cache.values.take().unwrap();
 
-        // Assign new keys/values into the pre-allocated buffer
-        k_buf.try_index_mut(
-            (.., .., prev_offset as i32..cache.offset as i32, ..),
-            new_keys,
-        )?;
-        v_buf.try_index_mut(
-            (.., .., prev_offset as i32..cache.offset as i32, ..),
-            new_values,
-        )?;
+        let batch = k_buf.dim(0) as usize;
+        let heads = k_buf.dim(1) as usize;
+        let _alloc = k_buf.dim(2) as usize;
+        let key_hdim = k_buf.dim(3) as usize;
+        let val_hdim = v_buf.dim(3) as usize;
+
+        let k_start = [0i32, 0, prev_offset as i32, 0];
+        let k_stop = [batch as i32, heads as i32, cache.offset as i32, key_hdim as i32];
+        let v_start = [0i32, 0, prev_offset as i32, 0];
+        let v_stop = [batch as i32, heads as i32, cache.offset as i32, val_hdim as i32];
+
+        cache.keys = Some(k_buf.slice_set(new_keys, &k_start, &k_stop));
+        cache.values = Some(v_buf.slice_set(new_values, &v_start, &v_stop));
 
         // Apply cache mode limits (sliding window, rotating, etc.)
         let final_offset = match self.config.mode {
             CacheMode::SlidingWindow { window_size } => {
                 if cache.offset > window_size {
-                    // For sliding window, we need to shift data and adjust offset
-                    // This is a less common path, so we can do a copy here
+                    // For sliding window, shift data and adjust offset
                     let shift = cache.offset - window_size;
                     let k = cache.keys.as_ref().unwrap();
                     let v = cache.values.as_ref().unwrap();
-                    cache.keys = Some(k.index((.., .., shift as i32..cache.offset as i32, ..)));
-                    cache.values = Some(v.index((.., .., shift as i32..cache.offset as i32, ..)));
+                    let kb = k.dim(0) as usize;
+                    let kh = k.dim(1) as usize;
+                    let kd = k.dim(3) as usize;
+                    let vd = v.dim(3) as usize;
+                    cache.keys = Some(k.slice(
+                        &[0, 0, shift as i32, 0],
+                        &[kb as i32, kh as i32, cache.offset as i32, kd as i32],
+                    ));
+                    cache.values = Some(v.slice(
+                        &[0, 0, shift as i32, 0],
+                        &[kb as i32, kh as i32, cache.offset as i32, vd as i32],
+                    ));
                     cache.offset = window_size;
                 }
                 cache.offset
@@ -453,28 +462,56 @@ impl KVCache {
                     let tail_len = max_size.saturating_sub(keep);
                     let k = cache.keys.as_ref().unwrap();
                     let v = cache.values.as_ref().unwrap();
+                    let kb = k.dim(0) as usize;
+                    let kh = k.dim(1) as usize;
+                    let kd = k.dim(3) as usize;
+                    let vd = v.dim(3) as usize;
 
                     let rotated_keys = if keep == 0 {
                         let tail_start = cache.offset - max_size;
-                        k.index((.., .., tail_start as i32..cache.offset as i32, ..))
+                        k.slice(
+                            &[0, 0, tail_start as i32, 0],
+                            &[kb as i32, kh as i32, cache.offset as i32, kd as i32],
+                        )
                     } else if tail_len == 0 {
-                        k.index((.., .., ..keep as i32, ..))
+                        k.slice(
+                            &[0, 0, 0, 0],
+                            &[kb as i32, kh as i32, keep as i32, kd as i32],
+                        )
                     } else {
-                        let kept = k.index((.., .., ..keep as i32, ..));
+                        let kept = k.slice(
+                            &[0, 0, 0, 0],
+                            &[kb as i32, kh as i32, keep as i32, kd as i32],
+                        );
                         let tail_start = cache.offset - tail_len;
-                        let tail = k.index((.., .., tail_start as i32..cache.offset as i32, ..));
-                        concatenate_axis(&[&kept, &tail], 2)?
+                        let tail = k.slice(
+                            &[0, 0, tail_start as i32, 0],
+                            &[kb as i32, kh as i32, cache.offset as i32, kd as i32],
+                        );
+                        ops::concatenate_axis(&[&kept, &tail], 2)
                     };
                     let rotated_values = if keep == 0 {
                         let tail_start = cache.offset - max_size;
-                        v.index((.., .., tail_start as i32..cache.offset as i32, ..))
+                        v.slice(
+                            &[0, 0, tail_start as i32, 0],
+                            &[kb as i32, kh as i32, cache.offset as i32, vd as i32],
+                        )
                     } else if tail_len == 0 {
-                        v.index((.., .., ..keep as i32, ..))
+                        v.slice(
+                            &[0, 0, 0, 0],
+                            &[kb as i32, kh as i32, keep as i32, vd as i32],
+                        )
                     } else {
-                        let kept = v.index((.., .., ..keep as i32, ..));
+                        let kept = v.slice(
+                            &[0, 0, 0, 0],
+                            &[kb as i32, kh as i32, keep as i32, vd as i32],
+                        );
                         let tail_start = cache.offset - tail_len;
-                        let tail = v.index((.., .., tail_start as i32..cache.offset as i32, ..));
-                        concatenate_axis(&[&kept, &tail], 2)?
+                        let tail = v.slice(
+                            &[0, 0, tail_start as i32, 0],
+                            &[kb as i32, kh as i32, cache.offset as i32, vd as i32],
+                        );
+                        ops::concatenate_axis(&[&kept, &tail], 2)
                     };
                     cache.keys = Some(rotated_keys);
                     cache.values = Some(rotated_values);
@@ -496,12 +533,16 @@ impl KVCache {
             }
         };
 
-        // Return slice views (not clones) - matches Python mlx_lm pattern
+        // Return slice views up to final_offset — matches Python mlx_lm pattern
         let k = cache.keys.as_ref().unwrap();
         let v = cache.values.as_ref().unwrap();
+        let kb = k.dim(0) as usize;
+        let kh = k.dim(1) as usize;
+        let kd = k.dim(3) as usize;
+        let vd = v.dim(3) as usize;
         Ok((
-            k.index((.., .., ..final_offset as i32, ..)),
-            v.index((.., .., ..final_offset as i32, ..)),
+            k.slice(&[0, 0, 0, 0], &[kb as i32, kh as i32, final_offset as i32, kd as i32]),
+            v.slice(&[0, 0, 0, 0], &[kb as i32, kh as i32, final_offset as i32, vd as i32]),
         ))
     }
 
@@ -562,10 +603,19 @@ impl KVCache {
         let cache = self.layer_caches.get(layer_idx)?;
         match (&cache.keys, &cache.values) {
             (Some(k), Some(v)) if cache.offset > 0 => {
-                // Return sliced view up to actual offset (not full pre-allocated buffer)
+                let kb = k.dim(0) as usize;
+                let kh = k.dim(1) as usize;
+                let kd = k.dim(3) as usize;
+                let vd = v.dim(3) as usize;
                 Some((
-                    k.index((.., .., ..cache.offset as i32, ..)),
-                    v.index((.., .., ..cache.offset as i32, ..)),
+                    k.slice(
+                        &[0, 0, 0, 0],
+                        &[kb as i32, kh as i32, cache.offset as i32, kd as i32],
+                    ),
+                    v.slice(
+                        &[0, 0, 0, 0],
+                        &[kb as i32, kh as i32, cache.offset as i32, vd as i32],
+                    ),
                 ))
             }
             _ => None,
@@ -639,10 +689,14 @@ impl KVCache {
     ) -> Result<(Array, Array), Exception> {
         let cache = &self.layer_caches[layer_idx];
         if let (Some(k), Some(v)) = (&cache.keys, &cache.values) {
-            let offset = cache.offset as i32;
+            let kb = k.dim(0) as usize;
+            let kh = k.dim(1) as usize;
+            let kd = k.dim(3) as usize;
+            let vd = v.dim(3) as usize;
+            let offset = cache.offset;
             Ok((
-                k.index((.., .., ..offset, ..)),
-                v.index((.., .., ..offset, ..)),
+                k.slice(&[0, 0, 0, 0], &[kb as i32, kh as i32, offset as i32, kd as i32]),
+                v.slice(&[0, 0, 0, 0], &[kb as i32, kh as i32, offset as i32, vd as i32]),
             ))
         } else {
             // No cache yet — return empty arrays with correct shape
@@ -676,10 +730,22 @@ impl KVCache {
             cache.values = Some(full_values.clone());
         } else {
             // In-place update into pre-allocated buffer
-            let k_buf = cache.keys.as_mut().unwrap();
-            let v_buf = cache.values.as_mut().unwrap();
-            k_buf.try_index_mut((.., .., ..new_seq_len as i32, ..), full_keys)?;
-            v_buf.try_index_mut((.., .., ..new_seq_len as i32, ..), full_values)?;
+            let k_buf = cache.keys.take().unwrap();
+            let v_buf = cache.values.take().unwrap();
+            let kb = k_buf.dim(0) as usize;
+            let kh = k_buf.dim(1) as usize;
+            let kd = k_buf.dim(3) as usize;
+            let vd = v_buf.dim(3) as usize;
+            cache.keys = Some(k_buf.slice_set(
+                full_keys,
+                &[0, 0, 0, 0],
+                &[kb as i32, kh as i32, new_seq_len as i32, kd as i32],
+            ));
+            cache.values = Some(v_buf.slice_set(
+                full_values,
+                &[0, 0, 0, 0],
+                &[kb as i32, kh as i32, new_seq_len as i32, vd as i32],
+            ));
         }
         cache.offset = new_seq_len;
         if layer_idx == 0 {

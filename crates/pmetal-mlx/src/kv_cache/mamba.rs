@@ -1,6 +1,8 @@
 //! Mamba SSM state cache for hybrid architectures.
 
-use mlx_rs::{Array, error::Exception, ops::concatenate_axis, ops::indexing::IndexOp};
+use pmetal_bridge::compat::{Array, Exception, ops};
+
+use crate::array_ext::ArrayDtypeExt;
 
 /// Cache for Mamba-2 SSM state during autoregressive generation.
 ///
@@ -92,17 +94,23 @@ impl MambaCacheEntry {
             state.clone()
         } else {
             // Initialize to zeros with shape [batch, pad_len, conv_dim]
-            // Use same dtype as input to avoid dtype mismatch issues
-            Array::zeros::<f32>(&[batch, pad_len as i32, conv_dim])?.as_dtype(input.dtype())?
+            // Match the input dtype to avoid dtype mismatch issues
+            let z = ops::zeros(&[batch, pad_len as i32, conv_dim], input.dtype());
+            z
         };
 
         // Concatenate state with new input along sequence dimension
-        let padded = concatenate_axis(&[&conv_state, input], 1)?;
+        let padded = ops::concatenate_axis(&[&conv_state, input], 1);
 
         // Store last (kernel_size - 1) values for next call
-        let seq_len = padded.dim(1);
-        let start_idx = seq_len - pad_len as i32;
-        self.conv_state = Some(padded.index((.., start_idx.., ..)));
+        let seq_len = padded.dim(1) as usize;
+        let start_idx = seq_len - pad_len;
+        let b = padded.dim(0) as usize;
+        let cd = padded.dim(2) as usize;
+        self.conv_state = Some(padded.slice(
+            &[0, start_idx as i32, 0],
+            &[b as i32, seq_len as i32, cd as i32],
+        ));
 
         Ok(padded)
     }

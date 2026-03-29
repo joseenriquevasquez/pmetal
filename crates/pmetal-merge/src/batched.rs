@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 use tracing::{debug, info, trace};
 
 use crate::{MergeConfig, MergeMethod, MergeParameters, Result, SafetensorsLoader, TensorLoader};
@@ -451,8 +451,8 @@ mod tests {
 
     #[test]
     fn test_batch_sparsify_online() {
-        let t1 = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[4]);
-        let t2 = Array::from_slice(&[0.5_f32, 1.5, 2.5, 3.5], &[4]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[4]);
+        let t2 = Array::from_f32_slice(&[0.5_f32, 1.5, 2.5, 3.5], &[4]);
 
         let results = batch_sparsify(&[&t1, &t2], &[0.5, 0.5], true).unwrap();
         assert_eq!(results.len(), 2);

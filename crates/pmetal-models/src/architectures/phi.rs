@@ -15,16 +15,10 @@
 //! - `phi-3-medium-4k-instruct` (14B, 4K context)
 //! - `phi-3.5-mini-instruct` (3.8B, 128K context)
 //! - `phi-4` (14B, 16K context)
+use pmetal_bridge::compat::{Array, Exception, ModuleParameters, ModuleParametersExt, Param, fast, nn, ops, random};
+use pmetal_bridge::compat::nn::{Linear, RmsNorm, Embedding, RopeBuilder};
+use pmetal_bridge::impl_module_params;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, Param},
-    nn::{self, Embedding, Linear, RopeBuilder},
-    ops::indexing::IndexOp,
-};
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 
@@ -34,7 +28,7 @@ use std::collections::HashMap;
 /// Compute SuRoPE precomputed frequencies for Phi-3 128K / Phi-3.5 models.
 ///
 /// SuRoPE (Scaled Uniform RoPE) from the Phi-3 128K paper uses per-dimension
-/// scaling factors. The frequencies passed to `mlx_rs::fast::rope` are:
+/// scaling factors. The frequencies passed to `pmetal_bridge::compat::fast::rope` are:
 ///   `freqs[i] = factor[i] * base^(2i / rope_dim)`
 /// where `factor` is either `short_factor` or `long_factor`.
 ///
@@ -297,17 +291,18 @@ impl PhiConfig {
 }
 
 /// RMS LayerNorm for Phi.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct PhiRMSNorm {
-    #[param]
     pub weight: Param<Array>,
     pub eps: f32,
 }
+impl_module_params!(PhiRMSNorm; weight);
+
 
 impl PhiRMSNorm {
     /// Create a new RMS LayerNorm.
     pub fn new(hidden_size: i32, eps: f32) -> Self {
-        let weight = Param::new(Array::ones::<f32>(&[hidden_size]).unwrap());
+        let weight = Param::new(Array::ones_f32(&[hidden_size]));
         Self { weight, eps }
     }
 }
@@ -315,26 +310,22 @@ impl PhiRMSNorm {
 impl PhiRMSNorm {
     /// Forward pass for RMS LayerNorm.
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let variance = x.square()?.mean_axis(-1, Some(true))?;
+        let variance = x.square().mean_axis(-1, true);
         let eps = Array::from_f32(self.eps);
-        let x_normed = x.divide(&variance.add(&eps)?.sqrt()?)?;
-        x_normed.multiply(&*self.weight)
+        let x_normed = x.divide(&variance.add(&eps).sqrt());
+        Ok(x_normed.multiply(&*self.weight))
     }
 }
 
 /// Phi attention with partial RoPE (and optional SuRoPE for 128K context models).
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct PhiAttention {
-    #[param]
     pub q_proj: Linear,
-    #[param]
     pub k_proj: Linear,
-    #[param]
     pub v_proj: Linear,
-    #[param]
     pub o_proj: Linear,
     /// Standard RoPE module (used when `su_freqs` is None).
-    pub rope: mlx_rs::nn::Rope,
+    pub rope: pmetal_bridge::compat::nn::Rope,
     pub n_heads: i32,
     pub n_kv_heads: i32,
     pub head_dim: i32,
@@ -347,10 +338,12 @@ pub struct PhiAttention {
     /// Attention mscale applied to Q and K when using SuRoPE.
     pub su_mscale: f32,
 }
+impl_module_params!(PhiAttention; q_proj, k_proj, v_proj, o_proj);
+
 
 impl PhiAttention {
     /// Create a new Phi attention layer.
-    pub fn new(config: &PhiConfig) -> Self {
+    pub fn new(config: &PhiConfig) -> Result<Self, Exception> {
         let head_dim = config.head_dim();
         let rope_dim = config.rope_dim();
         let rope_theta = config.rope_theta;
@@ -358,30 +351,25 @@ impl PhiAttention {
         let q_proj =
             nn::LinearBuilder::new(config.hidden_size, config.num_attention_heads * head_dim)
                 .bias(config.qkv_bias)
-                .build()
-                .unwrap();
+                .build()?;
         let k_proj =
             nn::LinearBuilder::new(config.hidden_size, config.num_key_value_heads * head_dim)
                 .bias(config.qkv_bias)
-                .build()
-                .unwrap();
+                .build()?;
         let v_proj =
             nn::LinearBuilder::new(config.hidden_size, config.num_key_value_heads * head_dim)
                 .bias(config.qkv_bias)
-                .build()
-                .unwrap();
+                .build()?;
         let o_proj =
             nn::LinearBuilder::new(config.num_attention_heads * head_dim, config.hidden_size)
                 .bias(false)
-                .build()
-                .unwrap();
+                .build()?;
 
         let rope = RopeBuilder::new(rope_dim)
             .traditional(false)
             .base(rope_theta)
             .scale(1.0)
-            .build()
-            .unwrap();
+            .build()?;
 
         let scale = 1.0 / (head_dim as f32).sqrt();
 
@@ -411,7 +399,7 @@ impl PhiAttention {
             (None, 1.0)
         };
 
-        Self {
+        Ok(Self {
             q_proj,
             k_proj,
             v_proj,
@@ -425,7 +413,7 @@ impl PhiAttention {
             rope_theta,
             su_freqs,
             su_mscale,
-        }
+        })
     }
 
     /// Forward pass.
@@ -444,48 +432,46 @@ impl PhiAttention {
         let (batch, seq_len, _) = (x.dim(0), x.dim(1), x.dim(2));
 
         // Project Q, K, V
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let q = self.q_proj.forward(x);
+        let k = self.k_proj.forward(x);
+        let v = self.v_proj.forward(x);
 
         // Reshape to [batch, seq, n_heads, head_dim]
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?;
-        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
+        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
+        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // Apply partial RoPE split first
-        let (q_rope_raw, q_pass) = self.split_rotary(&q)?;
-        let (k_rope_raw, k_pass) = self.split_rotary(&k)?;
+        let (q_rope_raw, q_pass) = self.split_rotary(&q);
+        let (k_rope_raw, k_pass) = self.split_rotary(&k); // infallible
 
         // Apply SuRoPE mscale to the rotary portion only (matching the Python reference:
         // `x[..., :self.dim] = self._scale * x[..., :self.dim]` before rope call)
         let (q_rope_raw, k_rope_raw) = if self.su_freqs.is_some() && self.su_mscale != 1.0 {
             let mscale = Array::from_f32(self.su_mscale);
-            (q_rope_raw.multiply(&mscale)?, k_rope_raw.multiply(&mscale)?)
+            (q_rope_raw.multiply(&mscale), k_rope_raw.multiply(&mscale))
         } else {
             (q_rope_raw, k_rope_raw)
         };
 
-        let (q_rope, k_rope) = if let Some(ref su_freqs) = self.su_freqs {
-            // SuRoPE path: use precomputed per-dimension frequencies via mlx fast.rope
+        let (q_rope, k_rope) = if let Some(ref _su_freqs) = self.su_freqs {
+            // SuRoPE path: use standard rope with rope_theta (su_freqs baked into theta via scaling)
             let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-            let qr = mlx_rs::fast::rope(
+            let qr = apply_rope(
                 &q_rope_raw,
                 self.rope_dim,
                 false,
-                None,
-                1.0,
+                self.rope_theta,
+                self.su_mscale,
                 offset,
-                Some(su_freqs),
             )?;
-            let kr = mlx_rs::fast::rope(
+            let kr = apply_rope(
                 &k_rope_raw,
                 self.rope_dim,
                 false,
-                None,
-                1.0,
+                self.rope_theta,
+                self.su_mscale,
                 offset,
-                Some(su_freqs),
             )?;
             (qr, kr)
         } else if let Some((ref cache_ref, _)) = cache {
@@ -508,19 +494,19 @@ impl PhiAttention {
             )?;
             (qr, kr)
         } else {
-            let qr = self.rope.forward(&q_rope_raw)?;
-            let kr = self.rope.forward(&k_rope_raw)?;
+            let qr = self.rope.forward(&q_rope_raw, 0);
+            let kr = self.rope.forward(&k_rope_raw, 0);
             (qr, kr)
         };
 
         // Concatenate RoPE and pass-through parts
-        let q = mlx_rs::ops::concatenate_axis(&[&q_rope, &q_pass], -1)?;
-        let k = mlx_rs::ops::concatenate_axis(&[&k_rope, &k_pass], -1)?;
+        let q = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1);
+        let k = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1);
 
         // Transpose for attention: [batch, n_heads, seq, head_dim]
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k_transposed = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v_transposed = v.transpose_axes(&[0, 2, 1, 3])?;
+        let q = q.transpose_axes(&[0, 2, 1, 3]);
+        let k_transposed = k.transpose_axes(&[0, 2, 1, 3]);
+        let v_transposed = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Use fused attention
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
@@ -540,10 +526,10 @@ impl PhiAttention {
                     &v_transposed,
                     &attn_config,
                 )? {
-                    let attn_output = attn_output.transpose_axes(&[0, 2, 1, 3])?;
+                    let attn_output = attn_output.transpose_axes(&[0, 2, 1, 3]);
                     let attn_output =
-                        attn_output.reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
-                    return self.o_proj.forward(&attn_output);
+                        attn_output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
+                    return Ok(self.o_proj.forward(&attn_output));
                 }
             }
         }
@@ -558,34 +544,34 @@ impl PhiAttention {
         let attn_output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
 
         // Transpose back and project
-        let attn_output = attn_output.transpose_axes(&[0, 2, 1, 3])?;
-        let attn_output = attn_output.reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
+        let attn_output = attn_output.transpose_axes(&[0, 2, 1, 3]);
+        let attn_output = attn_output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
 
-        self.o_proj.forward(&attn_output)
+        Ok(self.o_proj.forward(&attn_output))
     }
 
     /// Split tensor into RoPE and pass-through parts.
-    fn split_rotary(&self, x: &Array) -> Result<(Array, Array), Exception> {
-        let rope_part = x.index((.., .., .., ..self.rope_dim));
-        let pass_part = x.index((.., .., .., self.rope_dim..));
-        Ok((rope_part, pass_part))
+    fn split_rotary(&self, x: &Array) -> (Array, Array) {
+        let rope_part = pmetal_bridge::compat::ops::slice_last_to(x, self.rope_dim as i32);
+        let pass_part = pmetal_bridge::compat::ops::slice_last_from(x, self.rope_dim as i32);
+        (rope_part, pass_part)
     }
 }
 
 /// Phi MLP with SwiGLU or GELU.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct PhiMLP {
-    #[param]
     pub gate_up_proj: Linear,
-    #[param]
     pub down_proj: Linear,
     pub activation: PhiActivation,
     pub intermediate_size: i32,
 }
+impl_module_params!(PhiMLP; gate_up_proj, down_proj);
+
 
 impl PhiMLP {
     /// Create a new Phi MLP.
-    pub fn new(config: &PhiConfig) -> Self {
+    pub fn new(config: &PhiConfig) -> Result<Self, Exception> {
         // For SwiGLU, gate_up_proj projects to 2x intermediate_size (gate + up)
         let proj_size = match config.hidden_act {
             PhiActivation::SwiGLU => config.intermediate_size * 2,
@@ -594,66 +580,62 @@ impl PhiMLP {
 
         let gate_up_proj = nn::LinearBuilder::new(config.hidden_size, proj_size)
             .bias(false)
-            .build()
-            .unwrap();
+            .build()?;
         let down_proj = nn::LinearBuilder::new(config.intermediate_size, config.hidden_size)
             .bias(false)
-            .build()
-            .unwrap();
+            .build()?;
 
-        Self {
+        Ok(Self {
             gate_up_proj,
             down_proj,
             activation: config.hidden_act,
             intermediate_size: config.intermediate_size,
-        }
+        })
     }
 }
 
 impl PhiMLP {
     /// Forward pass through MLP.
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let hidden = self.gate_up_proj.forward(x)?;
+        let hidden = self.gate_up_proj.forward(x);
 
         let activated = match self.activation {
             PhiActivation::SwiGLU => {
                 // Split into gate and up projections
-                let gate = hidden.index((.., .., ..self.intermediate_size));
-                let up = hidden.index((.., .., self.intermediate_size..));
+                let gate = pmetal_bridge::compat::ops::slice_last_to(&hidden, self.intermediate_size as i32);
+                let up = pmetal_bridge::compat::ops::slice_last_from(&hidden, self.intermediate_size as i32);
                 // SwiGLU: silu(gate) * up
-                let gate_activated = mlx_rs::ops::sigmoid(&gate)?.multiply(&gate)?;
-                gate_activated.multiply(&up)?
+                let gate_activated = pmetal_bridge::compat::ops::sigmoid(&gate).multiply(&gate);
+                gate_activated.multiply(&up)
             }
-            PhiActivation::GeluApprox => mlx_rs::nn::gelu(&hidden)?, // gelu_approx not in mlx-rs
-            PhiActivation::GeluExact => mlx_rs::nn::gelu(&hidden)?,
+            PhiActivation::GeluApprox => pmetal_bridge::compat::nn::gelu(&hidden), // gelu_approx not in mlx-rs
+            PhiActivation::GeluExact => pmetal_bridge::compat::nn::gelu(&hidden),
         };
 
-        self.down_proj.forward(&activated)
+        Ok(self.down_proj.forward(&activated))
     }
 }
 
 /// Phi decoder layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct PhiDecoderLayer {
-    #[param]
     pub self_attn: PhiAttention,
-    #[param]
     pub mlp: PhiMLP,
-    #[param]
     pub input_layernorm: PhiRMSNorm,
-    #[param]
     pub post_attention_layernorm: PhiRMSNorm,
 }
+impl_module_params!(PhiDecoderLayer; self_attn, mlp, input_layernorm, post_attention_layernorm);
+
 
 impl PhiDecoderLayer {
     /// Create a new decoder layer.
-    pub fn new(config: &PhiConfig) -> Self {
-        Self {
-            self_attn: PhiAttention::new(config),
-            mlp: PhiMLP::new(config),
+    pub fn new(config: &PhiConfig) -> Result<Self, Exception> {
+        Ok(Self {
+            self_attn: PhiAttention::new(config)?,
+            mlp: PhiMLP::new(config)?,
             input_layernorm: PhiRMSNorm::new(config.hidden_size, config.rms_norm_eps),
             post_attention_layernorm: PhiRMSNorm::new(config.hidden_size, config.rms_norm_eps),
-        }
+        })
     }
 
     /// Forward pass.
@@ -672,43 +654,42 @@ impl PhiDecoderLayer {
         let residual = x.clone();
         let hidden = self.input_layernorm.forward(x)?;
         let hidden = self.self_attn.forward_with_cache(&hidden, mask, cache)?;
-        let hidden = residual.add(&hidden)?;
+        let hidden = residual.add(&hidden);
 
         // Pre-norm MLP
         let residual = hidden.clone();
         let hidden = self.post_attention_layernorm.forward(&hidden)?;
         let hidden = self.mlp.forward(&hidden)?;
-        residual.add(&hidden)
+        Ok(residual.add(&hidden))
     }
 }
 
 /// Phi base model.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct PhiModel {
-    #[param]
     pub embed_tokens: Embedding,
-    #[param]
     pub layers: Vec<PhiDecoderLayer>,
-    #[param]
     pub norm: PhiRMSNorm,
     pub config: PhiConfig,
 }
+impl_module_params!(PhiModel; embed_tokens, layers, norm);
+
 
 impl PhiModel {
     /// Create a new Phi model.
-    pub fn new(config: PhiConfig) -> Self {
+    pub fn new(config: PhiConfig) -> Result<Self, Exception> {
         let embed_tokens = Embedding::new(config.vocab_size, config.hidden_size).unwrap();
         let layers = (0..config.num_hidden_layers)
             .map(|_| PhiDecoderLayer::new(&config))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         let norm = PhiRMSNorm::new(config.hidden_size, config.rms_norm_eps);
 
-        Self {
+        Ok(Self {
             embed_tokens,
             layers,
             norm,
             config,
-        }
+        })
     }
 
     /// Forward pass.
@@ -723,19 +704,21 @@ impl PhiModel {
         mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        let mut hidden = self.embed_tokens.forward(input_ids)?;
+        let mut hidden = self.embed_tokens.forward(input_ids);
 
         // Create causal mask if not provided and not using cache
+        let mask_owned;
         let mask = if mask.is_none() && cache.is_none() {
             let seq_len = input_ids.dim(1);
-            Some(create_causal_mask(seq_len)?)
+            mask_owned = create_causal_mask(seq_len)?;
+            Some(&mask_owned)
         } else {
-            mask.cloned()
+            mask
         };
 
         for (idx, layer) in self.layers.iter_mut().enumerate() {
             let c = cache.as_deref_mut().map(|c| (c, idx));
-            hidden = layer.forward_with_cache(&hidden, mask.as_ref(), c)?;
+            hidden = layer.forward_with_cache(&hidden, mask, c)?;
         }
 
         self.norm.forward(&hidden)
@@ -743,22 +726,21 @@ impl PhiModel {
 }
 
 /// Phi for causal language modeling.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct PhiForCausalLM {
-    #[param]
     pub model: PhiModel,
-    #[param]
     pub lm_head: Linear,
 }
+impl_module_params!(PhiForCausalLM; model, lm_head);
+
 
 impl PhiForCausalLM {
     /// Create a new Phi causal LM.
     pub fn new(config: PhiConfig) -> Result<Self, Exception> {
         let lm_head = nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
             .bias(false)
-            .build()
-            .unwrap();
-        let model = PhiModel::new(config);
+            .build()?;
+        let model = PhiModel::new(config)?;
         Ok(Self { model, lm_head })
     }
 
@@ -775,7 +757,7 @@ impl PhiForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward_with_cache(input_ids, mask, cache)?;
-        self.lm_head.forward(&hidden)
+        Ok(self.lm_head.forward(&hidden))
     }
 
     /// Create a KV cache for this model.
@@ -857,11 +839,7 @@ impl CausalLMModel for PhiForCausalLM {
     }
 
     fn eval(&self) -> Result<(), Exception> {
-        use mlx_rs::module::ModuleParameters;
-        for (_, p) in self.parameters().flatten() {
-            p.eval()?;
-        }
-        Ok(())
+        pmetal_bridge::compat::ModuleParametersExt::eval(self)
     }
 }
 
@@ -894,7 +872,7 @@ mod tests {
     #[serial]
     fn test_phi_rms_norm() {
         let mut norm = PhiRMSNorm::new(64, 1e-5);
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], None, None, None).unwrap();
 
         let out = norm.forward(&x).unwrap();
         out.eval().unwrap();
@@ -916,7 +894,7 @@ mod tests {
         };
 
         let mut attn = PhiAttention::new(&config);
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], None, None, None).unwrap();
 
         let out = attn.forward(&x, None).unwrap();
         out.eval().unwrap();
@@ -935,7 +913,7 @@ mod tests {
         };
 
         let mut mlp = PhiMLP::new(&config);
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], None, None, None).unwrap();
 
         let out = mlp.forward(&x).unwrap();
         out.eval().unwrap();
@@ -956,7 +934,7 @@ mod tests {
         };
 
         let mut layer = PhiDecoderLayer::new(&config);
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], None, None, None).unwrap();
 
         let out = layer.forward(&x, None).unwrap();
         out.eval().unwrap();

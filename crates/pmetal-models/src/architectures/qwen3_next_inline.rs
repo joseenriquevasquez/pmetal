@@ -4,12 +4,11 @@
 //! direct C++ bridge). This eliminates the 6.8x build overhead from mlx-c handle
 //! management (mlx_array_new/free/set per op), matching Python's nanobind path.
 //!
-//! Weights are converted from `mlx_rs::Array` → `InlineArray` once at first decode
+//! Weights are converted from `pmetal_bridge::compat::Array` → `InlineArray` once at first decode
 //! call (cold path). All subsequent decode calls use InlineArray exclusively.
 
 use pmetal_bridge::InlineArray;
-use mlx_rs::Array;
-use mlx_rs::error::Exception;
+use pmetal_bridge::compat::{Array, Dtype, Exception};
 
 use super::qwen3_next::Qwen3NextForCausalLM;
 use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
@@ -18,16 +17,14 @@ use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 // These go through the raw void* pointer (shared_ptr copy, ~10ns).
 // The hot-path decode uses ONLY InlineArray — zero mlx-rs.
 
-#[allow(unsafe_code)]
+/// Convert a bridge Array (= InlineArray) to InlineArray — identity since they're the same type.
 pub fn ia_from_array(arr: &Array) -> InlineArray {
-    unsafe { InlineArray::from_raw_ctx(arr.as_ptr().ctx) }
+    arr.clone()
 }
 
-#[allow(unsafe_code)]
+/// Convert an InlineArray to a bridge Array — identity since they're the same type.
 pub fn ia_to_array(ia: &InlineArray) -> Array {
-    let ctx = ia.to_raw_ctx();
-    let handle = mlx_sys::mlx_array { ctx };
-    unsafe { Array::from_ptr(handle) }
+    ia.clone()
 }
 
 // ============================================================================
@@ -758,8 +755,8 @@ impl InlineModelWeights {
 ///
 /// Typical usage:
 /// ```ignore
-/// let native    = InlineModelWeights::from_safetensors(&model_dir, &config)?;
-/// let from_mdl  = InlineModelWeights::from_model(&mut qwen3_next_model)?;
+/// let native    = InlineModelWeights::from_safetensors(&model_dir, &config);
+/// let from_mdl  = InlineModelWeights::from_model(&mut qwen3_next_model);
 /// InlineModelWeights::compare_weights(&native, &from_mdl);
 /// ```
 pub fn compare_weights(native: &InlineModelWeights, from_model: &InlineModelWeights) {

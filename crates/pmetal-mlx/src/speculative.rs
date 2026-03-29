@@ -31,11 +31,7 @@
 //! via CLI. Greedy and sampling verification modes are fully implemented. Next step:
 //! add a `pmetal infer --speculative <draft-model>` subcommand that wires both models.
 
-use mlx_rs::{
-    Array,
-    error::Exception,
-    ops::indexing::{IndexOp, argmax},
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 
 /// Configuration for speculative decoding.
 #[derive(Debug, Clone)]
@@ -292,19 +288,25 @@ impl SpeculativeDecoder {
 
         // Apply temperature
         let temp = self.config.temperature.max(1e-6);
-        let draft_scaled = draft_logits.divide(Array::from_f32(temp))?;
-        let target_scaled = target_logits.divide(Array::from_f32(temp))?;
+        let draft_scaled = draft_logits.divide(&Array::from_f32(temp));
+        let target_scaled = target_logits.divide(&Array::from_f32(temp));
 
         // Compute probabilities
-        let draft_probs = mlx_rs::ops::softmax_axis(&draft_scaled, -1, None)?;
-        let target_probs = mlx_rs::ops::softmax_axis(&target_scaled, -1, None)?;
+        let draft_probs = &draft_scaled.softmax(-1);
+        let target_probs = &target_scaled.softmax(-1);
 
         // Evaluate for CPU access
-        draft_tokens.eval()?;
-        draft_probs.eval()?;
-        target_probs.eval()?;
+        let mut dt_eval = draft_tokens.clone();
+        dt_eval.eval();
+        let mut dp_eval = draft_probs.clone();
+        dp_eval.eval();
+        let mut tp_eval = target_probs.clone();
+        tp_eval.eval();
+        let draft_probs = &dp_eval;
+        let target_probs = &tp_eval;
 
-        let tokens: Vec<i32> = draft_tokens.as_slice().to_vec();
+        // Get token indices as i32
+        let tokens: Vec<i32> = dt_eval.to_f32_vec(dt_eval.size()).unwrap_or_default().into_iter().map(|x| x as i32).collect();
         let mut accepted_tokens = Vec::new();
         let mut rejection_idx = None;
 
@@ -313,10 +315,10 @@ impl SpeculativeDecoder {
             let token = tokens[i];
 
             // Get probability of this token under both models
-            let p_draft = draft_probs.index((i as i32, token));
-            let p_target = target_probs.index((i as i32, token));
-            p_draft.eval()?;
-            p_target.eval()?;
+            let mut p_draft = draft_probs.slice(&[i as i32, token], &[i as i32 + 1, token + 1]).reshape(&[]);
+            let mut p_target = target_probs.slice(&[i as i32, token], &[i as i32 + 1, token + 1]).reshape(&[]);
+            p_draft.eval();
+            p_target.eval();
 
             let p_d = p_draft.item::<f32>();
             let p_t = p_target.item::<f32>();
@@ -339,19 +341,19 @@ impl SpeculativeDecoder {
         // Compute correction distribution if rejected
         let correction_logits = if let Some(idx) = rejection_idx {
             // Correction distribution: max(0, p_target - p_draft) normalized
-            let p_draft_row = draft_probs.index(idx as i32);
-            let p_target_row = target_probs.index(idx as i32);
+            let p_draft_row = draft_probs.slice(&[idx as i32, 0], &[idx as i32 + 1, draft_probs.dim(1)]).squeeze(0);
+            let p_target_row = target_probs.slice(&[idx as i32, 0], &[idx as i32 + 1, target_probs.dim(1)]).squeeze(0);
 
-            let diff = p_target_row.subtract(&p_draft_row)?;
-            let zero = Array::zeros::<f32>(&[diff.dim(0)])?;
-            let clipped = mlx_rs::ops::maximum(&diff, &zero)?;
+            let diff = p_target_row.subtract(&p_draft_row);
+            let zero = ops::zeros(&[diff.dim(0)], Dtype::Float32);
+            let clipped = ops::maximum(&diff, &zero);
 
             // Convert back to logits (log of normalized diff)
-            let sum = clipped.sum(None)?;
-            let normalized = clipped.divide(&sum)?;
+            let sum = clipped.sum_all();
+            let normalized = clipped.divide(&sum);
             let eps = Array::from_f32(1e-10);
-            let safe_probs = normalized.add(&eps)?;
-            Some(safe_probs.log()?)
+            let safe_probs = normalized.add(&eps);
+            Some(safe_probs.log())
         } else {
             None
         };
@@ -388,16 +390,20 @@ impl SpeculativeDecoder {
     ) -> Result<(Vec<i32>, Option<Array>), Exception> {
         let k = draft_tokens.dim(0) as usize;
 
-        draft_tokens.eval()?;
-        target_logits.eval()?;
+        let mut dt_eval = draft_tokens.clone();
+        dt_eval.eval();
+        let mut tl_eval = target_logits.clone();
+        tl_eval.eval();
+        let target_logits = &tl_eval;
 
-        let tokens: Vec<i32> = draft_tokens.as_slice().to_vec();
+        // Get token indices as i32
+        let tokens: Vec<i32> = dt_eval.to_f32_vec(dt_eval.size()).unwrap_or_default().into_iter().map(|x| x as i32).collect();
         let mut accepted_tokens = Vec::new();
 
         for i in 0..k {
-            let target_row = target_logits.index(i as i32);
-            let best_idx = argmax(&target_row, None)?;
-            best_idx.eval()?;
+            let target_row = target_logits.slice(&[i as i32, 0], &[i as i32 + 1, target_logits.dim(1)]).squeeze(0);
+            let mut best_idx = target_row.argmax(-1);
+            best_idx.eval();
             let best_token = best_idx.item::<u32>() as i32;
 
             if tokens[i] == best_token {
@@ -408,7 +414,7 @@ impl SpeculativeDecoder {
                 let vocab_size = target_logits.dim(1) as usize;
                 let mut one_hot = vec![-1e9f32; vocab_size];
                 one_hot[best_token as usize] = 0.0;
-                let correction = Array::from_slice(&one_hot, &[vocab_size as i32]);
+                let correction = Array::from_f32_slice(&one_hot, &[vocab_size as i32]);
                 // Update stats
                 self.stats.total_draft_tokens += k;
                 self.stats.total_accepted += accepted_tokens.len();
@@ -455,23 +461,24 @@ impl SpeculativeDecoder {
 
     /// Sample from a probability distribution.
     pub fn sample(&self, logits: &Array) -> Result<i32, Exception> {
-        logits.eval()?;
+        let mut logits_owned = logits.clone();
+        logits_owned.eval();
 
         if self.config.temperature == 0.0 {
             // Greedy
-            let max_idx = argmax(logits, None)?;
-            max_idx.eval()?;
+            let mut max_idx = logits_owned.argmax(-1);
+            max_idx.eval();
             Ok(max_idx.item::<u32>() as i32)
         } else {
             // Temperature sampling
-            let scaled = logits.divide(Array::from_f32(self.config.temperature))?;
-            let probs = mlx_rs::ops::softmax_axis(&scaled, -1, None)?;
+            let scaled = logits_owned.divide(&Array::from_f32(self.config.temperature));
+            let probs_base = scaled.softmax(-1);
 
             // Apply top-p if specified
             let probs = if self.config.top_p < 1.0 {
-                self.apply_top_p(&probs)?
+                self.apply_top_p(&probs_base).unwrap_or_else(|_| probs_base.clone())
             } else {
-                probs
+                probs_base
             };
 
             // Sample from distribution
@@ -481,8 +488,9 @@ impl SpeculativeDecoder {
 
     /// Apply nucleus (top-p) sampling.
     fn apply_top_p(&self, probs: &Array) -> Result<Array, Exception> {
-        probs.eval()?;
-        let probs_vec: Vec<f32> = probs.as_slice().to_vec();
+        let mut probs_owned = probs.clone();
+        probs_owned.eval();
+        let probs_vec: Vec<f32> = probs_owned.to_f32_vec(probs_owned.size()).unwrap_or_default();
 
         // Sort indices by probability (descending)
         let mut indexed: Vec<(usize, f32)> = probs_vec.iter().cloned().enumerate().collect();
@@ -513,13 +521,14 @@ impl SpeculativeDecoder {
             }
         }
 
-        Ok(Array::from_slice(&filtered, probs.shape()))
+        Ok(Array::from_f32_slice(&filtered, probs.shape()))
     }
 
     /// Sample from categorical distribution.
     fn categorical_sample(&self, probs: &Array) -> Result<i32, Exception> {
-        probs.eval()?;
-        let probs_vec: Vec<f32> = probs.as_slice().to_vec();
+        let mut probs_owned = probs.clone();
+        probs_owned.eval();
+        let probs_vec: Vec<f32> = probs_owned.to_f32_vec(probs_owned.size()).unwrap_or_default();
 
         let r = rand_uniform();
         let mut cumsum = 0.0;
@@ -735,7 +744,7 @@ mod tests {
         let decoder = SpeculativeDecoder::new(config);
 
         // Logits with clear maximum
-        let logits = Array::from_slice(&[-10.0f32, -5.0, 10.0, -3.0, 0.0], &[5]);
+        let logits = Array::from_f32_slice(&[-10.0f32, -5.0, 10.0, -3.0, 0.0], &[5]);
         let token = decoder.sample(&logits).unwrap();
 
         assert_eq!(token, 2); // Index of max

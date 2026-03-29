@@ -1,7 +1,6 @@
 use super::*;
-use mlx_rs::module::ModuleParameters;
-use mlx_rs::transforms::compile::compile_with_state;
-use mlx_rs::utils::Updatable;
+use pmetal_bridge::compat::module::ModuleParameters;
+use pmetal_bridge::compat::optimizers::Updatable;
 
 impl TrainingLoop {
     /// Run optimized training with fused forward/backward/optimizer step.
@@ -139,8 +138,8 @@ impl TrainingLoop {
                 self.config.neftune_noise_alpha,
             )?
         };
-        warmup_loss.eval()?;
-        let warmup_loss_val = warmup_loss.item::<f32>();
+        warmup_loss.eval();
+        let warmup_loss_val = warmup_loss.item_f32();
 
         // Record state count AFTER warmup (optimizer states now initialized)
         let state_count_after = state.updatable_states_len();
@@ -259,7 +258,7 @@ impl TrainingLoop {
                 // Evaluate each step immediately to prevent computation graph
                 // accumulation. Without mx.compile, each step builds a new graph
                 // (~10 GB for a 0.6B model). Deferring across steps causes OOM.
-                loss.eval()?;
+                loss.eval();
                 eval_training_state(&[], &state)?;
 
                 accumulated_losses.push(loss);
@@ -276,7 +275,7 @@ impl TrainingLoop {
                 {
                     // Already evaluated above, just process the losses
                     for loss in &accumulated_losses {
-                        let loss_val = loss.item::<f32>();
+                        let loss_val = loss.item_f32();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
                         let action = self.apply_adaptive_lr(loss_val as f64);
                         if action == AdaptiveAction::Continue && self.should_snapshot_best() {
@@ -324,7 +323,7 @@ impl TrainingLoop {
                     // Now extract values and compute running loss
                     let mut adaptive_action = AdaptiveAction::Continue;
                     for loss in &accumulated_losses {
-                        let loss_val = loss.item::<f32>();
+                        let loss_val = loss.item_f32();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
                         let action = self.apply_adaptive_lr(loss_val as f64);
                         match action {
@@ -420,7 +419,7 @@ impl TrainingLoop {
                     if !accumulated_losses.is_empty() {
                         eval_training_state(&accumulated_losses, &state)?;
                         for loss in &accumulated_losses {
-                            let loss_val = loss.item::<f32>();
+                            let loss_val = loss.item_f32();
                             self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
                         }
                         accumulated_losses.clear();
@@ -439,7 +438,7 @@ impl TrainingLoop {
                         if !accumulated_losses.is_empty() {
                             eval_training_state(&accumulated_losses, &state)?;
                             for loss in &accumulated_losses {
-                                let loss_val = loss.item::<f32>();
+                                let loss_val = loss.item_f32();
                                 self.running_loss =
                                     0.99 * self.running_loss + 0.01 * loss_val as f64;
                             }
@@ -456,7 +455,7 @@ impl TrainingLoop {
         if !accumulated_losses.is_empty() {
             eval_training_state(&accumulated_losses, &state)?;
             for loss in &accumulated_losses {
-                let loss_val = loss.item::<f32>();
+                let loss_val = loss.item_f32();
                 self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
             }
         }
@@ -577,8 +576,8 @@ impl TrainingLoop {
                 self.config.neftune_noise_alpha,
             )?
         };
-        warmup_loss.eval()?;
-        let warmup_loss_val = warmup_loss.item::<f32>();
+        warmup_loss.eval();
+        let warmup_loss_val = warmup_loss.item_f32();
 
         let state_count_after = state.updatable_states_len();
 
@@ -667,8 +666,8 @@ impl TrainingLoop {
 
                 // Logging at boundaries
                 if self.step % self.config.log_every == 0 {
-                    loss.eval()?;
-                    let loss_val = loss.item::<f32>();
+                    loss.eval();
+                    let loss_val = loss.item_f32();
                     self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
                     let action = self.apply_adaptive_lr(loss_val as f64);
 

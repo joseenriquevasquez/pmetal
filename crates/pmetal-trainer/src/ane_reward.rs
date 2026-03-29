@@ -38,7 +38,7 @@
 use std::sync::mpsc;
 use std::thread;
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 
 use crate::grpo::{GrpoError, GrpoResult, RewardFunction};
 
@@ -355,7 +355,7 @@ mod tests {
             &self,
             _prompts: &[String],
             completions: &[String],
-            _images: Option<&[Vec<mlx_rs::Array>]>,
+            _images: Option<&[Vec<pmetal_bridge::compat::Array>]>,
         ) -> GrpoResult<Vec<f64>> {
             Ok(completions.iter().map(|c| c.len() as f64).collect())
         }
@@ -371,7 +371,7 @@ mod tests {
             &self,
             _: &[String],
             _: &[String],
-            _: Option<&[Vec<mlx_rs::Array>]>,
+            _: Option<&[Vec<pmetal_bridge::compat::Array>]>,
         ) -> GrpoResult<Vec<f64>> {
             Err(GrpoError::Reward("intentional test error".into()))
         }

@@ -17,9 +17,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use mlx_rs::Array;
-use mlx_rs::error::Exception;
-use mlx_rs::module::{ModuleParamMut, ModuleParamRef, ModuleParameters};
+use pmetal_bridge::compat::Array;
+use pmetal_bridge::compat::Exception;
+use pmetal_bridge::compat::{ModuleParamMut, ModuleParamRef, ModuleParameters};
 use pmetal_models::ModelArchitecture;
 use pmetal_models::architectures::{
     gemma::GemmaConfig, llama::LlamaConfig, mistral::MistralConfig, qwen3::Qwen3Config,

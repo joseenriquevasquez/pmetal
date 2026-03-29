@@ -18,7 +18,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result};
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 
 /// SLERP merge implementation.
 #[derive(Debug, Clone, Default)]
@@ -47,32 +47,32 @@ impl SlerpMerge {
 
         // Flatten tensors for computation
         let original_shape = a.shape().to_vec();
-        let a_flat = a.reshape(&[-1])?;
-        let b_flat = b.reshape(&[-1])?;
+        let a_flat = a.reshape(&[-1]);
+        let b_flat = b.reshape(&[-1]);
 
         // Compute norms (sum over all dimensions)
-        let a_norm = a_flat.multiply(&a_flat)?.sum(None)?.sqrt()?;
-        let b_norm = b_flat.multiply(&b_flat)?.sum(None)?.sqrt()?;
+        let a_norm = a_flat.multiply(&a_flat).sum_all().sqrt();
+        let b_norm = b_flat.multiply(&b_flat).sum_all().sqrt();
 
         // Get scalar values
-        let a_norm_val: f32 = a_norm.item();
-        let b_norm_val: f32 = b_norm.item();
+        let a_norm_val: f32 = a_norm.clone().item_f32();
+        let b_norm_val: f32 = b_norm.clone().item_f32();
 
         // Handle degenerate cases
         if a_norm_val < 1e-8 {
-            return Ok(b.multiply(Array::from_f32(t))?);
+            return Ok(b.multiply(&Array::from_f32(t)));
         }
         if b_norm_val < 1e-8 {
-            return Ok(a.multiply(Array::from_f32(1.0 - t))?);
+            return Ok(a.multiply(&Array::from_f32(1.0 - t)));
         }
 
         // Normalize
-        let a_unit = a_flat.divide(&a_norm)?;
-        let b_unit = b_flat.divide(&b_norm)?;
+        let a_unit = a_flat.divide(&a_norm);
+        let b_unit = b_flat.divide(&b_norm);
 
         // Compute dot product (cosine of angle)
-        let dot = a_unit.multiply(&b_unit)?.sum(None)?;
-        let mut cos_theta: f32 = dot.item();
+        let dot = a_unit.multiply(&b_unit).sum_all();
+        let mut cos_theta: f32 = dot.clone().item_f32();
 
         // Clamp to valid range for arccos
         cos_theta = cos_theta.clamp(-1.0, 1.0);
@@ -80,9 +80,9 @@ impl SlerpMerge {
         // If vectors are very close, use linear interpolation
         if cos_theta.abs() > 0.9999 {
             let result_flat = a_flat
-                .multiply(Array::from_f32(1.0 - t))?
-                .add(&b_flat.multiply(Array::from_f32(t))?)?;
-            return Ok(result_flat.reshape(&original_shape)?);
+                .multiply(&Array::from_f32(1.0 - t))
+                .add(&b_flat.multiply(&Array::from_f32(t)));
+            return Ok(result_flat.reshape(&original_shape));
         }
 
         // No negation needed - SLERP handles all angles correctly
@@ -94,9 +94,9 @@ impl SlerpMerge {
         if sin_theta.abs() < 1e-8 {
             // Fallback to linear interpolation
             let result_flat = a_flat
-                .multiply(Array::from_f32(1.0 - t))?
-                .add(&b_flat.multiply(Array::from_f32(t))?)?;
-            return Ok(result_flat.reshape(&original_shape)?);
+                .multiply(&Array::from_f32(1.0 - t))
+                .add(&b_flat.multiply(&Array::from_f32(t)));
+            return Ok(result_flat.reshape(&original_shape));
         }
 
         let s0 = ((1.0 - t) * theta).sin() / sin_theta;
@@ -104,15 +104,15 @@ impl SlerpMerge {
 
         // Interpolate unit vectors
         let result_unit = a_unit
-            .multiply(Array::from_f32(s0))?
-            .add(&b_unit.multiply(Array::from_f32(s1))?)?;
+            .multiply(&Array::from_f32(s0))
+            .add(&b_unit.multiply(&Array::from_f32(s1)));
 
         // Interpolate norms linearly
         let result_norm = a_norm_val * (1.0 - t) + b_norm_val * t;
 
         // Scale result
-        let result_flat = result_unit.multiply(Array::from_f32(result_norm))?;
-        Ok(result_flat.reshape(&original_shape)?)
+        let result_flat = result_unit.multiply(&Array::from_f32(result_norm));
+        Ok(result_flat.reshape(&original_shape))
     }
 }
 
@@ -166,17 +166,17 @@ mod tests {
     #[test]
     fn test_slerp_endpoints() {
         // t=0 should return first tensor
-        let a = Array::from_slice(&[1.0_f32, 0.0, 0.0], &[3]);
-        let b = Array::from_slice(&[0.0_f32, 1.0, 0.0], &[3]);
+        let a = Array::from_f32_slice(&[1.0_f32, 0.0, 0.0], &[3]);
+        let b = Array::from_f32_slice(&[0.0_f32, 1.0, 0.0], &[3]);
 
-        let result = SlerpMerge::slerp(&a, &b, 0.0).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = SlerpMerge::slerp(&a, &b, 0.0).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
         assert!((result_slice[0] - 1.0).abs() < 1e-5);
         assert!((result_slice[1] - 0.0).abs() < 1e-5);
 
         // t=1 should return second tensor
-        let result = SlerpMerge::slerp(&a, &b, 1.0).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = SlerpMerge::slerp(&a, &b, 1.0).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
         assert!((result_slice[0] - 0.0).abs() < 1e-5);
         assert!((result_slice[1] - 1.0).abs() < 1e-5);
     }
@@ -184,11 +184,11 @@ mod tests {
     #[test]
     fn test_slerp_midpoint() {
         // Orthogonal unit vectors
-        let a = Array::from_slice(&[1.0_f32, 0.0], &[2]);
-        let b = Array::from_slice(&[0.0_f32, 1.0], &[2]);
+        let a = Array::from_f32_slice(&[1.0_f32, 0.0], &[2]);
+        let b = Array::from_f32_slice(&[0.0_f32, 1.0], &[2]);
 
-        let result = SlerpMerge::slerp(&a, &b, 0.5).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = SlerpMerge::slerp(&a, &b, 0.5).unwrap();
+        let result_slice = result.to_f32_vec(2).unwrap();
 
         // Should be at 45 degrees: [sqrt(2)/2, sqrt(2)/2]
         let expected = std::f32::consts::FRAC_1_SQRT_2;
@@ -199,11 +199,11 @@ mod tests {
     #[test]
     fn test_slerp_parallel_vectors() {
         // Parallel vectors (same direction)
-        let a = Array::from_slice(&[1.0_f32, 0.0], &[2]);
-        let b = Array::from_slice(&[2.0_f32, 0.0], &[2]);
+        let a = Array::from_f32_slice(&[1.0_f32, 0.0], &[2]);
+        let b = Array::from_f32_slice(&[2.0_f32, 0.0], &[2]);
 
-        let result = SlerpMerge::slerp(&a, &b, 0.5).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = SlerpMerge::slerp(&a, &b, 0.5).unwrap();
+        let result_slice = result.to_f32_vec(2).unwrap();
 
         // Should interpolate magnitude: (1 + 2) / 2 = 1.5
         assert!((result_slice[0] - 1.5).abs() < 1e-4);
@@ -212,8 +212,8 @@ mod tests {
 
     #[test]
     fn test_slerp_preserves_shape() {
-        let a = Array::from_slice(&[1.0_f32; 12], &[3, 4]);
-        let b = Array::from_slice(&[2.0_f32; 12], &[3, 4]);
+        let a = Array::from_f32_slice(&[1.0_f32; 12], &[3, 4]);
+        let b = Array::from_f32_slice(&[2.0_f32; 12], &[3, 4]);
 
         let result = SlerpMerge::slerp(&a, &b, 0.5).unwrap();
         assert_eq!(result.shape(), &[3, 4]);

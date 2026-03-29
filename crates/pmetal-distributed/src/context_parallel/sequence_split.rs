@@ -2,17 +2,16 @@
 
 use crate::mlx_dist::group::DistributedGroup;
 use crate::mlx_dist::ops;
-use mlx_rs::Array;
-use mlx_rs::error::Exception;
+use pmetal_bridge::compat::{Array, Exception};
 
 /// Extract a contiguous slice along `axis` using `take_axis`.
 ///
-/// Equivalent to `x[..., start:start+len, ...]` but using the mlx-rs
-/// `take_axis` API (there is no `narrow` method in mlx-rs).
+/// Equivalent to `x[..., start:start+len, ...]` but using the bridge
+/// compat `take_axis` API (there is no `narrow` method in the compat layer).
 fn narrow(x: &Array, axis: i32, start: i32, len: i32) -> Result<Array, Exception> {
     let indices: Vec<i32> = (start..start + len).collect();
-    let idx = Array::from_slice(&indices, &[len]);
-    x.take_axis(&idx, axis)
+    let idx = Array::from_i32_slice(&indices);
+    Ok(x.take_axis(&idx, axis))
 }
 
 /// Split a tensor along the sequence dimension across ranks.
@@ -103,7 +102,7 @@ mod tests {
     fn split_sequence_even() {
         // [1, 8, 4] → split seq_axis=1 into 2 → [1, 4, 4] each
         let data: Vec<f32> = (0..32).map(|i| i as f32).collect();
-        let x = Array::from_slice(&data, &[1, 8, 4]);
+        let x = Array::from_f32_slice(&data, &[1, 8, 4]);
 
         let chunk0 = split_sequence(&x, 1, 0, 2).unwrap();
         let chunk1 = split_sequence(&x, 1, 1, 2).unwrap();
@@ -116,7 +115,7 @@ mod tests {
     fn split_sequence_uneven() {
         // [1, 7, 2] → split into 3 → [1,3,2], [1,2,2], [1,2,2]
         let data: Vec<f32> = (0..14).map(|i| i as f32).collect();
-        let x = Array::from_slice(&data, &[1, 7, 2]);
+        let x = Array::from_f32_slice(&data, &[1, 7, 2]);
 
         let chunk0 = split_sequence(&x, 1, 0, 3).unwrap();
         let chunk1 = split_sequence(&x, 1, 1, 3).unwrap();

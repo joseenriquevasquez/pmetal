@@ -26,8 +26,7 @@
 //! )?;
 //! ```
 
-use mlx_rs::Array;
-use mlx_rs::ops::{sign, stack_axis};
+use pmetal_bridge::compat::{Array, Dtype, ops};
 
 use crate::{MergeError, Result, sparsify_by_magnitude};
 
@@ -145,81 +144,73 @@ impl GpuMerger {
 
         // --- Step 1: Stack all fine-tuned tensors into a single [M, ...] array.
         // This lets MLX schedule a single large GPU operation instead of M small ones.
-        let stacked = stack_axis(tensors, 0).map_err(MergeError::from)?;
+        let stacked = ops::stack_axis(tensors, 0);
 
         // --- Step 2: Compute all task vectors at once via broadcast subtract.
         // base has shape [...]; stacked has shape [M, ...].
         // MLX broadcasts base against the leading model dimension automatically.
-        let task_vectors_stacked = stacked.subtract(base).map_err(MergeError::from)?;
+        let task_vectors_stacked = stacked.subtract(base);
 
         // --- Step 3: Sparsify each task vector independently.
         // Split the [M, ...] array into M slices of shape [1, ...], then reshape each
         // to [...] to match the per-model API expected by sparsify_batch_by_magnitude.
         let original_shape = base.shape().to_vec();
+        // split takes split-point indices (not a count) and an axis.
+        // To get num_models slices of size 1 along axis 0, pass indices [1, 2, ..., M-1].
+        let split_indices: Vec<i32> = (1..num_models).map(|i| i as i32).collect();
         let task_vectors: Vec<Array> = task_vectors_stacked
-            .split(num_models as i32, Some(0))
-            .map_err(MergeError::from)?
+            .split(&split_indices, 0)
             .into_iter()
-            .map(|row| row.reshape(&original_shape).map_err(MergeError::from))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|row| row.reshape(&original_shape))
+            .collect::<Vec<_>>();
 
         let sparse_vectors = crate::sparsify_batch_by_magnitude(&task_vectors, densities)?;
 
         // --- Step 4: Re-stack sparse vectors into [M, ...] for vectorized sign consensus.
-        let stacked_sparse = stack_axis(&sparse_vectors, 0).map_err(MergeError::from)?;
+        let stacked_sparse = ops::stack_axis(&sparse_vectors, 0);
 
         // --- Step 5: Batched sign consensus using a single GPU reduction.
         //
         // Build a broadcastable [M, 1, 1, ..., 1] weights tensor so that a single
         // element-wise multiply fans the per-model scalars across all parameter positions.
         let tensor_ndim = base.ndim();
-        let mut weights_shape: Vec<i32> = Vec::with_capacity(1 + tensor_ndim);
+        let tensor_ndim_usize = tensor_ndim as usize;
+        let mut weights_shape: Vec<i32> = Vec::with_capacity(1 + tensor_ndim_usize);
         weights_shape.push(num_models as i32);
-        weights_shape.extend(std::iter::repeat_n(1_i32, tensor_ndim));
-        let weights_bcast = Array::from_slice(weights, &[num_models as i32])
-            .reshape(&weights_shape)
-            .map_err(MergeError::from)?;
+        weights_shape.extend(std::iter::repeat_n(1_i32, tensor_ndim_usize));
+        let weights_bcast = Array::from_f32_slice(weights, &[num_models as i32])
+            .reshape(&weights_shape);
 
         // 5a. Element-wise signs for every model and every parameter: [M, ...].
-        let signs = sign(&stacked_sparse).map_err(MergeError::from)?;
+        let signs = stacked_sparse.sign();
 
         // 5b. Weighted sign vote collapsed over the model axis:
         //     vote[i] = sum_m( weight_m * sign(sparse_m[i]) )  ->  shape [...]
         let vote = signs
             .multiply(&weights_bcast)
-            .map_err(MergeError::from)?
-            .sum_axis(0, None)
-            .map_err(MergeError::from)?;
+            .sum_axis(0, false);
 
         // 5c. Majority sign at each parameter position (+1, -1, or 0 when tied).
-        let maj_sign = sign(&vote).map_err(MergeError::from)?;
+        let maj_sign = vote.sign();
 
         // 5d. Agreement mask: 1.0 where sign(sparse_m[i]) == majority_sign[i], else 0.0.
         // maj_sign has shape [...]; MLX broadcasts it against signs [M, ...] automatically.
         let zero = Array::from_f32(0.0);
         let agreement = signs
             .multiply(&maj_sign)
-            .map_err(MergeError::from)?
-            .gt(&zero)
-            .map_err(MergeError::from)?
-            .as_type::<f32>()
-            .map_err(MergeError::from)?;
+            .greater(&zero)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
 
         // 5e. Compute weighted, agreement-masked contributions and reduce over models.
         // stacked_sparse * weights_bcast * agreement -> [M, ...] -> sum over axis 0 -> [...]
         let weighted_sum = stacked_sparse
             .multiply(&weights_bcast)
-            .map_err(MergeError::from)?
             .multiply(&agreement)
-            .map_err(MergeError::from)?
-            .sum_axis(0, None)
-            .map_err(MergeError::from)?;
+            .sum_axis(0, false);
 
         // --- Step 6: Scale by lambda and add to base.
-        let result = weighted_sum
-            .multiply(Array::from_f32(lambda))
-            .map_err(MergeError::from)?;
-        base.add(&result).map_err(MergeError::from)
+        let result = weighted_sum.multiply(&Array::from_f32(lambda));
+        Ok(base.add(&result))
     }
 
     /// Optimized CPU path using batch sparsification.
@@ -234,8 +225,8 @@ impl GpuMerger {
         // Step 1: Compute task vectors
         let task_vectors: Vec<Array> = tensors
             .iter()
-            .map(|t| t.subtract(base).map_err(MergeError::from))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|t| t.subtract(base))
+            .collect();
 
         // Step 2: Batch sparsify (uses O(n) quickselect)
         let sparse_vectors = crate::sparsify_batch_by_magnitude(&task_vectors, densities)?;
@@ -244,8 +235,8 @@ impl GpuMerger {
         let weighted_sum = crate::sign_consensus(&sparse_vectors, weights)?;
 
         // Step 4: Scale by lambda and add to base
-        let result = weighted_sum.multiply(Array::from_f32(lambda))?;
-        Ok(base.add(&result)?)
+        let result = weighted_sum.multiply(&Array::from_f32(lambda));
+        Ok(base.add(&result))
     }
 
     /// Standard CPU path for TIES merge.
@@ -260,8 +251,8 @@ impl GpuMerger {
         // Step 1: Compute task vectors
         let task_vectors: Vec<Array> = tensors
             .iter()
-            .map(|t| t.subtract(base).map_err(MergeError::from))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|t| t.subtract(base))
+            .collect();
 
         // Step 2: Sparsify each task vector
         let sparse_vectors: Vec<Array> = task_vectors
@@ -274,8 +265,8 @@ impl GpuMerger {
         let weighted_sum = crate::sign_consensus(&sparse_vectors, weights)?;
 
         // Step 4: Scale by lambda and add to base
-        let result = weighted_sum.multiply(Array::from_f32(lambda))?;
-        Ok(base.add(&result)?)
+        let result = weighted_sum.multiply(&Array::from_f32(lambda));
+        Ok(base.add(&result))
     }
 
     /// GPU-accelerated linear merge.
@@ -291,11 +282,11 @@ impl GpuMerger {
 
         // Linear merge is simple enough that GPU overhead isn't worth it for single tensors
         // Use MLX operations which may use GPU internally
-        let mut result = Array::zeros::<f32>(tensors[0].shape())?;
+        let mut result = Array::zeros(tensors[0].shape(), Dtype::Float32.as_i32());
 
         for (tensor, &weight) in tensors.iter().zip(weights.iter()) {
-            let weighted = tensor.multiply(Array::from_f32(weight))?;
-            result = result.add(&weighted)?;
+            let weighted = tensor.multiply(&Array::from_f32(weight));
+            result = result.add(&weighted);
         }
 
         Ok(result)
@@ -306,17 +297,17 @@ impl GpuMerger {
     /// Spherical linear interpolation between two tensors.
     pub fn slerp_merge(&self, tensor_a: &Array, tensor_b: &Array, t: f32) -> Result<Array> {
         // Compute dot product and norms
-        let a_flat = tensor_a.flatten(0, -1)?;
-        let b_flat = tensor_b.flatten(0, -1)?;
+        let a_flat = tensor_a.flatten(0, -1);
+        let b_flat = tensor_b.flatten(0, -1);
 
-        let dot = a_flat.multiply(&b_flat)?.sum(None)?;
-        let norm_a = a_flat.multiply(&a_flat)?.sum(None)?.sqrt()?;
-        let norm_b = b_flat.multiply(&b_flat)?.sum(None)?.sqrt()?;
+        let dot = a_flat.multiply(&b_flat).sum_all();
+        let norm_a = a_flat.multiply(&a_flat).sum_all().sqrt();
+        let norm_b = b_flat.multiply(&b_flat).sum_all().sqrt();
 
         // Get scalar values
-        let dot_val: f32 = dot.item();
-        let norm_a_val: f32 = norm_a.item();
-        let norm_b_val: f32 = norm_b.item();
+        let dot_val: f32 = dot.clone().item_f32();
+        let norm_a_val: f32 = norm_a.clone().item_f32();
+        let norm_b_val: f32 = norm_b.clone().item_f32();
 
         // Clamp to [-1, 1] for numerical stability
         let cos_omega = (dot_val / (norm_a_val * norm_b_val)).clamp(-1.0, 1.0);
@@ -329,20 +320,20 @@ impl GpuMerger {
             let coeff_a = Array::from_f32(1.0 - t);
             let coeff_b = Array::from_f32(t);
 
-            let result_a = tensor_a.multiply(coeff_a)?;
-            let result_b = tensor_b.multiply(coeff_b)?;
+            let result_a = tensor_a.multiply(&coeff_a);
+            let result_b = tensor_b.multiply(&coeff_b);
 
-            return Ok(result_a.add(&result_b)?);
+            return Ok(result_a.add(&result_b));
         }
 
         // SLERP coefficients
         let coeff_a = ((1.0 - t) * omega).sin() / sin_omega;
         let coeff_b = (t * omega).sin() / sin_omega;
 
-        let result_a = tensor_a.multiply(Array::from_f32(coeff_a))?;
-        let result_b = tensor_b.multiply(Array::from_f32(coeff_b))?;
+        let result_a = tensor_a.multiply(&Array::from_f32(coeff_a));
+        let result_b = tensor_b.multiply(&Array::from_f32(coeff_b));
 
-        Ok(result_a.add(&result_b)?)
+        Ok(result_a.add(&result_b))
     }
 }
 
@@ -398,9 +389,9 @@ mod tests {
     fn test_gpu_ties_merge() {
         let merger = GpuMerger::new().unwrap();
 
-        let base = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t1 = Array::from_slice(&[2.0_f32, 3.0, 4.0], &[3]);
-        let t2 = Array::from_slice(&[3.0_f32, 4.0, 5.0], &[3]);
+        let base = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t1 = Array::from_f32_slice(&[2.0_f32, 3.0, 4.0], &[3]);
+        let t2 = Array::from_f32_slice(&[3.0_f32, 4.0, 5.0], &[3]);
 
         let result = merger
             .ties_merge(&[t1, t2], &base, &[0.5, 0.5], &[1.0, 1.0], 1.0)
@@ -413,11 +404,11 @@ mod tests {
     fn test_gpu_linear_merge() {
         let merger = GpuMerger::new().unwrap();
 
-        let t1 = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t2 = Array::from_slice(&[3.0_f32, 4.0, 5.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t2 = Array::from_f32_slice(&[3.0_f32, 4.0, 5.0], &[3]);
 
-        let result = merger.linear_merge(&[t1, t2], &[0.5, 0.5]).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = merger.linear_merge(&[t1, t2], &[0.5, 0.5]).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
 
         // 0.5 * [1,2,3] + 0.5 * [3,4,5] = [2, 3, 4]
         assert!((result_slice[0] - 2.0).abs() < 1e-5);
@@ -429,18 +420,18 @@ mod tests {
     fn test_gpu_slerp_merge() {
         let merger = GpuMerger::new().unwrap();
 
-        let t1 = Array::from_slice(&[1.0_f32, 0.0, 0.0], &[3]);
-        let t2 = Array::from_slice(&[0.0_f32, 1.0, 0.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 0.0, 0.0], &[3]);
+        let t2 = Array::from_f32_slice(&[0.0_f32, 1.0, 0.0], &[3]);
 
         // At t=0, should be t1
-        let result = merger.slerp_merge(&t1, &t2, 0.0).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = merger.slerp_merge(&t1, &t2, 0.0).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
         assert!((result_slice[0] - 1.0).abs() < 1e-5);
         assert!(result_slice[1].abs() < 1e-5);
 
         // At t=1, should be t2
-        let result = merger.slerp_merge(&t1, &t2, 1.0).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = merger.slerp_merge(&t1, &t2, 1.0).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
         assert!(result_slice[0].abs() < 1e-5);
         assert!((result_slice[1] - 1.0).abs() < 1e-5);
     }

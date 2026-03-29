@@ -6,15 +6,8 @@
 //! - RMSNorm applied to Q and K before RoPE (q_norm, k_norm)
 //! - SwitchGLU-style expert MLP with gather_mm
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param},
-    nn,
-    ops::indexing::IndexOp,
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, Param, indexing, nn, ops, random};
+use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopeScaling, apply_rope},
@@ -165,7 +158,7 @@ impl Default for Qwen3MoEConfig {
 }
 
 /// Qwen3-MoE attention with Q/K normalization before RoPE.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3MoEAttention {
     /// Configuration.
     #[allow(dead_code)]
@@ -188,24 +181,20 @@ pub struct Qwen3MoEAttention {
     /// Effective RoPE base after scaling.
     effective_base: f32,
     /// Query projection.
-    #[param]
     pub q_proj: nn::Linear,
     /// Key projection.
-    #[param]
     pub k_proj: nn::Linear,
     /// Value projection.
-    #[param]
     pub v_proj: nn::Linear,
     /// Output projection.
-    #[param]
     pub o_proj: nn::Linear,
     /// Query normalization.
-    #[param]
     pub q_norm: nn::RmsNorm,
     /// Key normalization.
-    #[param]
     pub k_norm: nn::RmsNorm,
 }
+impl_module_params!(Qwen3MoEAttention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
+
 
 impl Qwen3MoEAttention {
     /// Create a new attention layer.
@@ -276,23 +265,23 @@ impl Qwen3MoEAttention {
         let mut cache = cache;
 
         // Project Q, K, V
-        let mut q = self.q_proj.forward(x)?;
-        let mut k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let mut q = self.q_proj.forward(x);
+        let mut k = self.k_proj.forward(x);
+        let v = self.v_proj.forward(x);
 
         // Reshape and apply per-head normalization
-        q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?;
-        k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
+        q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
+        k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // Apply Q/K normalization (Qwen3 specific)
-        q = self.q_norm.forward(&q)?;
-        k = self.k_norm.forward(&k)?;
+        q = self.q_norm.forward(&q);
+        k = self.k_norm.forward(&k);
 
         // Transpose to [batch, heads, seq, head_dim]
-        q = q.transpose_axes(&[0, 2, 1, 3])?;
-        k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        q = q.transpose_axes(&[0, 2, 1, 3]);
+        k = k.transpose_axes(&[0, 2, 1, 3]);
+        let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Apply RoPE
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
@@ -325,11 +314,10 @@ impl Qwen3MoEAttention {
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
                 if let Some(output) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
-                {
-                    let output = output.transpose_axes(&[0, 2, 1, 3])?;
-                    let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
-                    return self.o_proj.forward(&output);
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)? {
+                    let output = output.transpose_axes(&[0, 2, 1, 3]);
+                    let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
+                    return Ok(self.o_proj.forward(&output));
                 }
             }
         }
@@ -344,26 +332,25 @@ impl Qwen3MoEAttention {
         let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
 
         // Transpose back and project
-        let output = output.transpose_axes(&[0, 2, 1, 3])?;
-        let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
+        let output = output.transpose_axes(&[0, 2, 1, 3]);
+        let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
 
-        self.o_proj.forward(&output)
+        Ok(self.o_proj.forward(&output))
     }
 }
 
 /// Dense MLP for non-MoE layers.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3MoEDenseMLP {
     /// Gate projection.
-    #[param]
     pub gate_proj: nn::Linear,
     /// Up projection.
-    #[param]
     pub up_proj: nn::Linear,
     /// Down projection.
-    #[param]
     pub down_proj: nn::Linear,
 }
+impl_module_params!(Qwen3MoEDenseMLP; gate_proj, up_proj, down_proj);
+
 
 impl Qwen3MoEDenseMLP {
     /// Create a new MLP.
@@ -387,11 +374,11 @@ impl Qwen3MoEDenseMLP {
 
     /// Forward pass through MLP.
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
+        let gate = self.gate_proj.forward(x);
+        let up = self.up_proj.forward(x);
         // SwiGLU: silu(gate) * up
-        let activated = nn::silu(&gate)?.multiply(&up)?;
-        self.down_proj.forward(&activated)
+        let activated = nn::silu(&gate).multiply(&up);
+        Ok(self.down_proj.forward(&activated))
     }
 }
 
@@ -399,7 +386,7 @@ impl Qwen3MoEDenseMLP {
 ///
 /// Uses cached stacked expert weights plus GPU batched gathers/matmuls for the main inference path.
 /// The cache is rebuilt automatically when the underlying expert weight handles change.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3MoEBlock {
     /// Number of experts.
     pub num_experts: usize,
@@ -408,10 +395,8 @@ pub struct Qwen3MoEBlock {
     /// Whether to normalize top-k probabilities.
     pub norm_topk_prob: bool,
     /// Gate projection (routes to experts).
-    #[param]
     pub gate: nn::Linear,
     /// Expert MLPs.
-    #[param]
     pub experts: Vec<pmetal_mlx::moe::Expert>,
     /// Stacked gate projection weights `[num_experts, hidden, intermediate]`.
     pub stacked_gate_proj: Option<Array>,
@@ -422,6 +407,8 @@ pub struct Qwen3MoEBlock {
     /// Signature of the currently stacked expert weight handles.
     pub stacked_weight_signature: Option<Vec<usize>>,
 }
+impl_module_params!(Qwen3MoEBlock; gate, experts);
+
 
 impl Qwen3MoEBlock {
     /// Create a new MoE block.
@@ -453,9 +440,9 @@ impl Qwen3MoEBlock {
     fn current_stacked_weight_signature(&self) -> Vec<usize> {
         let mut signature = Vec::with_capacity(self.experts.len() * 3);
         for expert in &self.experts {
-            signature.push(expert.w1.weight.as_ref().as_ptr().ctx as usize);
-            signature.push(expert.w3.weight.as_ref().as_ptr().ctx as usize);
-            signature.push(expert.w2.weight.as_ref().as_ptr().ctx as usize);
+            signature.push(expert.w1.weight.as_ref().data_ptr() as usize);
+            signature.push(expert.w3.weight.as_ref().data_ptr() as usize);
+            signature.push(expert.w2.weight.as_ref().data_ptr() as usize);
         }
         signature
     }
@@ -476,14 +463,10 @@ impl Qwen3MoEBlock {
             .iter()
             .map(|expert| expert.w2.weight.as_ref().t())
             .collect();
-        let gate_weight_refs: Vec<&Array> = gate_weights.iter().collect();
-        let up_weight_refs: Vec<&Array> = up_weights.iter().collect();
-        let down_weight_refs: Vec<&Array> = down_weights.iter().collect();
-
         Ok((
-            mlx_rs::ops::stack_axis(&gate_weight_refs, 0)?,
-            mlx_rs::ops::stack_axis(&up_weight_refs, 0)?,
-            mlx_rs::ops::stack_axis(&down_weight_refs, 0)?,
+            pmetal_bridge::compat::ops::stack_axis(&gate_weights, 0),
+            pmetal_bridge::compat::ops::stack_axis(&up_weights, 0),
+            pmetal_bridge::compat::ops::stack_axis(&down_weights, 0),
         ))
     }
 
@@ -495,11 +478,11 @@ impl Qwen3MoEBlock {
             || self.stacked_weight_signature.as_ref() != Some(&signature);
 
         if needs_refresh {
-            let (stacked_gate_proj, stacked_up_proj, stacked_down_proj) =
+            let (mut stacked_gate_proj, mut stacked_up_proj, mut stacked_down_proj) =
                 self.stack_expert_weights()?;
-            stacked_gate_proj.eval()?;
-            stacked_up_proj.eval()?;
-            stacked_down_proj.eval()?;
+            stacked_gate_proj.eval();
+            stacked_up_proj.eval();
+            stacked_down_proj.eval();
             self.stacked_gate_proj = Some(stacked_gate_proj);
             self.stacked_up_proj = Some(stacked_up_proj);
             self.stacked_down_proj = Some(stacked_down_proj);
@@ -525,24 +508,24 @@ impl Qwen3MoEBlock {
         let batch_seq = hidden_flat.dim(0);
         let hidden_size = hidden_flat.dim(1);
 
-        let gate_logits = self.gate.forward(hidden_flat)?;
-        let gate_logits_f32 = if gate_logits.dtype() != mlx_rs::Dtype::Float32 {
-            gate_logits.as_type::<f32>()?
+        let gate_logits = self.gate.forward(hidden_flat);
+        let gate_logits_f32 = if gate_logits.dtype() != pmetal_bridge::compat::Dtype::Float32 {
+            gate_logits.as_type::<f32>()
         } else {
             gate_logits
         };
-        let routing_probs = mlx_rs::ops::softmax_axis(&gate_logits_f32, -1, None)?;
+        let routing_probs = pmetal_bridge::compat::ops::softmax_axis(&gate_logits_f32, -1);
 
         let top_k = self.top_k as i32;
         let neg_k = -top_k;
-        let part_indices = mlx_rs::ops::argpartition_axis(&routing_probs, neg_k, -1)?;
-        let top_indices = part_indices.index((.., neg_k..)).as_type::<i32>()?;
-        let top_weights = routing_probs.take_along_axis(&top_indices, -1)?;
+        let part_indices = pmetal_bridge::compat::ops::argpartition_axis(&routing_probs, neg_k, -1);
+        let top_indices = pmetal_bridge::compat::ops::slice_last_from(&part_indices, neg_k).as_type::<i32>();
+        let top_weights = routing_probs.take_along_axis(&top_indices, -1);
 
         let normalized_weights = if self.norm_topk_prob {
-            let weight_sum = top_weights.sum_axis(-1, Some(true))?;
-            let safe_sum = mlx_rs::ops::maximum(&weight_sum, &Array::from_f32(1e-8))?;
-            top_weights.divide(&safe_sum)?
+            let weight_sum = top_weights.sum_axis(-1, true);
+            let safe_sum = pmetal_bridge::compat::ops::maximum(&weight_sum, &Array::from_f32(1e-8));
+            top_weights.divide(&safe_sum)
         } else {
             top_weights
         };
@@ -555,12 +538,12 @@ impl Qwen3MoEBlock {
         let shape = x.shape();
         let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
         let hidden_size = shape[shape.len() - 1];
-        let hidden_flat = x.reshape(&[batch_seq, hidden_size])?;
+        let hidden_flat = x.reshape(&[batch_seq, hidden_size]);
         let (_batch_seq, _hidden_size, top_indices, normalized_weights) =
             self.route_topk(&hidden_flat)?;
 
-        top_indices.eval()?;
-        normalized_weights.eval()?;
+        top_indices.eval();
+        normalized_weights.eval();
 
         let n_tokens = batch_seq as usize;
         let expert_indices: Vec<i32> = top_indices.as_slice().to_vec();
@@ -579,7 +562,7 @@ impl Qwen3MoEBlock {
         }
 
         let mut final_output =
-            mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
+            pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
         for (expert_idx, assignments) in expert_assignments.iter().enumerate() {
             if assignments.is_empty() {
                 continue;
@@ -590,16 +573,16 @@ impl Qwen3MoEBlock {
 
             let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
             let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
-            let expert_input = hidden_flat.take_axis(&idx_array, 0)?;
-            let expert_out = self.experts[expert_idx].forward(&expert_input)?;
-            let weighted_out = expert_out.multiply(&weight_array)?;
-            let updates_3d = weighted_out.reshape(&[token_indices.len() as i32, 1, hidden_size])?;
-            final_output = mlx_rs::ops::indexing::scatter_add_single(
+            let expert_input = hidden_flat.take_axis(&idx_array, 0);
+            let expert_out = self.experts[expert_idx].forward(&expert_input);
+            let weighted_out = expert_out.multiply(&weight_array);
+            let updates_3d = weighted_out.reshape(&[token_indices.len() as i32, 1, hidden_size]);
+            final_output = pmetal_bridge::compat::indexing::scatter_add_single(
                 &final_output,
                 &idx_array,
                 &updates_3d,
                 0,
-            )?;
+            );
         }
 
         let mut output_shape = shape.to_vec();
@@ -608,53 +591,53 @@ impl Qwen3MoEBlock {
     }
 
     fn batched_matmul(&self, x: &Array, w: &Array) -> Result<Array, Exception> {
-        let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)])?;
-        let result = mlx_rs::ops::matmul(&x_expanded, w)?;
-        result.squeeze_axes(&[1])
+        let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)]);
+        let result = pmetal_bridge::compat::ops::matmul(&x_expanded, w);
+        Ok(result.squeeze_axes(&[1]))
     }
 
     fn forward_stacked(&mut self, x: &Array) -> Result<Array, Exception> {
-        self.ensure_stacked_moe()?;
+        self.ensure_stacked_moe();
 
         let shape = x.shape();
         let hidden_flat = x.reshape(&[
             shape[..shape.len() - 1].iter().product(),
             shape[shape.len() - 1],
-        ])?;
+        ]);
         let (batch_seq, hidden_size, top_indices, normalized_weights) =
             self.route_topk(&hidden_flat)?;
         let top_k = self.top_k as i32;
-        let mut output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
+        let mut output = pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
         for slot in 0..top_k {
-            let slot_experts = top_indices.index((.., slot));
-            let slot_weights = normalized_weights.index((.., slot..slot + 1));
+            let slot_experts = pmetal_bridge::compat::ops::select_axis(&top_indices, -1, slot);
+            let slot_weights = pmetal_bridge::compat::ops::slice_axis(&normalized_weights, -1, slot, slot + 1);
 
             let gate_weights = self
                 .stacked_gate_proj
                 .as_ref()
                 .unwrap()
-                .take_axis(&slot_experts, 0)?;
+                .take_axis(&slot_experts, 0);
             let up_weights = self
                 .stacked_up_proj
                 .as_ref()
                 .unwrap()
-                .take_axis(&slot_experts, 0)?;
+                .take_axis(&slot_experts, 0);
             let down_weights = self
                 .stacked_down_proj
                 .as_ref()
                 .unwrap()
-                .take_axis(&slot_experts, 0)?;
+                .take_axis(&slot_experts, 0);
 
             let gate_out = self.batched_matmul(&hidden_flat, &gate_weights)?;
             let up_out = self.batched_matmul(&hidden_flat, &up_weights)?;
-            let activated = nn::silu(&gate_out)?.multiply(&up_out)?;
+            let activated = nn::silu(&gate_out).multiply(&up_out);
             let slot_out = self.batched_matmul(&activated, &down_weights)?;
-            output = output.add(&slot_out.multiply(&slot_weights)?)?;
+            output = output.add(&slot_out.multiply(&slot_weights));
         }
 
         let mut output_shape = shape.to_vec();
         output_shape[shape.len() - 1] = hidden_size;
-        output.reshape(&output_shape)
+        Ok(output.reshape(&output_shape))
     }
 
     /// Forward pass using the stacked batched-gather path.
@@ -753,28 +736,27 @@ impl Qwen3MoEFeedForward {
 }
 
 /// Qwen3-MoE decoder layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3MoEDecoderLayer {
     /// Configuration.
     pub config: Qwen3MoEConfig,
     /// Self-attention.
-    #[param]
     pub self_attn: Qwen3MoEAttention,
     /// Input layer norm.
-    #[param]
     pub input_layernorm: nn::RmsNorm,
     /// Post-attention layer norm.
-    #[param]
     pub post_attention_layernorm: nn::RmsNorm,
     /// Feed-forward (MLP or MoE).
-    #[param]
     pub ffn: Qwen3MoEFeedForward,
 }
+impl_module_params!(Qwen3MoEDecoderLayer; self_attn, input_layernorm, post_attention_layernorm, ffn);
+
 
 impl Qwen3MoEDecoderLayer {
     /// Create a new decoder layer.
     pub fn new(config: Qwen3MoEConfig, layer_idx: usize) -> Result<Self, Exception> {
         let self_attn = Qwen3MoEAttention::new(config.clone())?;
+
 
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
@@ -810,14 +792,14 @@ impl Qwen3MoEDecoderLayer {
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, Exception> {
         // Self-attention with residual
-        let normed = self.input_layernorm.forward(x)?;
+        let normed = self.input_layernorm.forward(x);
         let attn_out = self.self_attn.forward(&normed, mask, cache)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         // FFN with residual
-        let normed = self.post_attention_layernorm.forward(&h)?;
+        let normed = self.post_attention_layernorm.forward(&h);
         let ffn_out = self.ffn.forward(&normed)?;
-        h.add(&ffn_out)
+        Ok(h.add(&ffn_out))
     }
 
     /// Eagerly build stacked expert caches for this layer's MoE path.
@@ -827,20 +809,19 @@ impl Qwen3MoEDecoderLayer {
 }
 
 /// Qwen3-MoE base model (without LM head).
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3MoEModel {
     /// Configuration.
     pub config: Qwen3MoEConfig,
     /// Token embeddings.
-    #[param]
     pub embed_tokens: nn::Embedding,
     /// Transformer layers.
-    #[param]
     pub layers: Vec<Qwen3MoEDecoderLayer>,
     /// Final layer norm.
-    #[param]
     pub norm: nn::RmsNorm,
 }
+impl_module_params!(Qwen3MoEModel; embed_tokens, layers, norm);
+
 
 impl Qwen3MoEModel {
     /// Create a new model.
@@ -871,7 +852,7 @@ impl Qwen3MoEModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        let mut h = self.embed_tokens.forward(input_ids)?;
+        let mut h = self.embed_tokens.forward(input_ids);
 
         match cache {
             Some(cache) => {
@@ -886,13 +867,13 @@ impl Qwen3MoEModel {
             }
         }
 
-        self.norm.forward(&h)
+        Ok(self.norm.forward(&h))
     }
 
     /// Eagerly build stacked expert caches for all MoE layers.
     pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
         for layer in &mut self.layers {
-            layer.init_stacked_moe()?;
+            layer.init_stacked_moe();
         }
         Ok(())
     }
@@ -902,22 +883,23 @@ impl Qwen3MoEModel {
 ///
 /// C7: When `tie_word_embeddings` is true, `lm_head` is `None` and the
 /// forward pass uses the embedding weight directly for the language model head.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3MoE {
     /// Configuration.
     pub config: Qwen3MoEConfig,
     /// Base model.
-    #[param]
     pub model: Qwen3MoEModel,
     /// LM head (None when tied to embedding weights).
-    #[param]
     pub lm_head: Option<nn::Linear>,
 }
+impl_module_params!(Qwen3MoE; model, lm_head);
+
 
 impl Qwen3MoE {
     /// Create a new model.
     pub fn new(config: Qwen3MoEConfig) -> Result<Self, Exception> {
         let model = Qwen3MoEModel::new(config.clone())?;
+
 
         let lm_head = if config.tie_word_embeddings {
             // When tied, we use embed_tokens weight in forward - no separate lm_head
@@ -947,12 +929,12 @@ impl Qwen3MoE {
         let hidden_states = self.model.forward(input_ids, mask, cache)?;
 
         if let Some(ref mut head) = self.lm_head {
-            head.forward(&hidden_states)
+            Ok(head.forward(&hidden_states))
         } else {
             // Tied embeddings: use embed_tokens weight as linear projection
             // embed_tokens.weight is [vocab, hidden], so logits = hidden @ weight.T
             let embed_weight = self.model.embed_tokens.weight.value.as_ref();
-            hidden_states.matmul(&embed_weight.t())
+            Ok(hidden_states.matmul(&embed_weight.t()))
         }
     }
 
@@ -1031,7 +1013,7 @@ mod tests {
         let mut ffn = Qwen3MoEFeedForward::Dense(
             Qwen3MoEDenseMLP::new(config.hidden_size, config.intermediate_size).unwrap(),
         );
-        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
+        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
             .unwrap();
         let out = ffn.forward(&x).unwrap();
         assert_eq!(out.shape(), &[1, 4, config.hidden_size]);
@@ -1042,7 +1024,7 @@ mod tests {
     fn test_feed_forward_moe_dispatch() {
         let config = tiny_moe_config();
         let mut ffn = Qwen3MoEFeedForward::MoE(Qwen3MoEBlock::new(&config).unwrap());
-        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
+        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
             .unwrap();
         let out = ffn.forward(&x).unwrap();
         assert_eq!(out.shape(), &[1, 4, config.hidden_size]);
@@ -1115,7 +1097,7 @@ mod tests {
     fn test_moe_block_forward_shape() {
         let config = tiny_moe_config();
         let mut block = Qwen3MoEBlock::new(&config).unwrap();
-        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
+        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
             .unwrap();
         let out = block.forward(&x).unwrap();
         assert_eq!(out.shape(), &[2, 5, config.hidden_size]);
@@ -1126,7 +1108,7 @@ mod tests {
     fn test_moe_block_stacked_matches_per_expert_path() {
         let config = tiny_moe_config();
         let mut block = Qwen3MoEBlock::new(&config).unwrap();
-        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
+        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
             .unwrap();
 
         let reference = block.forward_per_expert(&x).unwrap();
@@ -1155,14 +1137,14 @@ mod tests {
     fn test_moe_block_stacked_cache_refreshes_after_weight_change() {
         let config = tiny_moe_config();
         let mut block = Qwen3MoEBlock::new(&config).unwrap();
-        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
+        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
             .unwrap();
 
         let _ = block.forward(&x).unwrap();
         assert!(block.has_stacked_moe());
 
         block.experts[0].w1.weight = Param::new(
-            Array::zeros::<f32>(&[config.get_moe_intermediate_size(), config.hidden_size]).unwrap(),
+            Array::zeros_f32(&[config.get_moe_intermediate_size(), config.hidden_size]),
         );
 
         let reference = block.forward_per_expert(&x).unwrap();

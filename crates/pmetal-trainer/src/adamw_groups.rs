@@ -22,13 +22,12 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::{
+use pmetal_bridge::compat::{
     Array, array,
-    builder::Builder,
-    error::{Exception, Result},
-    optimizers::{AdamW, AdamWBuilder, Optimizer, State},
-    utils::Updatable,
+    Exception,
+    optimizers::{AdamW, AdamWBuilder, Optimizer, State, Updatable},
 };
+type Result<T> = std::result::Result<T, Exception>;
 
 use crate::ParameterGroupConfig;
 
@@ -162,10 +161,10 @@ impl AdamWGroups {
     /// Get the learning rates used by this optimizer.
     ///
     /// Returns `(base_lr, embedding_lr)`.
-    pub fn learning_rates(&self) -> (f32, f32) {
+    pub fn learning_rates(&mut self) -> (f32, f32) {
         (
-            self.lora_optimizer.lr.item(),
-            self.embedding_optimizer.lr.item(),
+            self.lora_optimizer.lr.item_f32(),
+            self.embedding_optimizer.lr.item_f32(),
         )
     }
 
@@ -180,8 +179,8 @@ impl AdamWGroups {
     /// - LoRA B (LoRA+): `base_lr * loraplus_ratio`
     /// - No-decay: `base_lr` (no ratio)
     pub fn set_learning_rate(&mut self, base_lr: f32) {
-        let current_base: f32 = self.lora_optimizer.lr.item();
-        let current_embedding: f32 = self.embedding_optimizer.lr.item();
+        let current_base: f32 = self.lora_optimizer.lr.item_f32();
+        let current_embedding: f32 = self.embedding_optimizer.lr.item_f32();
 
         // Maintain the embedding ratio relative to the base LR
         let emb_ratio = if (current_base - current_embedding).abs() < 1e-10 {
@@ -200,7 +199,7 @@ impl AdamWGroups {
 
         // LoRA B optimizer maintains its ratio relative to the base LR
         if let Some(ref mut b_opt) = self.loraplus_b_optimizer {
-            let current_b: f32 = b_opt.lr.item();
+            let current_b: f32 = b_opt.lr.item_f32();
             let b_ratio = if current_base > 1e-10 {
                 current_b / current_base
             } else {
@@ -211,14 +210,14 @@ impl AdamWGroups {
     }
 
     /// Get summary of parameter grouping.
-    pub fn summary(&self) -> String {
+    pub fn summary(&mut self) -> String {
         let (base_lr, emb_lr) = self.learning_rates();
         let lora_count = self.lora_optimizer.state.len();
         let emb_count = self.embedding_optimizer.state.len();
         let no_decay_count = self.no_decay_optimizer.state.len();
 
-        if let Some(ref b_opt) = self.loraplus_b_optimizer {
-            let b_lr: f32 = b_opt.lr.item();
+        if let Some(ref mut b_opt) = self.loraplus_b_optimizer {
+            let b_lr: f32 = b_opt.lr.item_f32();
             let b_count = b_opt.state.len();
             format!(
                 "AdamWGroups(LoRA+): {} A params (lr={:.2e}), {} B params (lr={:.2e}), \
@@ -300,7 +299,7 @@ impl Updatable for AdamWGroups {
             + self.no_decay_optimizer.updatable_states_len()
     }
 
-    fn updatable_states(&self) -> impl IntoIterator<Item = &Array> {
+    fn updatable_states(&self) -> Vec<&Array> {
         let b_states: Box<dyn Iterator<Item = &Array>> =
             if let Some(ref b_opt) = self.loraplus_b_optimizer {
                 Box::new(b_opt.updatable_states().into_iter())
@@ -314,9 +313,10 @@ impl Updatable for AdamWGroups {
             .chain(b_states)
             .chain(self.embedding_optimizer.updatable_states())
             .chain(self.no_decay_optimizer.updatable_states())
+            .collect()
     }
 
-    fn updatable_states_mut(&mut self) -> impl IntoIterator<Item = &mut Array> {
+    fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
         let b_states: Box<dyn Iterator<Item = &mut Array>> =
             if let Some(ref mut b_opt) = self.loraplus_b_optimizer {
                 Box::new(b_opt.updatable_states_mut().into_iter())
@@ -330,6 +330,7 @@ impl Updatable for AdamWGroups {
             .chain(b_states)
             .chain(self.embedding_optimizer.updatable_states_mut())
             .chain(self.no_decay_optimizer.updatable_states_mut())
+            .collect()
     }
 }
 
@@ -480,11 +481,10 @@ impl AdamWGroupsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::Array;
 
     #[test]
     fn test_adamw_groups_creation() {
-        let optimizer = AdamWGroupsBuilder::new(2e-4)
+        let mut optimizer = AdamWGroupsBuilder::new(2e-4)
             .with_embedding_lr(5e-5)
             .with_weight_decay(0.01)
             .build()

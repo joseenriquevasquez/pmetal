@@ -20,6 +20,7 @@
 //! 2. Flash Attention (for regular batches) - efficient for long sequences
 //! 3. Standard SDPA - fallback for maximum compatibility
 
+use pmetal_bridge::compat::{Array, ops};
 use pmetal_core::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -269,12 +270,12 @@ impl AttentionDispatcher {
     /// Tuple of (attention output [batch, num_heads, seq_len, head_dim], backend used)
     pub fn dispatch(
         &self,
-        q: &mlx_rs::Array,
-        k: &mlx_rs::Array,
-        v: &mlx_rs::Array,
+        q: &Array,
+        k: &Array,
+        v: &Array,
         seq_info: &SequenceInfo,
         config: &AttentionConfig,
-    ) -> Result<(mlx_rs::Array, AttentionBackend)> {
+    ) -> Result<(Array, AttentionBackend)> {
         let (backend, reason) = self.select_backend(seq_info, config);
 
         if self.verbose {
@@ -294,7 +295,7 @@ impl AttentionDispatcher {
         // Both MlxFast and Standard paths share the same mask construction logic;
         // the MlxFast path can also use the built-in causal string shortcut, but
         // passing an explicit array works equally well and keeps the code uniform.
-        let mask: Option<mlx_rs::Array> = if config.is_causal {
+        let mask: Option<Array> = if config.is_causal {
             Some(create_causal_mask_array(seq_len))
         } else {
             config
@@ -302,33 +303,14 @@ impl AttentionDispatcher {
                 .map(|window| create_sliding_window_mask(seq_len, window as i32))
         };
 
-        // Helper: call mlx_rs fast SDPA with correct mask type conversion
-        let fast_sdpa = |q: &mlx_rs::Array,
-                         k: &mlx_rs::Array,
-                         v: &mlx_rs::Array,
+        // Helper: call bridge SDPA
+        let fast_sdpa = |q: &Array,
+                         k: &Array,
+                         v: &Array,
                          scale: f32,
-                         mask: &Option<mlx_rs::Array>|
-         -> std::result::Result<mlx_rs::Array, pmetal_core::PMetalError> {
-            let result = if let Some(m) = mask {
-                mlx_rs::fast::scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    scale,
-                    m,
-                    Option::<&mlx_rs::Array>::None,
-                )
-            } else {
-                mlx_rs::fast::scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    scale,
-                    Option::<mlx_rs::fast::ScaledDotProductAttentionMask>::None,
-                    Option::<&mlx_rs::Array>::None,
-                )
-            };
-            result.map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))
+                         mask: &Option<Array>|
+         -> std::result::Result<Array, pmetal_core::PMetalError> {
+            Ok(q.sdpa_with_mask(k, v, scale, mask.as_ref()))
         };
 
         let output = match backend {
@@ -342,36 +324,25 @@ impl AttentionDispatcher {
             // passing to dispatch; we simply compute the full attention here.
             AttentionBackend::Standard => {
                 // scores = Q @ K^T  →  [batch, num_heads, seq_len_q, seq_len_k]
-                let k_t = k
-                    .transpose_axes(&[0, 1, 3, 2])
-                    .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
-                let scores = q
-                    .matmul(&k_t)
-                    .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
+                let k_t = k.transpose_axes(&[0, 1, 3, 2]);
+                let scores = q.matmul(&k_t);
 
                 // Scale
-                let scale_arr = mlx_rs::Array::from_f32(scale);
-                let scores = scores
-                    .multiply(&scale_arr)
-                    .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
+                let scale_arr = Array::from_f32(scale);
+                let scores = scores.multiply(&scale_arr);
 
                 // Apply additive mask (if any)
                 let scores = if let Some(ref m) = mask {
-                    scores
-                        .add(m)
-                        .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?
+                    scores.add(m)
                 } else {
                     scores
                 };
 
                 // Softmax over key dimension (axis = -1)
-                let weights = mlx_rs::ops::softmax_axis(&scores, -1, None)
-                    .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
+                let weights = scores.softmax(-1);
 
                 // output = weights @ V  →  [batch, num_heads, seq_len_q, head_dim]
-                weights
-                    .matmul(v)
-                    .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?
+                weights.matmul(v)
             }
 
             // VarLen: packed sequence attention is handled at a higher level using
@@ -408,7 +379,7 @@ impl AttentionDispatcher {
                 };
 
                 crate::kernels::fused_attention::fused_sdpa(q, k, v, &fused_config, None)
-                    .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?
+                    .map_err(|e: pmetal_bridge::compat::Exception| pmetal_core::PMetalError::Mlx(e.to_string()))?
             }
         };
 
@@ -489,20 +460,20 @@ pub fn create_causal_mask(seq_len: usize) -> Vec<Vec<bool>> {
 /// Create a causal attention mask as an Array.
 ///
 /// Returns a mask where valid positions are 0.0 and masked positions are -inf.
-pub fn create_causal_mask_array(seq_len: i32) -> mlx_rs::Array {
+pub fn create_causal_mask_array(seq_len: i32) -> Array {
     let mut mask_data = vec![0.0f32; (seq_len * seq_len) as usize];
     for i in 0..seq_len {
         for j in (i + 1)..seq_len {
             mask_data[(i * seq_len + j) as usize] = f32::NEG_INFINITY;
         }
     }
-    mlx_rs::Array::from_slice(&mask_data, &[seq_len, seq_len])
+    Array::from_f32_slice(&mask_data, &[seq_len, seq_len])
 }
 
 /// Create a sliding window causal mask.
 ///
 /// Tokens can only attend to the last `window_size` tokens.
-pub fn create_sliding_window_mask(seq_len: i32, window_size: i32) -> mlx_rs::Array {
+pub fn create_sliding_window_mask(seq_len: i32, window_size: i32) -> Array {
     let mut mask_data = vec![f32::NEG_INFINITY; (seq_len * seq_len) as usize];
     for i in 0..seq_len {
         let start = (i - window_size + 1).max(0);
@@ -510,7 +481,7 @@ pub fn create_sliding_window_mask(seq_len: i32, window_size: i32) -> mlx_rs::Arr
             mask_data[(i * seq_len + j) as usize] = 0.0;
         }
     }
-    mlx_rs::Array::from_slice(&mask_data, &[seq_len, seq_len])
+    Array::from_f32_slice(&mask_data, &[seq_len, seq_len])
 }
 
 #[cfg(test)]
@@ -625,9 +596,9 @@ mod tests {
     #[test]
     #[allow(clippy::identity_op)]
     fn test_sliding_window_mask() {
-        let mask = create_sliding_window_mask(5, 2);
-        mask.eval().unwrap();
-        let data: Vec<f32> = mask.as_slice().to_vec();
+        let mut mask = create_sliding_window_mask(5, 2);
+        mask.eval();
+        let data: Vec<f32> = mask.to_f32_vec(mask.size()).unwrap_or_default();
 
         // Position 0 can only attend to 0
         assert_eq!(data[0], 0.0);

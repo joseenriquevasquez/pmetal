@@ -15,7 +15,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result, sign_consensus, sparsify_by_magnitude};
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 
 /// TIES merge implementation.
 #[derive(Debug, Clone, Default)]
@@ -29,7 +29,7 @@ impl TiesMerge {
 
     /// Compute task vector (delta from base).
     fn task_vector(tensor: &Array, base: &Array) -> Result<Array> {
-        Ok(tensor.subtract(base)?)
+        Ok(tensor.subtract(base))
     }
 
     /// Apply TIES-Merging to task vectors.
@@ -82,7 +82,7 @@ impl TiesMerge {
         let result = sign_consensus(&sparse_vectors, weights)?;
 
         // Step 3: Scale by lambda
-        let result = result.multiply(Array::from_f32(lambda))?;
+        let result = result.multiply(&Array::from_f32(lambda));
 
         Ok(result)
     }
@@ -135,7 +135,7 @@ impl MergeMethod for TiesMerge {
         let merged_delta = Self::merge_task_vectors(&task_vectors, &densities, &weights, lambda)?;
 
         // Add back to base
-        Ok(base.add(&merged_delta)?)
+        Ok(base.add(&merged_delta))
     }
 }
 
@@ -145,11 +145,12 @@ mod tests {
 
     #[test]
     fn test_task_vector() {
-        let tensor = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let base = Array::from_slice(&[0.5_f32, 1.0, 1.5], &[3]);
+        let tensor = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let base = Array::from_f32_slice(&[0.5_f32, 1.0, 1.5], &[3]);
 
         let tv = TiesMerge::task_vector(&tensor, &base).unwrap();
-        let tv_slice: Vec<f32> = tv.as_slice().to_vec();
+        let mut tv = tv;
+        let tv_slice = tv.to_f32_vec(3).unwrap();
 
         assert!((tv_slice[0] - 0.5).abs() < 1e-5);
         assert!((tv_slice[1] - 1.0).abs() < 1e-5);
@@ -160,9 +161,9 @@ mod tests {
     fn test_ties_preserves_base_with_zero_lambda() {
         let merge = TiesMerge::new();
 
-        let base = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t1 = Array::from_slice(&[2.0_f32, 3.0, 4.0], &[3]);
-        let t2 = Array::from_slice(&[3.0_f32, 4.0, 5.0], &[3]);
+        let base = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t1 = Array::from_f32_slice(&[2.0_f32, 3.0, 4.0], &[3]);
+        let t2 = Array::from_f32_slice(&[3.0_f32, 4.0, 5.0], &[3]);
 
         let params = vec![
             MergeParameters {
@@ -185,8 +186,10 @@ mod tests {
         let result = merge
             .merge(&[t1, t2], Some(&base), &params, &global)
             .unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
-        let base_slice: Vec<f32> = base.as_slice().to_vec();
+        let mut result = result;
+        let result_slice = result.to_f32_vec(3).unwrap();
+        let mut base_clone = base.clone();
+        let base_slice = base_clone.to_f32_vec(3).unwrap();
 
         // With lambda=0, result should equal base
         for (r, b) in result_slice.iter().zip(base_slice.iter()) {
@@ -198,8 +201,8 @@ mod tests {
     fn test_ties_with_full_density() {
         let merge = TiesMerge::new();
 
-        let base = Array::from_slice(&[0.0_f32, 0.0, 0.0], &[3]);
-        let t1 = Array::from_slice(&[1.0_f32, 1.0, 1.0], &[3]);
+        let base = Array::from_f32_slice(&[0.0_f32, 0.0, 0.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 1.0, 1.0], &[3]);
 
         let params = vec![MergeParameters {
             weight: Some(1.0_f32.into()),
@@ -215,7 +218,8 @@ mod tests {
         let result = merge
             .merge(std::slice::from_ref(&t1), Some(&base), &params, &global)
             .unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = result;
+        let result_slice = result.to_f32_vec(3).unwrap();
 
         // With single model, full density, lambda=1: should equal t1
         for (i, r) in result_slice.iter().enumerate() {

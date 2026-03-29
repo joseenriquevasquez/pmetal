@@ -9,7 +9,7 @@ repository.workspace = true
 [features]
 default = []
 # MLX distributed C API wrappers (JACCL/Ring/RDMA backends)
-mlx-collectives = ["dep:mlx-rs", "dep:mlx-sys"]
+mlx-collectives = ["dep:pmetal-bridge"]
 # Weight sharding, distributed linear layers
 tensor-parallel = ["mlx-collectives"]
 # MoE expert dispatch across nodes
@@ -66,9 +66,8 @@ parking_lot = "0.12"
 half = { workspace = true }
 ordered-float = "5"
 
-# MLX bindings (optional — gated behind mlx-collectives feature)
-mlx-rs = { workspace = true, optional = true }
-mlx-sys = { workspace = true, optional = true }
+# MLX bridge (optional — gated behind mlx-collectives feature)
+pmetal-bridge = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

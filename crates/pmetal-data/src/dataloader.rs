@@ -1,6 +1,6 @@
 //! DataLoader for creating training batches.
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, ops as mlx_ops};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use crate::image_processing::MllamaImageProcessor;
 pub enum DataLoaderError {
     /// Failed to convert batch contents into MLX arrays.
     #[error("failed to create MLX arrays for batch: {0}")]
-    Mlx(#[from] mlx_rs::error::Exception),
+    Mlx(#[from] pmetal_bridge::compat::Exception),
     /// Failed to preprocess an image for a multimodal sample.
     #[error("failed to preprocess image for sample {sample_index} at {path}: {source}")]
     ImagePreprocess {
@@ -22,7 +22,7 @@ pub enum DataLoaderError {
         /// Path of the image that failed preprocessing.
         path: std::path::PathBuf,
         /// Underlying MLX/image-processing failure.
-        source: mlx_rs::error::Exception,
+        source: pmetal_bridge::compat::Exception,
     },
     /// Multimodal batches require image data for every sample.
     #[error("sample {sample_index} is missing images in a multimodal batch")]
@@ -311,21 +311,16 @@ impl DataLoader {
     fn create_batch(&self, indices: &[usize]) -> Result<TrainingBatch, DataLoaderError> {
         let components = self.build_batch_components(indices)?;
 
-        let input_ids = Array::from_slice(
-            &components.input_ids_flat,
-            &[components.batch_size as i32, components.seq_len as i32],
-        );
-        let labels = Array::from_slice(
-            &components.labels_flat,
-            &[components.batch_size as i32, components.seq_len as i32],
-        );
-        let attention_mask = Array::from_slice(
-            &components.attention_mask_flat,
-            &[components.batch_size as i32, components.seq_len as i32],
-        );
+        let shape = &[components.batch_size as i32, components.seq_len as i32];
+        let input_ids = Array::from_i32_slice(&components.input_ids_flat).reshape(shape);
+        let labels_i32: Vec<i32> = components.labels_flat.iter().map(|&x| x as i32).collect();
+        let labels = Array::from_i32_slice(&labels_i32).reshape(shape);
+        let attention_mask =
+            Array::from_i32_slice(&components.attention_mask_flat).reshape(shape);
 
         let pixel_values = if !components.pixel_tensors.is_empty() {
-            mlx_rs::ops::concatenate(&components.pixel_tensors).ok()
+            let refs: Vec<&Array> = components.pixel_tensors.iter().collect();
+            Some(mlx_ops::concatenate_axis(&refs, 0))
         } else {
             None
         };

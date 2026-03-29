@@ -58,18 +58,20 @@
 //! The `jit_compile` module provides experimental utilities for future JIT support
 //! when mlx-rs improves its compile_with_state implementation.
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
+use pmetal_bridge::compat::{
+    Array, Exception,
     losses::CrossEntropy,
     module::{FlattenedModuleParam, ModuleParameters},
     nn,
+    ops,
     ops::indexing::{IndexOp, argmax_axis},
-    optimizers::{AdamW, AdamWBuilder, Optimizer},
-    transforms::compile::compile_with_state,
-    utils::Updatable,
+    optimizers::{AdamW, AdamWBuilder, Optimizer, Updatable},
+    transforms,
+    Dtype,
 };
+// Local no-op compile shim (bridge doesn't need JIT compilation)
+// Accepts Option<bool> to match the mlx-rs call site: compile_with_state(f, None)
+fn compile_with_state<F: FnMut(S, I) -> O, S, I, O>(f: F, _shapeless: Option<bool>) -> F { f }
 use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
 use pmetal_data::{
     DataLoader, DataLoaderConfig, PackedDataLoader, PackedTrainingBatch, PackerConfig,
@@ -681,8 +683,8 @@ impl TrainingLoop {
         let shift_labels = labels.index((.., 1..));
 
         // Reshape for cross entropy
-        let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
-        let flat_labels = shift_labels.reshape(&[-1])?;
+        let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
+        let flat_labels = shift_labels.reshape(&[-1]);
 
         // Compute cross entropy loss with ignore_index=-100
         let loss = cross_entropy_loss(&flat_logits, &flat_labels, Some(-100_i64), 0.0)?;
@@ -690,11 +692,11 @@ impl TrainingLoop {
         // Compute masked mean: only average over non-ignored (-100) tokens.
         // loss.mean(None) would incorrectly divide by all positions including
         // ignored ones, producing an underestimated loss.
-        let mask = flat_labels.ne(&Array::from_slice(&[-100_i64], &[1]))?;
-        let valid_count_raw = mask.as_dtype(mlx_rs::Dtype::Float32)?.sum(None)?;
-        let valid_count = mlx_rs::ops::maximum(&valid_count_raw, &Array::from_f32(1.0))?;
-        let masked_loss = loss.multiply(&mask.as_dtype(loss.dtype())?)?;
-        Ok(masked_loss.sum(None)?.divide(&valid_count)?)
+        let mask = flat_labels.ne(&Array::from_int(-100).as_dtype(flat_labels.dtype_raw()));
+        let valid_count_raw = mask.as_dtype(Dtype::Float32.as_i32()).sum(None);
+        let valid_count = ops::maximum(&valid_count_raw, &Array::from_f32(1.0));
+        let masked_loss = loss.multiply(&mask.as_dtype(loss.dtype_raw()));
+        Ok(masked_loss.sum(None).divide(&valid_count))
     }
 
     /// Clip gradients by global norm (GPU-based, no sync required).
@@ -719,31 +721,31 @@ impl TrainingLoop {
         // This stays entirely on GPU until evaluated
         let mut norm_sq_sum = Array::from_f32(0.0);
         for (_, grad) in grads.iter() {
-            let norm_sq = grad.multiply(grad)?.sum(None)?;
-            norm_sq_sum = norm_sq_sum.add(&norm_sq)?;
+            let norm_sq = grad.multiply(grad).sum(None);
+            norm_sq_sum = norm_sq_sum.add(&norm_sq);
         }
 
         // Compute norm = sqrt(sum) on GPU (lazy)
-        let norm = norm_sq_sum.sqrt()?;
+        let norm = norm_sq_sum.sqrt();
 
         // Compute scale = min(1.0, max_norm / norm) entirely on GPU.
         // `maximum(norm, max_norm)` clamps the denominator to [max_norm, ∞),
         // so scale ∈ (0, 1].  No epsilon is needed: when norm < max_norm the
         // clamped denominator equals max_norm (not zero), avoiding division by zero.
         let max_norm_arr = Array::from_f32(max_norm);
-        let norm_clamped = mlx_rs::ops::maximum(&norm, &max_norm_arr)?;
-        let scale = max_norm_arr.divide(&norm_clamped)?;
+        let norm_clamped = ops::maximum(&norm, &max_norm_arr);
+        let scale = max_norm_arr.divide(&norm_clamped);
 
         // Debug: check scale value
         static DEBUG_CLIP_ONCE: std::sync::Once = std::sync::Once::new();
         DEBUG_CLIP_ONCE.call_once(|| {
             // Force evaluate to debug
             let mut scale_copy = scale.clone();
-            scale_copy.eval().ok();
-            let scale_val = scale_copy.item::<f32>();
+            scale_copy.eval();
+            let scale_val = scale_copy.item_f32();
             let mut norm_copy = norm.clone();
-            norm_copy.eval().ok();
-            let norm_val = norm_copy.item::<f32>();
+            norm_copy.eval();
+            let norm_val = norm_copy.item_f32();
             tracing::info!(
                 "Gradient clipping: norm={:.4}, max_norm={}, scale={:.4}",
                 norm_val,
@@ -755,7 +757,7 @@ impl TrainingLoop {
         // Apply scale to all gradients on GPU (lazy)
         // Even when scale ~= 1.0, this is cheaper than a GPU-CPU sync to check
         for (_, grad) in grads.iter_mut() {
-            *grad = grad.multiply(&scale)?;
+            *grad = grad.multiply(&scale);
         }
 
         // Return lazy norm - caller can eval() for logging if needed
@@ -776,20 +778,20 @@ impl TrainingLoop {
         // Build lazy computation graph: sum of all squared norms
         let mut norm_sq_sum = Array::from_f32(0.0);
         for (_, grad) in grads.iter() {
-            let norm_sq = grad.multiply(grad)?.sum(None)?;
-            norm_sq_sum = norm_sq_sum.add(&norm_sq)?;
+            let norm_sq = grad.multiply(grad).sum(None);
+            norm_sq_sum = norm_sq_sum.add(&norm_sq);
         }
 
         // Single eval() for norm computation
-        norm_sq_sum.eval()?;
-        let total_norm = norm_sq_sum.item::<f32>().sqrt();
+        norm_sq_sum.eval();
+        let total_norm = norm_sq_sum.item_f32().sqrt();
 
         // Only clip if norm exceeds max and is finite (NaN/Inf gradients should not be scaled)
         if total_norm > max_norm && total_norm.is_finite() {
             let scale = max_norm / (total_norm + 1e-6);
             let scale_arr = Array::from_f32(scale);
             for (_, grad) in grads.iter_mut() {
-                *grad = grad.multiply(&scale_arr)?;
+                *grad = grad.multiply(&scale_arr);
             }
         }
 
@@ -837,7 +839,7 @@ impl TrainingLoop {
         if let Some(ref acc) = self.accumulated_grads {
             let grad_arrays: Vec<&Array> = acc.values().collect();
             if !grad_arrays.is_empty() {
-                mlx_rs::transforms::eval(grad_arrays)?;
+                transforms::eval(grad_arrays);
             }
         }
         Ok(())
@@ -948,12 +950,12 @@ impl TrainingLoop {
                     // model. Evaluating all 600M+ params of a frozen model every step
                     // is wasteful and can spike memory via unnecessary GPU->CPU sync.
                     // This matches mlx-lm's approach: mx.eval(state, losses, ...).
-                    mlx_rs::transforms::eval_params(model.trainable_parameters())?;
+                    pmetal_bridge::compat::eval_params(model.trainable_parameters());
                     // Optimizer state (momentum/variance for Adam)
                     let opt_states: Vec<&Array> =
                         optimizer.updatable_states().into_iter().collect();
                     if !opt_states.is_empty() {
-                        mlx_rs::transforms::eval(opt_states)?;
+                        transforms::eval(opt_states);
                     }
                 }
                 // NOTE: Do NOT clear the buffer cache here. MLX's cache holds
@@ -1230,22 +1232,22 @@ impl TrainingLoop {
         let shift_labels = labels.index((.., 1..));
 
         // Get predictions (argmax over vocab dimension)
-        let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
-        let predictions = argmax_axis(&flat_logits, -1, None)?;
-        predictions.eval()?;
+        let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
+        let predictions = argmax_axis(&flat_logits, -1, None);
+        predictions.eval();
 
-        let flat_labels = shift_labels.reshape(&[-1])?;
-        flat_labels.eval()?;
+        let flat_labels = shift_labels.reshape(&[-1]);
+        flat_labels.eval();
 
         // Create mask for valid tokens (label != -100)
         let ignore_index = Array::from_int(-100);
-        let valid_mask = flat_labels.ne(&ignore_index)?;
-        valid_mask.eval()?;
+        let valid_mask = flat_labels.ne(&ignore_index);
+        valid_mask.eval();
 
         // Count valid tokens
-        let total_valid = valid_mask.sum(None)?;
-        total_valid.eval()?;
-        let total_tokens = total_valid.item::<i64>() as u64;
+        let total_valid = valid_mask.sum(None);
+        total_valid.eval();
+        let total_tokens = total_valid.item_f32() as u64;
 
         if total_tokens == 0 {
             return Ok((0, 0));
@@ -1253,15 +1255,15 @@ impl TrainingLoop {
 
         // Compare predictions with labels where valid
         // predictions is i32, labels is i64, need to cast
-        let predictions_i64 = predictions.as_dtype(mlx_rs::Dtype::Int64)?;
-        let correct = predictions_i64.eq(&flat_labels)?;
-        correct.eval()?;
+        let predictions_i64 = predictions.as_dtype(Dtype::Int64.as_i32());
+        let correct = predictions_i64.eq(&flat_labels);
+        correct.eval();
 
         // Mask out invalid tokens and sum
-        let valid_correct = correct.multiply(&valid_mask)?;
-        let correct_sum = valid_correct.sum(None)?;
-        correct_sum.eval()?;
-        let correct_count = correct_sum.item::<i64>() as u64;
+        let valid_correct = correct.multiply(&valid_mask);
+        let correct_sum = valid_correct.sum(None);
+        correct_sum.eval();
+        let correct_count = correct_sum.item_f32() as u64;
 
         Ok((correct_count, total_tokens))
     }
@@ -1396,7 +1398,7 @@ impl TrainingLoop {
         {
             let arrays: Vec<&Array> = lora_params.values().collect();
             if !arrays.is_empty() {
-                mlx_rs::transforms::eval(arrays)?;
+                transforms::eval(arrays);
             }
         }
 

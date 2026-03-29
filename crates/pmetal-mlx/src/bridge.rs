@@ -12,27 +12,12 @@
 //! - **Copy** (`copy_*` methods): Creates a new Metal buffer and copies data into it.
 //!   Required when type conversion is needed (e.g., f32 → f16) or when the source
 //!   array may be modified/deallocated.
-//!
-//! # Example
-//!
-//! ```ignore
-//! use pmetal_mlx::bridge::MlxMetalBridge;
-//! use mlx_rs::Array;
-//!
-//! let array = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
-//! array.eval()?;
-//!
-//! // Zero-copy view (preferred for f32)
-//! let view = MlxMetalBridge::view_f32(&ctx, &array)?;
-//!
-//! // Use view with Metal kernel...
-//! kernel.forward(&view)?;
-//! ```
 
 #![allow(unsafe_code)]
 
+use crate::array_ext::ArrayDtypeExt;
 use half::f16;
-use mlx_rs::{Array, Dtype};
+use pmetal_bridge::compat::{Array, Dtype};
 use pmetal_metal::{
     bridge::{MetalBufferView, metal_buffer_from_ptr},
     buffer::{BufferUsage, MetalBuffer},
@@ -120,20 +105,20 @@ impl MlxMetalBridge {
         }
 
         // Ensure array is evaluated before accessing data pointer
-        array
-            .eval()
-            .map_err(|e| MetalError::InvalidConfig(format!("Failed to eval array: {e}")))?;
+        let mut evaled = array.clone();
+        evaled.eval();
 
-        // Get pointer to array data via sys call
-        let ptr = unsafe { mlx_sys::mlx_array_data_float32(array.as_ptr()) };
+        // Get pointer to array data
+        let ptr = evaled.data_ptr() as *mut f32;
         if ptr.is_null() {
             return Err(MetalError::InvalidConfig(
                 "MLX array data pointer is null".into(),
             ));
         }
 
-        // Create a view (unsafe - we assume the array outlives the view)
-        unsafe { metal_buffer_from_ptr(ctx, ptr as *mut f32, array.size()) }
+        // Create a view — the pointer remains valid while `evaled` is live,
+        // but view lifetime is tied to `array` parameter.
+        unsafe { metal_buffer_from_ptr(ctx, ptr, array.size()) }
     }
 
     /// Create a zero-copy buffer view from an f16 MLX array.
@@ -149,21 +134,17 @@ impl MlxMetalBridge {
             )));
         }
 
-        // Ensure array is evaluated before accessing data pointer
-        array
-            .eval()
-            .map_err(|e| MetalError::InvalidConfig(format!("Failed to eval array: {e}")))?;
+        let mut evaled = array.clone();
+        evaled.eval();
 
-        // Get pointer to array data via sys call
-        let ptr = unsafe { mlx_sys::mlx_array_data_float16(array.as_ptr()) };
+        let ptr = evaled.data_ptr() as *mut f16;
         if ptr.is_null() {
             return Err(MetalError::InvalidConfig(
                 "MLX array data pointer is null".into(),
             ));
         }
 
-        // Create a view (unsafe - we assume the array outlives the view)
-        unsafe { metal_buffer_from_ptr(ctx, ptr as *mut f16, array.size()) }
+        unsafe { metal_buffer_from_ptr(ctx, ptr, array.size()) }
     }
 
     /// Create a zero-copy buffer view from a packed `u32` MLX array.
@@ -178,11 +159,10 @@ impl MlxMetalBridge {
             )));
         }
 
-        array
-            .eval()
-            .map_err(|e| MetalError::InvalidConfig(format!("Failed to eval array: {e}")))?;
+        let mut evaled = array.clone();
+        evaled.eval();
 
-        let ptr = unsafe { mlx_sys::mlx_array_data_uint32(array.as_ptr()) };
+        let ptr = evaled.data_ptr() as *mut u32;
         if ptr.is_null() {
             return Err(MetalError::InvalidConfig(
                 "MLX array data pointer is null".into(),
@@ -197,89 +177,53 @@ impl MlxMetalBridge {
     /// This method is safer than zero-copy as it owns its data, but slower
     /// due to the copy operation. Auto-converts non-f32 arrays.
     pub fn copy_as_f32(ctx: &MetalContext, array: &Array) -> MetalResult<MetalBuffer<f32>> {
-        let converted = if array.dtype() != Dtype::Float32 {
-            array
-                .as_dtype(Dtype::Float32)
-                .map_err(|e| MetalError::InvalidConfig(format!("dtype conversion failed: {e}")))?
+        let mut converted = if array.dtype() != Dtype::Float32 {
+            array.as_dtype(Dtype::Float32.as_i32())
         } else {
             array.clone()
         };
-        let data = converted.as_slice::<f32>();
+        converted.eval();
+        let n = converted.size();
+        let ptr = converted.data_ptr() as *const f32;
+        let data: &[f32] = unsafe { std::slice::from_raw_parts(ptr, n) };
         MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)
     }
 
     /// Copy MLX array data to a new f16 Metal buffer, converting dtype if needed.
     pub fn copy_as_f16(ctx: &MetalContext, array: &Array) -> MetalResult<MetalBuffer<f16>> {
-        let converted = if array.dtype() != Dtype::Float16 {
-            array
-                .as_dtype(Dtype::Float16)
-                .map_err(|e| MetalError::InvalidConfig(format!("dtype conversion failed: {e}")))?
+        let mut converted = if array.dtype() != Dtype::Float16 {
+            array.as_dtype(Dtype::Float16.as_i32())
         } else {
             array.clone()
         };
-        let data = converted.as_slice::<f16>();
+        converted.eval();
+        let n = converted.size();
+        let ptr = converted.data_ptr() as *const f16;
+        let data: &[f16] = unsafe { std::slice::from_raw_parts(ptr, n) };
         MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)
     }
 
-    /// Convert an f32 Metal buffer back to an MLX Array (Zero-Copy).
+    /// Convert an f32 Metal buffer back to an MLX Array.
     ///
-    /// This uses `mlx_sys` to wrap the existing Metal buffer's memory in
-    /// an MLX array with a custom deleter that keeps the buffer alive.
+    /// Copies data from the Metal buffer into a new MLX array.
     pub fn buffer_into_array_f32(buffer: MetalBuffer<f32>, shape: &[i32]) -> MetalResult<Array> {
-        let ptr = buffer.contents_ptr() as *mut std::ffi::c_void;
-
-        // Wrap the buffer in a Box to pass as payload to the deleter
-        let payload = Box::into_raw(Box::new(buffer)) as *mut std::ffi::c_void;
-
-        // Custom deleter that re-claims the Box and drops it, freeing the buffer
-        unsafe extern "C" fn deleter(payload: *mut std::ffi::c_void) {
-            unsafe {
-                let _ = Box::from_raw(payload as *mut MetalBuffer<f32>);
-            }
-        }
-
-        let dim = shape.len() as i32;
-        let c_array = unsafe {
-            mlx_sys::mlx_array_new_data_managed_payload(
-                ptr,
-                shape.as_ptr(),
-                dim,
-                mlx_sys::mlx_dtype__MLX_FLOAT32,
-                payload,
-                Some(deleter),
-            )
-        };
-
-        // Create Array wrapper using official constructor
-        let array = unsafe { Array::from_ptr(c_array) };
-        Ok(array)
+        let n = buffer.len();
+        let ptr = buffer.contents_ptr() as *const f32;
+        let data: &[f32] = unsafe { std::slice::from_raw_parts(ptr, n) };
+        Ok(Array::from_f32_slice(data, shape))
     }
 
-    /// Convert an f16 Metal buffer back to an MLX Array (Zero-Copy).
+    /// Convert an f16 Metal buffer back to an MLX Array.
+    ///
+    /// Converts f16 data to f32, then creates an MLX array.
     pub fn buffer_into_array_f16(buffer: MetalBuffer<f16>, shape: &[i32]) -> MetalResult<Array> {
-        let ptr = buffer.contents_ptr() as *mut std::ffi::c_void;
-        let payload = Box::into_raw(Box::new(buffer)) as *mut std::ffi::c_void;
-
-        unsafe extern "C" fn deleter(payload: *mut std::ffi::c_void) {
-            unsafe {
-                let _ = Box::from_raw(payload as *mut MetalBuffer<f16>);
-            }
-        }
-
-        let dim = shape.len() as i32;
-        let c_array = unsafe {
-            mlx_sys::mlx_array_new_data_managed_payload(
-                ptr,
-                shape.as_ptr(),
-                dim,
-                mlx_sys::mlx_dtype__MLX_FLOAT16,
-                payload,
-                Some(deleter),
-            )
-        };
-
-        let array = unsafe { Array::from_ptr(c_array) };
-        Ok(array)
+        let n = buffer.len();
+        let ptr = buffer.contents_ptr() as *const f16;
+        let data_f16: &[f16] = unsafe { std::slice::from_raw_parts(ptr, n) };
+        // Convert f16 → f32 then create array and cast back to f16
+        let data_f32: Vec<f32> = data_f16.iter().map(|x| x.to_f32()).collect();
+        let arr_f32 = Array::from_f32_slice(&data_f32, shape);
+        Ok(arr_f32.as_dtype(Dtype::Float16.as_i32()))
     }
 }
 
@@ -290,8 +234,9 @@ mod tests {
     #[test]
     fn test_view_f32() {
         let ctx = MetalContext::new().unwrap();
-        let array = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
-        array.eval().unwrap();
+        let array = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
+        let mut evaled = array.clone();
+        evaled.eval();
 
         let view = MlxMetalBridge::view_f32(&ctx, &array).unwrap();
         assert_eq!(view.len(), 4);
@@ -301,10 +246,8 @@ mod tests {
     #[test]
     fn test_view_f32_rejects_f16() {
         let ctx = MetalContext::new().unwrap();
-        let array = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4])
-            .as_dtype(Dtype::Float16)
-            .unwrap();
-        array.eval().unwrap();
+        let array = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4])
+            .as_dtype(Dtype::Float16.as_i32());
 
         let result = MlxMetalBridge::view_f32(&ctx, &array);
         assert!(result.is_err());

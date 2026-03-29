@@ -18,8 +18,8 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::module::Module;
-use mlx_rs::{Array, nn};
+use pmetal_bridge::compat::Module;
+use pmetal_bridge::compat::{Array, nn};
 
 use crate::autograd::{
     AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext, LoraGrads, lora_backward,
@@ -117,17 +117,17 @@ fn compute_rope_freqs(
 ) -> Result<(Array, Array), LoraError> {
     let half_dim = head_dim / 2;
     // freq_i = 1 / theta^(2i / dim) for i in 0..half_dim
-    let freq_exp = mlx_rs::ops::arange::<i32, f32>(0, half_dim, None)?
+    let freq_exp = pmetal_bridge::compat::ops::arange_range(0, half_dim)
         .divide(&Array::from_f32(half_dim as f32))?;
     let freqs = Array::from_f32(1.0).divide(&Array::from_f32(theta).power(&freq_exp)?)?;
     // positions: [0, 1, ..., seq_len-1]
-    let positions = mlx_rs::ops::arange::<i32, f32>(0, seq_len, None)?;
+    let positions = pmetal_bridge::compat::ops::arange_range(0, seq_len);
     // outer product: [seq_len, half_dim]
     let angles = positions
-        .reshape(&[seq_len, 1])?
-        .multiply(&freqs.reshape(&[1, half_dim])?)?;
-    let cos = mlx_rs::ops::cos(&angles)?;
-    let sin = mlx_rs::ops::sin(&angles)?;
+        .reshape(&[seq_len, 1])
+        .multiply(&freqs.reshape(&[1, half_dim]))?;
+    let cos = pmetal_bridge::compat::ops::cos(&angles)?;
+    let sin = pmetal_bridge::compat::ops::sin(&angles)?;
     Ok((cos, sin))
 }
 
@@ -214,13 +214,13 @@ impl Qwen3CustomTrainer {
 
         // Reshape for multi-head attention
         let q = q
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
         let k = k
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
         let v = v
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Qwen3-specific: apply Q/K RMSNorm before RoPE
@@ -381,7 +381,7 @@ impl Qwen3CustomTrainer {
         // Backward through down projection
         let down_grads = lora_backward(d_output, &saved.down_saved)?;
         let d_hidden = down_grads.d_x.as_ref().ok_or_else(|| {
-            LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from down"))
+            LoraError::Mlx(pmetal_bridge::compat::Exception::custom("Expected d_x from down"))
         })?;
 
         // Backward through multiply: d_gate_act = d_hidden * up_out, d_up_out = d_hidden * gate_act
@@ -400,10 +400,10 @@ impl Qwen3CustomTrainer {
             .d_x
             .as_ref()
             .ok_or_else(|| {
-                LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from gate"))
+                LoraError::Mlx(pmetal_bridge::compat::Exception::custom("Expected d_x from gate"))
             })?
             .add(up_grads.d_x.as_ref().ok_or_else(|| {
-                LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from up"))
+                LoraError::Mlx(pmetal_bridge::compat::Exception::custom("Expected d_x from up"))
             })?)?;
 
         Ok((d_h_normed, gate_grads, up_grads, down_grads))
@@ -440,7 +440,7 @@ impl Qwen3CustomTrainer {
         // Backward through O projection
         let o_grads = lora_backward(d_attn_out, &saved.o_saved)?;
         let d_attn_out_reshaped = o_grads.d_x.as_ref().ok_or_else(|| {
-            LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from o_proj"))
+            LoraError::Mlx(pmetal_bridge::compat::Exception::custom("Expected d_x from o_proj"))
         })?;
 
         // Backward through attention
@@ -449,7 +449,7 @@ impl Qwen3CustomTrainer {
         let batch = shape[0];
         let seq_len = shape[1];
         let d_attn_reshaped = d_attn_out_reshaped
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
 
         let (d_q, d_k, d_v) = attention_backward(&d_attn_reshaped, &saved.attn_saved)?;
@@ -484,12 +484,12 @@ impl Qwen3CustomTrainer {
         let d_x_normed = q_grads
             .d_x
             .as_ref()
-            .ok_or_else(|| LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from q")))?
+            .ok_or_else(|| LoraError::Mlx(pmetal_bridge::compat::Exception::custom("Expected d_x from q")))?
             .add(k_grads.d_x.as_ref().ok_or_else(|| {
-                LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from k"))
+                LoraError::Mlx(pmetal_bridge::compat::Exception::custom("Expected d_x from k"))
             })?)?
             .add(v_grads.d_x.as_ref().ok_or_else(|| {
-                LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from v"))
+                LoraError::Mlx(pmetal_bridge::compat::Exception::custom("Expected d_x from v"))
             })?)?;
 
         // Backward through input norm
@@ -672,11 +672,11 @@ impl Qwen3CustomTrainer {
 }
 
 /// Create a causal attention mask.
-fn create_causal_mask(seq_len: i32) -> Result<Array, mlx_rs::error::Exception> {
-    let mask = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;
+fn create_causal_mask(seq_len: i32) -> Result<Array, pmetal_bridge::compat::Exception> {
+    let mask = pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
-    mlx_rs::ops::r#where(&mask.eq(&zero)?, &neg_inf, &zero)
+    pmetal_bridge::compat::ops::where_fn(&mask.eq(&zero), &neg_inf, &zero)
 }
 
 #[cfg(test)]
@@ -734,14 +734,10 @@ mod tests {
         // Create dummy batch
         let batch_size = 2;
         let seq_len = 8;
-        let input_ids = mlx_rs::Array::from_slice(
-            &vec![1_i32; batch_size * seq_len],
-            &[batch_size as i32, seq_len as i32],
-        );
-        let labels = mlx_rs::Array::from_slice(
-            &vec![2_i32; batch_size * seq_len],
-            &[batch_size as i32, seq_len as i32],
-        );
+        let input_ids = Array::from_i32_slice(&vec![1_i32; batch_size * seq_len])
+            .reshape(&[batch_size as i32, seq_len as i32]);
+        let labels = Array::from_i32_slice(&vec![2_i32; batch_size * seq_len])
+            .reshape(&[batch_size as i32, seq_len as i32]);
 
         // Run training step
         let (loss, grads) = trainer

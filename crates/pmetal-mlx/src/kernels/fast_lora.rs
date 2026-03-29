@@ -14,7 +14,8 @@
 
 use std::{sync::OnceLock, time::Instant};
 
-use mlx_rs::{Array, Dtype};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops, random};
+use crate::ArrayDtypeExt;
 use pmetal_metal::{
     MetalBuffer, MetalContext,
     buffer::BufferUsage,
@@ -164,16 +165,11 @@ impl OptimizedLoraParams {
         lora_b: &Array,
         scale: f32,
         bias: Option<Array>,
-    ) -> mlx_rs::error::Result<Self> {
-        // Pre-transpose weight: [out, in] -> [in, out]
+    ) -> Result<Self, Exception> {
         let weight_t = weight.t();
-
-        // Pre-transpose A: [rank, in] -> [in, rank]
         let lora_a_t = lora_a.t();
-
-        // Scale and transpose B: [out, rank] -> scale * [out, rank] -> [rank, out]
         let scale_arr = Array::from_f32(scale);
-        let lora_b_scaled = lora_b.multiply(&scale_arr)?;
+        let lora_b_scaled = lora_b.multiply(&scale_arr);
         let lora_b_scaled_t = lora_b_scaled.t();
 
         Ok(Self {
@@ -188,9 +184,9 @@ impl OptimizedLoraParams {
 
     /// Update LoRA B with new values (for gradient updates).
     /// Automatically applies scale and transpose.
-    pub fn update_lora_b(&mut self, lora_b: &Array) -> mlx_rs::error::Result<()> {
+    pub fn update_lora_b(&mut self, lora_b: &Array) -> Result<(), Exception> {
         let scale_arr = Array::from_f32(self.scale);
-        let lora_b_scaled = lora_b.multiply(&scale_arr)?;
+        let lora_b_scaled = lora_b.multiply(&scale_arr);
         self.lora_b_scaled_t = lora_b_scaled.t();
         Ok(())
     }
@@ -207,10 +203,10 @@ impl OptimizedLoraParams {
     }
 
     /// Get original (non-scaled, non-transposed) LoRA B for saving.
-    pub fn get_lora_b(&self) -> mlx_rs::error::Result<Array> {
+    pub fn get_lora_b(&self) -> Result<Array, Exception> {
         let b_t = self.lora_b_scaled_t.t();
         let scale_arr = Array::from_f32(1.0 / self.scale);
-        b_t.multiply(&scale_arr)
+        Ok(b_t.multiply(&scale_arr))
     }
 }
 
@@ -233,30 +229,22 @@ impl OptimizedLoraParams {
 pub fn optimized_lora_forward(
     x: &Array,
     params: &OptimizedLoraParams,
-) -> mlx_rs::error::Result<Array> {
+) -> Result<Array, Exception> {
     if params.merged {
-        // Use merged weight directly
-        let y = x.matmul(&params.weight_t)?;
+        let y = x.matmul(&params.weight_t);
         if let Some(ref bias) = params.bias {
-            return y.add(bias);
+            return Ok(y.add(bias));
         }
         return Ok(y);
     }
 
-    // Base forward: y_base = x @ weight_t
-    let y_base = x.matmul(&params.weight_t)?;
+    let y_base = x.matmul(&params.weight_t);
+    let xa = x.matmul(&params.lora_a_t);
+    let y_lora = xa.matmul(&params.lora_b_scaled_t);
+    let y = y_base.add(&y_lora);
 
-    // LoRA forward: y_lora = (x @ lora_a_t) @ lora_b_scaled_t
-    // Note: scale is already baked into lora_b_scaled_t!
-    let xa = x.matmul(&params.lora_a_t)?;
-    let y_lora = xa.matmul(&params.lora_b_scaled_t)?;
-
-    // Combined output
-    let y = y_base.add(&y_lora)?;
-
-    // Add bias if present
     if let Some(ref bias) = params.bias {
-        y.add(bias)
+        Ok(y.add(bias))
     } else {
         Ok(y)
     }
@@ -281,21 +269,16 @@ pub fn fused_lora_forward(
     lora_a: &Array,
     lora_b: &Array,
     scale: f32,
-) -> mlx_rs::error::Result<Array> {
-    // Base forward: y_base = x @ W.T
+) -> Result<Array, Exception> {
     let y_base = matmul_rhs_transposed_best_effort(x, weight)?;
-
-    // LoRA forward: y_lora = scale * (x @ A.T) @ B.T
-    let xa = x.matmul(&lora_a.t())?;
-    let xab = xa.matmul(&lora_b.t())?;
+    let xa = x.matmul(&lora_a.t());
+    let xab = xa.matmul(&lora_b.t());
     let scale_arr = Array::from_f32(scale);
-    let y_lora = xab.multiply(&scale_arr)?;
-
-    // Combined output
-    y_base.add(&y_lora)
+    let y_lora = xab.multiply(&scale_arr);
+    Ok(y_base.add(&y_lora))
 }
 
-fn matmul_rhs_transposed_best_effort(x: &Array, weight: &Array) -> mlx_rs::error::Result<Array> {
+fn matmul_rhs_transposed_best_effort(x: &Array, weight: &Array) -> Result<Array, Exception> {
     let dtype = x.dtype();
     let Some(problem) = rhs_transposed_problem(x, weight) else {
         return run_mlx_rhs_transposed(x, weight);
@@ -374,8 +357,8 @@ fn rhs_transposed_problem(x: &Array, weight: &Array) -> Option<ProjectionProblem
     })
 }
 
-fn run_mlx_rhs_transposed(x: &Array, weight: &Array) -> mlx_rs::error::Result<Array> {
-    x.matmul(&weight.t())
+fn run_mlx_rhs_transposed(x: &Array, weight: &Array) -> Result<Array, Exception> {
+    Ok(x.matmul(&weight.t()))
 }
 
 fn execute_projection_backend(
@@ -384,7 +367,7 @@ fn execute_projection_backend(
     weight: &Array,
     ctx: &std::sync::Arc<MetalContext>,
     problem: &ProjectionProblem,
-) -> mlx_rs::error::Result<Array> {
+) -> Result<Array, Exception> {
     match backend {
         ProjectionBackend::Mlx => run_mlx_rhs_transposed(x, weight),
         ProjectionBackend::Mpp => run_mpp_rhs_transposed(x, weight, ctx, problem),
@@ -396,16 +379,18 @@ fn benchmark_projection_backends(
     weight: &Array,
     ctx: &std::sync::Arc<MetalContext>,
     problem: &ProjectionProblem,
-) -> mlx_rs::error::Result<(ProjectionBackend, Array)> {
+) -> Result<(ProjectionBackend, Array), Exception> {
     let mlx_start = Instant::now();
     let mlx_output = run_mlx_rhs_transposed(x, weight)?;
-    mlx_output.eval()?;
+    let mut mlx_out_eval = mlx_output.clone();
+    mlx_out_eval.eval();
     let mlx_elapsed = mlx_start.elapsed();
 
     let mpp_start = Instant::now();
     let mpp_output = match run_mpp_rhs_transposed(x, weight, ctx, problem) {
         Ok(output) => {
-            output.eval()?;
+            let mut out_eval = output.clone();
+            out_eval.eval();
             Some(output)
         }
         Err(error) => {
@@ -453,7 +438,7 @@ fn run_mpp_rhs_transposed(
     weight: &Array,
     ctx: &std::sync::Arc<MetalContext>,
     problem: &ProjectionProblem,
-) -> mlx_rs::error::Result<Array> {
+) -> Result<Array, Exception> {
     let dtype = x.dtype();
     let x_shape = x.shape();
 
@@ -461,7 +446,7 @@ fn run_mpp_rhs_transposed(
     config.use_fp16 = dtype == Dtype::Float16;
     let gemm = MppGemm::new(ctx.clone(), config);
     if !gemm.is_available() {
-        return Err(mlx_rs::error::Exception::custom(
+        return Err(Exception::custom(
             "MPP GEMM unavailable on current device".to_string(),
         ));
     }
@@ -469,39 +454,39 @@ fn run_mpp_rhs_transposed(
     let x_2d = if x_shape.len() == 2 {
         x.clone()
     } else {
-        x.reshape(&[problem.m as i32, problem.k as i32])?
+        x.reshape(&[problem.m as i32, problem.k as i32])
     };
 
     match dtype {
         Dtype::Float16 => {
             let x_view = MlxMetalBridge::view_f16(ctx, &x_2d)
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+                .map_err(|e| Exception::custom(e.to_string()))?;
             let weight_view = MlxMetalBridge::view_f16(ctx, weight)
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+                .map_err(|e| Exception::custom(e.to_string()))?;
             let output_buffer = MetalBuffer::new(ctx, problem.m * problem.n, BufferUsage::Shared)
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+                .map_err(|e| Exception::custom(e.to_string()))?;
 
             gemm.execute(&x_view, &weight_view, &output_buffer)
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+                .map_err(|e| Exception::custom(e.to_string()))?;
 
             MlxMetalBridge::buffer_into_array_f16(output_buffer, &problem.output_shape)
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
+                .map_err(|e| Exception::custom(e.to_string()))
         }
         Dtype::Float32 => {
             let x_view = MlxMetalBridge::view_f32(ctx, &x_2d)
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+                .map_err(|e| Exception::custom(e.to_string()))?;
             let weight_view = MlxMetalBridge::view_f32(ctx, weight)
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+                .map_err(|e| Exception::custom(e.to_string()))?;
             let output_buffer = MetalBuffer::new(ctx, problem.m * problem.n, BufferUsage::Shared)
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+                .map_err(|e| Exception::custom(e.to_string()))?;
 
             gemm.execute(&x_view, &weight_view, &output_buffer)
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+                .map_err(|e| Exception::custom(e.to_string()))?;
 
             MlxMetalBridge::buffer_into_array_f32(output_buffer, &problem.output_shape)
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
+                .map_err(|e| Exception::custom(e.to_string()))
         }
-        _ => Err(mlx_rs::error::Exception::custom(
+        _ => Err(Exception::custom(
             "Unsupported dtype for MPP GEMM".to_string(),
         )),
     }
@@ -517,9 +502,7 @@ pub fn fused_qlora_forward(
     lora_a: &Array,
     lora_b: &Array,
     scale: f32,
-) -> mlx_rs::error::Result<Array> {
-    // For now, same as regular LoRA - quantization dequantization
-    // will be handled at a higher level
+) -> Result<Array, Exception> {
     fused_lora_forward(x, weight, lora_a, lora_b, scale)
 }
 
@@ -536,40 +519,40 @@ pub fn fused_lora_qkv_forward(
     q_params: &OptimizedLoraParams,
     k_params: &OptimizedLoraParams,
     v_params: &OptimizedLoraParams,
-) -> mlx_rs::error::Result<(Array, Array, Array)> {
-    // Base forwards (can potentially be batched in future)
-    let q_base = x.matmul(&q_params.weight_t)?;
-    let k_base = x.matmul(&k_params.weight_t)?;
-    let v_base = x.matmul(&v_params.weight_t)?;
+) -> Result<(Array, Array, Array), Exception> {
+    let q_base = x.matmul(&q_params.weight_t);
+    let k_base = x.matmul(&k_params.weight_t);
+    let v_base = x.matmul(&v_params.weight_t);
 
-    // LoRA forwards
-    let xaq = x.matmul(&q_params.lora_a_t)?;
-    let q_lora = xaq.matmul(&q_params.lora_b_scaled_t)?;
+    let xaq = x.matmul(&q_params.lora_a_t);
+    let q_lora = xaq.matmul(&q_params.lora_b_scaled_t);
 
-    let xak = x.matmul(&k_params.lora_a_t)?;
-    let k_lora = xak.matmul(&k_params.lora_b_scaled_t)?;
+    let xak = x.matmul(&k_params.lora_a_t);
+    let k_lora = xak.matmul(&k_params.lora_b_scaled_t);
 
-    let xav = x.matmul(&v_params.lora_a_t)?;
-    let v_lora = xav.matmul(&v_params.lora_b_scaled_t)?;
+    let xav = x.matmul(&v_params.lora_a_t);
+    let v_lora = xav.matmul(&v_params.lora_b_scaled_t);
 
-    // Combine
-    let q = q_base.add(&q_lora)?;
-    let k = k_base.add(&k_lora)?;
-    let v = v_base.add(&v_lora)?;
+    let q = q_base.add(&q_lora);
+    let k = k_base.add(&k_lora);
+    let v = v_base.add(&v_lora);
 
     Ok((q, k, v))
 }
 
 /// Initialize LoRA A matrix with Kaiming uniform initialization.
-pub fn init_lora_a(rank: i32, in_features: i32) -> mlx_rs::error::Result<Array> {
-    // Kaiming uniform: U(-sqrt(3/n), sqrt(3/n))
+pub fn init_lora_a(rank: i32, in_features: i32) -> Result<Array, Exception> {
+    // Kaiming uniform: U(-sqrt(3/n), sqrt(3/n)) — scale [0,1) uniform to [-bound, bound]
     let bound = (3.0_f32 / in_features as f32).sqrt();
-    mlx_rs::random::uniform::<_, f32>(-bound, bound, &[rank, in_features], None)
+    let u = random::uniform(&[rank, in_features], Dtype::Float32);
+    let two = Array::from_f32(2.0 * bound);
+    let offset = Array::from_f32(bound);
+    Ok(u.multiply(&two).subtract(&offset))
 }
 
 /// Initialize LoRA B matrix with zeros.
-pub fn init_lora_b(out_features: i32, rank: i32) -> mlx_rs::error::Result<Array> {
-    mlx_rs::ops::zeros::<f32>(&[out_features, rank])
+pub fn init_lora_b(out_features: i32, rank: i32) -> Result<Array, Exception> {
+    Ok(ops::zeros(&[out_features, rank], Dtype::Float32))
 }
 
 /// Create LoRA parameter pair (A, B) with proper initialization.
@@ -577,7 +560,7 @@ pub fn create_lora_params(
     in_features: i32,
     out_features: i32,
     rank: i32,
-) -> mlx_rs::error::Result<(Array, Array)> {
+) -> Result<(Array, Array), Exception> {
     let lora_a = init_lora_a(rank, in_features)?;
     let lora_b = init_lora_b(out_features, rank)?;
     Ok((lora_a, lora_b))
@@ -591,7 +574,7 @@ pub fn create_optimized_lora_params(
     rank: i32,
     scale: f32,
     bias: Option<Array>,
-) -> mlx_rs::error::Result<OptimizedLoraParams> {
+) -> Result<OptimizedLoraParams, Exception> {
     let (lora_a, lora_b) = create_lora_params(in_features, out_features, rank)?;
     OptimizedLoraParams::from_standard(weight, &lora_a, &lora_b, scale, bias)
 }
@@ -599,24 +582,30 @@ pub fn create_optimized_lora_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_bridge::compat::{Array, Dtype, random};
+
+    fn eval_item(arr: &Array) -> f32 {
+        let mut v = arr.clone();
+        v.eval();
+        v.item_f32()
+    }
+
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        let diff = a.subtract(b);
+        let absdiff = diff.abs_val();
+        eval_item(&absdiff.max(None))
+    }
 
     #[test]
     fn test_fused_lora_forward_shapes() {
-        let batch = 2;
-        let seq_len = 4;
-        let in_features = 64;
-        let out_features = 128;
-        let rank = 8;
+        let batch: i32 = 2;
+        let seq_len: i32 = 4;
+        let in_features: i32 = 64;
+        let out_features: i32 = 128;
+        let rank: i32 = 8;
 
-        // Input
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, in_features], None, None, None)
-            .unwrap();
-
-        // Base weight
-        let weight =
-            mlx_rs::random::normal::<f32>(&[out_features, in_features], None, None, None).unwrap();
-
-        // LoRA weights
+        let x = random::normal(&[batch, seq_len, in_features], Dtype::Float32);
+        let weight = random::normal(&[out_features, in_features], Dtype::Float32);
         let (lora_a, lora_b) = create_lora_params(in_features, out_features, rank).unwrap();
 
         let output = fused_lora_forward(&x, &weight, &lora_a, &lora_b, 0.5).unwrap();
@@ -626,80 +615,45 @@ mod tests {
 
     #[test]
     fn test_optimized_lora_forward() {
-        let batch = 2;
-        let seq_len = 4;
-        let in_features = 64;
-        let out_features = 128;
-        let rank = 8;
+        let batch: i32 = 2;
+        let seq_len: i32 = 4;
+        let in_features: i32 = 64;
+        let out_features: i32 = 128;
+        let rank: i32 = 8;
         let scale = 2.0;
 
-        // Input
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, in_features], None, None, None)
-            .unwrap();
-
-        // Base weight
-        let weight =
-            mlx_rs::random::normal::<f32>(&[out_features, in_features], None, None, None).unwrap();
-
-        // LoRA weights
+        let x = random::normal(&[batch, seq_len, in_features], Dtype::Float32);
+        let weight = random::normal(&[out_features, in_features], Dtype::Float32);
         let (lora_a, lora_b) = create_lora_params(in_features, out_features, rank).unwrap();
 
-        // Create optimized params
         let params =
             OptimizedLoraParams::from_standard(&weight, &lora_a, &lora_b, scale, None).unwrap();
 
-        // Compare outputs
         let output_std = fused_lora_forward(&x, &weight, &lora_a, &lora_b, scale).unwrap();
         let output_opt = optimized_lora_forward(&x, &params).unwrap();
 
-        output_std.eval().unwrap();
-        output_opt.eval().unwrap();
-
-        // Should be numerically equivalent
-        let diff = output_std.subtract(&output_opt).unwrap();
-        let max_diff = diff.abs().unwrap().max(None).unwrap();
-        max_diff.eval().unwrap();
-        assert!(
-            max_diff.item::<f32>() < 1e-4,
-            "Max diff: {}",
-            max_diff.item::<f32>()
-        );
+        let md = max_abs_diff(&output_std, &output_opt);
+        assert!(md < 1e-4, "Max diff: {}", md);
     }
 
     #[test]
     fn test_optimized_params_roundtrip() {
-        let in_features = 64;
-        let out_features = 128;
-        let rank = 8;
+        let in_features: i32 = 64;
+        let out_features: i32 = 128;
+        let rank: i32 = 8;
         let scale = 2.0;
 
-        let weight =
-            mlx_rs::random::normal::<f32>(&[out_features, in_features], None, None, None).unwrap();
+        let weight = random::normal(&[out_features, in_features], Dtype::Float32);
         let (lora_a, lora_b) = create_lora_params(in_features, out_features, rank).unwrap();
 
         let params =
             OptimizedLoraParams::from_standard(&weight, &lora_a, &lora_b, scale, None).unwrap();
 
-        // Recover original A and B
         let recovered_a = params.get_lora_a();
         let recovered_b = params.get_lora_b().unwrap();
 
-        lora_a.eval().unwrap();
-        lora_b.eval().unwrap();
-        recovered_a.eval().unwrap();
-        recovered_b.eval().unwrap();
-
-        // Should match originals
-        let diff_a = lora_a.subtract(&recovered_a).unwrap();
-        let diff_b = lora_b.subtract(&recovered_b).unwrap();
-
-        let max_diff_a = diff_a.abs().unwrap().max(None).unwrap();
-        let max_diff_b = diff_b.abs().unwrap().max(None).unwrap();
-        max_diff_a.eval().unwrap();
-        max_diff_b.eval().unwrap();
-
-        assert!(max_diff_a.item::<f32>() < 1e-5);
-        assert!(max_diff_b.item::<f32>() < 1e-5);
+        assert!(max_abs_diff(&lora_a, &recovered_a) < 1e-5);
+        assert!(max_abs_diff(&lora_b, &recovered_b) < 1e-5);
     }
 
     #[test]
@@ -710,46 +664,35 @@ mod tests {
         assert_eq!(lora_b.shape(), &[512, 16]);
 
         // B should be zeros
-        lora_b.eval().unwrap();
-        let b_sum = lora_b.sum(None).unwrap();
-        b_sum.eval().unwrap();
-        assert_eq!(b_sum.item::<f32>(), 0.0);
+        let b_sum = lora_b.sum_all();
+        let val = eval_item(&b_sum);
+        assert_eq!(val, 0.0);
     }
 
     #[test]
     fn test_lora_zero_contribution() {
-        // With B initialized to zeros, LoRA should have no effect
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
-        let weight = mlx_rs::random::normal::<f32>(&[64, 32], None, None, None).unwrap();
+        let x = random::normal(&[1, 4, 32], Dtype::Float32);
+        let weight = random::normal(&[64, 32], Dtype::Float32);
         let (lora_a, lora_b) = create_lora_params(32, 64, 8).unwrap();
 
         let output_lora = fused_lora_forward(&x, &weight, &lora_a, &lora_b, 1.0).unwrap();
-        let output_base = x.matmul(&weight.t()).unwrap();
+        let output_base = x.matmul(&weight.t());
 
-        output_lora.eval().unwrap();
-        output_base.eval().unwrap();
-
-        // Outputs should be equal since B is zeros
-        let diff = output_lora.subtract(&output_base).unwrap();
-        let max_diff = diff.abs().unwrap().max(None).unwrap();
-        max_diff.eval().unwrap();
-        assert!(max_diff.item::<f32>() < 1e-5);
+        assert!(max_abs_diff(&output_lora, &output_base) < 1e-5);
     }
 
     #[test]
     fn test_fused_qkv_forward() {
-        let batch = 2;
-        let seq_len = 8;
-        let hidden = 256;
-        let rank = 8;
+        let batch: i32 = 2;
+        let seq_len: i32 = 8;
+        let hidden: i32 = 256;
+        let rank: i32 = 8;
         let scale = 2.0;
 
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden], None, None, None).unwrap();
-
-        // Create Q, K, V weights
-        let wq = mlx_rs::random::normal::<f32>(&[hidden, hidden], None, None, None).unwrap();
-        let wk = mlx_rs::random::normal::<f32>(&[hidden, hidden], None, None, None).unwrap();
-        let wv = mlx_rs::random::normal::<f32>(&[hidden, hidden], None, None, None).unwrap();
+        let x = random::normal(&[batch, seq_len, hidden], Dtype::Float32);
+        let wq = random::normal(&[hidden, hidden], Dtype::Float32);
+        let wk = random::normal(&[hidden, hidden], Dtype::Float32);
+        let wv = random::normal(&[hidden, hidden], Dtype::Float32);
 
         let (aq, bq) = create_lora_params(hidden, hidden, rank).unwrap();
         let (ak, bk) = create_lora_params(hidden, hidden, rank).unwrap();
@@ -768,80 +711,54 @@ mod tests {
 
     #[test]
     fn test_fused_lora_forward_matches_reference_large_f32() {
-        let batch = 2;
-        let seq_len = 4;
-        let in_features = 128;
-        let out_features = 256;
-        let rank = 16;
+        let batch: i32 = 2;
+        let seq_len: i32 = 4;
+        let in_features: i32 = 128;
+        let out_features: i32 = 256;
+        let rank: i32 = 16;
         let scale = 1.5;
 
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, in_features], None, None, None)
-            .unwrap();
-        let weight =
-            mlx_rs::random::normal::<f32>(&[out_features, in_features], None, None, None).unwrap();
+        let x = random::normal(&[batch, seq_len, in_features], Dtype::Float32);
+        let weight = random::normal(&[out_features, in_features], Dtype::Float32);
         let (lora_a, lora_b) = create_lora_params(in_features, out_features, rank).unwrap();
 
         let output = fused_lora_forward(&x, &weight, &lora_a, &lora_b, scale).unwrap();
-        let reference = x
-            .matmul(&weight.t())
-            .unwrap()
-            .add(
-                &x.matmul(&lora_a.t())
-                    .unwrap()
-                    .matmul(&lora_b.t())
-                    .unwrap()
-                    .multiply(&Array::from_f32(scale))
-                    .unwrap(),
-            )
-            .unwrap();
 
-        let diff = output.subtract(&reference).unwrap();
-        let max_diff = diff.abs().unwrap().max(None).unwrap();
-        max_diff.eval().unwrap();
-        assert!(max_diff.item::<f32>() < 1e-4);
+        let scale_arr = Array::from_f32(scale);
+        let reference = x.matmul(&weight.t()).add(
+            &x.matmul(&lora_a.t()).matmul(&lora_b.t()).multiply(&scale_arr)
+        );
+
+        assert!(max_abs_diff(&output, &reference) < 1e-4);
     }
 
     #[test]
     fn test_fused_lora_forward_matches_reference_large_f16() {
-        let batch = 2;
-        let seq_len = 4;
-        let in_features = 128;
-        let out_features = 256;
-        let rank = 16;
+        let batch: i32 = 2;
+        let seq_len: i32 = 4;
+        let in_features: i32 = 128;
+        let out_features: i32 = 256;
+        let rank: i32 = 16;
         let scale = 1.5;
 
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, in_features], None, None, None)
-            .unwrap()
-            .as_dtype(Dtype::Float16)
-            .unwrap();
-        let weight = mlx_rs::random::normal::<f32>(&[out_features, in_features], None, None, None)
-            .unwrap()
-            .as_dtype(Dtype::Float16)
-            .unwrap();
+        let x = random::normal(&[batch, seq_len, in_features], Dtype::Float32)
+            .as_dtype(Dtype::Float16.as_i32());
+        let weight = random::normal(&[out_features, in_features], Dtype::Float32)
+            .as_dtype(Dtype::Float16.as_i32());
         let (lora_a, lora_b) = create_lora_params(in_features, out_features, rank).unwrap();
-        let lora_a = lora_a.as_dtype(Dtype::Float16).unwrap();
-        let lora_b = lora_b.as_dtype(Dtype::Float16).unwrap();
+        let lora_a = lora_a.as_dtype(Dtype::Float16.as_i32());
+        let lora_b = lora_b.as_dtype(Dtype::Float16.as_i32());
 
         let output = fused_lora_forward(&x, &weight, &lora_a, &lora_b, scale).unwrap();
-        let reference = x
-            .matmul(&weight.t())
-            .unwrap()
-            .add(
-                &x.matmul(&lora_a.t())
-                    .unwrap()
-                    .matmul(&lora_b.t())
-                    .unwrap()
-                    .multiply(&Array::from_f32(scale).as_dtype(Dtype::Float16).unwrap())
-                    .unwrap(),
-            )
-            .unwrap();
 
-        let output = output.as_dtype(Dtype::Float32).unwrap();
-        let reference = reference.as_dtype(Dtype::Float32).unwrap();
-        let diff = output.subtract(&reference).unwrap();
-        let max_diff = diff.abs().unwrap().max(None).unwrap();
-        max_diff.eval().unwrap();
-        assert!(max_diff.item::<f32>() < 0.1);
+        let scale_arr = Array::from_f32(scale).as_dtype(Dtype::Float16.as_i32());
+        let reference = x.matmul(&weight.t()).add(
+            &x.matmul(&lora_a.t()).matmul(&lora_b.t()).multiply(&scale_arr)
+        );
+
+        let output_f32 = output.as_dtype(Dtype::Float32.as_i32());
+        let reference_f32 = reference.as_dtype(Dtype::Float32.as_i32());
+        assert!(max_abs_diff(&output_f32, &reference_f32) < 0.1);
         assert_eq!(output.shape(), &[batch, seq_len, out_features]);
     }
 
@@ -871,8 +788,8 @@ mod tests {
 
     #[test]
     fn test_rhs_transposed_problem_infers_output_shape() {
-        let x = Array::zeros::<f32>(&[2, 4, 128]).unwrap();
-        let weight = Array::zeros::<f32>(&[256, 128]).unwrap();
+        let x = ops::zeros(&[2, 4, 128], Dtype::Float32);
+        let weight = ops::zeros(&[256, 128], Dtype::Float32);
 
         let problem = rhs_transposed_problem(&x, &weight).unwrap();
         assert_eq!(

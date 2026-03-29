@@ -14,14 +14,11 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::{
-    Array, Dtype,
-    builder::Builder,
-    error::Exception,
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception, eval_params,
     module::{FlattenedModuleParam, ModuleParameters},
-    nn,
-    optimizers::{AdamWBuilder, Optimizer},
-    transforms::eval_params,
+    nn, ops,
+    optimizers::{AdamW, AdamWBuilder, Optimizer},
 };
 use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
 use pmetal_data::{DataLoader, DataLoaderConfig, TrainingBatch, TrainingDataset};
@@ -193,22 +190,19 @@ pub fn forward_process_gpu(
     let shape = x_0.shape();
 
     // Generate random values on GPU: shape = x_0.shape(), values in [0, 1)
-    let random_vals = if let Some(s) = seed {
-        let key = mlx_rs::random::key(s)?;
-        mlx_rs::random::uniform::<_, f32>(0.0_f32, 1.0_f32, shape, Some(&key))?
-    } else {
-        mlx_rs::random::uniform::<_, f32>(0.0_f32, 1.0_f32, shape, None::<&Array>)?
-    };
+    // Note: seed is ignored in bridge (stateless RNG); use uniform_range.
+    let _ = seed; // suppress unused warning
+    use pmetal_bridge::compat::random;
+    let random_vals = random::uniform_range(0.0_f32, 1.0_f32, shape, Dtype::Float32);
 
     // Create mask: positions where random < t should be masked
     let t_arr = Array::from_f32(t);
-    let mask = random_vals.lt(&t_arr)?;
+    let mask = random_vals.lt(&t_arr);
 
     // Create masked tokens: where(mask, mask_token_id, x_0)
-    let mask_value = Array::from_int(mask_token_id as i32);
-    let mask_tokens = Array::full::<i32>(shape, &mask_value)?;
-    let x_0_i32 = x_0.as_dtype(Dtype::Int32)?;
-    let x_t = mlx_rs::ops::r#where(&mask, &mask_tokens, &x_0_i32)?;
+    let mask_tokens = ops::full(shape, mask_token_id as f32, Dtype::Int32);
+    let x_0_i32 = x_0.as_dtype(Dtype::Int32.as_i32());
+    let x_t = ops::r#where(&mask, &mask_tokens, &x_0_i32);
 
     Ok((x_t, mask))
 }
@@ -222,13 +216,13 @@ pub fn forward_process(
     mask_token_id: i64,
     rng: &mut StdRng,
 ) -> std::result::Result<(Array, Vec<bool>), Exception> {
-    x_0.eval()?;
+    x_0.eval();
     let shape = x_0.shape();
     let total_elements = shape.iter().product::<i32>() as usize;
 
     // Get original tokens as slice
-    let x_0_i32 = x_0.as_dtype(Dtype::Int32)?;
-    x_0_i32.eval()?;
+    let x_0_i32 = x_0.as_dtype(Dtype::Int32);
+    x_0_i32.eval();
     let original: Vec<i32> = x_0_i32.as_slice().to_vec();
 
     // Generate mask: each position independently masked with probability t
@@ -266,27 +260,27 @@ pub fn diffusion_loss_gpu(
     let vocab_size = logits.dim(2);
 
     // Reshape for cross-entropy computation
-    let flat_logits = logits.reshape(&[-1, vocab_size])?;
-    let flat_targets = targets.reshape(&[-1])?;
-    let flat_mask = mask.reshape(&[-1])?.as_dtype(Dtype::Float32)?;
+    let flat_logits = logits.reshape(&[-1, vocab_size]);
+    let flat_targets = targets.reshape(&[-1]);
+    let flat_mask = mask.reshape(&[-1]).as_dtype(Dtype::Float32.as_i32());
 
     // Compute per-token cross-entropy loss using the fused kernel
     let per_token_loss = cross_entropy_loss(&flat_logits, &flat_targets, Some(ignore_index), 0.0)?;
 
     // Apply mask: only count loss for masked positions
-    let masked_loss = per_token_loss.multiply(&flat_mask)?;
+    let masked_loss = per_token_loss.multiply(&flat_mask);
 
     // Sum and normalize by number of masked tokens
-    let num_masked = mlx_rs::ops::maximum(&flat_mask.sum(None)?, &Array::from_f32(1.0))?;
-    let mean_loss = masked_loss.sum(None)?.divide(&num_masked)?;
+    let num_masked = ops::maximum(&flat_mask.sum(None), &Array::from_f32(1.0));
+    let mean_loss = masked_loss.sum(None).divide(&num_masked);
 
     // Apply ELBO weighting: multiply by 1/t
-    if use_elbo_weighting && t > 0.0001 {
+    Ok(if use_elbo_weighting && t > 0.0001 {
         let weight = Array::from_f32(1.0 / t);
         mean_loss.multiply(&weight)
     } else {
-        Ok(mean_loss)
-    }
+        mean_loss
+    })
 }
 
 /// Compute the diffusion loss (CPU fallback for compatibility).
@@ -303,22 +297,22 @@ pub fn diffusion_loss(
     let vocab_size = logits.dim(2) as usize;
 
     // Reshape for selective computation: [N, V] and [N]
-    let flat_logits = logits.reshape(&[-1, vocab_size as i32])?;
-    let flat_targets = targets.reshape(&[-1])?;
+    let flat_logits = logits.reshape(&[-1, vocab_size as i32]);
+    let flat_targets = targets.reshape(&[-1]);
 
     // Selective log softmax: gather logit + logsumexp instead of full [N, V] log_softmax
     // Clamp targets to valid range for gathering
-    let gather_targets = mlx_rs::ops::maximum(&flat_targets, &Array::from_int(0))?;
-    let gather_indices = gather_targets.expand_dims(-1i32)?; // [N, 1]
-    let selected_logits = flat_logits.take_along_axis(&gather_indices, -1)?; // [N, 1]
-    let lse = flat_logits.logsumexp_axis(-1, true)?; // [N, 1]
-    let log_probs_at_target = selected_logits.subtract(&lse)?; // [N, 1]
-    let log_probs_at_target = log_probs_at_target.squeeze_axes(&[-1i32])?; // [N]
-    log_probs_at_target.eval()?;
+    let gather_targets = ops::maximum(&flat_targets, &Array::from_int(0));
+    let gather_indices = gather_targets.expand_dims(-1i32); // [N, 1]
+    let selected_logits = flat_logits.take_along_axis(&gather_indices, -1); // [N, 1]
+    let lse = flat_logits.logsumexp(-1, true); // [N, 1]
+    let log_probs_at_target = selected_logits.subtract(&lse); // [N, 1]
+    let log_probs_at_target = log_probs_at_target.squeeze(-1i32); // [N]
+    log_probs_at_target.eval();
 
     // Get targets for masking logic
-    let flat_targets_i64 = flat_targets.as_dtype(Dtype::Int64)?;
-    flat_targets_i64.eval()?;
+    let flat_targets_i64 = flat_targets.as_dtype(Dtype::Int64.as_i32());
+    flat_targets_i64.eval();
     let target_vec: Vec<i64> = flat_targets_i64.as_slice().to_vec();
 
     let lp_data: &[f32] = log_probs_at_target.as_slice();
@@ -422,17 +416,17 @@ impl DiffusionTrainingLoop {
 
         let mut total_norm_sq = 0.0_f32;
         for (_, grad) in grads.iter() {
-            grad.eval()?;
-            let norm_sq = grad.multiply(grad)?.sum(None)?;
-            norm_sq.eval()?;
-            total_norm_sq += norm_sq.item::<f32>();
+            grad.eval();
+            let norm_sq = grad.multiply(grad).sum(None);
+            norm_sq.eval();
+            total_norm_sq += norm_sq.item_f32();
         }
         let total_norm = total_norm_sq.sqrt();
 
         if total_norm > max_norm {
             let scale = max_norm / (total_norm + 1e-6);
             for (_, grad) in grads.iter_mut() {
-                *grad = grad.multiply(&Array::from_f32(scale))?;
+                *grad = grad.multiply(&Array::from_f32(scale));
             }
         }
 
@@ -459,8 +453,8 @@ impl DiffusionTrainingLoop {
                 let scale = 1.0 / accum_steps as f32;
                 for (key, new_grad) in new_grads {
                     if let Some(existing) = acc.get_mut(&key) {
-                        let scaled = new_grad.multiply(&Array::from_f32(scale))?;
-                        *existing = existing.add(&scaled)?;
+                        let scaled = new_grad.multiply(&Array::from_f32(scale));
+                        *existing = existing.add(&scaled);
                     }
                 }
             }
@@ -511,24 +505,23 @@ impl DiffusionTrainingLoop {
 
         // IMPORTANT: Eval x_t and mask before any further operations to avoid
         // Metal command buffer conflicts (AGXG16X tryCoalescingPreviousComputeCommandEncoder)
-        x_t.eval()?;
-        mask.eval()?;
+        x_t.eval();
+        mask.eval();
 
         // Compute mask ratio on GPU and read single scalar
-        let mask_f32 = mask.as_dtype(Dtype::Float32)?;
-        let mask_sum = mask_f32.sum(None)?;
-        mask_sum.eval()?;
-        let mask_ratio = mask_sum.item::<f32>() / batch_tokens as f32;
+        let mask_f32 = mask.as_dtype(Dtype::Float32);
+        let mask_sum = mask_f32.sum(None);
+        mask_sum.eval();
+        let mask_ratio = mask_sum.item_f32() / batch_tokens as f32;
 
         // 3. Prepare targets on GPU: original tokens for masked positions, -100 for unmasked
         // targets = where(mask, original_tokens, -100)
-        let ignore_value = Array::from_int(-100);
-        let ignore_tokens = Array::full::<i32>(batch.input_ids.shape(), &ignore_value)?;
-        let original_i32 = batch.input_ids.as_dtype(Dtype::Int32)?;
-        let targets = mlx_rs::ops::r#where(&mask, &original_i32, &ignore_tokens)?;
+        let ignore_tokens = ops::full(batch.input_ids.shape(), -100.0_f32, Dtype::Int32);
+        let original_i32 = batch.input_ids.as_dtype(Dtype::Int32.as_i32());
+        let targets = ops::r#where(&mask, &original_i32, &ignore_tokens);
 
         // Sync all inputs before loss computation
-        targets.eval()?;
+        targets.eval();
 
         // 4. Define loss function for autodiff
         let loss_fn = |model: &mut M,
@@ -540,12 +533,11 @@ impl DiffusionTrainingLoop {
 
             // Use standard cross-entropy with ignore_index for non-masked tokens
             let vocab_size = logits.dim(2);
-            let flat_logits = logits.reshape(&[-1, vocab_size])?;
-            let flat_targets = targets.reshape(&[-1])?;
+            let flat_logits = logits.reshape(&[-1, vocab_size]);
+            let flat_targets = targets.reshape(&[-1]);
 
-            cross_entropy_loss(&flat_logits, &flat_targets, Some(-100), 0.0)?
-                .mean(None)
-                .map_err(|e| e.into())
+            let loss = cross_entropy_loss(&flat_logits, &flat_targets, Some(-100), 0.0)?;
+            Ok(loss.mean(None))
         };
 
         // Create value_and_grad function
@@ -554,8 +546,8 @@ impl DiffusionTrainingLoop {
         // 5. Compute loss and gradients
         let (loss, grads) = loss_and_grad_fn(model, (&x_t, &targets))?;
 
-        loss.eval()?;
-        let mut loss_val = loss.item::<f32>();
+        loss.eval();
+        let mut loss_val = loss.item_f32();
 
         // Apply ELBO weighting
         if self.config.use_elbo_loss && t > 0.0001 {
@@ -742,10 +734,10 @@ impl DiffusionTrainingLoop {
                 .forward(&x_t, None)
                 .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
-            let targets = batch.input_ids.as_dtype(Dtype::Int64)?;
+            let targets = batch.input_ids.as_dtype(Dtype::Int64);
             let loss = diffusion_loss(&logits, &targets, &mask_flags, eval_t, false, -100)?;
-            loss.eval()?;
-            total_loss += loss.item::<f32>() as f64;
+            loss.eval();
+            total_loss += loss.item_f32() as f64;
             num_batches += 1;
         }
 
@@ -851,13 +843,13 @@ impl DiffusionSampler {
     where
         M: TrainableModel,
     {
-        prompt.eval()?;
+        prompt.eval();
         let prompt_len = prompt.dim(1) as usize;
         let total_len = prompt_len + max_new_tokens;
 
         // Get prompt tokens
-        let prompt_i32 = prompt.as_dtype(Dtype::Int32)?;
-        prompt_i32.eval()?;
+        let prompt_i32 = prompt.as_dtype(Dtype::Int32);
+        prompt_i32.eval();
         let prompt_vec: Vec<i32> = prompt_i32.as_slice().to_vec();
 
         // Initialize: prompt + masks
@@ -888,8 +880,8 @@ impl DiffusionSampler {
             } else {
                 logits
             };
-            let probs = mlx_rs::ops::softmax_axis(&scaled_logits, -1, None)?;
-            probs.eval()?;
+            let probs = ops::softmax_axis(&scaled_logits, -1);
+            probs.eval();
 
             let probs_data: Vec<f32> = probs.as_slice().to_vec();
             let vocab_size = scaled_logits.dim(2) as usize;

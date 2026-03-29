@@ -55,10 +55,10 @@ fn single_sequence_packed_batch(tokens: &[i32], labels: &[i64]) -> PackedTrainin
     let len = tokens.len() as i32;
     let position_ids: Vec<i32> = (0..len).collect();
     PackedTrainingBatch {
-        input_ids: Array::from_slice(tokens, &[len]),
-        position_ids: Array::from_slice(&position_ids, &[len]),
-        cu_seqlens: Array::from_slice(&[0_i32, len], &[2]),
-        labels: Array::from_slice(labels, &[len]),
+        input_ids: Array::from_i32_slice_shaped(tokens, &[len]),
+        position_ids: Array::from_i32_slice_shaped(&position_ids, &[len]),
+        cu_seqlens: Array::from_i32_slice_shaped(&[0_i32, len], &[2]),
+        labels: Array::from_i32_slice_shaped(&labels.iter().map(|&x| x as i32).collect::<Vec<_>>(), &[len]),
         total_tokens: tokens.len(),
         num_sequences: 1,
         max_seqlen: tokens.len(),
@@ -205,7 +205,7 @@ fn test_gradient_accumulation_flag() {
 
 #[test]
 fn test_single_train_step() {
-    use mlx_rs::optimizers::Sgd;
+    use pmetal_bridge::compat::optimizers::Sgd;
 
     let config = TrainingLoopConfig {
         use_metal_flash_attention: false, // Disable for simpler test
@@ -218,9 +218,9 @@ fn test_single_train_step() {
 
     // Create a minimal batch
     let batch = TrainingBatch {
-        input_ids: Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]),
-        labels: Array::from_slice(&[2_i64, 3, 4, 5], &[1, 4]),
-        attention_mask: Array::from_slice(&[1_i32, 1, 1, 1], &[1, 4]),
+        input_ids: Array::from_i32_slice_shaped(&[1_i32, 2, 3, 4], &[1, 4]),
+        labels: Array::from_i32_slice_shaped(&[2_i32, 3, 4, 5], &[1, 4]),
+        attention_mask: Array::from_i32_slice_shaped(&[1_i32, 1, 1, 1], &[1, 4]),
         pixel_values: None,
         batch_size: 1,
         seq_len: 4,
@@ -238,7 +238,7 @@ fn test_single_train_step() {
 #[test]
 fn test_jit_training_step() {
     // Test the JIT-compiled training step function directly
-    use mlx_rs::optimizers::AdamW;
+    use pmetal_bridge::compat::optimizers::AdamW;
 
     let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
     let optimizer = AdamW::new(1e-4);
@@ -246,14 +246,14 @@ fn test_jit_training_step() {
     let mut state = (model, optimizer);
 
     // Create a minimal batch
-    let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
-    let labels = Array::from_slice(&[2_i64, 3, 4, 5], &[1, 4]);
+    let input_ids = Array::from_i32_slice_shaped(&[1_i32, 2, 3, 4], &[1, 4]);
+    let labels = Array::from_i32_slice_shaped(&[2_i32, 3, 4, 5], &[1, 4]);
 
     // Run the JIT training step
     let loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
-    loss.eval().unwrap();
+    loss.eval();
 
-    let loss_val = loss.item::<f32>();
+    let loss_val = loss.item_f32();
     assert!(loss_val > 0.0, "Loss should be positive, got {}", loss_val);
     assert!(
         loss_val.is_finite(),
@@ -266,7 +266,7 @@ fn test_jit_training_step() {
 fn test_jit_training_step_multiple_steps() {
     // Test that jit_training_step works correctly over multiple steps
     // This verifies the training step function itself works, independent of compile_with_state
-    use mlx_rs::optimizers::AdamW;
+    use pmetal_bridge::compat::optimizers::AdamW;
 
     let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
     let optimizer = AdamW::new(1e-4);
@@ -274,15 +274,15 @@ fn test_jit_training_step_multiple_steps() {
     let mut state = (model, optimizer);
 
     // Create test data
-    let input_ids = Array::from_slice(&[1_i32, 2, 3, 4, 5, 6, 7, 8], &[1, 8]);
-    let labels = Array::from_slice(&[2_i64, 3, 4, 5, 6, 7, 8, 9], &[1, 8]);
+    let input_ids = Array::from_i32_slice_shaped(&[1_i32, 2, 3, 4, 5, 6, 7, 8], &[1, 8]);
+    let labels = Array::from_i32_slice_shaped(&[2_i32, 3, 4, 5, 6, 7, 8, 9], &[1, 8]);
 
     // Run multiple training steps
     let mut losses = Vec::new();
     for _ in 0..5 {
         let loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
-        loss.eval().unwrap();
-        losses.push(loss.item::<f32>());
+        loss.eval();
+        losses.push(loss.item_f32());
     }
 
     // All losses should be finite and positive
@@ -400,14 +400,14 @@ fn test_run_compiled_direct_api_applies_gradient_checkpointing() {
 
 #[test]
 fn test_single_sequence_packed_step_matches_standard_step() {
-    use mlx_rs::{optimizers::AdamW, random};
+    use pmetal_bridge::compat::{optimizers::AdamW, random};
 
     let tokens = [1_i32, 2, 3, 4, 5, 6];
     let labels = [2_i64, 3, 4, 5, 6, 7];
 
-    random::seed(1337).unwrap();
+    random::seed(1337);
     let model_standard = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
-    random::seed(1337).unwrap();
+    random::seed(1337);
     let model_packed = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
 
     let optimizer_standard = AdamW::new(0.0);
@@ -416,17 +416,17 @@ fn test_single_sequence_packed_step_matches_standard_step() {
     let mut standard_state = (model_standard, optimizer_standard);
     let mut packed_state = (model_packed, optimizer_packed);
 
-    let input_ids = Array::from_slice(&tokens, &[1, tokens.len() as i32]);
-    let label_ids = Array::from_slice(&labels, &[1, labels.len() as i32]);
+    let input_ids = Array::from_i32_slice_shaped(&tokens, &[1, tokens.len() as i32]);
+    let label_ids = Array::from_i32_slice_shaped(&labels.iter().map(|&x| x as i32).collect::<Vec<_>>(), &[1, labels.len() as i32]);
     let packed_batch = single_sequence_packed_batch(&tokens, &labels);
 
     let standard_loss = jit_training_step(&mut standard_state, (&input_ids, &label_ids)).unwrap();
-    standard_loss.eval().unwrap();
+    standard_loss.eval();
     let packed_loss = jit_training_step_packed(&mut packed_state, &packed_batch, 0.0).unwrap();
-    packed_loss.eval().unwrap();
+    packed_loss.eval();
 
-    let standard_val = standard_loss.item::<f32>();
-    let packed_val = packed_loss.item::<f32>();
+    let standard_val = standard_loss.item_f32();
+    let packed_val = packed_loss.item_f32();
     assert!(
         (standard_val - packed_val).abs() < 1e-4,
         "single-sequence packed step should match standard step: standard={standard_val}, packed={packed_val}"
@@ -435,12 +435,12 @@ fn test_single_sequence_packed_step_matches_standard_step() {
 
 #[test]
 fn test_single_sequence_packed_cce_step_is_finite() {
-    use mlx_rs::{optimizers::AdamW, random};
+    use pmetal_bridge::compat::{optimizers::AdamW, random};
 
     let tokens = [1_i32, 2, 3, 4, 5, 6];
     let labels = [2_i64, 3, 4, 5, 6, 7];
 
-    random::seed(7331).unwrap();
+    random::seed(7331);
     let model_packed = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
 
     let optimizer_packed = AdamW::new(0.0);
@@ -450,9 +450,9 @@ fn test_single_sequence_packed_cce_step_is_finite() {
     let packed_batch = single_sequence_packed_batch(&tokens, &labels);
 
     let packed_loss = jit_training_step_packed_cce(&mut packed_state, &packed_batch, 0.0).unwrap();
-    packed_loss.eval().unwrap();
+    packed_loss.eval();
 
-    let packed_val = packed_loss.item::<f32>();
+    let packed_val = packed_loss.item_f32();
     assert!(
         packed_val.is_finite() && packed_val > 0.0,
         "single-sequence packed CCE step should produce a finite positive loss, got {packed_val}"
@@ -463,8 +463,8 @@ fn test_single_sequence_packed_cce_step_is_finite() {
 fn test_jit_training_step_with_warmup() {
     // Test the jit_training_step function with proper warmup to initialize
     // optimizer state. This verifies state stability and correct loss reduction.
-    use mlx_rs::optimizers::AdamW;
-    use mlx_rs::utils::Updatable;
+    use pmetal_bridge::compat::optimizers::AdamW;
+    use pmetal_bridge::compat::optimizers::Updatable;
 
     let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
     let optimizer = AdamW::new(1e-4);
@@ -472,8 +472,8 @@ fn test_jit_training_step_with_warmup() {
     let mut state = (model, optimizer);
 
     // Create test data
-    let input_ids = Array::from_slice(&[1_i32, 2, 3, 4, 5, 6, 7, 8], &[1, 8]);
-    let labels = Array::from_slice(&[2_i64, 3, 4, 5, 6, 7, 8, 9], &[1, 8]);
+    let input_ids = Array::from_i32_slice_shaped(&[1_i32, 2, 3, 4, 5, 6, 7, 8], &[1, 8]);
+    let labels = Array::from_i32_slice_shaped(&[2_i32, 3, 4, 5, 6, 7, 8, 9], &[1, 8]);
 
     // ========================================
     // PHASE 1: Record state count BEFORE warmup
@@ -486,8 +486,8 @@ fn test_jit_training_step_with_warmup() {
     // ========================================
     // This initializes optimizer momentum/velocity buffers
     let warmup_loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
-    warmup_loss.eval().unwrap();
-    let warmup_loss_val = warmup_loss.item::<f32>();
+    warmup_loss.eval();
+    let warmup_loss_val = warmup_loss.item_f32();
     println!("Warmup loss: {:.4}", warmup_loss_val);
 
     // ========================================
@@ -514,8 +514,8 @@ fn test_jit_training_step_with_warmup() {
     // ========================================
     println!("Running second warmup step to verify state stability...");
     let warmup2_loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
-    warmup2_loss.eval().unwrap();
-    let warmup2_loss_val = warmup2_loss.item::<f32>();
+    warmup2_loss.eval();
+    let warmup2_loss_val = warmup2_loss.item_f32();
     println!("Second warmup loss: {:.4}", warmup2_loss_val);
 
     let state_count_after_2 = state.updatable_states_len();
@@ -548,8 +548,8 @@ fn test_jit_training_step_with_warmup() {
     let mut losses = vec![warmup_loss_val, warmup2_loss_val];
     for i in 0..3 {
         let loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
-        loss.eval().unwrap();
-        let loss_val = loss.item::<f32>();
+        loss.eval();
+        let loss_val = loss.item_f32();
         losses.push(loss_val);
         println!("Training step {}: loss={:.4}", i + 3, loss_val);
     }
@@ -584,7 +584,7 @@ fn test_eager_evaluation_config() {
 
 #[test]
 fn test_gpu_gradient_clipping() {
-    use mlx_rs::Array;
+    use pmetal_bridge::compat::Array;
     use std::rc::Rc;
 
     let config = TrainingLoopConfig {
@@ -597,8 +597,8 @@ fn test_gpu_gradient_clipping() {
     let training_loop = TrainingLoop::new(config);
 
     // Create some fake gradients
-    let grad1 = Array::from_slice(&[3.0f32, 4.0], &[2]); // norm = 5
-    let grad2 = Array::from_slice(&[0.0f32, 0.0], &[2]); // norm = 0
+    let grad1 = Array::from_f32_slice(&[3.0f32, 4.0], &[2]); // norm = 5
+    let grad2 = Array::from_f32_slice(&[0.0f32, 0.0], &[2]); // norm = 0
     let mut grads = FlattenedModuleParam::new();
     grads.insert(Rc::from("layer1.weight"), grad1);
     grads.insert(Rc::from("layer2.weight"), grad2);
@@ -614,8 +614,8 @@ fn test_gpu_gradient_clipping() {
     );
 
     let norm = norm_arr.unwrap();
-    norm.eval().unwrap();
-    let norm_val = norm.item::<f32>();
+    norm.eval();
+    let norm_val = norm.item_f32();
 
     // Original norm should be 5 (sqrt(3^2 + 4^2))
     // After clipping with max_norm=1.0, gradients should be scaled
@@ -629,7 +629,7 @@ fn test_gpu_gradient_clipping() {
     // Check that gradients were actually clipped
     let key: Rc<str> = Rc::from("layer1.weight");
     let clipped_grad1 = grads.get(&key).unwrap();
-    clipped_grad1.eval().unwrap();
+    clipped_grad1.eval();
 
     // Gradients should be scaled by 1.0/5.0 = 0.2
     // [3.0, 4.0] * 0.2 = [0.6, 0.8]

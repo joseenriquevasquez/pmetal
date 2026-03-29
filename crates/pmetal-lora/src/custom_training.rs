@@ -46,8 +46,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{Array, error::Exception};
+use pmetal_bridge::compat::{Array, Exception};
 
 use crate::autograd::{AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext, LoraGrads};
 use crate::{LoraError, LoraLinear};
@@ -160,23 +159,23 @@ impl CustomLoraTrainer {
         let num_tokens = flat_logits.dim(0);
 
         // Compute softmax probabilities (for gradient)
-        let probs = mlx_rs::ops::softmax_axis(&flat_logits, -1, None)?;
+        let probs = pmetal_bridge::compat::ops::softmax_axis(&flat_logits, -1, None)?;
 
         // Create ignore mask
         let ignore_mask = flat_labels.ne(&Array::from_int(ignore_index as i32))?;
-        let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
+        let ignore_mask_f32 = ignore_mask.as_dtype(pmetal_bridge::compat::Dtype::Float32)?;
         let valid_count = ignore_mask_f32.sum(None)?;
         valid_count.eval()?;
         let valid_count_val = valid_count.item::<f32>();
 
         if valid_count_val == 0.0 {
             // No valid tokens - return zero loss and gradient
-            let d_logits = mlx_rs::ops::zeros_like(logits)?;
+            let d_logits = pmetal_bridge::compat::ops::zeros_like(logits)?;
             return Ok((0.0, d_logits));
         }
 
         // Compute loss using mlx-rs CrossEntropy
-        let ce = mlx_rs::losses::CrossEntropy::new()
+        let ce = crate::LossHelper::new()
             .map_err(|e| LoraError::Mlx(Exception::custom(format!("{:?}", e))))?;
         let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
 
@@ -204,12 +203,12 @@ impl CustomLoraTrainer {
         // Actually, simpler: compute one_hot via comparison and broadcasting.
 
         // Create row indices [0, 1, 2, ..., num_tokens-1]
-        let row_indices = mlx_rs::ops::arange::<i32, i32>(0, num_tokens, 1)?;
+        let row_indices = pmetal_bridge::compat::ops::arange_from(0, num_tokens);
 
         // Labels clamped to valid range (negative labels become 0, which is fine since masked)
-        let labels_i32 = flat_labels.as_dtype(mlx_rs::Dtype::Int32)?;
+        let labels_i32 = flat_labels.as_dtype(pmetal_bridge::compat::Dtype::Int32)?;
         let zero = Array::from_int(0_i32);
-        let labels_clipped = mlx_rs::ops::maximum(&labels_i32, &zero)?;
+        let labels_clipped = pmetal_bridge::compat::ops::maximum(&labels_i32, &zero)?;
 
         // Create scatter indices: [row_idx, label]
         // We'll use put_along_axis or similar...
@@ -226,7 +225,7 @@ impl CustomLoraTrainer {
         // Create a tensor to subtract from probs at label positions
         // Using put_along_axis: put -1 at positions [i, labels[i]]
         let ones = Array::from_f32(-1.0);
-        let ones_expanded = mlx_rs::ops::broadcast_to(&ones, &[num_tokens, 1])?;
+        let ones_expanded = pmetal_bridge::compat::ops::broadcast_to(&ones, &[num_tokens, 1])?;
         let labels_expanded = labels_clipped.reshape(&[-1, 1])?;
 
         // Actually mlx-rs doesn't have put_along_axis directly exposed.
@@ -238,11 +237,11 @@ impl CustomLoraTrainer {
         // one_hot[i,j] = 1 if labels[i] == j else 0
 
         // Broadcast labels to [num_tokens, vocab_size] and compare
-        let vocab_range = mlx_rs::ops::arange::<i32, i32>(0, vocab_size, 1)?;
+        let vocab_range = pmetal_bridge::compat::ops::arange_from(0, vocab_size);
         let labels_bc = labels_clipped.reshape(&[-1, 1])?;
         let vocab_bc = vocab_range.reshape(&[1, vocab_size])?;
         let one_hot_mask = labels_bc.eq(&vocab_bc)?;
-        let one_hot_f32 = one_hot_mask.as_dtype(mlx_rs::Dtype::Float32)?;
+        let one_hot_f32 = one_hot_mask.as_dtype(pmetal_bridge::compat::Dtype::Float32)?;
 
         // Gradient: (probs - one_hot) * mask / valid_count
         let d_flat_logits = probs.subtract(&one_hot_f32)?;
@@ -258,8 +257,8 @@ impl CustomLoraTrainer {
         let d_shift_logits = d_flat_logits.reshape(&[batch_size, seq_len - 1, vocab_size])?;
 
         // Pad to full sequence length (prepend zeros for shifted position)
-        let zero_pad = mlx_rs::ops::zeros::<f32>(&[batch_size, 1, vocab_size])?;
-        let d_logits = mlx_rs::ops::concatenate_axis(&[&zero_pad, &d_shift_logits], 1)?;
+        let zero_pad = pmetal_bridge::compat::ops::zeros(&[batch_size, 1, vocab_size], pmetal_bridge::compat::Dtype::Float32);
+        let d_logits = pmetal_bridge::compat::ops::concatenate_axis(&[&zero_pad, &d_shift_logits], 1)?;
 
         Ok((loss_val, d_logits))
     }
@@ -360,11 +359,11 @@ mod tests {
 
         // Random logits
         let logits =
-            mlx_rs::random::normal::<f32>(&[batch, seq_len, vocab_size], None, None, None).unwrap();
+            pmetal_bridge::compat::random::normal(&[batch, seq_len, vocab_size], pmetal_bridge::compat::Dtype::Float32);
 
         // Random labels (valid indices 0 to vocab_size-1)
         let labels =
-            mlx_rs::random::randint::<i32, i32>(0, vocab_size, &[batch, seq_len], None).unwrap();
+            pmetal_bridge::compat::random::randint(0, vocab_size, &[batch, seq_len], pmetal_bridge::compat::Dtype::Int32);
 
         let (loss, d_logits) =
             CustomLoraTrainer::cross_entropy_with_grad(&logits, &labels, -100).unwrap();
@@ -389,16 +388,14 @@ mod tests {
         let trainer = CustomLoraTrainer::new();
 
         // Forward with grad
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, in_features], None, None, None)
-            .unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, in_features], pmetal_bridge::compat::Dtype::Float32);
 
         let (output, saved) = trainer.forward_lora_linear(&lora, &x).unwrap();
         assert_eq!(output.shape(), &[batch, seq_len, out_features]);
 
         // Backward
         let d_output =
-            mlx_rs::random::normal::<f32>(&[batch, seq_len, out_features], None, None, None)
-                .unwrap();
+            pmetal_bridge::compat::random::normal(&[batch, seq_len, out_features], pmetal_bridge::compat::Dtype::Float32);
 
         let grads = trainer
             .backward_lora_linear(&lora, &d_output, &saved)
@@ -421,14 +418,14 @@ mod tests {
         let out_features = 64;
 
         let grads1 = LoraGrads {
-            d_lora_a: mlx_rs::Array::ones::<f32>(&[rank, in_features]).unwrap(),
-            d_lora_b: mlx_rs::Array::ones::<f32>(&[out_features, rank]).unwrap(),
+            d_lora_a: pmetal_bridge::compat::ops::ones(&[rank, in_features], pmetal_bridge::compat::Dtype::Float32),
+            d_lora_b: pmetal_bridge::compat::ops::ones(&[out_features, rank], pmetal_bridge::compat::Dtype::Float32),
             d_x: None,
         };
 
         let grads2 = LoraGrads {
-            d_lora_a: mlx_rs::Array::ones::<f32>(&[rank, in_features]).unwrap(),
-            d_lora_b: mlx_rs::Array::ones::<f32>(&[out_features, rank]).unwrap(),
+            d_lora_a: pmetal_bridge::compat::ops::ones(&[rank, in_features], pmetal_bridge::compat::Dtype::Float32),
+            d_lora_b: pmetal_bridge::compat::ops::ones(&[out_features, rank], pmetal_bridge::compat::Dtype::Float32),
             d_x: None,
         };
 

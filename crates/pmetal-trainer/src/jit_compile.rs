@@ -42,18 +42,26 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::{
-    Array,
-    error::Exception,
+use pmetal_bridge::compat::{
+    Array, Exception,
     losses::CrossEntropy,
-    module::{FlattenedModuleParam, ModuleParameters},
+    module::{FlattenedModuleParam, ModuleParameters, update_parameters},
+    nn,
     ops::indexing::IndexOp,
     optimizers::Optimizer,
-    transforms::compile::compile,
-    utils::Updatable,
+    optimizers::Updatable,
 };
 
 use crate::Result;
+
+/// No-op shim for `mlx_rs::transforms::compile::compile`.
+///
+/// The bridge executes pre-compiled Metal kernels; JIT compilation
+/// via this path is a no-op that returns the function unchanged.
+#[allow(dead_code)]
+fn compile<F>(f: F, _shapeful: bool) -> F {
+    f
+}
 
 /// Trait for types that can extract their state as arrays and update from arrays.
 pub trait StateExtractor {
@@ -181,7 +189,7 @@ where
             .zip(arrays.iter().cloned())
             .collect();
 
-        mlx_rs::module::update_parameters(&mut self.model, updates.into_iter());
+        update_parameters(&mut self.model, updates.into_iter());
         Ok(())
     }
 }
@@ -197,7 +205,7 @@ pub fn stateless_loss_and_grad(
     labels: &Array,
     forward_fn: impl Fn(&FlattenedModuleParam, &Array) -> std::result::Result<Array, Exception>,
 ) -> std::result::Result<(Array, Vec<Array>), Exception> {
-    use mlx_rs::transforms::keyed_value_and_grad;
+    use pmetal_bridge::compat::nn::keyed_value_and_grad;
 
     // Reconstruct params map
     let params: FlattenedModuleParam = param_keys
@@ -220,23 +228,24 @@ pub fn stateless_loss_and_grad(
         let shift_logits = logits.index((.., ..seq_len - 1, ..));
         let shift_labels = labels.index((.., 1..));
 
-        let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
-        let flat_labels = shift_labels.reshape(&[-1])?;
+        let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
+        let flat_labels = shift_labels.reshape(&[-1]);
 
         // Cross-entropy with ignore_index=-100
         let ce = CrossEntropy::new()?;
         let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
 
-        let labels_dtype = flat_labels.dtype();
-        let ignore_idx = Array::from_int(-100).as_dtype(labels_dtype)?;
-        let valid_mask = flat_labels.ne(&ignore_idx)?;
-        let valid_mask_f32 = valid_mask.as_dtype(mlx_rs::Dtype::Float32)?;
+        let labels_dtype = flat_labels.dtype_raw();
+        let ignore_idx = Array::from_int(-100).as_dtype(labels_dtype);
+        let valid_mask = flat_labels.ne(&ignore_idx);
+        use pmetal_bridge::compat::{Dtype, ops};
+        let valid_mask_f32 = valid_mask.as_dtype(Dtype::Float32.as_i32());
 
-        let masked_loss = per_token_loss.multiply(&valid_mask_f32)?;
-        let n_valid = valid_mask_f32.sum(None)?;
-        let n_valid_safe = mlx_rs::ops::maximum(&n_valid, &Array::from_f32(1.0))?;
+        let masked_loss = per_token_loss.multiply(&valid_mask_f32);
+        let n_valid = valid_mask_f32.sum(None);
+        let n_valid_safe = ops::maximum(&n_valid, &Array::from_f32(1.0));
 
-        let loss = masked_loss.sum(None)?.divide(&n_valid_safe)?;
+        let loss = masked_loss.sum(None).divide(&n_valid_safe);
         Ok(vec![loss])
     };
 

@@ -8,10 +8,9 @@
 //! - Optimized for Fill-in-the-Middle (FIM) training
 
 use crate::architectures::llama::{LlamaAttention, LlamaConfig};
-use mlx_rs::error::Exception;
-use mlx_rs::macros::ModuleParameters;
-use mlx_rs::module::{Module, ModuleParameters};
-use mlx_rs::{Array, nn};
+// ModuleParameters derive via impl_module_params!
+use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, nn};
+use pmetal_bridge::impl_module_params;
 use pmetal_core::ModelConfig;
 use pmetal_mlx::Builder;
 use serde::{Deserialize, Serialize};
@@ -51,54 +50,48 @@ impl Default for StarCoder2Config {
 }
 
 /// StarCoder2 MLP block.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct StarCoder2MLP {
-    #[param]
     pub gate_proj: nn::Linear,
-    #[param]
     pub up_proj: nn::Linear,
-    #[param]
     pub down_proj: nn::Linear,
 }
+impl_module_params!(StarCoder2MLP; gate_proj, up_proj, down_proj);
+
 
 impl StarCoder2MLP {
     pub fn new(config: &StarCoder2Config) -> Result<Self, Exception> {
         Ok(Self {
             gate_proj: nn::LinearBuilder::new(config.hidden_size, config.intermediate_size)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             up_proj: nn::LinearBuilder::new(config.hidden_size, config.intermediate_size)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             down_proj: nn::LinearBuilder::new(config.intermediate_size, config.hidden_size)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
         })
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
-        let activated = nn::silu(gate)?.multiply(&up)?;
-        self.down_proj.forward(&activated)
+        let gate = self.gate_proj.forward(x);
+        let up = self.up_proj.forward(x);
+        let activated = nn::silu(&gate).multiply(&up);
+        Ok(self.down_proj.forward(&activated))
     }
 }
 
 /// StarCoder2 Layer block.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct StarCoder2Layer {
-    #[param]
     pub attention: LlamaAttention,
-    #[param]
     pub mlp: StarCoder2MLP,
-    #[param]
     pub input_layernorm: nn::RmsNorm,
-    #[param]
     pub post_attention_layernorm: nn::RmsNorm,
 }
+impl_module_params!(StarCoder2Layer; attention, mlp, input_layernorm, post_attention_layernorm);
+
 
 impl StarCoder2Layer {
     pub fn new(config: &StarCoder2Config, layer_idx: usize) -> Result<Self, Exception> {
@@ -116,12 +109,10 @@ impl StarCoder2Layer {
             mlp: StarCoder2MLP::new(config)?,
             input_layernorm: nn::RmsNormBuilder::new(config.hidden_size)
                 .eps(config.rms_norm_eps)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             post_attention_layernorm: nn::RmsNormBuilder::new(config.hidden_size)
                 .eps(config.rms_norm_eps)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
         })
     }
 
@@ -131,32 +122,30 @@ impl StarCoder2Layer {
         mask: Option<&Array>,
         mut cache: Option<(&mut pmetal_mlx::kv_cache::KVCache, usize)>,
     ) -> Result<Array, Exception> {
-        let h = self.input_layernorm.forward(x)?;
+        let h = self.input_layernorm.forward(x);
         let attn_out = self.attention.forward_with_cache(
             &h,
             mask,
             cache.as_mut().map(|(c, i)| (&mut **c, *i)),
         )?;
-        let x = x.add(&attn_out)?;
-        let h = self.post_attention_layernorm.forward(&x)?;
+        let x = x.add(&attn_out);
+        let h = self.post_attention_layernorm.forward(&x);
         let mlp_out = self.mlp.forward(&h)?;
-        x.add(&mlp_out)
+        Ok(x.add(&mlp_out))
     }
 }
 
 /// StarCoder2 Model.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct StarCoder2Model {
-    #[param]
     pub embed_tokens: nn::Embedding,
-    #[param]
     pub layers: Vec<StarCoder2Layer>,
-    #[param]
     pub norm: nn::RmsNorm,
-    #[param]
     pub lm_head: nn::Linear,
     pub config: StarCoder2Config,
 }
+impl_module_params!(StarCoder2Model; embed_tokens, layers, norm, lm_head);
+
 
 impl StarCoder2Model {
     pub fn new(config: StarCoder2Config) -> Result<Self, Exception> {
@@ -169,12 +158,10 @@ impl StarCoder2Model {
             layers,
             norm: nn::RmsNormBuilder::new(config.hidden_size)
                 .eps(config.rms_norm_eps)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             lm_head: nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             config,
         })
     }
@@ -185,12 +172,12 @@ impl StarCoder2Model {
         mask: Option<&Array>,
         mut cache: Option<&mut pmetal_mlx::kv_cache::KVCache>,
     ) -> Result<Array, Exception> {
-        let mut x = self.embed_tokens.forward(input_ids)?;
+        let mut x = self.embed_tokens.forward(input_ids);
         for (i, layer) in self.layers.iter_mut().enumerate() {
             x = layer.forward(&x, mask, cache.as_mut().map(|c| (&mut **c, i)))?;
         }
-        x = self.norm.forward(&x)?;
-        self.lm_head.forward(&x)
+        x = self.norm.forward(&x);
+        Ok(self.lm_head.forward(&x))
     }
 
     pub fn forward_with_cache(

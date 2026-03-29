@@ -22,9 +22,9 @@
 //!     .system("You are a helpful assistant.")
 //!     .parameter("temperature", "0.7")
 //!     .parameter("num_ctx", "4096")
-//!     .build();
+//!     .build()?;
 //!
-//! std::fs::write("Modelfile", modelfile)?;
+//! std::fs::write("Modelfile", modelfile);
 //! ```
 
 use std::collections::HashMap;
@@ -361,7 +361,7 @@ impl ModelfileBuilder {
     /// Build and write to a file.
     pub fn write_to_file(&self, path: impl AsRef<Path>) -> Result<(), ModelfileError> {
         let content = self.build()?;
-        std::fs::write(path, content)?;
+        std::fs::write(path, content);
         Ok(())
     }
 }
@@ -416,7 +416,7 @@ mod tests {
     fn test_build_basic_modelfile() {
         let modelfile = ModelfileBuilder::new()
             .from("./model.gguf")
-            .build()
+            .build()?
             .unwrap();
 
         assert!(modelfile.contains("FROM ./model.gguf"));
@@ -429,7 +429,7 @@ mod tests {
             .temperature(0.7)
             .num_ctx(4096)
             .top_p(0.9)
-            .build()
+            .build()?
             .unwrap();
 
         assert!(modelfile.contains("PARAMETER temperature 0.7"));
@@ -442,7 +442,7 @@ mod tests {
         let modelfile = ModelfileBuilder::new()
             .from("llama3.2")
             .system("You are a helpful assistant.")
-            .build()
+            .build()?
             .unwrap();
 
         assert!(modelfile.contains("SYSTEM"));
@@ -454,7 +454,7 @@ mod tests {
         let modelfile = ModelfileBuilder::new()
             .from("./base.gguf")
             .adapter("./lora.gguf")
-            .build()
+            .build()?
             .unwrap();
 
         assert!(modelfile.contains("ADAPTER ./lora.gguf"));
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn test_missing_from_error() {
-        let result = ModelfileBuilder::new().build();
+        let result = ModelfileBuilder::new().build()?;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ModelfileError::MissingFrom));
     }
@@ -472,7 +472,7 @@ mod tests {
         let modelfile = ModelfileBuilder::new()
             .from("llama3.2")
             .template(templates::LLAMA3_CHAT)
-            .build()
+            .build()?
             .unwrap();
 
         assert!(modelfile.contains("TEMPLATE"));

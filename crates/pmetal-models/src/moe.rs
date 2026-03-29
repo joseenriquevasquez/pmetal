@@ -29,7 +29,7 @@
 //! let mut moe = MoELayer::new(config);
 //! moe.eval();
 //!
-//! let (output, aux_loss) = moe.forward(&hidden_states)?;
+//! let (output, aux_loss) = moe.forward(&hidden_states);
 //! ```
 
 pub use pmetal_mlx::moe::*;

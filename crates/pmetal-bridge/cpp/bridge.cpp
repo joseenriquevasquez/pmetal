@@ -2073,6 +2073,31 @@ void mlx_inline_stop_gradient(mlx_inline_array* dst, const mlx_inline_array* a) 
     new (dst->buf) array(mlx::core::stop_gradient(as_arr(a)));
 }
 
+void mlx_inline_tri_inv(mlx_inline_array* dst, const mlx_inline_array* a, bool upper, bool use_cpu) {
+    // tri_inv has no VJP in MLX — used in WY factorization as a fixed preconditioner.
+    // use_cpu=true routes execution to the CPU device (matching mlx-lm's StreamOrDevice::cpu()).
+    mlx::core::StreamOrDevice stream = use_cpu
+        ? mlx::core::StreamOrDevice{mlx::core::Device(mlx::core::Device::cpu)}
+        : mlx::core::StreamOrDevice{};
+    new (dst->buf) array(mlx::core::linalg::tri_inv(as_arr(a), upper, stream));
+}
+
+void mlx_inline_svd(
+    mlx_inline_array* dst_u,
+    mlx_inline_array* dst_s,
+    mlx_inline_array* dst_vt,
+    const mlx_inline_array* a)
+{
+    // SVD always runs on CPU (GPU SVD not available in MLX).
+    // Returns economy / thin SVD: U[m,k], S[k], Vt[k,n] where k=min(m,n).
+    mlx::core::StreamOrDevice cpu_stream{mlx::core::Device(mlx::core::Device::cpu)};
+    auto result = mlx::core::linalg::svd(as_arr(a), /* compute_uv */ true, cpu_stream);
+    // result = {U, S, Vt}
+    new (dst_u->buf)  array(result[0]);
+    new (dst_s->buf)  array(result[1]);
+    new (dst_vt->buf) array(result[2]);
+}
+
 // ── Autograd: value_and_grad ─────────────────────────────────────────────────
 //
 // Callback-based autograd bridge. The Rust caller provides a function pointer
@@ -2147,6 +2172,140 @@ void mlx_inline_value_and_grad(
     for (int i = 0; i < n_params; i++) {
         new (grads_out[i]->buf) array(grads[i]);
     }
+}
+
+// ── FFT ops ──────────────────────────────────────────────────────────────────
+
+void mlx_inline_rfft(mlx_inline_array* dst, const mlx_inline_array* a, int n_fft, int axis) {
+    const auto& x = as_arr(a);
+    // n_fft < 0 means "use full axis size" — use the no-n overload
+    if (n_fft < 0) {
+        new (dst->buf) array(mlx::core::fft::rfft(x, axis));
+    } else {
+        new (dst->buf) array(mlx::core::fft::rfft(x, n_fft, axis));
+    }
+}
+
+void mlx_inline_irfft(mlx_inline_array* dst, const mlx_inline_array* a, int n_fft, int axis) {
+    const auto& x = as_arr(a);
+    if (n_fft < 0) {
+        new (dst->buf) array(mlx::core::fft::irfft(x, axis));
+    } else {
+        new (dst->buf) array(mlx::core::fft::irfft(x, n_fft, axis));
+    }
+}
+
+// ── leaky_relu ────────────────────────────────────────────────────────────────
+
+void mlx_inline_leaky_relu(mlx_inline_array* dst, const mlx_inline_array* a, float neg_slope) {
+    const auto& x = as_arr(a);
+    // leaky_relu(x) = where(x >= 0, x, neg_slope * x)
+    new (dst->buf) array(mlx::core::maximum(
+        mlx::core::multiply(x, array(neg_slope)),
+        x));
+}
+
+// ── squeeze all size-1 axes ────────────────────────────────────────────────────
+
+void mlx_inline_squeeze_all(mlx_inline_array* dst, const mlx_inline_array* a) {
+    const auto& x = as_arr(a);
+    std::vector<int> axes;
+    for (int i = 0; i < (int)x.ndim(); ++i) {
+        if (x.shape(i) == 1) axes.push_back(i);
+    }
+    if (axes.empty()) {
+        new (dst->buf) array(x);
+    } else {
+        new (dst->buf) array(mlx::core::squeeze(x, axes));
+    }
+}
+
+// ── pad ───────────────────────────────────────────────────────────────────────
+
+void mlx_inline_pad(mlx_inline_array* dst, const mlx_inline_array* a,
+                    const int* pad_widths, int ndim, float fill_value) {
+    const auto& x = as_arr(a);
+    std::vector<std::pair<int,int>> pw(ndim);
+    for (int i = 0; i < ndim; ++i) {
+        pw[i] = { pad_widths[2*i], pad_widths[2*i+1] };
+    }
+    new (dst->buf) array(mlx::core::pad(x, pw, array(fill_value)));
+}
+
+// ── Missing ops for pmetal-models migration ───────────────────────────────────
+
+void mlx_inline_rsqrt(mlx_inline_array* dst, const mlx_inline_array* a) {
+    new (dst->buf) array(mlx::core::rsqrt(as_arr(a)));
+}
+
+void mlx_inline_zeros_like(mlx_inline_array* dst, const mlx_inline_array* a) {
+    const auto& x = as_arr(a);
+    new (dst->buf) array(mlx::core::zeros_like(x));
+}
+
+void mlx_inline_ones_like(mlx_inline_array* dst, const mlx_inline_array* a) {
+    const auto& x = as_arr(a);
+    new (dst->buf) array(mlx::core::ones_like(x));
+}
+
+void mlx_inline_tile(mlx_inline_array* dst, const mlx_inline_array* a, const int* reps, int ndim) {
+    std::vector<int> r(reps, reps + ndim);
+    new (dst->buf) array(mlx::core::tile(as_arr(a), r));
+}
+
+void mlx_inline_linspace(mlx_inline_array* dst, float start, float stop, int n, int dtype) {
+    new (dst->buf) array(mlx::core::linspace(start, stop, n, dtype_from_int(dtype)));
+}
+
+void mlx_inline_split_sections(mlx_inline_array* dst_arr, const mlx_inline_array* a,
+                                int sections, int axis, int* out_count) {
+    auto parts = mlx::core::split(as_arr(a), sections, axis);
+    *out_count = (int)parts.size();
+    for (int i = 0; i < (int)parts.size(); i++) {
+        new (dst_arr[i].buf) array(parts[i]);
+    }
+}
+
+void mlx_inline_scatter_add(mlx_inline_array* dst, const mlx_inline_array* a,
+                             const mlx_inline_array* indices, const mlx_inline_array* updates,
+                             int axis) {
+    new (dst->buf) array(mlx::core::scatter_add(as_arr(a), as_arr(indices), as_arr(updates), axis));
+}
+
+void mlx_inline_topk(mlx_inline_array* dst, const mlx_inline_array* a, int k, int axis) {
+    new (dst->buf) array(mlx::core::topk(as_arr(a), k, axis));
+}
+
+void mlx_inline_put_along_axis(mlx_inline_array* dst, const mlx_inline_array* a,
+                                const mlx_inline_array* indices, const mlx_inline_array* values,
+                                int axis) {
+    // MLX scatter can be used to implement put_along_axis
+    // scatter(a, indices, values, axis) where indices shape matches values shape
+    new (dst->buf) array(mlx::core::scatter(as_arr(a), {as_arr(indices)}, as_arr(values), axis));
+}
+
+void mlx_inline_layer_norm(mlx_inline_array* dst, const mlx_inline_array* x,
+                            const mlx_inline_array* weight, const mlx_inline_array* bias,
+                            float eps) {
+    auto w_opt = weight ? std::optional<array>(as_arr(weight)) : std::nullopt;
+    auto b_opt = bias   ? std::optional<array>(as_arr(bias))   : std::nullopt;
+    new (dst->buf) array(mlx::core::fast::layer_norm(as_arr(x), w_opt, b_opt, eps));
+}
+
+void mlx_inline_addmm(mlx_inline_array* dst, const mlx_inline_array* c,
+                       const mlx_inline_array* a, const mlx_inline_array* b) {
+    // addmm(c, a, b) = c + a @ b
+    new (dst->buf) array(mlx::core::addmm(as_arr(c), as_arr(a), as_arr(b)));
+}
+
+void mlx_inline_conv2d(mlx_inline_array* dst, const mlx_inline_array* input,
+                       const mlx_inline_array* weight,
+                       int stride_h, int stride_w, int pad_h, int pad_w,
+                       int dil_h, int dil_w, int groups) {
+    new (dst->buf) array(mlx::core::conv2d(
+        as_arr(input), as_arr(weight),
+        {stride_h, stride_w}, {pad_h, pad_w},
+        {dil_h, dil_w}, groups));
 }
 
 } // extern "C" (qwen35 full forward)

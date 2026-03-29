@@ -349,10 +349,10 @@ impl TrainingLoop {
                 if let Some(ref norm) = lazy_norm {
                     to_eval.push(norm);
                 }
-                mlx_rs::transforms::eval(to_eval)?;
+                pmetal_bridge::compat::transforms::eval(to_eval);
 
-                let loss_val = loss.item::<f32>();
-                let norm = lazy_norm.map(|n| n.item::<f32>());
+                let loss_val = loss.item_f32();
+                let norm = lazy_norm.map(|n| n.item_f32());
 
                 (loss_val, norm, clip_elapsed, opt_elapsed)
             } else {

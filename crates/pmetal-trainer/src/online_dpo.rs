@@ -15,8 +15,7 @@
 
 use std::sync::Arc;
 
-use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{Array, Dtype, error::Exception, nn, optimizers::Optimizer};
+use pmetal_bridge::compat::{Array, Dtype, Exception, nn, ops, ops::indexing::IndexOp, optimizers::Optimizer, random};
 use pmetal_core::TrainingConfig;
 use pmetal_lora::TrainableModel;
 use tracing::{debug, info};
@@ -282,13 +281,13 @@ impl OnlineDpoTrainer {
 
                     // Apply temperature scaling to logits
                     let scaled =
-                        last_logits.multiply(&Array::from_f32(1.0 / self.config.temperature))?;
+                        last_logits.multiply(&Array::from_f32(1.0 / self.config.temperature));
 
                     // Sample from categorical distribution (proper stochastic sampling)
                     // categorical() takes logits directly (applies softmax internally)
-                    let next_token = mlx_rs::random::categorical(&scaled, -1, None, None)?;
-                    next_token.eval()?;
-                    let token_id = next_token.item::<u32>();
+                    let next_token = scaled.categorical();
+                    next_token.eval();
+                    let token_id = next_token.clone().item_u32();
 
                     generated.push(token_id);
 
@@ -343,7 +342,7 @@ impl OnlineDpoTrainer {
 
                 let score = self.reward_func.score(&prompt_array, &completion_array)?;
                 score.eval()?;
-                scored.push((idx, score.item::<f32>()));
+                scored.push((idx, score.item_f32()));
             }
 
             // Sort by score (descending)
@@ -454,7 +453,7 @@ impl OnlineDpoTrainer {
         let (loss, grads) = value_and_grad(policy_model, ())?;
 
         loss.eval()?;
-        let loss_val = loss.item::<f32>();
+        let loss_val = loss.item_f32();
 
         // Update
         optimizer.update(policy_model, grads)?;
@@ -690,14 +689,14 @@ mod tests {
 
         let score = reward_fn.score(&prompt, &completion).unwrap();
         score.eval().unwrap();
-        assert!((score.item::<f32>() - 1.0).abs() < 0.01);
+        assert!((score.item_f32() - 1.0).abs() < 0.01);
 
         // Too short (length 10, deviation 40)
         let short = Array::from_slice(&vec![1_i32; 10], &[1, 10]);
         let score_short = reward_fn.score(&prompt, &short).unwrap();
         score_short.eval().unwrap();
         // reward = 1.0 - 40 * 0.02 = 0.2
-        assert!((score_short.item::<f32>() - 0.2).abs() < 0.01);
+        assert!((score_short.item_f32() - 0.2).abs() < 0.01);
     }
 
     #[test]

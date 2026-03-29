@@ -2,12 +2,11 @@
 //!
 //! Provides functionality to load model weights from safetensor files,
 //! with support for HuggingFace model formats and weight name mapping.
+use pmetal_bridge::compat::{Array, Exception, ModuleParameters, ModuleParametersExt, Param, nn, transforms};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-pub use mlx_rs::module::ModuleParametersExt;
-use mlx_rs::{Array, module::ModuleParameters, nn};
 
 use crate::architectures::bert::BertForEmbedding;
 use crate::architectures::clip::CLIPTextModel;
@@ -50,36 +49,55 @@ pub enum LoadError {
     #[error("MLX error: {0}")]
     Mlx(String),
     #[error("MLX IO error: {0}")]
-    MlxIo(#[from] mlx_rs::error::IoError),
+    MlxIo(#[from] pmetal_bridge::compat::IoError),
 }
 
-impl From<mlx_rs::error::Exception> for LoadError {
-    fn from(e: mlx_rs::error::Exception) -> Self {
+impl From<pmetal_bridge::compat::Exception> for LoadError {
+    fn from(e: pmetal_bridge::compat::Exception) -> Self {
         Self::Mlx(e.to_string())
     }
 }
 
 const PARAM_EVAL_BATCH_SIZE: usize = 128;
 
+/// Load a safetensors shard file into a `HashMap<String, Array>`.
+///
+/// This wraps `pmetal_bridge::inline_array::load_safetensors_shard` which
+/// returns `Option<Vec<(String, InlineArray)>>` and converts it into the
+/// `HashMap<String, Array>` that the model loaders expect.
+fn load_shard(path: &std::path::Path) -> Result<HashMap<String, Array>, LoadError> {
+    let path_str = path.to_str().ok_or_else(|| {
+        LoadError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Non-UTF8 path: {:?}", path),
+        ))
+    })?;
+    pmetal_bridge::inline_array::load_safetensors_shard(path_str)
+        .map(|pairs| pairs.into_iter().collect::<HashMap<_, _>>())
+        .ok_or_else(|| {
+            LoadError::SafeTensors(format!("Failed to load safetensors: {}", path_str))
+        })
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Qwen3NextLoadOptions {
     pub skip_routed_experts: bool,
 }
 
-fn assign_loaded_weights<M: ModuleParameters>(model: &mut M, loaded: HashMap<String, Array>) {
-    let mut params = model.parameters_mut().flatten();
+fn assign_loaded_weights<M: ModuleParameters + ModuleParametersExt>(model: &mut M, loaded: HashMap<String, Array>) {
+    let mut params = model.flatten_params_mut();
     for (key, value) in loaded {
-        if let Some(param) = params.get_mut(&*key) {
+        if let Some(param) = params.get_mut(&key) {
             **param = value;
         }
     }
 }
 
-fn eval_loaded_parameters<M: ModuleParameters>(model: &M) -> Result<(), LoadError> {
-    let params = model.parameters().flatten();
-    let arrays: Vec<&Array> = params.values().copied().collect();
+fn eval_loaded_parameters<M: ModuleParameters + ModuleParametersExt>(model: &M) -> Result<(), LoadError> {
+    let params = model.flatten_params();
+    let arrays: Vec<Array> = params.into_values().collect();
     for chunk in arrays.chunks(PARAM_EVAL_BATCH_SIZE) {
-        mlx_rs::transforms::eval(chunk.iter().copied())
+        pmetal_bridge::compat::transforms::eval(chunk.iter())
             .map_err(|e| LoadError::Mlx(e.to_string()))?;
     }
     Ok(())
@@ -98,16 +116,16 @@ pub fn load_clip_weights(
 
         match name {
             "embeddings.token_embedding.weight" => {
-                model.token_embedding.weight = mlx_rs::module::Param::new(weight.clone())
+                model.token_embedding.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
             }
             "embeddings.position_embedding.weight" => {
-                model.position_embedding = mlx_rs::module::Param::new(weight.clone())
+                model.position_embedding = pmetal_bridge::compat::module::Param::new(weight.clone())
             }
             "final_layer_norm.weight" => {
-                model.final_layer_norm.weight = mlx_rs::module::Param::new(Some(weight.clone()))
+                model.final_layer_norm.weight = pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
             }
             "final_layer_norm.bias" => {
-                model.final_layer_norm.bias = mlx_rs::module::Param::new(Some(weight.clone()))
+                model.final_layer_norm.bias = pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
             }
             _ if name.starts_with("encoder.layers.") => {
                 let parts: Vec<&str> = name.split('.').collect();
@@ -121,67 +139,67 @@ pub fn load_clip_weights(
                 match sub_path.as_str() {
                     "self_attn.q_proj.weight" => {
                         model.layers[idx].attn.q_proj.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.q_proj.bias" => {
                         model.layers[idx].attn.q_proj.bias =
-                            mlx_rs::module::Param::new(Some(weight.clone()))
+                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                     }
                     "self_attn.k_proj.weight" => {
                         model.layers[idx].attn.k_proj.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.k_proj.bias" => {
                         model.layers[idx].attn.k_proj.bias =
-                            mlx_rs::module::Param::new(Some(weight.clone()))
+                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                     }
                     "self_attn.v_proj.weight" => {
                         model.layers[idx].attn.v_proj.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.v_proj.bias" => {
                         model.layers[idx].attn.v_proj.bias =
-                            mlx_rs::module::Param::new(Some(weight.clone()))
+                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                     }
                     "self_attn.out_proj.weight" => {
                         model.layers[idx].attn.out_proj.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.out_proj.bias" => {
                         model.layers[idx].attn.out_proj.bias =
-                            mlx_rs::module::Param::new(Some(weight.clone()))
+                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                     }
                     "layer_norm1.weight" => {
                         model.layers[idx].norm1.weight =
-                            mlx_rs::module::Param::new(Some(weight.clone()))
+                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                     }
                     "layer_norm1.bias" => {
                         model.layers[idx].norm1.bias =
-                            mlx_rs::module::Param::new(Some(weight.clone()))
+                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                     }
                     "layer_norm2.weight" => {
                         model.layers[idx].norm2.weight =
-                            mlx_rs::module::Param::new(Some(weight.clone()))
+                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                     }
                     "layer_norm2.bias" => {
                         model.layers[idx].norm2.bias =
-                            mlx_rs::module::Param::new(Some(weight.clone()))
+                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                     }
                     "mlp.fc1.weight" => {
                         model.layers[idx].mlp.fc1.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "mlp.fc1.bias" => {
                         model.layers[idx].mlp.fc1.bias =
-                            mlx_rs::module::Param::new(Some(weight.clone()))
+                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                     }
                     "mlp.fc2.weight" => {
                         model.layers[idx].mlp.fc2.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "mlp.fc2.bias" => {
                         model.layers[idx].mlp.fc2.bias =
-                            mlx_rs::module::Param::new(Some(weight.clone()))
+                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                     }
                     _ => {}
                 }
@@ -198,9 +216,9 @@ pub fn load_t5_weights(
 ) -> Result<(), LoadError> {
     for (name, weight) in weights {
         match name.as_str() {
-            "shared.weight" => model.shared.weight = mlx_rs::module::Param::new(weight.clone()),
+            "shared.weight" => model.shared.weight = pmetal_bridge::compat::module::Param::new(weight.clone()),
             "encoder.final_layer_norm.weight" => {
-                model.final_layer_norm.weight = mlx_rs::module::Param::new(weight.clone())
+                model.final_layer_norm.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
             }
             _ if name.starts_with("encoder.block.") => {
                 let parts: Vec<&str> = name.split('.').collect();
@@ -214,46 +232,46 @@ pub fn load_t5_weights(
                 match sub_path.as_str() {
                     "layer.0.SelfAttention.q.weight" => {
                         model.blocks[idx].layer_0_attn.q.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "layer.0.SelfAttention.k.weight" => {
                         model.blocks[idx].layer_0_attn.k.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "layer.0.SelfAttention.v.weight" => {
                         model.blocks[idx].layer_0_attn.v.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "layer.0.SelfAttention.o.weight" => {
                         model.blocks[idx].layer_0_attn.o.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "layer.0.SelfAttention.relative_attention_bias.weight" => {
                         if let Some(ref mut rel_bias) =
                             model.blocks[idx].layer_0_attn.relative_attention_bias
                         {
-                            rel_bias.embedding.weight = mlx_rs::module::Param::new(weight.clone());
+                            rel_bias.embedding.weight = pmetal_bridge::compat::module::Param::new(weight.clone());
                         }
                     }
                     "layer.0.layer_norm.weight" => {
                         model.blocks[idx].layer_0_norm.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "layer.1.DenseReluDense.wi_0.weight" => {
                         model.blocks[idx].layer_1_mlp.wi_0.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "layer.1.DenseReluDense.wi_1.weight" => {
                         model.blocks[idx].layer_1_mlp.wi_1.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "layer.1.DenseReluDense.wo.weight" => {
                         model.blocks[idx].layer_1_mlp.wo.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "layer.1.layer_norm.weight" => {
                         model.blocks[idx].layer_1_norm.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     _ => {}
                 }
@@ -274,15 +292,15 @@ pub fn load_vae_weights(
         weights: &HashMap<String, Array>,
         prefix: &str,
     ) -> Result<(), LoadError> {
-        load_group_norm_weight(&mut block.norm1, weights, &format!("{prefix}.norm1"))?;
-        load_conv2d_weight(&mut block.conv1, weights, &format!("{prefix}.conv1"))?;
-        load_group_norm_weight(&mut block.norm2, weights, &format!("{prefix}.norm2"))?;
-        load_conv2d_weight(&mut block.conv2, weights, &format!("{prefix}.conv2"))?;
+        load_group_norm_weight(&mut block.norm1, weights, &format!("{prefix}.norm1"));
+        load_conv2d_weight(&mut block.conv1, weights, &format!("{prefix}.conv1"));
+        load_group_norm_weight(&mut block.norm2, weights, &format!("{prefix}.norm2"));
+        load_conv2d_weight(&mut block.conv2, weights, &format!("{prefix}.conv2"));
         if let Some(ref mut shortcut) = block.conv_shortcut {
             // Only load if the weights exist (skip silently if they don't)
             let key = format!("{prefix}.conv_shortcut.weight");
             if weights.contains_key(&key) {
-                load_conv2d_weight(shortcut, weights, &format!("{prefix}.conv_shortcut"))?;
+                load_conv2d_weight(shortcut, weights, &format!("{prefix}.conv_shortcut"));
             }
         }
         Ok(())
@@ -294,202 +312,202 @@ pub fn load_vae_weights(
         weights: &HashMap<String, Array>,
         prefix: &str,
     ) -> Result<(), LoadError> {
-        load_group_norm_weight(&mut attn.norm, weights, &format!("{prefix}.group_norm"))?;
-        load_conv2d_weight(&mut attn.q, weights, &format!("{prefix}.to_q"))?;
-        load_conv2d_weight(&mut attn.k, weights, &format!("{prefix}.to_k"))?;
-        load_conv2d_weight(&mut attn.v, weights, &format!("{prefix}.to_v"))?;
-        load_conv2d_weight(&mut attn.proj_out, weights, &format!("{prefix}.to_out.0"))?;
+        load_group_norm_weight(&mut attn.norm, weights, &format!("{prefix}.group_norm"));
+        load_conv2d_weight(&mut attn.q, weights, &format!("{prefix}.to_q"));
+        load_conv2d_weight(&mut attn.k, weights, &format!("{prefix}.to_k"));
+        load_conv2d_weight(&mut attn.v, weights, &format!("{prefix}.to_v"));
+        load_conv2d_weight(&mut attn.proj_out, weights, &format!("{prefix}.to_out.0"));
         Ok(())
     }
 
     // Encoder weights
     if let Some(ref mut encoder) = model.encoder {
-        load_conv2d_weight(&mut encoder.conv_in, weights, "encoder.conv_in")?;
+        load_conv2d_weight(&mut encoder.conv_in, weights, "encoder.conv_in");
 
         // Down blocks: block 0 has no downsampler, blocks 1-3 have downsamplers
         load_resnet_block(
             &mut encoder.down_1_0,
             weights,
             "encoder.down_blocks.0.resnets.0",
-        )?;
+        );
         load_resnet_block(
             &mut encoder.down_1_1,
             weights,
             "encoder.down_blocks.0.resnets.1",
-        )?;
+        );
 
         load_resnet_block(
             &mut encoder.down_2_0,
             weights,
             "encoder.down_blocks.1.resnets.0",
-        )?;
+        );
         load_resnet_block(
             &mut encoder.down_2_1,
             weights,
             "encoder.down_blocks.1.resnets.1",
-        )?;
+        );
         load_conv2d_weight(
             &mut encoder.down_2_sampler.conv,
             weights,
             "encoder.down_blocks.1.downsamplers.0.conv",
-        )?;
+        );
 
         load_resnet_block(
             &mut encoder.down_3_0,
             weights,
             "encoder.down_blocks.2.resnets.0",
-        )?;
+        );
         load_resnet_block(
             &mut encoder.down_3_1,
             weights,
             "encoder.down_blocks.2.resnets.1",
-        )?;
+        );
         load_conv2d_weight(
             &mut encoder.down_3_sampler.conv,
             weights,
             "encoder.down_blocks.2.downsamplers.0.conv",
-        )?;
+        );
 
         load_resnet_block(
             &mut encoder.down_4_0,
             weights,
             "encoder.down_blocks.3.resnets.0",
-        )?;
+        );
         load_resnet_block(
             &mut encoder.down_4_1,
             weights,
             "encoder.down_blocks.3.resnets.1",
-        )?;
+        );
         load_conv2d_weight(
             &mut encoder.down_4_sampler.conv,
             weights,
             "encoder.down_blocks.3.downsamplers.0.conv",
-        )?;
+        );
 
         // Mid block
         load_resnet_block(
             &mut encoder.mid_block_1,
             weights,
             "encoder.mid_block.resnets.0",
-        )?;
+        );
         load_attn_block(
             &mut encoder.mid_attn,
             weights,
             "encoder.mid_block.attentions.0",
-        )?;
+        );
         load_resnet_block(
             &mut encoder.mid_block_2,
             weights,
             "encoder.mid_block.resnets.1",
-        )?;
+        );
 
-        load_group_norm_weight(&mut encoder.norm_out, weights, "encoder.conv_norm_out")?;
-        load_conv2d_weight(&mut encoder.conv_out, weights, "encoder.conv_out")?;
+        load_group_norm_weight(&mut encoder.norm_out, weights, "encoder.conv_norm_out");
+        load_conv2d_weight(&mut encoder.conv_out, weights, "encoder.conv_out");
     }
 
     // Decoder weights
     let decoder = &mut model.decoder;
-    load_conv2d_weight(&mut decoder.conv_in, weights, "decoder.conv_in")?;
+    load_conv2d_weight(&mut decoder.conv_in, weights, "decoder.conv_in");
 
     // Mid block
     load_resnet_block(
         &mut decoder.mid_block_1,
         weights,
         "decoder.mid_block.resnets.0",
-    )?;
+    );
     load_attn_block(
         &mut decoder.mid_attn,
         weights,
         "decoder.mid_block.attentions.0",
-    )?;
+    );
     load_resnet_block(
         &mut decoder.mid_block_2,
         weights,
         "decoder.mid_block.resnets.1",
-    )?;
+    );
 
     // Up blocks: blocks 0-2 have upsamplers, block 3 does not
     load_resnet_block(
         &mut decoder.up_1_0,
         weights,
         "decoder.up_blocks.0.resnets.0",
-    )?;
+    );
     load_resnet_block(
         &mut decoder.up_1_1,
         weights,
         "decoder.up_blocks.0.resnets.1",
-    )?;
+    );
     load_resnet_block(
         &mut decoder.up_1_2,
         weights,
         "decoder.up_blocks.0.resnets.2",
-    )?;
+    );
     load_conv2d_weight(
         &mut decoder.up_1_sampler.conv,
         weights,
         "decoder.up_blocks.0.upsamplers.0.conv",
-    )?;
+    );
 
     load_resnet_block(
         &mut decoder.up_2_0,
         weights,
         "decoder.up_blocks.1.resnets.0",
-    )?;
+    );
     load_resnet_block(
         &mut decoder.up_2_1,
         weights,
         "decoder.up_blocks.1.resnets.1",
-    )?;
+    );
     load_resnet_block(
         &mut decoder.up_2_2,
         weights,
         "decoder.up_blocks.1.resnets.2",
-    )?;
+    );
     load_conv2d_weight(
         &mut decoder.up_2_sampler.conv,
         weights,
         "decoder.up_blocks.1.upsamplers.0.conv",
-    )?;
+    );
 
     load_resnet_block(
         &mut decoder.up_3_0,
         weights,
         "decoder.up_blocks.2.resnets.0",
-    )?;
+    );
     load_resnet_block(
         &mut decoder.up_3_1,
         weights,
         "decoder.up_blocks.2.resnets.1",
-    )?;
+    );
     load_resnet_block(
         &mut decoder.up_3_2,
         weights,
         "decoder.up_blocks.2.resnets.2",
-    )?;
+    );
     load_conv2d_weight(
         &mut decoder.up_3_sampler.conv,
         weights,
         "decoder.up_blocks.2.upsamplers.0.conv",
-    )?;
+    );
 
     load_resnet_block(
         &mut decoder.up_4_0,
         weights,
         "decoder.up_blocks.3.resnets.0",
-    )?;
+    );
     load_resnet_block(
         &mut decoder.up_4_1,
         weights,
         "decoder.up_blocks.3.resnets.1",
-    )?;
+    );
     load_resnet_block(
         &mut decoder.up_4_2,
         weights,
         "decoder.up_blocks.3.resnets.2",
-    )?;
+    );
 
-    load_group_norm_weight(&mut decoder.norm_out, weights, "decoder.conv_norm_out")?;
-    load_conv2d_weight(&mut decoder.conv_out, weights, "decoder.conv_out")?;
+    load_group_norm_weight(&mut decoder.norm_out, weights, "decoder.conv_norm_out");
+    load_conv2d_weight(&mut decoder.conv_out, weights, "decoder.conv_out");
 
     Ok(())
 }
@@ -518,100 +536,100 @@ pub fn load_flux_weights(
             match sub_path.as_str() {
                 "img_mod.lin.weight" => {
                     model.blocks[idx].norm1_a.linear.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "img_mod.lin.bias" => {
                     model.blocks[idx].norm1_a.linear.bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "txt_mod.lin.weight" => {
                     model.blocks[idx].norm1_b.linear.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "txt_mod.lin.bias" => {
                     model.blocks[idx].norm1_b.linear.bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "img_attn.qkv.weight" => {
                     model.blocks[idx].attn.a_to_qkv.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "img_attn.qkv.bias" => {
                     model.blocks[idx].attn.a_to_qkv.bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "txt_attn.qkv.weight" => {
                     model.blocks[idx].attn.b_to_qkv.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "txt_attn.qkv.bias" => {
                     model.blocks[idx].attn.b_to_qkv.bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "img_attn.norm.query_norm.scale" => {
                     model.blocks[idx].attn.norm_q_a.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "img_attn.norm.key_norm.scale" => {
                     model.blocks[idx].attn.norm_k_a.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "txt_attn.norm.query_norm.scale" => {
                     model.blocks[idx].attn.norm_q_b.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "txt_attn.norm.key_norm.scale" => {
                     model.blocks[idx].attn.norm_k_b.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
 
                 "img_attn.proj.weight" => {
                     model.blocks[idx].attn.a_to_out.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "img_attn.proj.bias" => {
                     model.blocks[idx].attn.a_to_out.bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "txt_attn.proj.weight" => {
                     model.blocks[idx].attn.b_to_out.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "txt_attn.proj.bias" => {
                     model.blocks[idx].attn.b_to_out.bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "img_mlp.0.weight" => {
-                    model.blocks[idx].ff_a[0].weight = mlx_rs::module::Param::new(weight.clone())
+                    model.blocks[idx].ff_a[0].weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "img_mlp.0.bias" => {
                     model.blocks[idx].ff_a[0].bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "img_mlp.2.weight" => {
-                    model.blocks[idx].ff_a[1].weight = mlx_rs::module::Param::new(weight.clone())
+                    model.blocks[idx].ff_a[1].weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "img_mlp.2.bias" => {
                     model.blocks[idx].ff_a[1].bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "txt_mlp.0.weight" => {
-                    model.blocks[idx].ff_b[0].weight = mlx_rs::module::Param::new(weight.clone())
+                    model.blocks[idx].ff_b[0].weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "txt_mlp.0.bias" => {
                     model.blocks[idx].ff_b[0].bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "txt_mlp.2.weight" => {
-                    model.blocks[idx].ff_b[1].weight = mlx_rs::module::Param::new(weight.clone())
+                    model.blocks[idx].ff_b[1].weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "txt_mlp.2.bias" => {
                     model.blocks[idx].ff_b[1].bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 _ => {}
             }
@@ -628,119 +646,119 @@ pub fn load_flux_weights(
             match sub_path.as_str() {
                 "modulation.lin.weight" => {
                     model.single_blocks[idx].norm.linear.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "modulation.lin.bias" => {
                     model.single_blocks[idx].norm.linear.bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "linear1.weight" => {
                     model.single_blocks[idx].to_qkv_mlp.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "linear1.bias" => {
                     model.single_blocks[idx].to_qkv_mlp.bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "linear2.weight" => {
                     model.single_blocks[idx].proj_out.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "linear2.bias" => {
                     model.single_blocks[idx].proj_out.bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "norm.query_norm.scale" => {
                     model.single_blocks[idx].norm_q_a.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "norm.key_norm.scale" => {
                     model.single_blocks[idx].norm_k_a.weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 _ => {}
             }
         } else {
             match name {
                 "time_in.in_layer.weight" => {
-                    model.time_embedder.linear_1.weight = mlx_rs::module::Param::new(weight.clone())
+                    model.time_embedder.linear_1.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "time_in.in_layer.bias" => {
                     model.time_embedder.linear_1.bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "time_in.out_layer.weight" => {
-                    model.time_embedder.linear_2.weight = mlx_rs::module::Param::new(weight.clone())
+                    model.time_embedder.linear_2.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "time_in.out_layer.bias" => {
                     model.time_embedder.linear_2.bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "txt_in.weight" => {
-                    model.context_embedder.weight = mlx_rs::module::Param::new(weight.clone())
+                    model.context_embedder.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "txt_in.bias" => {
-                    model.context_embedder.bias = mlx_rs::module::Param::new(Some(weight.clone()))
+                    model.context_embedder.bias = pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "vector_in.in_layer.weight" => {
                     model.pooled_text_embedder[0].weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "vector_in.in_layer.bias" => {
                     model.pooled_text_embedder[0].bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "vector_in.out_layer.weight" => {
                     model.pooled_text_embedder[1].weight =
-                        mlx_rs::module::Param::new(weight.clone())
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "vector_in.out_layer.bias" => {
                     model.pooled_text_embedder[1].bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "guidance_in.in_layer.weight" => {
                     if let Some(ref mut ge) = model.guidance_embedder {
-                        ge.linear_1.weight = mlx_rs::module::Param::new(weight.clone());
+                        ge.linear_1.weight = pmetal_bridge::compat::module::Param::new(weight.clone());
                     }
                 }
                 "guidance_in.in_layer.bias" => {
                     if let Some(ref mut ge) = model.guidance_embedder {
-                        ge.linear_1.bias = mlx_rs::module::Param::new(Some(weight.clone()));
+                        ge.linear_1.bias = pmetal_bridge::compat::module::Param::new(Some(weight.clone()));
                     }
                 }
                 "guidance_in.out_layer.weight" => {
                     if let Some(ref mut ge) = model.guidance_embedder {
-                        ge.linear_2.weight = mlx_rs::module::Param::new(weight.clone());
+                        ge.linear_2.weight = pmetal_bridge::compat::module::Param::new(weight.clone());
                     }
                 }
                 "guidance_in.out_layer.bias" => {
                     if let Some(ref mut ge) = model.guidance_embedder {
-                        ge.linear_2.bias = mlx_rs::module::Param::new(Some(weight.clone()));
+                        ge.linear_2.bias = pmetal_bridge::compat::module::Param::new(Some(weight.clone()));
                     }
                 }
 
                 "img_in.weight" => {
-                    model.x_embedder.weight = mlx_rs::module::Param::new(weight.clone())
+                    model.x_embedder.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "img_in.bias" => {
-                    model.x_embedder.bias = mlx_rs::module::Param::new(Some(weight.clone()))
+                    model.x_embedder.bias = pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "final_layer.adaLN_modulation.1.weight" => {
-                    model.final_norm_out.linear.weight = mlx_rs::module::Param::new(weight.clone())
+                    model.final_norm_out.linear.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "final_layer.adaLN_modulation.1.bias" => {
                     model.final_norm_out.linear.bias =
-                        mlx_rs::module::Param::new(Some(weight.clone()))
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "final_layer.linear.weight" => {
-                    model.final_proj_out.weight = mlx_rs::module::Param::new(weight.clone())
+                    model.final_proj_out.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "final_layer.linear.bias" => {
-                    model.final_proj_out.bias = mlx_rs::module::Param::new(Some(weight.clone()))
+                    model.final_proj_out.bias = pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 _ => {}
             }
@@ -802,7 +820,7 @@ fn validate_shard_path(
         )));
     }
     let shard_path = model_dir.join(shard_file);
-    let canonical_dir = model_dir.canonicalize()?;
+    let canonical_dir = model_dir.canonicalize().map_err(|e| LoadError::Io(e))?;
     let canonical_shard = shard_path.canonicalize().map_err(|e| {
         LoadError::Io(std::io::Error::new(
             e.kind(),
@@ -851,17 +869,16 @@ fn find_hf_repo_root(path: &Path) -> Option<std::path::PathBuf> {
 }
 
 /// Load generic weights using safetensors.
-pub fn load_generic_weights<M: ModuleParameters>(
+pub fn load_generic_weights<M: ModuleParameters + ModuleParametersExt>(
     model: &mut M,
     model_dir: impl AsRef<Path>,
 ) -> Result<(), LoadError> {
     let model_dir = model_dir.as_ref();
     let single_file = model_dir.join("model.safetensors");
     if single_file.exists() {
-        let loaded = Array::load_safetensors(&single_file)
-            .map_err(|e| LoadError::SafeTensors(e.to_string()))?;
+        let loaded = load_shard(&single_file)?;
         assign_loaded_weights(model, loaded);
-        eval_loaded_parameters(model)?;
+        eval_loaded_parameters(model);
         return Ok(());
     }
     let index_path = model_dir.join("model.safetensors.index.json");
@@ -871,13 +888,12 @@ pub fn load_generic_weights<M: ModuleParameters>(
             "No weights found",
         )));
     }
-    let index_content = std::fs::read_to_string(&index_path)?;
+    let index_content = std::fs::read_to_string(&index_path).map_err(LoadError::Io)?;
     let index: WeightIndex = serde_json::from_str(&index_content)?;
     let shard_files: HashSet<&String> = index.weight_map.values().collect();
     for shard_file in shard_files {
         let shard_path = validate_shard_path(model_dir, shard_file)?;
-        let loaded = Array::load_safetensors(&shard_path)
-            .map_err(|e| LoadError::SafeTensors(e.to_string()))?;
+        let loaded = load_shard(&shard_path)?;
         assign_loaded_weights(model, loaded);
     }
     eval_loaded_parameters(model)?;
@@ -895,8 +911,7 @@ where
     let mut all_weights = HashMap::new();
     let single_file = model_dir.join("model.safetensors");
     if single_file.exists() {
-        let weights =
-            Array::load_safetensors(&single_file).map_err(|e| LoadError::Mlx(e.to_string()))?;
+        let weights = load_shard(&single_file)?;
         return Ok(weights
             .into_iter()
             .filter(|(key, _)| keep_key(key))
@@ -911,7 +926,7 @@ where
         )));
     }
 
-    let index_content = std::fs::read_to_string(&index_path)?;
+    let index_content = std::fs::read_to_string(&index_path).map_err(LoadError::Io)?;
     let index: WeightIndex = serde_json::from_str(&index_content)?;
     let shard_files: HashSet<&String> = index
         .weight_map
@@ -922,8 +937,7 @@ where
 
     for shard_file in shard_files {
         let shard_path = validate_shard_path(model_dir, shard_file)?;
-        let shard_weights =
-            Array::load_safetensors(&shard_path).map_err(|e| LoadError::Mlx(e.to_string()))?;
+        let shard_weights = load_shard(&shard_path)?;
         all_weights.extend(shard_weights.into_iter().filter(|(key, _)| keep_key(key)));
     }
 
@@ -941,7 +955,7 @@ pub fn load_nemotron_weights(
 /// Load weights for FalconH1 models from a HuggingFace safetensors directory.
 pub fn load_falcon_h1_weights(
     model: &mut FalconH1ForCausalLM,
-    weights: &std::collections::HashMap<String, mlx_rs::Array>,
+    weights: &std::collections::HashMap<String, pmetal_bridge::compat::Array>,
 ) -> Result<(), LoadError> {
     load_falcon_h1(model, weights).map_err(|e| LoadError::SafeTensors(format!("{:?}", e)))
 }
@@ -976,7 +990,7 @@ pub fn load_qwen3_next_weights_with_options(
     .map_err(|e| LoadError::SafeTensors(format!("{:?}", e)))?;
 
     // Apply sanitized weights to model parameters
-    let mut params = model.parameters_mut().flatten();
+    let mut params = model.flatten_params_mut();
     let expected_keys: HashSet<String> = params.keys().map(|key| key.to_string()).collect();
     let mut loaded_param_keys = HashSet::new();
     let mut matched = 0usize;
@@ -1025,7 +1039,7 @@ pub fn load_llama_weights(
     weights: &HashMap<String, Array>,
 ) -> Result<(), LoadError> {
     if let Some(w) = weights.get("model.embed_tokens.weight") {
-        model.model.embed_tokens.weight = mlx_rs::module::Param::new(w.clone());
+        model.model.embed_tokens.weight = pmetal_bridge::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight("model.embed_tokens.weight".into()));
     }
@@ -1035,52 +1049,52 @@ pub fn load_llama_weights(
             &mut layer.self_attn.q_proj,
             weights,
             &format!("{prefix}.self_attn.q_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.self_attn.k_proj,
             weights,
             &format!("{prefix}.self_attn.k_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.self_attn.v_proj,
             weights,
             &format!("{prefix}.self_attn.v_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.self_attn.o_proj,
             weights,
             &format!("{prefix}.self_attn.o_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.mlp.gate_proj,
             weights,
             &format!("{prefix}.mlp.gate_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.mlp.up_proj,
             weights,
             &format!("{prefix}.mlp.up_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.mlp.down_proj,
             weights,
             &format!("{prefix}.mlp.down_proj"),
-        )?;
+        );
         load_rms_norm_weight(
             &mut layer.input_layernorm,
             weights,
             &format!("{prefix}.input_layernorm"),
-        )?;
+        );
         load_rms_norm_weight(
             &mut layer.post_attention_layernorm,
             weights,
             &format!("{prefix}.post_attention_layernorm"),
-        )?;
+        );
     }
-    load_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
+    load_rms_norm_weight(&mut model.model.norm, weights, "model.norm");
     if let Some(ref mut lm_head) = model.lm_head {
         if let Some(w) = weights.get("lm_head.weight") {
-            lm_head.weight = mlx_rs::module::Param::new(w.clone());
+            lm_head.weight = pmetal_bridge::compat::module::Param::new(w.clone());
         }
     }
     Ok(())
@@ -1091,7 +1105,7 @@ pub fn load_mistral_weights(
     weights: &HashMap<String, Array>,
 ) -> Result<(), LoadError> {
     if let Some(w) = weights.get("model.embed_tokens.weight") {
-        model.model.embed_tokens.weight = mlx_rs::module::Param::new(w.clone());
+        model.model.embed_tokens.weight = pmetal_bridge::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight("model.embed_tokens.weight".into()));
     }
@@ -1101,52 +1115,52 @@ pub fn load_mistral_weights(
             &mut layer.self_attn.q_proj,
             weights,
             &format!("{prefix}.self_attn.q_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.self_attn.k_proj,
             weights,
             &format!("{prefix}.self_attn.k_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.self_attn.v_proj,
             weights,
             &format!("{prefix}.self_attn.v_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.self_attn.o_proj,
             weights,
             &format!("{prefix}.self_attn.o_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.mlp.gate_proj,
             weights,
             &format!("{prefix}.mlp.gate_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.mlp.up_proj,
             weights,
             &format!("{prefix}.mlp.up_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.mlp.down_proj,
             weights,
             &format!("{prefix}.mlp.down_proj"),
-        )?;
+        );
         load_rms_norm_weight(
             &mut layer.input_layernorm,
             weights,
             &format!("{prefix}.input_layernorm"),
-        )?;
+        );
         load_rms_norm_weight(
             &mut layer.post_attention_layernorm,
             weights,
             &format!("{prefix}.post_attention_layernorm"),
-        )?;
+        );
     }
-    load_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
+    load_rms_norm_weight(&mut model.model.norm, weights, "model.norm");
     if let Some(ref mut lm_head) = model.lm_head {
         if let Some(w) = weights.get("lm_head.weight") {
-            lm_head.weight = mlx_rs::module::Param::new(w.clone());
+            lm_head.weight = pmetal_bridge::compat::module::Param::new(w.clone());
         }
     }
     Ok(())
@@ -1157,7 +1171,7 @@ pub fn load_gemma_weights(
     weights: &HashMap<String, Array>,
 ) -> Result<(), LoadError> {
     if let Some(w) = weights.get("model.embed_tokens.weight") {
-        model.model.embed_tokens.weight = mlx_rs::module::Param::new(w.clone());
+        model.model.embed_tokens.weight = pmetal_bridge::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight("model.embed_tokens.weight".into()));
     }
@@ -1168,47 +1182,47 @@ pub fn load_gemma_weights(
                 &mut layer.self_attn.q_proj,
                 weights,
                 &format!("{prefix}.self_attn.q_proj"),
-            )?;
+            );
             load_linear_weight(
                 &mut layer.self_attn.k_proj,
                 weights,
                 &format!("{prefix}.self_attn.k_proj"),
-            )?;
+            );
             load_linear_weight(
                 &mut layer.self_attn.v_proj,
                 weights,
                 &format!("{prefix}.self_attn.v_proj"),
-            )?;
+            );
             load_linear_weight(
                 &mut layer.self_attn.o_proj,
                 weights,
                 &format!("{prefix}.self_attn.o_proj"),
-            )?;
+            );
             load_linear_weight(
                 &mut layer.mlp.gate_proj,
                 weights,
                 &format!("{prefix}.mlp.gate_proj"),
-            )?;
+            );
             load_linear_weight(
                 &mut layer.mlp.up_proj,
                 weights,
                 &format!("{prefix}.mlp.up_proj"),
-            )?;
+            );
             load_linear_weight(
                 &mut layer.mlp.down_proj,
                 weights,
                 &format!("{prefix}.mlp.down_proj"),
-            )?;
+            );
             load_gemma_rms_norm_weight(
                 &mut layer.input_layernorm,
                 weights,
                 &format!("{prefix}.input_layernorm"),
-            )?;
+            );
             load_gemma_rms_norm_weight(
                 &mut layer.post_attention_layernorm,
                 weights,
                 &format!("{prefix}.post_attention_layernorm"),
-            )?;
+            );
         }
     } else if let Some(ref mut layers) = model.model.layers.gemma2 {
         for (i, layer) in layers.iter_mut().enumerate() {
@@ -1217,60 +1231,60 @@ pub fn load_gemma_weights(
                 &mut layer.self_attn.q_proj,
                 weights,
                 &format!("{prefix}.self_attn.q_proj"),
-            )?;
+            );
             load_linear_weight(
                 &mut layer.self_attn.k_proj,
                 weights,
                 &format!("{prefix}.self_attn.k_proj"),
-            )?;
+            );
             load_linear_weight(
                 &mut layer.self_attn.v_proj,
                 weights,
                 &format!("{prefix}.self_attn.v_proj"),
-            )?;
+            );
             load_linear_weight(
                 &mut layer.self_attn.o_proj,
                 weights,
                 &format!("{prefix}.self_attn.o_proj"),
-            )?;
+            );
             load_linear_weight(
                 &mut layer.mlp.gate_proj,
                 weights,
                 &format!("{prefix}.mlp.gate_proj"),
-            )?;
+            );
             load_linear_weight(
                 &mut layer.mlp.up_proj,
                 weights,
                 &format!("{prefix}.mlp.up_proj"),
-            )?;
+            );
             load_linear_weight(
                 &mut layer.mlp.down_proj,
                 weights,
                 &format!("{prefix}.mlp.down_proj"),
-            )?;
+            );
             load_gemma_rms_norm_weight(
                 &mut layer.input_layernorm,
                 weights,
                 &format!("{prefix}.input_layernorm"),
-            )?;
+            );
             load_gemma_rms_norm_weight(
                 &mut layer.post_attention_layernorm,
                 weights,
                 &format!("{prefix}.post_attention_layernorm"),
-            )?;
+            );
             load_gemma_rms_norm_weight(
                 &mut layer.pre_feedforward_layernorm,
                 weights,
                 &format!("{prefix}.pre_feedforward_layernorm"),
-            )?;
+            );
             load_gemma_rms_norm_weight(
                 &mut layer.post_feedforward_layernorm,
                 weights,
                 &format!("{prefix}.post_feedforward_layernorm"),
-            )?;
+            );
         }
     }
-    load_gemma_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
+    load_gemma_rms_norm_weight(&mut model.model.norm, weights, "model.norm");
     Ok(())
 }
 
@@ -1279,7 +1293,7 @@ pub fn load_phi_weights(
     weights: &HashMap<String, Array>,
 ) -> Result<(), LoadError> {
     if let Some(w) = weights.get("model.embed_tokens.weight") {
-        model.model.embed_tokens.weight = mlx_rs::module::Param::new(w.clone());
+        model.model.embed_tokens.weight = pmetal_bridge::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight("model.embed_tokens.weight".into()));
     }
@@ -1289,74 +1303,74 @@ pub fn load_phi_weights(
             &mut layer.self_attn.q_proj,
             weights,
             &format!("{prefix}.self_attn.q_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.self_attn.k_proj,
             weights,
             &format!("{prefix}.self_attn.k_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.self_attn.v_proj,
             weights,
             &format!("{prefix}.self_attn.v_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.self_attn.o_proj,
             weights,
             &format!("{prefix}.self_attn.o_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.mlp.gate_up_proj,
             weights,
             &format!("{prefix}.mlp.gate_up_proj"),
-        )?;
+        );
         load_linear_weight(
             &mut layer.mlp.down_proj,
             weights,
             &format!("{prefix}.mlp.down_proj"),
-        )?;
+        );
         load_phi_rms_norm_weight(
             &mut layer.input_layernorm,
             weights,
             &format!("{prefix}.input_layernorm"),
-        )?;
+        );
         load_phi_rms_norm_weight(
             &mut layer.post_attention_layernorm,
             weights,
             &format!("{prefix}.post_attention_layernorm"),
-        )?;
+        );
     }
-    load_phi_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
-    load_linear_weight(&mut model.lm_head, weights, "lm_head")?;
+    load_phi_rms_norm_weight(&mut model.model.norm, weights, "model.norm");
+    load_linear_weight(&mut model.lm_head, weights, "lm_head");
     Ok(())
 }
 
 fn load_linear_weight(
-    linear: &mut mlx_rs::nn::Linear,
+    linear: &mut pmetal_bridge::compat::nn::Linear,
     weights: &HashMap<String, Array>,
     prefix: &str,
 ) -> Result<(), LoadError> {
     let weight_key = format!("{prefix}.weight");
     if let Some(w) = weights.get(&weight_key) {
-        linear.weight = mlx_rs::module::Param::new(w.clone());
+        linear.weight = pmetal_bridge::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight(weight_key));
     }
     let bias_key = format!("{prefix}.bias");
     if let Some(b) = weights.get(&bias_key) {
-        linear.bias = mlx_rs::module::Param::new(Some(b.clone()));
+        linear.bias = pmetal_bridge::compat::module::Param::new(Some(b.clone()));
     }
     Ok(())
 }
 
 fn load_rms_norm_weight(
-    norm: &mut mlx_rs::nn::RmsNorm,
+    norm: &mut pmetal_bridge::compat::nn::RmsNorm,
     weights: &HashMap<String, Array>,
     prefix: &str,
 ) -> Result<(), LoadError> {
     let weight_key = format!("{prefix}.weight");
     if let Some(w) = weights.get(&weight_key) {
-        norm.weight = mlx_rs::module::Param::new(w.clone());
+        norm.weight = pmetal_bridge::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight(weight_key));
     }
@@ -1365,19 +1379,19 @@ fn load_rms_norm_weight(
 
 #[allow(dead_code)] // Utility for architectures that use LayerNorm (e.g. GPT-style models)
 fn load_layer_norm_weight(
-    norm: &mut mlx_rs::nn::LayerNorm,
+    norm: &mut pmetal_bridge::compat::nn::LayerNorm,
     weights: &HashMap<String, Array>,
     prefix: &str,
 ) -> Result<(), LoadError> {
     let weight_key = format!("{prefix}.weight");
     if let Some(w) = weights.get(&weight_key) {
-        norm.weight = mlx_rs::module::Param::new(Some(w.clone()));
+        norm.weight = pmetal_bridge::compat::module::Param::new(Some(w.clone()));
     } else {
         return Err(LoadError::MissingWeight(weight_key));
     }
     let bias_key = format!("{prefix}.bias");
     if let Some(b) = weights.get(&bias_key) {
-        norm.bias = mlx_rs::module::Param::new(Some(b.clone()));
+        norm.bias = pmetal_bridge::compat::module::Param::new(Some(b.clone()));
     }
     Ok(())
 }
@@ -1389,7 +1403,7 @@ fn load_gemma_rms_norm_weight(
 ) -> Result<(), LoadError> {
     let weight_key = format!("{prefix}.weight");
     if let Some(w) = weights.get(&weight_key) {
-        norm.weight = mlx_rs::module::Param::new(w.clone());
+        norm.weight = pmetal_bridge::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight(weight_key));
     }
@@ -1403,7 +1417,7 @@ fn load_phi_rms_norm_weight(
 ) -> Result<(), LoadError> {
     let weight_key = format!("{prefix}.weight");
     if let Some(w) = weights.get(&weight_key) {
-        norm.weight = mlx_rs::module::Param::new(w.clone());
+        norm.weight = pmetal_bridge::compat::module::Param::new(w.clone());
     } else {
         return Err(LoadError::MissingWeight(weight_key));
     }
@@ -1418,16 +1432,14 @@ fn load_conv2d_weight(
     let weight_key = format!("{prefix}.weight");
     if let Some(w) = weights.get(&weight_key) {
         // HF/PyTorch Conv2d weights are [O, I, H, W], MLX uses [O, H, W, I]
-        let w = w
-            .transpose_axes(&[0, 2, 3, 1])
-            .map_err(|e| LoadError::Mlx(e.to_string()))?;
-        conv.weight = mlx_rs::module::Param::new(w);
+        let w = w.transpose_axes(&[0, 2, 3, 1]);
+        conv.weight = pmetal_bridge::compat::module::Param::new(w);
     } else {
         return Err(LoadError::MissingWeight(weight_key));
     }
     let bias_key = format!("{prefix}.bias");
     if let Some(b) = weights.get(&bias_key) {
-        conv.bias = mlx_rs::module::Param::new(Some(b.clone()));
+        conv.bias = pmetal_bridge::compat::module::Param::new(Some(b.clone()));
     }
     Ok(())
 }
@@ -1439,13 +1451,13 @@ fn load_group_norm_weight(
 ) -> Result<(), LoadError> {
     let weight_key = format!("{prefix}.weight");
     if let Some(w) = weights.get(&weight_key) {
-        norm.weight = mlx_rs::module::Param::new(Some(w.clone()));
+        norm.weight = pmetal_bridge::compat::module::Param::new(Some(w.clone()));
     } else {
         return Err(LoadError::MissingWeight(weight_key));
     }
     let bias_key = format!("{prefix}.bias");
     if let Some(b) = weights.get(&bias_key) {
-        norm.bias = mlx_rs::module::Param::new(Some(b.clone()));
+        norm.bias = pmetal_bridge::compat::module::Param::new(Some(b.clone()));
     }
     Ok(())
 }
@@ -1479,7 +1491,7 @@ pub fn load_bert_weights(
     model: &mut BertForEmbedding,
     weights: &HashMap<String, Array>,
 ) -> Result<(), LoadError> {
-    let mut params = model.parameters_mut().flatten();
+    let mut params = model.flatten_params_mut();
     let mut matched: usize = 0;
 
     for (hf_name, weight) in weights {
@@ -1560,7 +1572,7 @@ mod tests {
     fn write_safetensors(
         path: &Path,
         weights: &HashMap<String, Array>,
-    ) -> Result<(), mlx_rs::error::IoError> {
+    ) -> Result<(), pmetal_bridge::compat::IoError> {
         Array::save_safetensors(
             weights.iter().map(|(key, value)| (key.as_str(), value)),
             None,

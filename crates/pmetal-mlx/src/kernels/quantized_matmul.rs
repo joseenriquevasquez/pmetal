@@ -5,7 +5,8 @@
 
 use std::{sync::OnceLock, time::Instant};
 
-use mlx_rs::{Array, Dtype, error::Exception, ops::quantized_matmul};
+use pmetal_bridge::compat::{Array, Dtype, Exception};
+use crate::ArrayDtypeExt;
 use pmetal_metal::{
     BufferUsage, MetalBuffer, MetalContext, MppQuantizedGemm, MppQuantizedGemmConfig,
     context::{DeviceProperties, DeviceTier},
@@ -173,21 +174,22 @@ fn should_consider_mpp_quantized_linear(
     work >= threshold
 }
 
-fn max_abs_diff(lhs: &Array, rhs: &Array) -> mlx_rs::error::Result<f32> {
+fn max_abs_diff(lhs: &Array, rhs: &Array) -> Result<f32, Exception> {
     let lhs = if lhs.dtype() == Dtype::Float32 {
         lhs.clone()
     } else {
-        lhs.as_dtype(Dtype::Float32)?
+        lhs.as_dtype(Dtype::Float32.as_i32())
     };
     let rhs = if rhs.dtype() == Dtype::Float32 {
         rhs.clone()
     } else {
-        rhs.as_dtype(Dtype::Float32)?
+        rhs.as_dtype(Dtype::Float32.as_i32())
     };
 
-    let diff = lhs.subtract(&rhs)?.abs()?.max(None)?;
-    diff.eval()?;
-    Ok(diff.item::<f32>())
+    let diff = lhs.subtract(&rhs).abs_val().max(None);
+    let mut diff_owned = diff.clone();
+    diff_owned.eval();
+    Ok(diff_owned.item::<f32>())
 }
 
 fn run_mlx_quantized_rhs_transposed(
@@ -196,8 +198,8 @@ fn run_mlx_quantized_rhs_transposed(
     scales: &Array,
     biases: &Array,
     group_size: i32,
-) -> mlx_rs::error::Result<Array> {
-    quantized_matmul(x, w_q, scales, biases, true, group_size, 4)
+) -> Result<Array, Exception> {
+    Ok(x.quantized_matmul(w_q, scales, Some(biases), true, group_size, 4))
 }
 
 fn run_mpp_quantized_rhs_transposed(
@@ -207,11 +209,11 @@ fn run_mpp_quantized_rhs_transposed(
     biases: &Array,
     ctx: &std::sync::Arc<MetalContext>,
     problem: &QuantizedLinearProblem,
-) -> mlx_rs::error::Result<Array> {
+) -> Result<Array, Exception> {
     let x_2d = if x.shape().len() == 2 {
         x.clone()
     } else {
-        x.reshape(&[problem.m as i32, problem.k as i32])?
+        x.reshape(&[problem.m as i32, problem.k as i32])
     };
 
     let x_view =
@@ -257,7 +259,7 @@ fn execute_quantized_linear_backend(
     biases: &Array,
     ctx: &std::sync::Arc<MetalContext>,
     problem: &QuantizedLinearProblem,
-) -> mlx_rs::error::Result<Array> {
+) -> Result<Array, Exception> {
     match backend {
         QuantizedLinearBackend::Mlx => {
             run_mlx_quantized_rhs_transposed(x, w_q, scales, biases, problem.group_size)
@@ -275,16 +277,17 @@ fn benchmark_quantized_linear_backends(
     biases: &Array,
     ctx: &std::sync::Arc<MetalContext>,
     problem: &QuantizedLinearProblem,
-) -> mlx_rs::error::Result<(QuantizedLinearBackend, Array)> {
+) -> Result<(QuantizedLinearBackend, Array), Exception> {
     let mlx_start = Instant::now();
     let mlx_output = run_mlx_quantized_rhs_transposed(x, w_q, scales, biases, problem.group_size)?;
-    mlx_output.eval()?;
+    let mut mlx_evaled = mlx_output.clone();
+    mlx_evaled.eval();
     let mlx_elapsed = mlx_start.elapsed();
 
     let mpp_start = Instant::now();
     let mpp_output = match run_mpp_quantized_rhs_transposed(x, w_q, scales, biases, ctx, problem) {
-        Ok(output) => {
-            output.eval()?;
+        Ok(mut output) => {
+            output.eval();
             Some(output)
         }
         Err(error) => {
@@ -342,7 +345,7 @@ pub fn quantized_linear_rhs_transposed_best_effort(
     scales: &Array,
     biases: &Array,
     group_size: i32,
-) -> mlx_rs::error::Result<Array> {
+) -> Result<Array, Exception> {
     let Some(problem) = quantized_rhs_transposed_problem(x, w_q, scales, biases, group_size) else {
         return run_mlx_quantized_rhs_transposed(x, w_q, scales, biases, group_size);
     };
@@ -381,7 +384,7 @@ pub fn quantized_linear_rhs_transposed_best_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::{ops::quantize, random};
+    use pmetal_bridge::compat::{Dtype, random};
 
     #[test]
     #[serial_test::serial]
@@ -409,10 +412,10 @@ mod tests {
 
     #[test]
     fn test_quantized_rhs_transposed_problem_infers_output_shape() {
-        let x = Array::zeros::<half::f16>(&[2, 4, 128]).unwrap();
-        let w_q = Array::zeros::<u32>(&[256, 16]).unwrap();
-        let scales = Array::zeros::<f32>(&[256, 2]).unwrap();
-        let biases = Array::zeros::<f32>(&[256, 2]).unwrap();
+        let x = pmetal_bridge::compat::ops::zeros(&[2, 4, 128], Dtype::Float16);
+        let w_q = pmetal_bridge::compat::ops::zeros(&[256, 16], Dtype::Uint32);
+        let scales = pmetal_bridge::compat::ops::zeros(&[256, 2], Dtype::Float32);
+        let biases = pmetal_bridge::compat::ops::zeros(&[256, 2], Dtype::Float32);
 
         let problem = quantized_rhs_transposed_problem(&x, &w_q, &scales, &biases, 64).unwrap();
         assert_eq!(
@@ -429,10 +432,10 @@ mod tests {
 
     #[test]
     fn test_quantized_rhs_transposed_problem_rejects_mismatched_metadata() {
-        let x = Array::zeros::<half::f16>(&[2, 4, 128]).unwrap();
-        let w_q = Array::zeros::<u32>(&[256, 16]).unwrap();
-        let scales = Array::zeros::<f32>(&[255, 2]).unwrap();
-        let biases = Array::zeros::<f32>(&[256, 2]).unwrap();
+        let x = pmetal_bridge::compat::ops::zeros(&[2, 4, 128], Dtype::Float16);
+        let w_q = pmetal_bridge::compat::ops::zeros(&[256, 16], Dtype::Uint32);
+        let scales = pmetal_bridge::compat::ops::zeros(&[255, 2], Dtype::Float32);
+        let biases = pmetal_bridge::compat::ops::zeros(&[256, 2], Dtype::Float32);
 
         assert!(quantized_rhs_transposed_problem(&x, &w_q, &scales, &biases, 64).is_none());
     }
@@ -441,17 +444,12 @@ mod tests {
     #[serial_test::serial]
     fn test_quantized_linear_rhs_transposed_best_effort_matches_mlx() {
         clear_cached_quantized_linear_backends();
-        random::seed(0).unwrap();
 
-        let x = random::normal::<f32>(&[2, 4, 128], None, None, None)
-            .unwrap()
-            .as_dtype(Dtype::Float16)
-            .unwrap();
-        let weight = random::normal::<f32>(&[256, 128], None, None, None)
-            .unwrap()
-            .as_dtype(Dtype::Float16)
-            .unwrap();
-        let (w_q, scales, biases) = quantize(&weight, 64, 4).unwrap();
+        let x = random::normal(&[2, 4, 128], Dtype::Float32)
+            .as_dtype(Dtype::Float16.as_i32());
+        let weight = random::normal(&[256, 128], Dtype::Float32)
+            .as_dtype(Dtype::Float16.as_i32());
+        let (w_q, scales, biases) = weight.quantize_weights(64, 4);
 
         let output =
             quantized_linear_rhs_transposed_best_effort(&x, &w_q, &scales, &biases, 64).unwrap();

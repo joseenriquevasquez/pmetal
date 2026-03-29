@@ -9,7 +9,7 @@
 //! All losses operate on L2-normalised embeddings `[batch, dim]`.
 //! Normalisation should be applied by the caller (use `pool::normalize_embeddings`).
 
-use mlx_rs::{Array, Dtype, error::Exception, module::Module};
+use pmetal_bridge::compat::{Array, Dtype, Exception, module::Module, ops, ops::indexing::IndexOp};
 
 // ---------------------------------------------------------------------------
 // Public loss functions
@@ -38,7 +38,7 @@ pub fn info_nce_loss(
     let labels: Vec<i32> = (0..batch_size).collect();
     let labels_arr = Array::from_slice(&labels, &[batch_size]);
 
-    let ce = mlx_rs::losses::CrossEntropy::new()?;
+    let ce = pmetal_bridge::compat::losses::CrossEntropy::new()?;
     let loss = ce.apply(&sim_scaled, &labels_arr)?;
     loss.mean(None)
 }
@@ -60,7 +60,7 @@ pub fn triplet_loss(
     // loss = max(0, margin - pos_sim + neg_sim)
     let diff = Array::from_f32(margin).subtract(&pos_sim)?.add(&neg_sim)?;
     let zero = Array::from_f32(0.0);
-    let loss = mlx_rs::ops::maximum(&diff, &zero)?;
+    let loss = ops::maximum(&diff, &zero);
     loss.mean(None)
 }
 
@@ -129,7 +129,7 @@ pub fn cosent_loss(
     // Softplus: log(1 + exp(neg_lse - pos_lse))
     let diff = neg_lse.subtract(&pos_lse)?;
     // softplus(x) = log(1 + exp(x)) — use log1p for numerical stability
-    let loss = mlx_rs::ops::log1p(&diff.exp()?)?;
+    let loss = ops::log1p(&diff.exp());
     loss.mean(None)
 }
 
@@ -173,7 +173,7 @@ pub(crate) fn pairwise_cosine_similarity(a: &Array, b: &Array) -> Result<Array, 
     let norm_a = a.square()?.sum_axes(&[-1], false)?.sqrt()?; // [batch]
     let norm_b = b.square()?.sum_axes(&[-1], false)?.sqrt()?; // [batch]
     let norms = norm_a.multiply(&norm_b)?;
-    let norms = mlx_rs::ops::maximum(&norms, &Array::from_f32(1e-8))?;
+    let norms = ops::maximum(&norms, &Array::from_f32(1e-8));
     dot.divide(&norms)
 }
 
@@ -183,8 +183,8 @@ pub(crate) fn pairwise_cosine_similarity(a: &Array, b: &Array) -> Result<Array, 
 pub(crate) fn cosine_similarity_matrix(a: &Array, b: &Array) -> Result<Array, Exception> {
     let norm_a = a.square()?.sum_axes(&[-1], true)?.sqrt()?;
     let norm_b = b.square()?.sum_axes(&[-1], true)?.sqrt()?;
-    let a_normed = a.divide(&mlx_rs::ops::maximum(&norm_a, &Array::from_f32(1e-8))?)?;
-    let b_normed = b.divide(&mlx_rs::ops::maximum(&norm_b, &Array::from_f32(1e-8))?)?;
+    let a_normed = a.divide(&ops::maximum(&norm_a, &Array::from_f32(1e-8)));
+    let b_normed = b.divide(&ops::maximum(&norm_b, &Array::from_f32(1e-8)));
     a_normed.matmul(&b_normed.transpose_axes(&[1, 0])?)
 }
 
@@ -202,7 +202,7 @@ fn diagonal_zeros(n: i32) -> Result<Array, Exception> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::ops::indexing::IndexOp;
+    // IndexOp already imported via top-level use
 
     fn unit_embeddings(batch: i32, dim: i32) -> Array {
         // Each row is [1, 0, 0, ..., 0] (already unit-normed)

@@ -13,11 +13,7 @@
 //! log_odds = log(probs / (1 - probs))
 //! ```
 
-use mlx_rs::error::Exception;
-use mlx_rs::nn;
-use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::optimizers::Optimizer;
-use mlx_rs::{Array, Dtype};
+use pmetal_bridge::compat::{Array, Dtype, Exception, nn, ops, ops::indexing::IndexOp, optimizers::Optimizer};
 use pmetal_core::{StepMetrics, TrainingCallback, TrainingConfig};
 use pmetal_lora::TrainableModel;
 use std::time::Instant;
@@ -141,13 +137,13 @@ impl OrpoTrainer {
             crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
 
         // Sum over sequence dimension -> [B] (masked positions are already 0)
-        let total_log_probs = per_token_logps.sum_axes(&[1i32], false)?;
+        let total_log_probs = per_token_logps.sum_axes(&[1i32], false);
 
         // Count valid tokens per sequence for averaging
-        let valid_counts = valid_mask.sum_axes(&[1i32], false)?;
+        let valid_counts = valid_mask.sum_axes(&[1i32], false);
 
         // Compute average log probs
-        let average_log_probs = total_log_probs.divide(&valid_counts)?;
+        let average_log_probs = total_log_probs.divide(&valid_counts);
 
         Ok((total_log_probs, average_log_probs))
     }
@@ -253,21 +249,21 @@ impl OrpoTrainer {
                     loss_and_grad(policy_model, ())?
                 };
                 optimizer.update(policy_model, grads)?;
-                loss.eval()?;
+                loss.eval();
 
                 let (sft_loss, or_loss, log_odds_chosen, log_odds_rejected) = metrics_cell
                     .into_inner()
                     .expect("loss_fn must have been called");
-                sft_loss.eval()?;
-                or_loss.eval()?;
-                log_odds_chosen.eval()?;
-                log_odds_rejected.eval()?;
+                sft_loss.eval();
+                or_loss.eval();
+                log_odds_chosen.eval();
+                log_odds_rejected.eval();
                 let metrics = OrpoMetrics {
-                    loss: loss.item::<f32>(),
-                    sft_loss: sft_loss.item::<f32>(),
-                    or_loss: or_loss.item::<f32>(),
-                    chosen_log_odds: log_odds_chosen.mean(None)?.item::<f32>(),
-                    rejected_log_odds: log_odds_rejected.mean(None)?.item::<f32>(),
+                    loss: loss.item_f32(),
+                    sft_loss: sft_loss.item_f32(),
+                    or_loss: or_loss.item_f32(),
+                    chosen_log_odds: log_odds_chosen.mean(None).item_f32(),
+                    rejected_log_odds: log_odds_rejected.mean(None).item_f32(),
                 };
 
                 self.step += 1;
@@ -349,9 +345,9 @@ impl OrpoTrainer {
         let target_labels = labels.index((.., 1..));
         let (per_token_logps, valid_mask) =
             crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
-        let total_log_probs = per_token_logps.sum_axes(&[1i32], false)?;
-        let valid_counts = valid_mask.sum_axes(&[1i32], false)?;
-        let average_log_probs = total_log_probs.divide(&valid_counts)?;
+        let total_log_probs = per_token_logps.sum_axes(&[1i32], false);
+        let valid_counts = valid_mask.sum_axes(&[1i32], false);
+        let average_log_probs = total_log_probs.divide(&valid_counts);
         Ok((total_log_probs, average_log_probs))
     }
 
@@ -362,36 +358,36 @@ impl OrpoTrainer {
         rejected_avg_log_probs: &Array,
     ) -> Result<(Array, Array, Array, Array, Array), Exception> {
         // SFT loss: negative log-likelihood of the chosen response
-        let sft_loss = chosen_log_probs.negative()?;
+        let sft_loss = chosen_log_probs.negative();
 
         // Odds ratio computation: log_odds = avg_log_p - log(1 - exp(avg_log_p))
-        let compute_log_odds = |avg_log_p: &Array| -> Result<Array, Exception> {
-            let p = avg_log_p.exp()?;
+        let compute_log_odds = |avg_log_p: &Array| -> Array {
+            let p = avg_log_p.exp();
             let one = Array::from_f32(1.0);
-            let one_minus_p = one.subtract(&p)?;
+            let one_minus_p = one.subtract(&p);
             let epsilon = Array::from_f32(1e-10);
-            let one_minus_p_safe = mlx_rs::ops::maximum(&one_minus_p, &epsilon)?;
-            let log_one_minus_p = one_minus_p_safe.log()?;
+            let one_minus_p_safe = ops::maximum(&one_minus_p, &epsilon);
+            let log_one_minus_p = one_minus_p_safe.log();
             avg_log_p.subtract(&log_one_minus_p)
         };
 
-        let log_odds_chosen = compute_log_odds(chosen_avg_log_probs)?;
-        let log_odds_rejected = compute_log_odds(rejected_avg_log_probs)?;
+        let log_odds_chosen = compute_log_odds(chosen_avg_log_probs);
+        let log_odds_rejected = compute_log_odds(rejected_avg_log_probs);
 
         // OR loss: -log(sigmoid(log_odds_chosen - log_odds_rejected))
-        let ratio = log_odds_chosen.subtract(&log_odds_rejected)?;
-        let neg_ratio = ratio.negative()?;
-        let or_loss = mlx_rs::nn::softplus(&neg_ratio)?;
+        let ratio = log_odds_chosen.subtract(&log_odds_rejected);
+        let neg_ratio = ratio.negative();
+        let or_loss = nn::softplus(&neg_ratio);
 
         // Total loss = SFT_loss + beta * OR_loss
         let beta = Array::from_f32(config.beta as f32);
-        let weighted_or_loss = or_loss.multiply(&beta)?;
-        let total_loss = sft_loss.add(&weighted_or_loss)?;
+        let weighted_or_loss = or_loss.multiply(&beta);
+        let total_loss = sft_loss.add(&weighted_or_loss);
 
         Ok((
-            total_loss.mean(None)?,
-            sft_loss.mean(None)?,
-            or_loss.mean(None)?,
+            total_loss.mean(None),
+            sft_loss.mean(None),
+            or_loss.mean(None),
             log_odds_chosen,
             log_odds_rejected,
         ))
@@ -436,7 +432,7 @@ mod tests {
         let log_odds = avg_log_p.subtract(&log_one_minus_p).unwrap();
 
         log_odds.eval().unwrap();
-        assert!(log_odds.item::<f32>().abs() < 1e-4);
+        assert!(log_odds.item_f32().abs() < 1e-4);
     }
 
     #[test]
@@ -468,7 +464,7 @@ mod tests {
         // diff = 4.38
         // or_loss = -log(sigmoid(4.38)) approx 0.012
 
-        assert!((sft.item::<f32>() - 1.05).abs() < 1e-3);
-        assert!(or.item::<f32>() < 0.1); // Loss should be small as chosen >> rejected
+        assert!((sft.item_f32() - 1.05).abs() < 1e-3);
+        assert!(or.item_f32() < 0.1); // Loss should be small as chosen >> rejected
     }
 }

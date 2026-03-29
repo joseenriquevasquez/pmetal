@@ -6,7 +6,7 @@
 use super::DiscriminatorOutput;
 use crate::error::Result;
 use crate::nn::WeightNormConv1d;
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, nn, ops};
 
 /// Multi-Period Discriminator.
 ///
@@ -132,8 +132,8 @@ impl PeriodDiscriminator {
         let remainder = samples % self.period;
         let x = if remainder != 0 {
             let pad_size = self.period - remainder;
-            let padding = mlx_rs::ops::zeros::<f32>(&[batch, 1, pad_size])?;
-            mlx_rs::ops::concatenate_axis(&[audio, &padding], -1)?
+            let padding = Array::zeros(&[batch, 1, pad_size], 10);
+            ops::concatenate_axis(&[audio, &padding], -1)
         } else {
             audio.clone()
         };
@@ -141,7 +141,7 @@ impl PeriodDiscriminator {
         // Reshape: [B, 1, T] -> [B, period, T/period]
         // Then treat period as channels for 1D conv
         let new_length = x.dim(2);
-        let x = x.reshape(&[batch, self.period, new_length / self.period])?;
+        let x = x.reshape(&[batch, self.period, new_length / self.period]);
 
         // Apply convolutions and collect features
         let mut features = Vec::new();
@@ -149,7 +149,7 @@ impl PeriodDiscriminator {
 
         for conv in &self.convs {
             x = conv.forward(&x)?;
-            x = mlx_rs::nn::leaky_relu(&x, 0.1)?;
+            x = nn::leaky_relu(&x, 0.1);
             features.push(x.clone());
         }
 
@@ -168,9 +168,10 @@ mod tests {
     fn test_period_discriminator() {
         let disc = PeriodDiscriminator::new(2).unwrap();
 
-        let audio = mlx_rs::random::normal::<f32>(&[1, 1, 1024], None, None, None).unwrap();
+        let audio = Array::random_normal(&[1, 1, 1024], 10);
         let output = disc.forward(&audio).unwrap();
-        output.logits.eval().unwrap();
+        let mut l2 = output.logits.clone();
+        l2.eval();
 
         assert!(!output.features.is_empty());
     }
@@ -179,7 +180,7 @@ mod tests {
     fn test_mpd() {
         let mpd = MultiPeriodDiscriminator::new().unwrap();
 
-        let audio = mlx_rs::random::normal::<f32>(&[2, 1, 2048], None, None, None).unwrap();
+        let audio = Array::random_normal(&[2, 1, 2048], 10);
         let outputs = mpd.forward(&audio).unwrap();
 
         assert_eq!(outputs.len(), 5); // 5 periods

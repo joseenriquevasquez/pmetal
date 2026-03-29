@@ -24,7 +24,7 @@
 //!
 //! ```rust,ignore
 //! let mut compiled = compile_with_state(categorical_with_state, None);
-//! compiled(&mut sampler_state, &logits)?;
+//! compiled(&mut sampler_state, &logits);
 //! ```
 
 pub mod compiled_sampler;

@@ -30,7 +30,7 @@
 //! let trainer = GspoTrainer::new(config)?;
 //! ```
 
-use mlx_rs::{Array, error::Exception};
+use pmetal_bridge::compat::{Array, Exception};
 
 /// Error type for GSPO training.
 #[derive(Debug, thiserror::Error)]

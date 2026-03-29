@@ -68,10 +68,10 @@ use crate::expert_layout::{ExpertComponent, ExpertRecord};
 ///
 /// ```ignore
 /// let ctx = MetalContext::global();
-/// let layout = ExpertPackLayout::load(&packed_dir)?;
-/// let raw_bytes = offload_ctx.read_experts(layer_idx, &[expert_id])?;
-/// let buffers = parse_expert_weights(&raw_bytes[0], &layout.record, &ctx)?;
-/// fused_expert.forward_single_expert(&input, &buffers, &output, &scratch)?;
+/// let layout = ExpertPackLayout::load(&packed_dir);
+/// let raw_bytes = offload_ctx.read_experts(layer_idx, &[expert_id]);
+/// let buffers = parse_expert_weights(&raw_bytes[0], &layout.record, &ctx);
+/// fused_expert.forward_single_expert(&input, &buffers, &output, &scratch);
 /// ```
 pub fn parse_expert_weights(
     raw: &[u8],
@@ -113,7 +113,7 @@ fn extract_u32(
     name: &'static str,
 ) -> Result<MetalBuffer<u32>, String> {
     let bytes = component_bytes(raw, comp, name)?;
-    validate_alignment(bytes.len(), mem::size_of::<u32>(), name)?;
+    validate_alignment(bytes.len(), mem::size_of::<u32>(), name);
 
     // Convert LE bytes → u32 elements.
     //
@@ -146,7 +146,7 @@ fn extract_u16(
     name: &'static str,
 ) -> Result<MetalBuffer<u16>, String> {
     let bytes = component_bytes(raw, comp, name)?;
-    validate_alignment(bytes.len(), mem::size_of::<u16>(), name)?;
+    validate_alignment(bytes.len(), mem::size_of::<u16>(), name);
 
     let elements: Vec<u16> = bytes
         .chunks_exact(mem::size_of::<u16>())

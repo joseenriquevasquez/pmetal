@@ -20,12 +20,7 @@
 //! - `pi_ref` is the reference model (frozen)
 //! - `beta` is the temperature parameter
 
-use mlx_rs::Array;
-use mlx_rs::Dtype;
-use mlx_rs::error::Exception;
-use mlx_rs::nn;
-use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::optimizers::Optimizer;
+use pmetal_bridge::compat::{Array, Dtype, Exception, nn, ops, ops::indexing::IndexOp, optimizers::Optimizer};
 use pmetal_core::{StepMetrics, TrainingCallback, TrainingConfig};
 use pmetal_lora::TrainableModel;
 use std::time::Instant;
@@ -305,7 +300,7 @@ impl DpoTrainer {
             crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
 
         // Sum over sequence dimension -> [B] (masked positions are already 0)
-        let total_log_probs = per_token_logps.sum_axes(&[1i32], false)?;
+        let total_log_probs = per_token_logps.sum_axes(&[1i32], false);
 
         Ok(total_log_probs)
     }
@@ -334,13 +329,13 @@ impl DpoTrainer {
 
         // Length-normalize: divide sum by number of valid (non-ignored) tokens.
         // This prevents bias toward longer sequences in SimPO.
-        let token_sum = per_token_logps.sum_axes(&[1i32], false)?;
+        let token_sum = per_token_logps.sum_axes(&[1i32], false);
         let valid_count_raw = valid_mask
-            .as_dtype(mlx_rs::Dtype::Float32)?
-            .sum_axes(&[1i32], false)?;
-        let valid_count = mlx_rs::ops::maximum(&valid_count_raw, &Array::from_f32(1.0))?;
+            .as_dtype(Dtype::Float32.as_i32())
+            .sum_axes(&[1i32], false);
+        let valid_count = ops::maximum(&valid_count_raw, &Array::from_f32(1.0))?;
 
-        Ok(token_sum.divide(&valid_count)?)
+        Ok(token_sum.divide(&valid_count))
     }
 
     /// Compute both policy and reference log probabilities in a single pass.
@@ -382,7 +377,7 @@ impl DpoTrainer {
 
         // Create reference log probs using stop_gradient
         // This prevents gradient flow to reference, treating it as a constant
-        let reference_log_probs = mlx_rs::stop_gradient(&policy_log_probs)?;
+        let reference_log_probs = ops::stop_gradient(&policy_log_probs);
 
         Ok((policy_log_probs, reference_log_probs))
     }
@@ -413,7 +408,7 @@ impl DpoTrainer {
         let (policy_chosen_logps, ref_chosen_logps) = if is_simpo {
             // SimPO: use normalized log probs; reference is irrelevant but keep interface
             let lp = self.compute_log_probs_normalized(chosen_logits, chosen_labels)?;
-            let ref_lp = mlx_rs::stop_gradient(&lp)?;
+            let ref_lp = ops::stop_gradient(&lp);
             (lp, ref_lp)
         } else {
             self.compute_log_probs_with_stop_gradient_reference(chosen_logits, chosen_labels)?
@@ -421,7 +416,7 @@ impl DpoTrainer {
 
         let (policy_rejected_logps, ref_rejected_logps) = if is_simpo {
             let lp = self.compute_log_probs_normalized(rejected_logits, rejected_labels)?;
-            let ref_lp = mlx_rs::stop_gradient(&lp)?;
+            let ref_lp = ops::stop_gradient(&lp);
             (lp, ref_lp)
         } else {
             self.compute_log_probs_with_stop_gradient_reference(rejected_logits, rejected_labels)?
@@ -462,24 +457,24 @@ impl DpoTrainer {
         let chosen_rewards = if reference_free {
             policy_chosen_logps.clone()
         } else {
-            policy_chosen_logps.subtract(ref_chosen_logps)?
+            policy_chosen_logps.subtract(ref_chosen_logps)
         };
 
         let rejected_rewards = if reference_free {
             policy_rejected_logps.clone()
         } else {
-            policy_rejected_logps.subtract(ref_rejected_logps)?
+            policy_rejected_logps.subtract(ref_rejected_logps)
         };
 
         // Compute logits = beta * (chosen_rewards - rejected_rewards)
-        let reward_diff = chosen_rewards.subtract(&rejected_rewards)?;
+        let reward_diff = chosen_rewards.subtract(&rejected_rewards);
         let beta = Array::from_f32(self.config.beta as f32);
-        let mut logits = reward_diff.multiply(&beta)?;
+        let mut logits = reward_diff.multiply(&beta);
 
         // For SimPO: subtract gamma margin
         if is_simpo {
             let gamma = Array::from_f32(self.config.simpo_gamma as f32);
-            logits = logits.subtract(&gamma)?;
+            logits = logits.subtract(&gamma);
         }
 
         // Compute loss based on loss type
@@ -505,11 +500,11 @@ impl DpoTrainer {
         };
 
         // Average loss over batch
-        let loss = loss.mean(None)?;
+        let loss = loss.mean(None);
 
         // Scale rewards by beta for logging
-        let chosen_rewards_scaled = chosen_rewards.multiply(&beta)?;
-        let rejected_rewards_scaled = rejected_rewards.multiply(&beta)?;
+        let chosen_rewards_scaled = chosen_rewards.multiply(&beta);
+        let rejected_rewards_scaled = rejected_rewards.multiply(&beta);
 
         Ok((loss, chosen_rewards_scaled, rejected_rewards_scaled))
     }
@@ -517,24 +512,24 @@ impl DpoTrainer {
     /// Sigmoid DPO loss with optional label smoothing.
     fn sigmoid_loss(&self, logits: &Array) -> DpoResult<Array> {
         // -log(sigmoid(x)) = log(1 + exp(-x)) = softplus(-x)
-        let neg_logits = logits.negative()?;
+        let neg_logits = logits.negative();
 
         if self.config.label_smoothing > 0.0 {
             // With label smoothing:
             // loss = -log_sigmoid(logits) * (1-s) - log_sigmoid(-logits) * s
-            let pos_loss = mlx_rs::nn::softplus(&neg_logits)?; // -log_sigmoid(logits)
-            let neg_loss = mlx_rs::nn::softplus(logits)?; // -log_sigmoid(-logits)
+            let pos_loss = nn::softplus(&neg_logits); // -log_sigmoid(logits)
+            let neg_loss = nn::softplus(logits); // -log_sigmoid(-logits)
 
             let s = Array::from_f32(self.config.label_smoothing as f32);
             let one_minus_s = Array::from_f32((1.0 - self.config.label_smoothing) as f32);
 
             let loss = pos_loss
-                .multiply(&one_minus_s)?
-                .add(&neg_loss.multiply(&s)?)?;
+                .multiply(&one_minus_s)
+                .add(&neg_loss.multiply(&s));
             Ok(loss)
         } else {
             // Simple: -log_sigmoid(logits) = softplus(-logits)
-            Ok(mlx_rs::nn::softplus(&neg_logits)?)
+            Ok(nn::softplus(&neg_logits))
         }
     }
 
@@ -542,32 +537,32 @@ impl DpoTrainer {
     fn ipo_loss(&self, logits: &Array) -> DpoResult<Array> {
         // (logits - 1/(2*beta))^2
         let target = Array::from_f32((1.0 / (2.0 * self.config.beta)) as f32);
-        let diff = logits.subtract(&target)?;
-        Ok(diff.square()?)
+        let diff = logits.subtract(&target);
+        Ok(diff.square())
     }
 
     /// Hinge loss variant.
     fn hinge_loss(&self, logits: &Array) -> DpoResult<Array> {
         // max(0, 1 - logits)
         let one = Array::from_f32(1.0);
-        let margin = one.subtract(logits)?;
+        let margin = one.subtract(logits);
         let zero = Array::from_f32(0.0);
-        Ok(mlx_rs::ops::maximum(&margin, &zero)?)
+        Ok(ops::maximum(&margin, &zero))
     }
 
     /// Robust loss (more stable with noisy preferences).
     fn robust_loss(&self, logits: &Array) -> DpoResult<Array> {
         // Combination of sigmoid and hinge for robustness
         // loss = -log_sigmoid(logits) + 0.5 * max(0, 0.5 - logits)
-        let neg_logits = logits.negative()?;
-        let sigmoid_loss = mlx_rs::nn::softplus(&neg_logits)?;
+        let neg_logits = logits.negative();
+        let sigmoid_loss = nn::softplus(&neg_logits);
 
         let half = Array::from_f32(0.5);
-        let margin = half.subtract(logits)?;
+        let margin = half.subtract(logits);
         let zero = Array::from_f32(0.0);
-        let hinge_part = mlx_rs::ops::maximum(&margin, &zero)?;
+        let hinge_part = ops::maximum(&margin, &zero);
 
-        Ok(sigmoid_loss.add(&hinge_part.multiply(&half)?)?)
+        Ok(sigmoid_loss.add(&hinge_part.multiply(&half)))
     }
 
     /// Get current training step.
@@ -653,8 +648,8 @@ impl DpoTrainer {
                             &rejected_labels,
                             matches!(config.loss_type, DpoLossType::SimPo),
                         )?;
-                        let chosen_ref_logps = mlx_rs::stop_gradient(&chosen_policy_logps)?;
-                        let rejected_ref_logps = mlx_rs::stop_gradient(&rejected_policy_logps)?;
+                        let chosen_ref_logps = ops::stop_gradient(&chosen_policy_logps);
+                        let rejected_ref_logps = ops::stop_gradient(&rejected_policy_logps);
                         let (loss, chosen_rewards, rejected_rewards) =
                             Self::compute_dpo_loss_static(
                                 &config,
@@ -672,21 +667,21 @@ impl DpoTrainer {
                         loss_and_grad(policy_model, ())?
                     };
                     optimizer.update(policy_model, grads)?;
-                    loss.eval()?;
+                    loss.eval();
 
                     let (chosen_rewards, rejected_rewards) = metrics_cell
                         .into_inner()
                         .expect("loss_fn must have been called");
-                    chosen_rewards.eval()?;
-                    rejected_rewards.eval()?;
+                    chosen_rewards.eval();
+                    rejected_rewards.eval();
                     let chosen_rewards_vec = chosen_rewards.as_slice::<f32>().to_vec();
                     let rejected_rewards_vec = rejected_rewards.as_slice::<f32>().to_vec();
                     let metrics = DpoMetrics::compute(
-                        loss.item::<f32>(),
+                        loss.item_f32(),
                         &chosen_rewards_vec,
                         &rejected_rewards_vec,
                     );
-                    (loss.item::<f32>(), metrics)
+                    (loss.item_f32(), metrics)
                 } else {
                     let (ref_chosen_logps, ref_rejected_logps) = if self.config.reference_free {
                         (Array::from_f32(0.0), Array::from_f32(0.0))
@@ -740,21 +735,21 @@ impl DpoTrainer {
                         loss_and_grad(policy_model, ())?
                     };
                     optimizer.update(policy_model, grads)?;
-                    loss.eval()?;
+                    loss.eval();
 
                     let (chosen_rewards, rejected_rewards) = metrics_cell
                         .into_inner()
                         .expect("loss_fn must have been called");
-                    chosen_rewards.eval()?;
-                    rejected_rewards.eval()?;
+                    chosen_rewards.eval();
+                    rejected_rewards.eval();
                     let chosen_rewards_vec = chosen_rewards.as_slice::<f32>().to_vec();
                     let rejected_rewards_vec = rejected_rewards.as_slice::<f32>().to_vec();
                     let metrics = DpoMetrics::compute(
-                        loss.item::<f32>(),
+                        loss.item_f32(),
                         &chosen_rewards_vec,
                         &rejected_rewards_vec,
                     );
-                    (loss.item::<f32>(), metrics)
+                    (loss.item_f32(), metrics)
                 };
 
                 self.step += 1;
@@ -837,15 +832,15 @@ impl DpoTrainer {
         let target_labels = labels.index((.., 1..));
         let (per_token_logps, valid_mask) =
             crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
-        let token_sum = per_token_logps.sum_axes(&[1i32], false)?;
+        let token_sum = per_token_logps.sum_axes(&[1i32], false);
         if !normalized {
             return Ok(token_sum);
         }
 
         let valid_count_raw = valid_mask
-            .as_dtype(Dtype::Float32)?
-            .sum_axes(&[1i32], false)?;
-        let valid_count = mlx_rs::ops::maximum(&valid_count_raw, &Array::from_f32(1.0))?;
+            .as_dtype(Dtype::Float32.as_i32())
+            .sum_axes(&[1i32], false);
+        let valid_count = ops::maximum(&valid_count_raw, &Array::from_f32(1.0))?;
         token_sum.divide(&valid_count)
     }
 
@@ -861,58 +856,58 @@ impl DpoTrainer {
         let chosen_rewards = if reference_free {
             policy_chosen_logps.clone()
         } else {
-            policy_chosen_logps.subtract(ref_chosen_logps)?
+            policy_chosen_logps.subtract(ref_chosen_logps)
         };
         let rejected_rewards = if reference_free {
             policy_rejected_logps.clone()
         } else {
-            policy_rejected_logps.subtract(ref_rejected_logps)?
+            policy_rejected_logps.subtract(ref_rejected_logps)
         };
 
-        let reward_diff = chosen_rewards.subtract(&rejected_rewards)?;
+        let reward_diff = chosen_rewards.subtract(&rejected_rewards);
         let beta = Array::from_f32(config.beta as f32);
         let logits = if matches!(config.loss_type, DpoLossType::SimPo) {
             reward_diff
-                .multiply(&beta)?
+                .multiply(&beta)
                 .subtract(&Array::from_f32(config.simpo_gamma as f32))?
         } else {
-            reward_diff.multiply(&beta)?
+            reward_diff.multiply(&beta)
         };
 
         let loss = match config.loss_type {
             DpoLossType::Sigmoid | DpoLossType::SimPo => {
-                let mut loss = nn::softplus(&logits.negative()?)?;
+                let mut loss = nn::softplus(&logits.negative());
                 if config.label_smoothing > 0.0 {
                     let smooth = Array::from_f32(config.label_smoothing as f32);
-                    let flipped = nn::softplus(&logits)?;
+                    let flipped = nn::softplus(&logits);
                     loss = loss
-                        .multiply(&Array::from_f32(1.0 - config.label_smoothing as f32))?
-                        .add(&flipped.multiply(&smooth)?)?;
+                        .multiply(&Array::from_f32(1.0 - config.label_smoothing as f32))
+                        .add(&flipped.multiply(&smooth));
                 }
                 loss
             }
             DpoLossType::Ipo => {
                 let target = Array::from_f32((1.0 / (2.0 * config.beta)) as f32);
-                logits.subtract(&target)?.square()?
+                logits.subtract(&target).square()
             }
-            DpoLossType::Hinge => mlx_rs::ops::maximum(
-                &Array::from_f32(1.0).subtract(&logits)?,
+            DpoLossType::Hinge => ops::maximum(
+                &Array::from_f32(1.0).subtract(&logits),
                 &Array::from_f32(0.0),
-            )?,
+            ),
             DpoLossType::Robust => {
-                let sigmoid = nn::softplus(&logits.negative()?)?;
-                let hinge = mlx_rs::ops::maximum(
-                    &Array::from_f32(0.5).subtract(&logits)?,
+                let sigmoid = nn::softplus(&logits.negative());
+                let hinge = ops::maximum(
+                    &Array::from_f32(0.5).subtract(&logits),
                     &Array::from_f32(0.0),
-                )?;
-                sigmoid.add(&hinge.multiply(&Array::from_f32(0.5))?)?
+                );
+                sigmoid.add(&hinge.multiply(&Array::from_f32(0.5)))
             }
         };
 
         Ok((
-            loss.mean(None)?,
-            chosen_rewards.multiply(&beta)?,
-            rejected_rewards.multiply(&beta)?,
+            loss.mean(None),
+            chosen_rewards.multiply(&beta),
+            rejected_rewards.multiply(&beta),
         ))
     }
 
@@ -1054,10 +1049,10 @@ impl DpoTrainer {
                 let rejected_inputs_refs: Vec<&Array> = batch_rejected_inputs.iter().collect();
                 let rejected_labels_refs: Vec<&Array> = batch_rejected_labels.iter().collect();
 
-                let chosen_inputs = mlx_rs::ops::stack(&chosen_inputs_refs)?;
-                let chosen_labels = mlx_rs::ops::stack(&chosen_labels_refs)?;
-                let rejected_inputs = mlx_rs::ops::stack(&rejected_inputs_refs)?;
-                let rejected_labels = mlx_rs::ops::stack(&rejected_labels_refs)?;
+                let chosen_inputs = ops::stack(&chosen_inputs_refs);
+                let chosen_labels = ops::stack(&chosen_labels_refs);
+                let rejected_inputs = ops::stack(&rejected_inputs_refs);
+                let rejected_labels = ops::stack(&rejected_labels_refs);
 
                 // Compute log probs for batch
                 let (chosen_logps, rejected_logps) = self.precompute_reference_log_probs(
@@ -1086,10 +1081,10 @@ impl DpoTrainer {
             let rejected_inputs_refs: Vec<&Array> = batch_rejected_inputs.iter().collect();
             let rejected_labels_refs: Vec<&Array> = batch_rejected_labels.iter().collect();
 
-            let chosen_inputs = mlx_rs::ops::stack(&chosen_inputs_refs)?;
-            let chosen_labels = mlx_rs::ops::stack(&chosen_labels_refs)?;
-            let rejected_inputs = mlx_rs::ops::stack(&rejected_inputs_refs)?;
-            let rejected_labels = mlx_rs::ops::stack(&rejected_labels_refs)?;
+            let chosen_inputs = ops::stack(&chosen_inputs_refs);
+            let chosen_labels = ops::stack(&chosen_labels_refs);
+            let rejected_inputs = ops::stack(&rejected_inputs_refs);
+            let rejected_labels = ops::stack(&rejected_labels_refs);
 
             let (chosen_logps, rejected_logps) = self.precompute_reference_log_probs(
                 model,
@@ -1205,7 +1200,7 @@ mod tests {
         // Loss should be positive
         let loss_val = loss.mean(None).unwrap();
         loss_val.eval().unwrap();
-        assert!(loss_val.item::<f32>() > 0.0);
+        assert!(loss_val.item_f32() > 0.0);
     }
 
     #[test]
@@ -1220,7 +1215,7 @@ mod tests {
         loss.eval().unwrap();
 
         // At target, loss should be ~0
-        assert!(loss.item::<f32>() < 0.01);
+        assert!(loss.item_f32() < 0.01);
     }
 
     #[test]
@@ -1241,7 +1236,7 @@ mod tests {
         for (i, &exp) in expected.iter().enumerate() {
             let val = loss.index(i as i32);
             val.eval().unwrap();
-            assert!((val.item::<f32>() - exp).abs() < 0.01);
+            assert!((val.item_f32() - exp).abs() < 0.01);
         }
     }
 
@@ -1270,7 +1265,7 @@ mod tests {
         loss.eval().unwrap();
 
         // With label smoothing, loss should be different from pure sigmoid
-        assert!(loss.item::<f32>() > 0.0);
+        assert!(loss.item_f32() > 0.0);
     }
 
     #[test]
@@ -1302,7 +1297,7 @@ mod tests {
             .unwrap();
 
         loss.eval().unwrap();
-        let loss_val = loss.item::<f32>();
+        let loss_val = loss.item_f32();
 
         let expected_logits = -0.5f32;
         let expected_loss = (1.0 + (-expected_logits).exp()).ln(); // softplus(-logits)

@@ -12,15 +12,10 @@
 
 #![allow(missing_docs)]
 
-use mlx_rs::{
-    Array, Dtype,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::Module,
-    nn::{self, Linear},
-    ops::indexing::IndexOp,
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, ops, random};
+use pmetal_bridge::impl_module_params;
+use crate::ArrayDtypeExt;
+use std::rc::Rc;
 
 /// Configuration for Mixture of Experts.
 #[derive(Debug, Clone)]
@@ -74,6 +69,30 @@ impl MoEConfig {
     }
 }
 
+/// Minimal linear layer: weight [out, in], no bias.
+///
+/// Replaces `nn::Linear` — keeps `pmetal-mlx` free of mlx-rs module machinery.
+#[derive(Debug, Clone)]
+pub struct Linear {
+    /// Weight matrix, shape `[out_features, in_features]`.
+    pub weight: Array,
+}
+impl_module_params!(Linear; weight);
+
+impl Linear {
+    /// Create a zero-initialised linear layer.
+    pub fn new(in_features: i32, out_features: i32) -> Self {
+        Self {
+            weight: ops::zeros(&[out_features, in_features], Dtype::Float32),
+        }
+    }
+
+    /// `y = x @ W^T`
+    pub fn forward(&self, x: &Array) -> Array {
+        x.matmul(&self.weight.t())
+    }
+}
+
 /// Router for selecting experts.
 ///
 /// Returns normalized top-k routing weights, top-k expert indices, and raw logits.
@@ -84,9 +103,8 @@ impl MoEConfig {
 ///   `bias[e] += gamma * (target_load - actual_load[e])`
 /// This eliminates the need for the Switch Transformer auxiliary loss while
 /// providing better load distribution.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct MoERouter {
-    #[param]
     pub gate: Linear,
     pub num_experts: usize,
     pub num_experts_per_tok: usize,
@@ -100,13 +118,11 @@ pub struct MoERouter {
     /// Learning rate for bias updates: `bias[e] += gamma * (target - actual)`.
     pub bias_gamma: f32,
 }
+impl_module_params!(MoERouter; gate);
 
 impl MoERouter {
     pub fn new(hidden_size: i32, num_experts: usize, num_experts_per_tok: usize) -> Self {
-        let gate = nn::LinearBuilder::new(hidden_size, num_experts as i32)
-            .bias(false)
-            .build()
-            .expect("MoERouter gate linear layer creation cannot fail with valid dimensions");
+        let gate = Linear::new(hidden_size, num_experts as i32);
         Self {
             gate,
             num_experts,
@@ -138,7 +154,7 @@ impl MoERouter {
     pub fn train(&mut self) {
         self.training = true;
     }
-    pub fn eval(&mut self) {
+    pub fn eval_mode(&mut self) {
         self.training = false;
     }
 
@@ -153,55 +169,54 @@ impl MoERouter {
         let shape = hidden_states.shape();
         let batch_seq = shape[..shape.len() - 1].iter().product::<i32>();
         let hidden_size = shape[shape.len() - 1];
-        let hidden_flat = hidden_states.reshape(&[batch_seq, hidden_size])?;
+        let hidden_flat = hidden_states.reshape(&[batch_seq, hidden_size]);
 
-        let mut router_logits = self.gate.forward(&hidden_flat)?;
+        let mut router_logits = self.gate.forward(&hidden_flat);
 
         // Add jitter noise during training for load balancing
         if self.training && self.jitter > 0.0 {
-            let noise = mlx_rs::random::uniform::<_, f32>(
-                -self.jitter,
-                self.jitter,
-                router_logits.shape(),
-                None,
-            )?;
-            router_logits = router_logits.add(&noise)?;
+            let noise = random::uniform(router_logits.shape(), Dtype::Float32);
+            // Scale noise to [-jitter, jitter]: noise * 2*jitter - jitter
+            let scaled = noise
+                .multiply(&Array::from_f32(2.0 * self.jitter))
+                .subtract(&Array::from_f32(self.jitter));
+            router_logits = router_logits.add(&scaled);
         }
 
-        // M6: Cast to float32 before softmax for numerical stability
+        // Cast to float32 before softmax for numerical stability
         let router_logits_f32 = if router_logits.dtype() != Dtype::Float32 {
-            router_logits.as_type::<f32>()?
+            router_logits.as_dtype(Dtype::Float32.as_i32())
         } else {
             router_logits.clone()
         };
-        let routing_weights = mlx_rs::ops::softmax_axis(&router_logits_f32, -1, None)?;
+        let routing_weights = router_logits_f32.softmax(-1);
 
-        // C10: GPU-native top-k
+        // GPU-native top-k
         let k = self.num_experts_per_tok;
 
         let top_indices = if self.use_bias_balancing {
             // DeepSeek-V3 style: add bias for selection, use original scores for weights
             if let Some(ref bias) = self.routing_bias {
-                let bias_array = Array::from_slice(bias, &[self.num_experts as i32]);
-                let biased_weights = routing_weights.add(&bias_array)?;
-                let (_, indices) = gpu_topk(&biased_weights, k)?;
+                let bias_array = Array::from_f32_slice(bias, &[self.num_experts as i32]);
+                let biased_weights = routing_weights.add(&bias_array);
+                let (_, indices) = gpu_topk(&biased_weights, k);
                 indices
             } else {
-                let (_, indices) = gpu_topk(&routing_weights, k)?;
+                let (_, indices) = gpu_topk(&routing_weights, k);
                 indices
             }
         } else {
-            let (_, indices) = gpu_topk(&routing_weights, k)?;
+            let (_, indices) = gpu_topk(&routing_weights, k);
             indices
         };
 
         // Gather the *unbiased* routing weights for the selected experts
-        let top_weights = routing_weights.take_along_axis(&top_indices, -1)?;
+        let top_weights = routing_weights.take_along_axis(&top_indices, -1);
 
         // Normalize selected weights to sum to 1
-        let weight_sum = top_weights.sum_axis(-1, Some(true))?;
-        let safe_sum = mlx_rs::ops::maximum(&weight_sum, &Array::from_f32(1e-8))?;
-        let normalized_weights = top_weights.divide(&safe_sum)?;
+        let weight_sum = top_weights.sum_axis(-1, true);
+        let safe_sum = weight_sum.maximum(&Array::from_f32(1e-8));
+        let normalized_weights = top_weights.divide(&safe_sum);
 
         // Update routing bias after forward (DeepSeek-V3 dynamic balancing)
         if self.use_bias_balancing && self.training {
@@ -224,8 +239,15 @@ impl MoERouter {
             return Ok(());
         };
 
-        selected_experts.eval()?;
-        let indices: Vec<i32> = selected_experts.as_slice().to_vec();
+        let mut se_owned = selected_experts.clone();
+        se_owned.eval();
+        let n = se_owned.size();
+        let indices: Vec<i32> = se_owned
+            .to_f32_vec(n)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
 
         let target_load = self.num_experts_per_tok as f32 / self.num_experts as f32;
         let total = (num_tokens * self.num_experts_per_tok) as f32;
@@ -253,52 +275,48 @@ impl MoERouter {
 /// Returns the top-k values and indices from `probs` along the last axis.
 /// This avoids the CPU round-trip and NaN panic of the previous `custom_topk`.
 /// Indices are returned as Int32.
-fn gpu_topk(probs: &Array, k: usize) -> Result<(Array, Array), Exception> {
+fn gpu_topk(probs: &Array, k: usize) -> (Array, Array) {
     let neg_k = -(k as i32);
-    let partitioned_indices = mlx_rs::ops::argpartition_axis(probs, neg_k, -1)?;
-    let top_indices = partitioned_indices.index((.., neg_k..));
-    let top_indices = top_indices.as_type::<i32>()?;
+    let partitioned_indices = probs.argpartition(neg_k, -1);
+
+    // Slice the last k columns: [N, E] -> [N, k]
+    // slice(start, stop) uses the full shape start/stop vectors.
+    let n_rows = partitioned_indices.dim(0);
+    let n_cols = partitioned_indices.dim(1);
+    let col_start = n_cols + neg_k; // == n_cols - k
+    let top_indices_raw = partitioned_indices.slice(&[0, col_start], &[n_rows, n_cols]);
+    let top_indices = top_indices_raw.as_dtype(Dtype::Int32.as_i32());
 
     // Gather top-k values
-    let top_values = probs.take_along_axis(&top_indices, -1)?;
+    let top_values = probs.take_along_axis(&top_indices, -1);
 
-    Ok((top_values, top_indices))
+    (top_values, top_indices)
 }
 
 /// Single expert MLP (SwiGLU).
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Expert {
-    #[param]
     pub w1: Linear,
-    #[param]
     pub w3: Linear,
-    #[param]
     pub w2: Linear,
 }
+impl_module_params!(Expert; w1, w3, w2);
 
 impl Expert {
     pub fn new(hidden_size: i32, intermediate_size: i32) -> Self {
-        let w1 = nn::LinearBuilder::new(hidden_size, intermediate_size)
-            .bias(false)
-            .build()
-            .expect("Expert w1 linear layer creation cannot fail with valid dimensions");
-        let w3 = nn::LinearBuilder::new(hidden_size, intermediate_size)
-            .bias(false)
-            .build()
-            .expect("Expert w3 linear layer creation cannot fail with valid dimensions");
-        let w2 = nn::LinearBuilder::new(intermediate_size, hidden_size)
-            .bias(false)
-            .build()
-            .expect("Expert w2 linear layer creation cannot fail with valid dimensions");
-        Self { w1, w3, w2 }
+        Self {
+            w1: Linear::new(hidden_size, intermediate_size),
+            w3: Linear::new(hidden_size, intermediate_size),
+            w2: Linear::new(intermediate_size, hidden_size),
+        }
     }
 
-    pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let gate = self.w1.forward(x)?;
+    pub fn forward(&self, x: &Array) -> Array {
+        let gate = self.w1.forward(x);
         // SwiGLU: silu(gate) * up
-        let gate_activated = mlx_rs::nn::silu(&gate)?;
-        let up = self.w3.forward(x)?;
-        let hidden = gate_activated.multiply(&up)?;
+        let gate_activated = gate.silu();
+        let up = self.w3.forward(x);
+        let hidden = gate_activated.multiply(&up);
         self.w2.forward(&hidden)
     }
 }
@@ -307,14 +325,13 @@ impl Expert {
 ///
 /// Routes tokens to top-k experts, runs only assigned tokens per expert,
 /// and accumulates weighted outputs.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct MoELayer {
-    #[param]
     pub router: MoERouter,
-    #[param]
     pub experts: Vec<Expert>,
     pub config: MoEConfig,
 }
+impl_module_params!(MoELayer; router, experts);
 
 impl MoELayer {
     pub fn new(config: MoEConfig) -> Self {
@@ -337,13 +354,13 @@ impl MoELayer {
     pub fn train(&mut self) {
         self.router.train();
     }
-    pub fn eval(&mut self) {
-        self.router.eval();
+    pub fn eval_mode(&mut self) {
+        self.router.eval_mode();
     }
 
     /// Forward pass: route tokens to experts and accumulate outputs.
     ///
-    /// C11: Per-expert dispatch — each expert only processes its assigned tokens.
+    /// Per-expert dispatch — each expert only processes its assigned tokens.
     /// Uses eval + CPU index extraction to gather token indices per expert,
     /// matching the mlx-examples pattern (small routing tensor round-trip is
     /// negligible compared to the expert MLP compute savings).
@@ -354,17 +371,26 @@ impl MoELayer {
 
         let (routing_weights, selected_experts, router_logits) =
             self.router.forward(hidden_states)?;
-        let hidden_flat = hidden_states.reshape(&[batch_seq, hidden_size])?;
+        let hidden_flat = hidden_states.reshape(&[batch_seq, hidden_size]);
 
         // Eval routing tensors to CPU for index extraction
         // (small tensors: [batch_seq, k] — negligible transfer cost)
-        selected_experts.eval()?;
-        routing_weights.eval()?;
+        let mut se_owned = selected_experts.clone();
+        se_owned.eval();
+        let mut rw_owned = routing_weights.clone();
+        rw_owned.eval();
 
         let n_tokens = batch_seq as usize;
         let k = self.config.num_experts_per_tok;
-        let expert_indices: Vec<i32> = selected_experts.as_slice().to_vec();
-        let expert_weights: Vec<f32> = routing_weights.as_slice().to_vec();
+        let se_n = se_owned.size();
+        let rw_n = rw_owned.size();
+        let expert_indices: Vec<i32> = se_owned
+            .to_f32_vec(se_n)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
+        let expert_weights: Vec<f32> = rw_owned.to_f32_vec(rw_n).unwrap_or_default();
 
         // Build per-expert token lists: (token_idx, routing_weight)
         let mut expert_assignments: Vec<Vec<(usize, f32)>> =
@@ -380,9 +406,11 @@ impl MoELayer {
             }
         }
 
-        // C11: Run each expert only on its assigned tokens
+        // Per-expert dispatch — each expert only processes its assigned tokens.
+        // Outputs are accumulated into a CPU f32 buffer (scatter-add replacement).
+        let hidden_size_usize = hidden_size as usize;
         let input_dtype = hidden_states.dtype();
-        let mut final_output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], input_dtype)?;
+        let mut output_buf = vec![0.0f32; n_tokens * hidden_size_usize];
 
         for (expert_idx, assignments) in expert_assignments.iter().enumerate() {
             if assignments.is_empty() {
@@ -392,41 +420,43 @@ impl MoELayer {
             // Gather assigned token indices and weights
             let token_indices: Vec<i32> = assignments.iter().map(|&(idx, _)| idx as i32).collect();
             let weights: Vec<f32> = assignments.iter().map(|&(_, w)| w).collect();
+            let m = token_indices.len();
 
-            let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
-            let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
+            let idx_array = Array::from_i32_slice(&token_indices).reshape(&[m as i32]);
+            let weight_array = Array::from_f32_slice(&weights, &[m as i32, 1]);
 
             // Gather only the assigned tokens
-            let expert_input = hidden_flat.take_axis(&idx_array, 0)?;
+            let expert_input = hidden_flat.take_axis(&idx_array, 0);
 
             // Run expert only on assigned tokens
-            let expert_out = self.experts[expert_idx].forward(&expert_input)?;
+            let expert_out = self.experts[expert_idx].forward(&expert_input);
 
             // Weight the output
-            let weighted_out = expert_out.multiply(&weight_array)?;
+            let weighted_out = expert_out.multiply(&weight_array);
 
-            // Scatter-add weighted output back to token positions.
-            //
-            // MLX scatter constraint: ndim(updates) == ndim(a) + ndim(indices)
-            //   ndim(a)       = 2  ([batch_seq, hidden])
-            //   ndim(indices) = 1  ([M] — 1-D token index array)
-            //   => ndim(updates) must be 3
-            //
-            // Reshape [M, hidden] -> [M, 1, hidden] so the constraint holds.
-            // The scatter writes updates[i, 0, :] into final_output[idx_array[i], :].
-            let m = token_indices.len() as i32;
-            let updates_3d = weighted_out.reshape(&[m, 1, hidden_size])?;
-            final_output = mlx_rs::ops::indexing::scatter_add_single(
-                &final_output,
-                &idx_array,
-                &updates_3d,
-                0,
-            )?;
+            // Eval and scatter-add into CPU buffer
+            let mut wo_owned = weighted_out.clone();
+            wo_owned.eval();
+            let wo_n = wo_owned.size();
+            let wo_data: Vec<f32> = wo_owned.to_f32_vec(wo_n).unwrap_or_default();
+
+            for (local_idx, &token_pos) in token_indices.iter().enumerate() {
+                let tok = token_pos as usize;
+                let src_base = local_idx * hidden_size_usize;
+                let dst_base = tok * hidden_size_usize;
+                for d in 0..hidden_size_usize {
+                    output_buf[dst_base + d] += wo_data[src_base + d];
+                }
+            }
         }
+
+        // Build final output array from accumulated buffer
+        let final_output = Array::from_f32_slice(&output_buf, &[batch_seq, hidden_size])
+            .as_dtype(input_dtype.as_i32());
 
         let mut output_shape = shape.to_vec();
         output_shape[shape.len() - 1] = hidden_size;
-        let output = final_output.reshape(&output_shape)?;
+        let output = final_output.reshape(&output_shape);
 
         // Compute auxiliary loss if enabled (skip when using bias balancing)
         let aux_loss = if self.config.use_aux_loss && !self.router.use_bias_balancing {
@@ -458,16 +488,25 @@ impl MoELayer {
         let shape = hidden_states.shape();
         let batch_seq = shape[..shape.len() - 1].iter().product::<i32>();
         let hidden_size = shape[shape.len() - 1];
-        let hidden_flat = hidden_states.reshape(&[batch_seq, hidden_size])?;
+        let hidden_flat = hidden_states.reshape(&[batch_seq, hidden_size]);
 
         // Eval routing tensors to CPU for index extraction
-        expert_indices.eval()?;
-        expert_weights.eval()?;
+        let mut ei_owned = expert_indices.clone();
+        ei_owned.eval();
+        let mut ew_owned = expert_weights.clone();
+        ew_owned.eval();
 
         let n_tokens = batch_seq as usize;
         let k = self.config.num_experts_per_tok;
-        let ei_data: Vec<i32> = expert_indices.as_slice().to_vec();
-        let ew_data: Vec<f32> = expert_weights.as_slice().to_vec();
+        let ei_n = ei_owned.size();
+        let ew_n = ew_owned.size();
+        let ei_data: Vec<i32> = ei_owned
+            .to_f32_vec(ei_n)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
+        let ew_data: Vec<f32> = ew_owned.to_f32_vec(ew_n).unwrap_or_default();
 
         // Build per-expert token lists: (token_idx, routing_weight)
         let mut expert_assignments: Vec<Vec<(usize, f32)>> =
@@ -483,8 +522,9 @@ impl MoELayer {
             }
         }
 
+        let hidden_size_usize = hidden_size as usize;
         let input_dtype = hidden_states.dtype();
-        let mut final_output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], input_dtype)?;
+        let mut output_buf = vec![0.0f32; n_tokens * hidden_size_usize];
 
         for (expert_idx, assignments) in expert_assignments.iter().enumerate() {
             if assignments.is_empty() {
@@ -493,30 +533,39 @@ impl MoELayer {
 
             let token_indices: Vec<i32> = assignments.iter().map(|&(idx, _)| idx as i32).collect();
             let weights: Vec<f32> = assignments.iter().map(|&(_, w)| w).collect();
+            let m = token_indices.len();
 
-            let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
-            let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
+            let idx_array = Array::from_i32_slice(&token_indices).reshape(&[m as i32]);
+            let weight_array = Array::from_f32_slice(&weights, &[m as i32, 1]);
 
-            let expert_input = hidden_flat.take_axis(&idx_array, 0)?;
-            let expert_out = self.experts[expert_idx].forward(&expert_input)?;
-            let weighted_out = expert_out.multiply(&weight_array)?;
+            let expert_input = hidden_flat.take_axis(&idx_array, 0);
+            let expert_out = self.experts[expert_idx].forward(&expert_input);
+            let weighted_out = expert_out.multiply(&weight_array);
 
-            let m = token_indices.len() as i32;
-            let updates_3d = weighted_out.reshape(&[m, 1, hidden_size])?;
-            final_output = mlx_rs::ops::indexing::scatter_add_single(
-                &final_output,
-                &idx_array,
-                &updates_3d,
-                0,
-            )?;
+            let mut wo_owned = weighted_out.clone();
+            wo_owned.eval();
+            let wo_n = wo_owned.size();
+            let wo_data: Vec<f32> = wo_owned.to_f32_vec(wo_n).unwrap_or_default();
+
+            for (local_idx, &token_pos) in token_indices.iter().enumerate() {
+                let tok = token_pos as usize;
+                let src_base = local_idx * hidden_size_usize;
+                let dst_base = tok * hidden_size_usize;
+                for d in 0..hidden_size_usize {
+                    output_buf[dst_base + d] += wo_data[src_base + d];
+                }
+            }
         }
+
+        let final_output = Array::from_f32_slice(&output_buf, &[batch_seq, hidden_size])
+            .as_dtype(input_dtype.as_i32());
 
         let mut output_shape = shape.to_vec();
         output_shape[shape.len() - 1] = hidden_size;
-        final_output.reshape(&output_shape)
+        Ok(final_output.reshape(&output_shape))
     }
 
-    /// M7: Compute auxiliary load-balancing loss using Switch Transformer formula.
+    /// Compute auxiliary load-balancing loss using Switch Transformer formula.
     ///
     /// `aux_loss = num_experts * sum(f_i * P_i)`
     ///
@@ -533,28 +582,35 @@ impl MoELayer {
         let num_experts_i32 = num_experts as i32;
 
         // P_i: mean routing probability per expert across all tokens
-        let routing_probs = mlx_rs::ops::softmax_axis(router_logits, -1, None)?;
-        let mean_routing_prob = routing_probs.mean_axis(0, None)?; // [num_experts]
+        let routing_probs = router_logits.softmax(-1);
+        let mean_routing_prob = routing_probs.mean_axis(0, false); // [num_experts]
 
         // f_i: fraction of tokens dispatched to each expert
         // Count how many times each expert appears in selected_experts
         let mut dispatch_fractions = Vec::with_capacity(num_experts);
         let total_dispatches = (num_tokens * self.config.num_experts_per_tok) as f32;
-        selected_experts.eval()?;
-        let se_data: Vec<i32> = selected_experts.as_slice().to_vec();
+        let mut se_owned = selected_experts.clone();
+        se_owned.eval();
+        let se_n = se_owned.size();
+        let se_data: Vec<i32> = se_owned
+            .to_f32_vec(se_n)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
         for e in 0..num_experts {
             let count = se_data.iter().filter(|&&x| x == e as i32).count();
             dispatch_fractions.push(count as f32 / total_dispatches.max(1.0));
         }
-        let f_array = Array::from_slice(&dispatch_fractions, &[num_experts_i32]);
+        let f_array = Array::from_f32_slice(&dispatch_fractions, &[num_experts_i32]);
 
         // Switch Transformer aux loss: N * sum(f_i * P_i)
-        let f_times_p = f_array.multiply(&mean_routing_prob)?;
+        let f_times_p = f_array.multiply(&mean_routing_prob);
         let aux_loss = f_times_p
-            .sum(None)?
-            .multiply(&Array::from_f32(num_experts as f32))?;
+            .sum(None)
+            .multiply(&Array::from_f32(num_experts as f32));
 
-        aux_loss.multiply(&Array::from_f32(self.config.aux_loss_coef))
+        Ok(aux_loss.multiply(&Array::from_f32(self.config.aux_loss_coef)))
     }
 }
 
@@ -598,7 +654,7 @@ mod tests {
         let mut router = MoERouter::new(hidden, n_experts, k);
 
         // Random float32 input [n_tokens, hidden]
-        let input = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[n_tokens, hidden], None)?;
+        let input = random::uniform(&[n_tokens, hidden], Dtype::Float32);
 
         let (weights, top_indices, _logits) = router.forward(&input)?;
 
@@ -625,8 +681,10 @@ mod tests {
         );
 
         // Each row must sum to ~1.0 (normalized weights)
-        weights.eval()?;
-        let w_data: Vec<f32> = weights.as_slice::<f32>().to_vec();
+        let mut w_owned = weights.clone();
+        w_owned.eval();
+        let w_n = w_owned.size();
+        let w_data: Vec<f32> = w_owned.to_f32_vec(w_n).unwrap_or_default();
         for token in 0..(n_tokens as usize) {
             let row_sum: f32 = (0..k).map(|slot| w_data[token * k + slot]).sum();
             assert!(
@@ -660,7 +718,7 @@ mod tests {
 
         let mut router = MoERouter::new(hidden, n_experts, k);
 
-        let input = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[n_tokens, hidden], None)?;
+        let input = random::uniform(&[n_tokens, hidden], Dtype::Float32);
 
         let (_weights, top_indices, _logits) = router.forward(&input)?;
 
@@ -674,8 +732,15 @@ mod tests {
 
         // Every index must be a valid expert id and no token should pick the
         // same expert twice (argsort of distinct values is always injective).
-        top_indices.eval()?;
-        let indices: Vec<i32> = top_indices.as_slice::<i32>().to_vec();
+        let mut ti_owned = top_indices.clone();
+        ti_owned.eval();
+        let ti_n = ti_owned.size();
+        let indices: Vec<i32> = ti_owned
+            .to_f32_vec(ti_n)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
         for token in 0..n_tokens as usize {
             let a = indices[token * k] as usize;
             let b = indices[token * k + 1] as usize;
@@ -694,20 +759,32 @@ mod tests {
     #[test]
     #[serial]
     fn test_gpu_topk_matches_full_sort_reference() -> Result<(), Exception> {
-        let probs = Array::from_slice(
+        let probs = Array::from_f32_slice(
             &[
                 0.10f32, 0.60, 0.20, 0.40, 0.30, 0.55, 0.15, 0.45, 0.35, 0.25,
             ],
             &[2, 5],
         );
 
-        let (values, indices) = gpu_topk(&probs, 2)?;
-        values.eval()?;
-        indices.eval()?;
+        let (values, indices) = gpu_topk(&probs, 2);
+        let mut values_owned = values.clone();
+        values_owned.eval();
+        let mut indices_owned = indices.clone();
+        indices_owned.eval();
 
-        let value_data: Vec<f32> = values.as_slice::<f32>().to_vec();
-        let index_data: Vec<i32> = indices.as_slice::<i32>().to_vec();
-        let probs_data: Vec<f32> = probs.as_slice::<f32>().to_vec();
+        let v_n = values_owned.size();
+        let i_n = indices_owned.size();
+        let value_data: Vec<f32> = values_owned.to_f32_vec(v_n).unwrap_or_default();
+        let index_data: Vec<i32> = indices_owned
+            .to_f32_vec(i_n)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
+        let mut probs_owned = probs.clone();
+        probs_owned.eval();
+        let p_n = probs_owned.size();
+        let probs_data: Vec<f32> = probs_owned.to_f32_vec(p_n).unwrap_or_default();
 
         for row in 0..2 {
             let mut expected: Vec<(i32, f32)> = probs_data[row * 5..(row + 1) * 5]
@@ -760,10 +837,10 @@ mod tests {
         let intermediate = 32_i32;
         let t = 4_i32;
 
-        let mut expert = Expert::new(hidden, intermediate);
-        let input = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[t, hidden], None)?;
+        let expert = Expert::new(hidden, intermediate);
+        let input = random::uniform(&[t, hidden], Dtype::Float32);
 
-        let output = expert.forward(&input)?;
+        let output = expert.forward(&input);
 
         assert_eq!(
             output.shape(),
@@ -793,7 +870,7 @@ mod tests {
 
         let mut layer = MoELayer::new(config);
 
-        let input = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[batch, seq, hidden], None)?;
+        let input = random::uniform(&[batch, seq, hidden], Dtype::Float32);
 
         let (output, _aux) = layer.forward(&input)?;
 
@@ -814,7 +891,7 @@ mod tests {
     // Test 5 — Auxiliary loss is Some and strictly positive when enabled
     // -----------------------------------------------------------------------
 
-    /// The Switch Transformer aux loss `N * sum(f_i * P_i)` is always ≥ 0
+    /// The Switch Transformer aux loss `N * sum(f_i * P_i)` is always >= 0
     /// (product of non-negative terms).  For any non-trivial routing it is
     /// strictly positive, which we verify here.
     #[test]
@@ -828,13 +905,16 @@ mod tests {
         let hidden = config.hidden_size;
         let mut layer = MoELayer::new(config);
 
-        let input = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[3, 4, hidden], None)?;
+        let input = random::uniform(&[3, 4, hidden], Dtype::Float32);
 
         let (_output, aux_loss) = layer.forward(&input)?;
 
         let aux = aux_loss.expect("aux_loss must be Some when use_aux_loss = true");
-        aux.eval()?;
-        let val: f32 = aux.item();
+        let mut aux_owned = aux.clone();
+        aux_owned.eval();
+        let n = aux_owned.size();
+        let vals = aux_owned.to_f32_vec(n).unwrap_or_default();
+        let val = vals.first().copied().unwrap_or(f32::NAN);
 
         assert!(val.is_finite(), "aux_loss must be finite, got {}", val);
         assert!(
@@ -862,7 +942,7 @@ mod tests {
         let hidden = config.hidden_size;
         let mut layer = MoELayer::new(config);
 
-        let input = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[2, 3, hidden], None)?;
+        let input = random::uniform(&[2, 3, hidden], Dtype::Float32);
 
         let (_output, aux_loss) = layer.forward(&input)?;
 
@@ -899,20 +979,22 @@ mod tests {
         let mut layer = MoELayer::new(config);
 
         // Single token — 6 of 8 experts will receive no assignments
-        let input = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[1, hidden], None)?;
+        let input = random::uniform(&[1, hidden], Dtype::Float32);
 
         let (output, _aux) = layer.forward(&input)?;
-        output.eval()?;
+        let mut out_owned = output.clone();
+        out_owned.eval();
 
         assert_eq!(
-            output.shape(),
+            out_owned.shape(),
             &[1, hidden],
             "output shape mismatch with sparse expert usage: {:?}",
-            output.shape()
+            out_owned.shape()
         );
 
         // Verify no NaN values in the output
-        let out_data: Vec<f32> = output.as_slice::<f32>().to_vec();
+        let n = out_owned.size();
+        let out_data: Vec<f32> = out_owned.to_f32_vec(n).unwrap_or_default();
         for (i, &v) in out_data.iter().enumerate() {
             assert!(
                 v.is_finite(),
@@ -947,30 +1029,34 @@ mod tests {
         let mut layer = MoELayer::new(config);
 
         // Switch to eval — jitter must be suppressed
-        layer.eval();
+        layer.eval_mode();
 
         // Use a fixed deterministic input
         let input_data: Vec<f32> = (0..(3 * hidden as usize))
             .map(|i| (i as f32) * 0.01)
             .collect();
-        let input = Array::from_slice(&input_data, &[3, hidden]);
+        let input = Array::from_f32_slice(&input_data, &[3, hidden]);
 
         let (output_a, _) = layer.forward(&input)?;
         let (output_b, _) = layer.forward(&input)?;
 
-        output_a.eval()?;
-        output_b.eval()?;
+        let mut a_owned = output_a.clone();
+        a_owned.eval();
+        let mut b_owned = output_b.clone();
+        b_owned.eval();
 
         assert_eq!(
-            output_a.shape(),
+            a_owned.shape(),
             &[3, hidden],
             "eval mode output shape mismatch: {:?}",
-            output_a.shape()
+            a_owned.shape()
         );
 
         // Both passes must produce identical results (eval mode is deterministic)
-        let a: Vec<f32> = output_a.as_slice::<f32>().to_vec();
-        let b: Vec<f32> = output_b.as_slice::<f32>().to_vec();
+        let an = a_owned.size();
+        let bn = b_owned.size();
+        let a: Vec<f32> = a_owned.to_f32_vec(an).unwrap_or_default();
+        let b: Vec<f32> = b_owned.to_f32_vec(bn).unwrap_or_default();
         for (i, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
             assert_eq!(
                 va, vb,

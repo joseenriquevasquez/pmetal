@@ -5,7 +5,7 @@
 
 use super::DistillLoss;
 use crate::Result;
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, ops};
 
 /// Mean Squared Error loss on logits.
 ///
@@ -40,16 +40,16 @@ impl DistillLoss for MseLoss {
         // the T^2 re-scaling in Distiller::compute_loss. This is a fundamental property
         // of MSE — use KL/JS/soft-CE losses when temperature softening is desired.
         let _ = temperature; // explicitly unused
-        let diff = student_logits.subtract(teacher_logits)?;
-        let mse_per_token = diff.multiply(&diff)?.mean_axes(&[-1], false)?;
+        let diff = student_logits.subtract(teacher_logits);
+        let mse_per_token = diff.multiply(&diff).mean_axes(&[-1], false);
 
         if let Some(w) = weights {
-            let weighted = mse_per_token.multiply(w)?;
-            let total_weight = w.sum(None)?;
-            let safe_weight = mlx_rs::ops::maximum(&total_weight, &Array::from_f32(1e-8))?;
-            Ok(weighted.sum(None)?.divide(&safe_weight)?)
+            let weighted = mse_per_token.multiply(w);
+            let total_weight = w.sum_all();
+            let safe_weight = ops::maximum(&total_weight, &Array::from_f32(1e-8));
+            Ok(weighted.sum_all().divide(&safe_weight))
         } else {
-            Ok(mse_per_token.mean(None)?)
+            Ok(mse_per_token.mean_all())
         }
     }
 
@@ -66,7 +66,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_mse_identical_logits() {
-        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let loss = MseLoss::new();
         let result = loss.compute(&logits, &logits, 1.0).unwrap();
         let value: f32 = result.item();
@@ -82,8 +82,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_mse_different_logits() {
-        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
-        let student = Array::from_slice(&[2.0_f32, 3.0, 4.0, 5.0], &[1, 1, 4]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let student = Array::from_f32_slice(&[2.0_f32, 3.0, 4.0, 5.0], &[1, 1, 4]);
 
         let loss = MseLoss::new();
         let result = loss.compute(&teacher, &student, 1.0).unwrap();
@@ -100,8 +100,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_mse_temperature_ignored() {
-        let teacher = Array::from_slice(&[2.0_f32, 4.0, 6.0, 8.0], &[1, 1, 4]);
-        let student = Array::from_slice(&[4.0_f32, 6.0, 8.0, 10.0], &[1, 1, 4]);
+        let teacher = Array::from_f32_slice(&[2.0_f32, 4.0, 6.0, 8.0], &[1, 1, 4]);
+        let student = Array::from_f32_slice(&[4.0_f32, 6.0, 8.0, 10.0], &[1, 1, 4]);
 
         let loss = MseLoss::new();
 
@@ -123,8 +123,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_mse_symmetry() {
-        let a = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
-        let b = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
+        let a = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let b = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
 
         let loss = MseLoss::new();
         let mse_ab = loss.compute(&a, &b, 1.0).unwrap();
@@ -146,24 +146,23 @@ mod tests {
     #[test]
     #[serial]
     fn test_mse_gradient_flow() {
-        use mlx_rs::transforms::value_and_grad;
+        use pmetal_bridge::compat::nn::value_and_grad;
 
-        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
 
-        let loss_fn = |inputs: &[Array]| -> Vec<Array> {
+        let loss_fn = |inputs: &[Array]| -> Array {
             let student = &inputs[0];
-            let diff = student.subtract(&teacher).unwrap();
-            let mse = diff.multiply(&diff).unwrap().mean(None).unwrap();
-            vec![mse]
+            let diff = student.subtract(&teacher);
+            diff.multiply(&diff).mean_all()
         };
 
-        let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
-        let (values, grads) = value_and_grad(loss_fn)(&[student]).unwrap();
+        let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
+        let (loss_val_arr, grads) = value_and_grad(loss_fn, &[student], &[]).unwrap();
 
-        values[0].eval().unwrap();
-        grads[0].eval().unwrap();
+        loss_val_arr.eval();
+        grads[0].eval();
 
-        let loss_val: f32 = values[0].item();
+        let loss_val: f32 = loss_val_arr.item();
         assert!(
             loss_val.is_finite(),
             "MSE loss must be finite, got {}",
@@ -175,7 +174,7 @@ mod tests {
             loss_val
         );
 
-        let grad_data: Vec<f32> = grads[0].as_slice().to_vec();
+        let grad_data: Vec<f32> = grads[0].clone().to_f32_vec(4).unwrap();
         let grad_norm: f32 = grad_data.iter().map(|&g| g * g).sum::<f32>().sqrt();
         assert!(
             grad_norm.is_finite(),
@@ -192,8 +191,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_mse_batch_processing() {
-        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 1, 4]);
-        let student = Array::from_slice(&[2.0_f32, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], &[2, 1, 4]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 1, 4]);
+        let student = Array::from_f32_slice(&[2.0_f32, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], &[2, 1, 4]);
 
         let loss = MseLoss::new();
         let result = loss.compute(&teacher, &student, 1.0).unwrap();

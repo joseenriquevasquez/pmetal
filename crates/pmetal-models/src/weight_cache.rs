@@ -10,7 +10,7 @@
 //! layer-at-a-time inference for models larger than device memory. The LRU
 //! cache with refcounting is fully implemented and tested.
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, Exception};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -148,7 +148,7 @@ impl WeightCache {
     pub fn get_or_load(
         &mut self,
         layer_idx: usize,
-    ) -> Result<&HashMap<String, Array>, mlx_rs::error::Exception> {
+    ) -> Result<&HashMap<String, Array>, pmetal_bridge::compat::Exception> {
         if self.resident.contains_key(&layer_idx) {
             // Cache hit — move to back of LRU
             self.stats.hits += 1;
@@ -156,7 +156,7 @@ impl WeightCache {
         } else {
             // Cache miss — load and possibly evict
             self.stats.misses += 1;
-            self.load_layer(layer_idx)?;
+            self.load_layer(layer_idx);
         }
 
         Ok(self.resident.get(&layer_idx).unwrap())
@@ -170,7 +170,7 @@ impl WeightCache {
     ///
     /// Future work: when async I/O is available this should submit a
     /// non-blocking load so compute can overlap with I/O.
-    pub fn prefetch(&mut self, layer_idx: usize) -> Result<(), mlx_rs::error::Exception> {
+    pub fn prefetch(&mut self, layer_idx: usize) -> Result<(), pmetal_bridge::compat::Exception> {
         if self.resident.contains_key(&layer_idx) {
             tracing::trace!("Prefetch layer {}: already resident, skipping", layer_idx);
             return Ok(());
@@ -179,7 +179,7 @@ impl WeightCache {
             "Prefetch layer {}: not resident, loading synchronously (async not yet implemented)",
             layer_idx
         );
-        self.load_layer(layer_idx)?;
+        self.load_layer(layer_idx);
         Ok(())
     }
 
@@ -210,7 +210,7 @@ impl WeightCache {
     }
 
     /// Load a layer's weights from safetensors and manage cache capacity.
-    fn load_layer(&mut self, layer_idx: usize) -> Result<(), mlx_rs::error::Exception> {
+    fn load_layer(&mut self, layer_idx: usize) -> Result<(), pmetal_bridge::compat::Exception> {
         // Evict LRU layers until we have room, skipping any that are referenced.
         while self.resident.len() >= self.max_resident {
             // Find the position of the first unreferenced layer in LRU order.
@@ -266,13 +266,13 @@ impl WeightCache {
 pub fn load_layer_weights(
     model_dir: &Path,
     layer_idx: usize,
-) -> Result<HashMap<String, Array>, mlx_rs::error::Exception> {
+) -> Result<HashMap<String, Array>, pmetal_bridge::compat::Exception> {
     let prefix = format!("model.layers.{layer_idx}.");
     let alt_prefix = format!("transformer.h.{layer_idx}.");
 
     // Load all weights using the existing loader (handles all dtypes safely)
     let all_weights = crate::loader::load_weights(model_dir)
-        .map_err(|e| mlx_rs::error::Exception::custom(format!("load_weights: {e}")))?;
+        .map_err(|e| pmetal_bridge::compat::Exception::custom(format!("load_weights: {e}")))?;
 
     // Filter to just this layer's weights
     let layer_weights: HashMap<String, Array> = all_weights

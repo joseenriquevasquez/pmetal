@@ -7,18 +7,17 @@
 //! - Multi-Token Prediction (MTP) for densified training signals
 //! - Multi-token prediction lookahead modules
 
-use mlx_rs::error::Exception;
-use mlx_rs::macros::ModuleParameters;
-use mlx_rs::module::{Module, ModuleParameters};
-use mlx_rs::nested::NestedHashMap;
-use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{Array, nn};
+// ModuleParameters derive via impl_module_params!
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param, indexing, nn, ops, random};
+use pmetal_bridge::compat::indexing::IndexOp;
+use pmetal_bridge::impl_module_params;
 use pmetal_mlx::Builder;
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_mlx::moe::{MoEConfig, MoELayer};
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
+use std::collections::HashMap;
 
 /// Result type for DeepSeek operations.
 pub type Result<T, E = Exception> = std::result::Result<T, E>;
@@ -190,29 +189,23 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct DeepSeekAttention {
     pub config: DeepSeekConfig,
     pub n_heads: i32,
     pub scale: f32,
     pub layer_id: usize,
-    #[param]
     pub q_a_proj: Option<nn::Linear>,
-    #[param]
     pub q_a_layernorm: Option<nn::RmsNorm>,
-    #[param]
     pub q_b_proj: Option<nn::Linear>,
-    #[param]
     pub q_proj: Option<nn::Linear>,
-    #[param]
     pub kv_a_proj_with_mqa: nn::Linear,
-    #[param]
     pub kv_a_layernorm: nn::RmsNorm,
-    #[param]
     pub kv_b_proj: nn::Linear,
-    #[param]
     pub o_proj: nn::Linear,
 }
+impl_module_params!(DeepSeekAttention; q_a_proj, q_a_layernorm, q_b_proj, q_proj, kv_a_proj_with_mqa, kv_a_layernorm, kv_b_proj, o_proj);
+
 
 impl DeepSeekAttention {
     pub fn new(config: &DeepSeekConfig, layer_id: usize) -> Result<Self> {
@@ -224,44 +217,36 @@ impl DeepSeekAttention {
             if let Some(q_lora_rank) = config.q_lora_rank {
                 let q_a = nn::LinearBuilder::new(hidden_size, q_lora_rank)
                     .bias(config.attention_bias)
-                    .build()
-                    .map_err(|_| Exception::custom("Build error"))?;
+                    .build()?;
                 let q_a_norm = nn::RmsNormBuilder::new(q_lora_rank)
                     .eps(1e-6)
-                    .build()
-                    .map_err(|_| Exception::custom("Build error"))?;
+                    .build()?;
                 let q_b = nn::LinearBuilder::new(q_lora_rank, n_heads * q_head_dim)
                     .bias(false)
-                    .build()
-                    .map_err(|_| Exception::custom("Build error"))?;
+                    .build()?;
                 (Some(q_a), Some(q_a_norm), Some(q_b), None)
             } else {
                 let q = nn::LinearBuilder::new(hidden_size, n_heads * q_head_dim)
                     .bias(false)
-                    .build()
-                    .map_err(|_| Exception::custom("Build error"))?;
+                    .build()?;
                 (None, None, None, Some(q))
             };
         let kv_a_proj_with_mqa =
             nn::LinearBuilder::new(hidden_size, config.kv_lora_rank + config.qk_rope_head_dim)
                 .bias(config.attention_bias)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?;
+                .build()?;
         let kv_a_layernorm = nn::RmsNormBuilder::new(config.kv_lora_rank)
             .eps(1e-6)
-            .build()
-            .map_err(|_| Exception::custom("Build error"))?;
+            .build()?;
         let kv_b_proj = nn::LinearBuilder::new(
             config.kv_lora_rank,
             n_heads * (config.qk_nope_head_dim + config.v_head_dim),
         )
         .bias(false)
-        .build()
-        .map_err(|_| Exception::custom("Build error"))?;
+        .build()?;
         let o_proj = nn::LinearBuilder::new(n_heads * config.v_head_dim, hidden_size)
             .bias(config.attention_bias)
-            .build()
-            .map_err(|_| Exception::custom("Build error"))?;
+            .build()?;
         Ok(Self {
             config: config.clone(),
             n_heads,
@@ -281,33 +266,33 @@ impl DeepSeekAttention {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
-        let q = if let Some(ref mut q_a) = self.q_a_proj {
-            let q_a_out = q_a.forward(x)?;
-            let q_a_norm = self.q_a_layernorm.as_mut().unwrap().forward(&q_a_out)?;
-            self.q_b_proj.as_mut().unwrap().forward(&q_a_norm)?
+        let q = if let Some(ref q_a) = self.q_a_proj {
+            let q_a_out = q_a.forward(x);
+            let q_a_norm = self.q_a_layernorm.as_ref().unwrap().forward(&q_a_out);
+            self.q_b_proj.as_ref().unwrap().forward(&q_a_norm)
         } else {
-            self.q_proj.as_mut().unwrap().forward(x)?
+            self.q_proj.as_ref().unwrap().forward(x)
         };
         let q_head_dim = self.config.q_head_dim();
         let q = q
-            .reshape(&[batch, seq_len, self.n_heads, q_head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let q_parts = q.split_axis(&[self.config.qk_nope_head_dim as i32], Some(-1))?;
+            .reshape(&[batch, seq_len, self.n_heads, q_head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let q_parts = ops::split_sections(&q, &[self.config.qk_nope_head_dim as i32], -1);
         let q_nope = &q_parts[0];
         let q_pe = &q_parts[1];
-        let compressed_kv = self.kv_a_proj_with_mqa.forward(x)?;
-        let kv_parts = compressed_kv.split_axis(&[self.config.kv_lora_rank as i32], Some(-1))?;
+        let compressed_kv = self.kv_a_proj_with_mqa.forward(x);
+        let kv_parts = ops::split_sections(&compressed_kv, &[self.config.kv_lora_rank as i32], -1);
         let compressed_latent = &kv_parts[0];
         let k_pe = &kv_parts[1]
-            .reshape(&[batch, seq_len, 1, self.config.qk_rope_head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let kv_normalized = self.kv_a_layernorm.forward(compressed_latent)?;
-        let kv = self.kv_b_proj.forward(&kv_normalized)?;
+            .reshape(&[batch, seq_len, 1, self.config.qk_rope_head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let kv_normalized = self.kv_a_layernorm.forward(compressed_latent);
+        let kv = self.kv_b_proj.forward(&kv_normalized);
         let kv_dim = self.config.qk_nope_head_dim + self.config.v_head_dim;
         let kv = kv
-            .reshape(&[batch, seq_len, self.n_heads, kv_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let kv_split = kv.split_axis(&[self.config.qk_nope_head_dim as i32], Some(-1))?;
+            .reshape(&[batch, seq_len, self.n_heads, kv_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let kv_split = ops::split_sections(&kv, &[self.config.qk_nope_head_dim as i32], -1);
         let k_nope = &kv_split[0];
         let values = &kv_split[1];
         let q_pe = apply_rope(
@@ -326,12 +311,12 @@ impl DeepSeekAttention {
             1.0,
             offset,
         )?;
-        let k_pe_repeated = mlx_rs::ops::broadcast_to(
+        let k_pe_repeated = pmetal_bridge::compat::ops::broadcast_to(
             &k_pe,
             &[batch, self.n_heads, seq_len, self.config.qk_rope_head_dim],
-        )?;
-        let keys = mlx_rs::ops::concatenate_axis(&[k_nope, &k_pe_repeated], -1)?;
-        let queries = mlx_rs::ops::concatenate_axis(&[q_nope, &q_pe], -1)?;
+        );
+        let keys = pmetal_bridge::compat::ops::concatenate_axis(&[k_nope, &k_pe_repeated], -1);
+        let queries = pmetal_bridge::compat::ops::concatenate_axis(&[q_nope, &q_pe], -1);
         Ok((queries, keys, values.clone()))
     }
 
@@ -379,9 +364,9 @@ impl DeepSeekAttention {
                     &attn_config,
                 )? {
                     let output = output
-                        .transpose_axes(&[0, 2, 1, 3])?
-                        .reshape(&[batch, seq_len, -1])?;
-                    return self.o_proj.forward(&output);
+                        .transpose_axes(&[0, 2, 1, 3])
+                        .reshape(&[batch, seq_len, -1]);
+                    return Ok(self.o_proj.forward(&output));
                 }
             }
         }
@@ -393,26 +378,24 @@ impl DeepSeekAttention {
         };
 
         let mut attn_weights = queries
-            .matmul(&keys.transpose_axes(&[0, 1, 3, 2])?)?
-            .multiply(&Array::from_f32(self.scale))?;
+            .matmul(&keys.transpose_axes(&[0, 1, 3, 2]))
+            .multiply(&Array::from_f32(self.scale));
         if let Some(mask) = mask {
-            attn_weights = attn_weights.add(mask)?;
+            attn_weights = attn_weights.add(mask);
         }
-        let attn_weights = mlx_rs::ops::softmax_axis(&attn_weights, -1, None)?;
+        let attn_weights = pmetal_bridge::compat::ops::softmax_axis(&attn_weights, -1);
         let output = attn_weights
-            .matmul(&values)?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
-        self.o_proj.forward(&output)
+            .matmul(&values)
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
+        Ok(self.o_proj.forward(&output))
     }
 }
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct LightningIndexer {
     pub n_heads: i32,
-    #[param]
     pub q_proj: nn::Linear,
-    #[param]
     pub k_proj: nn::Linear,
     pub head_dim: i32,
     pub scale: f32,
@@ -420,6 +403,8 @@ pub struct LightningIndexer {
     pub rope_theta: f32,
     pub non_interleaved: bool,
 }
+impl_module_params!(LightningIndexer; q_proj, k_proj);
+
 
 impl LightningIndexer {
     pub fn new(config: &DeepSeekConfig) -> Result<Self> {
@@ -427,12 +412,10 @@ impl LightningIndexer {
         let head_dim = config.qk_rope_head_dim;
         let q_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
             .bias(false)
-            .build()
-            .map_err(|_| Exception::custom("Build error"))?;
+            .build()?;
         let k_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
             .bias(false)
-            .build()
-            .map_err(|_| Exception::custom("Build error"))?;
+            .build()?;
         Ok(Self {
             n_heads,
             q_proj,
@@ -450,14 +433,14 @@ impl LightningIndexer {
         let seq_len = shape[1];
         let q = self
             .q_proj
-            .forward(x)?
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .forward(x)
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
         let k = self
             .k_proj
-            .forward(x)?
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .forward(x)
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
         let q = apply_rope(
             &q,
             self.rope_dim,
@@ -475,9 +458,9 @@ impl LightningIndexer {
             offset,
         )?;
         let scores = q
-            .matmul(&k.transpose_axes(&[0, 1, 3, 2])?)?
-            .multiply(&Array::from_f32(self.scale))?;
-        scores.mean_axis(1, true)?.squeeze_axes(&[1])
+            .matmul(&k.transpose_axes(&[0, 1, 3, 2]))
+            .multiply(&Array::from_f32(self.scale));
+        Ok(scores.mean_axis(1, true).squeeze_axes(&[1]))
     }
 }
 
@@ -494,24 +477,24 @@ impl TokenSelector {
     pub fn select_tokens(&self, scores: &Array, mask: Option<&Array>) -> Result<Array> {
         let mask_2d = mask.map(|m| m.squeeze_axes(&[0, 1]));
         let masked_scores = if let Some(m) = mask_2d {
-            scores.add(&m?)?
+            scores.add(&m)
         } else {
             scores.clone()
         };
         let neg_k = -self.top_k;
-        Ok(mlx_rs::ops::argpartition_axis(&masked_scores, neg_k, -1)?.index((.., .., neg_k..)))
+        Ok(pmetal_bridge::compat::ops::slice_axis_from(&pmetal_bridge::compat::ops::argpartition_axis(&masked_scores, neg_k, -1), -1, neg_k))
     }
 }
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct DeepSeekSparseAttention {
-    #[param]
     pub base_attention: DeepSeekAttention,
-    #[param]
     pub indexer: LightningIndexer,
     pub selector: TokenSelector,
     pub store_indices: bool,
 }
+impl_module_params!(DeepSeekSparseAttention; base_attention, indexer);
+
 
 impl DeepSeekSparseAttention {
     pub fn new(config: &DeepSeekConfig, layer_id: usize) -> Result<Self> {
@@ -544,74 +527,69 @@ impl DeepSeekSparseAttention {
         );
         let val_dim = values.shape()[3];
         let top_k = self.selector.top_k;
-        let idx = selected_indices.reshape(&[batch, 1, query_len, top_k])?;
-        let idx = mlx_rs::ops::broadcast_to(&idx, &[batch, n_heads, query_len, top_k])?;
-        let idx_for_keys = idx.reshape(&[batch, n_heads, query_len * top_k, 1])?;
-        let idx_for_keys = mlx_rs::ops::broadcast_to(
+        let idx = selected_indices.reshape(&[batch, 1, query_len, top_k]);
+        let idx = pmetal_bridge::compat::ops::broadcast_to(&idx, &[batch, n_heads, query_len, top_k]);
+        let idx_for_keys = idx.reshape(&[batch, n_heads, query_len * top_k, 1]);
+        let idx_for_keys = pmetal_bridge::compat::ops::broadcast_to(
             &idx_for_keys,
             &[batch, n_heads, query_len * top_k, key_dim],
-        )?;
-        let gathered_keys = mlx_rs::ops::indexing::take_along_axis(&keys, &idx_for_keys, 2)?
-            .reshape(&[batch, n_heads, query_len, top_k, key_dim])?;
-        let idx_for_vals = idx.reshape(&[batch, n_heads, query_len * top_k, 1])?;
-        let idx_for_vals = mlx_rs::ops::broadcast_to(
+        );
+        let gathered_keys = pmetal_bridge::compat::indexing::take_along_axis(&keys, &idx_for_keys, 2)
+            .reshape(&[batch, n_heads, query_len, top_k, key_dim]);
+        let idx_for_vals = idx.reshape(&[batch, n_heads, query_len * top_k, 1]);
+        let idx_for_vals = pmetal_bridge::compat::ops::broadcast_to(
             &idx_for_vals,
             &[batch, n_heads, query_len * top_k, val_dim],
-        )?;
-        let gathered_values = mlx_rs::ops::indexing::take_along_axis(&values, &idx_for_vals, 2)?
-            .reshape(&[batch, n_heads, query_len, top_k, val_dim])?;
-        let q_expanded = queries.reshape(&[batch, n_heads, query_len, 1, key_dim])?;
+        );
+        let gathered_values = pmetal_bridge::compat::indexing::take_along_axis(&values, &idx_for_vals, 2)
+            .reshape(&[batch, n_heads, query_len, top_k, val_dim]);
+        let q_expanded = queries.reshape(&[batch, n_heads, query_len, 1, key_dim]);
         let attn_scores = q_expanded
-            .matmul(&gathered_keys.transpose_axes(&[0, 1, 2, 4, 3])?)?
-            .squeeze_axes(&[3])?
-            .multiply(&Array::from_f32(self.base_attention.scale))?;
-        let attn_weights = mlx_rs::ops::softmax_axis(&attn_scores, -1, None)?
-            .reshape(&[batch, n_heads, query_len, 1, top_k])?;
+            .matmul(&gathered_keys.transpose_axes(&[0, 1, 2, 4, 3]))
+            .squeeze_axes(&[3])
+            .multiply(&Array::from_f32(self.base_attention.scale));
+        let attn_weights = pmetal_bridge::compat::ops::softmax_axis(&attn_scores, -1)
+            .reshape(&[batch, n_heads, query_len, 1, top_k]);
         let output = attn_weights
-            .matmul(&gathered_values)?
-            .squeeze_axes(&[3])?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, query_len, -1])?;
-        self.base_attention.o_proj.forward(&output)
+            .matmul(&gathered_values)
+            .squeeze_axes(&[3])
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, query_len, -1]);
+        Ok(self.base_attention.o_proj.forward(&output))
     }
 }
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct DeepSeekMLP {
-    #[param]
     pub gate_proj: nn::Linear,
-    #[param]
     pub up_proj: nn::Linear,
-    #[param]
     pub down_proj: nn::Linear,
 }
+impl_module_params!(DeepSeekMLP; gate_proj, up_proj, down_proj);
+
 impl DeepSeekMLP {
     pub fn new(hidden_size: i32, intermediate_size: i32) -> Result<Self> {
         Ok(Self {
             gate_proj: nn::LinearBuilder::new(hidden_size, intermediate_size)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             up_proj: nn::LinearBuilder::new(hidden_size, intermediate_size)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             down_proj: nn::LinearBuilder::new(intermediate_size, hidden_size)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
         })
     }
     pub fn forward(&mut self, x: &Array) -> Result<Array> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&nn::silu(gate)?.multiply(&up)?)
+        let gate = self.gate_proj.forward(x);
+        let up = self.up_proj.forward(x);
+        Ok(self.down_proj.forward(&nn::silu(&gate).multiply(&up)))
     }
 }
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct DeepSeekMoEGate {
-    #[param]
     pub weight: nn::Linear,
     pub e_score_correction_bias: Array,
     pub top_k: i32,
@@ -619,15 +597,16 @@ pub struct DeepSeekMoEGate {
     pub routed_scaling_factor: f32,
     pub norm_topk_prob: bool,
 }
+impl_module_params!(DeepSeekMoEGate; weight);
+
 impl DeepSeekMoEGate {
     pub fn new(config: &DeepSeekConfig) -> Result<Self> {
         let num_experts = config.n_routed_experts.unwrap_or(8);
         Ok(Self {
             weight: nn::LinearBuilder::new(config.hidden_size, num_experts)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
-            e_score_correction_bias: Array::zeros::<f32>(&[num_experts])?,
+                .build()?,
+            e_score_correction_bias: Array::zeros_f32(&[num_experts]),
             top_k: config.num_experts_per_tok,
             num_experts,
             routed_scaling_factor: config.routed_scaling_factor,
@@ -638,23 +617,25 @@ impl DeepSeekMoEGate {
         let shape = x.shape();
         let hidden_size = *shape.last().unwrap_or(&0);
         let token_count: i32 = shape[..shape.len().saturating_sub(1)].iter().product();
-        let hidden_flat = x.reshape(&[token_count, hidden_size])?;
-        let gates = self.weight.forward(&hidden_flat)?;
-        let scores = mlx_rs::ops::sigmoid(&gates.as_dtype(mlx_rs::Dtype::Float32)?)?;
-        let scores_with_bias = scores.add(&self.e_score_correction_bias)?;
+        let hidden_flat = x.reshape(&[token_count, hidden_size]);
+        let gates = self.weight.forward(&hidden_flat);
+        let scores = pmetal_bridge::compat::ops::sigmoid(&gates.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32()));
+        let scores_with_bias = scores.add(&self.e_score_correction_bias);
         let neg_k = -self.top_k;
-        let inds = mlx_rs::ops::argpartition_axis(&scores_with_bias, neg_k, -1)?
-            .index((.., neg_k..))
-            .as_type::<i32>()?;
-        let top_scores = scores.take_along_axis(&inds, -1)?;
+        let inds = pmetal_bridge::compat::ops::slice_axis_from(
+            &pmetal_bridge::compat::ops::argpartition_axis(&scores_with_bias, neg_k, -1),
+            -1,
+            neg_k,
+        ).as_type::<i32>();
+        let top_scores = scores.take_along_axis(&inds, -1);
         let final_scores = if self.norm_topk_prob && self.top_k > 1 {
-            top_scores.divide(&top_scores.sum_axis(-1, true)?)?
+            top_scores.divide(&top_scores.sum_axis(-1, true))
         } else {
             top_scores
         };
         Ok((
             inds,
-            final_scores.multiply(&Array::from_f32(self.routed_scaling_factor))?,
+            final_scores.multiply(&Array::from_f32(self.routed_scaling_factor)),
         ))
     }
 }
@@ -671,19 +652,19 @@ pub struct DeepSeekMoE {
     pub stacked_weight_signature: Option<Vec<usize>>,
 }
 impl ModuleParameters for DeepSeekMoE {
-    fn parameters(&self) -> NestedHashMap<Rc<str>, &Array> {
+    fn parameters(&self) -> ModuleParamRef<'_> {
         let mut map = self.gate.parameters();
-        map.entries.extend(self.moe.parameters().entries);
+        map.extend(self.moe.parameters());
         if let Some(ref s) = self.shared_experts {
-            map.entries.extend(s.parameters().entries);
+            map.extend(s.parameters());
         }
         map
     }
-    fn trainable_parameters(&self) -> NestedHashMap<Rc<str>, &Array> {
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let mut map = self.gate.trainable_parameters();
-        map.entries.extend(self.moe.trainable_parameters().entries);
+        map.extend(self.moe.trainable_parameters());
         if let Some(ref s) = self.shared_experts {
-            map.entries.extend(s.trainable_parameters().entries);
+            map.extend(s.trainable_parameters());
         }
         map
     }
@@ -695,11 +676,11 @@ impl ModuleParameters for DeepSeekMoE {
                 .as_ref()
                 .map_or(0, |s| s.num_parameters())
     }
-    fn parameters_mut(&mut self) -> NestedHashMap<Rc<str>, &mut Array> {
+    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         let mut map = self.gate.parameters_mut();
-        map.entries.extend(self.moe.parameters_mut().entries);
+        map.extend(self.moe.parameters_mut());
         if let Some(ref mut s) = self.shared_experts {
-            map.entries.extend(s.parameters_mut().entries);
+            map.extend(s.parameters_mut());
         }
         map
     }
@@ -719,8 +700,8 @@ impl ModuleParameters for DeepSeekMoE {
     }
     fn all_frozen(&self) -> Option<bool> {
         Some(
-            self.gate.all_frozen()?
-                && self.moe.all_frozen()?
+            self.gate.all_frozen().unwrap_or(true)
+                && self.moe.all_frozen().unwrap_or(true)
                 && self
                     .shared_experts
                     .as_ref()
@@ -729,8 +710,8 @@ impl ModuleParameters for DeepSeekMoE {
     }
     fn any_frozen(&self) -> Option<bool> {
         Some(
-            self.gate.any_frozen()?
-                || self.moe.any_frozen()?
+            self.gate.any_frozen().unwrap_or(false)
+                || self.moe.any_frozen().unwrap_or(false)
                 || self
                     .shared_experts
                     .as_ref()
@@ -770,9 +751,9 @@ impl DeepSeekMoE {
     fn current_stacked_weight_signature(&self) -> Vec<usize> {
         let mut signature = Vec::with_capacity(self.moe.experts.len() * 3);
         for expert in &self.moe.experts {
-            signature.push(expert.w1.weight.as_ref().as_ptr().ctx as usize);
-            signature.push(expert.w3.weight.as_ref().as_ptr().ctx as usize);
-            signature.push(expert.w2.weight.as_ref().as_ptr().ctx as usize);
+            signature.push(expert.w1.weight.as_ref().data_ptr() as usize);
+            signature.push(expert.w3.weight.as_ref().data_ptr() as usize);
+            signature.push(expert.w2.weight.as_ref().data_ptr() as usize);
         }
         signature
     }
@@ -796,14 +777,10 @@ impl DeepSeekMoE {
             .iter()
             .map(|expert| expert.w2.weight.as_ref().t())
             .collect();
-        let gate_weight_refs: Vec<&Array> = gate_weights.iter().collect();
-        let up_weight_refs: Vec<&Array> = up_weights.iter().collect();
-        let down_weight_refs: Vec<&Array> = down_weights.iter().collect();
-
         Ok((
-            mlx_rs::ops::stack_axis(&gate_weight_refs, 0)?,
-            mlx_rs::ops::stack_axis(&up_weight_refs, 0)?,
-            mlx_rs::ops::stack_axis(&down_weight_refs, 0)?,
+            pmetal_bridge::compat::ops::stack_axis(&gate_weights, 0),
+            pmetal_bridge::compat::ops::stack_axis(&up_weights, 0),
+            pmetal_bridge::compat::ops::stack_axis(&down_weights, 0),
         ))
     }
 
@@ -815,11 +792,11 @@ impl DeepSeekMoE {
             || self.stacked_weight_signature.as_ref() != Some(&signature);
 
         if needs_refresh {
-            let (stacked_gate_proj, stacked_up_proj, stacked_down_proj) =
+            let (mut stacked_gate_proj, mut stacked_up_proj, mut stacked_down_proj) =
                 self.stack_expert_weights()?;
-            stacked_gate_proj.eval()?;
-            stacked_up_proj.eval()?;
-            stacked_down_proj.eval()?;
+            stacked_gate_proj.eval();
+            stacked_up_proj.eval();
+            stacked_down_proj.eval();
             self.stacked_gate_proj = Some(stacked_gate_proj);
             self.stacked_up_proj = Some(stacked_up_proj);
             self.stacked_down_proj = Some(stacked_down_proj);
@@ -840,71 +817,71 @@ impl DeepSeekMoE {
     }
 
     fn batched_matmul(&self, x: &Array, w: &Array) -> Result<Array> {
-        let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)])?;
-        let result = mlx_rs::ops::matmul(&x_expanded, w)?;
-        result.squeeze_axes(&[1])
+        let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)]);
+        let result = pmetal_bridge::compat::ops::matmul(&x_expanded, w);
+        Ok(result.squeeze_axes(&[1]))
     }
 
     #[cfg(test)]
     fn forward_reference(&mut self, x: &Array) -> Result<Array> {
-        let (expert_indices, expert_weights) = self.gate.forward(x)?;
+        let (expert_indices, expert_weights) = self.gate.forward(x);
         let moe_out = self
             .moe
-            .forward_with_routing(x, &expert_indices, &expert_weights)?;
+            .forward_with_routing(x, &expert_indices, &expert_weights);
         if let Some(ref mut shared) = self.shared_experts {
-            moe_out.add(&shared.forward(x)?)
+            moe_out.add(&shared.forward(x))
         } else {
             Ok(moe_out)
         }
     }
 
     fn forward_stacked(&mut self, x: &Array) -> Result<Array> {
-        self.ensure_stacked_moe()?;
+        self.ensure_stacked_moe();
 
         let shape = x.shape();
         let hidden_flat = x.reshape(&[
             shape[..shape.len() - 1].iter().product(),
             shape[shape.len() - 1],
-        ])?;
+        ]);
         let batch_seq = hidden_flat.dim(0);
         let hidden_size = hidden_flat.dim(1);
         let (expert_indices, expert_weights) = self.gate.forward(&hidden_flat)?;
         let top_k = self.gate.top_k;
-        let mut output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
+        let mut output = pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
 
         for slot in 0..top_k {
-            let slot_experts = expert_indices.index((.., slot));
-            let slot_weights = expert_weights.index((.., slot..slot + 1));
+            let slot_experts = pmetal_bridge::compat::ops::slice_axis(&expert_indices, 1, slot, slot + 1).reshape(&[expert_indices.dim(0)]);
+            let slot_weights = pmetal_bridge::compat::ops::slice_axis(&expert_weights, 1, slot, slot + 1);
 
             let gate_weights = self
                 .stacked_gate_proj
                 .as_ref()
                 .unwrap()
-                .take_axis(&slot_experts, 0)?;
+                .take_axis(&slot_experts, 0);
             let up_weights = self
                 .stacked_up_proj
                 .as_ref()
                 .unwrap()
-                .take_axis(&slot_experts, 0)?;
+                .take_axis(&slot_experts, 0);
             let down_weights = self
                 .stacked_down_proj
                 .as_ref()
                 .unwrap()
-                .take_axis(&slot_experts, 0)?;
+                .take_axis(&slot_experts, 0);
 
             let gate_out = self.batched_matmul(&hidden_flat, &gate_weights)?;
             let up_out = self.batched_matmul(&hidden_flat, &up_weights)?;
-            let activated = nn::silu(&gate_out)?.multiply(&up_out)?;
+            let activated = nn::silu(&gate_out).multiply(&up_out);
             let slot_out = self.batched_matmul(&activated, &down_weights)?;
-            output = output.add(&slot_out.multiply(&slot_weights)?)?;
+            output = output.add(&slot_out.multiply(&slot_weights));
         }
 
         let mut output_shape = shape.to_vec();
         output_shape[shape.len() - 1] = hidden_size;
-        let moe_out = output.reshape(&output_shape)?;
+        let moe_out = output.reshape(&output_shape);
 
         if let Some(ref mut shared) = self.shared_experts {
-            moe_out.add(&shared.forward(x)?)
+            Ok(moe_out.add(&shared.forward(x)?))
         } else {
             Ok(moe_out)
         }
@@ -921,13 +898,13 @@ pub enum DeepSeekMLPType {
     MoE(DeepSeekMoE),
 }
 impl ModuleParameters for DeepSeekMLPType {
-    fn parameters(&self) -> NestedHashMap<Rc<str>, &Array> {
+    fn parameters(&self) -> ModuleParamRef<'_> {
         match self {
             Self::Dense(m) => m.parameters(),
             Self::MoE(m) => m.parameters(),
         }
     }
-    fn trainable_parameters(&self) -> NestedHashMap<Rc<str>, &Array> {
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         match self {
             Self::Dense(m) => m.trainable_parameters(),
             Self::MoE(m) => m.trainable_parameters(),
@@ -939,7 +916,7 @@ impl ModuleParameters for DeepSeekMLPType {
             Self::MoE(m) => m.num_parameters(),
         }
     }
-    fn parameters_mut(&mut self) -> NestedHashMap<Rc<str>, &mut Array> {
+    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         match self {
             Self::Dense(m) => m.parameters_mut(),
             Self::MoE(m) => m.parameters_mut(),
@@ -986,29 +963,25 @@ impl DeepSeekMLPType {
     }
 }
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct DeepSeekDecoderLayer {
     pub layer_id: usize,
-    #[param]
     pub self_attn: DeepSeekAttention,
-    #[param]
     pub input_layernorm: nn::RmsNorm,
-    #[param]
     pub post_attention_layernorm: nn::RmsNorm,
-    #[param]
     pub mlp: DeepSeekMLPType,
 }
+impl_module_params!(DeepSeekDecoderLayer; self_attn, input_layernorm, post_attention_layernorm, mlp);
+
 impl DeepSeekDecoderLayer {
     pub fn new(config: &DeepSeekConfig, layer_id: usize) -> Result<Self> {
         let self_attn = DeepSeekAttention::new(config, layer_id)?;
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
-            .build()
-            .map_err(|_| Exception::custom("Build error"))?;
+            .build()?;
         let post_attention_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
-            .build()
-            .map_err(|_| Exception::custom("Build error"))?;
+            .build()?;
         let mlp = if config.is_moe_layer(layer_id as i32) {
             DeepSeekMLPType::MoE(DeepSeekMoE::new(config)?)
         } else {
@@ -1032,15 +1005,15 @@ impl DeepSeekDecoderLayer {
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array> {
         let h = x.add(&self.self_attn.forward(
-            &self.input_layernorm.forward(x)?,
+            &self.input_layernorm.forward(x),
             mask,
             cache,
-        )?)?;
-        h.add(
+        )?);
+        Ok(h.add(
             &self
                 .mlp
-                .forward(&self.post_attention_layernorm.forward(&h)?)?,
-        )
+                .forward(&self.post_attention_layernorm.forward(&h))?,
+        ))
     }
 
     pub fn init_stacked_moe(&mut self) -> Result<()> {
@@ -1048,16 +1021,15 @@ impl DeepSeekDecoderLayer {
     }
 }
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct DeepSeekModel {
     pub config: DeepSeekConfig,
-    #[param]
     pub embed_tokens: nn::Embedding,
-    #[param]
     pub layers: Vec<DeepSeekDecoderLayer>,
-    #[param]
     pub norm: nn::RmsNorm,
 }
+impl_module_params!(DeepSeekModel; embed_tokens, layers, norm);
+
 impl DeepSeekModel {
     pub fn new(config: DeepSeekConfig) -> Result<Self> {
         let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)?;
@@ -1066,8 +1038,7 @@ impl DeepSeekModel {
             .collect::<Result<Vec<_>>>()?;
         let norm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
-            .build()
-            .map_err(|_| Exception::custom("Build error"))?;
+            .build()?;
         Ok(Self {
             config,
             embed_tokens,
@@ -1081,61 +1052,56 @@ impl DeepSeekModel {
         mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
     ) -> Result<Array> {
-        let mut h = self.embed_tokens.forward(input_ids)?;
+        let mut h = self.embed_tokens.forward(input_ids);
         for (i, layer) in self.layers.iter_mut().enumerate() {
             h = layer.forward(&h, mask, cache.as_mut().map(|c| (&mut **c, i)))?;
         }
-        self.norm.forward(&h)
+        Ok(self.norm.forward(&h))
     }
     pub fn forward_with_hidden(
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
     ) -> Result<(Array, Vec<Array>)> {
-        let mut h = self.embed_tokens.forward(input_ids)?;
+        let mut h = self.embed_tokens.forward(input_ids);
         let mut all_hidden = Vec::with_capacity(self.layers.len());
         for layer in self.layers.iter_mut() {
             h = layer.forward(&h, mask, None)?;
             all_hidden.push(h.clone());
         }
-        let out = self.norm.forward(&h)?;
+        let out = self.norm.forward(&h);
         Ok((out, all_hidden))
     }
 
     pub fn init_stacked_moe(&mut self) -> Result<()> {
         for layer in &mut self.layers {
-            layer.init_stacked_moe()?;
+            layer.init_stacked_moe();
         }
         Ok(())
     }
 }
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct DeepSeekMTPModule {
-    #[param]
     pub eh_proj: nn::Linear,
-    #[param]
     pub enorm: nn::RmsNorm,
-    #[param]
     pub hnorm: nn::RmsNorm,
-    #[param]
     pub layer: DeepSeekDecoderLayer,
 }
+impl_module_params!(DeepSeekMTPModule; eh_proj, enorm, hnorm, layer);
+
 impl DeepSeekMTPModule {
     pub fn new(config: &DeepSeekConfig, layer_idx: usize) -> Result<Self> {
         Ok(Self {
             eh_proj: nn::LinearBuilder::new(config.hidden_size * 2, config.hidden_size)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             enorm: nn::RmsNormBuilder::new(config.hidden_size)
                 .eps(config.rms_norm_eps)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             hnorm: nn::RmsNormBuilder::new(config.hidden_size)
                 .eps(config.rms_norm_eps)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             layer: DeepSeekDecoderLayer::new(config, layer_idx)?,
         })
     }
@@ -1145,24 +1111,25 @@ impl DeepSeekMTPModule {
         e_curr: &Array,
         mask: Option<&Array>,
     ) -> Result<Array> {
-        let cat = mlx_rs::ops::concatenate_axis(
-            &[self.hnorm.forward(h_prev)?, self.enorm.forward(e_curr)?],
+        let hn = self.hnorm.forward(h_prev);
+        let en = self.enorm.forward(e_curr);
+        let cat = pmetal_bridge::compat::ops::concatenate_axis(
+            &[&hn, &en],
             -1,
-        )?;
-        self.layer.forward(&self.eh_proj.forward(&cat)?, mask, None)
+        );
+        self.layer.forward(&self.eh_proj.forward(&cat), mask, None)
     }
 }
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct DeepSeek {
     pub config: DeepSeekConfig,
-    #[param]
     pub model: DeepSeekModel,
-    #[param]
     pub lm_head: nn::Linear,
-    #[param]
     pub mtp_modules: Vec<DeepSeekMTPModule>,
 }
+impl_module_params!(DeepSeek; model, lm_head, mtp_modules);
+
 impl DeepSeek {
     pub fn new(config: DeepSeekConfig) -> Result<Self> {
         let mut mtp_modules = Vec::new();
@@ -1176,8 +1143,7 @@ impl DeepSeek {
         }
         let lm_head = nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
             .bias(false)
-            .build()
-            .map_err(|_| Exception::custom("Build error"))?;
+            .build()?;
         let config_clone = config.clone();
         Ok(Self {
             config,
@@ -1188,23 +1154,23 @@ impl DeepSeek {
     }
     pub fn forward_mtp(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Vec<Array>> {
         let (hidden_final, _) = self.model.forward_with_hidden(input_ids, mask)?;
-        let mut all_logits = vec![self.lm_head.forward(&hidden_final)?];
+        let mut all_logits = vec![self.lm_head.forward(&hidden_final)];
         if !self.config.use_mtp {
             return Ok(all_logits);
         }
         let mut h_prev = hidden_final;
-        let embeddings = self.model.embed_tokens.forward(input_ids)?;
+        let embeddings = self.model.embed_tokens.forward(input_ids);
         for mtp_module in &mut self.mtp_modules {
-            let e_curr = embeddings.index((.., 1.., ..));
-            let e_curr_padded = mlx_rs::ops::concatenate_axis(
+            let e_curr = pmetal_bridge::compat::ops::slice_axis_from(&embeddings, 1, 1);
+            let e_curr_padded = pmetal_bridge::compat::ops::concatenate_axis(
                 &[
-                    e_curr,
-                    Array::zeros::<f32>(&[embeddings.dim(0), 1, self.config.hidden_size])?,
+                    &e_curr,
+                    &Array::zeros_f32(&[embeddings.dim(0), 1, self.config.hidden_size]),
                 ],
                 1,
-            )?;
+            );
             h_prev = mtp_module.forward(&h_prev, &e_curr_padded, mask)?;
-            all_logits.push(self.lm_head.forward(&h_prev)?);
+            all_logits.push(self.lm_head.forward(&h_prev));
         }
         Ok(all_logits)
     }
@@ -1214,8 +1180,7 @@ impl DeepSeek {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array> {
-        self.lm_head
-            .forward(&self.model.forward(input_ids, mask, cache)?)
+        Ok(self.lm_head.forward(&self.model.forward(input_ids, mask, cache)?))
     }
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
         KVCache::new(
@@ -1230,9 +1195,9 @@ impl DeepSeek {
     }
 
     pub fn init_stacked_moe(&mut self) -> Result<()> {
-        self.model.init_stacked_moe()?;
+        self.model.init_stacked_moe();
         for module in &mut self.mtp_modules {
-            module.layer.init_stacked_moe()?;
+            module.layer.init_stacked_moe();
         }
         Ok(())
     }
@@ -1241,7 +1206,7 @@ impl DeepSeek {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::module::Param;
+    use pmetal_bridge::compat::module::Param;
     use serial_test::serial;
 
     fn tiny_deepseek_moe_config() -> DeepSeekConfig {
@@ -1266,7 +1231,7 @@ mod tests {
     fn test_deepseek_moe_stacked_matches_reference() {
         let config = tiny_deepseek_moe_config();
         let mut moe = DeepSeekMoE::new(&config).unwrap();
-        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
+        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
             .unwrap();
 
         let reference = moe.forward_reference(&x).unwrap();
@@ -1295,14 +1260,14 @@ mod tests {
     fn test_deepseek_moe_cache_refreshes_after_weight_change() {
         let config = tiny_deepseek_moe_config();
         let mut moe = DeepSeekMoE::new(&config).unwrap();
-        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
+        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
             .unwrap();
 
         let _ = moe.forward(&x).unwrap();
         assert!(moe.has_stacked_moe());
 
         moe.moe.experts[0].w1.weight = Param::new(
-            Array::zeros::<f32>(&[config.moe_intermediate_size, config.hidden_size]).unwrap(),
+            Array::zeros_f32(&[config.moe_intermediate_size, config.hidden_size]),
         );
 
         let reference = moe.forward_reference(&x).unwrap();

@@ -119,14 +119,14 @@ impl PackedBatch {
         mask
     }
 
-    /// Build a block diagonal attention mask, returning as mlx_rs Array.
+    /// Build a block diagonal attention mask, returning as an MLX Array.
     ///
     /// This is more efficient than building Vec<f32> and then converting,
     /// as it avoids an intermediate allocation.
-    pub fn build_attention_mask_array(&self) -> mlx_rs::error::Result<mlx_rs::Array> {
+    pub fn build_attention_mask_array(&self) -> std::result::Result<Array, Exception> {
         let n = self.total_tokens() as i32;
         let mask_data = self.build_attention_mask();
-        Ok(mlx_rs::Array::from_slice(&mask_data, &[n, n]))
+        Ok(Array::from_f32_slice(&mask_data, &[n, n]))
     }
 
     /// Build a block diagonal attention mask with sliding window.
@@ -597,7 +597,7 @@ impl Default for SequencePacker {
 // MLX Training Integration
 // =============================================================================
 
-use mlx_rs::{Array, error::Exception};
+use pmetal_bridge::compat::{Array, Exception};
 
 /// A packed batch ready for training with MLX Arrays.
 ///
@@ -612,6 +612,8 @@ pub struct PackedTrainingBatch {
     pub position_ids: Array,
     /// Cumulative sequence lengths [num_sequences + 1].
     pub cu_seqlens: Array,
+    /// Cumulative sequence lengths as a CPU-side Vec for mask construction.
+    pub cu_seqlens_raw: Vec<i32>,
     /// Packed labels for loss computation [total_tokens].
     pub labels: Array,
     /// Total number of tokens.
@@ -631,36 +633,35 @@ impl PackedTrainingBatch {
     pub fn from_packed_batch(batch: &PackedBatch) -> std::result::Result<Self, Exception> {
         // Convert input_ids to Array [total_tokens]
         let input_ids_i32: Vec<i32> = batch.input_ids.iter().map(|&x| x as i32).collect();
-        let len = input_ids_i32.len() as i32;
-        let input_ids = Array::from_slice(&input_ids_i32, &[len]);
+        let input_ids = Array::from_i32_slice(&input_ids_i32);
 
         // Convert position_ids to Array [total_tokens]
         let position_ids_i32: Vec<i32> = batch.position_ids.iter().map(|&x| x as i32).collect();
-        let len = position_ids_i32.len() as i32;
-        let position_ids = Array::from_slice(&position_ids_i32, &[len]);
+        let position_ids = Array::from_i32_slice(&position_ids_i32);
 
         // Convert cu_seqlens to Array [num_sequences + 1]
-        let cu_seqlens_i32: Vec<i32> = batch.cu_seqlens.iter().map(|&x| x as i32).collect();
-        let len = cu_seqlens_i32.len() as i32;
-        let cu_seqlens = Array::from_slice(&cu_seqlens_i32, &[len]);
+        let cu_seqlens_raw: Vec<i32> = batch.cu_seqlens.iter().map(|&x| x as i32).collect();
+        let cu_seqlens = Array::from_i32_slice(&cu_seqlens_raw);
 
         // Convert labels to Array [total_tokens]
         // If labels are None, use input_ids shifted by 1 (language modeling)
         let labels = if let Some(ref labels_vec) = batch.labels {
-            let len = labels_vec.len() as i32;
-            Array::from_slice(labels_vec, &[len])
+            // i64 label values — cast to i32 (all values fit: token IDs < 2^24, sentinel -100)
+            let labels_i32: Vec<i32> = labels_vec.iter().map(|&x| x as i32).collect();
+            Array::from_i32_slice(&labels_i32)
         } else {
             // Default: next token prediction (shift input_ids by 1)
-            let mut labels_i64: Vec<i64> = batch.input_ids[1..].iter().map(|&x| x as i64).collect();
-            labels_i64.push(-100); // Ignore last token prediction
-            let len = labels_i64.len() as i32;
-            Array::from_slice(&labels_i64, &[len])
+            let mut labels_i32: Vec<i32> =
+                batch.input_ids[1..].iter().map(|&x| x as i32).collect();
+            labels_i32.push(-100); // Ignore last token prediction
+            Array::from_i32_slice(&labels_i32)
         };
 
         Ok(Self {
             input_ids,
             position_ids,
             cu_seqlens,
+            cu_seqlens_raw,
             labels,
             total_tokens: batch.input_ids.len(),
             num_sequences: batch.num_sequences,
@@ -693,12 +694,12 @@ impl PackedTrainingBatch {
         }
 
         let n_i32 = n as i32;
-        Ok(Array::from_slice(&mask, &[n_i32, n_i32]))
+        Ok(Array::from_f32_slice(&mask, &[n_i32, n_i32]))
     }
 
     /// Get cu_seqlens as a Vec for CPU iteration.
     fn cu_seqlens_vec(&self) -> Vec<i32> {
-        self.cu_seqlens.as_slice::<i32>().to_vec()
+        self.cu_seqlens_raw.clone()
     }
 
     /// Get token count (for throughput calculations).

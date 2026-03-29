@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 
 use crate::LoraError;
 use crate::lora::LoraProjection;
@@ -276,9 +276,9 @@ macro_rules! impl_trainable_model {
         impl $crate::TrainableModel for $type {
             fn forward(
                 &mut self,
-                input_ids: &mlx_rs::Array,
-                mask: Option<&mlx_rs::Array>,
-            ) -> Result<mlx_rs::Array, $crate::LoraError> {
+                input_ids: &Array,
+                mask: Option<&Array>,
+            ) -> Result<Array, $crate::LoraError> {
                 <$type>::forward(self, input_ids, mask)
             }
 
@@ -288,13 +288,13 @@ macro_rules! impl_trainable_model {
 
             fn lora_parameters(
                 &self,
-            ) -> std::collections::HashMap<std::rc::Rc<str>, mlx_rs::Array> {
+            ) -> std::collections::HashMap<std::rc::Rc<str>, Array> {
                 <$type>::lora_parameters(self)
             }
 
             fn set_lora_parameters(
                 &mut self,
-                params: &std::collections::HashMap<std::rc::Rc<str>, mlx_rs::Array>,
+                params: &std::collections::HashMap<std::rc::Rc<str>, Array>,
             ) {
                 <$type>::set_lora_parameters(self, params)
             }
@@ -335,36 +335,36 @@ macro_rules! impl_trainable_model {
 
             fn forward_noised(
                 &mut self,
-                input_ids: &mlx_rs::Array,
-                mask: Option<&mlx_rs::Array>,
+                input_ids: &Array,
+                mask: Option<&Array>,
                 noise_alpha: f32,
-            ) -> Result<mlx_rs::Array, $crate::LoraError> {
+            ) -> Result<Array, $crate::LoraError> {
                 <$type>::forward_noised(self, input_ids, mask, noise_alpha)
             }
 
             fn forward_with_cache(
                 &mut self,
-                input_ids: &mlx_rs::Array,
-                mask: Option<&mlx_rs::Array>,
+                input_ids: &Array,
+                mask: Option<&Array>,
                 cache: Option<&mut pmetal_mlx::kv_cache::KVCache>,
-            ) -> Result<mlx_rs::Array, $crate::LoraError> {
+            ) -> Result<Array, $crate::LoraError> {
                 <$type>::forward_with_cache(self, input_ids, mask, cache)
             }
 
             fn forward_hidden(
                 &mut self,
-                input_ids: &mlx_rs::Array,
-                mask: Option<&mlx_rs::Array>,
-            ) -> Option<Result<mlx_rs::Array, $crate::LoraError>> {
+                input_ids: &Array,
+                mask: Option<&Array>,
+            ) -> Option<Result<Array, $crate::LoraError>> {
                 Some(<$type>::forward_hidden_states(self, input_ids, mask))
             }
 
             fn forward_hidden_with_positions(
                 &mut self,
-                input_ids: &mlx_rs::Array,
-                mask: Option<&mlx_rs::Array>,
-                position_ids: &mlx_rs::Array,
-            ) -> Option<Result<mlx_rs::Array, $crate::LoraError>> {
+                input_ids: &Array,
+                mask: Option<&Array>,
+                position_ids: &Array,
+            ) -> Option<Result<Array, $crate::LoraError>> {
                 Some(<$type>::forward_hidden_states_with_positions(
                     self,
                     input_ids,
@@ -373,7 +373,7 @@ macro_rules! impl_trainable_model {
                 ))
             }
 
-            fn lm_head_weight(&self) -> Option<mlx_rs::Array> {
+            fn lm_head_weight(&self) -> Option<Array> {
                 <$type>::get_lm_head_weight(self)
             }
         }

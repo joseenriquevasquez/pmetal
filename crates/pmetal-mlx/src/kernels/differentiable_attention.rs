@@ -20,7 +20,7 @@
 //! while using our efficient Metal kernels for attention.
 
 use half::f16;
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, Dtype};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -385,10 +385,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::random::uniform;
+    use pmetal_bridge::compat::random;
 
     fn random_tensor(shape: &[i32]) -> Array {
-        uniform::<_, f32>(0.0, 1.0, shape, None).unwrap()
+        random::uniform(shape, Dtype::Float32)
     }
 
     #[test]

@@ -29,8 +29,6 @@
 //! let result = loss.compute(&teacher_logits, &student_logits, 2.0)?;
 //! ```
 
-use std::ops::Neg;
-
 pub mod hidden_state;
 mod hinge_ranking;
 mod jensen_shannon;
@@ -50,7 +48,7 @@ pub use soft_cross_entropy::SoftCrossEntropyLoss;
 pub use tvd::TvdLoss;
 
 use crate::Result;
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, Dtype, ops};
 
 /// Default number of top-k teacher tokens to use when vocab sizes differ.
 ///
@@ -115,11 +113,11 @@ pub trait DistillLoss: Send + Sync {
         mask: &Array,
     ) -> Result<Array> {
         let loss = self.compute_weighted(teacher_logits, student_logits, temperature, None)?;
-        let masked = loss.multiply(mask)?;
-        let sum = masked.sum(false)?;
-        let count = mask.sum(false)?;
-        let safe_count = mlx_rs::ops::maximum(&count, &Array::from_f32(1.0))?;
-        Ok(sum.divide(&safe_count)?)
+        let masked = loss.multiply(mask);
+        let sum = masked.sum_all();
+        let count = mask.sum_all();
+        let safe_count = ops::maximum(&count, &Array::from_f32(1.0));
+        Ok(sum.divide(&safe_count))
     }
 
     /// Get the name of this loss function.
@@ -183,32 +181,32 @@ impl CombinedLoss {
         // Weighted combination
         // Note: soft loss is scaled by T^2 to maintain gradient magnitude
         let t_squared = self.temperature * self.temperature;
-        let soft_scaled = soft.multiply(&Array::from_f32(self.alpha * t_squared))?;
-        let hard_scaled = hard.multiply(&Array::from_f32(1.0 - self.alpha))?;
+        let soft_scaled = soft.multiply(&Array::from_f32(self.alpha * t_squared));
+        let hard_scaled = hard.multiply(&Array::from_f32(1.0 - self.alpha));
 
-        Ok(soft_scaled.add(&hard_scaled)?)
+        Ok(soft_scaled.add(&hard_scaled))
     }
 }
 
 /// Standard cross-entropy loss with logits and integer labels.
 fn cross_entropy_with_logits(logits: &Array, labels: &Array) -> Result<Array> {
     // Log-softmax for numerical stability
-    let log_probs = mlx_rs::nn::log_softmax(logits, -1)?;
+    let log_probs = logits.log_softmax(-1);
 
     // Gather the log probabilities at label positions
     // Shape: logits [batch, seq, vocab], labels [batch, seq]
     let vocab_size = logits.dim(2);
 
     // Flatten for gather operation
-    let log_probs_flat = log_probs.reshape(&[-1, vocab_size])?;
-    let labels_flat = labels.reshape(&[-1])?;
+    let log_probs_flat = log_probs.reshape(&[-1, vocab_size]);
+    let labels_flat = labels.reshape(&[-1]);
 
     // Get log prob at each label position using MLX take_along_axis
     let gathered = gather_at_indices(&log_probs_flat, &labels_flat)?;
 
     // Mean negative log probability
-    let neg_log_probs = gathered.neg();
-    let loss = neg_log_probs.mean(None)?;
+    let neg_log_probs = gathered.negative();
+    let loss = neg_log_probs.mean_all();
 
     Ok(loss)
 }
@@ -273,8 +271,6 @@ pub fn align_vocab_with_k(
 
     // argpartition requires kth < size; cap at teacher_vocab - 1 so we never
     // request kth == vocab_size (which would be out-of-range).
-    // If top_k >= teacher_vocab the early-exit above already handles the
-    // same-size case; here we just guard against edge cases.
     let k = top_k
         .max(1)
         .min((teacher_vocab as i32).saturating_sub(1).max(1));
@@ -289,51 +285,54 @@ pub fn align_vocab_with_k(
     // Argpartition descending: negate teacher logits then argpartition so the
     // first k indices correspond to the k largest teacher logit positions.
     // O(V) vs O(V log V) for argsort — significant win at vocab size ~150k.
-    let neg_teacher = teacher_logits.negative()?;
-    let partitioned_indices = mlx_rs::ops::argpartition_axis(&neg_teacher, k as i32, -1)?;
+    let neg_teacher = teacher_logits.negative();
+    let partitioned_indices = ops::argpartition_axis(&neg_teacher, k as i32, -1);
 
-    // Slice first k positions along the **last** axis.
+    // Slice first k positions along the last axis.
     //
-    // `Ellipsis` consumes all leading dimensions so this correctly handles
-    // tensors of any rank: [tokens, vocab], [batch, seq, vocab], etc.
-    // Using `(.., ..k)` instead would be wrong for rank > 2 — it would slice
-    // the second-to-last dimension rather than the last one.
-    use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
-    let top_k_indices = partitioned_indices.index((Ellipsis, ..k));
+    // Reshape to 2D [N, vocab], slice to [N, k], reshape back to leading_dims + [k].
+    // This is rank-agnostic and works correctly for tensors of any rank.
+    let shape = partitioned_indices.shape().to_vec();
+    let ndim = shape.len();
+    let vocab_dim = shape[ndim - 1] as usize;
+    let n: i32 = shape[..ndim - 1].iter().product();
+
+    let part_2d = partitioned_indices.reshape(&[n, vocab_dim as i32]);
+    let top_k_2d = part_2d.slice(&[0, 0], &[n, k]);
+    // Rebuild leading shape + [k]
+    let mut out_shape: Vec<i32> = shape[..ndim - 1].to_vec();
+    out_shape.push(k);
+    let top_k_indices = top_k_2d.reshape(&out_shape);
 
     // Gather teacher logits at the top-k token positions.
-    let teacher_aligned = teacher_logits.take_along_axis(&top_k_indices, -1)?;
+    let teacher_aligned = teacher_logits.take_along_axis(&top_k_indices, -1);
 
     // Clamp teacher indices to the student vocab range for gathering.
     // Out-of-range positions are masked below so clamping to 0 is safe here.
-    let student_vocab_minus1 = Array::from_int((student_vocab as i32) - 1);
-    let zero = Array::from_int(0);
-    let clamped = mlx_rs::ops::minimum(&top_k_indices, &student_vocab_minus1)?
-        .as_dtype(mlx_rs::Dtype::Int32)?;
-    let clamped = mlx_rs::ops::maximum(&clamped, &zero)?;
+    let student_vocab_minus1 = Array::from_i32((student_vocab as i32) - 1);
+    let zero = Array::from_i32(0);
+    let clamped = ops::minimum(&top_k_indices, &student_vocab_minus1)
+        .as_dtype(Dtype::Int32.as_i32());
+    let clamped = ops::maximum(&clamped, &zero);
 
     // Gather student logits at clamped positions.
-    let student_gathered = student_logits.take_along_axis(&clamped, -1)?;
+    let student_gathered = student_logits.take_along_axis(&clamped, -1);
 
     // Mask out positions where the teacher index fell outside the student vocab.
     // Those positions receive -1e9 so their softmax weight is negligible (~0).
-    let student_vocab_arr = Array::from_int(student_vocab as i32);
+    let student_vocab_arr = Array::from_i32(student_vocab as i32);
     let out_of_range = top_k_indices
-        .as_dtype(mlx_rs::Dtype::Int32)?
-        .ge(&student_vocab_arr)?;
+        .as_dtype(Dtype::Int32.as_i32())
+        .greater_equal(&student_vocab_arr);
     let neg_large = Array::from_f32(-1e9_f32);
-    let student_aligned = mlx_rs::ops::r#where(&out_of_range, &neg_large, &student_gathered)?;
+    let student_aligned = ops::where_fn(&out_of_range, &neg_large, &student_gathered);
 
     Ok((teacher_aligned, student_aligned, true))
 }
 
 /// Softmax along specified axis.
 pub fn softmax(x: &Array, axis: i32) -> Result<Array> {
-    let max_x = x.max_axes(&[axis], Some(true))?;
-    let shifted = x.subtract(&max_x)?;
-    let exp_shifted = shifted.exp()?;
-    let sum_exp = exp_shifted.sum_axes(&[axis], Some(true))?;
-    Ok(exp_shifted.divide(&sum_exp)?)
+    Ok(x.softmax(axis))
 }
 
 /// Gather values from a 2D array at specified column indices.
@@ -346,15 +345,15 @@ fn gather_at_indices(values: &Array, indices: &Array) -> Result<Array> {
 
     // Create row indices [0, 1, 2, ..., N-1] via GPU arange — stays in the
     // MLX compute graph and avoids a CPU Vec<i32> allocation.
-    let row_indices_arr = mlx_rs::ops::arange::<_, i32>(0, n as i32, 1)?;
+    let row_indices_arr = Array::arange(n, Dtype::Int32.as_i32());
 
     // Compute flat indices: row * V + col
-    let v_arr = Array::from_int(v);
-    let flat_indices = row_indices_arr.multiply(&v_arr)?.add(indices)?;
+    let v_arr = Array::from_i32(v);
+    let flat_indices = row_indices_arr.multiply(&v_arr).add(indices);
 
     // Flatten values and gather
-    let values_flat = values.reshape(&[-1])?;
-    let gathered = values_flat.take(&flat_indices)?;
+    let values_flat = values.reshape(&[-1]);
+    let gathered = values_flat.take_axis(&flat_indices, 0);
 
     Ok(gathered)
 }
@@ -367,9 +366,9 @@ mod tests {
     #[test]
     #[serial]
     fn test_softmax() {
-        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[1, 3]);
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[1, 3]);
         let probs = softmax(&logits, -1).unwrap();
-        let probs_data: Vec<f32> = probs.as_slice().to_vec();
+        let probs_data: Vec<f32> = probs.clone().to_f32_vec(3).unwrap();
 
         // Check probabilities sum to 1
         let sum: f32 = probs_data.iter().sum();
@@ -383,9 +382,9 @@ mod tests {
     #[test]
     #[serial]
     fn test_log_softmax() {
-        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[1, 3]);
-        let log_probs = mlx_rs::nn::log_softmax(&logits, -1).unwrap();
-        let log_probs_data: Vec<f32> = log_probs.as_slice().to_vec();
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[1, 3]);
+        let log_probs = logits.log_softmax(-1);
+        let log_probs_data: Vec<f32> = log_probs.clone().to_f32_vec(3).unwrap();
 
         // All log probs should be <= 0
         for lp in &log_probs_data {
@@ -393,8 +392,8 @@ mod tests {
         }
 
         // exp(log_softmax) should equal softmax
-        let probs = log_probs.exp().unwrap();
-        let probs_data: Vec<f32> = probs.as_slice().to_vec();
+        let probs = log_probs.exp();
+        let probs_data: Vec<f32> = probs.clone().to_f32_vec(3).unwrap();
         let sum: f32 = probs_data.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5);
     }
@@ -402,10 +401,10 @@ mod tests {
     #[test]
     #[serial]
     fn test_gather_at_indices() {
-        let values = Array::from_slice(&[0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
-        let indices = Array::from_slice(&[1_i32, 2], &[2]);
+        let values = Array::from_f32_slice(&[0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
+        let indices = Array::from_i32_slice(&[1_i32, 2]);
         let result = gather_at_indices(&values, &indices).unwrap();
-        let result_data: Vec<f32> = result.as_slice().to_vec();
+        let result_data: Vec<f32> = result.clone().to_f32_vec(2).unwrap();
 
         assert_eq!(result_data.len(), 2);
         assert!((result_data[0] - 0.2).abs() < 1e-5); // row 0, col 1
@@ -428,7 +427,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_align_vocab_same_size_passthrough() {
-        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let (t, s, mismatched) = align_vocab(&logits, &logits).unwrap();
         assert!(!mismatched, "same vocab should not be mismatched");
         // Shapes preserved
@@ -444,13 +443,13 @@ mod tests {
         // teacher: [1, 8], student: [1, 6]  (teacher larger)
         let teacher_data: Vec<f32> = (0..8).map(|i| i as f32).collect();
         let student_data: Vec<f32> = (0..6).map(|i| i as f32).collect();
-        let teacher = Array::from_slice(&teacher_data, &[1, 8]);
-        let student = Array::from_slice(&student_data, &[1, 6]);
+        let teacher = Array::from_f32_slice(&teacher_data, &[1, 8]);
+        let student = Array::from_f32_slice(&student_data, &[1, 6]);
 
         let k = 4_i32;
         let (ta, sa, mismatched) = align_vocab_with_k(&teacher, &student, k).unwrap();
-        ta.eval().unwrap();
-        sa.eval().unwrap();
+        ta.eval();
+        sa.eval();
 
         assert!(mismatched);
         assert_eq!(ta.dim(-1), k);
@@ -466,13 +465,13 @@ mod tests {
         // teacher: [1, 6], student: [1, 8]  (student larger)
         let teacher_data: Vec<f32> = (0..6).map(|i| i as f32).collect();
         let student_data: Vec<f32> = (0..8).map(|i| i as f32).collect();
-        let teacher = Array::from_slice(&teacher_data, &[1, 6]);
-        let student = Array::from_slice(&student_data, &[1, 8]);
+        let teacher = Array::from_f32_slice(&teacher_data, &[1, 6]);
+        let student = Array::from_f32_slice(&student_data, &[1, 8]);
 
         let k = 4_i32;
         let (ta, sa, mismatched) = align_vocab_with_k(&teacher, &student, k).unwrap();
-        ta.eval().unwrap();
-        sa.eval().unwrap();
+        ta.eval();
+        sa.eval();
 
         assert!(mismatched);
         assert_eq!(ta.dim(-1), k);
@@ -497,12 +496,12 @@ mod tests {
         let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
             .map(|i| i as f32)
             .collect();
-        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
-        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+        let teacher = Array::from_f32_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_f32_slice(&student_data, &[batch, seq, student_vocab]);
 
         let (ta, sa, mismatched) = align_vocab_with_k(&teacher, &student, k).unwrap();
-        ta.eval().unwrap();
-        sa.eval().unwrap();
+        ta.eval();
+        sa.eval();
 
         assert!(mismatched);
         // Shape must be [batch, seq, k] — NOT [batch, k, teacher_vocab]
@@ -528,13 +527,13 @@ mod tests {
         // token 5 has highest logit (10.0), token 4 second (9.0), etc.
         let teacher_data = [1.0_f32, 2.0, 3.0, 4.0, 9.0, 10.0];
         let student_data = [0.1_f32, 0.2, 0.3, 0.4]; // only 4 tokens
-        let teacher = Array::from_slice(&teacher_data, &[1, 6]);
-        let student = Array::from_slice(&student_data, &[1, 4]);
+        let teacher = Array::from_f32_slice(&teacher_data, &[1, 6]);
+        let student = Array::from_f32_slice(&student_data, &[1, 4]);
 
         let (ta, _sa, _) = align_vocab_with_k(&teacher, &student, 3).unwrap();
-        ta.eval().unwrap();
+        ta.eval();
 
-        let ta_vals: Vec<f32> = ta.as_slice().to_vec();
+        let ta_vals: Vec<f32> = ta.clone().to_f32_vec(3).unwrap();
         // All three selected values must be from {4.0, 9.0, 10.0}
         // i.e. all >= 4.0 (the 4th-highest)
         for v in &ta_vals {
@@ -552,13 +551,13 @@ mod tests {
         // so all 4 selected student positions must be masked.
         let teacher_data = [1.0_f32, 1.0, 1.0, 1.0, 5.0, 6.0, 7.0, 8.0]; // indices 4-7 top
         let student_data = [0.1_f32, 0.2, 0.3, 0.4];
-        let teacher = Array::from_slice(&teacher_data, &[1, 8]);
-        let student = Array::from_slice(&student_data, &[1, 4]);
+        let teacher = Array::from_f32_slice(&teacher_data, &[1, 8]);
+        let student = Array::from_f32_slice(&student_data, &[1, 4]);
 
         let (_ta, sa, _) = align_vocab_with_k(&teacher, &student, 4).unwrap();
-        sa.eval().unwrap();
+        sa.eval();
 
-        let sa_vals: Vec<f32> = sa.as_slice().to_vec();
+        let sa_vals: Vec<f32> = sa.clone().to_f32_vec(4).unwrap();
         // Every entry must be ≤ -1e8 (masked)
         for v in &sa_vals {
             assert!(*v <= -1e8, "expected masked value (-1e9), got {}", v);
@@ -585,23 +584,23 @@ mod tests {
         let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
             .map(|i| (i % 50) as f32 - 25.0)
             .collect();
-        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
-        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+        let teacher = Array::from_f32_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_f32_slice(&student_data, &[batch, seq, student_vocab]);
 
         let (ta, sa, mismatched) = align_vocab_with_k(&teacher, &student, k).unwrap();
-        ta.eval().unwrap();
-        sa.eval().unwrap();
+        ta.eval();
+        sa.eval();
 
         assert!(mismatched);
         assert_eq!(ta.shape(), &[batch, seq, k]);
         assert_eq!(sa.shape(), &[batch, seq, k]);
 
         // All teacher-aligned values must be finite
-        let ta_vals: Vec<f32> = ta.as_slice().to_vec();
+        let ta_vals: Vec<f32> = ta.clone().to_f32_vec(64).unwrap();
         assert!(ta_vals.iter().all(|v| v.is_finite()));
 
         // student-aligned: indices < student_vocab so no masking expected
-        let sa_vals: Vec<f32> = sa.as_slice().to_vec();
+        let sa_vals: Vec<f32> = sa.clone().to_f32_vec(64).unwrap();
         assert!(sa_vals.iter().all(|v| v.is_finite()));
     }
 }

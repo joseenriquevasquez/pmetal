@@ -32,15 +32,15 @@
 //!     &lora_a,
 //!     &lora_b,
 //!     &config,
-//! )?;
+//! );
 //! ```
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, Dtype, ops, random};
 
-use crate::error::MlxError;
 
 /// Result type for fused norm+LoRA operations.
-pub type Result<T> = std::result::Result<T, MlxError>;
+use pmetal_bridge::compat::Exception;
+pub type Result<T> = std::result::Result<T, Exception>;
 
 /// Configuration for fused RMSNorm + LoRA.
 #[derive(Debug, Clone)]
@@ -126,18 +126,18 @@ impl FusedNormLoraMlx {
         lora_b: &Array,
     ) -> Result<FusedNormLoraOutput> {
         // RMSNorm: x / sqrt(mean(x^2) + eps) * gamma
-        let normalized = rms_norm(x, gamma, self.config.eps)?;
+        let normalized = rms_norm(x, gamma, self.config.eps);
 
         // Base projection: norm(x) @ W.T
-        let base = normalized.matmul(&weight.t())?;
+        let base = normalized.matmul(&weight.t());
 
         // LoRA projection: scale * (norm(x) @ A.T) @ B.T
-        let lora_out = normalized.matmul(&lora_a.t())?.matmul(&lora_b.t())?;
+        let lora_out = normalized.matmul(&lora_a.t()).matmul(&lora_b.t());
         let scale_arr = Array::from_f32(self.config.lora_scale);
-        let scaled_lora = lora_out.multiply(&scale_arr)?;
+        let scaled_lora = lora_out.multiply(&scale_arr);
 
         // Combine
-        let output = base.add(&scaled_lora)?;
+        let output = base.add(&scaled_lora);
 
         Ok(FusedNormLoraOutput {
             output,
@@ -154,14 +154,14 @@ impl FusedNormLoraMlx {
         lora_a: &Array,
         lora_b: &Array,
     ) -> Result<FusedNormLoraOutput> {
-        let normalized = rms_norm(x, gamma, self.config.eps)?;
-        let base = normalized.matmul(&weight.t())?;
+        let normalized = rms_norm(x, gamma, self.config.eps);
+        let base = normalized.matmul(&weight.t());
 
-        let lora_out = normalized.matmul(&lora_a.t())?.matmul(&lora_b.t())?;
+        let lora_out = normalized.matmul(&lora_a.t()).matmul(&lora_b.t());
         let scale_arr = Array::from_f32(self.config.lora_scale);
-        let scaled_lora = lora_out.multiply(&scale_arr)?;
+        let scaled_lora = lora_out.multiply(&scale_arr);
 
-        let output = base.add(&scaled_lora)?;
+        let output = base.add(&scaled_lora);
 
         Ok(FusedNormLoraOutput {
             output,
@@ -178,8 +178,8 @@ impl FusedNormLoraMlx {
         gamma: &Array,
         weight: &Array,
     ) -> Result<FusedNormLoraOutput> {
-        let normalized = rms_norm(x, gamma, self.config.eps)?;
-        let output = normalized.matmul(&weight.t())?;
+        let normalized = rms_norm(x, gamma, self.config.eps);
+        let output = normalized.matmul(&weight.t());
 
         Ok(FusedNormLoraOutput {
             output,
@@ -193,22 +193,22 @@ impl FusedNormLoraMlx {
 // =============================================================================
 
 /// Compute RMSNorm: x / sqrt(mean(x^2) + eps) * gamma.
-fn rms_norm(x: &Array, gamma: &Array, eps: f32) -> Result<Array> {
+fn rms_norm(x: &Array, gamma: &Array, eps: f32) -> Array {
     // Compute x^2
-    let x_squared = x.square()?;
+    let x_squared = x.square();
 
     // Mean over last dimension, keeping dims for broadcasting
-    let mean_squared = x_squared.mean_axes(&[-1], true)?;
+    let mean_squared = x_squared.mean_axes(&[-1], true);
 
     // sqrt(mean + eps)
     let eps_arr = Array::from_f32(eps);
-    let rms = mean_squared.add(&eps_arr)?.sqrt()?;
+    let rms = mean_squared.add(&eps_arr).sqrt();
 
     // x / rms
-    let normalized = x.divide(&rms)?;
+    let normalized = x.divide(&rms);
 
     // Scale by gamma
-    Ok(normalized.multiply(gamma)?)
+    normalized.multiply(gamma)
 }
 
 // =============================================================================
@@ -240,32 +240,32 @@ pub fn fused_norm_lora_forward(
     config: &FusedNormLoraConfig,
 ) -> Result<Array> {
     // RMSNorm
-    let normalized = rms_norm(x, gamma, config.eps)?;
+    let normalized = rms_norm(x, gamma, config.eps);
 
     // Base projection
-    let base = normalized.matmul(&weight.t())?;
+    let base = normalized.matmul(&weight.t());
 
     // LoRA projection
-    let lora_out = normalized.matmul(&lora_a.t())?.matmul(&lora_b.t())?;
+    let lora_out = normalized.matmul(&lora_a.t()).matmul(&lora_b.t());
     let scale_arr = Array::from_f32(config.lora_scale);
-    let scaled_lora = lora_out.multiply(&scale_arr)?;
+    let scaled_lora = lora_out.multiply(&scale_arr);
 
     // Combine
-    Ok(base.add(&scaled_lora)?)
+    Ok(base.add(&scaled_lora))
 }
 
 /// Fused RMSNorm + projection without LoRA.
 ///
 /// Useful for inference with merged weights or non-LoRA layers.
 pub fn fused_norm_forward(x: &Array, gamma: &Array, weight: &Array, eps: f32) -> Result<Array> {
-    let normalized = rms_norm(x, gamma, eps)?;
-    Ok(normalized.matmul(&weight.t())?)
+    let normalized = rms_norm(x, gamma, eps);
+    Ok(normalized.matmul(&weight.t()))
 }
 
 /// Apply RMSNorm to input (functional version).
 ///
 /// Computes: `x / sqrt(mean(x^2) + eps) * gamma`
-pub fn apply_rms_norm(x: &Array, gamma: &Array, eps: f32) -> Result<Array> {
+pub fn apply_rms_norm(x: &Array, gamma: &Array, eps: f32) -> Array {
     rms_norm(x, gamma, eps)
 }
 
@@ -286,24 +286,30 @@ mod tests {
         assert!((config.lora_scale - 2.0).abs() < 1e-6); // 16 / 8 = 2
     }
 
+    fn to_f32_vec(arr: &Array) -> Vec<f32> {
+        let mut a = arr.clone();
+        a.eval();
+        let n = a.size();
+        a.to_f32_vec(n).unwrap_or_default()
+    }
+
     #[test]
     fn test_rms_norm() {
         let batch = 2;
         let seq_len = 4;
         let hidden_size = 64;
 
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden_size], None, None, None)
-            .unwrap();
-        let gamma = mlx_rs::ops::ones::<f32>(&[hidden_size]).unwrap();
+        let x = random::normal(&[batch as i32, seq_len as i32, hidden_size as i32], Dtype::Float32);
+        let gamma = ops::ones(&[hidden_size], Dtype::Float32);
 
         let normalized = apply_rms_norm(&x, &gamma, 1e-6).unwrap();
         assert_eq!(normalized.shape(), x.shape());
 
         // Check normalization: mean(x^2) should be close to 1
-        let normalized_squared = normalized.square().unwrap();
-        let mean = normalized_squared.mean(None).unwrap();
-        mean.eval().unwrap();
-        let mean_val: f32 = mean.item();
+        let normalized_squared = normalized.square();
+        let mean = normalized_squared.mean_all();
+        mean.eval();
+        let mean_val: f32 = mean.item_f32();
         assert!(
             (mean_val - 1.0).abs() < 0.1,
             "Mean squared should be ~1.0, got {}",
@@ -318,11 +324,10 @@ mod tests {
         let hidden_size = 64;
         let out_features = 128;
 
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden_size], None, None, None)
-            .unwrap();
-        let gamma = mlx_rs::ops::ones::<f32>(&[hidden_size]).unwrap();
+        let x = random::normal(&[batch as i32, seq_len as i32, hidden_size as i32], Dtype::Float32);
+        let gamma = ops::ones(&[hidden_size], Dtype::Float32);
         let weight =
-            mlx_rs::random::normal::<f32>(&[out_features, hidden_size], None, None, None).unwrap();
+            random::normal(&[out_features, hidden_size], Dtype::Float32);
 
         let output = fused_norm_forward(&x, &gamma, &weight, 1e-6).unwrap();
         assert_eq!(output.shape(), &[batch, seq_len, out_features]);
@@ -336,15 +341,14 @@ mod tests {
         let out_features = 128;
         let lora_rank = 8;
 
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden_size], None, None, None)
-            .unwrap();
-        let gamma = mlx_rs::ops::ones::<f32>(&[hidden_size]).unwrap();
+        let x = random::normal(&[batch as i32, seq_len as i32, hidden_size as i32], Dtype::Float32);
+        let gamma = ops::ones(&[hidden_size], Dtype::Float32);
         let weight =
-            mlx_rs::random::normal::<f32>(&[out_features, hidden_size], None, None, None).unwrap();
+            random::normal(&[out_features, hidden_size], Dtype::Float32);
         let lora_a =
-            mlx_rs::random::normal::<f32>(&[lora_rank, hidden_size], None, None, None).unwrap();
+            random::normal(&[lora_rank, hidden_size], Dtype::Float32);
         let lora_b =
-            mlx_rs::random::normal::<f32>(&[out_features, lora_rank], None, None, None).unwrap();
+            random::normal(&[out_features, lora_rank], Dtype::Float32);
 
         let config = FusedNormLoraConfig::new(
             hidden_size as usize,
@@ -374,15 +378,14 @@ mod tests {
         );
         let layer = FusedNormLoraMlx::new(config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden_size], None, None, None)
-            .unwrap();
-        let gamma = mlx_rs::ops::ones::<f32>(&[hidden_size]).unwrap();
+        let x = random::normal(&[batch as i32, seq_len as i32, hidden_size as i32], Dtype::Float32);
+        let gamma = ops::ones(&[hidden_size], Dtype::Float32);
         let weight =
-            mlx_rs::random::normal::<f32>(&[out_features, hidden_size], None, None, None).unwrap();
+            random::normal(&[out_features, hidden_size], Dtype::Float32);
         let lora_a =
-            mlx_rs::random::normal::<f32>(&[lora_rank, hidden_size], None, None, None).unwrap();
+            random::normal(&[lora_rank, hidden_size], Dtype::Float32);
         let lora_b =
-            mlx_rs::random::normal::<f32>(&[out_features, lora_rank], None, None, None).unwrap();
+            random::normal(&[out_features, lora_rank], Dtype::Float32);
 
         let result = layer
             .forward(&x, &gamma, &weight, &lora_a, &lora_b)
@@ -401,15 +404,14 @@ mod tests {
         let eps = 1e-6f32;
 
         // Create test data
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden_size], None, None, None)
-            .unwrap();
-        let gamma = mlx_rs::ops::ones::<f32>(&[hidden_size]).unwrap();
+        let x = random::normal(&[batch as i32, seq_len as i32, hidden_size as i32], Dtype::Float32);
+        let gamma = ops::ones(&[hidden_size], Dtype::Float32);
         let weight =
-            mlx_rs::random::normal::<f32>(&[out_features, hidden_size], None, None, None).unwrap();
+            random::normal(&[out_features, hidden_size], Dtype::Float32);
         let lora_a =
-            mlx_rs::random::normal::<f32>(&[lora_rank, hidden_size], None, None, None).unwrap();
+            random::normal(&[lora_rank, hidden_size], Dtype::Float32);
         let lora_b =
-            mlx_rs::random::normal::<f32>(&[out_features, lora_rank], None, None, None).unwrap();
+            random::normal(&[out_features, lora_rank], Dtype::Float32);
 
         // Fused version
         let config = FusedNormLoraConfig::new(
@@ -421,26 +423,24 @@ mod tests {
         .with_eps(eps);
 
         let fused_output =
-            fused_norm_lora_forward(&x, &gamma, &weight, &lora_a, &lora_b, &config).unwrap();
+            fused_norm_lora_forward(&x, &gamma, &weight, &lora_a, &lora_b, &config).unwrap_or_else(|e| panic!("{e}"));
 
         // Separate operations version
-        let normalized = apply_rms_norm(&x, &gamma, eps).unwrap();
-        let base = normalized.matmul(&weight.t()).unwrap();
+        let normalized = apply_rms_norm(&x, &gamma, eps);
+        let base = normalized.matmul(&weight.t());
         let lora_out = normalized
             .matmul(&lora_a.t())
-            .unwrap()
-            .matmul(&lora_b.t())
-            .unwrap();
+            .matmul(&lora_b.t());
         let scale = lora_alpha / lora_rank as f32;
-        let scaled_lora = lora_out.multiply(&Array::from_f32(scale)).unwrap();
-        let separate_output = base.add(&scaled_lora).unwrap();
+        let scaled_lora = lora_out.multiply(&Array::from_f32(scale));
+        let separate_output = base.add(&scaled_lora);
 
         // Compare outputs
-        fused_output.eval().unwrap();
-        separate_output.eval().unwrap();
+        fused_output.eval();
+        separate_output.eval();
 
-        let fused_data: Vec<f32> = fused_output.as_slice().to_vec();
-        let separate_data: Vec<f32> = separate_output.as_slice().to_vec();
+        let fused_data = to_f32_vec(&fused_output);
+        let separate_data = to_f32_vec(&separate_output);
 
         assert_eq!(fused_data.len(), separate_data.len());
 

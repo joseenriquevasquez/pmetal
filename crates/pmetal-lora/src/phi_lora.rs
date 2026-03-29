@@ -9,22 +9,17 @@
 //! # Performance Optimizations (SOTA)
 //!
 //! This implementation uses several state-of-the-art optimizations:
-//! - **Fast RMS Norm**: Uses `mlx_rs::fast::rms_norm()` for fused kernel execution
+//! - **Fast RMS Norm**: Uses `pmetal_bridge::compat::fast::rms_norm()` for fused kernel execution
 //! - **Compiled activations**: Uses optimized `nn::silu()` for SwiGLU
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    fast,
-    module::{Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param},
-    nested::NestedValue,
-    nn::{self, RopeBuilder},
-    ops::indexing::IndexOp,
+use pmetal_bridge::compat::{
+    Array, Exception, nn, Param,
+    ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
 };
+use pmetal_bridge::compat as fast;
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
@@ -41,7 +36,7 @@ use crate::{LoraError, LoraLinear};
 
 /// LoRA-enabled Phi RMS LayerNorm.
 ///
-/// Uses `mlx_rs::fast::rms_norm()` for optimized fused kernel execution.
+/// Uses `pmetal_bridge::compat::fast::rms_norm()` for optimized fused kernel execution.
 #[derive(Debug)]
 pub struct PhiLoraRmsNorm {
     /// Weight parameter.
@@ -60,7 +55,7 @@ impl PhiLoraRmsNorm {
     /// Forward pass using optimized fast::rms_norm.
     pub fn forward(&self, x: &Array) -> Result<Array, Exception> {
         // Use the optimized fused RMS norm kernel
-        fast::rms_norm(x, &*self.weight, self.eps)
+        Ok(fast::rms_norm(x, &*self.weight, self.eps))
     }
 }
 
@@ -180,8 +175,8 @@ impl PhiLoraAttention {
         let k_rope = Module::forward(&mut self.rope, &k_rope)?;
 
         // Concatenate RoPE and pass-through parts
-        let q = mlx_rs::ops::concatenate_axis(&[&q_rope, &q_pass], -1)?;
-        let k = mlx_rs::ops::concatenate_axis(&[&k_rope, &k_pass], -1)?;
+        let q = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1)?;
+        let k = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1)?;
 
         // Transpose for attention: [batch, n_heads, seq, head_dim]
         let q = q.transpose_axes(&[0, 2, 1, 3])?;
@@ -203,16 +198,16 @@ impl PhiLoraAttention {
         };
 
         // Scaled dot-product attention
-        let scores = q.matmul(&k.transpose_axes(&[0, 1, 3, 2])?)?;
+        let scores = q.matmul(&k.transpose_axes(&[0, 1, 3, 2]))?;
         let scores = scores.multiply(Array::from_f32(self.scale))?;
 
         let scores = if let Some(m) = mask {
-            scores.add(m)?
+            scores.add(m)
         } else {
             scores
         };
 
-        let weights = mlx_rs::ops::softmax_axis(&scores, -1, None)?;
+        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1, None)?;
         let output = weights.matmul(&v)?;
 
         // Transpose back and project
@@ -263,12 +258,12 @@ impl PhiLoraAttention {
             // Apply partial RoPE to query
             let (q_rope, q_pass) = self.split_rotary_transposed(&queries)?;
             let q_rope = apply_rope(&q_rope, self.rope_dim, false, self.rope.base, 1.0, offset)?;
-            let queries = mlx_rs::ops::concatenate_axis(&[&q_rope, &q_pass], -1)?;
+            let queries = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1)?;
 
             // Apply partial RoPE to key
             let (k_rope, k_pass) = self.split_rotary_transposed(&keys)?;
             let k_rope = apply_rope(&k_rope, self.rope_dim, false, self.rope.base, 1.0, offset)?;
-            let keys = mlx_rs::ops::concatenate_axis(&[&k_rope, &k_pass], -1)?;
+            let keys = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1)?;
 
             (queries, keys, values)
         } else {
@@ -279,8 +274,8 @@ impl PhiLoraAttention {
             let q_rope = Module::forward(&mut self.rope, &q_rope)?;
             let k_rope = Module::forward(&mut self.rope, &k_rope)?;
 
-            let queries = mlx_rs::ops::concatenate_axis(&[&q_rope, &q_pass], -1)?;
-            let keys = mlx_rs::ops::concatenate_axis(&[&k_rope, &k_pass], -1)?;
+            let queries = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1)?;
+            let keys = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1)?;
 
             (queries, keys, values)
         };
@@ -343,7 +338,7 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
     let head_dim = shape[3];
 
     let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
-    let x = mlx_rs::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
+    let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
     x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])
 }
 
@@ -415,7 +410,7 @@ impl PhiLoraMLP {
                 let up = hidden.index((.., .., self.intermediate_size..));
                 // SwiGLU: silu(gate) * up - use compiled silu kernel
                 let gate_activated = nn::silu(&gate)?;
-                gate_activated.multiply(&up)?
+                gate_activated.multiply(&up)
             }
             PhiActivation::GeluApprox | PhiActivation::GeluExact => nn::gelu(&hidden)?,
         };
@@ -469,7 +464,7 @@ impl PhiLoraDecoderLayer {
         let residual = hidden.clone();
         let hidden = self.post_attention_layernorm.forward(&hidden)?;
         let hidden = self.mlp.forward(&hidden)?;
-        Ok(residual.add(&hidden)?)
+        Ok(residual.add(&hidden))
     }
 
     /// Forward pass with KV cache for efficient inference.
@@ -492,7 +487,7 @@ impl PhiLoraDecoderLayer {
         // Pre-norm + MLP + residual
         let normed = self.post_attention_layernorm.forward(&h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out)?)
+        Ok(h.add(&mlp_out))
     }
 
     /// Get number of trainable parameters.
@@ -1192,10 +1187,10 @@ impl ModuleParameters for PhiLoraForCausalLM {
 crate::impl_trainable_model!(PhiLoraForCausalLM);
 
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;
+    let mask = pmetal_bridge::compat::ops::tri::<f32>(seq_len, None, None)?;
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
-    mlx_rs::ops::r#where(&mask.eq(&zero)?, &neg_inf, &zero)
+    pmetal_bridge::compat::ops::where_fn(&mask.eq(&zero), &neg_inf, &zero)
 }
 
 #[cfg(test)]
@@ -1250,7 +1245,7 @@ mod tests {
         let lora_config = small_lora_config();
         let mut attn = PhiLoraAttention::new(&config, &lora_config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1262,7 +1257,7 @@ mod tests {
         let lora_config = small_lora_config();
         let mut model = PhiLoraForCausalLM::new(config.clone(), lora_config).unwrap();
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, config.vocab_size]);
@@ -1301,7 +1296,7 @@ mod tests {
         assert_eq!(cache.rope_offset(), 0);
 
         // Test forward pass with cache
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
         let logits = model
             .forward_with_cache(&input_ids, None, Some(&mut cache))
             .unwrap();
@@ -1310,7 +1305,7 @@ mod tests {
         assert_eq!(cache.rope_offset(), 4);
 
         // Test incremental generation
-        let next_token = mlx_rs::Array::from_slice(&[5_i32], &[1, 1]);
+        let next_token = Array::from_i32_slice(&[5_i32]).reshape(&[1, 1]);
         let next_logits = model
             .forward_with_cache(&next_token, None, Some(&mut cache))
             .unwrap();

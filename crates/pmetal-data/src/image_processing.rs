@@ -4,7 +4,7 @@
 //! Uses CLIP-style normalization and supports batch processing.
 
 use image::{DynamicImage, imageops::FilterType};
-use mlx_rs::{Array, error::Exception};
+use pmetal_bridge::compat::{Array, Exception};
 use std::path::Path;
 
 /// Configuration for Mllama image processing.
@@ -62,9 +62,9 @@ impl MllamaImageProcessor {
     /// Call this once before processing many images for better performance.
     pub fn init_gpu_arrays(&mut self) -> Result<(), Exception> {
         // Mean: [1, 3, 1, 1] for broadcasting over [N, C, H, W]
-        self.mean_array = Some(Array::from_slice(&self.config.mean, &[1, 3, 1, 1]));
+        self.mean_array = Some(Array::from_f32_slice(&self.config.mean, &[1, 3, 1, 1]));
         // Std: [1, 3, 1, 1]
-        self.std_array = Some(Array::from_slice(&self.config.std, &[1, 3, 1, 1]));
+        self.std_array = Some(Array::from_f32_slice(&self.config.std, &[1, 3, 1, 1]));
         Ok(())
     }
 
@@ -119,7 +119,7 @@ impl MllamaImageProcessor {
 
         // Create Array: [1, C, H, W]
         let shape = &[1, 3i32, height as i32, width as i32];
-        let array = Array::from_slice(&data, shape);
+        let array = Array::from_f32_slice(&data, shape);
 
         Ok(array)
     }
@@ -154,13 +154,13 @@ impl MllamaImageProcessor {
 
         // 3. Create array and do normalization on GPU
         let shape = &[1, 3i32, height as i32, width as i32];
-        let arr = Array::from_slice(&data, shape);
+        let arr = Array::from_f32_slice(&data, shape);
 
         // GPU operations: rescale then normalize
         let rescale = Array::from_f32(self.config.rescale_factor);
-        let scaled = arr.multiply(&rescale)?;
-        let centered = scaled.subtract(mean)?;
-        let normalized = centered.divide(std)?;
+        let scaled = arr.multiply(&rescale);
+        let centered = scaled.subtract(mean);
+        let normalized = centered.divide(std);
 
         Ok(normalized)
     }
@@ -182,7 +182,7 @@ impl MllamaImageProcessor {
 
         // Stack along batch dimension
         let batch_refs: Vec<&Array> = batch_data.iter().collect();
-        mlx_rs::ops::concatenate_axis(&batch_refs, 0)
+        Ok(pmetal_bridge::compat::ops::concatenate_axis(&batch_refs, 0))
     }
 
     /// Process a batch from file paths.
@@ -274,14 +274,15 @@ mod tests {
         let img_buf = image::RgbImage::from_fn(4, 4, |_x, _y| image::Rgb([128u8, 64, 192]));
         let img = DynamicImage::ImageRgb8(img_buf);
 
-        let result = processor.process_image(img).unwrap();
-        result.eval().unwrap();
+        let mut result = processor.process_image(img).unwrap();
+        result.eval();
 
         // Check shape: [1, 3, 4, 4]
         assert_eq!(result.shape(), &[1, 3, 4, 4]);
 
         // Check normalization was applied (values should not be 0-255)
-        let vals: Vec<f32> = result.as_slice::<f32>().to_vec();
+        let n = result.shape().iter().product::<i32>() as usize;
+        let vals: Vec<f32> = result.to_f32_vec(n).unwrap();
 
         // With CLIP normalization, 128 in red channel becomes:
         // (128/255 - 0.48145466) / 0.26862954 ≈ 0.082

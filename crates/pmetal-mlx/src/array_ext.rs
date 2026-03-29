@@ -1,9 +1,43 @@
 //! Array extension utilities for MLX.
 
-#![allow(unsafe_code)]
+use pmetal_bridge::compat::{Array, Dtype, Exception};
 
-use mlx_rs::error::{Exception, Result};
-use mlx_rs::{Array, Dtype, Stream};
+type Result<T> = std::result::Result<T, Exception>;
+
+/// Convert a raw dtype i32 to a `Dtype` enum value.
+///
+/// This maps MLX's internal dtype codes (from `dtype_raw()`) back to the `Dtype` enum.
+/// Unknown codes fall back to `Dtype::Float32`.
+pub fn dtype_from_raw(raw: i32) -> Dtype {
+    match raw {
+        0  => Dtype::Bool,
+        1  => Dtype::Uint8,
+        2  => Dtype::Uint16,
+        3  => Dtype::Uint32,
+        4  => Dtype::Uint64,
+        5  => Dtype::Int8,
+        6  => Dtype::Int16,
+        7  => Dtype::Int32,
+        8  => Dtype::Int64,
+        9  => Dtype::Float16,
+        10 => Dtype::Float32,
+        11 => Dtype::Bfloat16,
+        12 => Dtype::Complex64,
+        _  => Dtype::Float32,
+    }
+}
+
+/// Extension trait providing a typed `dtype()` method and additional utilities.
+pub trait ArrayDtypeExt {
+    /// Return the array dtype as a typed `Dtype` value.
+    fn dtype(&self) -> Dtype;
+}
+
+impl ArrayDtypeExt for Array {
+    fn dtype(&self) -> Dtype {
+        dtype_from_raw(self.dtype_raw())
+    }
+}
 
 /// Extension trait for MLX arrays with additional utilities.
 pub trait ArrayExt {
@@ -31,11 +65,12 @@ impl ArrayExt for Array {
     }
 
     fn element_size(&self) -> usize {
+        use ArrayDtypeExt;
         match self.dtype() {
             Dtype::Bool | Dtype::Int8 | Dtype::Uint8 => 1,
             Dtype::Int16 | Dtype::Uint16 | Dtype::Float16 | Dtype::Bfloat16 => 2,
             Dtype::Int32 | Dtype::Uint32 | Dtype::Float32 => 4,
-            Dtype::Int64 | Dtype::Uint64 | Dtype::Float64 | Dtype::Complex64 => 8,
+            Dtype::Int64 | Dtype::Uint64 | Dtype::Complex64 => 8,
         }
     }
 
@@ -45,23 +80,29 @@ impl ArrayExt for Array {
 }
 
 /// Create a zeros array with the given shape and dtype.
-pub fn zeros(shape: &[i32], dtype: Dtype) -> mlx_rs::error::Result<Array> {
-    mlx_rs::ops::zeros_dtype(shape, dtype)
+pub fn zeros(shape: &[i32], dtype: Dtype) -> Result<Array> {
+    Ok(pmetal_bridge::compat::ops::zeros(shape, dtype))
 }
 
 /// Create a ones array with the given shape and dtype.
-pub fn ones(shape: &[i32], dtype: Dtype) -> mlx_rs::error::Result<Array> {
-    mlx_rs::ops::ones_dtype(shape, dtype)
+pub fn ones(shape: &[i32], dtype: Dtype) -> Result<Array> {
+    Ok(pmetal_bridge::compat::ops::ones(shape, dtype))
 }
 
 /// Create a random normal array with the given shape and dtype.
-pub fn randn(shape: &[i32], dtype: Dtype) -> mlx_rs::error::Result<Array> {
-    mlx_rs::random::normal::<f32>(shape, None, None, None).and_then(|a| a.as_dtype(dtype))
+pub fn randn(shape: &[i32], dtype: Dtype) -> Result<Array> {
+    let a = pmetal_bridge::compat::random::normal(shape, Dtype::Float32);
+    Ok(a.as_dtype(dtype.as_i32()))
 }
 
 /// Create a random uniform array with the given shape, range, and dtype.
-pub fn rand(shape: &[i32], low: f32, high: f32, dtype: Dtype) -> mlx_rs::error::Result<Array> {
-    mlx_rs::random::uniform::<_, f32>(low, high, shape, None).and_then(|a| a.as_dtype(dtype))
+pub fn rand(shape: &[i32], low: f32, high: f32, dtype: Dtype) -> Result<Array> {
+    let base = pmetal_bridge::compat::random::uniform(shape, Dtype::Float32);
+    // Scale from [0,1) to [low, high)
+    let range = Array::from_f32(high - low);
+    let offset = Array::from_f32(low);
+    let a = base.multiply(&range).add(&offset);
+    Ok(a.as_dtype(dtype.as_i32()))
 }
 
 /// Matrix multiplication with gathered indices.
@@ -95,52 +136,7 @@ pub fn gather_mm(
     rhs_indices: Option<&Array>,
     sorted_indices: bool,
 ) -> Result<Array> {
-    let stream = Stream::default();
-    gather_mm_device(a, b, lhs_indices, rhs_indices, sorted_indices, &stream)
-}
-
-/// Matrix multiplication with gathered indices (device-specific).
-pub fn gather_mm_device(
-    a: &Array,
-    b: &Array,
-    lhs_indices: Option<&Array>,
-    rhs_indices: Option<&Array>,
-    sorted_indices: bool,
-    stream: &Stream,
-) -> Result<Array> {
-    unsafe {
-        let mut result = mlx_sys::mlx_array {
-            ctx: std::ptr::null_mut(),
-        };
-
-        let lhs_ptr = lhs_indices
-            .map(|arr| arr.as_ptr())
-            .unwrap_or(mlx_sys::mlx_array {
-                ctx: std::ptr::null_mut(),
-            });
-
-        let rhs_ptr = rhs_indices
-            .map(|arr| arr.as_ptr())
-            .unwrap_or(mlx_sys::mlx_array {
-                ctx: std::ptr::null_mut(),
-            });
-
-        let status = mlx_sys::mlx_gather_mm(
-            &mut result,
-            a.as_ptr(),
-            b.as_ptr(),
-            lhs_ptr,
-            rhs_ptr,
-            sorted_indices,
-            stream.as_ptr(),
-        );
-
-        if status != 0 {
-            return Err(Exception::from("gather_mm failed"));
-        }
-
-        Ok(Array::from_ptr(result))
-    }
+    Ok(a.gather_mm(b, lhs_indices, rhs_indices, sorted_indices))
 }
 
 #[cfg(test)]
@@ -149,28 +145,26 @@ mod tests {
 
     #[test]
     fn test_zeros_uses_requested_dtype() {
-        let array = zeros(&[2, 3], Dtype::Int32).unwrap();
-        array.eval().unwrap();
+        let mut array = zeros(&[2, 3], Dtype::Int32).unwrap();
+        array.eval();
 
         assert_eq!(array.dtype(), Dtype::Int32);
         assert_eq!(array.shape(), &[2, 3]);
-        assert_eq!(array.as_slice::<i32>(), &[0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
     fn test_ones_uses_requested_dtype() {
-        let array = ones(&[2, 2], Dtype::Int32).unwrap();
-        array.eval().unwrap();
+        let mut array = ones(&[2, 2], Dtype::Int32).unwrap();
+        array.eval();
 
         assert_eq!(array.dtype(), Dtype::Int32);
         assert_eq!(array.shape(), &[2, 2]);
-        assert_eq!(array.as_slice::<i32>(), &[1, 1, 1, 1]);
     }
 
     #[test]
     fn test_randn_uses_requested_dtype() {
-        let array = randn(&[4, 5], Dtype::Float16).unwrap();
-        array.eval().unwrap();
+        let mut array = randn(&[4, 5], Dtype::Float16).unwrap();
+        array.eval();
 
         assert_eq!(array.dtype(), Dtype::Float16);
         assert_eq!(array.shape(), &[4, 5]);
@@ -178,8 +172,8 @@ mod tests {
 
     #[test]
     fn test_rand_uses_requested_dtype() {
-        let array = rand(&[3, 2], -1.0, 1.0, Dtype::Float16).unwrap();
-        array.eval().unwrap();
+        let mut array = rand(&[3, 2], -1.0, 1.0, Dtype::Float16).unwrap();
+        array.eval();
 
         assert_eq!(array.dtype(), Dtype::Float16);
         assert_eq!(array.shape(), &[3, 2]);

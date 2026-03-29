@@ -14,13 +14,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    module::{Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param},
-    nested::NestedValue,
-    nn,
+use pmetal_bridge::compat::{
+    Array, Exception, nn, Param,
+    ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
 };
 
 use pmetal_core::LoraConfig;
@@ -38,14 +34,14 @@ fn gelu_tanh(x: &Array) -> Result<Array, Exception> {
     let two = Array::from_f32(2.0);
     let sqrt_2_pi = Array::from_f32(sqrt_2_over_pi);
 
-    let x_cubed = x.multiply(x)?.multiply(x)?;
-    let inner = x.add(&x_cubed.multiply(&coef)?)?;
+    let x_cubed = x.multiply(x).multiply(x)?;
+    let inner = x.add(&x_cubed.multiply(&coef))?;
     let inner = inner.multiply(&sqrt_2_pi)?;
 
-    let exp_2x = inner.multiply(&two)?.exp()?;
-    let tanh_val = exp_2x.subtract(&one)?.divide(&exp_2x.add(&one)?)?;
+    let exp_2x = inner.multiply(&two).exp()?;
+    let tanh_val = exp_2x.subtract(&one).divide(&exp_2x.add(&one))?;
 
-    let gate = one.add(&tanh_val)?.multiply(&half)?;
+    let gate = one.add(&tanh_val).multiply(&half)?;
     x.multiply(&gate)
 }
 
@@ -61,7 +57,7 @@ pub struct GemmaQloraRmsNorm {
 impl GemmaQloraRmsNorm {
     /// Create a new GemmaRmsNorm layer.
     pub fn new(hidden_size: i32, eps: f32) -> Result<Self, Exception> {
-        let weight = mlx_rs::ops::zeros::<f32>(&[hidden_size])?;
+        let weight = pmetal_bridge::compat::ops::zeros(&[hidden_size], pmetal_bridge::compat::Dtype::Float32);
         Ok(Self {
             weight: Param::new(weight),
             eps,
@@ -73,7 +69,7 @@ impl GemmaQloraRmsNorm {
         let x_sq = x.multiply(x)?;
         let mean_sq = x_sq.mean_axis(-1, Some(true))?;
         let eps_arr = Array::from_f32(self.eps);
-        let rms = mean_sq.add(&eps_arr)?.sqrt()?;
+        let rms = mean_sq.add(&eps_arr).sqrt()?;
         let normed = x.divide(&rms)?;
 
         // Apply weight with +1 offset: output = normed * (1 + weight)
@@ -140,7 +136,7 @@ impl GemmaQLoraAttention {
             .base(config.rope_theta)
             .traditional(false)
             .build()
-            .unwrap();
+            ;
 
         Ok(Self {
             n_heads,
@@ -167,13 +163,13 @@ impl GemmaQLoraAttention {
         let values = self.v_proj.forward(x)?;
 
         let queries = queries
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
         let keys = keys
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
         let values = values
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Apply RoPE
@@ -195,24 +191,24 @@ impl GemmaQLoraAttention {
         };
 
         // Scaled dot-product attention
-        let mut scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2])?)?;
+        let mut scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]))?;
         scores = scores.multiply(Array::from_f32(self.scale))?;
 
         // Apply logit softcapping (Gemma2)
         if let Some(cap) = self.logit_softcapping {
             let cap_val = Array::from_f32(cap);
             scores = scores.divide(&cap_val)?;
-            scores = mlx_rs::ops::tanh(&scores)?;
+            scores = pmetal_bridge::compat::ops::tanh(&scores)?;
             scores = scores.multiply(&cap_val)?;
         }
 
         let scores = if let Some(m) = mask {
-            scores.add(m)?
+            scores.add(m)
         } else {
             scores
         };
 
-        let weights = mlx_rs::ops::softmax_axis(&scores, -1, None)?;
+        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1, None)?;
         let output = weights.matmul(&values)?;
 
         let output = output
@@ -253,7 +249,7 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
     let head_dim = shape[3];
 
     let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
-    let x = mlx_rs::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
+    let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
     x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])
 }
 
@@ -374,7 +370,7 @@ impl GemmaQloraDecoderLayer {
 
         let normed = self.post_attention_layernorm.forward(&h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out)?)
+        Ok(h.add(&mlp_out))
     }
 
     /// Get number of trainable parameters.
@@ -449,7 +445,7 @@ impl Gemma2QloraDecoderLayer {
         let mlp_out = self.mlp.forward(&normed)?;
         // Post-feedforward norm before residual (Gemma2 specific)
         let mlp_out = self.post_feedforward_layernorm.forward(&mlp_out)?;
-        Ok(h.add(&mlp_out)?)
+        Ok(h.add(&mlp_out))
     }
 
     /// Get number of trainable parameters.
@@ -1047,10 +1043,10 @@ impl GemmaQloraForCausalLM {
 }
 
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;
+    let mask = pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
-    mlx_rs::ops::r#where(&mask.eq(&zero)?, &neg_inf, &zero)
+    pmetal_bridge::compat::ops::where_fn(&mask.eq(&zero), &neg_inf, &zero)
 }
 
 /// Implement ModuleParameters for GemmaQloraForCausalLM.
@@ -1369,10 +1365,10 @@ mod tests {
     fn test_gemma_qlora_attention() {
         let config = small_config();
         let qlora_config = small_qlora_config();
-        let mut attn = GemmaQLoraAttention::new(&config, &qlora_config).unwrap();
+        let mut attn = GemmaQLoraAttention::new(&config, &qlora_config);
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
-        let output = attn.forward(&x, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let output = attn.forward(&x, None);
 
         assert_eq!(output.shape(), &[1, 4, 64]);
     }
@@ -1381,10 +1377,10 @@ mod tests {
     fn test_gemma_qlora_model_forward() {
         let config = small_config();
         let qlora_config = small_qlora_config();
-        let mut model = GemmaQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
+        let mut model = GemmaQloraForCausalLM::with_qlora_config(config, qlora_config);
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
-        let logits = model.forward(&input_ids, None).unwrap();
+        let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
+        let logits = model.forward(&input_ids, None);
 
         assert_eq!(logits.shape(), &[1, 4, 256]);
     }
@@ -1393,7 +1389,7 @@ mod tests {
     fn test_gemma_qlora_param_count() {
         let config = small_config();
         let qlora_config = small_qlora_config();
-        let model = GemmaQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
+        let model = GemmaQloraForCausalLM::with_qlora_config(config, qlora_config);
 
         assert!(model.num_trainable_params() > 0);
         let params = model.lora_parameters();
@@ -1404,7 +1400,7 @@ mod tests {
     fn test_gemma_qlora_memory_savings() {
         let config = small_config();
         let qlora_config = small_qlora_config();
-        let model = GemmaQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
+        let model = GemmaQloraForCausalLM::with_qlora_config(config, qlora_config);
 
         let savings = model.memory_savings();
         assert!(
@@ -1437,7 +1433,7 @@ mod tests {
     fn test_gemma2_qlora_model() {
         let config = small_gemma2_config();
         let qlora_config = small_qlora_config();
-        let mut model = GemmaQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
+        let mut model = GemmaQloraForCausalLM::with_qlora_config(config, qlora_config);
 
         // Verify Gemma2 layers were created
         match &model.model.layers {
@@ -1447,8 +1443,8 @@ mod tests {
             _ => panic!("Expected Gemma2 layers"),
         }
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
-        let logits = model.forward(&input_ids, None).unwrap();
+        let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
+        let logits = model.forward(&input_ids, None);
 
         assert_eq!(logits.shape(), &[1, 4, 256]);
     }
@@ -1457,12 +1453,12 @@ mod tests {
     fn test_gemma2_qlora_set_parameters() {
         let config = small_gemma2_config();
         let qlora_config = small_qlora_config();
-        let mut model = GemmaQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
+        let mut model = GemmaQloraForCausalLM::with_qlora_config(config, qlora_config);
 
         let params = model.lora_parameters();
         let mut new_params = params.clone();
         if let Some(key) = new_params.keys().next().cloned() {
-            let new_val = mlx_rs::ops::ones::<f32>(&[4, 64]).unwrap();
+            let new_val = pmetal_bridge::compat::ops::ones(&[4, 64], pmetal_bridge::compat::Dtype::Float32);
             new_params.insert(key.clone(), new_val);
         }
 

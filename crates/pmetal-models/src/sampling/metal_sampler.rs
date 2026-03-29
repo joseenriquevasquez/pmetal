@@ -15,22 +15,22 @@
 //! ```rust,ignore
 //! use pmetal_models::sampling::MetalSampler;
 //!
-//! let mut sampler = MetalSampler::new(vocab_size)?;
+//! let mut sampler = MetalSampler::new(vocab_size);
 //!
 //! // Dispatch sampling asynchronously
-//! sampler.sample_async(&logits_array, temperature, top_k, top_p, min_p)?;
+//! sampler.sample_async(&logits_array, temperature, top_k, top_p, min_p);
 //!
 //! // ... do other work while GPU computes ...
 //!
 //! // Get the result
-//! let token = sampler.get_token()?;
+//! let token = sampler.get_token();
 //! ```
 
 #![allow(unsafe_code)]
 
 use std::sync::Arc;
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, Dtype};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLCommandBuffer;
@@ -49,7 +49,7 @@ pub enum MetalSamplerError {
 
     /// Array has wrong dtype.
     #[error("Array must be float32, got {0:?}")]
-    WrongDtype(mlx_rs::Dtype),
+    WrongDtype(pmetal_bridge::compat::Dtype),
 
     /// Array is empty.
     #[error("Cannot sample from empty array")]
@@ -158,7 +158,7 @@ impl MetalSampler {
 
         // Create zero-copy buffer view
         // SAFETY: MLX uses unified memory, pointer is valid for GPU access
-        let buffer_view = unsafe { metal_buffer_from_ptr(&self.ctx, data_ptr, logits.size())? };
+        let buffer_view = unsafe { metal_buffer_from_ptr(&self.ctx, data_ptr, logits.size()) }?;
 
         // Dispatch kernel asynchronously
         let cmd = self
@@ -185,7 +185,7 @@ impl MetalSampler {
 
         // Create zero-copy buffer view
         // SAFETY: MLX uses unified memory, pointer is valid for GPU access
-        let buffer_view = unsafe { metal_buffer_from_ptr(&self.ctx, data_ptr, logits.size())? };
+        let buffer_view = unsafe { metal_buffer_from_ptr(&self.ctx, data_ptr, logits.size()) }?;
 
         // Dispatch kernel
         let cmd = self.fused.argmax_async(&buffer_view)?;
@@ -242,13 +242,12 @@ impl MetalSampler {
         }
 
         // Ensure array is evaluated before getting data pointer
-        logits
-            .eval()
-            .map_err(|_| MetalSamplerError::NonContiguous)?;
+        let mut logits_owned = logits.clone();
+        logits_owned.eval();
 
         // Check dtype - must be f32
         let dtype = logits.dtype();
-        if dtype != mlx_rs::Dtype::Float32 {
+        if dtype != pmetal_bridge::compat::Dtype::Float32 {
             return Err(MetalSamplerError::WrongDtype(dtype));
         }
         Ok(())

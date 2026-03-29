@@ -11,16 +11,9 @@
 //! Variants:
 //! - **Llama 4 Scout**: 109B total params (16 experts), 17B active, 10M context
 //! - **Llama 4 Maverick**: 402B total params (128 experts), 17B active, 1M context
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, fast, indexing, nn, ops, random};
+use pmetal_bridge::impl_module_params;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, Param},
-    nn,
-    ops::{self, indexing::IndexOp, softmax_axis},
-};
 use pmetal_mlx::kernels::rope::apply_rope as rope_apply;
 use serde::{Deserialize, Serialize};
 
@@ -267,15 +260,14 @@ impl ModelConfig for Llama4TextConfig {
 // =============================================================================
 
 /// A single expert (MLP).
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Llama4Expert {
-    #[param]
     pub gate_proj: nn::Linear,
-    #[param]
     pub up_proj: nn::Linear,
-    #[param]
     pub down_proj: nn::Linear,
 }
+impl_module_params!(Llama4Expert; gate_proj, up_proj, down_proj);
+
 
 impl Llama4Expert {
     pub fn new(hidden_size: i32, intermediate_size: i32) -> Result<Self, Exception> {
@@ -297,21 +289,22 @@ impl Llama4Expert {
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = Module::forward(&mut self.gate_proj, x)?;
-        let gate = nn::silu(gate)?;
+        let gate = nn::silu(&gate);
         let up = Module::forward(&mut self.up_proj, x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = gate.multiply(&up);
         Module::forward(&mut self.down_proj, &hidden)
     }
 }
 
 /// Router for selecting experts.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Llama4Router {
-    #[param]
     pub gate: nn::Linear,
     pub num_experts: i32,
     pub top_k: i32,
 }
+impl_module_params!(Llama4Router; gate);
+
 
 impl Llama4Router {
     pub fn new(hidden_size: i32, num_experts: i32, top_k: i32) -> Result<Self, Exception> {
@@ -336,21 +329,21 @@ impl Llama4Router {
         let router_logits = Module::forward(&mut self.gate, x)?;
 
         // Softmax over experts
-        let router_probs = softmax_axis(&router_logits, -1, None)?;
+        let router_probs = ops::softmax_axis(&router_logits, -1);
 
         // Top-k selection via argpartition — O(n) vs O(n log n) for argsort.
         // argpartition places the k largest elements at the last k positions.
         let neg_k = -(self.top_k as i32);
-        let part_indices = ops::argpartition_axis(&router_probs, neg_k, -1)?;
+        let part_indices = ops::argpartition_axis(&router_probs, neg_k, -1);
         // Slice the last top_k entries: [total_tokens, top_k]
-        let expert_indices = part_indices.index((.., neg_k..));
+        let expert_indices = ops::slice_axis_from(&part_indices, -1, neg_k);
 
         // Gather the corresponding probabilities for the selected experts.
-        let expert_weights = router_probs.take_along_axis(&expert_indices, -1)?;
+        let expert_weights = router_probs.take_along_axis(&expert_indices, -1);
 
         // Normalize weights so they sum to 1 across the top_k dimension.
-        let weight_sum = expert_weights.sum_axis(-1, true)?;
-        let expert_weights = expert_weights.divide(&weight_sum)?;
+        let weight_sum = expert_weights.sum_axis(-1, true);
+        let expert_weights = expert_weights.divide(&weight_sum);
 
         Ok((expert_indices, expert_weights, router_logits))
     }
@@ -365,12 +358,13 @@ impl Llama4Router {
 /// A lightweight scalar projection that assigns each token a routing weight.
 /// Top-k tokens (by weight) are selected to pass through the transformer block;
 /// the remaining tokens receive a residual identity pass-through.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Llama4ModRouter {
     /// Scalar linear projection: [hidden_size] -> [1].
-    #[param]
     pub gate: nn::Linear,
 }
+impl_module_params!(Llama4ModRouter; gate);
+
 
 impl Llama4ModRouter {
     pub fn new(hidden_size: i32) -> Result<Self, Exception> {
@@ -397,7 +391,7 @@ impl Llama4ModRouter {
         let router_logits = Module::forward(&mut self.gate, x)?;
 
         // Squeeze to [B, T] for selection
-        let weights = router_logits.reshape(&[batch, seq_len])?;
+        let weights = router_logits.reshape(&[batch, seq_len]);
 
         // k = floor(C * T), clamped to [1, T]
         let k = ((capacity * seq_len as f32).floor() as i32)
@@ -406,17 +400,17 @@ impl Llama4ModRouter {
 
         // argpartition(weights, -k, axis=-1) places the k largest at positions [-k..]
         // This is O(T) vs O(T log T) for argsort.
-        let part_indices = ops::argpartition_axis(&weights, -k, -1)?;
+        let part_indices = ops::argpartition_axis(&weights, -k, -1);
 
         // Slice the last k indices — these correspond to the top-k tokens.
-        let selected_indices = part_indices.index((.., -k..));
+        let selected_indices = ops::slice_axis_from(&part_indices, -1, -k);
         // selected_indices: [B, k]
 
         // Build a binary top-k mask [B, T] of zeros with 1s at selected positions.
         // We scatter ones into a zeros tensor using put_along_axis.
-        let zeros = ops::zeros::<f32>(&[batch, seq_len])?;
-        let ones = ops::ones::<f32>(&[batch, k])?;
-        let top_k_mask = zeros.put_along_axis(&selected_indices, &ones, 1)?;
+        let zeros = ops::zeros(&[batch, seq_len], Dtype::Float32);
+        let ones = ops::ones(&[batch, k], Dtype::Float32);
+        let top_k_mask = ops::put_along_axis(&zeros, &selected_indices, &ones, 1);
         // top_k_mask: [B, T] with 1.0 at selected token positions
 
         Ok((selected_indices, router_logits, top_k_mask))
@@ -424,17 +418,16 @@ impl Llama4ModRouter {
 }
 
 /// Mixture of Experts layer with shared expert.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Llama4MoE {
     pub config: Llama4TextConfig,
 
-    #[param]
     pub router: Llama4Router,
-    #[param]
     pub experts: Vec<Llama4Expert>,
-    #[param]
     pub shared_expert: Llama4Expert,
 }
+impl_module_params!(Llama4MoE; router, experts, shared_expert);
+
 
 impl Llama4MoE {
     pub fn new(config: &Llama4TextConfig) -> Result<Self, Exception> {
@@ -450,6 +443,7 @@ impl Llama4MoE {
 
         let shared_expert = Llama4Expert::new(config.hidden_size, config.intermediate_size)?;
 
+
         Ok(Self {
             config: config.clone(),
             router,
@@ -464,7 +458,7 @@ impl Llama4MoE {
 
         // Flatten to [total_tokens, hidden]
         let total_tokens = shape.iter().take(shape.len() - 1).product::<i32>();
-        let flat_x = x.reshape(&[total_tokens, hidden_size])?;
+        let flat_x = x.reshape(&[total_tokens, hidden_size]);
 
         // Route tokens.
         // expert_indices: [total_tokens, top_k]
@@ -477,13 +471,14 @@ impl Llama4MoE {
         // Eval routing tensors to CPU for index extraction.
         // The routing tensors are small relative to expert MLP compute, and
         // per-expert dispatch avoids running every expert over every token.
-        let expert_indices = expert_indices.as_type::<i32>()?;
-        expert_indices.eval()?;
-        expert_weights.eval()?;
+        let mut expert_indices = expert_indices.as_type::<i32>();
+        expert_indices.eval();
+        let mut expert_weights = expert_weights;
+        expert_weights.eval();
 
         let top_k = self.config.num_experts_per_tok as usize;
         let n_tokens = total_tokens as usize;
-        let expert_ids: Vec<i32> = expert_indices.as_slice().to_vec();
+        let expert_ids: Vec<i32> = expert_indices.as_slice::<u32>().iter().map(|&x| x as i32).collect();
         let routing_weights: Vec<f32> = expert_weights.as_slice().to_vec();
 
         let mut expert_assignments: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.experts.len()];
@@ -499,7 +494,7 @@ impl Llama4MoE {
         }
 
         let input_dtype = flat_x.dtype();
-        let mut combined_out = ops::zeros_dtype(&[total_tokens, hidden_size], input_dtype)?;
+        let mut combined_out = ops::zeros_dtype(&[total_tokens, hidden_size], input_dtype);
         for (expert_idx, assignments) in expert_assignments.iter().enumerate() {
             if assignments.is_empty() {
                 continue;
@@ -511,18 +506,18 @@ impl Llama4MoE {
             let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
             let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
 
-            let expert_input = flat_x.take_axis(&idx_array, 0)?;
+            let expert_input = flat_x.take_axis(&idx_array, 0);
             let expert_out = self.experts[expert_idx].forward(&expert_input)?;
-            let weighted_out = expert_out.multiply(&weight_array)?;
+            let weighted_out = expert_out.multiply(&weight_array);
 
-            let updates = weighted_out.reshape(&[token_indices.len() as i32, 1, hidden_size])?;
+            let updates = weighted_out.reshape(&[token_indices.len() as i32, 1, hidden_size]);
             combined_out =
-                mlx_rs::ops::indexing::scatter_add_single(&combined_out, &idx_array, &updates, 0)?;
+                pmetal_bridge::compat::indexing::scatter_add_single(&combined_out, &idx_array, &updates, 0);
         }
 
         // Add shared expert contribution and reshape to original shape
-        let output = shared_out.add(&combined_out)?;
-        output.reshape(&shape)
+        let output = shared_out.add(&combined_out);
+        Ok(output.reshape(&shape))
     }
 }
 
@@ -531,7 +526,7 @@ impl Llama4MoE {
 // =============================================================================
 
 /// Llama 4 attention with iRoPE (interleaved RoPE/NoPE) and QK norm.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Llama4Attention {
     pub layer_idx: usize,
     pub uses_rope: bool,
@@ -545,21 +540,17 @@ pub struct Llama4Attention {
     pub floor_scale: f32,
     pub attn_scale: f32,
 
-    #[param]
     pub q_proj: nn::Linear,
-    #[param]
     pub k_proj: nn::Linear,
-    #[param]
     pub v_proj: nn::Linear,
-    #[param]
     pub o_proj: nn::Linear,
 
     // QK normalization (optional)
-    #[param]
     pub q_norm: Option<nn::RmsNorm>,
-    #[param]
     pub k_norm: Option<nn::RmsNorm>,
 }
+impl_module_params!(Llama4Attention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
+
 
 impl Llama4Attention {
     pub fn new(config: &Llama4TextConfig, layer_idx: usize) -> Result<Self, Exception> {
@@ -636,9 +627,9 @@ impl Llama4Attention {
         let v = Module::forward(&mut self.v_proj, x)?;
 
         // Reshape for attention
-        q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?;
-        k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
+        q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
+        k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // QK normalization (applied before RoPE)
         if let (Some(qn), Some(kn)) = (&mut self.q_norm, &mut self.k_norm) {
@@ -662,9 +653,9 @@ impl Llama4Attention {
         // NoPE layers: no positional encoding applied
 
         // Transpose for attention: [B, n_heads, seq, head_dim]
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let mut k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let mut v = v.transpose_axes(&[0, 2, 1, 3])?;
+        let q = q.transpose_axes(&[0, 2, 1, 3]);
+        let mut k = k.transpose_axes(&[0, 2, 1, 3]);
+        let mut v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // GQA: repeat KV heads to match query heads
         let repeat = self.n_heads / self.n_kv_heads;
@@ -672,7 +663,7 @@ impl Llama4Attention {
             // [B, n_kv, T, D] -> [B, n_kv, 1, T, D] -> broadcast -> [B, n_heads, T, D]
             let k_shape = k.shape().to_vec();
             let v_shape = v.shape().to_vec();
-            k = k.reshape(&[k_shape[0], self.n_kv_heads, 1, k_shape[2], self.head_dim])?;
+            k = k.reshape(&[k_shape[0], self.n_kv_heads, 1, k_shape[2], self.head_dim]);
             k = ops::broadcast_to(
                 &k,
                 &[
@@ -682,9 +673,9 @@ impl Llama4Attention {
                     k_shape[2],
                     self.head_dim,
                 ],
-            )?;
-            k = k.reshape(&[k_shape[0], self.n_heads, k_shape[2], self.head_dim])?;
-            v = v.reshape(&[v_shape[0], self.n_kv_heads, 1, v_shape[2], self.head_dim])?;
+            );
+            k = k.reshape(&[k_shape[0], self.n_heads, k_shape[2], self.head_dim]);
+            v = v.reshape(&[v_shape[0], self.n_kv_heads, 1, v_shape[2], self.head_dim]);
             v = ops::broadcast_to(
                 &v,
                 &[
@@ -694,55 +685,55 @@ impl Llama4Attention {
                     v_shape[2],
                     self.head_dim,
                 ],
-            )?;
-            v = v.reshape(&[v_shape[0], self.n_heads, v_shape[2], self.head_dim])?;
+            );
+            v = v.reshape(&[v_shape[0], self.n_heads, v_shape[2], self.head_dim]);
         }
 
         // Temperature scaling for NoPE layers (long-context attention stabilization).
         // Formula: scale_i = log(floor((i + 1) / floor_scale) + 1) * attn_scale + 1
         // Applied to Q states before QK matmul, only when attn_temperature_tuning is enabled.
         let q = if !self.uses_rope && self.attn_temperature_tuning {
-            let ones = ops::ones::<f32>(&[seq_len])?;
-            let positions = ops::arange::<i32, f32>(0, seq_len, None)?;
-            let pos_plus_one = positions.add(&ones)?;
-            let floored = ops::floor(&pos_plus_one.divide(&Array::from_f32(self.floor_scale))?)?;
-            let log_vals = ops::log(&floored.add(&ones)?)?;
+            let ones = ops::ones(&[seq_len], Dtype::Float32);
+            let positions = ops::arange_from(0, seq_len).as_dtype(Dtype::Float32.as_i32());
+            let pos_plus_one = positions.add(&ones);
+            let floored = ops::floor(&pos_plus_one.divide(&Array::from_f32(self.floor_scale)));
+            let log_vals = ops::log(&floored.add(&ones));
             let scales = log_vals
-                .multiply(&Array::from_f32(self.attn_scale))?
-                .add(&ones)?;
+                .multiply(&Array::from_f32(self.attn_scale))
+                .add(&ones);
             // [T] -> [1, 1, T, 1] to broadcast over [B, H, T, D]
-            let scales = scales.reshape(&[1, 1, seq_len, 1])?;
-            q.multiply(&scales)?
+            let scales = scales.reshape(&[1, 1, seq_len, 1]);
+            q.multiply(&scales)
         } else {
             q
         };
 
         // Attention scores
-        let k_t = k.transpose_axes(&[0, 1, 3, 2])?;
-        let mut scores = q.matmul(&k_t)?;
-        scores = scores.multiply(&Array::from_f32(self.scale))?;
+        let k_t = k.transpose_axes(&[0, 1, 3, 2]);
+        let mut scores = q.matmul(&k_t);
+        scores = scores.multiply(&Array::from_f32(self.scale));
 
         // Apply mask
         if let Some(m) = mask {
-            scores = scores.add(m)?;
+            scores = scores.add(m);
         }
 
-        let probs = softmax_axis(&scores, -1, None)?;
-        let output = probs.matmul(&v)?;
+        let probs = ops::softmax_axis(&scores, -1);
+        let output = probs.matmul(&v);
 
         // Reshape and project
-        let output = output.transpose_axes(&[0, 2, 1, 3])?;
-        let output = output.reshape(&[batch, seq_len, -1])?;
+        let output = output.transpose_axes(&[0, 2, 1, 3]);
+        let output = output.reshape(&[batch, seq_len, -1]);
         Module::forward(&mut self.o_proj, &output)
     }
 
     /// Apply RoPE embeddings.
     ///
-    /// `x` arrives as `[B, T, n_heads, head_dim]`.  `rope_apply` (mlx_rs::fast::rope)
+    /// `x` arrives as `[B, T, n_heads, head_dim]`.  `rope_apply` (pmetal_bridge::compat::fast::rope)
     /// expects `[B, heads, T, head_dim]`, so we transpose before and after.
     fn apply_rope(&self, x: &Array, _position_ids: &Array) -> Result<Array, Exception> {
         // [B, T, H, D] -> [B, H, T, D]
-        let x_t = x.transpose_axes(&[0, 2, 1, 3])?;
+        let x_t = x.transpose_axes(&[0, 2, 1, 3]);
         let result = rope_apply(
             &x_t,
             self.head_dim,
@@ -752,7 +743,7 @@ impl Llama4Attention {
             0,
         )?;
         // [B, H, T, D] -> [B, T, H, D]
-        result.transpose_axes(&[0, 2, 1, 3])
+        Ok(result.transpose_axes(&[0, 2, 1, 3]))
     }
 }
 
@@ -761,25 +752,19 @@ impl Llama4Attention {
 // =============================================================================
 
 /// Llama 4 decoder layer (can be dense or MoE, optionally with MoD).
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Llama4DecoderLayer {
     pub layer_idx: usize,
     pub is_moe: bool,
     /// MoD capacity factor for this layer (None = MoD disabled).
     pub mod_capacity: Option<f32>,
 
-    #[param]
     pub self_attn: Llama4Attention,
-    #[param]
     pub mlp: Option<Llama4Expert>, // Dense MLP (if not MoE)
-    #[param]
     pub moe: Option<Llama4MoE>, // MoE layer (if MoE)
-    #[param]
     pub input_layernorm: nn::RmsNorm,
-    #[param]
     pub post_attention_layernorm: nn::RmsNorm,
     /// MoD router (present only when this layer uses Mixture-of-Depths).
-    #[param]
     pub mod_router: Option<Llama4ModRouter>,
 
     // Auxiliary loss from the most recent MoD forward pass (not a learned parameter).
@@ -787,6 +772,8 @@ pub struct Llama4DecoderLayer {
     // through the forward signature.
     pub last_mod_aux_loss: Option<Array>,
 }
+impl_module_params!(Llama4DecoderLayer; self_attn, mlp, moe, input_layernorm, post_attention_layernorm, mod_router);
+
 
 impl Llama4DecoderLayer {
     pub fn new(config: &Llama4TextConfig, layer_idx: usize) -> Result<Self, Exception> {
@@ -861,7 +848,7 @@ impl Llama4DecoderLayer {
         // Self attention with residual
         let normed = Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward(&normed, mask, position_ids)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         // FFN with residual (MoE or dense)
         let normed = Module::forward(&mut self.post_attention_layernorm, &h)?;
@@ -870,7 +857,7 @@ impl Llama4DecoderLayer {
         } else {
             self.mlp.as_mut().unwrap().forward(&normed)?
         };
-        h.add(&ffn_out)
+        Ok(h.add(&ffn_out))
     }
 
     /// MoD forward: route top-k tokens through the block, identity for the rest.
@@ -908,10 +895,10 @@ impl Llama4DecoderLayer {
 
         // ---- Gather selected tokens ----
         // Expand indices to [B, k, D] for take_along_axis on axis=1
-        let idx_reshaped = selected_indices.reshape(&[batch, k, 1])?;
-        let idx_expanded = ops::broadcast_to(&idx_reshaped, &[batch, k, hidden])?;
+        let idx_reshaped = selected_indices.reshape(&[batch, k, 1]);
+        let idx_expanded = ops::broadcast_to(&idx_reshaped, &[batch, k, hidden]);
         // gathered: [B, k, D]
-        let gathered = x.take_along_axis(&idx_expanded, 1)?;
+        let gathered = x.take_along_axis(&idx_expanded, 1);
 
         // ---- Run transformer block on gathered sub-batch ----
         // Note: we pass `None` for mask here — the gathered tokens form a
@@ -922,7 +909,7 @@ impl Llama4DecoderLayer {
         // how iRoPE NoPE layers work in this model.
         let normed = Module::forward(&mut self.input_layernorm, &gathered)?;
         let attn_out = self.self_attn.forward(&normed, None, None)?;
-        let h_sel = gathered.add(&attn_out)?;
+        let h_sel = gathered.add(&attn_out);
 
         let normed2 = Module::forward(&mut self.post_attention_layernorm, &h_sel)?;
         let ffn_out = if self.is_moe {
@@ -930,28 +917,28 @@ impl Llama4DecoderLayer {
         } else {
             self.mlp.as_mut().unwrap().forward(&normed2)?
         };
-        let block_out = h_sel.add(&ffn_out)?;
+        let block_out = h_sel.add(&ffn_out);
         // block_out: [B, k, D] — processed token outputs
 
         // ---- Scatter results back into the full-sequence tensor ----
         // Non-selected token slots start as the original `x` (identity/residual skip).
         // We overwrite the selected positions with the block output.
-        let idx_reshaped_scatter = selected_indices.reshape(&[batch, k, 1])?;
-        let idx_expanded_scatter = ops::broadcast_to(&idx_reshaped_scatter, &[batch, k, hidden])?;
-        let output = x.put_along_axis(&idx_expanded_scatter, &block_out, 1)?;
+        let idx_reshaped_scatter = selected_indices.reshape(&[batch, k, 1]);
+        let idx_expanded_scatter = ops::broadcast_to(&idx_reshaped_scatter, &[batch, k, hidden]);
+        let output = ops::put_along_axis(x, &idx_expanded_scatter, &block_out, 1);
         // output: [B, T, D]  — selected tokens updated, others unchanged
 
         // ---- Auxiliary BCE loss ----
         // BCE(sigmoid(router_logits), top_k_mask) teaches the router to
         // predict which tokens it will select, enabling autoregressive inference
         // where the router must decide without seeing future selections.
-        let logits_flat = router_logits.reshape(&[batch * seq_len])?;
-        let mask_flat = top_k_mask.reshape(&[batch * seq_len])?;
-        let aux_loss = mlx_rs::losses::BinaryCrossEntropyBuilder::new()
-            .inputs_are_logits(true)
-            .reduction(mlx_rs::losses::LossReduction::Mean)
-            .build()?
-            .apply(&logits_flat, &mask_flat)?;
+        let logits_flat = router_logits.reshape(&[batch * seq_len]);
+        let mask_flat = top_k_mask.reshape(&[batch * seq_len]);
+        let aux_loss = pmetal_bridge::compat::losses::BinaryCrossEntropyBuilder::new()
+            .with_logits(true)
+            .reduction(pmetal_bridge::compat::losses::LossReduction::Mean)
+            .build()
+            .call(&logits_flat, &mask_flat);
         self.last_mod_aux_loss = Some(aux_loss);
 
         Ok(output)
@@ -968,17 +955,16 @@ impl Llama4DecoderLayer {
 // =============================================================================
 
 /// Llama 4 text model.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Llama4TextModel {
     pub config: Llama4TextConfig,
 
-    #[param]
     pub embed_tokens: nn::Embedding,
-    #[param]
     pub layers: Vec<Llama4DecoderLayer>,
-    #[param]
     pub norm: nn::RmsNorm,
 }
+impl_module_params!(Llama4TextModel; embed_tokens, layers, norm);
+
 
 impl Llama4TextModel {
     pub fn new(config: Llama4TextConfig) -> Result<Self, Exception> {
@@ -1027,7 +1013,7 @@ impl Llama4TextModel {
             if let Some(loss) = layer.mod_aux_loss() {
                 total = Some(match total {
                     None => loss.clone(),
-                    Some(acc) => acc.add(loss)?,
+                    Some(acc) => acc.add(loss),
                 });
                 count += 1;
             }
@@ -1037,22 +1023,22 @@ impl Llama4TextModel {
             None => Ok(None),
             Some(sum) => {
                 let denom = Array::from_f32(count as f32);
-                Ok(Some(sum.divide(&denom)?))
+                Ok(Some(sum.divide(&denom)))
             }
         }
     }
 }
 
 /// Llama 4 for causal language modeling.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Llama4ForCausalLM {
     pub config: Llama4TextConfig,
 
-    #[param]
     pub model: Llama4TextModel,
-    #[param]
     pub lm_head: nn::Linear,
 }
+impl_module_params!(Llama4ForCausalLM; model, lm_head);
+
 
 impl Llama4ForCausalLM {
     pub fn new(config: Llama4TextConfig) -> Result<Self, Exception> {
@@ -1061,6 +1047,7 @@ impl Llama4ForCausalLM {
             .build()?;
 
         let model = Llama4TextModel::new(config.clone())?;
+
 
         Ok(Self {
             config,
@@ -1130,7 +1117,7 @@ impl Llama4TextConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::module::ModuleParameters;
+    use pmetal_bridge::compat::ModuleParameters;
     use serial_test::serial;
 
     #[test]
@@ -1166,7 +1153,7 @@ mod tests {
     #[serial]
     fn test_llama4_expert() {
         let expert = Llama4Expert::new(64, 256).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 10, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 10, 64], None, None, None).unwrap();
 
         let mut expert = expert;
         let out = expert.forward(&x).unwrap();
@@ -1187,7 +1174,7 @@ mod tests {
 
         let mut moe = Llama4MoE::new(&config).unwrap();
         let x =
-            mlx_rs::random::normal::<f32>(&[2, 5, config.hidden_size], None, None, None).unwrap();
+            pmetal_bridge::compat::random::normal(&[2, 5, config.hidden_size], None, None, None).unwrap();
 
         let shape = x.shape().to_vec();
         let hidden_size = *shape.last().unwrap();
@@ -1211,7 +1198,7 @@ mod tests {
             for (expert_idx, expert) in moe.experts.iter_mut().enumerate() {
                 let expert_id = Array::from_int(expert_idx as i32);
                 let mask = slot_indices.eq(&expert_id).unwrap();
-                let mask_f32 = mask.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+                let mask_f32 = mask.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32()).unwrap();
                 let exp_output = expert.forward(&flat_x).unwrap();
                 let masked = exp_output
                     .multiply(&mask_f32.reshape(&[total_tokens, 1]).unwrap())
@@ -1255,9 +1242,9 @@ mod tests {
         config.num_experts_per_tok = 1;
 
         let mut moe = Llama4MoE::new(&config).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, config.hidden_size], None, None, None)
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, config.hidden_size], None, None, None)
             .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float16)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float16.as_i32())
             .unwrap();
 
         let output = moe.forward(&x).unwrap();
@@ -1285,7 +1272,7 @@ mod tests {
 
         let model = Llama4ForCausalLM::new(config).unwrap();
 
-        let params = model.parameters().flatten();
+        let params = model.flatten_params();
         assert!(params.len() > 0);
     }
 
@@ -1329,7 +1316,7 @@ mod tests {
         let capacity = 0.5_f32; // k = 4
 
         let mut router = Llama4ModRouter::new(hidden).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden], None, None, None).unwrap();
 
         let (selected_indices, router_logits, top_k_mask) = router.route(&x, capacity).unwrap();
         selected_indices.eval().unwrap();
@@ -1356,7 +1343,7 @@ mod tests {
         let capacity = 0.3_f32; // k = floor(0.3 * 10) = 3
 
         let mut router = Llama4ModRouter::new(hidden).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden], None, None, None).unwrap();
 
         let (_indices, _logits, top_k_mask) = router.route(&x, capacity).unwrap();
         top_k_mask.eval().unwrap();
@@ -1399,7 +1386,7 @@ mod tests {
         let seq_len = 8i32;
         let hidden = config.hidden_size;
 
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden], None, None, None).unwrap();
         let out = layer.forward(&x, None, None).unwrap();
         out.eval().unwrap();
 
@@ -1435,7 +1422,7 @@ mod tests {
             "No MoD router when MoD is disabled"
         );
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 6, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 6, 32], None, None, None).unwrap();
         let out = layer.forward(&x, None, None).unwrap();
         out.eval().unwrap();
         assert_eq!(out.shape(), &[1, 6, 32]);
@@ -1467,7 +1454,7 @@ mod tests {
         assert!(model.model.layers[2].mod_router.is_some());
         assert!(model.model.layers[3].mod_router.is_none());
 
-        let params = model.parameters().flatten();
+        let params = model.flatten_params();
         assert!(!params.is_empty());
     }
 

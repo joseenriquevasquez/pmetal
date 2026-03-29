@@ -29,9 +29,8 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::{
-    Array, error::Exception, module::ModuleParameters, nn, optimizers::Optimizer,
-    transforms::eval_params,
+use pmetal_bridge::compat::{
+    Array, Exception, module::ModuleParameters, nn, optimizers::Optimizer, eval_params,
 };
 use pmetal_core::{EvalMetrics, TrainingCallback, TrainingConfig};
 use pmetal_data::{EmbeddingDataset, EmbeddingPair, EmbeddingTriplet, Tokenizer};

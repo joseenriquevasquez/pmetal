@@ -6,10 +6,9 @@
 //! - LoRA parameter updates
 //! - Checkpoint saving
 
-use mlx_rs::{
+use pmetal_bridge::compat::{
     Array,
-    builder::Builder,
-    error::Exception,
+    Exception,
     ops,
     ops::indexing::IndexOp,
     optimizers::{AdamW, AdamWBuilder},
@@ -163,7 +162,7 @@ impl SftTrainer {
     ///
     /// The real training path lives in
     /// `training_loop::TrainingLoop::compute_text_loss_and_grads`, which uses
-    /// `mlx_rs::nn::value_and_grad` to compute gradients and applies them via
+    /// `nn::value_and_grad` to compute gradients and applies them via
     /// the optimizer.  Use `TrainingLoop` directly for functional LoRA training.
     #[deprecated(
         since = "0.1.0",
@@ -185,7 +184,7 @@ impl SftTrainer {
         let loss = self.compute_loss(&logits, labels, None)?;
 
         loss.eval()?;
-        let loss_value = loss.item::<f32>() as f64;
+        let loss_value = loss.item_f32() as f64;
 
         self.state.step += 1;
         self.state.loss = loss_value;
@@ -205,7 +204,7 @@ impl SftTrainer {
             grad.eval()?;
             let norm_sq = grad.multiply(grad)?.sum(None)?;
             norm_sq.eval()?;
-            total_norm_sq += norm_sq.item::<f32>() as f64;
+            total_norm_sq += norm_sq.item_f32() as f64;
         }
         let total_norm = total_norm_sq.sqrt();
 
@@ -362,7 +361,7 @@ impl SftTrainer {
 
 /// Compute the loss function for a language model.
 ///
-/// This is a standalone function for use with `mlx_rs::transforms::value_and_grad`.
+/// This is a standalone function for use with `nn::value_and_grad`.
 pub fn lm_loss(logits: &Array, labels: &Array, ignore_index: i64) -> Result<Array> {
     let seq_len = logits.dim(1);
     let vocab_size = logits.dim(2);
@@ -384,7 +383,7 @@ pub fn lm_loss(logits: &Array, labels: &Array, ignore_index: i64) -> Result<Arra
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::ops::zeros;
+    use pmetal_bridge::compat::{random, ops::zeros};
 
     #[test]
     fn test_trainer_creation() {
@@ -454,31 +453,31 @@ mod tests {
         let seq_len = 8;
         let vocab_size = 100;
 
-        let logits =
-            mlx_rs::random::normal::<f32>(&[batch, seq_len, vocab_size], None, None, None).unwrap();
-        let labels =
-            mlx_rs::random::randint::<_, i32>(0, vocab_size, &[batch, seq_len], None).unwrap();
+        use pmetal_bridge::compat::Dtype;
+        let logits = random::normal(&[batch, seq_len, vocab_size], Dtype::Float32);
+        let labels = random::randint(0, vocab_size, &[batch, seq_len], Dtype::Int32);
 
         let loss = lm_loss(&logits, &labels, -100).unwrap();
-        loss.eval().unwrap();
+        loss.eval();
 
         // Loss should be a scalar
         let empty_shape: &[i32] = &[];
         assert_eq!(loss.shape(), empty_shape);
-        assert!(loss.item::<f32>() > 0.0);
+        assert!(loss.item_f32() > 0.0);
     }
 
     #[test]
     fn test_compute_loss_with_fully_masked_batch_returns_zero() {
         let trainer = SftTrainer::new(TrainingConfig::default());
-        let logits = zeros::<f32>(&[1, 3, 8]).unwrap();
-        let labels = zeros::<i32>(&[1, 3]).unwrap();
-        let mask = zeros::<f32>(&[1, 3]).unwrap();
+        use pmetal_bridge::compat::Dtype;
+        let logits = zeros(&[1, 3, 8], Dtype::Float32);
+        let labels = zeros(&[1, 3], Dtype::Int32);
+        let mask = zeros(&[1, 3], Dtype::Float32);
 
         let loss = trainer.compute_loss(&logits, &labels, Some(&mask)).unwrap();
-        loss.eval().unwrap();
+        loss.eval();
 
-        assert_eq!(loss.item::<f32>(), 0.0);
+        assert_eq!(loss.item_f32(), 0.0);
     }
 
     #[test]

@@ -590,6 +590,21 @@ size_t mlx_inline_nbytes(const mlx_inline_array* a);
 int mlx_inline_data_ptr(const mlx_inline_array* a, const void** out_ptr);
 void mlx_inline_stop_gradient(mlx_inline_array* dst, const mlx_inline_array* a);
 
+// ── Triangular inverse (CPU stream for WY factorization) ──
+// Compute inverse of a triangular square matrix (batched; last 2 dims).
+// upper=false -> lower triangular (default).
+// Runs on CPU stream matching mlx-lm's tri_inv(StreamOrDevice::cpu()) usage.
+void mlx_inline_tri_inv(mlx_inline_array* dst, const mlx_inline_array* a, bool upper, bool use_cpu);
+
+// Singular Value Decomposition (economy/thin SVD).
+// Writes U -> dst_u, S -> dst_s, Vt -> dst_vt.
+// Always runs on the CPU stream (GPU SVD not yet in MLX).
+void mlx_inline_svd(
+    mlx_inline_array* dst_u,
+    mlx_inline_array* dst_s,
+    mlx_inline_array* dst_vt,
+    const mlx_inline_array* a);
+
 // ── Autograd: value_and_grad ──
 // Callback type for Rust forward function
 typedef void (*mlx_rust_forward_fn)(
@@ -598,6 +613,23 @@ typedef void (*mlx_rust_forward_fn)(
     mlx_inline_array* loss_out,
     void* ctx
 );
+
+// ── FFT ops ──────────────────────────────────────────────────────────────────
+// rfft: real-valued FFT along the given axis. n_fft=-1 means use full axis size.
+void mlx_inline_rfft(mlx_inline_array* dst, const mlx_inline_array* a, int n_fft, int axis);
+// irfft: inverse rfft. n_fft=-1 means infer from input size (n = 2*(freq-1)).
+void mlx_inline_irfft(mlx_inline_array* dst, const mlx_inline_array* a, int n_fft, int axis);
+
+// ── leaky_relu ────────────────────────────────────────────────────────────────
+void mlx_inline_leaky_relu(mlx_inline_array* dst, const mlx_inline_array* a, float neg_slope);
+
+// ── squeeze all axes (remove all size-1 dims) ─────────────────────────────────
+void mlx_inline_squeeze_all(mlx_inline_array* dst, const mlx_inline_array* a);
+
+// ── pad ───────────────────────────────────────────────────────────────────────
+// pad_widths: flat array of [before_0, after_0, before_1, after_1, ...] length 2*ndim
+void mlx_inline_pad(mlx_inline_array* dst, const mlx_inline_array* a,
+                    const int* pad_widths, int ndim, float fill_value);
 
 // Compute loss + gradients via callback-based autograd.
 // forward_fn is called ONCE with traced arrays to build the computation graph.
@@ -611,6 +643,20 @@ void mlx_inline_value_and_grad(
     mlx_inline_array* loss_out,
     mlx_inline_array** grads_out
 );
+
+// ── Missing ops for pmetal-models migration ───────────────────────────────────
+void mlx_inline_rsqrt(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_zeros_like(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_ones_like(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_tile(mlx_inline_array* dst, const mlx_inline_array* a, const int* reps, int ndim);
+void mlx_inline_linspace(mlx_inline_array* dst, float start, float stop, int n, int dtype);
+void mlx_inline_split_sections(mlx_inline_array* dst_arr, const mlx_inline_array* a, int sections, int axis, int* out_count);
+void mlx_inline_scatter_add(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* indices, const mlx_inline_array* updates, int axis);
+void mlx_inline_topk(mlx_inline_array* dst, const mlx_inline_array* a, int k, int axis);
+void mlx_inline_put_along_axis(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* indices, const mlx_inline_array* values, int axis);
+void mlx_inline_layer_norm(mlx_inline_array* dst, const mlx_inline_array* x, const mlx_inline_array* weight, const mlx_inline_array* bias, float eps);
+void mlx_inline_addmm(mlx_inline_array* dst, const mlx_inline_array* c, const mlx_inline_array* a, const mlx_inline_array* b);
+void mlx_inline_conv2d(mlx_inline_array* dst, const mlx_inline_array* input, const mlx_inline_array* weight, int stride_h, int stride_w, int pad_h, int pad_w, int dil_h, int dil_w, int groups);
 
 #ifdef __cplusplus
 }

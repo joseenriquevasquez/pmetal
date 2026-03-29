@@ -9,6 +9,9 @@
 //!
 //! Reference: `mlx-lm/models/qwen3_next.py` (Apple, 2025).
 
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param, fast, nn, ops, random};
+use pmetal_bridge::compat::ops::{slice_last_to, slice_last_from, slice_axis, slice_axis_from, select_axis};
+use pmetal_bridge::impl_module_params;
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -16,17 +19,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{
-        Module, ModuleParamMut, ModuleParamRef, ModuleParameters, ModuleParametersExt, Param,
-    },
-    nn,
-    ops::{self, indexing::IndexOp},
-};
 use serde::{Deserialize, Serialize};
 
 use crate::expert_io::ExpertOffloadContext;
@@ -431,15 +423,15 @@ fn profile_array_section<F>(
     layer_profile: &mut Qwen3NextLayerProfile,
     name: &str,
     op: F,
-) -> Result<Array, Exception>
+) -> Array
 where
-    F: FnOnce() -> Result<Array, Exception>,
+    F: FnOnce() -> Array,
 {
     let start = Instant::now();
-    let output = op()?;
-    output.eval()?;
+    let mut output = op();
+    output.eval();
     layer_profile.push_section(name, start);
-    Ok(output)
+    output
 }
 
 // ============================================================================
@@ -452,12 +444,13 @@ where
 /// RMSNorm layers in the model, this norm does NOT use the (1+w) convention —
 /// its weights are initialized at 1.0 and used directly. The (1+w) offset in
 /// `sanitize_weights` intentionally excludes `.linear_attn.norm.weight`.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3NextRMSNormGated {
-    #[param]
     pub weight: Param<Array>,
     pub eps: f32,
 }
+impl_module_params!(Qwen3NextRMSNormGated; weight);
+
 
 /// Compiled _precise_swiglu: `(silu(gate.f32()) * norm_out.f32()).as(dtype)`.
 ///
@@ -466,44 +459,56 @@ pub struct Qwen3NextRMSNormGated {
 fn compiled_precise_swiglu(
     norm_out: &Array,
     gate: &Array,
-    out_dtype: mlx_rs::Dtype,
+    out_dtype: pmetal_bridge::compat::Dtype,
 ) -> Result<Array, Exception> {
-    use std::sync::OnceLock;
-    static COMPILED: OnceLock<Option<mlx_rs::compile::Closure>> = OnceLock::new();
-    let compiled = COMPILED.get_or_init(|| {
-        let closure = mlx_rs::compile::Closure::new(|inputs: &[Array]| {
-            let norm_out = &inputs[0];
-            let gate = &inputs[1];
-            let gate_f32 = nn::silu(&gate.as_type::<f32>()?)?;
-            let norm_f32 = norm_out.as_type::<f32>()?;
-            let result = gate_f32.multiply(&norm_f32)?;
-            // Cast back to original dtype
-            Ok(vec![result.as_dtype(norm_out.dtype())?])
-        });
-        mlx_rs::compile::compile(&closure, true).ok()
+    thread_local! {
+        static COMPILED: std::cell::RefCell<Option<pmetal_bridge::compat::compile::Closure>> =
+            std::cell::RefCell::new(None);
+    }
+
+    // Initialize the compiled closure on first call
+    COMPILED.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let closure = pmetal_bridge::compat::compile::Closure::new(|inputs: &[Array]| {
+                let norm_out = &inputs[0];
+                let gate = &inputs[1];
+                let gate_f32 = nn::silu(&gate.cast(pmetal_bridge::compat::Dtype::Float32));
+                let norm_f32 = norm_out.cast(pmetal_bridge::compat::Dtype::Float32);
+                let result = gate_f32.multiply(&norm_f32);
+                vec![result.as_dtype(norm_out.dtype_raw())]
+            });
+            *slot = pmetal_bridge::compat::compile::compile(closure, true).ok();
+        }
     });
 
-    if let Some(compiled_fn) = compiled {
-        // Pass norm_out first so its dtype can be recovered inside the closure
-        let outputs = compiled_fn.apply(&[norm_out, gate])?;
-        let result = outputs.into_iter().next().unwrap();
-        // The compiled closure casts to norm_out.dtype(), but we need out_dtype
-        if result.dtype() != out_dtype {
-            result.as_dtype(out_dtype)
-        } else {
-            Ok(result)
-        }
+    // Try the compiled path; fall back to uncompiled if unavailable
+    let result = COMPILED.with(|cell| -> Option<Result<Array, Exception>> {
+        let slot = cell.borrow();
+        slot.as_ref().map(|compiled_fn| {
+            let outputs = compiled_fn.apply(&[norm_out.clone(), gate.clone()])?;
+            let result = outputs.into_iter().next().unwrap();
+            Ok(if result.dtype() != out_dtype {
+                result.as_dtype(out_dtype.as_i32())
+            } else {
+                result
+            })
+        })
+    });
+
+    if let Some(r) = result {
+        r
     } else {
         // Fallback: uncompiled
-        let gate_f32 = nn::silu(&gate.as_type::<f32>()?)?;
-        let norm_f32 = norm_out.as_type::<f32>()?;
-        gate_f32.multiply(&norm_f32)?.as_dtype(out_dtype)
+        let gate_f32 = nn::silu(&gate.cast(pmetal_bridge::compat::Dtype::Float32));
+        let norm_f32 = norm_out.cast(pmetal_bridge::compat::Dtype::Float32);
+        Ok(gate_f32.multiply(&norm_f32).as_dtype(out_dtype.as_i32()))
     }
 }
 
 impl Qwen3NextRMSNormGated {
     pub fn new(hidden_size: i32, eps: f32) -> Result<Self, Exception> {
-        let weight = Array::ones::<f32>(&[hidden_size])?;
+        let weight = Array::ones_f32(&[hidden_size]);
         Ok(Self {
             weight: Param::new(weight),
             eps,
@@ -511,7 +516,7 @@ impl Qwen3NextRMSNormGated {
     }
 
     pub fn forward(&self, x: &Array, gate: Option<&Array>) -> Result<Array, Exception> {
-        let normed = mlx_rs::fast::rms_norm(x, self.weight.as_ref(), self.eps)?;
+        let normed = pmetal_bridge::compat::fast::rms_norm(x, self.weight.as_ref(), self.eps);
         if let Some(g) = gate {
             // Compiled _precise_swiglu: matches mlx-lm's @mx.compile(shapeless=True).
             // Fuses silu(gate.f32()) * norm.f32() → cast_back into 1 Metal dispatch
@@ -527,15 +532,14 @@ impl Qwen3NextRMSNormGated {
 // Qwen3Next MLP (SwiGLU)
 // ============================================================================
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3NextMLP {
-    #[param]
     pub gate_proj: nn::Linear,
-    #[param]
     pub up_proj: nn::Linear,
-    #[param]
     pub down_proj: nn::Linear,
 }
+impl_module_params!(Qwen3NextMLP; gate_proj, up_proj, down_proj);
+
 
 impl Qwen3NextMLP {
     pub fn new(dim: i32, hidden_dim: i32) -> Result<Self, Exception> {
@@ -570,19 +574,13 @@ impl Qwen3NextMLP {
 // Qwen3Next Attention (Full attention with gated output + partial RoPE)
 // ============================================================================
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3NextAttention {
-    #[param]
     pub q_proj: nn::Linear,
-    #[param]
     pub k_proj: nn::Linear,
-    #[param]
     pub v_proj: nn::Linear,
-    #[param]
     pub o_proj: nn::Linear,
-    #[param]
     pub q_norm: nn::RmsNorm,
-    #[param]
     pub k_norm: nn::RmsNorm,
     pub n_heads: i32,
     pub n_kv_heads: i32,
@@ -592,6 +590,8 @@ pub struct Qwen3NextAttention {
     pub effective_base: f32,
     pub rope_scale: f32,
 }
+impl_module_params!(Qwen3NextAttention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
+
 
 impl Qwen3NextAttention {
     pub fn new(config: &Qwen3NextConfig) -> Result<Self, Exception> {
@@ -658,34 +658,34 @@ impl Qwen3NextAttention {
         let mut cache = cache;
 
         // Project Q (with gate) and K, V
-        let q_proj_out = self.q_proj.forward(x)?;
+        let q_proj_out = self.q_proj.forward(x);
         // Reshape to [B, L, n_heads, head_dim * 2], split into queries and gate
-        let q_gate = q_proj_out.reshape(&[b, l, self.n_heads, self.head_dim * 2])?;
-        let queries = q_gate.index((.., .., .., ..self.head_dim));
-        let gate = q_gate.index((.., .., .., self.head_dim..)).reshape(&[
+        let q_gate = q_proj_out.reshape(&[b, l, self.n_heads, self.head_dim * 2]);
+        let mut queries = slice_last_to(&q_gate, self.head_dim);
+        let gate = slice_last_from(&q_gate, self.head_dim).reshape(&[
             b,
             l,
             self.n_heads * self.head_dim,
-        ])?;
+        ]);
 
-        let keys = self.k_proj.forward(x)?;
-        let values = self.v_proj.forward(x)?;
+        let mut keys = self.k_proj.forward(x);
+        let mut values = self.v_proj.forward(x);
 
         // Reshape and apply Q/K norm
-        let mut queries = self.q_norm.forward(&queries)?;
+        let mut queries = self.q_norm.forward(&queries);
         let mut keys =
             self.k_norm
-                .forward(&keys.reshape(&[b, l, self.n_kv_heads, self.head_dim])?)?;
-        let values = values.reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
+                .forward(&keys.reshape(&[b, l, self.n_kv_heads, self.head_dim]));
+        let mut values = values.reshape(&[b, l, self.n_kv_heads, self.head_dim]);
 
         // Transpose to [B, heads, L, head_dim]
-        queries = queries.transpose_axes(&[0, 2, 1, 3])?;
-        keys = keys.transpose_axes(&[0, 2, 1, 3])?;
-        let values = values.transpose_axes(&[0, 2, 1, 3])?;
+        queries = queries.transpose_axes(&[0, 2, 1, 3]);
+        keys = keys.transpose_axes(&[0, 2, 1, 3]);
+        let mut values = values.transpose_axes(&[0, 2, 1, 3]);
 
         // Apply partial RoPE
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let queries = apply_rope(
+        let mut queries = apply_rope(
             &queries,
             self.rope_dims,
             false,
@@ -693,7 +693,7 @@ impl Qwen3NextAttention {
             self.rope_scale,
             offset,
         )?;
-        let keys = apply_rope(
+        let mut keys = apply_rope(
             &keys,
             self.rope_dims,
             false,
@@ -709,40 +709,40 @@ impl Qwen3NextAttention {
 
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
-                if let Some(output) = (*cache_ref).try_turboquant_attention(
+                if let Some(mut output) = (*cache_ref).try_turboquant_attention(
                     *layer_idx,
                     &queries,
                     &keys,
                     &values,
                     &attn_config,
                 )? {
-                    let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                    let mut output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[
                         b,
                         l,
                         self.n_heads * self.head_dim,
-                    ])?;
-                    let gated = output.multiply(&nn::sigmoid(&gate)?)?;
-                    return self.o_proj.forward(&gated);
+                    ]);
+                    let gated = output.multiply(&nn::sigmoid(&gate));
+                    return Ok(self.o_proj.forward(&gated));
                 }
             }
         }
 
         // Update KV cache
-        let (keys, values) = if let Some((cache, layer_idx)) = cache {
+        let (mut keys, mut values) = if let Some((cache, layer_idx)) = cache {
             cache.update_and_fetch(layer_idx, &keys, &values)?
         } else {
             (keys, values)
         };
 
-        let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
-        let output =
+        let mut output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
+        let mut output =
             output
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[b, l, self.n_heads * self.head_dim])?;
+                .transpose_axes(&[0, 2, 1, 3])
+                .reshape(&[b, l, self.n_heads * self.head_dim]);
 
         // Gated output: o_proj(output * sigmoid(gate))
-        let gated = output.multiply(&nn::sigmoid(&gate)?)?;
-        self.o_proj.forward(&gated)
+        let gated = output.multiply(&nn::sigmoid(&gate));
+        Ok(self.o_proj.forward(&gated))
     }
 
     pub fn forward_profiled(
@@ -759,32 +759,32 @@ impl Qwen3NextAttention {
         let mut cache = cache;
 
         let prep_start = Instant::now();
-        let q_proj_out = self.q_proj.forward(x)?;
-        let q_gate = q_proj_out.reshape(&[b, l, self.n_heads, self.head_dim * 2])?;
-        let queries = q_gate.index((.., .., .., ..self.head_dim));
-        let gate = q_gate.index((.., .., .., self.head_dim..)).reshape(&[
+        let q_proj_out = self.q_proj.forward(x);
+        let q_gate = q_proj_out.reshape(&[b, l, self.n_heads, self.head_dim * 2]);
+        let mut queries = slice_last_to(&q_gate, self.head_dim);
+        let gate = slice_last_from(&q_gate, self.head_dim).reshape(&[
             b,
             l,
             self.n_heads * self.head_dim,
-        ])?;
-        let keys = self.k_proj.forward(x)?;
-        let values = self.v_proj.forward(x)?;
-        let mut queries = self.q_norm.forward(&queries)?;
+        ]);
+        let mut keys = self.k_proj.forward(x);
+        let mut values = self.v_proj.forward(x);
+        let mut queries = self.q_norm.forward(&queries);
         let mut keys =
             self.k_norm
-                .forward(&keys.reshape(&[b, l, self.n_kv_heads, self.head_dim])?)?;
-        let values = values.reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
-        queries = queries.transpose_axes(&[0, 2, 1, 3])?;
-        keys = keys.transpose_axes(&[0, 2, 1, 3])?;
-        let values = values.transpose_axes(&[0, 2, 1, 3])?;
-        queries.eval()?;
-        keys.eval()?;
-        values.eval()?;
+                .forward(&keys.reshape(&[b, l, self.n_kv_heads, self.head_dim]));
+        let mut values = values.reshape(&[b, l, self.n_kv_heads, self.head_dim]);
+        queries = queries.transpose_axes(&[0, 2, 1, 3]);
+        keys = keys.transpose_axes(&[0, 2, 1, 3]);
+        let mut values = values.transpose_axes(&[0, 2, 1, 3]);
+        queries.eval();
+        keys.eval();
+        values.eval();
         layer_profile.push_section("attn_prepare_qkv", prep_start);
 
         let rope_cache_start = Instant::now();
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let queries = apply_rope(
+        let mut queries = apply_rope(
             &queries,
             self.rope_dims,
             false,
@@ -792,7 +792,7 @@ impl Qwen3NextAttention {
             self.rope_scale,
             offset,
         )?;
-        let keys = apply_rope(
+        let mut keys = apply_rope(
             &keys,
             self.rope_dims,
             false,
@@ -813,20 +813,20 @@ impl Qwen3NextAttention {
                     &values,
                     &attn_config,
                 )? {
-                    queries.eval()?;
-                    output.eval()?;
+                    queries.eval();
+                    output.eval();
                     layer_profile.push_section("attn_rope_cache", rope_cache_start);
                     layer_profile.push_section("attn_sdpa", turbo_attn_start);
 
                     let out_start = Instant::now();
-                    let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                    let mut output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[
                         b,
                         l,
                         self.n_heads * self.head_dim,
-                    ])?;
-                    let gated = output.multiply(&nn::sigmoid(&gate)?)?;
-                    let projected = self.o_proj.forward(&gated)?;
-                    projected.eval()?;
+                    ]);
+                    let gated = output.multiply(&nn::sigmoid(&gate));
+                    let mut projected = self.o_proj.forward(&gated);
+                    projected.eval();
                     layer_profile.push_section("attn_out_proj", out_start);
                     return Ok(projected);
                 }
@@ -837,24 +837,24 @@ impl Qwen3NextAttention {
         } else {
             (keys, values)
         };
-        queries.eval()?;
-        keys.eval()?;
-        values.eval()?;
+        queries.eval();
+        keys.eval();
+        values.eval();
         layer_profile.push_section("attn_rope_cache", rope_cache_start);
 
         let sdpa_start = Instant::now();
-        let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
-        output.eval()?;
+        let mut output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
+        output.eval();
         layer_profile.push_section("attn_sdpa", sdpa_start);
 
         let out_start = Instant::now();
-        let output =
+        let mut output =
             output
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[b, l, self.n_heads * self.head_dim])?;
-        let gated = output.multiply(&nn::sigmoid(&gate)?)?;
-        let projected = self.o_proj.forward(&gated)?;
-        projected.eval()?;
+                .transpose_axes(&[0, 2, 1, 3])
+                .reshape(&[b, l, self.n_heads * self.head_dim]);
+        let gated = output.multiply(&nn::sigmoid(&gate));
+        let mut projected = self.o_proj.forward(&gated);
+        projected.eval();
         layer_profile.push_section("attn_out_proj", out_start);
         Ok(projected)
     }
@@ -877,25 +877,16 @@ impl Qwen3NextAttention {
 // Qwen3Next Gated Delta Net (GDN) linear attention
 // ============================================================================
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3NextGatedDeltaNet {
-    #[param]
     pub conv1d: nn::Conv1d,
-    #[param]
     pub in_proj_qkv: nn::Linear,
-    #[param]
     pub in_proj_z: nn::Linear,
-    #[param]
     pub in_proj_b: nn::Linear,
-    #[param]
     pub in_proj_a: nn::Linear,
-    #[param]
     pub norm: Qwen3NextRMSNormGated,
-    #[param]
     pub out_proj: nn::Linear,
-    #[param]
     pub dt_bias: Param<Array>,
-    #[param]
     pub a_log: Param<Array>,
 
     pub hidden_size: i32,
@@ -920,23 +911,25 @@ pub struct Qwen3NextGatedDeltaNet {
     /// Cached InlineArray weights for zero-alloc decode. Lazily initialized on first decode.
     pub inline_weights: Option<GdnInlineWeights>,
     /// Compiled decode closure (mx.compile). Lazily initialized on first decode.
-    pub compiled_decode: Option<mlx_rs::compile::Closure>,
+    pub compiled_decode: Option<pmetal_bridge::compat::compile::Closure>,
 }
+impl_module_params!(Qwen3NextGatedDeltaNet; conv1d, in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, norm, out_proj, dt_bias, a_log);
+
 
 /// Pre-cached InlineArray weights for the GDN decode hot path.
 /// All weights are pre-transposed and ready for matmul — zero allocation per token.
 pub struct GdnInlineWeights {
-    pub qkv_wt: mlx_rs::inline_array::InlineArray,   // in_proj_qkv.weight.T
-    pub z_wt: mlx_rs::inline_array::InlineArray,      // in_proj_z.weight.T
-    pub b_wt: mlx_rs::inline_array::InlineArray,      // in_proj_b.weight.T
-    pub a_wt: mlx_rs::inline_array::InlineArray,      // in_proj_a.weight.T
-    pub conv_w: mlx_rs::inline_array::InlineArray,     // conv1d weight
-    pub out_wt: mlx_rs::inline_array::InlineArray,     // out_proj.weight.T
-    pub q_norm_w: mlx_rs::inline_array::InlineArray,   // q normalization weight
-    pub k_norm_w: mlx_rs::inline_array::InlineArray,   // k normalization weight
-    pub a_log: mlx_rs::inline_array::InlineArray,      // decay log
-    pub dt_bias: mlx_rs::inline_array::InlineArray,    // dt bias
-    pub norm_w: mlx_rs::inline_array::InlineArray,     // gated norm weight
+    pub qkv_wt: pmetal_bridge::inline_array::InlineArray,   // in_proj_qkv.weight.T
+    pub z_wt: pmetal_bridge::inline_array::InlineArray,      // in_proj_z.weight.T
+    pub b_wt: pmetal_bridge::inline_array::InlineArray,      // in_proj_b.weight.T
+    pub a_wt: pmetal_bridge::inline_array::InlineArray,      // in_proj_a.weight.T
+    pub conv_w: pmetal_bridge::inline_array::InlineArray,     // conv1d weight
+    pub out_wt: pmetal_bridge::inline_array::InlineArray,     // out_proj.weight.T
+    pub q_norm_w: pmetal_bridge::inline_array::InlineArray,   // q normalization weight
+    pub k_norm_w: pmetal_bridge::inline_array::InlineArray,   // k normalization weight
+    pub a_log: pmetal_bridge::inline_array::InlineArray,      // decay log
+    pub dt_bias: pmetal_bridge::inline_array::InlineArray,    // dt bias
+    pub norm_w: pmetal_bridge::inline_array::InlineArray,     // gated norm weight
 }
 
 impl std::fmt::Debug for GdnInlineWeights {
@@ -984,11 +977,12 @@ impl Qwen3NextGatedDeltaNet {
             .bias(false)
             .build()?;
 
-        let dt_bias = Param::new(Array::ones::<f32>(&[num_v_heads])?);
+        let dt_bias = Param::new(Array::ones_f32(&[num_v_heads]));
         let a_log =
-            Param::new(mlx_rs::random::uniform::<_, f32>(0.0, 16.0, &[num_v_heads], None)?.log()?);
+            Param::new(pmetal_bridge::compat::random::uniform_range(0.0, 16.0, &[num_v_heads], pmetal_bridge::compat::Dtype::Float32).log());
 
         let norm = Qwen3NextRMSNormGated::new(head_v_dim, config.rms_norm_eps)?;
+
         let out_proj = nn::LinearBuilder::new(value_dim, hidden_size)
             .bias(false)
             .build()?;
@@ -1018,11 +1012,11 @@ impl Qwen3NextGatedDeltaNet {
             combined_ba_weight: None,
             q_norm_weight: {
                 let inv = (head_k_dim as f32).sqrt().recip();
-                Array::ones::<f32>(&[head_k_dim])?.multiply(&Array::from_f32(inv * inv))?
+                Array::ones_f32(&[head_k_dim]).multiply(&Array::from_f32(inv * inv))
             },
             k_norm_weight: {
                 let inv = (head_k_dim as f32).sqrt().recip();
-                Array::ones::<f32>(&[head_k_dim])?.multiply(&Array::from_f32(inv))?
+                Array::ones_f32(&[head_k_dim]).multiply(&Array::from_f32(inv))
             },
             inline_weights: None,
             compiled_decode: None,
@@ -1034,7 +1028,7 @@ impl Qwen3NextGatedDeltaNet {
         if self.inline_weights.is_some() {
             return;
         }
-        use mlx_rs::inline_array::InlineArray;
+        use pmetal_bridge::inline_array::InlineArray;
         // Pre-transpose weights via InlineArray.t() (no Result overhead)
         let iw = GdnInlineWeights {
             qkv_wt: InlineArray::from_array(self.in_proj_qkv.weight.as_ref()).t(),
@@ -1054,10 +1048,10 @@ impl Qwen3NextGatedDeltaNet {
 
     fn current_input_proj_signature(&self) -> Vec<usize> {
         vec![
-            self.in_proj_qkv.weight.as_ref().as_ptr().ctx as usize,
-            self.in_proj_z.weight.as_ref().as_ptr().ctx as usize,
-            self.in_proj_b.weight.as_ref().as_ptr().ctx as usize,
-            self.in_proj_a.weight.as_ref().as_ptr().ctx as usize,
+            self.in_proj_qkv.weight.as_ref().data_ptr() as usize,
+            self.in_proj_z.weight.as_ref().data_ptr() as usize,
+            self.in_proj_b.weight.as_ref().data_ptr() as usize,
+            self.in_proj_a.weight.as_ref().data_ptr() as usize,
         ]
     }
 
@@ -1074,8 +1068,8 @@ impl Qwen3NextGatedDeltaNet {
                 self.in_proj_a.weight.as_ref().clone(),
             ];
             let weight_refs: Vec<&Array> = weights.iter().collect();
-            let combined = ops::concatenate_axis(&weight_refs, 0)?;
-            combined.eval()?;
+            let mut combined = ops::concatenate_axis(&weight_refs, 0);
+            combined.eval();
             self.combined_in_proj_weight = Some(combined);
             self.combined_in_proj_signature = Some(signature);
         }
@@ -1087,11 +1081,11 @@ impl Qwen3NextGatedDeltaNet {
     /// Matches Python's `in_proj_qkvz` (key_dim*2 + value_dim*2 output dim).
     pub fn ensure_combined_qkvz_weight(&mut self) -> Result<Array, Exception> {
         if self.combined_qkvz_weight.is_none() {
-            let w = ops::concatenate_axis(
+            let mut w = ops::concatenate_axis(
                 &[self.in_proj_qkv.weight.as_ref(), self.in_proj_z.weight.as_ref()],
                 0,
-            )?;
-            w.eval()?;
+            );
+            w.eval();
             self.combined_qkvz_weight = Some(w);
         }
         Ok(self.combined_qkvz_weight.as_ref().unwrap().clone())
@@ -1101,11 +1095,11 @@ impl Qwen3NextGatedDeltaNet {
     /// Matches Python's `in_proj_ba` (num_v_heads*2 output dim).
     pub fn ensure_combined_ba_weight(&mut self) -> Result<Array, Exception> {
         if self.combined_ba_weight.is_none() {
-            let w = ops::concatenate_axis(
+            let mut w = ops::concatenate_axis(
                 &[self.in_proj_b.weight.as_ref(), self.in_proj_a.weight.as_ref()],
                 0,
-            )?;
-            w.eval()?;
+            );
+            w.eval();
             self.combined_ba_weight = Some(w);
         }
         Ok(self.combined_ba_weight.as_ref().unwrap().clone())
@@ -1119,11 +1113,11 @@ impl Qwen3NextGatedDeltaNet {
         let b = shape[0];
         let s = shape[1];
         let combined_weight = self.ensure_combined_input_proj_weight()?;
-        let projected = if s == 1 {
-            let flat = inputs.reshape(&[b, self.hidden_size])?;
-            ops::matmul(&flat, &combined_weight.t())?
+        let mut projected = if s == 1 {
+            let flat = inputs.reshape(&[b, self.hidden_size]);
+            ops::matmul(&flat, &combined_weight.t())
         } else {
-            ops::matmul(inputs, &combined_weight.t())?
+            ops::matmul(inputs, &combined_weight.t())
         };
 
         let qkv_end = self.conv_dim;
@@ -1131,40 +1125,37 @@ impl Qwen3NextGatedDeltaNet {
         let b_end = z_end + self.num_v_heads;
 
         let qkv = if s == 1 {
-            projected
-                .index((.., ..qkv_end))
-                .reshape(&[b, s, self.conv_dim])?
+            slice_last_to(&projected, qkv_end)
+                .reshape(&[b, s, self.conv_dim])
         } else {
-            projected.index((.., .., ..qkv_end))
+            slice_last_to(&projected, qkv_end)
         };
         let z = if s == 1 {
-            projected.index((.., qkv_end..z_end)).reshape(&[
+            slice_axis(&projected, -1, qkv_end, z_end).reshape(&[
                 b,
                 s,
                 self.num_v_heads,
                 self.head_v_dim,
-            ])?
+            ])
         } else {
-            projected.index((.., .., qkv_end..z_end)).reshape(&[
+            slice_axis(&projected, -1, qkv_end, z_end).reshape(&[
                 b,
                 s,
                 self.num_v_heads,
                 self.head_v_dim,
-            ])?
+            ])
         };
         let b_val = if s == 1 {
-            projected
-                .index((.., z_end..b_end))
-                .reshape(&[b, s, self.num_v_heads])?
+            slice_axis(&projected, -1, z_end, b_end)
+                .reshape(&[b, s, self.num_v_heads])
         } else {
-            projected.index((.., .., z_end..b_end))
+            slice_axis(&projected, -1, z_end, b_end)
         };
         let a = if s == 1 {
-            projected
-                .index((.., b_end..))
-                .reshape(&[b, s, self.num_v_heads])?
+            slice_last_from(&projected, b_end)
+                .reshape(&[b, s, self.num_v_heads])
         } else {
-            projected.index((.., .., b_end..))
+            slice_last_from(&projected, b_end)
         };
         Ok((qkv, z, b_val, a))
     }
@@ -1176,15 +1167,15 @@ impl Qwen3NextGatedDeltaNet {
     ) -> Result<Array, Exception> {
         let batch = inputs.dim(0);
         let hidden = inputs.dim(2);
-        let flat = inputs.reshape(&[batch, hidden])?;
-        let projected = ops::matmul(&flat, &weight.t())?;
-        projected.reshape(&[batch, 1, output_dim])
+        let flat = inputs.reshape(&[batch, hidden]);
+        let mut projected = ops::matmul(&flat, &weight.t());
+        Ok(projected.reshape(&[batch, 1, output_dim]))
     }
 
     fn decode_out_projection(&self, out: &Array, batch: i32) -> Result<Array, Exception> {
-        let flat = out.reshape(&[batch, self.value_dim])?;
-        let projected = ops::matmul(&flat, &self.out_proj.weight.as_ref().t())?;
-        projected.reshape(&[batch, 1, self.hidden_size])
+        let flat = out.reshape(&[batch, self.value_dim]);
+        let mut projected = ops::matmul(&flat, &self.out_proj.weight.as_ref().t());
+        Ok(projected.reshape(&[batch, 1, self.hidden_size]))
     }
 
     fn should_use_flattened_decode_proj(&self, inputs: &Array, mask: Option<&Array>) -> bool {
@@ -1215,14 +1206,12 @@ impl Qwen3NextGatedDeltaNet {
                 &[b, self.conv_kernel_size - 1, self.conv_dim],
                 inputs.dtype(),
             )
-            .unwrap()
         });
         let ssm_state = cache.ssm_state.take().unwrap_or_else(|| {
             ops::zeros_dtype(
                 &[b, self.num_v_heads, self.head_v_dim, self.head_k_dim],
                 inputs.dtype(),
             )
-            .unwrap()
         });
 
         // Direct decode: uses Metal GDN kernel (1 dispatch for recurrence) +
@@ -1235,31 +1224,31 @@ impl Qwen3NextGatedDeltaNet {
         // 2 combined matmuls matching Python's in_proj_qkvz + in_proj_ba
         let qkvz_w = self.ensure_combined_qkvz_weight()?;
         let ba_w = self.ensure_combined_ba_weight()?;
-        let qkvz = ops::matmul(inputs, &qkvz_w.t())?;
-        let ba = ops::matmul(inputs, &ba_w.t())?;
+        let qkvz = ops::matmul(inputs, &qkvz_w.t());
+        let ba = ops::matmul(inputs, &ba_w.t());
 
         // Split qkvz → qkv (conv_dim) + z (value_dim)
-        let qkv = qkvz.index((.., .., ..self.conv_dim));
-        let z = qkvz.index((.., .., self.conv_dim..)).reshape(&[b_dim, s, self.num_v_heads, self.head_v_dim])?;
+        let qkv = slice_last_to(&qkvz, self.conv_dim);
+        let z = slice_last_from(&qkvz, self.conv_dim).reshape(&[b_dim, s, self.num_v_heads, self.head_v_dim]);
 
         // Split ba → b_val + a
-        let b_val = ba.index((.., .., ..self.num_v_heads));
-        let a = ba.index((.., .., self.num_v_heads..));
+        let b_val = slice_last_to(&ba, self.num_v_heads);
+        let a = slice_last_from(&ba, self.num_v_heads);
 
         // Conv: concat old state + new, apply conv1d + silu
-        let conv_input_arr = ops::concatenate_axis(&[&conv_state, &qkv], 1)?;
-        let new_conv = conv_input_arr.index((.., (-(self.conv_kernel_size - 1)).., ..));
-        let conv_out = nn::silu(&self.conv1d.forward(&conv_input_arr)?)?;
+        let conv_input_arr = ops::concatenate_axis(&[&conv_state, &qkv], 1);
+        let new_conv = slice_axis_from(&conv_input_arr, 1, -(self.conv_kernel_size - 1));
+        let conv_out = nn::silu(&self.conv1d.forward(&conv_input_arr));
 
         // Split conv output → q, k, v
-        let parts = conv_out.split_axis(&[self.key_dim, self.key_dim * 2], -1)?;
-        let q = parts[0].reshape(&[b_dim, s, self.num_k_heads, self.head_k_dim])?;
-        let k = parts[1].reshape(&[b_dim, s, self.num_k_heads, self.head_k_dim])?;
-        let v = parts[2].reshape(&[b_dim, s, self.num_v_heads, self.head_v_dim])?;
+        let parts = ops::split_sections(&conv_out, &[self.key_dim, self.key_dim * 2], -1);
+        let q = parts[0].reshape(&[b_dim, s, self.num_k_heads, self.head_k_dim]);
+        let k = parts[1].reshape(&[b_dim, s, self.num_k_heads, self.head_k_dim]);
+        let v = parts[2].reshape(&[b_dim, s, self.num_v_heads, self.head_v_dim]);
 
         // Q/K normalization (fused fast:: ops)
-        let q = mlx_rs::fast::rms_norm(&q, &self.q_norm_weight, 1e-6)?;
-        let k = mlx_rs::fast::rms_norm(&k, &self.k_norm_weight, 1e-6)?;
+        let q = pmetal_bridge::compat::fast::rms_norm(&q, &self.q_norm_weight, 1e-6);
+        let k = pmetal_bridge::compat::fast::rms_norm(&k, &self.k_norm_weight, 1e-6);
 
         // GDN recurrence via Metal kernel (1 dispatch) or ops fallback
         let (out, new_ssm) = gated_delta_update(
@@ -1270,7 +1259,7 @@ impl Qwen3NextGatedDeltaNet {
 
         // Gated norm (f32 precision)
         let out_n = self.norm.forward(&out, Some(&z))?;
-        let result = self.out_proj.forward(&out_n.reshape(&[b_dim, s, -1])?)?;
+        let result = self.out_proj.forward(&out_n.reshape(&[b_dim, s, -1]));
         let outputs = vec![result, new_conv, new_ssm];
 
         cache.conv_state = Some(outputs[1].clone());
@@ -1289,16 +1278,16 @@ impl Qwen3NextGatedDeltaNet {
         //   in_proj_qkvz = concat(qkv_w, z_w, axis=0)  → [key_dim*2+value_dim*2, hidden]
         //   in_proj_ba   = concat(b_w, a_w, axis=0)     → [num_v_heads*2, hidden]
         // This reduces 4 matmuls to 2, saving 2 Metal dispatches per GDN layer.
-        let qkvz_w = ops::concatenate_axis(
+        let mut qkvz_w = ops::concatenate_axis(
             &[self.in_proj_qkv.weight.as_ref(), self.in_proj_z.weight.as_ref()],
             0,
-        ).unwrap();
-        qkvz_w.eval().unwrap();
-        let ba_w = ops::concatenate_axis(
+        );
+        qkvz_w.eval();
+        let mut ba_w = ops::concatenate_axis(
             &[self.in_proj_b.weight.as_ref(), self.in_proj_a.weight.as_ref()],
             0,
-        ).unwrap();
-        ba_w.eval().unwrap();
+        );
+        ba_w.eval();
 
         let conv_w = self.conv1d.weight.as_ref().clone();
         let out_w = self.out_proj.weight.as_ref().clone();
@@ -1315,8 +1304,8 @@ impl Qwen3NextGatedDeltaNet {
         let cd = self.conv_dim;
         let ck = self.conv_kernel_size;
 
-        let closure = mlx_rs::compile::Closure::new(
-            move |inputs: &[Array]| -> Result<Vec<Array>, Exception> {
+        let closure = pmetal_bridge::compat::compile::Closure::new(
+            move |inputs: &[Array]| -> Vec<Array> {
                 let x = &inputs[0];       // [B, 1, hidden]
                 let conv_st = &inputs[1];  // [B, kernel-1, conv_dim]
                 let ssm_st = &inputs[2];   // [B, Hv, Dv, Dk]
@@ -1324,63 +1313,64 @@ impl Qwen3NextGatedDeltaNet {
                 let s = 1i32;
 
                 // 2 matmuls matching Python's in_proj_qkvz + in_proj_ba
-                let qkvz = ops::matmul(x, &qkvz_w.t())?; // [B, 1, key_dim*2+value_dim*2]
-                let ba = ops::matmul(x, &ba_w.t())?;       // [B, 1, num_v_heads*2]
+                let qkvz = ops::matmul(x, &qkvz_w.t()); // [B, 1, key_dim*2+value_dim*2]
+                let ba = ops::matmul(x, &ba_w.t());       // [B, 1, num_v_heads*2]
 
                 // Split qkvz → qkv (conv_dim) + z (value_dim)
-                let qkv = qkvz.index((.., .., ..cd));
-                let z = qkvz.index((.., .., cd..)).reshape(&[b, s, nv, dv])?;
+                let qkv = slice_last_to(&qkvz, cd);
+                let z = slice_last_from(&qkvz, cd).reshape(&[b, s, nv, dv]);
 
                 // Split ba → b_val + a (each num_v_heads)
-                let b_val = ba.index((.., .., ..nv));
-                let a = ba.index((.., .., nv..));
+                let b_val = slice_last_to(&ba, nv);
+                let a = slice_last_from(&ba, nv);
 
                 // Conv: concat old state + new input, extract new state, apply conv1d
-                let conv_in = ops::concatenate_axis(&[conv_st, &qkv], 1)?;
-                let new_conv = conv_in.index((.., (-(ck - 1)).., ..));
-                let conv_out = nn::silu(&ops::conv1d(&conv_in, &conv_w, None, None, None, Some(cd))?)?;
+                let conv_in = ops::concatenate_axis(&[conv_st, &qkv], 1);
+                let new_conv = slice_axis_from(&conv_in, 1, -(ck - 1));
+                let conv_out = nn::silu(&ops::conv1d(&conv_in, &conv_w, 1, 0, 1, cd));
 
                 // Split + reshape
-                let parts = conv_out.split_axis(&[kd, kd * 2], -1)?;
-                let q = parts[0].reshape(&[b, s, nk, dk])?;
-                let k = parts[1].reshape(&[b, s, nk, dk])?;
-                let v = parts[2].reshape(&[b, s, nv, dv])?;
+                let parts = ops::split_sections(&conv_out, &[kd, kd * 2], -1);
+                let q = parts[0].reshape(&[b, s, nk, dk]);
+                let k = parts[1].reshape(&[b, s, nk, dk]);
+                let v = parts[2].reshape(&[b, s, nv, dv]);
 
                 // Q/K normalization
-                let q = mlx_rs::fast::rms_norm(&q, &q_nw, 1e-6)?;
-                let k = mlx_rs::fast::rms_norm(&k, &k_nw, 1e-6)?;
+                let q = pmetal_bridge::compat::fast::rms_norm(&q, &q_nw, 1e-6);
+                let k = pmetal_bridge::compat::fast::rms_norm(&k, &k_nw, 1e-6);
 
                 // GDN recurrence — uses Metal kernel (1 dispatch) instead of ops (~15 nodes).
                 // compute_g inlined (not via separately-compiled closure) so the outer
                 // compile can fuse sigmoid/exp/softplus with surrounding element-wise ops.
-                let beta = nn::sigmoid(&b_val)?;
-                let g = gated_delta::compute_g_impl(&a_log, &a, &dt_bias)?;
+                let beta = nn::sigmoid(&b_val);
+                let g = gated_delta::compute_g_impl(&a_log, &a, &dt_bias)
+                    .expect("compute_g_impl failed");
                 // Metal kernel dispatch: tries fused Metal kernel first, falls back to ops
                 let (out, new_ssm) = gated_delta::gated_delta_inference_dispatch(
                     &q, &k, &v, &g, &beta, ssm_st, None,
-                )?;
+                ).expect("gated_delta_inference_dispatch failed");
 
                 // Gated norm + out projection (f32 precision for gate multiply,
                 // matching mlx-lm _precise_swiglu)
-                let out_n = mlx_rs::fast::rms_norm(&out, &norm_w, 1e-6)?;
-                let gate_f32 = nn::silu(&z.as_type::<f32>()?)?;
-                let out_f32 = out_n.as_type::<f32>()?;
-                let gated = gate_f32.multiply(&out_f32)?.as_dtype(x.dtype())?;
-                let result = ops::matmul(&gated.reshape(&[b, s, -1])?, &out_w.t())?;
+                let out_n = pmetal_bridge::compat::fast::rms_norm(&out, &norm_w, 1e-6);
+                let gate_f32 = nn::silu(&z.cast(pmetal_bridge::compat::Dtype::Float32));
+                let out_f32 = out_n.cast(pmetal_bridge::compat::Dtype::Float32);
+                let gated = gate_f32.multiply(&out_f32).as_dtype(x.dtype().as_i32());
+                let result = ops::matmul(&gated.reshape(&[b, s, -1]), &out_w.t());
 
-                Ok(vec![result, new_conv, new_ssm])
+                vec![result, new_conv, new_ssm]
             },
         );
 
         // Compile the closure — MLX traces it and caches the fused graph
-        self.compiled_decode = Some(match mlx_rs::compile::compile(&closure, false) {
+        self.compiled_decode = Some(match pmetal_bridge::compat::compile::compile(closure, false) {
             Ok(compiled) => {
                 eprintln!("[GDN] mx.compile OK");
                 compiled
             }
             Err(e) => {
                 eprintln!("[GDN] mx.compile FAILED: {e}, using uncompiled");
-                closure
+                pmetal_bridge::compat::compile::Closure::new(|_: &[Array]| vec![])
             }
         });
     }
@@ -1396,17 +1386,17 @@ impl Qwen3NextGatedDeltaNet {
         let s = shape[1];
 
         let input_proj_start = Instant::now();
-        let (qkv, z, b_val, a) = self.combined_input_projection(inputs)?;
-        qkv.eval()?;
-        z.eval()?;
-        b_val.eval()?;
-        a.eval()?;
+        let (mut qkv, mut z, mut b_val, mut a) = self.combined_input_projection(inputs)?;
+        qkv.eval();
+        z.eval();
+        b_val.eval();
+        a.eval();
         layer_profile.push_section("gdn_input_proj", input_proj_start);
 
         let conv_start = Instant::now();
         let conv_input = cache.update_conv_state(&qkv, self.conv_kernel_size)?;
-        let conv_out = nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?;
-        conv_out.eval()?;
+        let mut conv_out = nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?);
+        conv_out.eval();
         layer_profile.push_section("gdn_conv", conv_start);
 
         self.finish_forward_from_conv_out_profiled(
@@ -1435,18 +1425,18 @@ impl Qwen3NextGatedDeltaNet {
     ) -> Result<Array, Exception> {
         // Split conv output into q, k, v using mx.split (1 op vs 3 index ops).
         // Matches mlx-lm qwen3_5.py line 163: mx.split(conv_out, [...], -1)
-        let splits = conv_out.split_axis(&[self.key_dim, self.key_dim * 2], -1)?;
+        let splits = ops::split_sections(&conv_out, &[self.key_dim, self.key_dim * 2], -1);
         let (q_conv, k_conv, v_conv) = (&splits[0], &splits[1], &splits[2]);
 
         // Reshape to head dimensions.
         // For T=1 decode, conv output seq_len already matches (no trim needed).
-        let q_conv = q_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim])?;
-        let k_conv = k_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim])?;
-        let v_conv = v_conv.reshape(&[batch, seq_len, self.num_v_heads, self.head_v_dim])?;
+        let q_conv = q_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim]);
+        let k_conv = k_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim]);
+        let v_conv = v_conv.reshape(&[batch, seq_len, self.num_v_heads, self.head_v_dim]);
 
         // Q/K normalization: fast::rms_norm (fused Metal op) with pre-baked scale weights.
-        let q_normed = mlx_rs::fast::rms_norm(&q_conv, &self.q_norm_weight, 1e-6)?;
-        let k_normed = mlx_rs::fast::rms_norm(&k_conv, &self.k_norm_weight, 1e-6)?;
+        let q_normed = pmetal_bridge::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, 1e-6);
+        let k_normed = pmetal_bridge::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, 1e-6);
 
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
 
@@ -1472,7 +1462,7 @@ impl Qwen3NextGatedDeltaNet {
         if mask.is_none() && seq_len == 1 && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN {
             self.decode_out_projection(&out, batch)
         } else {
-            self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])?)
+            Ok(self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])))
         }
     }
 
@@ -1489,28 +1479,28 @@ impl Qwen3NextGatedDeltaNet {
         layer_profile: &mut Qwen3NextLayerProfile,
     ) -> Result<Array, Exception> {
         let recurrence_start = Instant::now();
-        let q_conv = conv_out.index((.., .., ..self.key_dim));
-        let k_conv = conv_out.index((.., .., self.key_dim..self.key_dim * 2));
-        let v_conv = conv_out.index((.., .., self.key_dim * 2..));
+        let q_conv = slice_last_to(&conv_out, self.key_dim);
+        let k_conv = slice_axis(&conv_out, -1, self.key_dim, self.key_dim * 2);
+        let v_conv = slice_last_from(&conv_out, self.key_dim * 2);
         let out_len = q_conv.dim(1);
-        let q_conv = q_conv.index((.., (out_len - seq_len).., ..)).reshape(&[
+        let q_conv = slice_axis_from(&q_conv, 1, (out_len - seq_len)).reshape(&[
             batch,
             seq_len,
             self.num_k_heads,
             self.head_k_dim,
-        ])?;
-        let k_conv = k_conv.index((.., (out_len - seq_len).., ..)).reshape(&[
+        ]);
+        let k_conv = slice_axis_from(&k_conv, 1, (out_len - seq_len)).reshape(&[
             batch,
             seq_len,
             self.num_k_heads,
             self.head_k_dim,
-        ])?;
-        let v_conv = v_conv.index((.., (out_len - seq_len).., ..)).reshape(&[
+        ]);
+        let v_conv = slice_axis_from(&v_conv, 1, (out_len - seq_len)).reshape(&[
             batch,
             seq_len,
             self.num_v_heads,
             self.head_v_dim,
-        ])?;
+        ]);
         // Q/K normalization: use fast::rms_norm (1 fused Metal op) instead of
         // l2norm_last_dim (5 separate ops). Matches mlx-lm's qwen3_5.py exactly.
         // Pass ones weight since mlx-rs binding requires a weight array.
@@ -1518,10 +1508,10 @@ impl Qwen3NextGatedDeltaNet {
         // scale factors. inv_scale = 1/sqrt(dk).
         // q gets inv_scale² (because rms_norm divides by sqrt(mean) not sqrt(sum)),
         // k gets inv_scale.
-        let q_normed = mlx_rs::fast::rms_norm(&q_conv, &self.q_norm_weight, 1e-6)?;
-        let k_normed = mlx_rs::fast::rms_norm(&k_conv, &self.k_norm_weight, 1e-6)?;
+        let q_normed = pmetal_bridge::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, 1e-6);
+        let k_normed = pmetal_bridge::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, 1e-6);
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
-        let (out, new_state) = gated_delta_update(
+        let (mut out, new_state) = gated_delta_update(
             &q_normed,
             &k_normed,
             &v_conv,
@@ -1533,7 +1523,7 @@ impl Qwen3NextGatedDeltaNet {
             mask,
             false,
         )?;
-        out.eval()?;
+        out.eval();
         layer_profile.push_section("gdn_recurrence", recurrence_start);
 
         if let Some(cache) = cache {
@@ -1542,16 +1532,15 @@ impl Qwen3NextGatedDeltaNet {
 
         let out_proj_start = Instant::now();
         let out = self.norm.forward(&out, Some(z))?;
-        let projected = if mask.is_none()
+        let mut projected = if mask.is_none()
             && seq_len == 1
             && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
         {
             self.decode_out_projection(&out, batch)?
         } else {
-            self.out_proj
-                .forward(&out.reshape(&[batch, seq_len, -1])?)?
+            self.out_proj.forward(&out.reshape(&[batch, seq_len, -1]))
         };
-        projected.eval()?;
+        projected.eval();
         layer_profile.push_section("gdn_out_proj", out_proj_start);
         Ok(projected)
     }
@@ -1571,15 +1560,15 @@ impl Qwen3NextGatedDeltaNet {
         let qkv = if decode_linear {
             Self::decode_linear_projection(inputs, self.in_proj_qkv.weight.as_ref(), self.conv_dim)?
         } else {
-            self.in_proj_qkv.forward(inputs)?
+            self.in_proj_qkv.forward(inputs)
         };
         let z = if decode_linear {
             Self::decode_linear_projection(inputs, self.in_proj_z.weight.as_ref(), self.value_dim)?
-                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?
+                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])
         } else {
             self.in_proj_z
-                .forward(inputs)?
-                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?
+                .forward(inputs)
+                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])
         };
         let b_val = if decode_linear {
             Self::decode_linear_projection(
@@ -1588,7 +1577,7 @@ impl Qwen3NextGatedDeltaNet {
                 self.num_v_heads,
             )?
         } else {
-            self.in_proj_b.forward(inputs)?
+            self.in_proj_b.forward(inputs)
         };
         let a = if decode_linear {
             Self::decode_linear_projection(
@@ -1597,25 +1586,26 @@ impl Qwen3NextGatedDeltaNet {
                 self.num_v_heads,
             )?
         } else {
-            self.in_proj_a.forward(inputs)?
+            self.in_proj_a.forward(inputs)
         };
         let qkv = if let Some(mask) = mask {
-            let mask_expanded = mask.reshape(&[mask.dim(0), mask.dim(1), 1])?;
-            ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0))?
+            let mask_expanded = mask.reshape(&[mask.dim(0), mask.dim(1), 1]);
+            ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0))
         } else {
             qkv
         };
 
-        let conv_out = if let Some(cache_entry) = cache.as_deref_mut() {
+
+        let mut conv_out = if let Some(cache_entry) = cache.as_deref_mut() {
             let conv_input = cache_entry.update_conv_state(&qkv, self.conv_kernel_size)?;
-            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?
+            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
         } else {
-            let conv_state = mlx_rs::ops::zeros_dtype(
+            let conv_state = pmetal_bridge::compat::ops::zeros_dtype(
                 &[b, self.conv_kernel_size - 1, self.conv_dim],
                 qkv.dtype(),
-            )?;
-            let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1)?;
-            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?
+            );
+            let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1);
+            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
         };
 
         self.finish_forward_from_conv_out(&conv_out, b, s, &z, &a, &b_val, mask, cache)
@@ -1654,57 +1644,57 @@ impl Qwen3NextGatedDeltaNet {
         let decode_linear = self.should_use_flattened_decode_proj(inputs, mask);
 
         let qkv_start = Instant::now();
-        let qkv = if decode_linear {
+        let mut qkv = if decode_linear {
             Self::decode_linear_projection(inputs, self.in_proj_qkv.weight.as_ref(), self.conv_dim)?
         } else {
-            self.in_proj_qkv.forward(inputs)?
+            self.in_proj_qkv.forward(inputs)
         };
-        qkv.eval()?;
+        qkv.eval();
         layer_profile.push_section("gdn_input_qkv", qkv_start);
 
         let z_start = Instant::now();
-        let z = if decode_linear {
+        let mut z = if decode_linear {
             Self::decode_linear_projection(inputs, self.in_proj_z.weight.as_ref(), self.value_dim)?
-                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?
+                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])
         } else {
             self.in_proj_z
-                .forward(inputs)?
-                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?
+                .forward(inputs)
+                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])
         };
-        z.eval()?;
+        z.eval();
         layer_profile.push_section("gdn_input_z", z_start);
 
         let b_start = Instant::now();
-        let b_val = if decode_linear {
+        let mut b_val = if decode_linear {
             Self::decode_linear_projection(
                 inputs,
                 self.in_proj_b.weight.as_ref(),
                 self.num_v_heads,
             )?
         } else {
-            self.in_proj_b.forward(inputs)?
+            self.in_proj_b.forward(inputs)
         };
-        b_val.eval()?;
+        b_val.eval();
         layer_profile.push_section("gdn_input_b", b_start);
 
         let a_start = Instant::now();
-        let a = if decode_linear {
+        let mut a = if decode_linear {
             Self::decode_linear_projection(
                 inputs,
                 self.in_proj_a.weight.as_ref(),
                 self.num_v_heads,
             )?
         } else {
-            self.in_proj_a.forward(inputs)?
+            self.in_proj_a.forward(inputs)
         };
-        a.eval()?;
+        a.eval();
         layer_profile.push_section("gdn_input_a", a_start);
 
         let qkv = if let Some(mask) = mask {
             let mask_start = Instant::now();
-            let mask_expanded = mask.reshape(&[mask.dim(0), mask.dim(1), 1])?;
-            let masked = ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0))?;
-            masked.eval()?;
+            let mask_expanded = mask.reshape(&[mask.dim(0), mask.dim(1), 1]);
+            let mut masked = ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0));
+            masked.eval();
             layer_profile.push_section("gdn_input_mask", mask_start);
             masked
         } else {
@@ -1714,16 +1704,16 @@ impl Qwen3NextGatedDeltaNet {
         let conv_start = Instant::now();
         let conv_out = if let Some(cache_entry) = cache.as_deref_mut() {
             let conv_input = cache_entry.update_conv_state(&qkv, self.conv_kernel_size)?;
-            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?
+            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
         } else {
-            let conv_state = mlx_rs::ops::zeros_dtype(
+            let conv_state = pmetal_bridge::compat::ops::zeros_dtype(
                 &[b, self.conv_kernel_size - 1, self.conv_dim],
                 qkv.dtype(),
-            )?;
-            let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1)?;
-            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?
+            );
+            let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1);
+            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
         };
-        conv_out.eval()?;
+        conv_out.eval();
         layer_profile.push_section("gdn_conv", conv_start);
 
         self.finish_forward_from_conv_out_profiled(
@@ -1742,30 +1732,24 @@ impl Qwen3NextGatedDeltaNet {
 
 fn l2norm_last_dim(x: &Array, eps: f32) -> Result<Array, Exception> {
     let norm = x
-        .square()?
-        .sum_axis(-1, true)?
-        .add(&Array::from_f32(eps))?
-        .sqrt()?;
-    x.divide(&norm)
+        .square()
+        .sum_axis(-1, true)
+        .add(&Array::from_f32(eps))
+        .sqrt();
+    Ok(x.divide(&norm))
 }
 
 // ============================================================================
 // Sparse MoE Block
 // ============================================================================
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3NextSparseMoeBlock {
-    #[param]
     pub gate: nn::Linear,
-    #[param]
     pub switch_mlp_gate_proj: Param<Array>,
-    #[param]
     pub switch_mlp_up_proj: Param<Array>,
-    #[param]
     pub switch_mlp_down_proj: Param<Array>,
-    #[param]
     pub shared_expert: Qwen3NextMLP,
-    #[param]
     pub shared_expert_gate: nn::Linear,
     pub num_experts: i32,
     pub top_k: i32,
@@ -1794,6 +1778,8 @@ pub struct Qwen3NextSparseMoeBlock {
     /// Weight pointer signature used to invalidate the shared projection cache.
     pub shared_combined_in_proj_signature: Option<Vec<usize>>,
 }
+impl_module_params!(Qwen3NextSparseMoeBlock; gate, switch_mlp_gate_proj, switch_mlp_up_proj, switch_mlp_down_proj, shared_expert, shared_expert_gate);
+
 
 impl Qwen3NextSparseMoeBlock {
     const DEFAULT_PREFILL_EXPERT_WINDOW_TOKENS: usize = 8;
@@ -1843,22 +1829,23 @@ impl Qwen3NextSparseMoeBlock {
         // SwitchGLU stacked weights: [num_experts, intermediate_size, dim] etc.
         let routed_experts_loaded = routed_expert_mode == Qwen3NextRoutedExpertMode::Resident;
         let gate_proj = if routed_experts_loaded {
-            Array::zeros::<f32>(&[num_experts, intermediate_size, dim])?
+            Array::zeros_f32(&[num_experts, intermediate_size, dim])
         } else {
-            Array::zeros::<f32>(&[1])?
+            Array::zeros_f32(&[1])
         };
         let up_proj = if routed_experts_loaded {
-            Array::zeros::<f32>(&[num_experts, intermediate_size, dim])?
+            Array::zeros_f32(&[num_experts, intermediate_size, dim])
         } else {
-            Array::zeros::<f32>(&[1])?
+            Array::zeros_f32(&[1])
         };
         let down_proj = if routed_experts_loaded {
-            Array::zeros::<f32>(&[num_experts, dim, intermediate_size])?
+            Array::zeros_f32(&[num_experts, dim, intermediate_size])
         } else {
-            Array::zeros::<f32>(&[1])?
+            Array::zeros_f32(&[1])
         };
 
         let shared_expert = Qwen3NextMLP::new(dim, config.shared_expert_intermediate_size)?;
+
         let shared_expert_gate = nn::LinearBuilder::new(dim, 1).bias(false).build()?;
         let prefill_expert_window_tokens = Self::configured_prefill_expert_window_tokens();
 
@@ -1888,9 +1875,9 @@ impl Qwen3NextSparseMoeBlock {
 
     fn current_shared_input_proj_signature(&self) -> Vec<usize> {
         vec![
-            self.shared_expert.gate_proj.weight.as_ref().as_ptr().ctx as usize,
-            self.shared_expert.up_proj.weight.as_ref().as_ptr().ctx as usize,
-            self.shared_expert_gate.weight.as_ref().as_ptr().ctx as usize,
+            self.shared_expert.gate_proj.weight.as_ref().data_ptr() as usize,
+            self.shared_expert.up_proj.weight.as_ref().data_ptr() as usize,
+            self.shared_expert_gate.weight.as_ref().data_ptr() as usize,
         ]
     }
 
@@ -1906,8 +1893,8 @@ impl Qwen3NextSparseMoeBlock {
                 self.shared_expert_gate.weight.as_ref().clone(),
             ];
             let weight_refs: Vec<&Array> = weights.iter().collect();
-            let combined = ops::concatenate_axis(&weight_refs, 0)?;
-            combined.eval()?;
+            let mut combined = ops::concatenate_axis(&weight_refs, 0);
+            combined.eval();
             self.shared_combined_in_proj_weight = Some(combined);
             self.shared_combined_in_proj_signature = Some(signature);
         }
@@ -1926,20 +1913,19 @@ impl Qwen3NextSparseMoeBlock {
         let x_flat = if shape.len() == 2 {
             x.clone()
         } else {
-            x.reshape(&[batch_seq, hidden])?
+            x.reshape(&[batch_seq, hidden])
         };
 
         let combined_weight = self.ensure_shared_combined_input_proj_weight()?;
-        let projected = ops::matmul(&x_flat, &combined_weight.t())?;
+        let mut projected = ops::matmul(&x_flat, &combined_weight.t());
         let intermediate = self.shared_expert.gate_proj.weight.as_ref().dim(0);
 
-        let gate = projected.index((.., ..intermediate));
-        let up = projected.index((.., intermediate..intermediate * 2));
-        let shared_gate_logit = projected
-            .index((.., intermediate * 2..))
-            .reshape(&[batch_seq, 1])?;
-        let hidden = nn::silu(&gate)?.multiply(&up)?;
-        let shared_y = ops::matmul(&hidden, &self.shared_expert.down_proj.weight.as_ref().t())?;
+        let gate = slice_last_to(&projected, intermediate);
+        let up = slice_axis(&projected, -1, intermediate, intermediate * 2);
+        let shared_gate_logit = slice_last_from(&projected, intermediate * 2)
+            .reshape(&[batch_seq, 1]);
+        let hidden = nn::silu(&gate).multiply(&up);
+        let shared_y = ops::matmul(&hidden, &self.shared_expert.down_proj.weight.as_ref().t());
 
         Ok((shared_y, shared_gate_logit))
     }
@@ -2045,39 +2031,38 @@ impl Qwen3NextSparseMoeBlock {
         let shape = x.shape();
         let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
         let hidden = shape[shape.len() - 1];
-        let x_flat = x.reshape(&[batch_seq, hidden])?;
+        let x_flat = x.reshape(&[batch_seq, hidden]);
 
         // Compute routing probabilities
-        let gate_logits = self.gate.forward(&x_flat)?;
+        let gate_logits = self.gate.forward(&x_flat);
         let gates = ops::softmax_axis(
-            &if gate_logits.dtype() != mlx_rs::Dtype::Float32 {
-                gate_logits.as_type::<f32>()?
+            &if gate_logits.dtype() != pmetal_bridge::compat::Dtype::Float32 {
+                gate_logits.cast(pmetal_bridge::compat::Dtype::Float32)
             } else {
                 gate_logits
             },
             -1,
-            None,
-        )?;
+        );
 
         // Top-k selection via argpartition: O(E) vs O(E log E) argsort.
         // argpartition(-gates, -k, -1) places the k largest at the end.
         let k = self.top_k;
         let neg_k = -k;
-        let part_indices = ops::argpartition_axis(&gates.negative()?, neg_k, -1)?;
-        let top_indices = part_indices.index((.., neg_k..));
-        let top_weights = gates.take_along_axis(&top_indices, -1)?;
+        let part_indices = ops::argpartition_axis(&gates.negative(), neg_k, -1);
+        let top_indices = slice_last_from(&part_indices, neg_k);
+        let top_weights = gates.take_along_axis(&top_indices, -1);
 
         let top_weights = if self.norm_topk_prob {
-            let weight_sum = top_weights.sum_axis(-1, Some(true))?;
-            let safe_sum = ops::maximum(&weight_sum, &Array::from_f32(1e-8))?;
-            top_weights.divide(&safe_sum)?
+            let weight_sum = top_weights.sum_axis(-1, true);
+            let safe_sum = ops::maximum(&weight_sum, &Array::from_f32(1e-8));
+            top_weights.divide(&safe_sum)
         } else {
             top_weights
         };
 
         // SwitchGLU forward using gather_mm
         // x_flat: [N, D], indices: [N, k]
-        let top_indices_i32 = top_indices.as_type::<i32>()?;
+        let top_indices_i32 = top_indices.cast(pmetal_bridge::compat::Dtype::Int32);
 
         // gather_mm: batch matmul with expert selection
         let gate_out = gather_mm(
@@ -2095,7 +2080,7 @@ impl Qwen3NextSparseMoeBlock {
             false,
         )?; // [N, k, intermediate]
 
-        let activated = nn::silu(&gate_out)?.multiply(&up_out)?;
+        let activated = nn::silu(&gate_out).multiply(&up_out);
 
         // Down projection — gather_mm handles [N, k, intermediate] directly with
         // rhs_indices [N, k], selecting per-expert weight for each (token, slot) pair.
@@ -2121,8 +2106,8 @@ impl Qwen3NextSparseMoeBlock {
             &shared_gate_logit,
             k,
             batch_seq,
-        )?;
-        result.reshape(shape)
+        );
+        Ok(result?.reshape(shape))
     }
 
     pub fn forward_profiled(
@@ -2135,43 +2120,42 @@ impl Qwen3NextSparseMoeBlock {
         }
 
         let start = Instant::now();
-        let output = self.forward(x)?;
-        output.eval()?;
+        let mut output = self.forward(x)?;
+        output.eval();
         layer_profile.push_section("moe_resident", start);
         Ok(output)
     }
 
     fn route_experts(&mut self, x_flat: &Array) -> Result<(Array, Vec<usize>, i32), Exception> {
-        let gate_logits = self.gate.forward(x_flat)?;
+        let gate_logits = self.gate.forward(x_flat);
         let gates = ops::softmax_axis(
-            &if gate_logits.dtype() != mlx_rs::Dtype::Float32 {
-                gate_logits.as_type::<f32>()?
+            &if gate_logits.dtype() != pmetal_bridge::compat::Dtype::Float32 {
+                gate_logits.cast(pmetal_bridge::compat::Dtype::Float32)
             } else {
                 gate_logits
             },
             -1,
-            None,
-        )?;
+        );
 
         let k = self.top_k;
-        let neg_gates = gates.negative()?;
+        let neg_gates = gates.negative();
         let neg_k = -k;
-        let part_indices = ops::argpartition_axis(&neg_gates, neg_k, -1)?;
-        let top_indices = part_indices.index((.., neg_k..));
-        let top_weights = gates.take_along_axis(&top_indices, -1)?;
+        let part_indices = ops::argpartition_axis(&neg_gates, neg_k, -1);
+        let top_indices = slice_last_from(&part_indices, neg_k);
+        let top_weights = gates.take_along_axis(&top_indices, -1);
 
         let top_weights = if self.norm_topk_prob {
-            let weight_sum = top_weights.sum_axis(-1, Some(true))?;
-            let safe_sum = ops::maximum(&weight_sum, &Array::from_f32(1e-8))?;
-            top_weights.divide(&safe_sum)?
+            let weight_sum = top_weights.sum_axis(-1, true);
+            let safe_sum = ops::maximum(&weight_sum, &Array::from_f32(1e-8));
+            top_weights.divide(&safe_sum)
         } else {
             top_weights
         };
 
-        let top_indices_i32 = top_indices.as_type::<i32>()?;
-        top_indices_i32.eval()?;
-        let flat_indices: Vec<i32> = top_indices_i32.as_slice().to_vec();
-        let expert_indices: Vec<usize> = flat_indices.iter().map(|&i| i as usize).collect();
+        let mut top_indices_u32 = top_indices.cast(pmetal_bridge::compat::Dtype::Uint32);
+        top_indices_u32.eval();
+        let flat_u32: Vec<u32> = top_indices_u32.as_slice().to_vec();
+        let expert_indices: Vec<usize> = flat_u32.iter().map(|&i| i as usize).collect();
 
         Ok((top_weights, expert_indices, k))
     }
@@ -2205,7 +2189,7 @@ impl Qwen3NextSparseMoeBlock {
         let shape = x.shape();
         let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
         let hidden = shape[shape.len() - 1];
-        let x_flat = x.reshape(&[batch_seq, hidden])?;
+        let x_flat = x.reshape(&[batch_seq, hidden]);
 
         // The fused offloaded expert path is still single-token at the kernel
         // level. For prompt prefill, process small token windows with exact
@@ -2226,9 +2210,8 @@ impl Qwen3NextSparseMoeBlock {
             for window_start in (0..batch_seq as usize).step_by(prefill_window_tokens) {
                 let window_end = (window_start + prefill_window_tokens).min(batch_seq as usize);
                 let window_len = (window_end - window_start) as i32;
-                let window_input = x_flat
-                    .index((window_start as i32..window_end as i32, ..))
-                    .reshape(&[window_len, hidden])?;
+                let window_input = slice_axis(&x_flat, 0, window_start as i32, window_end as i32)
+                    .reshape(&[window_len, hidden]);
 
                 let route_start = Instant::now();
                 let (window_top_weights, window_expert_indices, k) =
@@ -2273,7 +2256,7 @@ impl Qwen3NextSparseMoeBlock {
                         .collect();
 
                     let io_start = Instant::now();
-                    let aligned_load = if miss_plan.len() == unique_experts.len() {
+                    let aligned_load: Result<(), Exception> = if miss_plan.len() == unique_experts.len() {
                         ctx.read_experts_aligned(layer_idx, &unique_experts, &mut unique_bufs)
                             .map_err(|e| {
                                 Exception::custom(format!(
@@ -2314,11 +2297,10 @@ impl Qwen3NextSparseMoeBlock {
                         .create_command_buffer()
                         .map_err(|e| Exception::custom(e.to_string()))?;
                     for token_offset in 0..window_len as usize {
-                        let token_input = window_input
-                            .index((token_offset as i32, ..))
-                            .reshape(&[1, hidden])?;
-                        let token_input_f32 = token_input.as_type::<f32>()?;
-                        token_input_f32.eval()?;
+                        let token_input = select_axis(&window_input, token_offset as i32, 0)
+                            .reshape(&[1, hidden]);
+                        let token_input_f32 = token_input.cast(pmetal_bridge::compat::Dtype::Float32);
+                        token_input_f32.eval();
                         let input_buf = pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(
                             &metal_ctx,
                             &token_input_f32,
@@ -2399,11 +2381,10 @@ impl Qwen3NextSparseMoeBlock {
                         .create_command_buffer()
                         .map_err(|e| Exception::custom(e.to_string()))?;
                     for token_offset in 0..window_len as usize {
-                        let token_input = window_input
-                            .index((token_offset as i32, ..))
-                            .reshape(&[1, hidden])?;
-                        let token_input_f32 = token_input.as_type::<f32>()?;
-                        token_input_f32.eval()?;
+                        let token_input = select_axis(&window_input, token_offset as i32, 0)
+                            .reshape(&[1, hidden]);
+                        let token_input_f32 = token_input.cast(pmetal_bridge::compat::Dtype::Float32);
+                        token_input_f32.eval();
                         let input_buf = pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(
                             &metal_ctx,
                             &token_input_f32,
@@ -2445,10 +2426,10 @@ impl Qwen3NextSparseMoeBlock {
                 };
 
                 let shared_start = Instant::now();
-                let (shared_y, shared_gate_logit) =
+                let (mut shared_y, mut shared_gate_logit) =
                     self.forward_shared_expert_and_gate(&window_input)?;
-                shared_y.eval()?;
-                shared_gate_logit.eval()?;
+                shared_y.eval();
+                shared_gate_logit.eval();
                 if let Some(profile) = layer_profile.as_deref_mut() {
                     profile.push_section("moe_prefill_shared", shared_start);
                 }
@@ -2479,7 +2460,7 @@ impl Qwen3NextSparseMoeBlock {
                         let slice = self.expert_out_bufs[output_slot].as_slice();
                         expert_arrays.push(Array::from_slice(slice, &[1, hidden]));
                     }
-                    let down_out = ops::stack_axis(&expert_arrays, 1)?.reshape(&[k, hidden])?;
+                    let down_out = ops::stack_axis(&expert_arrays, 1).reshape(&[k, hidden]);
                     window_down_tokens.push(down_out);
                 }
                 if let Some(profile) = layer_profile.as_deref_mut() {
@@ -2487,9 +2468,8 @@ impl Qwen3NextSparseMoeBlock {
                 }
 
                 let combine_start = Instant::now();
-                let down_refs: Vec<&Array> = window_down_tokens.iter().collect();
                 let window_down_out =
-                    ops::stack_axis(&down_refs, 0)?.reshape(&[window_len, k, hidden])?;
+                    ops::stack_axis(&window_down_tokens, 0).reshape(&[window_len, k, hidden]);
                 let window_output = moe_combine_mlx(
                     &window_input,
                     &window_down_out,
@@ -2499,15 +2479,15 @@ impl Qwen3NextSparseMoeBlock {
                     k,
                     window_len,
                 )?
-                .reshape(&[window_len, hidden])?;
+                .reshape(&[window_len, hidden]);
                 if let Some(profile) = layer_profile.as_deref_mut() {
                     profile.push_section("moe_prefill_combine", combine_start);
                 }
                 window_outputs.push(window_output);
             }
             let window_refs: Vec<&Array> = window_outputs.iter().collect();
-            let stacked = ops::concatenate_axis(&window_refs, 0)?.reshape(shape)?;
-            stacked.eval()?;
+            let stacked = ops::concatenate_axis(&window_refs, 0).reshape(shape);
+            stacked.eval();
             if let Some(profile) = layer_profile.as_deref_mut() {
                 profile.push_section("moe_prefill_windowed", prefill_start);
             }
@@ -2556,8 +2536,8 @@ impl Qwen3NextSparseMoeBlock {
             let record = &ctx.layout.record;
 
             // x_flat to Metal buffer (tiny for T=1 decode)
-            let x_flat_f32 = x_flat.as_type::<f32>()?;
-            x_flat_f32.eval()?;
+            let x_flat_f32 = x_flat.cast(pmetal_bridge::compat::Dtype::Float32);
+            x_flat_f32.eval();
             let input_buf =
                 pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(&metal_ctx, &x_flat_f32)
                     .map_err(|e| Exception::custom(e.to_string()))?;
@@ -2747,9 +2727,10 @@ impl Qwen3NextSparseMoeBlock {
                 cmd_buf
             };
             let shared_start = Instant::now();
-            let (shared_y, shared_gate_logit) = self.forward_shared_expert_and_gate(&x_flat)?;
-            shared_y.eval()?;
-            shared_gate_logit.eval()?;
+            let (mut shared_y, mut shared_gate_logit) =
+                self.forward_shared_expert_and_gate(&x_flat)?;
+            shared_y.eval();
+            shared_gate_logit.eval();
             if let Some(profile) = layer_profile.as_deref_mut() {
                 profile.push_section("moe_shared", shared_start);
             }
@@ -2783,8 +2764,8 @@ impl Qwen3NextSparseMoeBlock {
                 let slice = self.expert_out_bufs[i].as_slice();
                 expert_arrays.push(Array::from_slice(slice, &[1, hidden]));
             }
-            let down_out = ops::stack_axis(&expert_arrays, 1)?;
-            let down_out = down_out.reshape(&[batch_seq, k, hidden])?;
+            let down_out = ops::stack_axis(&expert_arrays, 1);
+            let down_out = down_out.reshape(&[batch_seq, k, hidden]);
             if let Some(profile) = layer_profile.as_deref_mut() {
                 profile.push_section("moe_output_wrap", output_wrap_start);
             }
@@ -2798,8 +2779,8 @@ impl Qwen3NextSparseMoeBlock {
                 k,
                 batch_seq,
             )?;
-            let reshaped = result.reshape(shape)?;
-            reshaped.eval()?;
+            let mut reshaped = result.reshape(shape);
+            reshaped.eval();
             if let Some(profile) = layer_profile {
                 profile.push_section("moe_combine", combine_start);
             }
@@ -2828,7 +2809,8 @@ fn copy_prefetched_expert_into_aligned(
 ) -> Result<(), Exception> {
     aligned
         .write_prefix(raw_bytes)
-        .map_err(|e| Exception::custom(e.to_string()))
+        .map_err(|e| Exception::custom(e.to_string()))?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2935,7 +2917,13 @@ impl Qwen3NextFeedForward {
         layer_profile: &mut Qwen3NextLayerProfile,
     ) -> Result<Array, Exception> {
         match self {
-            Self::Dense(m) => profile_array_section(layer_profile, "mlp_dense", || m.forward(x)),
+            Self::Dense(m) => {
+                let start = Instant::now();
+                let mut output = m.forward(x)?;
+                output.eval();
+                layer_profile.push_section("mlp_dense", start);
+                Ok(output)
+            }
             Self::MoE(m) => m.forward_profiled(x, layer_profile),
         }
     }
@@ -2948,20 +2936,17 @@ impl Qwen3NextFeedForward {
 /// Hybrid decoder layer: uses `linear_attn` (GDN) OR `self_attn` (full attention)
 /// based on layer index. Option fields produce correct HF weight key names
 /// (e.g. `model.layers.0.linear_attn.in_proj_qkv.weight`).
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3NextDecoderLayer {
     pub is_linear: bool,
-    #[param]
     pub linear_attn: Option<Qwen3NextGatedDeltaNet>,
-    #[param]
     pub self_attn: Option<Qwen3NextAttention>,
-    #[param]
     pub input_layernorm: nn::RmsNorm,
-    #[param]
     pub post_attention_layernorm: nn::RmsNorm,
-    #[param]
     pub mlp: Qwen3NextFeedForward,
 }
+impl_module_params!(Qwen3NextDecoderLayer; linear_attn, self_attn, input_layernorm, post_attention_layernorm, mlp);
+
 
 impl Qwen3NextDecoderLayer {
     pub fn new(config: &Qwen3NextConfig, layer_idx: usize) -> Result<Self, Exception> {
@@ -3022,7 +3007,7 @@ impl Qwen3NextDecoderLayer {
         kv_cache: Option<(&mut KVCache, usize)>,
         mamba_cache: Option<&mut MambaCacheEntry>,
     ) -> Result<Array, Exception> {
-        let normed = self.input_layernorm.forward(x)?;
+        let normed = self.input_layernorm.forward(x);
         let r = if self.is_linear {
             self.linear_attn
                 .as_mut()
@@ -3034,9 +3019,10 @@ impl Qwen3NextDecoderLayer {
                 .expect("self_attn must be Some for attention layers")
                 .forward(&normed, mask, kv_cache)?
         };
-        let h = x.add(&r)?;
-        let mlp_in = self.post_attention_layernorm.forward(&h)?;
-        h.add(&self.mlp.forward(&mlp_in)?)
+        let h = x.add(&r);
+        let mlp_in = self.post_attention_layernorm.forward(&h);
+        let mlp_out = self.mlp.forward(&mlp_in)?;
+        Ok(h.add(&mlp_out))
     }
 
     pub fn forward_profiled(
@@ -3052,7 +3038,7 @@ impl Qwen3NextDecoderLayer {
 
         let normed = profile_array_section(&mut profile, "input_layernorm", || {
             self.input_layernorm.forward(x)
-        })?;
+        });
         let r = if self.is_linear {
             self.linear_attn
                 .as_mut()
@@ -3064,15 +3050,16 @@ impl Qwen3NextDecoderLayer {
                 .expect("self_attn must be Some for attention layers")
                 .forward_profiled(&normed, mask, kv_cache, &mut profile)?
         };
-        let h = profile_array_section(&mut profile, "attn_residual", || x.add(&r))?;
+        let h = profile_array_section(&mut profile, "attn_residual", || x.add(&r));
         let mlp_in = profile_array_section(&mut profile, "post_attention_layernorm", || {
             self.post_attention_layernorm.forward(&h)
-        })?;
+        });
         let mlp_start = Instant::now();
         let mlp_out = self.mlp.forward_profiled(&mlp_in, &mut profile)?;
-        mlp_out.eval()?;
+        let mut mlp_out_eval = mlp_out.clone();
+        mlp_out_eval.eval();
         profile.push_section("mlp", mlp_start);
-        let out = profile_array_section(&mut profile, "mlp_residual", || h.add(&mlp_out))?;
+        let out = profile_array_section(&mut profile, "mlp_residual", || h.add(&mlp_out));
         profile.total_us = layer_start.elapsed().as_micros() as u64;
         Ok((out, profile))
     }
@@ -3082,13 +3069,10 @@ impl Qwen3NextDecoderLayer {
 // Model
 // ============================================================================
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3NextModel {
-    #[param]
     pub embed_tokens: nn::Embedding,
-    #[param]
     pub layers: Vec<Qwen3NextDecoderLayer>,
-    #[param]
     pub norm: nn::RmsNorm,
     pub full_attention_interval: i32,
     /// Shared expert offload context (set via `enable_expert_offloading`).
@@ -3098,6 +3082,8 @@ pub struct Qwen3NextModel {
     /// Pre-computed indices of MoE layers for fast next-MoE lookup during prefetch.
     pub moe_layer_indices: Vec<usize>,
 }
+impl_module_params!(Qwen3NextModel; embed_tokens, layers, norm);
+
 
 impl Qwen3NextModel {
     pub fn new(config: &Qwen3NextConfig) -> Result<Self, Exception> {
@@ -3199,7 +3185,7 @@ impl Qwen3NextModel {
             }
         }
 
-        let hidden = self.norm.forward(&hidden)?;
+        let hidden = self.norm.forward(&hidden);
         if prefill_like && let Some(prefetcher) = &self.prefetcher {
             prefetcher.reset_pending();
         }
@@ -3219,7 +3205,7 @@ impl Qwen3NextModel {
 
         let embed_start = Instant::now();
         let mut hidden = Module::forward(&mut self.embed_tokens, input_ids)?;
-        hidden.eval()?;
+        hidden.eval();
         profile.embedding_us = embed_start.elapsed().as_micros() as u64;
 
         let fa_mask = mask;
@@ -3265,8 +3251,8 @@ impl Qwen3NextModel {
         }
 
         let final_norm_start = Instant::now();
-        let hidden = self.norm.forward(&hidden)?;
-        hidden.eval()?;
+        let hidden = self.norm.forward(&hidden);
+        hidden.eval();
         profile.final_norm_us = final_norm_start.elapsed().as_micros() as u64;
         if prefill_like && let Some(prefetcher) = &self.prefetcher {
             prefetcher.reset_pending();
@@ -3280,20 +3266,20 @@ impl Qwen3NextModel {
 // ForCausalLM
 // ============================================================================
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3NextForCausalLM {
-    #[param]
     pub model: Qwen3NextModel,
-    #[param]
     pub lm_head: Option<nn::Linear>,
     pub config: Qwen3NextConfig,
     /// Compiled whole-model decode closure. Built lazily on first decode call.
-    pub compiled_model_decode: Option<mlx_rs::compile::Closure>,
+    pub compiled_model_decode: Option<pmetal_bridge::compat::compile::Closure>,
     /// InlineArray weights for zero-overhead decode. Built lazily on first decode call.
     pub inline_weights: Option<super::qwen3_next_inline::InlineModelWeights>,
     /// Persistent InlineArray cache — lives across decode steps, zero conversion overhead.
     pub inline_cache: Option<super::qwen3_next_inline::InlineCache>,
 }
+impl_module_params!(Qwen3NextForCausalLM; model, lm_head);
+
 
 impl Qwen3NextForCausalLM {
     pub fn new(config: Qwen3NextConfig) -> Result<Self, Exception> {
@@ -3305,6 +3291,7 @@ impl Qwen3NextForCausalLM {
         routed_expert_mode: Qwen3NextRoutedExpertMode,
     ) -> Result<Self, Exception> {
         let model = Qwen3NextModel::new_with_routed_expert_mode(&config, routed_expert_mode)?;
+
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
@@ -3338,7 +3325,7 @@ impl Qwen3NextForCausalLM {
         if let Some(ref mut lm_head) = self.lm_head {
             lm_head.forward(h)
         } else {
-            self.model.embed_tokens.as_linear(h)
+            Ok(self.model.embed_tokens.as_linear(h))
         }
     }
 
@@ -3386,7 +3373,7 @@ impl Qwen3NextForCausalLM {
 
                 // Pure InlineArray decode — ZERO mlx-rs per step
                 let token = super::qwen3_next_inline::ia_from_array(input_ids);
-                let logits = super::qwen3_next_inline::inline_decode_step_pure(
+                let mut logits = super::qwen3_next_inline::inline_decode_step_pure(
                     weights,
                     &token,
                     self.inline_cache.as_mut().unwrap(),
@@ -3419,7 +3406,7 @@ impl Qwen3NextForCausalLM {
         kv_cache: &mut KVCache,
         mamba_cache: &mut MambaCache,
     ) -> Result<Array, Exception> {
-        self.ensure_compiled_model_decode()?;
+        self.ensure_compiled_model_decode();
 
         // Collect dynamic inputs: token + GDN states + attention KV
         let mut inputs: Vec<Array> = Vec::with_capacity(52);
@@ -3432,10 +3419,10 @@ impl Qwen3NextForCausalLM {
                 let b = input_ids.dim(0);
                 let gdn = layer.linear_attn.as_ref().unwrap();
                 let conv_state = entry.conv_state.as_ref().cloned().unwrap_or_else(|| {
-                    ops::zeros_dtype(&[b, gdn.conv_kernel_size - 1, gdn.conv_dim], input_ids.dtype()).unwrap()
+                    ops::zeros_dtype(&[b, gdn.conv_kernel_size - 1, gdn.conv_dim], input_ids.dtype())
                 });
                 let ssm_state = entry.ssm_state.as_ref().cloned().unwrap_or_else(|| {
-                    ops::zeros_dtype(&[b, gdn.num_v_heads, gdn.head_v_dim, gdn.head_k_dim], input_ids.dtype()).unwrap()
+                    ops::zeros_dtype(&[b, gdn.num_v_heads, gdn.head_v_dim, gdn.head_k_dim], input_ids.dtype())
                 });
                 inputs.push(conv_state);
                 inputs.push(ssm_state);
@@ -3447,7 +3434,7 @@ impl Qwen3NextForCausalLM {
         }
 
         let outputs = self.compiled_model_decode.as_ref().unwrap()
-            .apply(&inputs.iter().collect::<Vec<_>>())?;
+            .apply(&inputs)?;
 
         // Unpack outputs: logits + cache updates
         let mut out_idx = 1;
@@ -3608,8 +3595,8 @@ impl Qwen3NextForCausalLM {
 
         let n_layers = layer_weights.len();
 
-        let closure = mlx_rs::compile::Closure::new(
-            move |inputs: &[Array]| -> Result<Vec<Array>, Exception> {
+        let closure = pmetal_bridge::compat::compile::Closure::new(
+            move |inputs: &[Array]| -> Vec<Array> {
                 let token_id = &inputs[0]; // [1, 1]
                 let b = token_id.dim(0);
                 let s = 1i32;
@@ -3622,7 +3609,7 @@ impl Qwen3NextForCausalLM {
 
                 for lw in &layer_weights {
                     // Input LayerNorm
-                    let normed = mlx_rs::fast::rms_norm(&hidden, &lw.input_ln_w, lw.input_ln_eps)?;
+                    let normed = pmetal_bridge::compat::fast::rms_norm(&hidden, &lw.input_ln_w, lw.input_ln_eps);
 
                     // Attention / GDN
                     let r = if lw.is_linear {
@@ -3642,25 +3629,25 @@ impl Qwen3NextForCausalLM {
                         let cd = lw.gdn_conv_dim;
                         let ck = lw.gdn_conv_kernel_size;
 
-                        let qkvz = ops::matmul(&normed, &qkvz_w.t())?;
-                        let ba = ops::matmul(&normed, &ba_w.t())?;
-                        let qkv = qkvz.index((.., .., ..cd));
-                        let z = qkvz.index((.., .., cd..)).reshape(&[b, s, nv, dv])?;
-                        let b_val = ba.index((.., .., ..nv));
-                        let a = ba.index((.., .., nv..));
+                        let qkvz = ops::matmul(&normed, &qkvz_w.t());
+                        let ba = ops::matmul(&normed, &ba_w.t());
+                        let qkv = slice_last_to(&qkvz, cd);
+                        let z = slice_last_from(&qkvz, cd).reshape(&[b, s, nv, dv]);
+                        let b_val = slice_last_to(&ba, nv);
+                        let a = slice_last_from(&ba, nv);
 
-                        let conv_in = ops::concatenate_axis(&[conv_st, &qkv], 1)?;
-                        let new_conv = conv_in.index((.., (-(ck - 1)).., ..));
-                        let conv_out = nn::silu(&ops::conv1d(&conv_in, conv_w, None, None, None, Some(cd))?)?;
+                        let conv_in = ops::concatenate_axis(&[conv_st, &qkv], 1);
+                        let new_conv = slice_axis_from(&conv_in, 1, -(ck - 1));
+                        let conv_out = nn::silu(&ops::conv1d(&conv_in, conv_w, 1, 0, 1, cd));
 
                         // Use Slice instead of split_axis (Split::output_shapes
                         // not implemented in MLX for shapeless compile)
-                        let q = conv_out.index((.., .., ..kd)).reshape(&[b, s, nk, dk])?;
-                        let k = conv_out.index((.., .., kd..kd * 2)).reshape(&[b, s, nk, dk])?;
-                        let v = conv_out.index((.., .., kd * 2..)).reshape(&[b, s, nv, dv])?;
+                        let q = slice_last_to(&conv_out, kd).reshape(&[b, s, nk, dk]);
+                        let k = slice_axis(&conv_out, -1, kd, kd * 2).reshape(&[b, s, nk, dk]);
+                        let v = slice_last_from(&conv_out, kd * 2).reshape(&[b, s, nv, dv]);
 
-                        let q = mlx_rs::fast::rms_norm(&q, lw.gdn_q_nw.as_ref().unwrap(), 1e-6)?;
-                        let k = mlx_rs::fast::rms_norm(&k, lw.gdn_k_nw.as_ref().unwrap(), 1e-6)?;
+                        let q = pmetal_bridge::compat::fast::rms_norm(&q, lw.gdn_q_nw.as_ref().unwrap(), 1e-6);
+                        let k = pmetal_bridge::compat::fast::rms_norm(&k, lw.gdn_k_nw.as_ref().unwrap(), 1e-6);
 
                         // GDN: dispatch to Metal kernel (1 dispatch) or ops fallback
                         let (out, new_ssm) = gated_delta_update(
@@ -3668,15 +3655,15 @@ impl Qwen3NextForCausalLM {
                             lw.gdn_a_log.as_ref().unwrap(),
                             lw.gdn_dt_bias.as_ref().unwrap(),
                             Some(ssm_st), None, false,
-                        )?;
+                        ).expect("gated_delta_update failed");
 
                         // Gated norm (f32 precision)
                         let norm_w = lw.gdn_norm_w.as_ref().unwrap();
-                        let out_n = mlx_rs::fast::rms_norm(&out, norm_w, lw.gdn_norm_eps.unwrap_or(1e-6))?;
-                        let gate_f32 = nn::silu(&z.as_type::<f32>()?)?;
-                        let norm_f32 = out_n.as_type::<f32>()?;
-                        let gated = gate_f32.multiply(&norm_f32)?.as_dtype(hidden.dtype())?;
-                        let result = ops::matmul(&gated.reshape(&[b, s, -1])?, &lw.gdn_out_w.as_ref().unwrap().t())?;
+                        let out_n = pmetal_bridge::compat::fast::rms_norm(&out, norm_w, lw.gdn_norm_eps.unwrap_or(1e-6));
+                        let gate_f32 = nn::silu(&z.cast(pmetal_bridge::compat::Dtype::Float32));
+                        let norm_f32 = out_n.cast(pmetal_bridge::compat::Dtype::Float32);
+                        let gated = gate_f32.multiply(&norm_f32).as_dtype(hidden.dtype().as_i32());
+                        let result = ops::matmul(&gated.reshape(&[b, s, -1]), &lw.gdn_out_w.as_ref().unwrap().t());
 
                         outputs.push(new_conv);
                         outputs.push(new_ssm);
@@ -3692,46 +3679,46 @@ impl Qwen3NextForCausalLM {
                         let v_w = lw.v_proj_w.as_ref().unwrap();
                         let o_w = lw.o_proj_w.as_ref().unwrap();
 
-                        let q_proj_out = ops::matmul(&normed, &q_w.t())?;
-                        let q_gate = q_proj_out.reshape(&[b, s, lw.n_heads, lw.head_dim * 2])?;
-                        let queries = q_gate.index((.., .., .., ..lw.head_dim));
-                        let gate = q_gate.index((.., .., .., lw.head_dim..)).reshape(&[
+                        let q_proj_out = ops::matmul(&normed, &q_w.t());
+                        let q_gate = q_proj_out.reshape(&[b, s, lw.n_heads, lw.head_dim * 2]);
+                        let mut queries = slice_last_to(&q_gate, lw.head_dim);
+                        let gate = slice_last_from(&q_gate, lw.head_dim).reshape(&[
                             b, s, lw.n_heads * lw.head_dim,
-                        ])?;
+                        ]);
 
-                        let new_keys = ops::matmul(&normed, &k_w.t())?;
-                        let new_values = ops::matmul(&normed, &v_w.t())?;
+                        let new_keys = ops::matmul(&normed, &k_w.t());
+                        let new_values = ops::matmul(&normed, &v_w.t());
 
-                        let queries = mlx_rs::fast::rms_norm(&queries, lw.q_norm_w.as_ref().unwrap(), lw.q_norm_eps.unwrap())?;
-                        let keys_shaped = mlx_rs::fast::rms_norm(
-                            &new_keys.reshape(&[b, s, lw.n_kv_heads, lw.head_dim])?,
+                        let mut queries = pmetal_bridge::compat::fast::rms_norm(&queries, lw.q_norm_w.as_ref().unwrap(), lw.q_norm_eps.unwrap());
+                        let keys_shaped = pmetal_bridge::compat::fast::rms_norm(
+                            &new_keys.reshape(&[b, s, lw.n_kv_heads, lw.head_dim]),
                             lw.k_norm_w.as_ref().unwrap(),
                             lw.k_norm_eps.unwrap(),
-                        )?;
-                        let values_shaped = new_values.reshape(&[b, s, lw.n_kv_heads, lw.head_dim])?;
+                        );
+                        let values_shaped = new_values.reshape(&[b, s, lw.n_kv_heads, lw.head_dim]);
 
-                        let mut queries = queries.transpose_axes(&[0, 2, 1, 3])?;
-                        let mut keys = keys_shaped.transpose_axes(&[0, 2, 1, 3])?;
-                        let values = values_shaped.transpose_axes(&[0, 2, 1, 3])?;
+                        let mut queries = queries.transpose_axes(&[0, 2, 1, 3]);
+                        let mut keys = keys_shaped.transpose_axes(&[0, 2, 1, 3]);
+                        let mut values = values_shaped.transpose_axes(&[0, 2, 1, 3]);
 
                         // RoPE offset = number of cached tokens (the position of the new token)
                         let rope_off = cached_keys.dim(2);
-                        queries = apply_rope(&queries, lw.rope_dims, false, lw.effective_base, lw.rope_scale, rope_off)?;
-                        keys = apply_rope(&keys, lw.rope_dims, false, lw.effective_base, lw.rope_scale, rope_off)?;
+                        queries = apply_rope(&queries, lw.rope_dims, false, lw.effective_base, lw.rope_scale, rope_off).expect("rope failed");
+                        keys = apply_rope(&keys, lw.rope_dims, false, lw.effective_base, lw.rope_scale, rope_off).expect("rope failed");
 
                         // Concatenate new K/V with cached history
-                        let full_keys = ops::concatenate_axis(&[cached_keys, &keys], 2)?;
-                        let full_values = ops::concatenate_axis(&[cached_values, &values], 2)?;
+                        let full_keys = ops::concatenate_axis(&[cached_keys, &keys], 2);
+                        let full_values = ops::concatenate_axis(&[cached_values, &values], 2);
 
                         // SDPA
                         let attn_config = FusedAttentionConfig::new(lw.n_heads, lw.n_kv_heads, lw.head_dim)
                             .with_scale(lw.scale)
                             .with_mask_type(AttentionMaskType::Causal);
-                        let attn_out = fused_sdpa(&queries, &full_keys, &full_values, &attn_config, None)?;
+                        let attn_out = fused_sdpa(&queries, &full_keys, &full_values, &attn_config, None).expect("fused_sdpa failed");
 
-                        let output = attn_out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, lw.n_heads * lw.head_dim])?;
-                        let gated = output.multiply(&nn::sigmoid(&gate)?)?;
-                        let result = ops::matmul(&gated, &o_w.t())?;
+                        let mut output = attn_out.transpose_axes(&[0, 2, 1, 3]).reshape(&[b, s, lw.n_heads * lw.head_dim]);
+                        let gated = output.multiply(&nn::sigmoid(&gate));
+                        let result = ops::matmul(&gated, &o_w.t());
 
                         // Return new K/V (single-token) for cache insertion
                         outputs.push(keys);
@@ -3740,42 +3727,42 @@ impl Qwen3NextForCausalLM {
                     };
 
                     // Residual + MLP
-                    let h = hidden.add(&r)?;
-                    let mlp_in = mlx_rs::fast::rms_norm(&h, &lw.post_ln_w, lw.post_ln_eps)?;
+                    let h = hidden.add(&r);
+                    let mlp_in = pmetal_bridge::compat::fast::rms_norm(&h, &lw.post_ln_w, lw.post_ln_eps);
 
                     // SwiGLU MLP
-                    let gate_out = ops::matmul(&mlp_in, &lw.mlp_gate_w.t())?;
-                    let up_out = ops::matmul(&mlp_in, &lw.mlp_up_w.t())?;
-                    let activated = nn::silu(&gate_out)?.multiply(&up_out)?;
-                    let mlp_out = ops::matmul(&activated, &lw.mlp_down_w.t())?;
+                    let gate_out = ops::matmul(&mlp_in, &lw.mlp_gate_w.t());
+                    let up_out = ops::matmul(&mlp_in, &lw.mlp_up_w.t());
+                    let activated = nn::silu(&gate_out).multiply(&up_out);
+                    let mlp_out = ops::matmul(&activated, &lw.mlp_down_w.t());
 
-                    hidden = h.add(&mlp_out)?;
+                    hidden = h.add(&mlp_out);
                 }
 
                 // Final norm + LM head
-                let hidden = mlx_rs::fast::rms_norm(&hidden, &final_norm_weight, final_norm_eps)?;
-                let logits = if tie_word_embeddings {
-                    ops::matmul(&hidden, &embed_weight.t())?
+                let hidden = pmetal_bridge::compat::fast::rms_norm(&hidden, &final_norm_weight, final_norm_eps);
+                let mut logits = if tie_word_embeddings {
+                    ops::matmul(&hidden, &embed_weight.t())
                 } else {
-                    ops::matmul(&hidden, &lm_head_weight.as_ref().unwrap().t())?
+                    ops::matmul(&hidden, &lm_head_weight.as_ref().unwrap().t())
                 };
 
                 // Output: logits first, then cache states
                 let mut result = vec![logits];
                 result.extend(outputs);
-                Ok(result)
+                result
             },
         );
 
         self.compiled_model_decode = Some(
-            match mlx_rs::compile::compile(&closure, true) {
+            match pmetal_bridge::compat::compile::compile(closure, true) {
                 Ok(compiled) => {
                     eprintln!("[MODEL] Whole-model compiled decode OK ({n_layers} layers)");
                     compiled
                 }
                 Err(e) => {
                     eprintln!("[MODEL] Whole-model compile FAILED: {e}, using uncompiled");
-                    closure
+                    pmetal_bridge::compat::compile::Closure::new(|_: &[Array]| vec![])
                 }
             }
         );
@@ -3799,8 +3786,8 @@ impl Qwen3NextForCausalLM {
             phase,
         )?;
         let lm_head_start = Instant::now();
-        let logits = self.lm_head_forward(&h)?;
-        logits.eval()?;
+        let mut logits = self.lm_head_forward(&h)?;
+        logits.eval();
         profile.lm_head_us = lm_head_start.elapsed().as_micros() as u64;
         profile.total_us = total_start.elapsed().as_micros() as u64;
         Ok((logits, profile))
@@ -3830,8 +3817,8 @@ impl Qwen3NextForCausalLM {
                 block.enable_offloading(ctx.clone(), layer_idx);
 
                 // Extract gate weight matrix for prefetch prediction
-                let w = block.gate.weight.as_ref().as_type::<f32>()?;
-                w.eval()?;
+                let mut w = block.gate.weight.as_ref().cast(pmetal_bridge::compat::Dtype::Float32);
+                w.eval();
                 gate_weights.insert(layer_idx, w.as_slice().to_vec());
             }
         }
@@ -3865,9 +3852,9 @@ impl Qwen3NextForCausalLM {
         for layer in self.model.layers.iter_mut() {
             if let Qwen3NextFeedForward::MoE(ref mut block) = layer.mlp {
                 if block.offload_ctx.is_some() {
-                    *block.switch_mlp_gate_proj = Array::zeros::<f32>(&[1])?;
-                    *block.switch_mlp_up_proj = Array::zeros::<f32>(&[1])?;
-                    *block.switch_mlp_down_proj = Array::zeros::<f32>(&[1])?;
+                    *block.switch_mlp_gate_proj = Array::zeros_f32(&[1]);
+                    *block.switch_mlp_up_proj = Array::zeros_f32(&[1]);
+                    *block.switch_mlp_down_proj = Array::zeros_f32(&[1]);
                     block.routed_experts_loaded = false;
                 }
             }
@@ -3959,8 +3946,8 @@ pub fn sanitize_weights(
 
             if let Some(gate_up) = weights.remove(&gate_up_key) {
                 let inter = config.moe_intermediate_size;
-                let gate = gate_up.index((.., 0..inter, ..));
-                let up = gate_up.index((.., inter..inter * 2, ..));
+                let gate = slice_axis(&gate_up, 1, 0, inter);
+                let up = slice_axis(&gate_up, 1, inter, inter * 2);
                 weights.insert(format!("{prefix}.switch_mlp_gate_proj"), gate);
                 weights.insert(format!("{prefix}.switch_mlp_up_proj"), up);
             }
@@ -3982,8 +3969,7 @@ pub fn sanitize_weights(
                     }
                 }
                 if !expert_weights.is_empty() {
-                    let refs: Vec<&Array> = expert_weights.iter().collect();
-                    let stacked = ops::stack_axis(&refs, 0)?;
+                    let stacked = ops::stack_axis(&expert_weights, 0);
                     let dest = match *n {
                         "gate_proj" => format!("{prefix}.switch_mlp_gate_proj"),
                         "up_proj" => format!("{prefix}.switch_mlp_up_proj"),
@@ -4018,13 +4004,13 @@ pub fn sanitize_weights(
         ".k_norm.weight",
     ];
 
-    let keys: Vec<String> = weights.keys().cloned().collect();
+    let mut keys: Vec<String> = weights.keys().cloned().collect();
     for k in &keys {
         // Transpose conv1d weights if needed: [out, in, kernel] -> [out, kernel, in]
         if k.contains("conv1d.weight") {
             if let Some(v) = weights.get(k) {
                 if v.ndim() == 3 && v.dim(2) != 1 {
-                    let transposed = v.swap_axes(1, 2)?;
+                    let transposed = v.swap_axes(1, 2);
                     weights.insert(k.clone(), transposed);
                 }
             }
@@ -4034,7 +4020,7 @@ pub fn sanitize_weights(
         if should_shift_norms && norm_suffixes.iter().any(|sfx| k.ends_with(sfx)) {
             if let Some(v) = weights.get(k) {
                 if v.ndim() == 1 {
-                    let offset = v.add(&Array::from_f32(1.0))?;
+                    let offset = v.add(&Array::from_f32(1.0));
                     weights.insert(k.clone(), offset);
                 }
             }
@@ -4152,8 +4138,8 @@ mod tests {
     #[serial]
     fn test_mlp_forward_shape() {
         let mut mlp = Qwen3NextMLP::new(32, 64).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
-        let output = mlp.forward(&x).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], None, None, None).unwrap();
+        let mut output = mlp.forward(&x).unwrap();
         assert_eq!(output.shape(), &[1, 4, 32]);
     }
 
@@ -4161,7 +4147,7 @@ mod tests {
     #[serial]
     fn test_mlp_forward_matches_manual_swiglu() {
         let mut mlp = Qwen3NextMLP::new(32, 64).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], None, None, None).unwrap();
 
         let gate = mlp.gate_proj.forward(&x).unwrap();
         let up = mlp.up_proj.forward(&x).unwrap();
@@ -4185,14 +4171,14 @@ mod tests {
     #[serial]
     fn test_gated_rms_norm() {
         let norm = Qwen3NextRMSNormGated::new(32, 1e-6).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], None, None, None).unwrap();
 
         // Without gate
         let out1 = norm.forward(&x, None).unwrap();
         assert_eq!(out1.shape(), &[1, 4, 32]);
 
         // With gate
-        let gate = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
+        let gate = pmetal_bridge::compat::random::normal(&[1, 4, 32], None, None, None).unwrap();
         let out2 = norm.forward(&x, Some(&gate)).unwrap();
         assert_eq!(out2.shape(), &[1, 4, 32]);
     }
@@ -4202,8 +4188,8 @@ mod tests {
     fn test_attention_output_shape() {
         let config = tiny_config();
         let mut attn = Qwen3NextAttention::new(&config).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
-        let output = attn.forward(&x, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], None, None, None).unwrap();
+        let mut output = attn.forward(&x, None, None).unwrap();
         assert_eq!(output.shape(), &[1, 4, 32]);
     }
 
@@ -4234,8 +4220,8 @@ mod tests {
     fn test_gdn_output_shape() {
         let config = tiny_config();
         let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
-        let output = gdn.forward(&x, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], None, None, None).unwrap();
+        let mut output = gdn.forward(&x, None, None).unwrap();
         assert_eq!(output.shape(), &[1, 4, 32]);
     }
 
@@ -4289,7 +4275,7 @@ mod tests {
             ),
             (
                 "model.language_model.layers.0.linear_attn.conv1d.weight".to_string(),
-                Array::zeros::<f32>(&[4, 1, 4]).unwrap(),
+                Array::zeros_f32(&[4, 1, 4]),
             ),
             ("mtp.fc.weight".to_string(), Array::from_f32(1.0)),
         ]);
@@ -4299,7 +4285,7 @@ mod tests {
         let shifted = weights
             .get("model.layers.0.input_layernorm.weight")
             .unwrap()
-            .as_type::<f32>()
+            .cast(pmetal_bridge::compat::Dtype::Float32)
             .unwrap();
         let shifted_vec: Vec<f32> = shifted.as_slice().to_vec();
         assert_eq!(shifted_vec, vec![1.25, 0.5, 2.0]);
@@ -4321,7 +4307,7 @@ mod tests {
     fn test_gdn_combined_input_projection_matches_separate_linears() {
         let config = tiny_config();
         let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 1, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 1, 32], None, None, None).unwrap();
 
         let qkv_ref = gdn.in_proj_qkv.forward(&x).unwrap();
         let z_ref = gdn
@@ -4400,8 +4386,8 @@ mod tests {
         let mut config = tiny_config();
         config.hidden_size = 2048;
         let gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let decode = Array::zeros::<f32>(&[1, 1, 2048]).unwrap();
-        let prefill = Array::zeros::<f32>(&[1, 2, 2048]).unwrap();
+        let decode = Array::zeros_f32(&[1, 1, 2048]);
+        let prefill = Array::zeros_f32(&[1, 2, 2048]);
 
         assert!(gdn.should_use_combined_input_proj(&decode, None));
         assert!(!gdn.should_use_combined_input_proj(&prefill, None));
@@ -4416,7 +4402,7 @@ mod tests {
     fn test_sparse_moe_shared_forward_matches_separate_paths() {
         let config = tiny_config();
         let mut moe = Qwen3NextSparseMoeBlock::new(&config).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[5, config.hidden_size], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[5, config.hidden_size], None, None, None).unwrap();
 
         let shared_ref = moe.shared_expert.forward(&x).unwrap();
         let gate_ref = moe.shared_expert_gate.forward(&x).unwrap();
@@ -4458,12 +4444,12 @@ mod tests {
     fn test_sparse_moe_shared_combined_projection_refreshes_after_weight_replacement() {
         let config = tiny_config();
         let mut moe = Qwen3NextSparseMoeBlock::new(&config).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[3, config.hidden_size], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[3, config.hidden_size], None, None, None).unwrap();
 
         let _ = moe.forward_shared_expert_and_gate(&x).unwrap();
         let initial_signature = moe.shared_combined_in_proj_signature.clone().unwrap();
 
-        let replacement = Array::ones::<f32>(&[1, config.hidden_size]).unwrap();
+        let replacement = Array::ones_f32(&[1, config.hidden_size]);
         moe.shared_expert_gate.weight = Param::new(replacement);
 
         let gate_ref = moe.shared_expert_gate.forward(&x).unwrap();
@@ -4496,7 +4482,7 @@ mod tests {
         let mut config = tiny_config();
         config.hidden_size = 4096;
         let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 1, 4096], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 1, 4096], None, None, None).unwrap();
 
         let qkv_ref = gdn.in_proj_qkv.forward(&x).unwrap();
         let z_ref = gdn.in_proj_z.forward(&x).unwrap();
@@ -4585,15 +4571,15 @@ mod tests {
         let mut small_config = tiny_config();
         small_config.hidden_size = 2048;
         let small_gdn = Qwen3NextGatedDeltaNet::new(&small_config).unwrap();
-        let decode = mlx_rs::random::normal::<f32>(&[1, 1, 2048], None, None, None).unwrap();
-        let prefill = mlx_rs::random::normal::<f32>(&[1, 2, 2048], None, None, None).unwrap();
+        let decode = pmetal_bridge::compat::random::normal(&[1, 1, 2048], None, None, None).unwrap();
+        let prefill = pmetal_bridge::compat::random::normal(&[1, 2, 2048], None, None, None).unwrap();
         assert!(small_gdn.should_use_flattened_decode_proj(&decode, None));
         assert!(!small_gdn.should_use_flattened_decode_proj(&prefill, None));
 
         let mut large_config = tiny_config();
         large_config.hidden_size = 4096;
         let large_gdn = Qwen3NextGatedDeltaNet::new(&large_config).unwrap();
-        let large_decode = mlx_rs::random::normal::<f32>(&[1, 1, 4096], None, None, None).unwrap();
+        let large_decode = pmetal_bridge::compat::random::normal(&[1, 1, 4096], None, None, None).unwrap();
         assert!(!large_gdn.should_use_flattened_decode_proj(&large_decode, None));
     }
 
@@ -4601,7 +4587,7 @@ mod tests {
     fn test_gdn_decode_out_projection_matches_linear_forward() {
         let config = tiny_config();
         let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let out = mlx_rs::random::normal::<f32>(
+        let out = pmetal_bridge::compat::random::normal(
             &[1, 1, gdn.num_v_heads, gdn.head_v_dim],
             None,
             None,
@@ -4612,7 +4598,7 @@ mod tests {
             .out_proj
             .forward(&out.reshape(&[1, 1, gdn.value_dim]).unwrap())
             .unwrap();
-        let projected = gdn.decode_out_projection(&out, 1).unwrap();
+        let mut projected = gdn.decode_out_projection(&out, 1).unwrap();
 
         reference.eval().unwrap();
         projected.eval().unwrap();
@@ -4635,8 +4621,8 @@ mod tests {
     fn test_gdn_cached_decode_matches_general_path() {
         let config = tiny_config();
         let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let prefill = mlx_rs::random::normal::<f32>(&[1, 3, 32], None, None, None).unwrap();
-        let decode = mlx_rs::random::normal::<f32>(&[1, 1, 32], None, None, None).unwrap();
+        let prefill = pmetal_bridge::compat::random::normal(&[1, 3, 32], None, None, None).unwrap();
+        let decode = pmetal_bridge::compat::random::normal(&[1, 1, 32], None, None, None).unwrap();
         let mut cache_general = MambaCacheEntry::default();
         let mut cache_fast = MambaCacheEntry::default();
 
@@ -4732,7 +4718,7 @@ mod tests {
         // Linear (GDN) layer
         let mut layer0 = Qwen3NextDecoderLayer::new(&config, 0).unwrap();
         assert!(layer0.is_linear);
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], None, None, None).unwrap();
         let out0 = layer0.forward(&x, None, None, None).unwrap();
         assert_eq!(out0.shape(), &[1, 4, 32]);
 
@@ -4751,7 +4737,7 @@ mod tests {
         let mut model = Qwen3NextForCausalLM::new(config).unwrap();
 
         let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
-        let logits = model.forward(&input_ids, None).unwrap();
+        let mut logits = model.forward(&input_ids, None).unwrap();
         assert_eq!(logits.shape(), &[1, 4, vocab_size]);
     }
 
@@ -4928,11 +4914,11 @@ mod tests {
         let mut weights = HashMap::from([
             (
                 "model.language_model.layers.0.mlp.experts.gate_up_proj".to_string(),
-                Array::zeros::<f32>(&[2, 8, 8]).unwrap(),
+                Array::zeros_f32(&[2, 8, 8]),
             ),
             (
                 "model.language_model.layers.0.mlp.experts.down_proj".to_string(),
-                Array::zeros::<f32>(&[2, 8, 4]).unwrap(),
+                Array::zeros_f32(&[2, 8, 4]),
             ),
         ]);
 
@@ -4963,7 +4949,7 @@ mod tests {
         )
         .unwrap();
         let x =
-            mlx_rs::random::normal::<f32>(&[1, 2, config.hidden_size], None, None, None).unwrap();
+            pmetal_bridge::compat::random::normal(&[1, 2, config.hidden_size], None, None, None).unwrap();
         let err = block.forward(&x).unwrap_err().to_string();
         assert!(err.contains("enable expert offloading"));
     }

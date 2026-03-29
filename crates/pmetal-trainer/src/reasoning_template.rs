@@ -90,7 +90,7 @@ impl RewardFunction for CodeExecutionReward {
         &self,
         _prompts: &[String],
         completions: &[String],
-        _images: Option<&[Vec<mlx_rs::Array>]>,
+        _images: Option<&[Vec<pmetal_bridge::compat::Array>]>,
     ) -> crate::grpo::GrpoResult<Vec<f64>> {
         let mut rewards = vec![0.0; completions.len()];
         for (i, completion) in completions.iter().enumerate() {

@@ -5,8 +5,7 @@
 //! normalization-induced artifacts in audio generation.
 
 use crate::error::Result;
-use mlx_rs::Array;
-use mlx_rs::module::Param;
+use pmetal_bridge::compat::{Array, Param, ops, random};
 
 /// Weight-normalized 1D convolution.
 ///
@@ -70,19 +69,21 @@ impl WeightNormConv1d {
         let bound = (1.0 / fan_in as f32).sqrt();
 
         // Weight shape for Conv1d: [out_channels, in_channels/groups, kernel_size]
-        let weight_v = mlx_rs::random::uniform::<_, f32>(
-            -bound,
-            bound,
+        // random::uniform produces U(0,1); scale to [-bound, bound]
+        let u = random::uniform(
             &[out_channels, in_channels / groups, kernel_size],
-            None,
-        )?;
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let scale = Array::from_f32(2.0 * bound);
+        let offset = Array::from_f32(-bound);
+        let weight_v = u.multiply(&scale).add(&offset);
 
         // Compute initial magnitude ||v||
         let norm = weight_norm(&weight_v)?;
         let weight_g = norm;
 
         let bias = if use_bias {
-            Some(Param::new(mlx_rs::ops::zeros::<f32>(&[out_channels])?))
+            Some(Param::new(Array::zeros(&[out_channels], 10)))
         } else {
             None
         };
@@ -103,15 +104,15 @@ impl WeightNormConv1d {
 
     /// Compute normalized weight: W = g * (v / ||v||)
     fn compute_weight(&self) -> Result<Array> {
-        let v = self.weight_v.as_ref();
-        let g = self.weight_g.as_ref();
+        let v = &self.weight_v.value;
+        let g = &self.weight_g.value;
 
         // Normalize v along all dims except output channel
         let norm = weight_norm(v)?;
-        let v_normalized = v.divide(&norm)?;
+        let v_normalized = v.divide(&norm);
 
         // Scale by magnitude
-        Ok(v_normalized.multiply(g)?)
+        Ok(v_normalized.multiply(g))
     }
 
     /// Forward pass.
@@ -132,29 +133,29 @@ impl WeightNormConv1d {
         // - weight: [C_out, C_in/groups, K] (OIK format)
 
         // Transpose input from NCL to NLC: [batch, channels, length] -> [batch, length, channels]
-        let x_nlc = x.transpose_axes(&[0, 2, 1])?;
+        let x_nlc = x.transpose_axes(&[0, 2, 1]);
 
         // Transpose weight from OIK to OKI: [out, in, kernel] -> [out, kernel, in]
-        let weight_oki = weight.transpose_axes(&[0, 2, 1])?;
+        let weight_oki = weight.transpose_axes(&[0, 2, 1]);
 
         // Apply 1D convolution
-        let output = mlx_rs::ops::conv1d(
+        let output = ops::conv1d(
             &x_nlc,
             &weight_oki,
             self.stride,
             self.padding,
             self.dilation,
             self.groups,
-        )?;
+        );
 
         // Transpose output from NLC back to NCL: [batch, length, channels] -> [batch, channels, length]
-        let output = output.transpose_axes(&[0, 2, 1])?;
+        let output = output.transpose_axes(&[0, 2, 1]);
 
         // Add bias if present
         if let Some(bias) = &self.bias {
             // Reshape bias for broadcasting: [out_channels] -> [1, out_channels, 1]
-            let bias_reshaped = bias.as_ref().reshape(&[1, self.out_channels, 1])?;
-            Ok(output.add(&bias_reshaped)?)
+            let bias_reshaped = bias.value.reshape(&[1, self.out_channels, 1]);
+            Ok(output.add(&bias_reshaped))
         } else {
             Ok(output)
         }
@@ -216,18 +217,19 @@ impl WeightNormConvTranspose1d {
         let bound = (1.0 / fan_in as f32).sqrt();
 
         // Weight shape for ConvTranspose1d: [in_channels, out_channels/groups, kernel_size]
-        let weight_v = mlx_rs::random::uniform::<_, f32>(
-            -bound,
-            bound,
+        let u = random::uniform(
             &[in_channels, out_channels / groups, kernel_size],
-            None,
-        )?;
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let scale = Array::from_f32(2.0 * bound);
+        let offset = Array::from_f32(-bound);
+        let weight_v = u.multiply(&scale).add(&offset);
 
         let norm = weight_norm(&weight_v)?;
         let weight_g = norm;
 
         let bias = if use_bias {
-            Some(Param::new(mlx_rs::ops::zeros::<f32>(&[out_channels])?))
+            Some(Param::new(Array::zeros(&[out_channels], 10)))
         } else {
             None
         };
@@ -249,13 +251,13 @@ impl WeightNormConvTranspose1d {
 
     /// Compute normalized weight.
     fn compute_weight(&self) -> Result<Array> {
-        let v = self.weight_v.as_ref();
-        let g = self.weight_g.as_ref();
+        let v = &self.weight_v.value;
+        let g = &self.weight_g.value;
 
         let norm = weight_norm(v)?;
-        let v_normalized = v.divide(&norm)?;
+        let v_normalized = v.divide(&norm);
 
-        Ok(v_normalized.multiply(g)?)
+        Ok(v_normalized.multiply(g))
     }
 
     /// Forward pass.
@@ -279,10 +281,9 @@ impl WeightNormConvTranspose1d {
         // MLX conv_transpose expects weight shape [out_channels, in_channels/groups, kernel_size]
         // but our weight is [in_channels, out_channels/groups, kernel_size]
         // Need to transpose axes 0 and 1
-        let weight_transposed = weight.transpose_axes(&[1, 0, 2])?;
+        let weight_transposed = weight.transpose_axes(&[1, 0, 2]);
 
-        // Use conv_general for transposed convolution
-        // For now, implement using manual upsampling + conv
+        // Use manual conv_transpose implementation
         let output = conv_transpose_1d_manual(
             x,
             &weight_transposed,
@@ -295,8 +296,8 @@ impl WeightNormConvTranspose1d {
 
         // Add bias if present
         if let Some(bias) = &self.bias {
-            let bias_reshaped = bias.as_ref().reshape(&[1, self.out_channels, 1])?;
-            Ok(output.add(&bias_reshaped)?)
+            let bias_reshaped = bias.value.reshape(&[1, self.out_channels, 1]);
+            Ok(output.add(&bias_reshaped))
         } else {
             Ok(output)
         }
@@ -307,22 +308,22 @@ impl WeightNormConvTranspose1d {
 /// Returns shape [out_channels, 1, 1] for broadcasting.
 fn weight_norm(weight: &Array) -> Result<Array> {
     // Sum of squares along dims 1 and 2
-    let sq = weight.multiply(weight)?;
-    let sum_sq = sq.sum_axes(&[1, 2], Some(true))?;
-    let norm = sum_sq.sqrt()?;
+    let sq = weight.multiply(weight);
+    let sum_sq = sq.sum_axes(&[1, 2], true);
+    let norm = sum_sq.sqrt();
 
     // Add small epsilon for numerical stability
     let eps = Array::from_f32(1e-12);
-    Ok(norm.add(&eps)?)
+    Ok(norm.add(&eps))
 }
 
 /// Flip array along an axis by reversing the indices.
 fn flip_axis(arr: &Array, axis: i32) -> Result<Array> {
     let axis_len = arr.dim(axis);
-    // Create reversed indices
+    // Create reversed indices as int32 array
     let indices: Vec<i32> = (0..axis_len).rev().collect();
-    let indices_arr = Array::from_slice(&indices, &[axis_len]);
-    arr.take_axis(&indices_arr, axis).map_err(Into::into)
+    let indices_arr = Array::from_i32_slice(&indices);
+    Ok(arr.take_axis(&indices_arr, axis))
 }
 
 /// Manual implementation of transposed 1D convolution.
@@ -348,39 +349,38 @@ fn conv_transpose_1d_manual(
     let kernel_size = weight.dim(2);
 
     // Helper to run conv1d with format conversion (NCL -> NLC -> NCL)
-    let run_conv1d = |input: &Array, w: &Array, s: i32, p: i32, d: i32, g: i32| -> Result<Array> {
+    let run_conv1d = |input: &Array, w: &Array, s: i32, p: i32, d: i32, g: i32| -> Array {
         // Input is NCL, convert to NLC
-        let input_nlc = input.transpose_axes(&[0, 2, 1])?;
+        let input_nlc = input.transpose_axes(&[0, 2, 1]);
         // Weight is OIK, convert to OKI
-        let weight_oki = w.transpose_axes(&[0, 2, 1])?;
+        let weight_oki = w.transpose_axes(&[0, 2, 1]);
         // Run conv1d
-        let output_nlc = mlx_rs::ops::conv1d(&input_nlc, &weight_oki, s, p, d, g)?;
+        let output_nlc = ops::conv1d(&input_nlc, &weight_oki, s, p, d, g);
         // Convert output back to NCL
-        output_nlc.transpose_axes(&[0, 2, 1]).map_err(Into::into)
+        output_nlc.transpose_axes(&[0, 2, 1])
     };
 
     if stride == 1 && padding == 0 && output_padding == 0 && dilation == 1 {
         // Simple case: just apply conv with flipped kernel
         let weight_flipped = flip_axis(weight, 2)?; // Flip along kernel axis (axis 2 in OIK)
-        return run_conv1d(x, &weight_flipped, 1, kernel_size - 1, 1, groups);
+        return Ok(run_conv1d(x, &weight_flipped, 1, kernel_size - 1, 1, groups));
     }
 
     // General case: insert zeros then convolve
     // Step 1: Insert (stride-1) zeros between samples
     let upsampled_length = (in_length - 1) * stride + 1;
 
-    // Alternative: Use unfold-like operation
-    // For now, use a simpler but less efficient approach with concatenation
     if stride > 1 {
-        use mlx_rs::ops::indexing::IndexOp;
         // Create interleaved tensor
-        let zeros_between =
-            mlx_rs::ops::zeros::<f32>(&[batch, in_channels, in_length, stride - 1])?;
-        let x_expanded = x.reshape(&[batch, in_channels, in_length, 1])?;
-        let interleaved = mlx_rs::ops::concatenate_axis(&[&x_expanded, &zeros_between], -1)?;
-        let interleaved = interleaved.reshape(&[batch, in_channels, in_length * stride])?;
-        // Trim last (stride-1) zeros
-        let upsampled = interleaved.index((.., .., ..upsampled_length));
+        let zeros_between = Array::zeros(&[batch, in_channels, in_length, stride - 1], 10);
+        let x_expanded = x.reshape(&[batch, in_channels, in_length, 1]);
+        let interleaved = ops::concatenate_axis(&[&x_expanded, &zeros_between], -1);
+        let interleaved = interleaved.reshape(&[batch, in_channels, in_length * stride]);
+        // Trim last (stride-1) zeros using slice
+        let upsampled = interleaved.slice(
+            &[0, 0, 0],
+            &[batch, in_channels, upsampled_length],
+        );
 
         // Step 2: Flip kernel and apply convolution
         let weight_flipped = flip_axis(weight, 2)?;
@@ -396,12 +396,12 @@ fn conv_transpose_1d_manual(
             conv_padding,
             dilation,
             groups,
-        )?;
+        );
 
         // Handle output_padding by adding zeros at the end
         if output_padding > 0 {
-            let pad = mlx_rs::ops::zeros::<f32>(&[batch, out_channels, output_padding])?;
-            return mlx_rs::ops::concatenate_axis(&[&output, &pad], -1).map_err(Into::into);
+            let pad = Array::zeros(&[batch, out_channels, output_padding], 10);
+            return Ok(ops::concatenate_axis(&[&output, &pad], -1));
         }
 
         Ok(output)
@@ -411,7 +411,7 @@ fn conv_transpose_1d_manual(
         let conv_padding = dilation * (kernel_size - 1) - padding;
         let conv_padding = conv_padding.max(0);
 
-        run_conv1d(x, &weight_flipped, 1, conv_padding, dilation, groups)
+        Ok(run_conv1d(x, &weight_flipped, 1, conv_padding, dilation, groups))
     }
 }
 
@@ -424,12 +424,13 @@ mod tests {
         let conv =
             WeightNormConv1d::new(4, 8, 3, Some(1), Some(1), None, None, Some(true)).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 16], None, None, None).unwrap();
+        let x = Array::random_normal(&[2, 4, 16], 10);
         let y = conv.forward(&x).unwrap();
-        y.eval().unwrap();
+        let mut y2 = y.clone();
+        y2.eval();
 
         // With padding=1, kernel=3, stride=1: output_len = input_len
-        assert_eq!(y.shape(), &[2, 8, 16]);
+        assert_eq!(y2.shape(), &[2, 8, 16]);
     }
 
     #[test]
@@ -437,11 +438,12 @@ mod tests {
         let conv =
             WeightNormConv1d::new(4, 8, 3, Some(1), Some(1), None, None, Some(false)).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 16], None, None, None).unwrap();
+        let x = Array::random_normal(&[2, 4, 16], 10);
         let y = conv.forward(&x).unwrap();
-        y.eval().unwrap();
+        let mut y2 = y.clone();
+        y2.eval();
 
-        assert_eq!(y.shape(), &[2, 8, 16]);
+        assert_eq!(y2.shape(), &[2, 8, 16]);
         assert!(conv.bias.is_none());
     }
 
@@ -451,10 +453,11 @@ mod tests {
         let conv = WeightNormConv1d::new(2, 4, 3, None, None, None, None, None).unwrap();
 
         let weight = conv.compute_weight().unwrap();
-        weight.eval().unwrap();
+        let mut w2 = weight.clone();
+        w2.eval();
 
         // The weight should be properly normalized
-        assert_eq!(weight.shape(), &[4, 2, 3]);
+        assert_eq!(w2.shape(), &[4, 2, 3]);
     }
 
     #[test]
@@ -464,13 +467,14 @@ mod tests {
             WeightNormConvTranspose1d::new(8, 4, 4, Some(2), Some(1), None, None, None, Some(true))
                 .unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 8, 16], None, None, None).unwrap();
+        let x = Array::random_normal(&[1, 8, 16], 10);
         let y = conv.forward(&x).unwrap();
-        y.eval().unwrap();
+        let mut y2 = y.clone();
+        y2.eval();
 
         // ConvTranspose1d output: (L-1)*S - 2*P + D*(K-1) + OP + 1
         // = (16-1)*2 - 2*1 + 1*(4-1) + 0 + 1 = 30 - 2 + 3 + 1 = 32
-        assert_eq!(y.shape(), &[1, 4, 32]);
+        assert_eq!(y2.shape(), &[1, 4, 32]);
     }
 
     #[test]
@@ -489,12 +493,13 @@ mod tests {
         )
         .unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 512, 8], None, None, None).unwrap();
+        let x = Array::random_normal(&[1, 512, 8], 10);
         let y = conv.forward(&x).unwrap();
-        y.eval().unwrap();
+        let mut y2 = y.clone();
+        y2.eval();
 
         // Output length should be approximately 4x input
         // (8-1)*4 - 2*6 + 1*(16-1) + 0 + 1 = 28 - 12 + 15 + 1 = 32
-        assert_eq!(y.shape(), &[1, 256, 32]);
+        assert_eq!(y2.shape(), &[1, 256, 32]);
     }
 }

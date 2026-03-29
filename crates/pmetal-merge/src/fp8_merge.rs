@@ -33,7 +33,7 @@
 //! let merged = merger.ties_merge_fp8(tensors, base, weights, densities, lambda)?;
 //! ```
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 use tracing::debug;
 
 use crate::{MergeError, Result};
@@ -248,7 +248,8 @@ impl Fp8Merger {
     /// Uses per-block scaling to map values to [-127, 127] range.
     pub fn quantize(&mut self, array: &Array) -> Result<Fp8Tensor> {
         let shape = array.shape().to_vec();
-        let data: Vec<f32> = array.as_slice().to_vec();
+        let n: usize = shape.iter().map(|&s| s as usize).product();
+        let data: Vec<f32> = array.clone().to_f32_vec(n).unwrap_or_default();
         let num_elements = data.len();
         let block_size = self.config.block_size;
         let num_blocks = num_elements.div_ceil(block_size);
@@ -312,7 +313,7 @@ impl Fp8Merger {
             }
         }
 
-        Ok(Array::from_slice(&output, &fp8.shape))
+        Ok(Array::from_f32_slice(&output, &fp8.shape))
     }
 
     /// Perform FP8 linear merge.
@@ -372,7 +373,7 @@ impl Fp8Merger {
         }
 
         // Re-quantize result
-        let result_array = Array::from_slice(&result, &shape);
+        let result_array = Array::from_f32_slice(&result, &shape);
 
         // If we need FP8 output, quantize again
         if self.config.fp8_intermediates {
@@ -407,8 +408,8 @@ impl Fp8Merger {
         // Step 1: Compute task vectors (can stay in FP8 for subtraction)
         let task_vectors: Vec<Array> = tensors
             .iter()
-            .map(|t| t.subtract(base).map_err(MergeError::from))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|t| t.subtract(base))
+            .collect();
 
         // Step 2: Sparsification - needs full precision for magnitude comparison
         let sparse_vectors = if self.config.force_dequant_for_sparsify {
@@ -433,8 +434,8 @@ impl Fp8Merger {
         let weighted_sum = crate::sign_consensus(&sparse_vectors, weights)?;
 
         // Step 4: Scale and add to base
-        let result = weighted_sum.multiply(Array::from_f32(lambda))?;
-        Ok(base.add(&result)?)
+        let result = weighted_sum.multiply(&Array::from_f32(lambda));
+        Ok(base.add(&result))
     }
 
     /// Calculate memory savings from FP8 quantization.
@@ -547,15 +548,15 @@ mod tests {
         let mut merger = Fp8Merger::default_new();
 
         // Create simple array
-        let input = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
+        let input = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
 
         // Quantize
         let fp8 = merger.quantize(&input).unwrap();
         assert_eq!(fp8.num_elements(), 4);
 
         // Dequantize
-        let output = merger.dequantize(&fp8).unwrap();
-        let output_slice: Vec<f32> = output.as_slice().to_vec();
+        let mut output = merger.dequantize(&fp8).unwrap();
+        let output_slice = output.to_f32_vec(4).unwrap();
 
         // Values should be approximately preserved
         // FP8 uses 127 levels, so error bound is ~amax/127 ≈ 4/127 ≈ 0.03
@@ -578,11 +579,11 @@ mod tests {
     fn test_fp8_linear_merge() {
         let mut merger = Fp8Merger::default_new();
 
-        let t1 = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
-        let t2 = Array::from_slice(&[5.0f32, 6.0, 7.0, 8.0], &[4]);
+        let t1 = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
+        let t2 = Array::from_f32_slice(&[5.0f32, 6.0, 7.0, 8.0], &[4]);
 
-        let result = merger.linear_merge_fp8(&[t1, t2], &[0.5, 0.5]).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = merger.linear_merge_fp8(&[t1, t2], &[0.5, 0.5]).unwrap();
+        let result_slice = result.to_f32_vec(4).unwrap();
 
         // Expected: [3, 4, 5, 6]
         assert_eq!(result_slice.len(), 4);

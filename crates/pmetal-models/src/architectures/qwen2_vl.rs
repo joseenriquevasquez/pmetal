@@ -13,7 +13,8 @@
 //!
 //! - Paper: <https://arxiv.org/abs/2409.12191>
 
-use mlx_rs::{Array, error::Exception, macros::ModuleParameters};
+use pmetal_bridge::compat::{Array, Exception, ModuleParameters};
+use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 use crate::architectures::qwen2::{Qwen2Config, Qwen2ForCausalLM};
@@ -147,19 +148,21 @@ impl ModelConfig for Qwen2VLConfig {
 ///
 /// This implementation wraps the Qwen2 language model for VLM inference.
 /// Vision features should be pre-computed and passed as input embeddings.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen2VL {
     /// The underlying language model.
-    #[param]
     pub language_model: Qwen2ForCausalLM,
     /// Full configuration.
     pub config: Qwen2VLConfig,
 }
+impl_module_params!(Qwen2VL; language_model);
+
 
 impl Qwen2VL {
     /// Create a new Qwen2-VL model.
     pub fn new(config: Qwen2VLConfig) -> Result<Self, Exception> {
         let language_model = Qwen2ForCausalLM::new(config.text_config.clone())?;
+
         Ok(Self {
             language_model,
             config,

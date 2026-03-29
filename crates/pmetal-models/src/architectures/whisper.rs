@@ -35,15 +35,8 @@
 //! - Paper: <https://arxiv.org/abs/2212.04356>
 //! - Implementation based on: candle-transformers/src/models/whisper
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, Param},
-    nn,
-    ops::{indexing::IndexOp, softmax_axis},
-};
+use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, Param, nn, ops};
+use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 /// Whisper model configuration.
@@ -217,7 +210,7 @@ impl WhisperConfig {
 }
 
 /// Whisper multi-head attention layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct WhisperAttention {
     /// Number of attention heads.
     pub n_heads: i32,
@@ -227,18 +220,16 @@ pub struct WhisperAttention {
     pub scale: f32,
 
     /// Query projection.
-    #[param]
     pub q_proj: nn::Linear,
     /// Key projection.
-    #[param]
     pub k_proj: nn::Linear,
     /// Value projection.
-    #[param]
     pub v_proj: nn::Linear,
     /// Output projection.
-    #[param]
     pub out_proj: nn::Linear,
 }
+impl_module_params!(WhisperAttention; q_proj, k_proj, v_proj, out_proj);
+
 
 impl WhisperAttention {
     /// Create a new attention layer.
@@ -297,36 +288,36 @@ impl WhisperAttention {
         };
 
         // Reshape to multi-head: [B, T, H, D]
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?;
-        let k = k.reshape(&[batch, -1, self.n_heads, self.head_dim])?;
-        let v = v.reshape(&[batch, -1, self.n_heads, self.head_dim])?;
+        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
+        let k = k.reshape(&[batch, -1, self.n_heads, self.head_dim]);
+        let v = v.reshape(&[batch, -1, self.n_heads, self.head_dim]);
 
         // Transpose to [B, H, T, D]
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        let q = q.transpose_axes(&[0, 2, 1, 3]);
+        let k = k.transpose_axes(&[0, 2, 1, 3]);
+        let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Scaled dot-product attention
         let scale = Array::from_f32(self.scale);
-        let q_scaled = mlx_rs::ops::multiply(&q, &scale)?;
-        let k_t = k.transpose_axes(&[0, 1, 3, 2])?;
-        let mut attn = mlx_rs::ops::matmul(&q_scaled, &k_t)?;
+        let q_scaled = pmetal_bridge::compat::ops::multiply(&q, &scale);
+        let k_t = k.transpose_axes(&[0, 1, 3, 2]);
+        let mut attn = pmetal_bridge::compat::ops::matmul(&q_scaled, &k_t);
 
         // Apply mask if provided
         if let Some(m) = mask {
-            attn = mlx_rs::ops::add(&attn, m)?;
+            attn = pmetal_bridge::compat::ops::add(&attn, m);
         }
 
         // Softmax
-        let attn = softmax_axis(&attn, -1, None)?;
+        let attn = ops::softmax_axis(&attn, -1);
 
         // Attention output
-        let out = mlx_rs::ops::matmul(&attn, &v)?;
+        let out = pmetal_bridge::compat::ops::matmul(&attn, &v);
 
         // Transpose back to [B, T, H, D] and reshape to [B, T, D_model]
-        let out = out.transpose_axes(&[0, 2, 1, 3])?;
+        let out = out.transpose_axes(&[0, 2, 1, 3]);
         let d_model = self.n_heads * self.head_dim;
-        let out = out.reshape(&[batch, seq_len, d_model])?;
+        let out = out.reshape(&[batch, seq_len, d_model]);
 
         // Output projection
         Module::forward(&mut self.out_proj, &out)
@@ -334,24 +325,21 @@ impl WhisperAttention {
 }
 
 /// Whisper encoder attention block.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct WhisperEncoderBlock {
     /// Self-attention.
-    #[param]
     pub self_attn: WhisperAttention,
     /// Self-attention layer norm.
-    #[param]
     pub self_attn_layer_norm: nn::LayerNorm,
     /// First MLP layer.
-    #[param]
     pub fc1: nn::Linear,
     /// Second MLP layer.
-    #[param]
     pub fc2: nn::Linear,
     /// Final layer norm.
-    #[param]
     pub final_layer_norm: nn::LayerNorm,
 }
+impl_module_params!(WhisperEncoderBlock; self_attn, self_attn_layer_norm, fc1, fc2, final_layer_norm);
+
 
 impl WhisperEncoderBlock {
     /// Create a new encoder block.
@@ -385,43 +373,38 @@ impl WhisperEncoderBlock {
         // Self-attention with residual
         let x_norm = Module::forward(&mut self.self_attn_layer_norm, x)?;
         let attn_out = self.self_attn.forward(&x_norm, None, None)?;
-        let x = mlx_rs::ops::add(x, &attn_out)?;
+        let x = pmetal_bridge::compat::ops::add(x, &attn_out);
 
         // MLP with residual
         let x_norm = Module::forward(&mut self.final_layer_norm, &x)?;
         let mlp_out = Module::forward(&mut self.fc1, &x_norm)?;
-        let mlp_out = mlx_rs::nn::gelu(&mlp_out)?;
+        let mlp_out = pmetal_bridge::compat::nn::gelu(&mlp_out);
         let mlp_out = Module::forward(&mut self.fc2, &mlp_out)?;
 
-        mlx_rs::ops::add(&x, &mlp_out)
+        Ok(pmetal_bridge::compat::ops::add(&x, &mlp_out))
     }
 }
 
 /// Whisper decoder attention block.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct WhisperDecoderBlock {
     /// Self-attention.
-    #[param]
     pub self_attn: WhisperAttention,
     /// Self-attention layer norm.
-    #[param]
     pub self_attn_layer_norm: nn::LayerNorm,
     /// Cross-attention.
-    #[param]
     pub encoder_attn: WhisperAttention,
     /// Cross-attention layer norm.
-    #[param]
     pub encoder_attn_layer_norm: nn::LayerNorm,
     /// First MLP layer.
-    #[param]
     pub fc1: nn::Linear,
     /// Second MLP layer.
-    #[param]
     pub fc2: nn::Linear,
     /// Final layer norm.
-    #[param]
     pub final_layer_norm: nn::LayerNorm,
 }
+impl_module_params!(WhisperDecoderBlock; self_attn, self_attn_layer_norm, encoder_attn, encoder_attn_layer_norm, fc1, fc2, final_layer_norm);
+
 
 impl WhisperDecoderBlock {
     /// Create a new decoder block.
@@ -467,44 +450,41 @@ impl WhisperDecoderBlock {
         // Self-attention with residual
         let x_norm = Module::forward(&mut self.self_attn_layer_norm, x)?;
         let attn_out = self.self_attn.forward(&x_norm, None, mask)?;
-        let x = mlx_rs::ops::add(x, &attn_out)?;
+        let x = pmetal_bridge::compat::ops::add(x, &attn_out);
 
         // Cross-attention with residual
         let x_norm = Module::forward(&mut self.encoder_attn_layer_norm, &x)?;
         let cross_out = self
             .encoder_attn
             .forward(&x_norm, Some(encoder_out), None)?;
-        let x = mlx_rs::ops::add(&x, &cross_out)?;
+        let x = pmetal_bridge::compat::ops::add(&x, &cross_out);
 
         // MLP with residual
         let x_norm = Module::forward(&mut self.final_layer_norm, &x)?;
         let mlp_out = Module::forward(&mut self.fc1, &x_norm)?;
-        let mlp_out = mlx_rs::nn::gelu(&mlp_out)?;
+        let mlp_out = pmetal_bridge::compat::nn::gelu(&mlp_out);
         let mlp_out = Module::forward(&mut self.fc2, &mlp_out)?;
 
-        mlx_rs::ops::add(&x, &mlp_out)
+        Ok(pmetal_bridge::compat::ops::add(&x, &mlp_out))
     }
 }
 
 /// Whisper audio encoder.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct WhisperEncoder {
     /// First conv layer.
-    #[param]
     pub conv1: nn::Conv1d,
     /// Second conv layer.
-    #[param]
     pub conv2: nn::Conv1d,
     /// Positional embedding.
-    #[param]
     pub positional_embedding: Param<Array>,
     /// Encoder blocks.
-    #[param]
     pub layers: Vec<WhisperEncoderBlock>,
     /// Post layer norm.
-    #[param]
     pub layer_norm: nn::LayerNorm,
 }
+impl_module_params!(WhisperEncoder; conv1, conv2, positional_embedding, layers, layer_norm);
+
 
 impl WhisperEncoder {
     /// Create a new encoder.
@@ -551,17 +531,17 @@ impl WhisperEncoder {
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         // Conv layers with GELU
         let x = Module::forward(&mut self.conv1, x)?;
-        let x = mlx_rs::nn::gelu(&x)?;
+        let x = pmetal_bridge::compat::nn::gelu(&x);
         let x = Module::forward(&mut self.conv2, &x)?;
-        let x = mlx_rs::nn::gelu(&x)?;
+        let x = pmetal_bridge::compat::nn::gelu(&x);
 
         // Transpose: [B, C, T] -> [B, T, C]
-        let x = x.transpose_axes(&[0, 2, 1])?;
+        let x = x.transpose_axes(&[0, 2, 1]);
 
         // Add positional embedding
         let seq_len = x.shape()[1] as i32;
-        let pos_embed = self.positional_embedding.value.index((0..seq_len, ..));
-        let mut x = mlx_rs::ops::add(&x, &pos_embed)?;
+        let pos_embed = pmetal_bridge::compat::ops::slice_axis(&self.positional_embedding.value, 0, 0, seq_len);
+        let mut x = pmetal_bridge::compat::ops::add(&x, &pos_embed);
 
         // Transformer blocks
         for layer in &mut self.layers {
@@ -573,21 +553,19 @@ impl WhisperEncoder {
 }
 
 /// Whisper text decoder.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct WhisperDecoder {
     /// Token embedding.
-    #[param]
     pub embed_tokens: nn::Embedding,
     /// Positional embedding.
-    #[param]
     pub embed_positions: Param<Array>,
     /// Decoder blocks.
-    #[param]
     pub layers: Vec<WhisperDecoderBlock>,
     /// Final layer norm.
-    #[param]
     pub layer_norm: nn::LayerNorm,
 }
+impl_module_params!(WhisperDecoder; embed_tokens, embed_positions, layers, layer_norm);
+
 
 impl WhisperDecoder {
     /// Create a new decoder.
@@ -595,10 +573,10 @@ impl WhisperDecoder {
         let embed_tokens = nn::Embedding::new(config.vocab_size, config.d_model)?;
 
         // Learned positional embeddings (initialized to zeros, will be loaded from checkpoint)
-        let embed_positions = Param::new(Array::zeros::<f32>(&[
+        let embed_positions = Param::new(Array::zeros_f32(&[
             config.max_target_positions,
             config.d_model,
-        ])?);
+        ]));
 
         let layers = (0..config.decoder_layers)
             .map(|_| WhisperDecoderBlock::new(config))
@@ -637,8 +615,8 @@ impl WhisperDecoder {
         let x = Module::forward(&mut self.embed_tokens, tokens)?;
 
         // Add positional embeddings
-        let pos_embed = self.embed_positions.value.index((0..seq_len, ..));
-        let mut x = mlx_rs::ops::add(&x, &pos_embed)?;
+        let pos_embed = pmetal_bridge::compat::ops::slice_axis(&self.embed_positions.value, 0, 0, seq_len);
+        let mut x = pmetal_bridge::compat::ops::add(&x, &pos_embed);
 
         // Transformer blocks
         for layer in &mut self.layers {
@@ -650,28 +628,30 @@ impl WhisperDecoder {
 
     /// Compute logits from hidden states (tied weights with embedding).
     pub fn logits(&self, hidden: &Array) -> Result<Array, Exception> {
-        self.embed_tokens.as_linear(hidden)
+        Ok(self.embed_tokens.as_linear(hidden))
     }
 }
 
 /// Complete Whisper model.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Whisper {
     /// Configuration.
     pub config: WhisperConfig,
     /// Audio encoder.
-    #[param]
     pub encoder: WhisperEncoder,
     /// Text decoder.
-    #[param]
     pub decoder: WhisperDecoder,
 }
+impl_module_params!(Whisper; encoder, decoder);
+
 
 impl Whisper {
     /// Create a new Whisper model.
     pub fn new(config: WhisperConfig) -> Result<Self, Exception> {
         let encoder = WhisperEncoder::new(&config)?;
+
         let decoder = WhisperDecoder::new(&config)?;
+
 
         Ok(Self {
             config,

@@ -1,6 +1,6 @@
 use super::*;
-use mlx_rs::module::ModuleParameters;
-use mlx_rs::utils::Updatable;
+use pmetal_bridge::compat::module::ModuleParameters;
+use pmetal_bridge::compat::optimizers::Updatable;
 
 impl TrainingLoop {
     /// Run training with sequence packing for 2-5x throughput improvement.
@@ -138,7 +138,7 @@ impl TrainingLoop {
         } else {
             jit_training_step_packed(&mut state, &warmup_batch, max_grad_norm)?
         };
-        warmup_loss.eval()?;
+        warmup_loss.eval();
         let warmup_loss_val: f32 = warmup_loss.item();
 
         // Record optimizer state count AFTER warmup (states now initialized)
@@ -203,7 +203,7 @@ impl TrainingLoop {
                 // accumulation. Without mx.compile (unavailable in mlx-rs), each
                 // step builds a NEW graph (~10 GB for a 0.6B model). Deferring
                 // evaluation across 10 steps means 10 graphs (~100 GB) in memory.
-                loss.eval()?;
+                loss.eval();
                 eval_training_state(&[], &state)?;
 
                 accumulated_losses.push(loss);
@@ -228,7 +228,7 @@ impl TrainingLoop {
                     let batch_size = accumulated_losses.len();
                     let mut adaptive_action = AdaptiveAction::Continue;
                     for (i, loss) in accumulated_losses.iter().enumerate() {
-                        let loss_val = loss.item::<f32>();
+                        let loss_val = loss.item_f32();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
                         self.step = saved_step - batch_size + i;
                         let action = self.apply_adaptive_lr(loss_val as f64);
@@ -345,7 +345,7 @@ impl TrainingLoop {
                     if !accumulated_losses.is_empty() {
                         eval_training_state(&accumulated_losses, &state)?;
                         for loss in &accumulated_losses {
-                            let loss_val = loss.item::<f32>();
+                            let loss_val = loss.item_f32();
                             self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
                         }
                         accumulated_losses.clear();
@@ -374,7 +374,7 @@ impl TrainingLoop {
         if !accumulated_losses.is_empty() {
             eval_training_state(&accumulated_losses, &state)?;
             for loss in &accumulated_losses {
-                let loss_val = loss.item::<f32>();
+                let loss_val = loss.item_f32();
                 self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
             }
         }

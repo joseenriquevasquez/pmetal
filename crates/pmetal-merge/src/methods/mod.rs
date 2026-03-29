@@ -40,7 +40,7 @@ pub use task_arithmetic::TaskArithmeticMerge;
 pub use ties::TiesMerge;
 
 use crate::{MergeParameters, Result};
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 
 /// Trait for merge method implementations.
 pub trait MergeMethod: Send + Sync {

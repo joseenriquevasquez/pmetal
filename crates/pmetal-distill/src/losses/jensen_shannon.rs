@@ -19,15 +19,13 @@
 
 use super::{DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k};
 use crate::Result;
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, ops};
 
 /// Numerically stable log(exp(a) + exp(b)) = max(a,b) + log(1 + exp(-|a-b|)).
-fn log_sum_exp(a: &Array, b: &Array) -> std::result::Result<Array, mlx_rs::error::Exception> {
-    let max_ab = mlx_rs::ops::maximum(a, b)?;
-    let diff = a.subtract(b)?.abs()?;
-    let log1p_term = mlx_rs::ops::exp(&diff.negative()?)?
-        .add(&Array::from_f32(1.0))?
-        .log()?;
+fn log_sum_exp(a: &Array, b: &Array) -> Array {
+    let max_ab = ops::maximum(a, b);
+    let diff = a.subtract(b).abs_val();
+    let log1p_term = diff.negative().exp().add(&Array::from_f32(1.0)).log();
     max_ab.add(&log1p_term)
 }
 
@@ -138,14 +136,14 @@ impl JensenShannonLoss {
         let total_elements = num_tokens * vocab_size;
 
         // Flatten to [num_tokens, vocab] for Metal kernel
-        let teacher_flat = teacher_logits.reshape(&[-1, vocab_size as i32])?;
-        let student_flat = student_logits.reshape(&[-1, vocab_size as i32])?;
+        let mut teacher_flat = teacher_logits.reshape(&[-1, vocab_size as i32]);
+        let mut student_flat = student_logits.reshape(&[-1, vocab_size as i32]);
 
         // Evaluate the arrays to ensure data is computed and available
-        teacher_flat.eval()?;
-        student_flat.eval()?;
+        teacher_flat.eval();
+        student_flat.eval();
 
-        // SAFETY: mlx_array_data_float32 returns *const f32 in mlx-rs 0.25.7+.
+        // SAFETY: data_ptr() returns *mut f32 pointing to unified memory shared by MLX and Metal.
         // metal_buffer_from_ptr requires *mut T because newBufferWithBytesNoCopy
         // takes a mutable void pointer (Metal API constraint), but the buffer is
         // created as a read-only view — we never write through this pointer.
@@ -153,14 +151,12 @@ impl JensenShannonLoss {
         //   1. The data is valid unified memory owned by the evaluated MLX arrays.
         //   2. We only read from the Metal buffer (kernel input).
         //   3. teacher_flat/student_flat remain alive for the duration of this fn.
-        let teacher_ptr =
-            unsafe { mlx_sys::mlx_array_data_float32(teacher_flat.as_ptr()) as *mut f32 };
-        let student_ptr =
-            unsafe { mlx_sys::mlx_array_data_float32(student_flat.as_ptr()) as *mut f32 };
+        let teacher_ptr = teacher_flat.data_ptr() as *mut f32;
+        let student_ptr = student_flat.data_ptr() as *mut f32;
 
         if teacher_ptr.is_null() || student_ptr.is_null() {
             return Err(crate::DistillError::Metal(
-                "mlx_array_data_float32 returned null — array may not be f32 or not evaluated"
+                "data_ptr returned null — array may not be f32 or not evaluated"
                     .to_string(),
             ));
         }
@@ -229,34 +225,34 @@ impl DistillLoss for JensenShannonLoss {
 
         // MLX fallback / weighted / sparse-vocab implementation (log-domain for stability)
         let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp)?;
-        let student_scaled = student_logits.divide(&temp)?;
+        let teacher_scaled = teacher_logits.divide(&temp);
+        let student_scaled = student_logits.divide(&temp);
 
-        let teacher_log_probs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
-        let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
-        let teacher_probs = teacher_log_probs.exp()?;
+        let teacher_log_probs = teacher_scaled.log_softmax(-1);
+        let student_log_probs = student_scaled.log_softmax(-1);
+        let teacher_probs = teacher_log_probs.exp();
 
         // log(M) via log-sum-exp for stability (avoids 0*-inf = NaN for disjoint distributions)
         let log2 = Array::from_f32(2.0_f32.ln());
-        let log_mixture = log_sum_exp(&teacher_log_probs, &student_log_probs)?.subtract(&log2)?;
+        let log_mixture = log_sum_exp(&teacher_log_probs, &student_log_probs).subtract(&log2);
 
-        let kl_teacher_m = teacher_probs.multiply(&teacher_log_probs.subtract(&log_mixture)?)?;
-        let student_probs = student_log_probs.exp()?;
-        let kl_student_m = student_probs.multiply(&student_log_probs.subtract(&log_mixture)?)?;
+        let kl_teacher_m = teacher_probs.multiply(&teacher_log_probs.subtract(&log_mixture));
+        let student_probs = student_log_probs.exp();
+        let kl_student_m = student_probs.multiply(&student_log_probs.subtract(&log_mixture));
 
         let half = Array::from_f32(0.5);
         let js_per_token = kl_teacher_m
-            .add(&kl_student_m)?
-            .multiply(&half)?
-            .sum_axes(&[-1], Some(false))?;
+            .add(&kl_student_m)
+            .multiply(&half)
+            .sum_axes(&[-1], false);
 
         if let Some(w) = weights {
-            let weighted = js_per_token.multiply(w)?;
-            let total_weight = w.sum(None)?;
-            let safe_weight = mlx_rs::ops::maximum(&total_weight, &Array::from_f32(1e-8))?;
-            Ok(weighted.sum(None)?.divide(&safe_weight)?)
+            let weighted = js_per_token.multiply(w);
+            let total_weight = w.sum_all();
+            let safe_weight = ops::maximum(&total_weight, &Array::from_f32(1e-8));
+            Ok(weighted.sum_all().divide(&safe_weight))
         } else {
-            Ok(js_per_token.mean(None)?)
+            Ok(js_per_token.mean_all())
         }
     }
 
@@ -273,7 +269,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_js_identical_distributions() {
-        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let loss = JensenShannonLoss::new();
         let result = loss.compute(&logits, &logits, 1.0).unwrap();
         let value: f32 = result.item();
@@ -289,8 +285,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_js_symmetry() {
-        let p = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
-        let q = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
+        let p = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let q = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
 
         let loss = JensenShannonLoss::new();
         let js_pq = loss.compute(&p, &q, 1.0).unwrap();
@@ -312,8 +308,8 @@ mod tests {
     #[serial]
     fn test_js_bounded() {
         // Even for very different distributions, JS should be bounded by log(2)
-        let p = Array::from_slice(&[10.0_f32, 0.0, 0.0, 0.0], &[1, 1, 4]);
-        let q = Array::from_slice(&[0.0_f32, 0.0, 0.0, 10.0], &[1, 1, 4]);
+        let p = Array::from_f32_slice(&[10.0_f32, 0.0, 0.0, 0.0], &[1, 1, 4]);
+        let q = Array::from_f32_slice(&[0.0_f32, 0.0, 0.0, 10.0], &[1, 1, 4]);
 
         let loss = JensenShannonLoss::new();
         let result = loss.compute(&p, &q, 1.0).unwrap();
@@ -332,8 +328,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_js_temperature_effect() {
-        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
-        let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
 
         let loss = JensenShannonLoss::new();
 
@@ -356,53 +352,46 @@ mod tests {
     #[test]
     #[serial]
     fn test_jensen_shannon_gradient_flow() {
-        use mlx_rs::transforms::value_and_grad;
+        use pmetal_bridge::compat::nn::value_and_grad;
 
-        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
 
-        let loss_fn = |inputs: &[Array]| -> Vec<Array> {
+        let loss_fn = |inputs: &[Array]| -> Array {
             let student = &inputs[0];
             let temp = Array::from_f32(2.0);
-            let teacher_scaled = teacher.divide(&temp).unwrap();
-            let student_scaled = student.divide(&temp).unwrap();
+            let teacher_scaled = teacher.divide(&temp);
+            let student_scaled = student.divide(&temp);
 
-            let teacher_log_probs = mlx_rs::nn::log_softmax(&teacher_scaled, -1).unwrap();
-            let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1).unwrap();
-            let teacher_probs = teacher_log_probs.exp().unwrap();
+            let teacher_log_probs = teacher_scaled.log_softmax(-1);
+            let student_log_probs = student_scaled.log_softmax(-1);
+            let teacher_probs = teacher_log_probs.exp();
 
             // log(M) = log(0.5*(P+Q)) via log-sum-exp
             let log2 = Array::from_f32(2.0_f32.ln());
             let log_mixture = log_sum_exp(&teacher_log_probs, &student_log_probs)
-                .unwrap()
-                .subtract(&log2)
-                .unwrap();
+                .subtract(&log2);
 
             let kl_teacher_m = teacher_probs
-                .multiply(&teacher_log_probs.subtract(&log_mixture).unwrap())
-                .unwrap();
-            let student_probs = student_log_probs.exp().unwrap();
+                .multiply(&teacher_log_probs.subtract(&log_mixture));
+            let student_probs = student_log_probs.exp();
             let kl_student_m = student_probs
-                .multiply(&student_log_probs.subtract(&log_mixture).unwrap())
-                .unwrap();
+                .multiply(&student_log_probs.subtract(&log_mixture));
 
             let half = Array::from_f32(0.5);
             let js = kl_teacher_m
                 .add(&kl_student_m)
-                .unwrap()
-                .multiply(&half)
-                .unwrap();
-            let js_sum = js.sum_axes(&[-1], Some(false)).unwrap();
-            let loss = js_sum.mean(None).unwrap();
-            vec![loss]
+                .multiply(&half);
+            let js_sum = js.sum_axes(&[-1], false);
+            js_sum.mean_all()
         };
 
-        let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
-        let (values, grads) = value_and_grad(loss_fn)(&[student]).unwrap();
+        let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
+        let (loss_val_arr, grads) = value_and_grad(loss_fn, &[student], &[]).unwrap();
 
-        values[0].eval().unwrap();
-        grads[0].eval().unwrap();
+        loss_val_arr.eval();
+        grads[0].eval();
 
-        let loss_val: f32 = values[0].item();
+        let loss_val: f32 = loss_val_arr.item();
         assert!(
             loss_val.is_finite(),
             "JS loss must be finite, got {}",
@@ -410,7 +399,7 @@ mod tests {
         );
         assert!(loss_val > 0.0, "JS loss must be positive, got {}", loss_val);
 
-        let grad_data: Vec<f32> = grads[0].as_slice().to_vec();
+        let grad_data: Vec<f32> = grads[0].clone().to_f32_vec(4).unwrap();
         let grad_norm: f32 = grad_data.iter().map(|&g| g * g).sum::<f32>().sqrt();
         assert!(
             grad_norm.is_finite(),
@@ -447,11 +436,11 @@ mod tests {
             .map(|i| ((i * 7 % 100) as f32 - 50.0) / 10.0)
             .collect();
 
-        let teacher = Array::from_slice(
+        let teacher = Array::from_f32_slice(
             &teacher_data,
             &[batch_size as i32, seq_len as i32, vocab_size as i32],
         );
-        let student = Array::from_slice(
+        let student = Array::from_f32_slice(
             &student_data,
             &[batch_size as i32, seq_len as i32, vocab_size as i32],
         );
@@ -484,8 +473,8 @@ mod tests {
         let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
             .map(|i| (i * 3 % 40) as f32 - 20.0)
             .collect();
-        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
-        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+        let teacher = Array::from_f32_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_f32_slice(&student_data, &[batch, seq, student_vocab]);
 
         let loss = JensenShannonLoss::new().with_sparse_top_k(32);
         let result = loss.compute(&teacher, &student, 2.0).unwrap();
@@ -516,8 +505,8 @@ mod tests {
         let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
             .map(|i| (i * 3 % 40) as f32 - 20.0)
             .collect();
-        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
-        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+        let teacher = Array::from_f32_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_f32_slice(&student_data, &[batch, seq, student_vocab]);
 
         let loss = JensenShannonLoss::new().with_sparse_top_k(32);
         let result = loss.compute(&teacher, &student, 2.0).unwrap();
@@ -547,8 +536,8 @@ mod tests {
         let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
             .map(|i| i as f32)
             .collect();
-        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
-        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+        let teacher = Array::from_f32_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_f32_slice(&student_data, &[batch, seq, student_vocab]);
 
         let loss = JensenShannonLoss::new().with_sparse_top_k(4);
         let result = loss.compute(&teacher, &student, 1.0).unwrap();
@@ -573,8 +562,8 @@ mod tests {
         // Identical logit values for the shared 6 tokens
         let shared: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let extended: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0];
-        let teacher = Array::from_slice(&shared, &[1, 1, teacher_vocab]);
-        let student = Array::from_slice(&extended, &[1, 1, student_vocab]);
+        let teacher = Array::from_f32_slice(&shared, &[1, 1, teacher_vocab]);
+        let student = Array::from_f32_slice(&extended, &[1, 1, student_vocab]);
 
         let loss = JensenShannonLoss::new().with_sparse_top_k(6);
         let result = loss.compute(&teacher, &student, 1.0).unwrap();
@@ -588,11 +577,11 @@ mod tests {
     #[test]
     #[serial]
     fn test_js_with_sparse_top_k_builder() {
-        let teacher = Array::from_slice(
+        let teacher = Array::from_f32_slice(
             &(0..200).map(|i| i as f32).collect::<Vec<_>>(),
             &[1, 1, 200],
         );
-        let student = Array::from_slice(
+        let student = Array::from_f32_slice(
             &(0..150).map(|i| i as f32).collect::<Vec<_>>(),
             &[1, 1, 150],
         );

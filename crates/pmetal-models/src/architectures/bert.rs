@@ -12,15 +12,8 @@
 //! The output is intended to be passed to a pooling layer
 //! (`pmetal_models::pooling::pool`) to produce fixed-size sentence embeddings.
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, Param},
-    nn,
-    ops::{indexing::IndexOp, softmax_axis},
-};
+use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, nn, ops};
+use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -105,19 +98,17 @@ impl Default for BertConfig {
 ///
 /// Pre-LayerNorm variant used by BERT: the three embeddings are summed and
 /// then passed through a single LayerNorm.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct BertEmbeddings {
-    #[param]
     pub word_embeddings: nn::Embedding,
-    #[param]
     pub position_embeddings: nn::Embedding,
-    #[param]
     pub token_type_embeddings: nn::Embedding,
-    #[param]
     pub layer_norm: nn::LayerNorm,
     /// Cached max position count (for position-ID generation).
     pub max_position_embeddings: i32,
 }
+impl_module_params!(BertEmbeddings; word_embeddings, position_embeddings, token_type_embeddings, layer_norm);
+
 
 impl BertEmbeddings {
     pub fn new(config: &BertConfig) -> Result<Self, Exception> {
@@ -166,7 +157,7 @@ impl BertEmbeddings {
             Module::forward(&mut self.token_type_embeddings, &zeros)?
         };
 
-        let combined = word_emb.add(&pos_emb)?.add(&type_emb)?;
+        let combined = word_emb.add(&pos_emb).add(&type_emb);
         Module::forward(&mut self.layer_norm, &combined)
     }
 }
@@ -176,13 +167,10 @@ impl BertEmbeddings {
 // ---------------------------------------------------------------------------
 
 /// BERT multi-head self-attention.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct BertSelfAttention {
-    #[param]
     pub query: nn::Linear,
-    #[param]
     pub key: nn::Linear,
-    #[param]
     pub value: nn::Linear,
     /// Number of attention heads.
     pub num_heads: i32,
@@ -191,6 +179,8 @@ pub struct BertSelfAttention {
     /// Softmax scale = 1/sqrt(head_dim).
     pub scale: f32,
 }
+impl_module_params!(BertSelfAttention; query, key, value);
+
 
 impl BertSelfAttention {
     pub fn new(config: &BertConfig) -> Result<Self, Exception> {
@@ -232,40 +222,40 @@ impl BertSelfAttention {
 
         // Project and reshape to [batch, heads, seq, head_dim]
         let q = Module::forward(&mut self.query, x)?
-            .reshape(&[batch, seq_len, nh, hd])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[batch, seq_len, nh, hd])
+            .transpose_axes(&[0, 2, 1, 3]);
         let k = Module::forward(&mut self.key, x)?
-            .reshape(&[batch, seq_len, nh, hd])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[batch, seq_len, nh, hd])
+            .transpose_axes(&[0, 2, 1, 3]);
         let v = Module::forward(&mut self.value, x)?
-            .reshape(&[batch, seq_len, nh, hd])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[batch, seq_len, nh, hd])
+            .transpose_axes(&[0, 2, 1, 3]);
 
         // Scaled dot-product: [batch, heads, seq, seq]
         let scores = q
-            .matmul(&k.transpose_axes(&[0, 1, 3, 2])?)?
-            .divide(&Array::from_f32(self.scale))?;
+            .matmul(&k.transpose_axes(&[0, 1, 3, 2]))
+            .divide(&Array::from_f32(self.scale));
 
         // Apply attention mask: [batch, seq] → [batch, 1, 1, seq] additive bias
         let scores = if let Some(mask) = attention_mask {
-            let mask_f = mask.as_dtype(scores.dtype())?;
+            let mask_f = mask.as_dtype(scores.dtype().as_i32());
             // 1 = keep, 0 = ignore → convert to additive: (1 - mask) * -1e9
-            let inv_mask = Array::from_f32(1.0).subtract(&mask_f)?;
+            let inv_mask = Array::from_f32(1.0).subtract(&mask_f);
             let additive = inv_mask
-                .reshape(&[batch, 1, 1, seq_len])?
-                .multiply(&Array::from_f32(-1e9))?;
-            scores.add(&additive)?
+                .reshape(&[batch, 1, 1, seq_len])
+                .multiply(&Array::from_f32(-1e9));
+            scores.add(&additive)
         } else {
             scores
         };
 
-        let attn_weights = softmax_axis(&scores, -1, None)?;
+        let attn_weights = ops::softmax_axis(&scores, -1);
 
         // Weighted sum: [batch, heads, seq, head_dim] → [batch, seq, hidden]
         let out = attn_weights
-            .matmul(&v)?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, nh * hd])?;
+            .matmul(&v)
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, nh * hd]);
 
         Ok(out)
     }
@@ -276,13 +266,13 @@ impl BertSelfAttention {
 // ---------------------------------------------------------------------------
 
 /// BERT attention output: dense projection + residual + LayerNorm.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct BertSelfOutput {
-    #[param]
     pub dense: nn::Linear,
-    #[param]
     pub layer_norm: nn::LayerNorm,
 }
+impl_module_params!(BertSelfOutput; dense, layer_norm);
+
 
 impl BertSelfOutput {
     pub fn new(config: &BertConfig) -> Result<Self, Exception> {
@@ -297,20 +287,21 @@ impl BertSelfOutput {
 
     pub fn forward(&mut self, hidden: &Array, residual: &Array) -> Result<Array, Exception> {
         let out = Module::forward(&mut self.dense, hidden)?;
-        let out = out.add(residual)?;
+        let out = out.add(residual);
         Module::forward(&mut self.layer_norm, &out)
     }
 }
 
 /// BERT intermediate (FFN first half): dense + activation.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct BertIntermediate {
-    #[param]
     pub dense: nn::Linear,
     /// Activation function name. Dispatched in `forward`: relu, silu/swish, tanh,
     /// gelu (default for any unrecognized value).
     pub act: String,
 }
+impl_module_params!(BertIntermediate; dense);
+
 
 impl BertIntermediate {
     pub fn new(config: &BertConfig) -> Result<Self, Exception> {
@@ -325,23 +316,23 @@ impl BertIntermediate {
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let h = Module::forward(&mut self.dense, x)?;
-        match self.act.as_str() {
+        Ok(match self.act.as_str() {
             "relu" => nn::relu(&h),
             "silu" | "swish" => nn::silu(&h),
-            "tanh" => mlx_rs::ops::tanh(&h),
+            "tanh" => pmetal_bridge::compat::ops::tanh(&h),
             _ => nn::gelu(&h), // "gelu" and any unrecognized value default to GELU
-        }
+        })
     }
 }
 
 /// BERT FFN output: dense + residual + LayerNorm.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct BertOutput {
-    #[param]
     pub dense: nn::Linear,
-    #[param]
     pub layer_norm: nn::LayerNorm,
 }
+impl_module_params!(BertOutput; dense, layer_norm);
+
 
 impl BertOutput {
     pub fn new(config: &BertConfig) -> Result<Self, Exception> {
@@ -357,7 +348,7 @@ impl BertOutput {
 
     pub fn forward(&mut self, hidden: &Array, residual: &Array) -> Result<Array, Exception> {
         let out = Module::forward(&mut self.dense, hidden)?;
-        let out = out.add(residual)?;
+        let out = out.add(residual);
         Module::forward(&mut self.layer_norm, &out)
     }
 }
@@ -367,17 +358,15 @@ impl BertOutput {
 // ---------------------------------------------------------------------------
 
 /// Single BERT transformer encoder layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct BertLayer {
-    #[param]
     pub attention: BertSelfAttention,
-    #[param]
     pub attention_output: BertSelfOutput,
-    #[param]
     pub intermediate: BertIntermediate,
-    #[param]
     pub output: BertOutput,
 }
+impl_module_params!(BertLayer; attention, attention_output, intermediate, output);
+
 
 impl BertLayer {
     pub fn new(config: &BertConfig) -> Result<Self, Exception> {
@@ -413,15 +402,15 @@ impl BertLayer {
 /// Returns the sequence of hidden states `[batch, seq_len, hidden_size]`.
 /// No pooler or classification head is included; use `pmetal_models::pooling`
 /// to extract sentence embeddings.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct BertModel {
-    #[param]
     pub embeddings: BertEmbeddings,
-    #[param]
     pub layers: Vec<BertLayer>,
     /// Model configuration (non-trainable metadata).
     pub config: BertConfig,
 }
+impl_module_params!(BertModel; embeddings, layers);
+
 
 impl BertModel {
     pub fn new(config: BertConfig) -> Result<Self, Exception> {
@@ -467,11 +456,12 @@ impl BertModel {
 ///
 /// Wraps `BertModel` and exposes a `forward` that returns encoder hidden
 /// states `[batch, seq_len, hidden_size]` ready for pooling.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct BertForEmbedding {
-    #[param]
     pub model: BertModel,
 }
+impl_module_params!(BertForEmbedding; model);
+
 
 impl BertForEmbedding {
     pub fn new(config: BertConfig) -> Result<Self, Exception> {

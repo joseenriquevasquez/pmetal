@@ -5,17 +5,16 @@
 //! - Local Sliding Window Attention (SWA)
 //! - Fixed-size recurrent state for O(1) memory during generation
 
-use mlx_rs::error::Exception;
-use mlx_rs::macros::ModuleParameters;
-use mlx_rs::module::{Module, ModuleParameters};
-use mlx_rs::nested::NestedHashMap;
-use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{Array, nn};
+// ModuleParameters derive via impl_module_params!
+use pmetal_bridge::compat::{Array, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, indexing, nn, ops};
+use pmetal_bridge::compat::indexing::IndexOp;
+use pmetal_bridge::impl_module_params;
 use pmetal_core::ModelConfig;
 use pmetal_mlx::Builder;
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
+use std::collections::HashMap;
 
 /// RecurrentGemma model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,34 +49,30 @@ impl Default for RecurrentGemmaConfig {
 }
 
 /// Real-Gated Linear Recurrent Unit (RG-LRU).
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct RGLRU {
-    #[param]
     pub input_proj: nn::Linear,
-    #[param]
     pub gate_proj: nn::Linear,
-    #[param]
     pub output_proj: nn::Linear,
     pub width: i32,
     /// Persistent recurrent state for decode mode.
     pub recurrent_state: Option<Array>,
 }
+impl_module_params!(RGLRU; input_proj, gate_proj, output_proj);
+
 
 impl RGLRU {
     pub fn new(config: &RecurrentGemmaConfig) -> Result<Self, Exception> {
         Ok(Self {
             input_proj: nn::LinearBuilder::new(config.hidden_size, config.lru_width)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             gate_proj: nn::LinearBuilder::new(config.hidden_size, config.lru_width)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             output_proj: nn::LinearBuilder::new(config.lru_width, config.hidden_size)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             width: config.lru_width,
             recurrent_state: None,
         })
@@ -86,67 +81,66 @@ impl RGLRU {
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         // RG-LRU recurrence: h_t = a_t * h_{t-1} + (1 - a_t) * (gate_t * input_t)
         // where a_t = sigmoid(a_proj(x_t)) is the recurrent decay gate
-        let input = self.input_proj.forward(x)?;
-        let gate = self.gate_proj.forward(x)?;
-        let gate_activated = mlx_rs::ops::sigmoid(&gate)?;
+        let input = self.input_proj.forward(x);
+        let gate = self.gate_proj.forward(x);
+        let gate_activated = pmetal_bridge::compat::ops::sigmoid(&gate);
 
         // a_t: recurrent decay gate derived from input projection
-        let a_t = mlx_rs::ops::sigmoid(&input)?;
+        let a_t = pmetal_bridge::compat::ops::sigmoid(&input);
 
         // Gated input: (1 - a_t) * (gate * input)
         // Must gate the projected input, NOT the raw embedding x.
-        let one_minus_a = Array::from_f32(1.0).subtract(&a_t)?;
-        let gated_input = gate_activated.multiply(&input)?;
-        let scaled_input = one_minus_a.multiply(&gated_input)?;
+        let one_minus_a = Array::from_f32(1.0).subtract(&a_t);
+        let gated_input = gate_activated.multiply(&input);
+        let scaled_input = one_minus_a.multiply(&gated_input);
 
         // Apply recurrence
         let seq_len = x.dim(1);
         if seq_len == 1 {
             // Decode path: single step with stored state
             let h = if let Some(ref state) = self.recurrent_state {
-                a_t.multiply(state)?.add(&scaled_input)?
+                a_t.multiply(state).add(&scaled_input)
             } else {
                 scaled_input
             };
             self.recurrent_state = Some(h.clone());
-            self.output_proj.forward(&h)
+            Ok(self.output_proj.forward(&h))
         } else {
             // Prefill path: sequential scan over time dimension
             let batch = x.dim(0);
-            let mut h = Array::zeros::<f32>(&[batch, 1, self.width as i32])?;
+            let mut h = Array::zeros_f32(&[batch, 1, self.width as i32]);
             let mut outputs = Vec::with_capacity(seq_len as usize);
 
             for t in 0..seq_len {
-                let a_t_step: Array = a_t.index((.., t..t + 1, ..));
-                let input_step: Array = scaled_input.index((.., t..t + 1, ..));
-                h = a_t_step.multiply(&h)?.add(&input_step)?;
+                let a_t_step = a_t.slice(&[0, t, 0], &[batch, t + 1, self.width]);
+                let input_step =
+                    scaled_input.slice(&[0, t, 0], &[batch, t + 1, self.width]);
+                h = a_t_step.multiply(&h).add(&input_step);
                 outputs.push(h.clone());
             }
             self.recurrent_state = Some(h);
 
             let concatenated =
-                mlx_rs::ops::concatenate_axis(&outputs.iter().collect::<Vec<_>>(), 1)?;
-            self.output_proj.forward(&concatenated)
+                pmetal_bridge::compat::ops::concatenate_axis(&outputs.iter().collect::<Vec<_>>(), 1);
+            Ok(self.output_proj.forward(&concatenated))
         }
     }
 }
 
 /// Manual attention implementation for RecurrentGemma.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct RecurrentGemmaAttention {
-    #[param]
     pub q_proj: nn::Linear,
-    #[param]
     pub k_proj: nn::Linear,
-    #[param]
     pub v_proj: nn::Linear,
-    #[param]
     pub o_proj: nn::Linear,
     pub n_heads: i32,
     pub n_kv_heads: i32,
     pub head_dim: i32,
     pub scale: f32,
 }
+impl_module_params!(RecurrentGemmaAttention; q_proj, k_proj, v_proj, o_proj);
+
 
 impl RecurrentGemmaAttention {
     pub fn new(config: &RecurrentGemmaConfig) -> Result<Self, Exception> {
@@ -156,20 +150,16 @@ impl RecurrentGemmaAttention {
         Ok(Self {
             q_proj: nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             k_proj: nn::LinearBuilder::new(config.hidden_size, n_kv_heads * head_dim)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             v_proj: nn::LinearBuilder::new(config.hidden_size, n_kv_heads * head_dim)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             o_proj: nn::LinearBuilder::new(n_heads * head_dim, config.hidden_size)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -183,27 +173,27 @@ impl RecurrentGemmaAttention {
         let seq_len = shape[1];
         let q = self
             .q_proj
-            .forward(x)?
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .forward(x)
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
         let k = self
             .k_proj
-            .forward(x)?
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .forward(x)
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
         let v = self
             .v_proj
-            .forward(x)?
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .forward(x)
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
         let config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
             .with_scale(self.scale)
             .with_mask_type(AttentionMaskType::Causal);
         let out = fused_sdpa(&q, &k, &v, &config, None)?;
-        self.o_proj.forward(
-            &out.transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[batch, seq_len, -1])?,
-        )
+        Ok(self.o_proj.forward(
+            &out.transpose_axes(&[0, 2, 1, 3])
+                .reshape(&[batch, seq_len, -1]),
+        ))
     }
 }
 
@@ -218,28 +208,28 @@ pub struct RecurrentGemmaLayer {
 }
 
 impl ModuleParameters for RecurrentGemmaLayer {
-    fn parameters(&self) -> NestedHashMap<Rc<str>, &Array> {
-        let mut map = NestedHashMap::new();
+    fn parameters(&self) -> ModuleParamRef<'_> {
+        let mut map = HashMap::new();
         if let Some(ref a) = self.attention {
-            map.entries.extend(a.parameters().entries);
+            map.extend(a.parameters());
         }
         if let Some(ref l) = self.lru {
-            map.entries.extend(l.parameters().entries);
+            map.extend(l.parameters());
         }
-        map.entries.extend(self.mlp.parameters().entries);
-        map.entries.extend(self.norm.parameters().entries);
+        map.extend(self.mlp.parameters());
+        map.extend(self.norm.parameters());
         map
     }
-    fn trainable_parameters(&self) -> NestedHashMap<Rc<str>, &Array> {
-        let mut map = NestedHashMap::new();
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
+        let mut map = HashMap::new();
         if let Some(ref a) = self.attention {
-            map.entries.extend(a.trainable_parameters().entries);
+            map.extend(a.trainable_parameters());
         }
         if let Some(ref l) = self.lru {
-            map.entries.extend(l.trainable_parameters().entries);
+            map.extend(l.trainable_parameters());
         }
-        map.entries.extend(self.mlp.trainable_parameters().entries);
-        map.entries.extend(self.norm.trainable_parameters().entries);
+        map.extend(self.mlp.trainable_parameters());
+        map.extend(self.norm.trainable_parameters());
         map
     }
     fn num_parameters(&self) -> usize {
@@ -248,16 +238,16 @@ impl ModuleParameters for RecurrentGemmaLayer {
             + self.mlp.num_parameters()
             + self.norm.num_parameters()
     }
-    fn parameters_mut(&mut self) -> NestedHashMap<Rc<str>, &mut Array> {
-        let mut map = NestedHashMap::new();
+    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
+        let mut map = HashMap::new();
         if let Some(ref mut a) = self.attention {
-            map.entries.extend(a.parameters_mut().entries);
+            map.extend(a.parameters_mut());
         }
         if let Some(ref mut l) = self.lru {
-            map.entries.extend(l.parameters_mut().entries);
+            map.extend(l.parameters_mut());
         }
-        map.entries.extend(self.mlp.parameters_mut().entries);
-        map.entries.extend(self.norm.parameters_mut().entries);
+        map.extend(self.mlp.parameters_mut());
+        map.extend(self.norm.parameters_mut());
         map
     }
     fn freeze_parameters(&mut self, recurse: bool) {
@@ -283,25 +273,25 @@ impl ModuleParameters for RecurrentGemmaLayer {
     fn all_frozen(&self) -> Option<bool> {
         let mut frozen = true;
         if let Some(ref a) = self.attention {
-            frozen &= a.all_frozen()?;
+            frozen &= a.all_frozen().unwrap_or(true);
         }
         if let Some(ref l) = self.lru {
-            frozen &= l.all_frozen()?;
+            frozen &= l.all_frozen().unwrap_or(true);
         }
-        frozen &= self.mlp.all_frozen()?;
-        frozen &= self.norm.all_frozen()?;
+        frozen &= self.mlp.all_frozen().unwrap_or(true);
+        frozen &= self.norm.all_frozen().unwrap_or(true);
         Some(frozen)
     }
     fn any_frozen(&self) -> Option<bool> {
         let mut frozen = false;
         if let Some(ref a) = self.attention {
-            frozen |= a.any_frozen()?;
+            frozen |= a.any_frozen().unwrap_or(false);
         }
         if let Some(ref l) = self.lru {
-            frozen |= l.any_frozen()?;
+            frozen |= l.any_frozen().unwrap_or(false);
         }
-        frozen |= self.mlp.any_frozen()?;
-        frozen |= self.norm.any_frozen()?;
+        frozen |= self.mlp.any_frozen().unwrap_or(false);
+        frozen |= self.norm.any_frozen().unwrap_or(false);
         Some(frozen)
     }
 }
@@ -326,32 +316,30 @@ impl RecurrentGemmaLayer {
             mlp,
             norm: nn::RmsNormBuilder::new(config.hidden_size)
                 .eps(config.rms_norm_eps)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             is_attention,
         })
     }
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let normed = self.norm.forward(x)?;
+        let normed = self.norm.forward(x);
         let branch_out = if self.is_attention {
             self.attention.as_mut().unwrap().forward(&normed)?
         } else {
             self.lru.as_mut().unwrap().forward(&normed)?
         };
-        x.add(&branch_out)
+        Ok(x.add(&branch_out))
     }
 }
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct RecurrentGemmaModel {
-    #[param]
     pub embed: nn::Embedding,
-    #[param]
     pub layers: Vec<RecurrentGemmaLayer>,
-    #[param]
     pub norm: nn::RmsNorm,
     pub config: RecurrentGemmaConfig,
 }
+impl_module_params!(RecurrentGemmaModel; embed, layers, norm);
+
 
 impl RecurrentGemmaModel {
     pub fn new(config: RecurrentGemmaConfig) -> Result<Self, Exception> {
@@ -363,35 +351,34 @@ impl RecurrentGemmaModel {
             layers,
             norm: nn::RmsNormBuilder::new(config.hidden_size)
                 .eps(config.rms_norm_eps)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             config,
         })
     }
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let mut h = self.embed.forward(x)?;
+        let mut h = self.embed.forward(x);
         for layer in self.layers.iter_mut() {
             h = layer.forward(&h)?;
         }
-        self.norm.forward(&h)
+        Ok(self.norm.forward(&h))
     }
-    pub fn eval(&self) -> Result<(), Exception> {
-        self.embed.weight.eval()?;
-        for layer in &self.layers {
-            if let Some(ref a) = layer.attention {
-                a.q_proj.weight.eval()?;
-                a.k_proj.weight.eval()?;
-                a.v_proj.weight.eval()?;
-                a.o_proj.weight.eval()?;
+    pub fn eval(&mut self) -> Result<(), Exception> {
+        self.embed.weight.eval();
+        for layer in self.layers.iter_mut() {
+            if let Some(ref mut a) = layer.attention {
+                a.q_proj.weight.eval();
+                a.k_proj.weight.eval();
+                a.v_proj.weight.eval();
+                a.o_proj.weight.eval();
             }
-            if let Some(ref l) = layer.lru {
-                l.input_proj.weight.eval()?;
-                l.gate_proj.weight.eval()?;
-                l.output_proj.weight.eval()?;
+            if let Some(ref mut l) = layer.lru {
+                l.input_proj.weight.eval();
+                l.gate_proj.weight.eval();
+                l.output_proj.weight.eval();
             }
-            layer.norm.weight.eval()?;
+            layer.norm.weight.eval();
         }
-        self.norm.weight.eval()?;
+        self.norm.weight.eval();
         Ok(())
     }
 }

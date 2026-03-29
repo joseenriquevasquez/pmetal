@@ -12,9 +12,8 @@
 //! - `AttentionBackward` - Full attention mechanism backward
 //! - `TransformerLayerBackward` - Complete layer backward combining all above
 
-use mlx_rs::error::Exception;
-use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{Array, Dtype};
+use pmetal_bridge::compat::Exception;
+use pmetal_bridge::compat::{Array, Dtype};
 
 use crate::LoraError;
 
@@ -90,7 +89,7 @@ pub fn rmsnorm_backward(d_output: &Array, saved: &RmsNormSaved) -> Result<Array,
 
     // d_x = (d_x_norm - x_norm * mean_dot) / rms
     let correction = saved.x_norm.multiply(&mean_dot)?;
-    let d_x = d_x_norm.subtract(&correction)?.divide(&saved.rms)?;
+    let d_x = d_x_norm.subtract(&correction).divide(&saved.rms)?;
 
     Ok(d_x)
 }
@@ -146,7 +145,7 @@ pub fn silu_backward(d_output: &Array, saved: &SiluSaved) -> Result<Array, LoraE
     let d_silu = saved.sigmoid_x.multiply(&factor)?;
 
     // d_x = d_output * d_silu
-    Ok(d_output.multiply(&d_silu)?)
+    Ok(d_output.multiply(&d_silu))
 }
 
 // =============================================================================
@@ -180,11 +179,11 @@ pub fn rope_forward_with_grad(
     let x2 = x.index((.., .., .., half_dim..));
 
     // Rotate: [x1*cos - x2*sin, x1*sin + x2*cos]
-    let out1 = x1.multiply(cos)?.subtract(&x2.multiply(sin)?)?;
-    let out2 = x1.multiply(sin)?.add(&x2.multiply(cos)?)?;
+    let out1 = x1.multiply(cos).subtract(&x2.multiply(sin))?;
+    let out2 = x1.multiply(sin).add(&x2.multiply(cos))?;
 
     // Concatenate along last dimension
-    let output = mlx_rs::ops::concatenate_axis(&[&out1, &out2], -1)?;
+    let output = pmetal_bridge::compat::ops::concatenate_axis(&[&out1, &out2], -1)?;
 
     let saved = RopeSaved {
         cos: cos.clone(),
@@ -208,13 +207,13 @@ pub fn rope_backward(d_output: &Array, saved: &RopeSaved) -> Result<Array, LoraE
     let d2 = d_output.index((.., .., .., half_dim..));
 
     // Inverse rotation: [d1*cos + d2*sin, -d1*sin + d2*cos]
-    let dx1 = d1.multiply(&saved.cos)?.add(&d2.multiply(&saved.sin)?)?;
+    let dx1 = d1.multiply(&saved.cos).add(&d2.multiply(&saved.sin))?;
     let dx2 = d2
-        .multiply(&saved.cos)?
-        .subtract(&d1.multiply(&saved.sin)?)?;
+        .multiply(&saved.cos)
+        .subtract(&d1.multiply(&saved.sin))?;
 
     // Concatenate
-    Ok(mlx_rs::ops::concatenate_axis(&[&dx1, &dx2], -1)?)
+    Ok(pmetal_bridge::compat::ops::concatenate_axis(&[&dx1, &dx2], -1))
 }
 
 // =============================================================================
@@ -259,20 +258,20 @@ pub fn attention_forward_with_grad(
     };
 
     // Q @ K^T
-    let scores = q.matmul(&k_expanded.transpose_axes(&[0, 1, 3, 2])?)?;
+    let scores = q.matmul(&k_expanded.transpose_axes(&[0, 1, 3, 2]))?;
 
     // Scale
     let scores = scores.multiply(Array::from_f32(scale))?;
 
     // Apply mask
     let scores = if let Some(m) = mask {
-        scores.add(m)?
+        scores.add(m)
     } else {
         scores
     };
 
     // Softmax
-    let attn_weights = mlx_rs::ops::softmax_axis(&scores, -1, None)?;
+    let attn_weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1, None)?;
 
     // Attention output: weights @ V
     let output = attn_weights.matmul(&v_expanded)?;
@@ -316,14 +315,14 @@ pub fn attention_backward(
     // d_weights = d_output @ V^T
     // [batch, heads, seq, head_dim] @ [batch, heads, head_dim, seq]
     // = [batch, heads, seq, seq]
-    let d_weights = d_output.matmul(&v_expanded.transpose_axes(&[0, 1, 3, 2])?)?;
+    let d_weights = d_output.matmul(&v_expanded.transpose_axes(&[0, 1, 3, 2]))?;
 
     // Softmax backward: d_scores = weights * (d_weights - sum(d_weights * weights, axis=-1, keepdims=True))
     let weighted_d = d_weights.multiply(&saved.attn_weights)?;
     let sum_weighted = weighted_d.sum_axis(-1, true)?;
     let d_scores = saved
         .attn_weights
-        .multiply(&d_weights.subtract(&sum_weighted)?)?;
+        .multiply(&d_weights.subtract(&sum_weighted))?;
 
     // Scale backward
     let d_scores = d_scores.multiply(Array::from_f32(saved.scale))?;
@@ -335,7 +334,7 @@ pub fn attention_backward(
     let d_k_expanded = saved
         .q
         .transpose_axes(&[0, 1, 3, 2])?
-        .matmul(&d_scores)?
+        .matmul(&d_scores)
         .transpose_axes(&[0, 1, 3, 2])?;
 
     // Contract GQA gradients if needed
@@ -359,7 +358,7 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
     let head_dim = shape[3];
 
     let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
-    let x = mlx_rs::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
+    let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
     x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])
 }
 
@@ -452,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_silu_forward_backward() {
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
 
         let (output, saved) = silu_forward_with_grad(&x).unwrap();
 
@@ -460,7 +459,7 @@ mod tests {
         assert_eq!(output.shape(), x.shape());
 
         // Test backward
-        let d_output = mlx_rs::random::normal::<f32>(&[2, 4, 64], None, None, None).unwrap();
+        let d_output = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let d_x = silu_backward(&d_output, &saved).unwrap();
 
         assert_eq!(d_x.shape(), x.shape());
@@ -468,13 +467,13 @@ mod tests {
 
     #[test]
     fn test_rmsnorm_forward_backward() {
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 64], None, None, None).unwrap();
-        let weight = mlx_rs::Array::ones::<f32>(&[64]).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let weight = pmetal_bridge::compat::ops::ones(&[64], pmetal_bridge::compat::Dtype::Float32);
 
         let (output, saved) = rmsnorm_forward_with_grad(&x, &weight, 1e-5).unwrap();
         assert_eq!(output.shape(), x.shape());
 
-        let d_output = mlx_rs::random::normal::<f32>(&[2, 4, 64], None, None, None).unwrap();
+        let d_output = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let d_x = rmsnorm_backward(&d_output, &saved).unwrap();
 
         assert_eq!(d_x.shape(), x.shape());
@@ -488,14 +487,11 @@ mod tests {
         let seq_len = 8;
         let head_dim = 16;
 
-        let q = mlx_rs::random::normal::<f32>(&[batch, heads, seq_len, head_dim], None, None, None)
-            .unwrap();
+        let q = pmetal_bridge::compat::random::normal(&[batch, heads, seq_len, head_dim], pmetal_bridge::compat::Dtype::Float32);
         let k =
-            mlx_rs::random::normal::<f32>(&[batch, kv_heads, seq_len, head_dim], None, None, None)
-                .unwrap();
+            pmetal_bridge::compat::random::normal(&[batch, kv_heads, seq_len, head_dim], pmetal_bridge::compat::Dtype::Float32);
         let v =
-            mlx_rs::random::normal::<f32>(&[batch, kv_heads, seq_len, head_dim], None, None, None)
-                .unwrap();
+            pmetal_bridge::compat::random::normal(&[batch, kv_heads, seq_len, head_dim], pmetal_bridge::compat::Dtype::Float32);
 
         let scale = (head_dim as f32).sqrt().recip();
         let num_heads_per_kv = heads / kv_heads;
@@ -505,8 +501,7 @@ mod tests {
         assert_eq!(output.shape(), &[batch, heads, seq_len, head_dim]);
 
         let d_output =
-            mlx_rs::random::normal::<f32>(&[batch, heads, seq_len, head_dim], None, None, None)
-                .unwrap();
+            pmetal_bridge::compat::random::normal(&[batch, heads, seq_len, head_dim], pmetal_bridge::compat::Dtype::Float32);
         let (d_q, d_k, d_v) = attention_backward(&d_output, &saved).unwrap();
 
         assert_eq!(d_q.shape(), q.shape());

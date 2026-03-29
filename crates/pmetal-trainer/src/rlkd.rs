@@ -34,7 +34,7 @@
 //! - The distillation loss uses the SAME student logits computed inside the closure,
 //!   so both objectives share one forward pass per step.
 
-use mlx_rs::{Array, error::Exception, nn, ops::indexing::IndexOp, optimizers::Optimizer};
+use pmetal_bridge::compat::{Array, Exception, nn, ops, ops::indexing::IndexOp, optimizers::Optimizer, eval_params};
 use pmetal_core::{EvalMetrics, TrainingConfig};
 use pmetal_lora::TrainableModel;
 use std::time::Instant;
@@ -378,8 +378,8 @@ impl RlkdTrainer {
         let student_scaled = student_shifted.divide(&t)?;
 
         // log-softmax for numerical stability
-        let teacher_log_probs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
-        let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
+        let teacher_log_probs = nn::log_softmax(&teacher_scaled, -1);
+        let student_log_probs = nn::log_softmax(&student_scaled, -1);
         let teacher_probs = teacher_log_probs.exp()?;
 
         // Forward KL: sum_v [ p_t * (log p_t - log p_s) ]
@@ -391,7 +391,7 @@ impl RlkdTrainer {
         // Apply completion mask and take mean over valid tokens
         let masked_kl = kl_per_token.multiply(completion_mask)?;
         let total_tokens = completion_mask.sum(None)?;
-        let safe_tokens = mlx_rs::ops::maximum(&total_tokens, &Array::from_f32(1.0))?;
+        let safe_tokens = ops::maximum(&total_tokens, &Array::from_f32(1.0));
         let mean_kl = masked_kl.sum(None)?.divide(&safe_tokens)?;
 
         // Scale by T^2 to preserve gradient magnitude
@@ -567,7 +567,7 @@ impl RlkdTrainer {
 
         // --- 5. Update optimizer ---
         optimizer.update(policy, grads)?;
-        mlx_rs::transforms::eval_params(policy.parameters())?;
+        eval_params(policy.parameters())?;
 
         let total_loss = total_loss_arr.item::<f32>();
 

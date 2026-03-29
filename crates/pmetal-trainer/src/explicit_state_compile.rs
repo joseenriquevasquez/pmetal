@@ -61,7 +61,7 @@
 //!     // loss is lazy - only eval when logging
 //!     if step % log_every == 0 {
 //!         loss.eval()?;
-//!         println!("Loss: {}", loss.item::<f32>());
+//!         println!("Loss: {}", loss.item_f32());
 //!     }
 //! }
 //!
@@ -74,14 +74,13 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-use mlx_rs::{
-    Array,
-    error::Exception,
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception,
     module::{FlattenedModuleParam, ModuleParameters},
-    nn,
+    nn, ops,
     ops::indexing::IndexOp,
-    optimizers::Optimizer,
-    utils::Updatable,
+    optimizers::{Optimizer, Updatable},
+    transforms,
 };
 use pmetal_lora::TrainableModel;
 use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
@@ -592,7 +591,7 @@ where
             .map_err(crate::SftError::Mlx)?;
 
         // Evaluate to ensure state is materialized
-        loss.eval().map_err(crate::SftError::Mlx)?;
+        loss.eval();
 
         // Get optimizer state count after warmup
         let optimizer_state_count = self.optimizer.updatable_states_len();
@@ -656,7 +655,7 @@ where
         // Eager evaluation if configured (for memory-constrained scenarios)
         if self.config.eager_evaluation {
             // Eval loss
-            loss.eval().map_err(crate::SftError::Mlx)?;
+            loss.eval();
 
             // Eval model params (flatten returns HashMap<Rc<str>, &Array>)
             let param_refs: Vec<&Array> = self
@@ -667,13 +666,13 @@ where
                 .copied() // &Array -> Array reference
                 .collect();
             if !param_refs.is_empty() {
-                mlx_rs::transforms::eval(param_refs).map_err(crate::SftError::Mlx)?;
+                transforms::eval(param_refs).map_err(crate::SftError::Mlx)?;
             }
 
             // Eval optimizer state
             let opt_states: Vec<&Array> = self.optimizer.updatable_states().into_iter().collect();
             if !opt_states.is_empty() {
-                mlx_rs::transforms::eval(opt_states).map_err(crate::SftError::Mlx)?;
+                transforms::eval(opt_states).map_err(crate::SftError::Mlx)?;
             }
         }
 
@@ -754,20 +753,20 @@ fn compute_causal_lm_loss(logits: &Array, labels: &Array) -> std::result::Result
     let shift_logits = logits.index((.., ..seq_len - 1, ..));
     let shift_labels = labels.index((.., 1..));
 
-    let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
-    let flat_labels = shift_labels.reshape(&[-1])?;
+    let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
+    let flat_labels = shift_labels.reshape(&[-1]);
 
     // Use optimized cross-entropy kernel with ignore_index=-100
     let per_token_loss = cross_entropy_loss(&flat_logits, &flat_labels, Some(-100_i64), 0.0)?;
 
     // Compute mean loss over non-ignored tokens
-    let ignore_mask = flat_labels.ne(&Array::from_int(-100_i32))?;
-    let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
-    let masked_loss = per_token_loss.multiply(&ignore_mask_f32)?;
-    let valid_count = ignore_mask_f32.sum(None)?;
-    let valid_count_safe = mlx_rs::ops::maximum(&valid_count, &Array::from_f32(1.0))?;
+    let ignore_mask = flat_labels.ne(&Array::from_int(-100_i32));
+    let ignore_mask_f32 = ignore_mask.as_dtype(Dtype::Float32.as_i32());
+    let masked_loss = per_token_loss.multiply(&ignore_mask_f32);
+    let valid_count = ignore_mask_f32.sum(None);
+    let valid_count_safe = ops::maximum(&valid_count, &Array::from_f32(1.0));
 
-    masked_loss.sum(None)?.divide(&valid_count_safe)
+    Ok(masked_loss.sum(None).divide(&valid_count_safe))
 }
 
 /// GPU-based gradient clipping by global norm.
@@ -783,36 +782,31 @@ fn clip_gradients_gpu(grads: &mut FlattenedModuleParam, max_norm: f32) -> Result
     let squared_norms: Vec<Array> = grads
         .values()
         .map(|g| {
-            let flat = g.reshape(&[-1]).expect("reshape failed");
-            flat.multiply(&flat)
-                .expect("multiply failed")
-                .sum(None)
-                .expect("sum failed")
+            let flat = g.reshape(&[-1]);
+            flat.multiply(&flat).sum(None)
         })
         .collect();
 
     // Sum all squared norms
     let mut total_sq_norm = squared_norms[0].clone();
     for sq_norm in squared_norms.iter().skip(1) {
-        total_sq_norm = total_sq_norm.add(sq_norm).map_err(crate::SftError::Mlx)?;
+        total_sq_norm = total_sq_norm.add(sq_norm);
     }
 
     // Compute global norm
-    let global_norm = total_sq_norm.sqrt().map_err(crate::SftError::Mlx)?;
+    let global_norm = total_sq_norm.sqrt();
 
     // Compute scale factor: min(max_norm / (norm + eps), 1.0)
     let max_norm_arr = Array::from_f32(max_norm);
     let eps = Array::from_f32(1e-6);
-    let norm_plus_eps = global_norm.add(&eps).map_err(crate::SftError::Mlx)?;
-    let raw_scale = max_norm_arr
-        .divide(&norm_plus_eps)
-        .map_err(crate::SftError::Mlx)?;
+    let norm_plus_eps = global_norm.add(&eps);
+    let raw_scale = max_norm_arr.divide(&norm_plus_eps);
     let one = Array::from_f32(1.0);
-    let scale = mlx_rs::ops::minimum(&raw_scale, &one).map_err(crate::SftError::Mlx)?;
+    let scale = ops::minimum(&raw_scale, &one);
 
     // Apply scale to all gradients (lazy - no eval)
     for grad in grads.values_mut() {
-        *grad = grad.multiply(&scale).map_err(crate::SftError::Mlx)?;
+        *grad = grad.multiply(&scale);
     }
 
     Ok(Some(global_norm))
@@ -848,8 +842,9 @@ pub fn compile_forward<F>(
 where
     F: Fn(&Array) -> std::result::Result<Array, Exception> + Copy + 'static,
 {
-    use mlx_rs::transforms::compile::compile;
-    let mut compiled = compile(forward_fn, shapeless);
+    // No-op shim: bridge executes pre-compiled Metal ops; JIT compile is a no-op.
+    fn compile_noop<F>(f: F, _shapeless: bool) -> F { f }
+    let mut compiled = compile_noop(forward_fn, shapeless);
     move |input| compiled(input)
 }
 
@@ -864,8 +859,8 @@ mod tests {
     #[test]
     fn test_state_container_vec() {
         let mut container = vec![
-            Array::from_slice(&[1.0f32, 2.0], &[2]),
-            Array::from_slice(&[3.0f32, 4.0, 5.0], &[3]),
+            Array::from_f32_slice(&[1.0f32, 2.0], &[2]),
+            Array::from_f32_slice(&[3.0f32, 4.0, 5.0], &[3]),
         ];
 
         assert_eq!(container.len(), 2);
@@ -874,24 +869,24 @@ mod tests {
         assert_eq!(flat.len(), 2);
 
         let new_arrays = vec![
-            Array::from_slice(&[10.0f32, 20.0], &[2]),
-            Array::from_slice(&[30.0f32, 40.0, 50.0], &[3]),
+            Array::from_f32_slice(&[10.0f32, 20.0], &[2]),
+            Array::from_f32_slice(&[30.0f32, 40.0, 50.0], &[3]),
         ];
         container.fill(&new_arrays);
 
         let updated = container.flatten();
-        updated[0].eval().unwrap();
-        updated[1].eval().unwrap();
+        updated[0].eval();
+        updated[1].eval();
         assert_eq!(updated[0].as_slice::<f32>(), &[10.0, 20.0]);
         assert_eq!(updated[1].as_slice::<f32>(), &[30.0, 40.0, 50.0]);
     }
 
     #[test]
     fn test_state_container_tuple() {
-        let a = vec![Array::from_slice(&[1.0f32], &[1])];
+        let a = vec![Array::from_f32_slice(&[1.0f32], &[1])];
         let b = vec![
-            Array::from_slice(&[2.0f32], &[1]),
-            Array::from_slice(&[3.0f32], &[1]),
+            Array::from_f32_slice(&[2.0f32], &[1]),
+            Array::from_f32_slice(&[3.0f32], &[1]),
         ];
 
         let mut tuple = (a, b);
@@ -901,24 +896,24 @@ mod tests {
         assert_eq!(flat.len(), 3);
 
         let new_arrays = vec![
-            Array::from_slice(&[10.0f32], &[1]),
-            Array::from_slice(&[20.0f32], &[1]),
-            Array::from_slice(&[30.0f32], &[1]),
+            Array::from_f32_slice(&[10.0f32], &[1]),
+            Array::from_f32_slice(&[20.0f32], &[1]),
+            Array::from_f32_slice(&[30.0f32], &[1]),
         ];
         tuple.fill(&new_arrays);
 
         assert_eq!(tuple.0.len(), 1);
         assert_eq!(tuple.1.len(), 2);
 
-        tuple.0[0].eval().unwrap();
+        tuple.0[0].eval();
         assert_eq!(tuple.0[0].as_slice::<f32>(), &[10.0]);
     }
 
     #[test]
     fn test_frozen_state() {
         let arrays = vec![
-            Array::from_slice(&[1.0f32, 2.0], &[2]),
-            Array::from_slice(&[3.0f32], &[1]),
+            Array::from_f32_slice(&[1.0f32, 2.0], &[2]),
+            Array::from_f32_slice(&[3.0f32], &[1]),
         ];
 
         let mut frozen = FrozenState { arrays, keys: None };
@@ -926,12 +921,12 @@ mod tests {
         assert_eq!(frozen.len(), 2);
 
         let new_arrays = vec![
-            Array::from_slice(&[10.0f32, 20.0], &[2]),
-            Array::from_slice(&[30.0f32], &[1]),
+            Array::from_f32_slice(&[10.0f32, 20.0], &[2]),
+            Array::from_f32_slice(&[30.0f32], &[1]),
         ];
         frozen.update(&new_arrays);
 
-        frozen.arrays()[0].eval().unwrap();
+        frozen.arrays()[0].eval();
         assert_eq!(frozen.arrays()[0].as_slice::<f32>(), &[10.0, 20.0]);
     }
 
@@ -946,16 +941,16 @@ mod tests {
 
         let mut compiler = ExplicitStateCompiler::new(func, 1, 1, true);
 
-        let arg = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
-        let mut state = vec![Array::from_slice(&[100.0f32], &[1])];
+        let arg = Array::from_f32_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let mut state = vec![Array::from_f32_slice(&[100.0f32], &[1])];
 
         let outputs = compiler.call(&[arg], &mut state).unwrap();
 
         assert_eq!(outputs.len(), 1);
-        outputs[0].eval().unwrap();
-        assert!((outputs[0].item::<f32>() - 6.0).abs() < 1e-5);
+        outputs[0].eval();
+        assert!((outputs[0].item_f32() - 6.0).abs() < 1e-5);
 
-        state[0].eval().unwrap();
+        state[0].eval();
         assert_eq!(state[0].as_slice::<f32>(), &[100.0]);
     }
 
@@ -971,15 +966,15 @@ mod tests {
 
         let mut compiler = ExplicitStateCompiler::new(func, 1, 1, true);
 
-        let arg = Array::from_slice(&[1.0f32, 2.0], &[2]);
-        let mut state = vec![Array::from_slice(&[10.0f32, 20.0], &[2])];
+        let arg = Array::from_f32_slice(&[1.0f32, 2.0], &[2]);
+        let mut state = vec![Array::from_f32_slice(&[10.0f32, 20.0], &[2])];
 
         let outputs = compiler.call(&[arg], &mut state).unwrap();
 
-        outputs[0].eval().unwrap();
-        assert!((outputs[0].item::<f32>() - 33.0).abs() < 1e-5);
+        outputs[0].eval();
+        assert!((outputs[0].item_f32() - 33.0).abs() < 1e-5);
 
-        state[0].eval().unwrap();
+        state[0].eval();
         assert_eq!(state[0].as_slice::<f32>(), &[11.0, 22.0]);
     }
 
@@ -1000,19 +995,18 @@ mod tests {
         let seq_len = 4;
         let vocab_size = 10;
 
-        let logits =
-            mlx_rs::random::normal::<f32>(&[batch, seq_len, vocab_size], None, None, None).unwrap();
-        let labels =
-            mlx_rs::random::randint::<_, i32>(0, vocab_size, &[batch, seq_len], None).unwrap();
+        use pmetal_bridge::compat::{random, Dtype as D};
+        let logits = random::normal(&[batch, seq_len, vocab_size], D::Float32);
+        let labels = random::randint(0, vocab_size, &[batch, seq_len], D::Int32);
 
         let loss = compute_causal_lm_loss(&logits, &labels).unwrap();
-        loss.eval().unwrap();
+        loss.eval();
 
         // Loss should be a scalar
         let empty_shape: &[i32] = &[];
         assert_eq!(loss.shape(), empty_shape);
-        assert!(loss.item::<f32>() > 0.0);
-        assert!(loss.item::<f32>().is_finite());
+        assert!(loss.item_f32() > 0.0);
+        assert!(loss.item_f32().is_finite());
     }
 
     #[test]
@@ -1020,11 +1014,11 @@ mod tests {
         let mut grads = FlattenedModuleParam::new();
         grads.insert(
             Rc::from("layer1.weight"),
-            Array::from_slice(&[10.0f32, 20.0], &[2]),
+            Array::from_f32_slice(&[10.0f32, 20.0], &[2]),
         );
         grads.insert(
             Rc::from("layer2.weight"),
-            Array::from_slice(&[30.0f32], &[1]),
+            Array::from_f32_slice(&[30.0f32], &[1]),
         );
 
         let result = clip_gradients_gpu(&mut grads, 1.0);
@@ -1035,7 +1029,7 @@ mod tests {
 
         // Verify gradients were clipped (norms reduced)
         for grad in grads.values() {
-            grad.eval().unwrap();
+            grad.eval();
             let grad_norm_sq: f32 = grad.as_slice::<f32>().iter().map(|x| x * x).sum();
             // After clipping to norm 1.0, all individual gradients should be scaled down
             assert!(grad_norm_sq < 1000.0, "Gradient should be clipped");

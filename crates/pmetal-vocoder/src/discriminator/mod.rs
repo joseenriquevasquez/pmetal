@@ -12,7 +12,7 @@ pub use mpd::{MultiPeriodDiscriminator, PeriodDiscriminator};
 pub use mrd::{MultiResolutionDiscriminator, ResolutionDiscriminator};
 
 use crate::error::Result;
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 
 /// Combined discriminator for BigVGAN training.
 ///

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 use regex::Regex;
 use tracing::{debug, info};
 

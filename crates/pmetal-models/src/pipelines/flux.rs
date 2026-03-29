@@ -2,12 +2,8 @@
 //!
 //! Coordinates CLIP/T5 text encoders, Flux DiT, and VAE for end-to-end
 //! high-quality image generation on Apple Silicon.
+use pmetal_bridge::compat::{Array, ModuleParametersExt, ops, random};
 
-use mlx_rs::{
-    Array,
-    error::Exception,
-    module::{Module, ModuleParametersExt},
-};
 use pmetal_core::Result;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -135,26 +131,20 @@ impl FluxPipeline {
         let latents_w = width / 16;
         let latents_seq = latents_h * latents_w;
 
-        let mut latents = if let Some(s) = seed {
-            let key =
-                mlx_rs::random::key(s).map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
-            mlx_rs::random::normal::<f32>(
+        let mut latents = {
+            if let Some(s) = seed {
+                pmetal_bridge::compat::random::seed(s as u64);
+            }
+            pmetal_bridge::compat::random::normal(
                 &[batch_size, latents_seq as i32, 64],
-                None,
-                None,
-                Some(&key),
+                pmetal_bridge::compat::Dtype::Float32,
             )
-            .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?
-        } else {
-            mlx_rs::random::normal::<f32>(&[batch_size, latents_seq as i32, 64], None, None, None)
-                .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?
         };
 
         // 3. Prepare IDs for RoPE
         // Text IDs are [B, text_seq, 3] - usually zeros or indices for Flux.
         let text_seq = prompt_emb.dim(1);
-        let text_ids = mlx_rs::ops::zeros::<f32>(&[batch_size, text_seq, 3])
-            .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
+        let text_ids = pmetal_bridge::compat::ops::zeros(&[batch_size, text_seq, 3], pmetal_bridge::compat::Dtype::Float32);
 
         // Image IDs: grid indices for positional encoding
         let mut image_ids_vec = Vec::with_capacity(latents_seq as usize);
@@ -164,26 +154,19 @@ impl FluxPipeline {
             }
         }
         let image_ids_flat: Vec<f32> = image_ids_vec.into_iter().flatten().collect();
-        let image_ids_base = Array::from_slice(&image_ids_flat, &[1, latents_seq as i32, 3]);
-        let image_ids = Array::repeat_axis::<f32>(image_ids_base, batch_size as i32, 0)
-            .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
+        let image_ids_base = Array::from_f32_slice(&image_ids_flat, &[1, latents_seq as i32, 3]);
+        let image_ids = pmetal_bridge::compat::ops::repeat_axis(image_ids_base, batch_size as i32, 0);
 
         // 4. Denoising loop
         let scheduler = FlowMatchScheduler::new_flux(num_steps, 1.0, Some(3.0))?;
-        let guidance_arr = Array::from_f32(guidance)
-            .expand_dims_axes(&[0])
-            .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
-        let guidance_arr = Array::repeat_axis::<f32>(guidance_arr, batch_size as i32, 0)
-            .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
+        let guidance_arr = Array::from_f32(guidance).expand_dims(0);
+        let guidance_arr = pmetal_bridge::compat::ops::repeat_axis(guidance_arr, batch_size as i32, 0);
 
         // Scheduler timesteps are already in descending order (high noise → low noise)
         let timesteps = scheduler.timesteps.as_slice::<f32>().to_vec();
         for timestep in timesteps.iter() {
-            let t = Array::from_f32(*timestep)
-                .expand_dims_axes(&[0])
-                .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
-            let t_repeated = Array::repeat_axis::<f32>(t, batch_size as i32, 0)
-                .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
+            let t = Array::from_f32(*timestep).expand_dims(0);
+            let t_repeated = pmetal_bridge::compat::ops::repeat_axis(t, batch_size as i32, 0);
 
             let model_output = self
                 .dit
@@ -202,20 +185,14 @@ impl FluxPipeline {
         }
 
         // 5. Decode latents with VAE (expects NHWC [B, H, W, 16])
-        let latents = latents
-            .reshape(&[batch_size, latents_h as i32, latents_w as i32, 2, 2, 16])
-            .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
-        let latents = latents
-            .transpose_axes(&[0, 1, 3, 2, 4, 5])
-            .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
-        let latents = latents
-            .reshape(&[
-                batch_size,
-                (latents_h * 2) as i32,
-                (latents_w * 2) as i32,
-                16,
-            ])
-            .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
+        let latents = latents.reshape(&[batch_size, latents_h as i32, latents_w as i32, 2, 2, 16]);
+        let latents = latents.transpose_axes(&[0, 1, 3, 2, 4, 5]);
+        let latents = latents.reshape(&[
+            batch_size,
+            (latents_h * 2) as i32,
+            (latents_w * 2) as i32,
+            16,
+        ]);
 
         let image_nhwc = self
             .vae
@@ -223,9 +200,7 @@ impl FluxPipeline {
             .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
 
         // Return as NCHW for consistency with standard image formats in ML
-        let image = image_nhwc
-            .transpose_axes(&[0, 3, 1, 2])
-            .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
+        let image = image_nhwc.transpose_axes(&[0, 3, 1, 2]);
 
         Ok(image)
     }
@@ -297,7 +272,10 @@ fn required_component_dir(
 
 fn read_json(path: &Path) -> Result<Value> {
     let raw = std::fs::read_to_string(path).map_err(pmetal_core::PMetalError::Io)?;
-    serde_json::from_str(&raw).map_err(|e| pmetal_core::PMetalError::Serialization(e.to_string()))
+    Ok(
+        serde_json::from_str(&raw)
+            .map_err(|e| pmetal_core::PMetalError::Serialization(e.to_string()))?,
+    )
 }
 
 fn load_clip_config(component_dir: &Path) -> Result<CLIPConfig> {
@@ -441,7 +419,7 @@ fn value_usize_array(raw: &Value, keys: &[&str]) -> Option<Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::ops::zeros;
+    use pmetal_bridge::compat::ops::zeros;
     use serde_json::json;
 
     #[test]

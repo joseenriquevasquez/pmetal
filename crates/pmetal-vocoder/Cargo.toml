@@ -12,7 +12,7 @@ categories.workspace = true
 [dependencies]
 pmetal-core = { workspace = true }
 pmetal-mlx = { workspace = true }
-mlx-rs = { workspace = true }
+pmetal-bridge = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

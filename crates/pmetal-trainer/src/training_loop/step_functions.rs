@@ -1,6 +1,6 @@
-use mlx_rs::{
-    Array, error::Exception, losses::CrossEntropy, nn, ops::indexing::IndexOp,
-    optimizers::Optimizer, utils::Updatable,
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception, losses::CrossEntropy, nn, ops, ops::indexing::IndexOp,
+    optimizers::{Optimizer, Updatable}, transforms,
 };
 use pmetal_data::PackedTrainingBatch;
 use pmetal_lora::TrainableModel;
@@ -29,7 +29,7 @@ pub(crate) fn jit_training_step_inner<M: TrainableModel, O: Optimizer>(
 
     // Construct CrossEntropy once per step rather than inside the closure so
     // that repeated calls (e.g. gradient-accumulation steps) don't re-allocate.
-    let ce = CrossEntropy::new().map_err(|e| Exception::custom(e.to_string()))?;
+    let ce = CrossEntropy::new();
 
     // Define loss function that will be used by value_and_grad
     let loss_fn = |model: &mut M,
@@ -53,23 +53,23 @@ pub(crate) fn jit_training_step_inner<M: TrainableModel, O: Optimizer>(
         let shift_logits = logits.index((.., ..seq_len - 1, ..));
         let shift_labels = labels.index((.., 1..));
 
-        let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
-        let flat_labels = shift_labels.reshape(&[-1])?;
+        let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
+        let flat_labels = shift_labels.reshape(&[-1]);
 
-        // Use mlx-rs CrossEntropy directly - it handles the logsumexp internally
+        // Use CrossEntropy directly - it handles the logsumexp internally
         // Note: We need to handle ignore_index=-100 separately
-        let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
+        let per_token_loss = ce.apply(&flat_logits, &flat_labels);
 
         // Mask out ignored tokens (label == -100) and compute mean
         // Cast ignore value to match labels dtype (may be i32 or i64)
-        let ignore_val = Array::from_int(-100_i32).as_dtype(flat_labels.dtype())?;
-        let ignore_mask = flat_labels.ne(&ignore_val)?;
-        let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
-        let masked_loss = per_token_loss.multiply(&ignore_mask_f32)?;
-        let valid_count = ignore_mask_f32.sum(None)?;
+        let ignore_val = Array::from_int(-100_i32).as_dtype(flat_labels.dtype_raw());
+        let ignore_mask = flat_labels.ne(&ignore_val);
+        let ignore_mask_f32 = ignore_mask.as_dtype(Dtype::Float32.as_i32());
+        let masked_loss = per_token_loss.multiply(&ignore_mask_f32);
+        let valid_count = ignore_mask_f32.sum(None);
         // Guard against division by zero when all tokens are masked (-100)
-        let safe_count = mlx_rs::ops::maximum(&valid_count, &Array::from_f32(1.0))?;
-        masked_loss.sum(None)?.divide(&safe_count)
+        let safe_count = ops::maximum(&valid_count, &Array::from_f32(1.0));
+        Ok(masked_loss.sum(None).divide(&safe_count))
     };
 
     // Compute loss and gradients
@@ -95,8 +95,8 @@ pub(crate) fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
 
     // Reshape 1D packed input to 2D [1, total_tokens] for model forward
     let total_tokens = packed_batch.total_tokens as i32;
-    let input_ids_2d = packed_batch.input_ids.reshape(&[1, total_tokens])?;
-    let labels_2d = packed_batch.labels.reshape(&[1, total_tokens])?;
+    let input_ids_2d = packed_batch.input_ids.reshape(&[1, total_tokens]);
+    let labels_2d = packed_batch.labels.reshape(&[1, total_tokens]);
 
     // Keep explicit position IDs so packed-sequence models can still reset RoPE
     // at sequence boundaries when needed.
@@ -108,14 +108,14 @@ pub(crate) fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
         Some(
             packed_batch
                 .attention_mask()?
-                .reshape(&[1, 1, total_tokens, total_tokens])?,
+                .reshape(&[1, 1, total_tokens, total_tokens]),
         )
     } else {
         None
     };
 
     // Construct CrossEntropy once per step rather than inside the closure.
-    let ce = CrossEntropy::new().map_err(|e| Exception::custom(e.to_string()))?;
+    let ce = CrossEntropy::new();
 
     // Define loss function that will be used by value_and_grad
     // Use IDENTICAL loss computation as regular training for consistency
@@ -137,26 +137,22 @@ pub(crate) fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
         let shift_logits = logits.index((.., ..seq_len - 1, ..));
         let shift_labels = labels.index((.., 1..));
 
-        let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
-        let flat_labels = shift_labels.reshape(&[-1])?;
+        let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
+        let flat_labels = shift_labels.reshape(&[-1]);
 
-        // Use mlx-rs CrossEntropy directly - SAME as regular training
-        let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
+        // Use CrossEntropy directly - SAME as regular training
+        let per_token_loss = ce.apply(&flat_logits, &flat_labels);
 
         // Mask out ignored tokens (label == -100) and compute mean
         // Match ignore_index dtype to labels dtype to avoid silent type promotion issues
-        let ignore_idx = if flat_labels.dtype() == mlx_rs::Dtype::Int64 {
-            Array::from_slice(&[-100_i64], &[1])
-        } else {
-            Array::from_slice(&[-100_i32], &[1])
-        };
-        let ignore_mask = flat_labels.ne(&ignore_idx)?;
-        let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
-        let masked_loss = per_token_loss.multiply(&ignore_mask_f32)?;
-        let valid_count = ignore_mask_f32.sum(None)?;
+        let ignore_idx = Array::from_int(-100).as_dtype(flat_labels.dtype_raw());
+        let ignore_mask = flat_labels.ne(&ignore_idx);
+        let ignore_mask_f32 = ignore_mask.as_dtype(Dtype::Float32.as_i32());
+        let masked_loss = per_token_loss.multiply(&ignore_mask_f32);
+        let valid_count = ignore_mask_f32.sum(None);
         // Guard against division by zero when all tokens are masked (-100)
-        let safe_count = mlx_rs::ops::maximum(&valid_count, &Array::from_f32(1.0))?;
-        masked_loss.sum(None)?.divide(&safe_count)
+        let safe_count = ops::maximum(&valid_count, &Array::from_f32(1.0));
+        Ok(masked_loss.sum(None).divide(&safe_count))
     };
 
     // Compute loss and gradients.
@@ -166,22 +162,22 @@ pub(crate) fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
     // Apply gradient clipping if max_grad_norm > 0
     if max_grad_norm > 0.0 {
         // Compute global gradient norm (GPU-based, no sync required)
-        let eps = Array::from_slice(&[1e-6_f32], &[1]);
-        let mut sq_sum = Array::from_slice(&[0.0_f32], &[1]);
+        let eps = Array::from_f32_slice(&[1e-6_f32], &[1]);
+        let mut sq_sum = Array::from_f32_slice(&[0.0_f32], &[1]);
         for grad in grads.values() {
-            sq_sum = sq_sum.add(&grad.square()?.sum(None)?)?;
+            sq_sum = sq_sum.add(&grad.square().sum(None));
         }
-        let norm = sq_sum.sqrt()?;
+        let norm = sq_sum.sqrt();
 
         // Scale gradients: scale = max_norm / max(norm, max_norm)
         // This clamps scale to [0, 1], only reducing large gradients
-        let max_norm_arr = Array::from_slice(&[max_grad_norm], &[1]);
-        let norm_clamped = mlx_rs::ops::maximum(&norm, &max_norm_arr)?;
-        let scale = max_norm_arr.divide(&norm_clamped.add(&eps)?)?;
+        let max_norm_arr = Array::from_f32_slice(&[max_grad_norm], &[1]);
+        let norm_clamped = ops::maximum(&norm, &max_norm_arr);
+        let scale = max_norm_arr.divide(&norm_clamped.add(&eps));
 
         // Apply scale to all gradients (in-place via replace)
         for grad in grads.values_mut() {
-            *grad = grad.multiply(&scale)?;
+            *grad = grad.multiply(&scale);
         }
     }
 
@@ -206,7 +202,7 @@ pub(crate) fn compute_cce_loss(
     // Flatten hidden states to [n_tokens, hidden_dim]
     let hidden_dim = hidden_states.dim(-1);
     let n_tokens = hidden_states.size() as i32 / hidden_dim;
-    let flat_hidden = hidden_states.reshape(&[n_tokens, hidden_dim])?;
+    let flat_hidden = hidden_states.reshape(&[n_tokens, hidden_dim]);
 
     cut_cross_entropy_loss(&flat_hidden, lm_head_weight, labels, -100)
         .map_err(|e| Exception::custom(e.to_string()))
@@ -245,7 +241,7 @@ pub(crate) fn jit_training_step_cce<M: TrainableModel, O: Optimizer>(
                     // Shift: hidden[:-1] predicts labels[1:]
                     let shift_hidden = hidden_states.index((.., ..seq_len - 1, ..));
                     let shift_labels = labels.index((.., 1..));
-                    let flat_labels = shift_labels.reshape(&[-1])?;
+                    let flat_labels = shift_labels.reshape(&[-1]);
 
                     compute_cce_loss(&shift_hidden, &cached_weight, &flat_labels)
                 }
@@ -258,17 +254,17 @@ pub(crate) fn jit_training_step_cce<M: TrainableModel, O: Optimizer>(
                     let vocab_size = logits.dim(2);
                     let shift_logits = logits.index((.., ..seq_len - 1, ..));
                     let shift_labels = labels.index((.., 1..));
-                    let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
-                    let flat_labels = shift_labels.reshape(&[-1])?;
-                    let ce = CrossEntropy::new().map_err(|e| Exception::custom(e.to_string()))?;
-                    let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
-                    let ignore_val = Array::from_int(-100_i32).as_dtype(flat_labels.dtype())?;
-                    let ignore_mask = flat_labels.ne(&ignore_val)?;
-                    let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
-                    let masked_loss = per_token_loss.multiply(&ignore_mask_f32)?;
-                    let valid_count = ignore_mask_f32.sum(None)?;
-                    let safe_count = mlx_rs::ops::maximum(&valid_count, &Array::from_f32(1.0))?;
-                    masked_loss.sum(None)?.divide(&safe_count)
+                    let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
+                    let flat_labels = shift_labels.reshape(&[-1]);
+                    let ce = CrossEntropy::new();
+                    let per_token_loss = ce.apply(&flat_logits, &flat_labels);
+                    let ignore_val = Array::from_int(-100_i32).as_dtype(flat_labels.dtype_raw());
+                    let ignore_mask = flat_labels.ne(&ignore_val);
+                    let ignore_mask_f32 = ignore_mask.as_dtype(Dtype::Float32.as_i32());
+                    let masked_loss = per_token_loss.multiply(&ignore_mask_f32);
+                    let valid_count = ignore_mask_f32.sum(None);
+                    let safe_count = ops::maximum(&valid_count, &Array::from_f32(1.0));
+                    Ok(masked_loss.sum(None).divide(&safe_count))
                 }
             }
         };
@@ -296,14 +292,14 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
     let (model, optimizer) = state;
 
     let total_tokens = packed_batch.total_tokens as i32;
-    let input_ids_2d = packed_batch.input_ids.reshape(&[1, total_tokens])?;
-    let labels_2d = packed_batch.labels.reshape(&[1, total_tokens])?;
+    let input_ids_2d = packed_batch.input_ids.reshape(&[1, total_tokens]);
+    let labels_2d = packed_batch.labels.reshape(&[1, total_tokens]);
     let position_ids = packed_batch.position_ids.clone();
     let attn_mask_4d = if packed_batch.num_sequences > 1 {
         Some(
             packed_batch
                 .attention_mask()?
-                .reshape(&[1, 1, total_tokens, total_tokens])?,
+                .reshape(&[1, 1, total_tokens, total_tokens]),
         )
     } else {
         None
@@ -331,7 +327,7 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
                     let seq_len = hidden_states.dim(1);
                     let shift_hidden = hidden_states.index((.., ..seq_len - 1, ..));
                     let shift_labels = labels.index((.., 1..));
-                    let flat_labels = shift_labels.reshape(&[-1])?;
+                    let flat_labels = shift_labels.reshape(&[-1]);
 
                     compute_cce_loss(&shift_hidden, &cached_weight, &flat_labels)
                 }
@@ -344,21 +340,21 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
                     let vocab_size = logits.dim(2);
                     let shift_logits = logits.index((.., ..seq_len - 1, ..));
                     let shift_labels = labels.index((.., 1..));
-                    let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
-                    let flat_labels = shift_labels.reshape(&[-1])?;
-                    let ce = CrossEntropy::new().map_err(|e| Exception::custom(e.to_string()))?;
-                    let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
-                    let ignore_idx = if flat_labels.dtype() == mlx_rs::Dtype::Int64 {
-                        Array::from_slice(&[-100_i64], &[1])
+                    let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
+                    let flat_labels = shift_labels.reshape(&[-1]);
+                    let ce = CrossEntropy::new();
+                    let per_token_loss = ce.apply(&flat_logits, &flat_labels);
+                    let ignore_idx = if flat_labels.dtype_raw() == Dtype::Int64.as_i32() {
+                        Array::from_i64_slice(&[-100_i64], &[1])
                     } else {
-                        Array::from_slice(&[-100_i32], &[1])
+                        Array::from_i32_slice(&[-100_i32], &[1])
                     };
-                    let ignore_mask = flat_labels.ne(&ignore_idx)?;
-                    let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
-                    let masked_loss = per_token_loss.multiply(&ignore_mask_f32)?;
-                    let valid_count = ignore_mask_f32.sum(None)?;
-                    let safe_count = mlx_rs::ops::maximum(&valid_count, &Array::from_f32(1.0))?;
-                    masked_loss.sum(None)?.divide(&safe_count)
+                    let ignore_mask = flat_labels.ne(&ignore_idx);
+                    let ignore_mask_f32 = ignore_mask.as_dtype(Dtype::Float32.as_i32());
+                    let masked_loss = per_token_loss.multiply(&ignore_mask_f32);
+                    let valid_count = ignore_mask_f32.sum(None);
+                    let safe_count = ops::maximum(&valid_count, &Array::from_f32(1.0));
+                    Ok(masked_loss.sum(None).divide(&safe_count))
                 }
             }
         };
@@ -368,17 +364,17 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
 
         // Gradient clipping (same as jit_training_step_packed)
         if max_grad_norm > 0.0 {
-            let eps = Array::from_slice(&[1e-6_f32], &[1]);
-            let mut sq_sum = Array::from_slice(&[0.0_f32], &[1]);
+            let eps = Array::from_f32_slice(&[1e-6_f32], &[1]);
+            let mut sq_sum = Array::from_f32_slice(&[0.0_f32], &[1]);
             for grad in grads.values() {
-                sq_sum = sq_sum.add(&grad.square()?.sum(None)?)?;
+                sq_sum = sq_sum.add(&grad.square().sum(None));
             }
-            let norm = sq_sum.sqrt()?;
-            let max_norm_arr = Array::from_slice(&[max_grad_norm], &[1]);
-            let norm_clamped = mlx_rs::ops::maximum(&norm, &max_norm_arr)?;
-            let scale = max_norm_arr.divide(&norm_clamped.add(&eps)?)?;
+            let norm = sq_sum.sqrt();
+            let max_norm_arr = Array::from_f32_slice(&[max_grad_norm], &[1]);
+            let norm_clamped = ops::maximum(&norm, &max_norm_arr);
+            let scale = max_norm_arr.divide(&norm_clamped.add(&eps));
             for grad in grads.values_mut() {
-                *grad = grad.multiply(&scale)?;
+                *grad = grad.multiply(&scale);
             }
         }
 
@@ -409,7 +405,7 @@ pub(crate) fn eval_training_state<M: Updatable, O: Updatable>(
     all_arrays.extend(state.1.updatable_states().into_iter());
 
     if !all_arrays.is_empty() {
-        mlx_rs::transforms::eval(all_arrays)?;
+        transforms::eval(all_arrays);
     }
     Ok(())
 }

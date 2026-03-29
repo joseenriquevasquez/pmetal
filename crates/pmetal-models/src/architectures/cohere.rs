@@ -9,16 +9,9 @@
 //! - **Command R**: 35B parameters
 //! - **Command R+**: 104B parameters
 //! - **Command A**: 111B parameters (2025)
+use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, nn, ops, random};
+use pmetal_bridge::impl_module_params;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, Param},
-    nn,
-    ops::softmax_axis,
-};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::ModelConfig;
@@ -162,15 +155,14 @@ impl ModelConfig for CohereConfig {
 // =============================================================================
 
 /// Cohere MLP layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct CohereMLP {
-    #[param]
     pub gate_proj: nn::Linear,
-    #[param]
     pub up_proj: nn::Linear,
-    #[param]
     pub down_proj: nn::Linear,
 }
+impl_module_params!(CohereMLP; gate_proj, up_proj, down_proj);
+
 
 impl CohereMLP {
     pub fn new(hidden_size: i32, intermediate_size: i32) -> Result<Self, Exception> {
@@ -192,15 +184,15 @@ impl CohereMLP {
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = Module::forward(&mut self.gate_proj, x)?;
-        let gate = nn::silu(gate)?;
+        let gate = nn::silu(&gate);
         let up = Module::forward(&mut self.up_proj, x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = gate.multiply(&up);
         Module::forward(&mut self.down_proj, &hidden)
     }
 }
 
 /// Cohere attention with optional sliding window.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct CohereAttention {
     pub layer_idx: usize,
     pub n_heads: i32,
@@ -211,15 +203,13 @@ pub struct CohereAttention {
     pub use_sliding_window: bool,
     pub sliding_window: i32,
 
-    #[param]
     pub q_proj: nn::Linear,
-    #[param]
     pub k_proj: nn::Linear,
-    #[param]
     pub v_proj: nn::Linear,
-    #[param]
     pub o_proj: nn::Linear,
 }
+impl_module_params!(CohereAttention; q_proj, k_proj, v_proj, o_proj);
+
 
 impl CohereAttention {
     pub fn new(config: &CohereConfig, layer_idx: usize) -> Result<Self, Exception> {
@@ -275,9 +265,9 @@ impl CohereAttention {
         let v = Module::forward(&mut self.v_proj, x)?;
 
         // Reshape for attention: [B, seq, n_heads, head_dim]
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?;
-        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
+        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
+        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // Apply RoPE BEFORE transpose — apply_rope expects [B, seq, heads, dim]
         let q = pmetal_mlx::kernels::rope::apply_rope(
@@ -298,45 +288,44 @@ impl CohereAttention {
         )?;
 
         // Transpose for attention: [B, n_heads, seq, head_dim]
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        let q = q.transpose_axes(&[0, 2, 1, 3]);
+        let k = k.transpose_axes(&[0, 2, 1, 3]);
+        let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Attention scores
-        let k_t = k.transpose_axes(&[0, 1, 3, 2])?;
-        let mut scores = q.matmul(&k_t)?;
-        scores = scores.multiply(&Array::from_f32(self.scale))?;
+        let k_t = k.transpose_axes(&[0, 1, 3, 2]);
+        let mut scores = q.matmul(&k_t);
+        scores = scores.multiply(&Array::from_f32(self.scale));
 
         // Apply mask (includes sliding window mask for non-global layers)
         if let Some(m) = mask {
-            scores = scores.add(m)?;
+            scores = scores.add(m);
         }
 
         // For sliding window, we could apply additional masking here
         // In production, this would use a sparse attention pattern
 
-        let probs = softmax_axis(&scores, -1, None)?;
-        let output = probs.matmul(&v)?;
+        let probs = ops::softmax_axis(&scores, -1);
+        let output = probs.matmul(&v);
 
         // Reshape and project
-        let output = output.transpose_axes(&[0, 2, 1, 3])?;
-        let output = output.reshape(&[batch, seq_len, -1])?;
+        let output = output.transpose_axes(&[0, 2, 1, 3]);
+        let output = output.reshape(&[batch, seq_len, -1]);
         Module::forward(&mut self.o_proj, &output)
     }
 }
 
 /// Cohere decoder layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct CohereDecoderLayer {
     pub layer_idx: usize,
 
-    #[param]
     pub self_attn: CohereAttention,
-    #[param]
     pub mlp: CohereMLP,
-    #[param]
     pub input_layernorm: nn::LayerNorm,
 }
+impl_module_params!(CohereDecoderLayer; self_attn, mlp, input_layernorm);
+
 
 impl CohereDecoderLayer {
     pub fn new(config: &CohereConfig, layer_idx: usize) -> Result<Self, Exception> {
@@ -368,22 +357,21 @@ impl CohereDecoderLayer {
         let ffn_out = self.mlp.forward(&normed)?;
 
         // Residual: x + attn + ffn
-        x.add(&attn_out)?.add(&ffn_out)
+        Ok(x.add(&attn_out).add(&ffn_out))
     }
 }
 
 /// Cohere model.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct CohereModel {
     pub config: CohereConfig,
 
-    #[param]
     pub embed_tokens: nn::Embedding,
-    #[param]
     pub layers: Vec<CohereDecoderLayer>,
-    #[param]
     pub norm: nn::LayerNorm,
 }
+impl_module_params!(CohereModel; embed_tokens, layers, norm);
+
 
 impl CohereModel {
     pub fn new(config: CohereConfig) -> Result<Self, Exception> {
@@ -422,15 +410,15 @@ impl CohereModel {
 }
 
 /// Cohere for causal language modeling.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct CohereForCausalLM {
     pub config: CohereConfig,
 
-    #[param]
     pub model: CohereModel,
-    #[param]
     pub lm_head: nn::Linear,
 }
+impl_module_params!(CohereForCausalLM; model, lm_head);
+
 
 impl CohereForCausalLM {
     pub fn new(config: CohereConfig) -> Result<Self, Exception> {
@@ -476,7 +464,7 @@ impl CohereForCausalLM {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::module::ModuleParameters;
+    use pmetal_bridge::compat::ModuleParameters;
     use serial_test::serial;
 
     #[test]
@@ -498,7 +486,7 @@ mod tests {
     #[serial]
     fn test_cohere_mlp() {
         let mlp = CohereMLP::new(64, 256).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 10, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 10, 64], None, None, None).unwrap();
 
         let mut mlp = mlp;
         let out = mlp.forward(&x).unwrap();
@@ -521,7 +509,7 @@ mod tests {
 
         let model = CohereForCausalLM::new(config).unwrap();
 
-        let params = model.parameters().flatten();
+        let params = model.flatten_params();
         assert!(params.len() > 0);
     }
 }

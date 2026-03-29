@@ -23,8 +23,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use mlx_rs::Array;
-use mlx_rs::error::Exception;
+use pmetal_bridge::compat::Array;
+use pmetal_bridge::compat::Exception;
 use pmetal_core::LoraConfig;
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_models::{
@@ -416,20 +416,20 @@ impl DynamicLoraModel {
 }
 
 // Implement TrainableModel for DynamicLoraModel via dispatch
-impl mlx_rs::module::ModuleParameters for DynamicLoraModel {
+impl pmetal_bridge::compat::ModuleParameters for DynamicLoraModel {
     fn num_parameters(&self) -> usize {
         dispatch_lora_uniform!(self, num_trainable_params)
     }
 
-    fn parameters(&self) -> mlx_rs::module::ModuleParamRef<'_> {
+    fn parameters(&self) -> pmetal_bridge::compat::ModuleParamRef<'_> {
         dispatch_lora_uniform!(self, parameters)
     }
 
-    fn parameters_mut(&mut self) -> mlx_rs::module::ModuleParamMut<'_> {
+    fn parameters_mut(&mut self) -> pmetal_bridge::compat::ModuleParamMut<'_> {
         dispatch_lora_uniform!(self, parameters_mut)
     }
 
-    fn trainable_parameters(&self) -> mlx_rs::module::ModuleParamRef<'_> {
+    fn trainable_parameters(&self) -> pmetal_bridge::compat::ModuleParamRef<'_> {
         dispatch_lora_uniform!(self, trainable_parameters)
     }
 
@@ -620,7 +620,7 @@ impl DynamicLoraModel {
 pub enum DynamicLoraError {
     /// MLX exception.
     #[error("MLX error: {0}")]
-    Mlx(#[from] mlx_rs::error::Exception),
+    Mlx(#[from] pmetal_bridge::compat::Exception),
     /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

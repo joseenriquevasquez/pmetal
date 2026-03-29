@@ -20,7 +20,7 @@
 
 use std::cell::RefCell;
 
-use mlx_rs::{Array, error::Exception};
+use pmetal_bridge::compat::{Array, Exception};
 use pmetal_core::LoraConfig;
 use pmetal_mlx::quantization::{
     NF4Config, NF4Quantizer, QuantScheme, QuantizedTensor, QuantizerOps,
@@ -176,7 +176,7 @@ impl QLoraLinear {
 
         // Cast weight to Float32 if needed (handles BFloat16, Float16, etc.)
         // This is necessary because models like Qwen3 use BFloat16 weights
-        let weight_f32 = if weight.dtype() != mlx_rs::Dtype::Float32 {
+        let weight_f32 = if weight.dtype() != pmetal_bridge::compat::Dtype::Float32 {
             weight.as_type::<f32>()?
         } else {
             weight.clone()
@@ -206,16 +206,16 @@ impl QLoraLinear {
         // Initialize LoRA A with Kaiming uniform (dummy when rank=0)
         let lora_a = if rank > 0 {
             let bound = (3.0_f32 / in_features as f32).sqrt();
-            mlx_rs::random::uniform::<_, f32>(-bound, bound, &[rank, in_features], None)?
+            pmetal_bridge::compat::random::uniform_range(-bound, bound, &[rank, in_features], pmetal_bridge::compat::Dtype::Float32)
         } else {
-            mlx_rs::ops::zeros::<f32>(&[1, in_features])?
+            pmetal_bridge::compat::ops::zeros(&[1, in_features], pmetal_bridge::compat::Dtype::Float32)
         };
 
         // Initialize LoRA B with zeros (dummy when rank=0)
         let lora_b = if rank > 0 {
-            mlx_rs::ops::zeros::<f32>(&[out_features, rank])?
+            pmetal_bridge::compat::ops::zeros(&[out_features, rank], pmetal_bridge::compat::Dtype::Float32)
         } else {
-            mlx_rs::ops::zeros::<f32>(&[out_features, 1])?
+            pmetal_bridge::compat::ops::zeros(&[out_features, 1], pmetal_bridge::compat::Dtype::Float32)
         };
 
         Ok(Self {
@@ -246,11 +246,11 @@ impl QLoraLinear {
         // Create random weight
         let bound = (3.0_f32 / in_features as f32).sqrt();
         let weight =
-            mlx_rs::random::uniform::<_, f32>(-bound, bound, &[out_features, in_features], None)?;
+            pmetal_bridge::compat::random::uniform_range(-bound, bound, &[out_features, in_features], pmetal_bridge::compat::Dtype::Float32);
 
         // Create random bias if needed
         let bias = if use_bias {
-            Some(mlx_rs::ops::zeros::<f32>(&[out_features])?)
+            Some(pmetal_bridge::compat::ops::zeros(&[out_features], pmetal_bridge::compat::Dtype::Float32))
         } else {
             None
         };
@@ -369,12 +369,12 @@ impl QLoraLinear {
             let y_lora = xab.multiply(&scale_arr)?;
 
             // Combined output
-            y_base.add(&y_lora)?
+            y_base.add(&y_lora)
         };
 
         // Add bias if present
         if let Some(ref bias) = self.bias {
-            Ok(y.add(bias)?)
+            Ok(y.add(bias))
         } else {
             Ok(y)
         }
@@ -388,7 +388,7 @@ impl QLoraLinear {
         let ba = self.lora_b.matmul(&self.lora_a)?;
         let scale_arr = Array::from_f32(self.scale);
         let update = ba.multiply(&scale_arr)?;
-        Ok(weight.add(&update)?)
+        Ok(weight.add(&update))
     }
 
     /// Set training mode (controls dropout).
@@ -521,7 +521,7 @@ mod tests {
         let config = default_config();
         let mut qlora = QLoraLinear::new(32, 64, &config, false).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 32], pmetal_bridge::compat::Dtype::Float32);
         let output = qlora.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[2, 4, 64]);
@@ -532,7 +532,7 @@ mod tests {
         let config = default_config();
         let mut qlora = QLoraLinear::new(32, 64, &config, true).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 32], pmetal_bridge::compat::Dtype::Float32);
         let output = qlora.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[2, 4, 64]);
@@ -545,7 +545,7 @@ mod tests {
         let config = default_config();
         let mut qlora = QLoraLinear::new(32, 64, &config, false).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], pmetal_bridge::compat::Dtype::Float32);
         let output = qlora.forward(&x).unwrap();
 
         // Get base output (dequantized weight only)
@@ -600,7 +600,7 @@ mod tests {
         // Create a layer with known weights
         let in_f = 64;
         let out_f = 128;
-        let weight = mlx_rs::random::normal::<f32>(&[out_f, in_f], None, None, None).unwrap();
+        let weight = pmetal_bridge::compat::random::normal(&[out_f, in_f], pmetal_bridge::compat::Dtype::Float32);
         weight.eval().unwrap();
 
         let qlora = QLoraLinear::from_weight(&weight, None, &config).unwrap();
@@ -635,7 +635,7 @@ mod tests {
         assert!(qlora.is_cache_enabled());
 
         // First forward should populate cache
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let output1 = qlora.forward(&x).unwrap();
         output1.eval().unwrap();
 

@@ -6,7 +6,7 @@
 
 use crate::error::Result;
 use crate::nn::{Activation1d, Snake, SnakeBeta, WeightNormConv1d};
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 
 /// Anti-aliased Multi-Periodicity (AMP) block.
 ///
@@ -113,16 +113,16 @@ impl AMPBlock {
 
             // Add to cumulative output
             match &output {
-                Some(o) => output = Some(o.add(&branch_out)?),
+                Some(o) => output = Some(o.add(&branch_out)),
                 None => output = Some(branch_out),
             }
         }
 
         // Average over branches and add residual
-        let num_branches = Array::from_int(self.branches.len() as i32);
-        let branch_avg = output.unwrap().divide(&num_branches)?;
+        let num_branches = Array::from_i32(self.branches.len() as i32);
+        let branch_avg = output.unwrap().divide(&num_branches);
 
-        Ok(x.add(&branch_avg)?)
+        Ok(x.add(&branch_avg))
     }
 }
 
@@ -188,15 +188,15 @@ impl AMPBlockSnake {
             }
 
             match &output {
-                Some(o) => output = Some(o.add(&branch_out)?),
+                Some(o) => output = Some(o.add(&branch_out)),
                 None => output = Some(branch_out),
             }
         }
 
-        let num_branches = Array::from_int(self.branches.len() as i32);
-        let branch_avg = output.unwrap().divide(&num_branches)?;
+        let num_branches = Array::from_i32(self.branches.len() as i32);
+        let branch_avg = output.unwrap().divide(&num_branches);
 
-        Ok(x.add(&branch_avg)?)
+        Ok(x.add(&branch_avg))
     }
 }
 
@@ -208,22 +208,24 @@ mod tests {
     fn test_amp_block_shape() {
         let amp = AMPBlock::new(64, 3, vec![vec![1, 3, 5]]).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 64, 128], None, None, None).unwrap();
+        let x = Array::random_normal(&[1, 64, 128], 10);
         let y = amp.forward(&x).unwrap();
-        y.eval().unwrap();
+        let mut y2 = y.clone();
+        y2.eval();
 
-        assert_eq!(y.shape(), &[1, 64, 128]);
+        assert_eq!(y2.shape(), &[1, 64, 128]);
     }
 
     #[test]
     fn test_amp_block_bigvgan_v2() {
         let amp = AMPBlock::bigvgan_v2(128).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[2, 128, 64], None, None, None).unwrap();
+        let x = Array::random_normal(&[2, 128, 64], 10);
         let y = amp.forward(&x).unwrap();
-        y.eval().unwrap();
+        let mut y2 = y.clone();
+        y2.eval();
 
-        assert_eq!(y.shape(), &[2, 128, 64]);
+        assert_eq!(y2.shape(), &[2, 128, 64]);
         assert_eq!(amp.branches.len(), 3);
     }
 
@@ -232,24 +234,27 @@ mod tests {
         // Verify residual connection works
         let amp = AMPBlock::new(32, 3, vec![vec![1]]).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 32, 16], None, None, None).unwrap();
+        let x = Array::random_normal(&[1, 32, 16], 10);
         let y = amp.forward(&x).unwrap();
-        x.eval().unwrap();
-        y.eval().unwrap();
+        let mut x2 = x.clone();
+        x2.eval();
+        let mut y2 = y.clone();
+        y2.eval();
 
         // Output should be different from input (processed) but same shape
-        assert_eq!(y.shape(), x.shape());
+        assert_eq!(y2.shape(), x2.shape());
     }
 
     #[test]
     fn test_amp_block_snake() {
         let amp = AMPBlockSnake::new(64, 3, vec![vec![1, 3], vec![1, 3]]).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 64, 32], None, None, None).unwrap();
+        let x = Array::random_normal(&[1, 64, 32], 10);
         let y = amp.forward(&x).unwrap();
-        y.eval().unwrap();
+        let mut y2 = y.clone();
+        y2.eval();
 
-        assert_eq!(y.shape(), &[1, 64, 32]);
+        assert_eq!(y2.shape(), &[1, 64, 32]);
     }
 
     #[test]
@@ -258,11 +263,12 @@ mod tests {
         let amp =
             AMPBlock::new(256, 3, vec![vec![1, 2], vec![3, 4], vec![5, 6], vec![7, 8]]).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 256, 64], None, None, None).unwrap();
+        let x = Array::random_normal(&[1, 256, 64], 10);
         let y = amp.forward(&x).unwrap();
-        y.eval().unwrap();
+        let mut y2 = y.clone();
+        y2.eval();
 
-        assert_eq!(y.shape(), &[1, 256, 64]);
+        assert_eq!(y2.shape(), &[1, 256, 64]);
         assert_eq!(amp.branches.len(), 4);
     }
 }

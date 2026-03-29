@@ -39,8 +39,9 @@
 //!   (Zhao et al., 2024) <https://arxiv.org/abs/2403.03507>
 
 use crate::LoraError;
-use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{Array, StreamOrDevice};
+use pmetal_bridge::compat::Array;
+use pmetal_bridge::compat::linalg;
+use pmetal_bridge::compat::ops::IndexOp;
 
 /// Projection type for GaLore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -193,7 +194,7 @@ impl GaloreProjector {
 
         // Compute SVD on CPU (GPU SVD not yet implemented in MLX)
         // G = U @ diag(S) @ Vt
-        let (u, _s, vt) = mlx_rs::linalg::svd_device(grad, StreamOrDevice::cpu())?;
+        let (u, _s, vt) = pmetal_bridge::compat::linalg::svd(&grad);
 
         let rank = self.config.rank as i32;
 
@@ -235,10 +236,10 @@ impl GaloreProjector {
 
         let low_rank = if self.use_right_projection {
             // Right: low_rank = grad @ P, shape [m, rank]
-            grad.matmul(ortho)?
+            grad.matmul(ortho)
         } else {
             // Left: low_rank = P^T @ grad, shape [rank, n]
-            ortho.t().matmul(grad)?
+            ortho.t().matmul(grad)
         };
 
         self.iteration += 1;
@@ -265,13 +266,13 @@ impl GaloreProjector {
             low_rank_grad.matmul(&ortho.t())?
         } else {
             // Left: full = P @ low_rank, shape [m, n]
-            ortho.matmul(low_rank_grad)?
+            ortho.matmul(low_rank_grad)
         };
 
         // Apply scale factor
         if (self.config.scale - 1.0).abs() > 1e-6 {
             let scale = Array::from_f32(self.config.scale);
-            Ok(full_grad.multiply(&scale)?)
+            Ok(full_grad.multiply(&scale))
         } else {
             Ok(full_grad)
         }
@@ -291,9 +292,9 @@ impl GaloreProjector {
             .ok_or_else(|| LoraError::InvalidState("Projector not initialized".into()))?;
 
         let low_rank = if self.use_right_projection {
-            grad.matmul(ortho)?
+            grad.matmul(ortho)
         } else {
-            ortho.t().matmul(grad)?
+            ortho.t().matmul(grad)
         };
 
         self.iteration += 1;
@@ -345,12 +346,12 @@ impl GaloreProjectionState {
         let full_grad = if self.use_right_projection {
             self.low_rank_grad.matmul(&self.projector.t())?
         } else {
-            self.projector.matmul(&self.low_rank_grad)?
+            self.projector.matmul(&self.low_rank_grad)
         };
 
         if (self.scale - 1.0).abs() > 1e-6 {
             let scale = Array::from_f32(self.scale);
-            Ok(full_grad.multiply(&scale)?)
+            Ok(full_grad.multiply(&scale))
         } else {
             Ok(full_grad)
         }
@@ -419,8 +420,8 @@ impl GaloreParamState {
 
         // Initialize moments if needed
         if self.m.is_none() {
-            self.m = Some(mlx_rs::ops::zeros_like(&low_rank_grad)?);
-            self.v = Some(mlx_rs::ops::zeros_like(&low_rank_grad)?);
+            self.m = Some(pmetal_bridge::compat::ops::zeros_like(&low_rank_grad));
+            self.v = Some(pmetal_bridge::compat::ops::zeros_like(&low_rank_grad));
         }
 
         let m = self.m.as_ref().unwrap();
@@ -431,16 +432,16 @@ impl GaloreParamState {
         let beta1_arr = Array::from_f32(beta1);
         let one_minus_beta1 = Array::from_f32(1.0 - beta1);
         let new_m = m
-            .multiply(&beta1_arr)?
-            .add(&low_rank_grad.multiply(&one_minus_beta1)?)?;
+            .multiply(&beta1_arr)
+            .add(&low_rank_grad.multiply(&one_minus_beta1))?;
 
         // v = beta2 * v + (1 - beta2) * g^2
         let beta2_arr = Array::from_f32(beta2);
         let one_minus_beta2 = Array::from_f32(1.0 - beta2);
         let grad_sq = low_rank_grad.multiply(&low_rank_grad)?;
         let new_v = v
-            .multiply(&beta2_arr)?
-            .add(&grad_sq.multiply(&one_minus_beta2)?)?;
+            .multiply(&beta2_arr)
+            .add(&grad_sq.multiply(&one_minus_beta2))?;
 
         // Bias correction
         let bias_correction1 = 1.0 - beta1.powf(step);
@@ -467,9 +468,9 @@ impl GaloreParamState {
         // Apply weight decay (decoupled)
         let new_param = if weight_decay > 0.0 {
             let wd = Array::from_f32(1.0 - lr * weight_decay);
-            param.multiply(&wd)?.subtract(&scaled_update)?
+            param.multiply(&wd).subtract(&scaled_update)
         } else {
-            param.subtract(&scaled_update)?
+            param.subtract(&scaled_update)
         };
 
         // Store updated moments
@@ -513,7 +514,7 @@ mod tests {
         let mut projector = GaloreProjector::new(config);
 
         // Create a gradient where m >= n (10 x 8)
-        let grad = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
+        let grad = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
 
         let low_rank = projector.project(&grad).unwrap();
 
@@ -533,7 +534,7 @@ mod tests {
         let mut projector = GaloreProjector::new(config);
 
         // Create a gradient where m < n (8 x 10)
-        let grad = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[8, 10], None).unwrap();
+        let grad = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[8, 10], pmetal_bridge::compat::Dtype::Float32);
 
         let low_rank = projector.project(&grad).unwrap();
 
@@ -552,7 +553,7 @@ mod tests {
         let config = GaloreConfig::with_rank(4).projection_type(GaloreProjectionType::Right);
         let mut projector = GaloreProjector::new(config);
 
-        let grad = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[8, 10], None).unwrap();
+        let grad = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[8, 10], pmetal_bridge::compat::Dtype::Float32);
 
         let low_rank = projector.project(&grad).unwrap();
 
@@ -566,10 +567,10 @@ mod tests {
         let config = GaloreConfig::with_rank(4).update_gap(3);
         let mut projector = GaloreProjector::new(config);
 
-        let grad1 = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
-        let grad2 = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
-        let grad3 = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
-        let grad4 = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
+        let grad1 = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
+        let grad2 = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
+        let grad3 = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
+        let grad4 = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
 
         // First projection - initializes projector
         projector.project(&grad1).unwrap();
@@ -609,7 +610,7 @@ mod tests {
         let config = GaloreConfig::with_rank(4);
         let mut projector = GaloreProjector::new(config);
 
-        let grad = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
+        let grad = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
 
         let state = projector.project_with_state(&grad).unwrap();
 
@@ -638,8 +639,8 @@ mod tests {
         let mut state = GaloreParamState::new(config);
 
         // Create parameter and gradient
-        let param = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
-        let grad = mlx_rs::random::uniform::<_, f32>(-0.1, 0.1, &[10, 8], None).unwrap();
+        let param = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
+        let grad = pmetal_bridge::compat::random::uniform_range(-0.1, 0.1, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
 
         // Take a step
         let new_param = state
@@ -669,11 +670,11 @@ mod tests {
         let config = GaloreConfig::with_rank(4).update_gap(5);
         let mut state = GaloreParamState::new(config);
 
-        let mut param = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
+        let mut param = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
 
         // Take multiple steps
         for _ in 0..10 {
-            let grad = mlx_rs::random::uniform::<_, f32>(-0.1, 0.1, &[10, 8], None).unwrap();
+            let grad = pmetal_bridge::compat::random::uniform_range(-0.1, 0.1, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
 
             param = state
                 .adam_step(

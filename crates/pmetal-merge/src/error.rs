@@ -34,7 +34,7 @@ pub enum MergeError {
 
     /// MLX operation error.
     #[error("MLX error: {0}")]
-    Mlx(#[from] mlx_rs::error::Exception),
+    Mlx(#[from] pmetal_bridge::compat::Exception),
 
     /// Safetensors error.
     #[error("Safetensors error: {0}")]

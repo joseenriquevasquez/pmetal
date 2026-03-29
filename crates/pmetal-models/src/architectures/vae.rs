@@ -2,16 +2,9 @@
 //!
 //! Implementation of Flux.1 and SDXL compatible VAEs optimized for Apple Silicon.
 //! This implementation uses NHWC format for consistency with MLX standards.
+use pmetal_bridge::compat::{Array, Exception, ModuleParameters, fast, nn, ops, random};
+use pmetal_bridge::impl_module_params;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, ModuleParametersExt},
-    nn,
-    ops::{concatenate_axis, indexing::IndexOp},
-};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -38,44 +31,36 @@ impl Default for VAEConfig {
 }
 
 /// Resnet block for VAE.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct ResnetBlock {
-    #[param]
     pub norm1: nn::GroupNorm,
-    #[param]
     pub conv1: nn::Conv2d,
-    #[param]
     pub norm2: nn::GroupNorm,
-    #[param]
     pub conv2: nn::Conv2d,
-    #[param]
     pub conv_shortcut: Option<nn::Conv2d>,
 }
+impl_module_params!(ResnetBlock; norm1, conv1, norm2, conv2, conv_shortcut);
+
 
 impl ResnetBlock {
     pub fn new(in_channels: usize, out_channels: usize, groups: usize, eps: f32) -> Self {
         let norm1 = nn::GroupNormBuilder::new(groups as i32, in_channels as i32)
             .eps(eps)
-            .build()
-            .expect("Infallible");
-        let conv1 = nn::Conv2dBuilder::new(in_channels as i32, out_channels as i32, (3, 3))
+            .build().unwrap();
+        let conv1 = nn::Conv2dBuilder::new(in_channels as i32, out_channels as i32, 3)
             .padding(1)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
         let norm2 = nn::GroupNormBuilder::new(groups as i32, out_channels as i32)
             .eps(eps)
-            .build()
-            .expect("Infallible");
-        let conv2 = nn::Conv2dBuilder::new(out_channels as i32, out_channels as i32, (3, 3))
+            .build().unwrap();
+        let conv2 = nn::Conv2dBuilder::new(out_channels as i32, out_channels as i32, 3)
             .padding(1)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
 
         let conv_shortcut = if in_channels != out_channels {
             Some(
-                nn::Conv2dBuilder::new(in_channels as i32, out_channels as i32, (1, 1))
-                    .build()
-                    .expect("Infallible"),
+                nn::Conv2dBuilder::new(in_channels as i32, out_channels as i32, 1)
+                    .build().unwrap(),
             )
         } else {
             None
@@ -91,36 +76,36 @@ impl ResnetBlock {
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let mut h = self.norm1.forward(x)?;
-        h = nn::silu(&h)?;
-        h = self.conv1.forward(&h)?;
-        h = self.norm2.forward(&h)?;
-        h = nn::silu(&h)?;
-        h = self.conv2.forward(&h)?;
+        let mut h = self.norm1.forward(x);
+        h = nn::silu(&h);
+        h = self.conv1.forward(&h);
+        h = self.norm2.forward(&h);
+        h = nn::silu(&h);
+        h = self.conv2.forward(&h);
 
         let residual = if let Some(ref mut shortcut) = self.conv_shortcut {
-            shortcut.forward(x)?
+            shortcut.forward(x)
         } else {
             x.clone()
         };
 
-        h.add(&residual)
+        Ok(h.add(&residual))
     }
 }
 
 /// UpSampler block for VAE.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct UpSampler {
-    #[param]
     pub conv: nn::Conv2d,
 }
+impl_module_params!(UpSampler; conv);
+
 
 impl UpSampler {
     pub fn new(channels: usize) -> Self {
-        let conv = nn::Conv2dBuilder::new(channels as i32, channels as i32, (3, 3))
+        let conv = nn::Conv2dBuilder::new(channels as i32, channels as i32, 3)
             .padding(1)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
         Self { conv }
     }
 
@@ -132,69 +117,61 @@ impl UpSampler {
         let c = shape[3];
 
         // NHWC upsampling: [B, H, 1, W, 1, C] -> [B, H, 2, W, 2, C] -> [B, H*2, W*2, C]
-        let x = x.expand_dims_axes(&[2, 4])?;
-        let x = mlx_rs::ops::broadcast_to(&x, &[b, h, 2, w, 2, c])?;
-        let x = x.reshape(&[b, h * 2, w * 2, c])?;
+        let x = x.expand_dims_axes(&[2, 4]);
+        let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[b, h, 2, w, 2, c]);
+        let x = x.reshape(&[b, h * 2, w * 2, c]);
 
-        self.conv.forward(&x)
+        Ok(self.conv.forward(&x))
     }
 }
 
 /// DownSampler block for VAE.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct DownSampler {
-    #[param]
     pub conv: nn::Conv2d,
 }
+impl_module_params!(DownSampler; conv);
+
 
 impl DownSampler {
     pub fn new(channels: usize) -> Self {
-        let conv = nn::Conv2dBuilder::new(channels as i32, channels as i32, (3, 3))
+        let conv = nn::Conv2dBuilder::new(channels as i32, channels as i32, 3)
             .stride(2)
             .padding(1)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
         Self { conv }
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        self.conv.forward(x)
+        Ok(self.conv.forward(x))
     }
 }
 
 /// Attention block for VAE.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct VAEAttentionBlock {
-    #[param]
     pub norm: nn::GroupNorm,
-    #[param]
     pub q: nn::Conv2d,
-    #[param]
     pub k: nn::Conv2d,
-    #[param]
     pub v: nn::Conv2d,
-    #[param]
     pub proj_out: nn::Conv2d,
 }
+impl_module_params!(VAEAttentionBlock; norm, q, k, v, proj_out);
+
 
 impl VAEAttentionBlock {
     pub fn new(channels: usize, groups: usize, eps: f32) -> Self {
         let norm = nn::GroupNormBuilder::new(groups as i32, channels as i32)
             .eps(eps)
-            .build()
-            .expect("Infallible");
-        let q = nn::Conv2dBuilder::new(channels as i32, channels as i32, (1, 1))
-            .build()
-            .expect("Infallible");
-        let k = nn::Conv2dBuilder::new(channels as i32, channels as i32, (1, 1))
-            .build()
-            .expect("Infallible");
-        let v = nn::Conv2dBuilder::new(channels as i32, channels as i32, (1, 1))
-            .build()
-            .expect("Infallible");
-        let proj_out = nn::Conv2dBuilder::new(channels as i32, channels as i32, (1, 1))
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
+        let q = nn::Conv2dBuilder::new(channels as i32, channels as i32, 1)
+            .build().unwrap();
+        let k = nn::Conv2dBuilder::new(channels as i32, channels as i32, 1)
+            .build().unwrap();
+        let v = nn::Conv2dBuilder::new(channels as i32, channels as i32, 1)
+            .build().unwrap();
+        let proj_out = nn::Conv2dBuilder::new(channels as i32, channels as i32, 1)
+            .build().unwrap();
 
         Self {
             norm,
@@ -212,78 +189,62 @@ impl VAEAttentionBlock {
         let c = x.dim(3);
 
         let residual = x;
-        let h_norm = self.norm.forward(x)?;
+        let h_norm = self.norm.forward(x);
 
-        let q = self.q.forward(&h_norm)?;
-        let k = self.k.forward(&h_norm)?;
-        let v = self.v.forward(&h_norm)?;
+        let q = self.q.forward(&h_norm);
+        let k = self.k.forward(&h_norm);
+        let v = self.v.forward(&h_norm);
 
         // NHWC attention: flatten H*W into sequence dimension
-        let q = q.reshape(&[b, h * w, c])?.expand_dims_axes(&[1])?;
-        let k = k.reshape(&[b, h * w, c])?.expand_dims_axes(&[1])?;
-        let v = v.reshape(&[b, h * w, c])?.expand_dims_axes(&[1])?;
+        let q = q.reshape(&[b, h * w, c]).expand_dims_axes(&[1]);
+        let k = k.reshape(&[b, h * w, c]).expand_dims_axes(&[1]);
+        let v = v.reshape(&[b, h * w, c]).expand_dims_axes(&[1]);
 
         let scale = 1.0 / (c as f32).sqrt();
-        let attn_out = mlx_rs::fast::scaled_dot_product_attention(
+        let attn_out = pmetal_bridge::compat::fast::scaled_dot_product_attention(
             &q,
             &k,
             &v,
             scale,
-            Option::<mlx_rs::fast::ScaledDotProductAttentionMask>::None,
-            Option::<&Array>::None,
-        )?;
+            "none",
+        );
 
-        let attn_out = attn_out.squeeze_axes(&[1])?.reshape(&[b, h, w, c])?;
-        let out = self.proj_out.forward(&attn_out)?;
+        let attn_out = attn_out.squeeze_axes(&[1]).reshape(&[b, h, w, c]);
+        let out = self.proj_out.forward(&attn_out);
 
-        residual.add(&out)
+        Ok(residual.add(&out))
     }
 }
 
 /// Flux VAE Encoder.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct FluxVAEEncoder {
-    #[param]
     pub conv_in: nn::Conv2d,
 
-    #[param]
     pub down_1_0: ResnetBlock,
-    #[param]
     pub down_1_1: ResnetBlock,
 
-    #[param]
     pub down_2_0: ResnetBlock,
-    #[param]
     pub down_2_1: ResnetBlock,
-    #[param]
     pub down_2_sampler: DownSampler,
 
-    #[param]
     pub down_3_0: ResnetBlock,
-    #[param]
     pub down_3_1: ResnetBlock,
-    #[param]
     pub down_3_sampler: DownSampler,
 
-    #[param]
     pub down_4_0: ResnetBlock,
-    #[param]
     pub down_4_1: ResnetBlock,
-    #[param]
     pub down_4_sampler: DownSampler,
 
-    #[param]
     pub mid_block_1: ResnetBlock,
-    #[param]
     pub mid_attn: VAEAttentionBlock,
-    #[param]
     pub mid_block_2: ResnetBlock,
 
-    #[param]
     pub norm_out: nn::GroupNorm,
-    #[param]
     pub conv_out: nn::Conv2d,
 }
+impl_module_params!(FluxVAEEncoder; conv_in, down_1_0, down_1_1, down_2_0, down_2_1, down_2_sampler, down_3_0, down_3_1, down_3_sampler, down_4_0, down_4_1, down_4_sampler, mid_block_1, mid_attn, mid_block_2, norm_out, conv_out);
+
 
 impl Default for FluxVAEEncoder {
     fn default() -> Self {
@@ -293,10 +254,9 @@ impl Default for FluxVAEEncoder {
 
 impl FluxVAEEncoder {
     pub fn new() -> Self {
-        let conv_in = nn::Conv2dBuilder::new(3, 128, (3, 3))
+        let conv_in = nn::Conv2dBuilder::new(3, 128, 3)
             .padding(1)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
 
         let down_1_0 = ResnetBlock::new(128, 128, 32, 1e-6);
         let down_1_1 = ResnetBlock::new(128, 128, 32, 1e-6);
@@ -319,12 +279,10 @@ impl FluxVAEEncoder {
 
         let norm_out = nn::GroupNormBuilder::new(32, 512)
             .eps(1e-6)
-            .build()
-            .expect("Infallible");
-        let conv_out = nn::Conv2dBuilder::new(512, 32, (3, 3))
+            .build().unwrap();
+        let conv_out = nn::Conv2dBuilder::new(512, 32, 3)
             .padding(1)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
 
         Self {
             conv_in,
@@ -348,7 +306,7 @@ impl FluxVAEEncoder {
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let mut h = self.conv_in.forward(x)?;
+        let mut h = self.conv_in.forward(x);
 
         h = self.down_1_0.forward(&h)?;
         h = self.down_1_1.forward(&h)?;
@@ -369,65 +327,46 @@ impl FluxVAEEncoder {
         h = self.mid_attn.forward(&h)?;
         h = self.mid_block_2.forward(&h)?;
 
-        h = self.norm_out.forward(&h)?;
-        h = nn::silu(&h)?;
-        h = self.conv_out.forward(&h)?;
+        h = self.norm_out.forward(&h);
+        h = nn::silu(&h);
+        h = self.conv_out.forward(&h);
 
         Ok(h)
     }
 }
 
 /// Flux VAE Decoder.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct FluxVAEDecoder {
-    #[param]
     pub conv_in: nn::Conv2d,
-    #[param]
     pub mid_block_1: ResnetBlock,
-    #[param]
     pub mid_attn: VAEAttentionBlock,
-    #[param]
     pub mid_block_2: ResnetBlock,
 
-    #[param]
     pub up_1_0: ResnetBlock,
-    #[param]
     pub up_1_1: ResnetBlock,
-    #[param]
     pub up_1_2: ResnetBlock,
-    #[param]
     pub up_1_sampler: UpSampler,
 
-    #[param]
     pub up_2_0: ResnetBlock,
-    #[param]
     pub up_2_1: ResnetBlock,
-    #[param]
     pub up_2_2: ResnetBlock,
-    #[param]
     pub up_2_sampler: UpSampler,
 
-    #[param]
     pub up_3_0: ResnetBlock,
-    #[param]
     pub up_3_1: ResnetBlock,
-    #[param]
     pub up_3_2: ResnetBlock,
-    #[param]
     pub up_3_sampler: UpSampler,
 
-    #[param]
     pub up_4_0: ResnetBlock,
-    #[param]
     pub up_4_1: ResnetBlock,
-    #[param]
     pub up_4_2: ResnetBlock,
 
-    #[param]
     pub norm_out: nn::GroupNorm,
-    #[param]
     pub conv_out: nn::Conv2d,
 }
+impl_module_params!(FluxVAEDecoder; conv_in, mid_block_1, mid_attn, mid_block_2, up_1_0, up_1_1, up_1_2, up_1_sampler, up_2_0, up_2_1, up_2_2, up_2_sampler, up_3_0, up_3_1, up_3_2, up_3_sampler, up_4_0, up_4_1, up_4_2, norm_out, conv_out);
+
 
 impl Default for FluxVAEDecoder {
     fn default() -> Self {
@@ -437,10 +376,9 @@ impl Default for FluxVAEDecoder {
 
 impl FluxVAEDecoder {
     pub fn new() -> Self {
-        let conv_in = nn::Conv2dBuilder::new(16, 512, (3, 3))
+        let conv_in = nn::Conv2dBuilder::new(16, 512, 3)
             .padding(1)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
 
         let mid_block_1 = ResnetBlock::new(512, 512, 32, 1e-6);
         let mid_attn = VAEAttentionBlock::new(512, 32, 1e-6);
@@ -467,12 +405,10 @@ impl FluxVAEDecoder {
 
         let norm_out = nn::GroupNormBuilder::new(32, 128)
             .eps(1e-6)
-            .build()
-            .expect("Infallible");
-        let conv_out = nn::Conv2dBuilder::new(128, 3, (3, 3))
+            .build().unwrap();
+        let conv_out = nn::Conv2dBuilder::new(128, 3, 3)
             .padding(1)
-            .build()
-            .expect("Infallible");
+            .build().unwrap();
 
         Self {
             conv_in,
@@ -500,7 +436,7 @@ impl FluxVAEDecoder {
     }
 
     pub fn forward(&mut self, z: &Array) -> Result<Array, Exception> {
-        let mut h = self.conv_in.forward(z)?;
+        let mut h = self.conv_in.forward(z);
 
         h = self.mid_block_1.forward(&h)?;
         h = self.mid_attn.forward(&h)?;
@@ -525,22 +461,22 @@ impl FluxVAEDecoder {
         h = self.up_4_1.forward(&h)?;
         h = self.up_4_2.forward(&h)?;
 
-        h = self.norm_out.forward(&h)?;
-        h = nn::silu(&h)?;
-        h = self.conv_out.forward(&h)?;
+        h = self.norm_out.forward(&h);
+        h = nn::silu(&h);
+        h = self.conv_out.forward(&h);
 
         Ok(h)
     }
 }
 
 /// Flux VAE model.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct FluxVAE {
-    #[param]
     pub encoder: Option<FluxVAEEncoder>,
-    #[param]
     pub decoder: FluxVAEDecoder,
 }
+impl_module_params!(FluxVAE; encoder, decoder);
+
 
 impl FluxVAE {
     pub const SCALING_FACTOR: f32 = 0.3611;
@@ -566,29 +502,32 @@ impl FluxVAE {
         let h = encoder.forward(x)?;
 
         // Output is 32 channels: [mean (16), logvar (16)]
-        let mean = h.index((.., .., .., 0..16));
+        let mean = pmetal_bridge::compat::ops::slice_last_to(&h, 16);
 
         if sample {
-            let logvar = h.index((.., .., .., 16..32));
+            let logvar = pmetal_bridge::compat::ops::slice_last_from(&h, 16);
             // Clamp logvar to prevent numerical overflow in exp()
-            let logvar =
-                mlx_rs::ops::clip(&logvar, (&Array::from_f32(-30.0), &Array::from_f32(20.0)))?;
-            let std = logvar.multiply(&Array::from_f32(0.5))?.exp()?;
-            let noise = mlx_rs::random::normal::<f32>(mean.shape(), None, None, None)?;
-            let z = mean.add(&std.multiply(&noise)?)?;
-            Ok(z.subtract(&Array::from_f32(Self::SHIFT_FACTOR))?
-                .multiply(&Array::from_f32(Self::SCALING_FACTOR))?)
+            let logvar = pmetal_bridge::compat::ops::clip(
+                &logvar,
+                Some(&Array::from_f32(-30.0)),
+                Some(&Array::from_f32(20.0)),
+            );
+            let std = logvar.multiply(&Array::from_f32(0.5)).exp();
+            let noise = pmetal_bridge::compat::random::normal(mean.shape(), mean.dtype());
+            let z = mean.add(&std.multiply(&noise));
+            Ok(z.subtract(&Array::from_f32(Self::SHIFT_FACTOR))
+                .multiply(&Array::from_f32(Self::SCALING_FACTOR)))
         } else {
             Ok(mean
-                .subtract(&Array::from_f32(Self::SHIFT_FACTOR))?
-                .multiply(&Array::from_f32(Self::SCALING_FACTOR))?)
+                .subtract(&Array::from_f32(Self::SHIFT_FACTOR))
+                .multiply(&Array::from_f32(Self::SCALING_FACTOR)))
         }
     }
 
     pub fn decode(&mut self, z: &Array) -> Result<Array, Exception> {
         let z = z
-            .divide(&Array::from_f32(Self::SCALING_FACTOR))?
-            .add(&Array::from_f32(Self::SHIFT_FACTOR))?;
+            .divide(&Array::from_f32(Self::SCALING_FACTOR))
+            .add(&Array::from_f32(Self::SHIFT_FACTOR));
         self.decoder.forward(&z)
     }
 }
@@ -596,7 +535,7 @@ impl FluxVAE {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::ops::zeros;
+    use pmetal_bridge::compat::ops::zeros;
 
     #[test]
     fn test_flux_vae_roundtrip() {

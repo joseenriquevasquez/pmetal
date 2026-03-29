@@ -1,6 +1,6 @@
 //! Rotating KV cache - MLX-LM parity implementation.
 
-use mlx_rs::{Array, error::Exception, ops::concatenate_axis, ops::indexing::IndexOp};
+use pmetal_bridge::compat::{Array, Exception, ops};
 
 /// Rotating KV cache that acts as a circular buffer.
 ///
@@ -90,19 +90,30 @@ impl RotatingKVCache {
         v: &Array,
         append: Option<&Array>,
     ) -> Result<Array, Exception> {
+        let b = v.dim(0) as usize;
+        let h = v.dim(1) as usize;
+        let d = v.dim(3) as usize;
+        let s = v.dim(2) as usize;
+
         if trim_size > 0 {
             // Keep initial tokens, then slice from after trim
-            let kept = v.index((.., .., ..self.keep as i32, ..));
-            let rest = v.index((.., .., (trim_size + self.keep) as i32.., ..));
+            let kept = v.slice(
+                &[0, 0, 0, 0],
+                &[b as i32, h as i32, self.keep as i32, d as i32],
+            );
+            let rest_start = (trim_size + self.keep) as i32;
+            let rest = v.slice(
+                &[0, 0, rest_start, 0],
+                &[b as i32, h as i32, s as i32, d as i32],
+            );
 
-            let parts: Vec<&Array> = if let Some(a) = append {
-                vec![&kept, &rest, a]
+            if let Some(a) = append {
+                Ok(ops::concatenate_axis(&[&kept, &rest, a], 2))
             } else {
-                vec![&kept, &rest]
-            };
-            concatenate_axis(&parts, 2)
+                Ok(ops::concatenate_axis(&[&kept, &rest], 2))
+            }
         } else if let Some(a) = append {
-            concatenate_axis(&[v, a], 2)
+            Ok(ops::concatenate_axis(&[v, a], 2))
         } else {
             Ok(v.clone())
         }
@@ -111,20 +122,35 @@ impl RotatingKVCache {
     /// Reorder cache into temporal order (for reading).
     fn temporal_order(&self, v: &Array) -> Array {
         let cache_len = v.dim(2) as usize;
+        let b = v.dim(0) as usize;
+        let h = v.dim(1) as usize;
+        let d = v.dim(3) as usize;
 
         if self._idx == cache_len {
             // No wrap-around yet
             v.clone()
         } else if self._idx < self.offset {
             // Wrapped around: reorder [keep][idx..][keep..idx]
-            let kept = v.index((.., .., ..self.keep as i32, ..));
-            let after_idx = v.index((.., .., self._idx as i32.., ..));
-            let before_idx = v.index((.., .., self.keep as i32..self._idx as i32, ..));
+            let kept = v.slice(
+                &[0, 0, 0, 0],
+                &[b as i32, h as i32, self.keep as i32, d as i32],
+            );
+            let after_idx = v.slice(
+                &[0, 0, self._idx as i32, 0],
+                &[b as i32, h as i32, cache_len as i32, d as i32],
+            );
+            let before_idx = v.slice(
+                &[0, 0, self.keep as i32, 0],
+                &[b as i32, h as i32, self._idx as i32, d as i32],
+            );
 
-            concatenate_axis(&[&kept, &after_idx, &before_idx], 2).unwrap_or_else(|_| v.clone())
+            ops::concatenate_axis(&[&kept, &after_idx, &before_idx], 2)
         } else {
             // Not full yet
-            v.index((.., .., ..self._idx as i32, ..))
+            v.slice(
+                &[0, 0, 0, 0],
+                &[b as i32, h as i32, self._idx as i32, d as i32],
+            )
         }
     }
 
@@ -173,6 +199,7 @@ impl RotatingKVCache {
             || (self.offset >= self.keys.as_ref().unwrap().dim(2) as usize
                 && (self.keys.as_ref().unwrap().dim(2) as usize) < self.max_size);
         if needs_growth {
+            use pmetal_bridge::compat::Dtype;
             let new_size = self.step.min(self.max_size - self.offset);
             let k_shape = [
                 batch as i32,
@@ -187,15 +214,15 @@ impl RotatingKVCache {
                 v_head_dim as i32,
             ];
 
-            let new_k = Array::zeros::<f32>(&k_shape)?;
-            let new_v = Array::zeros::<f32>(&v_shape)?;
+            let new_k = ops::zeros(&k_shape, Dtype::Float32);
+            let new_v = ops::zeros(&v_shape, Dtype::Float32);
 
             if let Some(ref existing_k) = self.keys {
-                self.keys = Some(concatenate_axis(&[existing_k, &new_k], 2)?);
-                self.values = Some(concatenate_axis(
+                self.keys = Some(ops::concatenate_axis(&[existing_k, &new_k], 2));
+                self.values = Some(ops::concatenate_axis(
                     &[self.values.as_ref().unwrap(), &new_v],
                     2,
-                )?);
+                ));
             } else {
                 self.keys = Some(new_k);
                 self.values = Some(new_v);
@@ -219,30 +246,41 @@ impl RotatingKVCache {
             self._idx = self.keep;
         }
 
-        // In-place update using scatter or slice assignment
-        // For now, we reconstruct the array (MLX doesn't have true in-place slice assignment in Rust bindings)
+        // In-place update: reconstruct array by concatenating before, new, and after
         let k = self.keys.as_ref().unwrap();
         let v = self.values.as_ref().unwrap();
 
+        let kb = k.dim(0) as usize;
+        let kh = k.dim(1) as usize;
+        let ks = k.dim(2) as usize;
+        let kd = k.dim(3) as usize;
+        let vd = v.dim(3) as usize;
+
         // Build updated cache by concatenating before, new, and after
         let before_k = if self._idx > 0 {
-            Some(k.index((.., .., ..self._idx as i32, ..)))
+            Some(k.slice(&[0, 0, 0, 0], &[kb as i32, kh as i32, self._idx as i32, kd as i32]))
         } else {
             None
         };
-        let after_k = if self._idx + num_steps < k.dim(2) as usize {
-            Some(k.index((.., .., (self._idx + num_steps) as i32.., ..)))
+        let after_k = if self._idx + num_steps < ks {
+            Some(k.slice(
+                &[0, 0, (self._idx + num_steps) as i32, 0],
+                &[kb as i32, kh as i32, ks as i32, kd as i32],
+            ))
         } else {
             None
         };
 
         let before_v = if self._idx > 0 {
-            Some(v.index((.., .., ..self._idx as i32, ..)))
+            Some(v.slice(&[0, 0, 0, 0], &[kb as i32, kh as i32, self._idx as i32, vd as i32]))
         } else {
             None
         };
-        let after_v = if self._idx + num_steps < v.dim(2) as usize {
-            Some(v.index((.., .., (self._idx + num_steps) as i32.., ..)))
+        let after_v = if self._idx + num_steps < ks {
+            Some(v.slice(
+                &[0, 0, (self._idx + num_steps) as i32, 0],
+                &[kb as i32, kh as i32, ks as i32, vd as i32],
+            ))
         } else {
             None
         };
@@ -266,23 +304,29 @@ impl RotatingKVCache {
             v_parts.push(av);
         }
 
-        self.keys = Some(concatenate_axis(&k_parts, 2)?);
-        self.values = Some(concatenate_axis(&v_parts, 2)?);
+        self.keys = Some(ops::concatenate_axis(&k_parts, 2));
+        self.values = Some(ops::concatenate_axis(&v_parts, 2));
 
         self.offset += num_steps;
         self._idx += num_steps;
 
         // Return slice if not full yet
         if self.offset < self.max_size {
+            let k = self.keys.as_ref().unwrap();
+            let v = self.values.as_ref().unwrap();
+            let kb = k.dim(0) as usize;
+            let kh = k.dim(1) as usize;
+            let kd = k.dim(3) as usize;
+            let vd = v.dim(3) as usize;
             Ok((
-                self.keys
-                    .as_ref()
-                    .unwrap()
-                    .index((.., .., ..self.offset as i32, ..)),
-                self.values
-                    .as_ref()
-                    .unwrap()
-                    .index((.., .., ..self.offset as i32, ..)),
+                k.slice(
+                    &[0, 0, 0, 0],
+                    &[kb as i32, kh as i32, self.offset as i32, kd as i32],
+                ),
+                v.slice(
+                    &[0, 0, 0, 0],
+                    &[kb as i32, kh as i32, self.offset as i32, vd as i32],
+                ),
             ))
         } else {
             Ok((

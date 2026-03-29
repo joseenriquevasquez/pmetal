@@ -10,11 +10,10 @@
 //! - **Flexible Rewards**: Pluggable reward functions for reasoning, formatting, and accuracy.
 //! - **Efficient Training**: Implementation optimized for Apple Silicon via MLX.
 
-use mlx_rs::{
-    Array,
-    error::Exception,
+use pmetal_bridge::compat::{
+    Array, Exception,
     module::{Module, ModuleParameters},
-    nn,
+    nn, ops,
     ops::indexing::IndexOp,
     optimizers::Optimizer,
 };
@@ -331,13 +330,8 @@ fn stack_pixel_values(images: &[Array]) -> Option<Array> {
         return None;
     }
     let refs: Vec<&Array> = images.iter().collect();
-    match mlx_rs::ops::concatenate_axis(&refs, 0) {
-        Ok(arr) => Some(arr),
-        Err(e) => {
-            tracing::warn!("VLM: failed to stack pixel values: {}", e);
-            None
-        }
-    }
+    let arr = ops::concatenate_axis(&refs, 0);
+    Some(arr)
 }
 
 /// GRPO Trainer.
@@ -581,49 +575,45 @@ impl GrpoTrainer {
 
         // --- PPO-clip policy loss (all variants) ---
         // Importance ratio against OLD policy (generation-time), not reference
-        let log_ratio = per_token_logps.subtract(old_per_token_logps)?;
-        let ratio = log_ratio.exp()?;
+        let log_ratio = per_token_logps.subtract(old_per_token_logps);
+        let ratio = log_ratio.exp();
 
         // Expand advantages for token-level broadcasting: [B] -> [B, 1]
-        let adv_expanded = advantages.reshape(&[advantages.dim(0), 1])?;
+        let adv_expanded = advantages.reshape(&[advantages.dim(0), 1]);
 
         // Clipped surrogate objective
-        let clipped_ratio = mlx_rs::ops::clip(
-            &ratio,
-            (
-                &Array::from_f32(1.0 - eps_low),
-                &Array::from_f32(1.0 + eps_high),
-            ),
-        )?;
-        let surr1 = ratio.multiply(&adv_expanded)?;
-        let surr2 = clipped_ratio.multiply(&adv_expanded)?;
-        let token_policy_loss = mlx_rs::ops::minimum(&surr1, &surr2)?.negative()?;
+        let clip_lo = Array::from_f32(1.0 - eps_low);
+        let clip_hi = Array::from_f32(1.0 + eps_high);
+        let clipped_ratio = ops::clip(&ratio, Some(&clip_lo), Some(&clip_hi));
+        let surr1 = ratio.multiply(&adv_expanded);
+        let surr2 = clipped_ratio.multiply(&adv_expanded);
+        let token_policy_loss = ops::minimum(&surr1, &surr2).negative();
 
         // --- Per-variant reduction ---
-        let masked_policy_loss = token_policy_loss.multiply(completion_mask)?;
-        let total_tokens = completion_mask.sum(None)?;
-        let safe_token_count = mlx_rs::ops::maximum(&total_tokens, &Array::from_f32(1.0))?;
+        let masked_policy_loss = token_policy_loss.multiply(completion_mask);
+        let total_tokens = completion_mask.sum(None);
+        let safe_token_count = ops::maximum(&total_tokens, &Array::from_f32(1.0));
 
         let policy_loss = match self.config.loss_type {
             GrpoLossType::Bnpo => {
                 // BNPO: mean over valid tokens
-                masked_policy_loss.sum(None)?.divide(&safe_token_count)?
+                masked_policy_loss.sum(None).divide(&safe_token_count)
             }
             GrpoLossType::DrGrpo => {
                 // DR-GRPO: per-sequence mean, then batch mean
                 // Sum tokens per sequence, divide by per-sequence token count
-                let per_seq_sum = masked_policy_loss.sum_axis(-1, false)?;
-                let per_seq_count = completion_mask.sum_axis(-1, false)?;
-                let safe_per_seq = mlx_rs::ops::maximum(&per_seq_count, &Array::from_f32(1.0))?;
-                per_seq_sum.divide(&safe_per_seq)?.mean(None)?
+                let per_seq_sum = masked_policy_loss.sum_axis(-1, false);
+                let per_seq_count = completion_mask.sum_axis(-1, false);
+                let safe_per_seq = ops::maximum(&per_seq_count, &Array::from_f32(1.0));
+                per_seq_sum.divide(&safe_per_seq).mean(None)
             }
             GrpoLossType::Dapo => {
                 // DAPO: token-level mean (same as BNPO but conceptually distinct)
-                masked_policy_loss.sum(None)?.divide(&safe_token_count)?
+                masked_policy_loss.sum(None).divide(&safe_token_count)
             }
             GrpoLossType::Reinforce => {
                 // REINFORCE: simple batch mean
-                masked_policy_loss.sum(None)?.divide(&safe_token_count)?
+                masked_policy_loss.sum(None).divide(&safe_token_count)
             }
         };
 
@@ -631,27 +621,27 @@ impl GrpoTrainer {
         // KL(pi || ref) ≈ exp(ref - pi) - (ref - pi) - 1  (Schulman approximation)
         // Correct direction: ratio = ref/pi, KL = ratio - 1 - log(ratio)
         let kl_mean = if let Some(ref_logps) = ref_per_token_logps {
-            let kl_log_ratio = ref_logps.subtract(per_token_logps)?;
-            let kl_ratio = kl_log_ratio.exp()?;
+            let kl_log_ratio = ref_logps.subtract(per_token_logps);
+            let kl_ratio = kl_log_ratio.exp();
             let per_token_kl = kl_ratio
-                .subtract(&Array::from_f32(1.0))?
-                .subtract(&kl_log_ratio)?;
-            let masked_kl = per_token_kl.multiply(completion_mask)?;
-            masked_kl.sum(None)?.divide(&safe_token_count)?
+                .subtract(&Array::from_f32(1.0))
+                .subtract(&kl_log_ratio);
+            let masked_kl = per_token_kl.multiply(completion_mask);
+            masked_kl.sum(None).divide(&safe_token_count)
         } else {
             Array::from_f32(0.0)
         };
 
-        let kl_loss = kl_mean.multiply(&Array::from_f32(self.config.beta as f32))?;
-        let mut total_loss = policy_loss.add(&kl_loss)?;
+        let kl_loss = kl_mean.multiply(&Array::from_f32(self.config.beta as f32));
+        let mut total_loss = policy_loss.add(&kl_loss);
 
         // Entropy bonus: subtract entropy_coef * entropy to encourage exploration
         if let (Some(ent), coef) = (entropy, self.config.entropy_coef) {
             if coef > 0.0 {
-                let masked_ent = ent.multiply(completion_mask)?;
-                let mean_ent = masked_ent.sum(None)?.divide(&safe_token_count)?;
-                let entropy_bonus = mean_ent.multiply(&Array::from_f32(coef as f32))?;
-                total_loss = total_loss.subtract(&entropy_bonus)?;
+                let masked_ent = ent.multiply(completion_mask);
+                let mean_ent = masked_ent.sum(None).divide(&safe_token_count);
+                let entropy_bonus = mean_ent.multiply(&Array::from_f32(coef as f32));
+                total_loss = total_loss.subtract(&entropy_bonus);
             }
         }
 
@@ -802,8 +792,8 @@ impl GrpoTrainer {
         let (old_per_token_logps, completion_mask) =
             self.compute_per_token_logps(&old_logits, &labels, temperature)?;
         // Eval to materialize — these must NOT be part of the grad graph
-        old_per_token_logps.eval()?;
-        completion_mask.eval()?;
+        old_per_token_logps.eval();
+        completion_mask.eval();
 
         // 2. Compute ref_per_token_logps from reference model (if beta > 0 and ref_model exists).
         //    The reference model is text-only (it is the original pre-LoRA weights), so we
@@ -813,7 +803,7 @@ impl GrpoTrainer {
                 let ref_logits = ref_m.forward(input_ids.clone())?;
                 let (ref_logps, _) =
                     self.compute_per_token_logps(&ref_logits, &labels, temperature)?;
-                ref_logps.eval()?;
+                ref_logps.eval();
                 Some(ref_logps)
             } else {
                 None
@@ -875,22 +865,22 @@ impl GrpoTrainer {
         optimizer.update(policy_model, grads)?;
 
         // Extract loss from the forward pass (already computed, no redundant re-forward)
-        let total_loss = total_loss_arr.item::<f32>();
+        let total_loss = total_loss_arr.item_f32();
 
         // Compute KL/policy_loss stats from the values already available in the loss
         // (We use the pre-update values since post-update requires an extra forward pass.
         // The loss value itself is the authoritative training signal.)
         let kl_stat = if let Some(ref_logps) = ref_per_token_logps.as_ref() {
             // Approximate: compute from old policy vs ref (cheap, no extra forward)
-            let kl_log_ratio = ref_logps.subtract(&old_per_token_logps)?;
-            let kl_ratio = kl_log_ratio.exp()?;
+            let kl_log_ratio = ref_logps.subtract(&old_per_token_logps);
+            let kl_ratio = kl_log_ratio.exp();
             let per_token_kl = kl_ratio
-                .subtract(&Array::from_f32(1.0))?
-                .subtract(&kl_log_ratio)?;
-            let masked_kl = per_token_kl.multiply(&completion_mask)?;
+                .subtract(&Array::from_f32(1.0))
+                .subtract(&kl_log_ratio);
+            let masked_kl = per_token_kl.multiply(&completion_mask);
             let safe_count =
-                mlx_rs::ops::maximum(&completion_mask.sum(None)?, &Array::from_f32(1.0))?;
-            masked_kl.sum(None)?.divide(&safe_count)?.item::<f32>()
+                ops::maximum(&completion_mask.sum(None), &Array::from_f32(1.0));
+            masked_kl.sum(None).divide(&safe_count).item_f32()
         } else {
             0.0
         };
@@ -1879,7 +1869,7 @@ impl RewardFunction for CombinedReward {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::Array;
+    use pmetal_bridge::compat::Array;
     use serial_test::serial;
 
     // ---------------------------------------------------------------------------

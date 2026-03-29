@@ -50,7 +50,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::{Array, nn};
+use pmetal_bridge::compat::{Array, nn};
 
 use crate::autograd::{
     AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext, LoraGrads, lora_backward,
@@ -271,7 +271,7 @@ pub fn mlp_backward(
     // First, backward through down projection
     let down_grads = lora_backward(d_output, down_saved)?;
     let d_mlp_hidden = down_grads.d_x.as_ref().ok_or_else(|| {
-        LoraError::Mlx(mlx_rs::error::Exception::custom(
+        LoraError::Mlx(pmetal_bridge::compat::Exception::custom(
             "Expected d_x from down backward",
         ))
     })?;
@@ -293,12 +293,12 @@ pub fn mlp_backward(
 
     // d_x = d_gate_x + d_up_x (both paths from x)
     let d_gate_x = gate_grads.d_x.as_ref().ok_or_else(|| {
-        LoraError::Mlx(mlx_rs::error::Exception::custom(
+        LoraError::Mlx(pmetal_bridge::compat::Exception::custom(
             "Expected d_x from gate backward",
         ))
     })?;
     let d_up_x = up_grads.d_x.as_ref().ok_or_else(|| {
-        LoraError::Mlx(mlx_rs::error::Exception::custom(
+        LoraError::Mlx(pmetal_bridge::compat::Exception::custom(
             "Expected d_x from up backward",
         ))
     })?;
@@ -334,7 +334,7 @@ mod tests {
         let trainer = CustomAutogradTrainer::new(1e-4, 1);
 
         // Forward through MLP
-        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden], pmetal_bridge::compat::Dtype::Float32);
 
         let (gate_out, gate_saved) = trainer.lora_forward(&gate, &x).unwrap();
         let (gate_activated, silu_saved) = silu_forward_with_grad(&gate_out).unwrap();
@@ -344,7 +344,7 @@ mod tests {
 
         // Backward
         let d_output =
-            mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden], None, None, None).unwrap();
+            pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden], pmetal_bridge::compat::Dtype::Float32);
 
         let (d_x, gate_grads, up_grads, down_grads) = mlp_backward(
             &d_output,

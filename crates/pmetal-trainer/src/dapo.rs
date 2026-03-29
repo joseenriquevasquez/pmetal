@@ -30,7 +30,7 @@
 //! let trainer = DapoTrainer::new(config)?;
 //! ```
 
-use mlx_rs::{Array, error::Exception};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 use std::collections::HashMap;
 
 /// Error type for DAPO training.
@@ -484,20 +484,20 @@ impl DapoTrainer {
         let eps_high = 1.0 + self.config.clip_eps_high;
         let eps_low = self.config.clip_eps_low;
 
-        let ratio_clipped_high = mlx_rs::ops::minimum(&ratio, &Array::from_f32(eps_high as f32))?;
+        let ratio_clipped_high = ops::minimum(&ratio, &Array::from_f32(eps_high as f32));
         let ratio_clipped =
-            mlx_rs::ops::maximum(&ratio_clipped_high, &Array::from_f32(eps_low as f32))?;
+            ops::maximum(&ratio_clipped_high, &Array::from_f32(eps_low as f32));
 
         // Compute clip fraction for logging
         let is_clipped = ratio
             .gt(&Array::from_f32(eps_high as f32))?
-            .as_dtype(mlx_rs::Dtype::Float32)?;
+            .as_dtype(Dtype::Float32 as i32);
         let clip_fraction = is_clipped
             .multiply(mask)?
             .sum(None)?
             .divide(&mask.sum(None)?)?;
         clip_fraction.eval()?;
-        let clip_frac = clip_fraction.item::<f32>();
+        let clip_frac = clip_fraction.item_f32();
 
         // Expand advantages for broadcasting: [batch] -> [batch, 1]
         let adv_expanded = advantages.reshape(&[advantages.dim(0), 1])?;
@@ -508,7 +508,7 @@ impl DapoTrainer {
         // Masked mean over all tokens, guarded against division by zero
         let masked_loss = token_loss.multiply(mask)?;
         let total_tokens = mask.sum(None)?;
-        let safe_count = mlx_rs::ops::maximum(&total_tokens, &Array::from_f32(1.0))?;
+        let safe_count = ops::maximum(&total_tokens, &Array::from_f32(1.0));
         let mean_loss = masked_loss.sum(None)?.divide(&safe_count)?;
 
         Ok((mean_loss, clip_frac))
@@ -529,17 +529,17 @@ impl DapoTrainer {
         let eps_high = 1.0 + self.config.clip_eps_high;
         let eps_low = self.config.clip_eps_low;
 
-        let ratio_clipped_high = mlx_rs::ops::minimum(&ratio, &Array::from_f32(eps_high as f32))?;
+        let ratio_clipped_high = ops::minimum(&ratio, &Array::from_f32(eps_high as f32));
         let ratio_clipped =
-            mlx_rs::ops::maximum(&ratio_clipped_high, &Array::from_f32(eps_low as f32))?;
+            ops::maximum(&ratio_clipped_high, &Array::from_f32(eps_low as f32));
 
         // Clip fraction
         let is_clipped = ratio.gt(&Array::from_f32(eps_high as f32))?;
-        let clip_count = is_clipped.as_dtype(mlx_rs::Dtype::Float32)?.sum(None)?;
+        let clip_count = is_clipped.as_dtype(Dtype::Float32 as i32).sum(None)?;
         let total_count = Array::from_int(policy_logps.dim(0));
         let clip_fraction = clip_count.divide(&total_count)?;
         clip_fraction.eval()?;
-        let clip_frac = clip_fraction.item::<f32>();
+        let clip_frac = clip_fraction.item_f32();
 
         // Sequence-level loss
         let loss = ratio_clipped.multiply(advantages)?.negative()?.mean(None)?;
@@ -863,7 +863,7 @@ mod tests {
             .unwrap();
 
         loss.eval().unwrap();
-        assert!(loss.item::<f32>().is_finite());
+        assert!(loss.item_f32().is_finite());
         // High ratio (exp(2) ≈ 7.4) should be clipped to 1.28
         assert!(clip_frac > 0.0);
     }

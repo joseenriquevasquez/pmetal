@@ -58,14 +58,14 @@
 //! - [The Road Less Scheduled](https://arxiv.org/abs/2405.15682)
 //! - [Facebook Research Implementation](https://github.com/facebookresearch/schedule_free)
 
-use mlx_rs::{Array, array};
+use pmetal_bridge::compat::{Array, array, Exception, ops};
 
 /// Error type for Schedule-Free optimizer.
 #[derive(Debug, thiserror::Error)]
 pub enum ScheduleFreeError {
     /// MLX computation error.
     #[error("MLX error: {0}")]
-    Mlx(#[from] mlx_rs::error::Exception),
+    Mlx(#[from] Exception),
     /// Parameter mismatch error.
     #[error("Parameter count mismatch: expected {expected}, got {actual}")]
     ParameterMismatch { expected: usize, actual: usize },
@@ -171,17 +171,17 @@ impl ScheduleFreeConfig {
     /// Validate the configuration.
     pub fn validate(&self) -> ScheduleFreeResult<()> {
         if self.lr <= 0.0 {
-            return Err(ScheduleFreeError::Mlx(mlx_rs::error::Exception::from(
+            return Err(ScheduleFreeError::Mlx(Exception::custom(
                 "learning rate must be positive",
             )));
         }
         if self.beta1 < 0.0 || self.beta1 >= 1.0 {
-            return Err(ScheduleFreeError::Mlx(mlx_rs::error::Exception::from(
+            return Err(ScheduleFreeError::Mlx(Exception::custom(
                 "beta1 must be in [0, 1)",
             )));
         }
         if self.beta2 < 0.0 || self.beta2 >= 1.0 {
-            return Err(ScheduleFreeError::Mlx(mlx_rs::error::Exception::from(
+            return Err(ScheduleFreeError::Mlx(Exception::custom(
                 "beta2 must be in [0, 1)",
             )));
         }
@@ -261,7 +261,7 @@ impl ScheduleFreeOptimizer {
             // Initialize z = params (conservative = current)
             // Initialize v = zeros_like(params) (no variance estimate yet)
             let z = p.clone();
-            let v = mlx_rs::ops::zeros::<f32>(p.shape())?;
+            let v = ops::zeros(p.shape(), pmetal_bridge::compat::Dtype::Float32);
 
             self.state.push(ParameterState {
                 z,

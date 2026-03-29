@@ -138,7 +138,7 @@ impl ExpertIoPool {
     #[cfg(unix)]
     fn do_pread(file: &File, offset: u64, size: usize) -> std::io::Result<Vec<u8>> {
         let mut buf = vec![0u8; size];
-        file.read_exact_at(&mut buf, offset)?;
+        file.read_exact_at(&mut buf, offset);
         Ok(buf)
     }
 
@@ -169,8 +169,8 @@ impl ExpertIoPool {
 
         // For a single task, skip the channel overhead
         if n == 1 {
-            let data = Self::do_pread(file, offsets[0], size)?;
-            return Ok(vec![data]);
+            let data = Self::do_pread(file, offsets[0], size);
+            return Ok(vec![data?]);
         }
 
         // Dispatch all tasks
@@ -319,7 +319,9 @@ impl ExpertOffloadContext {
     /// Create a new offload context from a packed experts directory.
     pub fn new(packed_dir: &Path) -> std::io::Result<Self> {
         let layout = ExpertPackLayout::load(packed_dir)?;
+
         let file_manager = ExpertFileManager::open(packed_dir, layout.clone())?;
+
         let io_pool = ExpertIoPool::new();
 
         Ok(Self {

@@ -3,7 +3,7 @@
 //! Run with: cargo bench -p pmetal-distill
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 use pmetal_distill::losses::{
     DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, SoftCrossEntropyLoss,
     is_gpu_available,
@@ -17,7 +17,7 @@ fn random_logits(batch: usize, seq: usize, vocab: usize) -> Array {
     let data: Vec<f32> = (0..size)
         .map(|i| (i as f32 * 0.1234567) % 10.0 - 5.0)
         .collect();
-    Array::from_slice(&data, &[batch as i32, seq as i32, vocab as i32])
+    Array::from_f32_slice(&data, &[batch as i32, seq as i32, vocab as i32])
 }
 
 /// Generate random hidden states for benchmarking.
@@ -26,7 +26,7 @@ fn random_hidden(batch: usize, seq: usize, hidden: usize) -> Array {
     let data: Vec<f32> = (0..size)
         .map(|i| (i as f32 * 0.7654321) % 2.0 - 1.0)
         .collect();
-    Array::from_slice(&data, &[batch as i32, seq as i32, hidden as i32])
+    Array::from_f32_slice(&data, &[batch as i32, seq as i32, hidden as i32])
 }
 
 fn bench_kl_divergence(c: &mut Criterion) {

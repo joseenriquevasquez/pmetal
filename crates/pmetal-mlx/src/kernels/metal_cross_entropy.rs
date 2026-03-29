@@ -38,7 +38,8 @@
 //! ```
 
 use half::f16;
-use mlx_rs::{Array, Dtype};
+use pmetal_bridge::compat::{Array, Dtype};
+use crate::ArrayDtypeExt;
 use serde::{Deserialize, Serialize};
 use std::{
     sync::{Arc, OnceLock},
@@ -310,44 +311,43 @@ impl MetalCrossEntropyContext {
 
 /// Convert MLX i32 Array to MetalBuffer<i32>.
 fn array_to_metal_buffer_i32(ctx: &MetalContext, array: &Array) -> Result<MetalBuffer<i32>> {
-    // Ensure array is evaluated and in i32
-    let array = if array.dtype() != Dtype::Int32 {
-        array.as_dtype(Dtype::Int32)?
-    } else {
-        array.clone()
-    };
-    array.eval()?;
-
-    let data: &[i32] = array.as_slice();
-    MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)
+    // Cast to f32 for extraction (no i32 bulk-read in bridge), then convert
+    let mut f32_arr = array.as_dtype(Dtype::Float32.as_i32());
+    f32_arr.eval();
+    let n = f32_arr.size();
+    let data_f32 = f32_arr.to_f32_vec(n).unwrap_or_default();
+    let data_i32: Vec<i32> = data_f32.into_iter().map(|v| v as i32).collect();
+    MetalBuffer::from_slice(ctx, &data_i32, BufferUsage::Shared)
         .map_err(|e| MlxError::Metal(e.to_string()))
 }
 
 /// Convert MLX f32 Array to MetalBuffer<f32>.
 fn array_to_metal_buffer_f32(ctx: &MetalContext, array: &Array) -> Result<MetalBuffer<f32>> {
-    let array = if array.dtype() != Dtype::Float32 {
-        array.as_dtype(Dtype::Float32)?
+    let mut f32_arr = if array.dtype() != Dtype::Float32 {
+        array.as_dtype(Dtype::Float32.as_i32())
     } else {
         array.clone()
     };
-    array.eval()?;
-
-    let data: &[f32] = array.as_slice();
-    MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)
+    f32_arr.eval();
+    let n = f32_arr.size();
+    let data = f32_arr.to_f32_vec(n).unwrap_or_default();
+    MetalBuffer::from_slice(ctx, &data, BufferUsage::Shared)
         .map_err(|e| MlxError::Metal(e.to_string()))
 }
 
 /// Convert MLX f16 Array to MetalBuffer<f16>.
 fn array_to_metal_buffer_f16(ctx: &MetalContext, array: &Array) -> Result<MetalBuffer<f16>> {
-    let array = if array.dtype() != Dtype::Float16 {
-        array.as_dtype(Dtype::Float16)?
+    // Upcast to f32 for extraction, then downcast each element to f16
+    let mut f32_arr = if array.dtype() != Dtype::Float32 {
+        array.as_dtype(Dtype::Float32.as_i32())
     } else {
         array.clone()
     };
-    array.eval()?;
-
-    let data: &[f16] = array.as_slice();
-    MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)
+    f32_arr.eval();
+    let n = f32_arr.size();
+    let data_f32 = f32_arr.to_f32_vec(n).unwrap_or_default();
+    let data_f16: Vec<f16> = data_f32.into_iter().map(f16::from_f32).collect();
+    MetalBuffer::from_slice(ctx, &data_f16, BufferUsage::Shared)
         .map_err(|e| MlxError::Metal(e.to_string()))
 }
 
@@ -503,8 +503,9 @@ fn benchmark_cross_entropy_backends(
 ) -> Result<(CrossEntropyBackendChoice, MetalCrossEntropyOutput)> {
     let mlx_start = Instant::now();
     let mlx_output = mlx_cut_cross_entropy(ctx, hidden_states, lm_head_weight, targets, config)?;
-    mlx_output.loss.eval()?;
-    let mlx_loss = mlx_output.loss.item::<f32>();
+    let mut mlx_loss_eval = mlx_output.loss.clone();
+    mlx_loss_eval.eval();
+    let mlx_loss = mlx_loss_eval.item_f32();
     let mlx_elapsed = mlx_start.elapsed();
 
     let metal_start = Instant::now();
@@ -516,7 +517,8 @@ fn benchmark_cross_entropy_backends(
         config,
     ) {
         Ok(output) => {
-            output.loss.eval()?;
+            let mut loss_eval = output.loss.clone();
+            loss_eval.eval();
             Some(output)
         }
         Err(error) => {
@@ -527,7 +529,9 @@ fn benchmark_cross_entropy_backends(
     let metal_elapsed = metal_start.elapsed();
 
     if let Some(metal_output) = metal_output {
-        let metal_loss = metal_output.loss.item::<f32>();
+        let mut metal_loss_eval = metal_output.loss.clone();
+        metal_loss_eval.eval();
+        let metal_loss = metal_loss_eval.item_f32();
         if losses_match(mlx_loss, metal_loss, config.use_fp16)
             && metal_output.n_valid == mlx_output.n_valid
             && metal_elapsed < mlx_elapsed
@@ -695,14 +699,13 @@ fn run_metal_kernel_cross_entropy_strict(
             .map_err(|e| MlxError::Metal(e.to_string()))?
     };
 
-    // Get targets as slice to count valid tokens
-    let targets_array = if targets.dtype() != Dtype::Int32 {
-        targets.as_dtype(Dtype::Int32)?
-    } else {
-        targets.clone()
-    };
-    targets_array.eval()?;
-    let targets_slice: &[i32] = targets_array.as_slice();
+    // Get targets as Vec<i32> to count valid tokens and pass to mean_loss
+    let mut targets_f32 = targets.as_dtype(Dtype::Float32.as_i32());
+    targets_f32.eval();
+    let n_targets = targets_f32.size();
+    let targets_f32_vec = targets_f32.to_f32_vec(n_targets).unwrap_or_default();
+    let targets_i32_vec: Vec<i32> = targets_f32_vec.into_iter().map(|v| v as i32).collect();
+    let targets_slice: &[i32] = &targets_i32_vec;
 
     // Compute mean loss
     let mean_loss = output.mean_loss(targets_slice, config.ignore_index);
@@ -812,56 +815,55 @@ mod tests {
     #[test]
     fn test_fused_linear_cross_entropy_basic() {
         // Uses MLX CutCrossEntropy by default
-        let n_tokens = 4;
-        let hidden_dim = 8;
-        let vocab_size = 16;
+        let n_tokens: i32 = 4;
+        let hidden_dim: i32 = 8;
+        let vocab_size: i32 = 16;
 
-        // Create test data
-        let hidden_data: Vec<f32> = (0..n_tokens * hidden_dim)
+        let hidden_data: Vec<f32> = (0..(n_tokens * hidden_dim) as usize)
             .map(|i| ((i * 7 + 3) % 10) as f32 / 10.0)
             .collect();
-        let hidden = Array::from_slice(&hidden_data, &[n_tokens as i32, hidden_dim as i32]);
+        let hidden = Array::from_f32_slice(&hidden_data, &[n_tokens, hidden_dim]);
 
-        let weight_data: Vec<f32> = (0..vocab_size * hidden_dim)
+        let weight_data: Vec<f32> = (0..(vocab_size * hidden_dim) as usize)
             .map(|i| ((i * 11 + 5) % 10) as f32 / 10.0 - 0.5)
             .collect();
-        let weight = Array::from_slice(&weight_data, &[vocab_size as i32, hidden_dim as i32]);
+        let weight = Array::from_f32_slice(&weight_data, &[vocab_size, hidden_dim]);
 
-        let targets = Array::from_slice(&[0i32, 5, 10, 15], &[4]);
+        let targets = Array::from_i32_slice(&[0i32, 5, 10, 15]).reshape(&[4]);
 
         let loss = fused_linear_cross_entropy_loss(&hidden, &weight, &targets, -100).unwrap();
-        loss.eval().unwrap();
+        let mut loss_eval = loss.clone();
+        loss_eval.eval();
 
-        let loss_value = loss.item::<f32>();
+        let loss_value = loss_eval.item_f32();
         assert!(loss_value.is_finite());
-        assert!(loss_value >= 0.0); // CE is always non-negative
+        assert!(loss_value >= 0.0);
     }
 
     #[test]
     fn test_fused_linear_cross_entropy_ignore_index() {
-        // Uses MLX CutCrossEntropy by default
-        let n_tokens = 4;
-        let hidden_dim = 8;
-        let vocab_size = 16;
+        let n_tokens: i32 = 4;
+        let hidden_dim: i32 = 8;
+        let vocab_size: i32 = 16;
 
-        let hidden_data: Vec<f32> = vec![0.5; n_tokens * hidden_dim];
-        let hidden = Array::from_slice(&hidden_data, &[n_tokens as i32, hidden_dim as i32]);
+        let hidden_data: Vec<f32> = vec![0.5; (n_tokens * hidden_dim) as usize];
+        let hidden = Array::from_f32_slice(&hidden_data, &[n_tokens, hidden_dim]);
 
-        let weight_data: Vec<f32> = vec![0.1; vocab_size * hidden_dim];
-        let weight = Array::from_slice(&weight_data, &[vocab_size as i32, hidden_dim as i32]);
+        let weight_data: Vec<f32> = vec![0.1; (vocab_size * hidden_dim) as usize];
+        let weight = Array::from_f32_slice(&weight_data, &[vocab_size, hidden_dim]);
 
-        // Two valid, two ignored
-        let targets = Array::from_slice(&[0i32, -100, 5, -100], &[4]);
+        let targets = Array::from_i32_slice(&[0i32, -100, 5, -100]).reshape(&[4]);
 
         let ctx = MetalCrossEntropyContext::new().unwrap();
-        let config = MetalCrossEntropyConfig::new().with_ignore_index(-100); // use_metal defaults to false
+        let config = MetalCrossEntropyConfig::new().with_ignore_index(-100);
 
         let output =
             metal_fused_linear_cross_entropy(&ctx, &hidden, &weight, &targets, &config).unwrap();
 
         assert_eq!(output.n_valid, 2);
-        output.loss.eval().unwrap();
-        assert!(output.loss.item::<f32>().is_finite());
+        let mut loss_eval = output.loss.clone();
+        loss_eval.eval();
+        assert!(loss_eval.item_f32().is_finite());
     }
 
     #[test]

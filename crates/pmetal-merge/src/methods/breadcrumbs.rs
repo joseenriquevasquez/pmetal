@@ -35,7 +35,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result, sign_consensus};
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, Dtype};
 
 /// Model Breadcrumbs merge implementation.
 ///
@@ -135,9 +135,9 @@ impl BreadcrumbsMerge {
     /// Apply dual-mask sparsification to a task vector.
     fn sparsify(&self, delta: &Array) -> Result<Array> {
         // Get absolute values for thresholding
-        let abs_delta = delta.abs()?;
-        abs_delta.eval()?;
-        let abs_values: Vec<f32> = abs_delta.as_slice().to_vec();
+        let mut abs_delta = delta.abs_val();
+        let n = delta.shape().iter().map(|&s| s as usize).product();
+        let abs_values: Vec<f32> = abs_delta.to_f32_vec(n).unwrap_or_default();
 
         // Compute percentile thresholds
         let lower_thresh = Self::compute_percentile(&abs_values, self.bottom_p);
@@ -155,8 +155,8 @@ impl BreadcrumbsMerge {
             })
             .collect();
 
-        let mask_array = Array::from_slice(&mask, delta.shape());
-        let sparse_delta = delta.multiply(&mask_array)?;
+        let mask_array = Array::from_f32_slice(&mask, delta.shape());
+        let sparse_delta = delta.multiply(&mask_array);
 
         // Optionally rescale to maintain expected value
         if self.rescale {
@@ -166,7 +166,7 @@ impl BreadcrumbsMerge {
 
             if density > 0.0 && density < 1.0 {
                 let scale = Array::from_f32(1.0 / density);
-                return Ok(sparse_delta.multiply(&scale)?);
+                return Ok(sparse_delta.multiply(&scale));
             }
         }
 
@@ -175,7 +175,7 @@ impl BreadcrumbsMerge {
 
     /// Compute task vector (delta from base).
     fn task_vector(tensor: &Array, base: &Array) -> Result<Array> {
-        Ok(tensor.subtract(base)?)
+        Ok(tensor.subtract(base))
     }
 }
 
@@ -244,17 +244,17 @@ impl MergeMethod for BreadcrumbsMerge {
             sign_consensus(&sparse_vectors, &weights)?
         } else {
             // Compute weighted sum without sign filtering.
-            let mut acc = mlx_rs::ops::zeros::<f32>(task_vectors[0].shape())?;
+            let mut acc = Array::zeros(task_vectors[0].shape(), Dtype::Float32.as_i32());
             for (vector, weight) in sparse_vectors.iter().zip(weights.iter()) {
-                let weighted = vector.multiply(Array::from_f32(*weight))?;
-                acc = acc.add(&weighted)?;
+                let weighted = vector.multiply(&Array::from_f32(*weight));
+                acc = acc.add(&weighted);
             }
             acc
         };
 
         // Scale by lambda and add back to base
-        let result = weighted_sum.multiply(Array::from_f32(lambda))?;
-        Ok(base.add(&result)?)
+        let result = weighted_sum.multiply(&Array::from_f32(lambda));
+        Ok(base.add(&result))
     }
 }
 
@@ -305,7 +305,7 @@ mod tests {
         let bc = BreadcrumbsMerge::with_thresholds(0.9, 0.1).without_rescale();
 
         // Create tensor with some outliers
-        let delta = Array::from_slice(
+        let delta = Array::from_f32_slice(
             &[
                 0.1_f32, 0.2, 0.3, 0.4, 0.5,  // Normal values
                 10.0, // Outlier (should be removed)
@@ -314,9 +314,8 @@ mod tests {
             &[7],
         );
 
-        let sparse = bc.sparsify(&delta).unwrap();
-        sparse.eval().unwrap();
-        let sparse_vals: Vec<f32> = sparse.as_slice().to_vec();
+        let mut sparse = bc.sparsify(&delta).unwrap();
+        let sparse_vals = sparse.to_f32_vec(7).unwrap();
 
         // Middle values should be kept, extremes removed
         assert!(sparse_vals[5].abs() < 1e-6); // Outlier removed
@@ -327,9 +326,9 @@ mod tests {
     fn test_breadcrumbs_with_base_model() {
         let bc = BreadcrumbsMerge::new();
 
-        let base = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t1 = Array::from_slice(&[1.5_f32, 2.5, 3.5], &[3]);
-        let t2 = Array::from_slice(&[1.3_f32, 2.3, 3.3], &[3]);
+        let base = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.5_f32, 2.5, 3.5], &[3]);
+        let t2 = Array::from_f32_slice(&[1.3_f32, 2.3, 3.3], &[3]);
 
         let params = vec![
             MergeParameters {
@@ -343,11 +342,10 @@ mod tests {
         ];
         let global = MergeParameters::default();
 
-        let result = bc.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
-        result.eval().unwrap();
+        let mut result = bc.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
 
         // Result should be close to average task vector added to base
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let result_slice = result.to_f32_vec(3).unwrap();
         assert!(result_slice[0].is_finite());
     }
 
@@ -370,8 +368,8 @@ mod tests {
     fn test_breadcrumbs_preserves_base_with_zero_lambda() {
         let bc = BreadcrumbsMerge::new();
 
-        let base = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t1 = Array::from_slice(&[2.0_f32, 3.0, 4.0], &[3]);
+        let base = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t1 = Array::from_f32_slice(&[2.0_f32, 3.0, 4.0], &[3]);
 
         let params = vec![MergeParameters {
             weight: Some(1.0_f32.into()),
@@ -383,11 +381,11 @@ mod tests {
             ..Default::default()
         };
 
-        let result = bc.merge(&[t1], Some(&base), &params, &global).unwrap();
-        result.eval().unwrap();
+        let mut result = bc.merge(&[t1], Some(&base), &params, &global).unwrap();
 
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
-        let base_slice: Vec<f32> = base.as_slice().to_vec();
+        let result_slice = result.to_f32_vec(3).unwrap();
+        let mut base_clone = base.clone();
+        let base_slice = base_clone.to_f32_vec(3).unwrap();
 
         // With lambda=0, result should equal base
         for (r, b) in result_slice.iter().zip(base_slice.iter()) {
@@ -398,7 +396,7 @@ mod tests {
     #[test]
     fn test_empty_input() {
         let bc = BreadcrumbsMerge::new();
-        let base = Array::from_slice(&[1.0_f32, 2.0], &[2]);
+        let base = Array::from_f32_slice(&[1.0_f32, 2.0], &[2]);
         let result = bc.merge(&[], Some(&base), &[], &MergeParameters::default());
         assert!(result.is_err());
     }
@@ -408,19 +406,16 @@ mod tests {
         let bc_rescale = BreadcrumbsMerge::with_thresholds(0.8, 0.2);
         let bc_no_rescale = BreadcrumbsMerge::with_thresholds(0.8, 0.2).without_rescale();
 
-        let delta = Array::from_slice(
+        let delta = Array::from_f32_slice(
             &[0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
             &[10],
         );
 
-        let sparse_rescaled = bc_rescale.sparsify(&delta).unwrap();
-        let sparse_plain = bc_no_rescale.sparsify(&delta).unwrap();
+        let mut sparse_rescaled = bc_rescale.sparsify(&delta).unwrap();
+        let mut sparse_plain = bc_no_rescale.sparsify(&delta).unwrap();
 
-        sparse_rescaled.eval().unwrap();
-        sparse_plain.eval().unwrap();
-
-        let sum_rescaled: f32 = sparse_rescaled.as_slice::<f32>().iter().sum();
-        let sum_plain: f32 = sparse_plain.as_slice::<f32>().iter().sum();
+        let sum_rescaled: f32 = sparse_rescaled.to_f32_vec(10).unwrap().iter().sum();
+        let sum_plain: f32 = sparse_plain.to_f32_vec(10).unwrap().iter().sum();
 
         // Rescaled should have higher sum due to density compensation
         // (assuming we removed some values)

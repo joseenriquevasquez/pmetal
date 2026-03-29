@@ -1,7 +1,7 @@
 //! Pooling strategies for converting sequence representations to fixed-size embeddings.
 
-use mlx_rs::{Array, error::Exception, module::Module, ops::indexing::IndexOp};
 
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 /// Pooling modes for sentence embeddings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PoolingMode {
@@ -51,29 +51,29 @@ pub fn pool(
         PoolingMode::Mean => {
             // Expand mask to [batch, seq_len, 1] for broadcasting
             let mask_expanded = attention_mask
-                .reshape(&[batch, seq_len, 1])?
-                .as_dtype(hidden_states.dtype())?;
+                .reshape(&[batch, seq_len, 1])
+                .as_dtype(hidden_states.dtype().as_i32());
             // Zero out padding positions, sum over sequence, divide by token count
-            let masked = hidden_states.multiply(&mask_expanded)?;
-            let sum = masked.sum_axes(&[1], false)?;
-            let count = mask_expanded.sum_axes(&[1], false)?;
-            let count = mlx_rs::ops::maximum(&count, &Array::from_f32(1e-9))?;
-            sum.divide(&count)
+            let masked = hidden_states.multiply(&mask_expanded);
+            let sum = masked.sum_axes(&[1], false);
+            let count = mask_expanded.sum_axes(&[1], false);
+            let count = pmetal_bridge::compat::ops::maximum(&count, &Array::from_f32(1e-9));
+            Ok(sum.divide(&count))
         }
         PoolingMode::Cls => {
             // Take first token embedding [batch, hidden_dim]
-            Ok(hidden_states.index((.., 0, ..)))
+            Ok(pmetal_bridge::compat::ops::slice_axis(hidden_states, 1, 0, 1).squeeze_axes(&[1]))
         }
         PoolingMode::Max => {
             // Replace padding positions with -inf then take max over sequence
             let mask_expanded = attention_mask
-                .reshape(&[batch, seq_len, 1])?
-                .as_dtype(hidden_states.dtype())?;
+                .reshape(&[batch, seq_len, 1])
+                .as_dtype(hidden_states.dtype().as_i32());
             // inv_mask is 1 where padding, 0 where real token
-            let inv_mask = Array::from_f32(1.0).subtract(&mask_expanded)?;
+            let inv_mask = Array::from_f32(1.0).subtract(&mask_expanded);
             let neg_inf = Array::from_f32(-1e9);
-            let masked = hidden_states.add(&inv_mask.multiply(&neg_inf)?)?;
-            masked.max_axes(&[1], false)
+            let masked = hidden_states.add(&inv_mask.multiply(&neg_inf));
+            Ok(masked.max_axis(1, false))
         }
         PoolingMode::LastToken => {
             // Vectorized gather: compute last non-padding position per sequence and
@@ -82,35 +82,35 @@ pub fn pool(
 
             // lengths [batch] → last index [batch] as Int32
             let last_indices = attention_mask
-                .as_dtype(mlx_rs::Dtype::Int32)?
-                .sum_axes(&[1], false)? // [batch]
-                .subtract(&Array::from_int(1))?; // [batch]
+                .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32())
+                .sum_axes(&[1], false) // [batch]
+                .subtract(&Array::from_int(1)); // [batch]
 
             // Reshape to [batch, 1, 1] then broadcast to [batch, 1, hidden_dim]
             // so take_along_axis can gather along the sequence dimension.
-            let indices_expanded = last_indices.reshape(&[batch, 1, 1])?;
+            let indices_expanded = last_indices.reshape(&[batch, 1, 1]);
             let indices_broadcast =
-                mlx_rs::ops::broadcast_to(&indices_expanded, &[batch, 1, hidden_dim])?;
+                pmetal_bridge::compat::ops::broadcast_to(&indices_expanded, &[batch, 1, hidden_dim]);
 
             // take_along_axis(hidden_states, indices, axis=1) → [batch, 1, hidden_dim]
-            let gathered = hidden_states.take_along_axis(&indices_broadcast, 1)?;
+            let gathered = hidden_states.take_along_axis(&indices_broadcast, 1);
 
             // Squeeze the singleton seq dimension → [batch, hidden_dim]
-            gathered.squeeze_axes(&[1])
+            Ok(gathered.squeeze_axes(&[1]))
         }
         PoolingMode::WeightedMean => {
             // Linearly increasing weights: position i gets weight (i+1)
             let weights: Vec<f32> = (1..=seq_len).map(|i| i as f32).collect();
             let weights =
-                Array::from_slice(&weights, &[1, seq_len, 1]).as_dtype(hidden_states.dtype())?;
+                Array::from_slice(&weights, &[1, seq_len, 1]).as_dtype(hidden_states.dtype().as_i32());
             let mask_expanded = attention_mask
-                .reshape(&[batch, seq_len, 1])?
-                .as_dtype(hidden_states.dtype())?;
-            let weighted = hidden_states.multiply(&weights)?.multiply(&mask_expanded)?;
-            let sum = weighted.sum_axes(&[1], false)?;
-            let weight_sum = weights.multiply(&mask_expanded)?.sum_axes(&[1], false)?;
-            let weight_sum = mlx_rs::ops::maximum(&weight_sum, &Array::from_f32(1e-9))?;
-            sum.divide(&weight_sum)
+                .reshape(&[batch, seq_len, 1])
+                .as_dtype(hidden_states.dtype().as_i32());
+            let weighted = hidden_states.multiply(&weights).multiply(&mask_expanded);
+            let sum = weighted.sum_axes(&[1], false);
+            let weight_sum = weights.multiply(&mask_expanded).sum_axes(&[1], false);
+            let weight_sum = pmetal_bridge::compat::ops::maximum(&weight_sum, &Array::from_f32(1e-9));
+            Ok(sum.divide(&weight_sum))
         }
     }
 }
@@ -123,9 +123,9 @@ pub fn pool(
 /// # Returns
 /// Unit-normalized embeddings `[batch, dim]`
 pub fn normalize_embeddings(embeddings: &Array) -> Result<Array, Exception> {
-    let norm = embeddings.square()?.sum_axes(&[-1], true)?.sqrt()?;
-    let norm = mlx_rs::ops::maximum(&norm, &Array::from_f32(1e-12))?;
-    embeddings.divide(&norm)
+    let norm = embeddings.square().sum_axes(&[-1], true).sqrt();
+    let norm = pmetal_bridge::compat::ops::maximum(&norm, &Array::from_f32(1e-12));
+    Ok(embeddings.divide(&norm))
 }
 
 #[cfg(test)]

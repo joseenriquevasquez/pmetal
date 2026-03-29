@@ -12,11 +12,12 @@
 
 use std::{f32::consts::PI, sync::Arc};
 
-use mlx_rs::{Array, Dtype, error::Exception};
+use pmetal_bridge::compat::{Array, Dtype, Exception};
 use pmetal_metal::{MetalContext, TurboQuantTransform};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use tracing::debug;
 
+use crate::array_ext::ArrayDtypeExt;
 use crate::kernels::{AttentionMaskType, FusedAttentionConfig};
 
 /// Deterministic seed used for TurboQuant rotations and QJL projections.
@@ -1100,7 +1101,7 @@ impl TurboQuantKvCache {
 
         let decoded = decode_key_rows_for_runtime(&runtime.keys, layout.key_dim, keys);
 
-        let array = Array::from_slice(
+        let array = Array::from_f32_slice(
             &decoded,
             &[
                 layout.batch as i32,
@@ -1109,7 +1110,7 @@ impl TurboQuantKvCache {
                 layout.key_dim as i32,
             ],
         );
-        array.transpose_axes(&[0, 2, 1, 3])?.as_dtype(self.dtype)
+        Ok(array.transpose_axes(&[0, 2, 1, 3]).as_dtype(self.dtype.as_i32()))
     }
 
     fn dequantize_values(&self) -> Result<Array, Exception> {
@@ -1127,7 +1128,7 @@ impl TurboQuantKvCache {
 
         let decoded = decode_value_rows_for_runtime(&runtime.values, layout.value_dim, values);
 
-        let array = Array::from_slice(
+        let array = Array::from_f32_slice(
             &decoded,
             &[
                 layout.batch as i32,
@@ -1136,7 +1137,7 @@ impl TurboQuantKvCache {
                 layout.value_dim as i32,
             ],
         );
-        array.transpose_axes(&[0, 2, 1, 3])?.as_dtype(self.dtype)
+        Ok(array.transpose_axes(&[0, 2, 1, 3]).as_dtype(self.dtype.as_i32()))
     }
 }
 
@@ -1154,7 +1155,7 @@ fn direct_attention_output(
     let num_heads = queries.dim(1) as usize;
     let key_dim = queries.dim(3) as usize;
     let value_dim = layout.value_dim;
-    let query_rows = array_rows_in_bshd_order(&queries.as_dtype(Dtype::Float32)?)?;
+    let query_rows = array_rows_in_bshd_order(&queries.as_dtype(Dtype::Float32.as_i32()))?;
     let start_seq = attention_start_seq(total_seq, attn_config.mask_type);
     let num_groups = (attn_config.num_heads / attn_config.num_kv_heads).max(1) as usize;
 
@@ -1214,14 +1215,14 @@ fn direct_attention_output(
         }
     }
 
-    let output = Array::from_slice(
+    let output = Array::from_f32_slice(
         &output_rows,
         &[batch as i32, num_heads as i32, 1, value_dim as i32],
     );
     if queries.dtype() == Dtype::Float32 {
         Ok(output)
     } else {
-        output.as_dtype(queries.dtype())
+        Ok(output.as_dtype(queries.dtype().as_i32()))
     }
 }
 
@@ -2084,9 +2085,10 @@ fn select_outlier_mask(row: &[f32], outlier_count: usize) -> Vec<u16> {
 }
 
 fn array_rows_in_bshd_order(array: &Array) -> Result<Vec<f32>, Exception> {
-    let seq_major = array.as_type::<f32>()?.transpose_axes(&[0, 2, 1, 3])?;
-    seq_major.eval()?;
-    Ok(seq_major.as_slice::<f32>().to_vec())
+    let mut seq_major = array.as_dtype(Dtype::Float32.as_i32()).transpose_axes(&[0, 2, 1, 3]);
+    seq_major.eval();
+    let n = seq_major.size();
+    Ok(seq_major.to_f32_vec(n).unwrap_or_default())
 }
 
 fn quantize_mse_rows(core: &TurboQuantCore, normalized: &[f32], bits: u8) -> Vec<u16> {

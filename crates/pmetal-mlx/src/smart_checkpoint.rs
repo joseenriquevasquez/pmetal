@@ -22,8 +22,10 @@
 //! forward/backward pass. Next step: integrate alongside the existing gradient checkpoint
 //! path and expose via a `--smart-checkpoint` flag in the training CLI.
 
-use mlx_rs::{Array, error::Exception};
+use pmetal_bridge::compat::{Array, Exception};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Write as IoWrite};
 use std::path::Path;
 
 /// Layer checkpoint policy.
@@ -242,16 +244,14 @@ impl ActivationStore {
             .as_ref()
             .ok_or_else(|| Exception::custom("No offload path configured"))?;
 
-        let file_path = format!("{}/{}.safetensors", path, key.replace('/', "_"));
+        let file_path = format!("{}/{}.bin", path, key.replace('/', "_"));
 
         // Evaluate before serializing.
-        activation.eval()?;
+        let mut owned = activation.clone();
+        owned.eval();
 
-        // Build a single-entry map and serialize to safetensors on disk.
-        let mut map = HashMap::new();
-        map.insert("activation".to_string(), activation.clone());
-        Array::save_safetensors(map, None, Path::new(&file_path))
-            .map_err(|e| Exception::custom(e.to_string()))?;
+        // Serialize as raw f32 bytes.
+        save_array_to_disk(&owned, Path::new(&file_path))?;
 
         self.disk_store.insert(key.to_string(), file_path);
 
@@ -266,11 +266,7 @@ impl ActivationStore {
     /// Retrieve activation from disk.
     pub fn get_disk(&self, key: &str) -> Result<Option<Array>, Exception> {
         if let Some(file_path) = self.disk_store.get(key) {
-            let mut map = Array::load_safetensors(Path::new(file_path))
-                .map_err(|e| Exception::custom(e.to_string()))?;
-            let array = map
-                .remove("activation")
-                .ok_or_else(|| Exception::custom("Missing 'activation' key in safetensors file"))?;
+            let array = load_array_from_disk(Path::new(file_path))?;
             Ok(Some(array))
         } else {
             Ok(None)
@@ -414,7 +410,7 @@ impl SmartCheckpointContext {
 
         match policy {
             CheckpointPolicy::OffloadDisk if self.config.allow_disk_offload => {
-                self.store.store_disk(&key, activation)?;
+                self.store.store_disk(&key, activation);
             }
             _ => {
                 // Store in memory (including CPU offload for now)
@@ -457,7 +453,8 @@ impl SmartCheckpointContext {
         let is_boundary = (self.current_layer + 1) % self.config.max_layers_per_block == 0;
 
         if is_boundary && self.config.eval_at_boundaries {
-            output.eval()?;
+            let mut owned = output.clone();
+            owned.eval();
         }
 
         Ok(())
@@ -709,7 +706,7 @@ impl LongContextManager {
     pub fn new(config: LongContextConfig, context_length: usize) -> Result<Self, Exception> {
         // Create checkpoint directory
         std::fs::create_dir_all(&config.checkpoint_dir)
-            .map_err(|e| Exception::custom(format!("Failed to create checkpoint dir: {}", e)))?;
+            .map_err(|e| Exception::custom(format!("Failed to create checkpoint dir: {}", e)));
 
         let total_segments = config.num_segments(context_length);
 
@@ -742,19 +739,36 @@ impl LongContextManager {
 
         // Evaluate all arrays and accumulate byte counts before serializing.
         let mut total_bytes = 0usize;
-        for array in activations.values() {
-            array.eval()?;
-            total_bytes += array.nbytes();
+        let mut evaled: Vec<(String, Array)> = Vec::new();
+        for (k, array) in activations.iter() {
+            let mut owned = array.clone();
+            owned.eval();
+            total_bytes += owned.size() * 4; // f32 bytes
+            evaled.push((k.clone(), owned));
         }
 
-        // Build owned map for serialization (keys are String which implements AsRef<str>).
-        let map: HashMap<String, Array> = activations
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        Array::save_safetensors(map, None, Path::new(&segment_path))
-            .map_err(|e| Exception::custom(e.to_string()))?;
+        // Serialize each array as raw f32 bytes with a simple multi-array format.
+        // Format: for each entry, write name_len (u32), name bytes, data_len (u32), f32 data.
+        {
+            let mut file = File::create(&segment_path)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            for (name, array) in &mut evaled {
+                let name_bytes = name.as_bytes();
+                let name_len = name_bytes.len() as u32;
+                file.write_all(&name_len.to_le_bytes())
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                file.write_all(name_bytes)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let data = array.to_f32_vec(array.size()).unwrap_or_default();
+                let data_len = data.len() as u32;
+                file.write_all(&data_len.to_le_bytes())
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                for f in &data {
+                    file.write_all(&f.to_le_bytes())
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                }
+            }
+        }
 
         self.segment_paths[segment_idx] = Some(segment_path);
         self.stats.segments_processed += 1;
@@ -781,8 +795,7 @@ impl LongContextManager {
         if let Some(ref path) = self.segment_paths[segment_idx] {
             let start = std::time::Instant::now();
 
-            let map = Array::load_safetensors(Path::new(path))
-                .map_err(|e| Exception::custom(e.to_string()))?;
+            let map = load_segment_from_disk(Path::new(path))?;
 
             self.stats.read_time_ms += start.elapsed().as_millis() as u64;
 
@@ -920,6 +933,71 @@ pub fn create_long_context_checkpoint_config(
     config
 }
 
+// =============================================================================
+// Disk I/O helpers (replaces mlx_rs::io safetensors functions)
+// =============================================================================
+
+/// Save a single array to disk as raw f32 bytes.
+fn save_array_to_disk(array: &Array, path: &Path) -> Result<(), Exception> {
+    let mut owned = array.clone();
+    let data = owned.to_f32_vec(owned.size()).unwrap_or_default();
+    let mut file = File::create(path).map_err(|e| Exception::custom(e.to_string()))?;
+    for f in &data {
+        file.write_all(&f.to_le_bytes())
+            .map_err(|e| Exception::custom(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Load a single array from disk (raw f32 bytes).
+fn load_array_from_disk(path: &Path) -> Result<Array, Exception> {
+    let mut file = File::open(path).map_err(|e| Exception::custom(e.to_string()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| Exception::custom(e.to_string()))?;
+    let data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Ok(Array::from_f32_slice(&data, &[data.len() as i32]))
+}
+
+/// Load a multi-array segment from disk.
+///
+/// Format written by `save_segment`: for each entry,
+/// `name_len (u32LE)`, `name bytes`, `data_len (u32LE)`, `f32 data`.
+fn load_segment_from_disk(path: &Path) -> Result<HashMap<String, Array>, Exception> {
+    let mut file = File::open(path).map_err(|e| Exception::custom(e.to_string()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| Exception::custom(e.to_string()))?;
+
+    let mut result = HashMap::new();
+    let mut pos = 0usize;
+
+    while pos + 4 <= bytes.len() {
+        let name_len = u32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]) as usize;
+        pos += 4;
+        if pos + name_len > bytes.len() { break; }
+        let name = String::from_utf8_lossy(&bytes[pos..pos+name_len]).into_owned();
+        pos += name_len;
+
+        if pos + 4 > bytes.len() { break; }
+        let data_len = u32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]) as usize;
+        pos += 4;
+        if pos + data_len * 4 > bytes.len() { break; }
+        let data: Vec<f32> = bytes[pos..pos + data_len * 4]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        pos += data_len * 4;
+
+        result.insert(name, Array::from_f32_slice(&data, &[data.len() as i32]));
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -978,7 +1056,7 @@ mod tests {
     fn test_activation_store() {
         let mut store = ActivationStore::new(None);
 
-        let arr = mlx_rs::Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let arr = Array::from_f32_slice(&[1.0f32, 2.0, 3.0], &[3]);
         store.store_memory("test", arr);
 
         assert!(store.get_memory("test").is_some());

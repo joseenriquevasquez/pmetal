@@ -3,8 +3,7 @@
 //! Provides gradient synchronization, loss reduction, and barrier operations
 //! that integrate with the existing `FlattenedModuleParam` gradient format.
 
-use mlx_rs::Array;
-use mlx_rs::module::FlattenedModuleParam;
+use pmetal_bridge::compat::{Array, Dtype, Exception, module::FlattenedModuleParam};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -120,11 +119,9 @@ impl DistributedGradientSync {
         for (name, _shape, count) in &self.param_layout {
             if let Some(arr) = grads.get(name) {
                 // Evaluate the gradient array to materialized f32 values
-                arr.eval().map_err(SftError::Mlx)?;
-                let arr_f32 = arr
-                    .as_dtype(mlx_rs::Dtype::Float32)
-                    .map_err(SftError::Mlx)?;
-                arr_f32.eval().map_err(SftError::Mlx)?;
+                arr.eval();
+                let arr_f32 = arr.as_dtype(Dtype::Float32.as_i32());
+                arr_f32.eval();
 
                 // Copy data from MLX Array into our flat buffer
                 let data = arr_f32.as_slice::<f32>();
@@ -147,7 +144,7 @@ impl DistributedGradientSync {
         for (name, shape, count) in &self.param_layout {
             let n = *count;
             let slice = &self.buffer[offset..offset + n];
-            let arr = Array::from_slice(slice, shape.as_slice());
+            let arr = Array::from_f32_slice(slice, shape.as_slice());
             grads.insert(name.clone(), arr);
             offset += n;
         }
@@ -177,7 +174,7 @@ impl DistributedGradientSync {
                 .all_reduce(&mut serialized, ReduceOp::Mean)
                 .await
                 .map_err(|e| {
-                    SftError::Mlx(mlx_rs::error::Exception::custom(format!(
+                    SftError::Mlx(Exception::custom(format!(
                         "distributed all_reduce failed: {e}"
                     )))
                 })?;
@@ -203,7 +200,7 @@ impl DistributedGradientSync {
                 .all_reduce(byte_buf, ReduceOp::Mean)
                 .await
                 .map_err(|e| {
-                    SftError::Mlx(mlx_rs::error::Exception::custom(format!(
+                    SftError::Mlx(Exception::custom(format!(
                         "distributed all_reduce failed: {e}"
                     )))
                 })?;
@@ -227,7 +224,7 @@ impl DistributedGradientSync {
             .all_reduce(buf, ReduceOp::Mean)
             .await
             .map_err(|e| {
-                SftError::Mlx(mlx_rs::error::Exception::custom(format!(
+                SftError::Mlx(Exception::custom(format!(
                     "distributed loss sync failed: {e}"
                 )))
             })?;
@@ -237,7 +234,7 @@ impl DistributedGradientSync {
     /// Barrier synchronization — all nodes must reach this point before any proceed.
     pub async fn barrier(&self) -> Result<()> {
         self.ctx.barrier().await.map_err(|e| {
-            SftError::Mlx(mlx_rs::error::Exception::custom(format!(
+            SftError::Mlx(Exception::custom(format!(
                 "distributed barrier failed: {e}"
             )))
         })?;
@@ -263,7 +260,7 @@ pub async fn create_distributed_context(
         let backend = pmetal_distributed::AutoDiscoveryBackend::with_config(auto_config)
             .await
             .map_err(|e| {
-                SftError::Mlx(mlx_rs::error::Exception::custom(format!(
+                SftError::Mlx(Exception::custom(format!(
                     "auto-discovery failed: {e}"
                 )))
             })?;
@@ -273,14 +270,14 @@ pub async fn create_distributed_context(
             .wait_for_peers(1, std::time::Duration::from_secs(60))
             .await
             .map_err(|e| {
-                SftError::Mlx(mlx_rs::error::Exception::custom(format!(
+                SftError::Mlx(Exception::custom(format!(
                     "peer discovery timeout: {e}"
                 )))
             })?;
         tracing::info!("Found {} peers, establishing ring...", peer_count);
 
         backend.establish_ring().await.map_err(|e| {
-            SftError::Mlx(mlx_rs::error::Exception::custom(format!(
+            SftError::Mlx(Exception::custom(format!(
                 "ring establishment failed: {e}"
             )))
         })?;
@@ -296,7 +293,7 @@ pub async fn create_distributed_context(
             .iter()
             .map(|s| {
                 s.parse().map_err(|e| {
-                    SftError::Mlx(mlx_rs::error::Exception::custom(format!(
+                    SftError::Mlx(Exception::custom(format!(
                         "invalid peer address '{s}': {e}"
                     )))
                 })
@@ -313,7 +310,7 @@ pub async fn create_distributed_context(
         let backend = pmetal_distributed::RingBackend::new(dist_config)
             .await
             .map_err(|e| {
-                SftError::Mlx(mlx_rs::error::Exception::custom(format!(
+                SftError::Mlx(Exception::custom(format!(
                     "ring backend failed: {e}"
                 )))
             })?;
@@ -323,7 +320,7 @@ pub async fn create_distributed_context(
             metrics,
         )))
     } else {
-        Err(SftError::Mlx(mlx_rs::error::Exception::custom(
+        Err(SftError::Mlx(Exception::custom(
             "distributed config has no peers and auto_discover is false",
         )))
     }

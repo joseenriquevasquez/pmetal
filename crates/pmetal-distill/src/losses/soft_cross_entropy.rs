@@ -18,7 +18,7 @@ use std::ops::Neg;
 
 use super::{DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k, softmax};
 use crate::Result;
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, ops};
 
 #[cfg(feature = "metal")]
 use std::sync::Arc;
@@ -127,14 +127,14 @@ impl SoftCrossEntropyLoss {
         let total_elements = num_tokens * vocab_size;
 
         // Flatten to [num_tokens, vocab] for Metal kernel
-        let teacher_flat = teacher_logits.reshape(&[-1, vocab_size as i32])?;
-        let student_flat = student_logits.reshape(&[-1, vocab_size as i32])?;
+        let mut teacher_flat = teacher_logits.reshape(&[-1, vocab_size as i32]);
+        let mut student_flat = student_logits.reshape(&[-1, vocab_size as i32]);
 
         // Evaluate the arrays to ensure data is computed and available
-        teacher_flat.eval()?;
-        student_flat.eval()?;
+        teacher_flat.eval();
+        student_flat.eval();
 
-        // SAFETY: mlx_array_data_float32 returns *const f32 in mlx-rs 0.25.7+.
+        // SAFETY: data_ptr() returns *mut f32 pointing to unified memory shared by MLX and Metal.
         // metal_buffer_from_ptr requires *mut T because newBufferWithBytesNoCopy
         // takes a mutable void pointer (Metal API constraint), but the buffer is
         // created as a read-only view — we never write through this pointer.
@@ -142,14 +142,12 @@ impl SoftCrossEntropyLoss {
         //   1. The data is valid unified memory owned by the evaluated MLX arrays.
         //   2. We only read from the Metal buffer (kernel input).
         //   3. teacher_flat/student_flat remain alive for the duration of this fn.
-        let teacher_ptr =
-            unsafe { mlx_sys::mlx_array_data_float32(teacher_flat.as_ptr()) as *mut f32 };
-        let student_ptr =
-            unsafe { mlx_sys::mlx_array_data_float32(student_flat.as_ptr()) as *mut f32 };
+        let teacher_ptr = teacher_flat.data_ptr() as *mut f32;
+        let student_ptr = student_flat.data_ptr() as *mut f32;
 
         if teacher_ptr.is_null() || student_ptr.is_null() {
             return Err(crate::DistillError::Metal(
-                "mlx_array_data_float32 returned null — array may not be f32 or not evaluated"
+                "data_ptr returned null — array may not be f32 or not evaluated"
                     .to_string(),
             ));
         }
@@ -218,24 +216,24 @@ impl DistillLoss for SoftCrossEntropyLoss {
 
         // MLX fallback / weighted / sparse-vocab implementation
         let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp)?;
-        let student_scaled = student_logits.divide(&temp)?;
+        let teacher_scaled = teacher_logits.divide(&temp);
+        let student_scaled = student_logits.divide(&temp);
 
         let teacher_probs = softmax(&teacher_scaled, -1)?;
-        let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
+        let student_log_probs = student_scaled.log_softmax(-1);
 
         let neg_ce_per_token = teacher_probs
-            .multiply(&student_log_probs)?
-            .sum_axes(&[-1], Some(false))?;
-        let ce_per_token = neg_ce_per_token.neg();
+            .multiply(&student_log_probs)
+            .sum_axes(&[-1], false);
+        let ce_per_token = neg_ce_per_token.negative();
 
         if let Some(w) = weights {
-            let weighted = ce_per_token.multiply(w)?;
-            let total_weight = w.sum(None)?;
-            let safe_weight = mlx_rs::ops::maximum(&total_weight, &Array::from_f32(1e-8))?;
-            Ok(weighted.sum(None)?.divide(&safe_weight)?)
+            let weighted = ce_per_token.multiply(w);
+            let total_weight = w.sum_all();
+            let safe_weight = ops::maximum(&total_weight, &Array::from_f32(1e-8));
+            Ok(weighted.sum_all().divide(&safe_weight))
         } else {
-            Ok(ce_per_token.mean(None)?)
+            Ok(ce_per_token.mean_all())
         }
     }
 
@@ -252,7 +250,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_soft_ce_identical_distributions() {
-        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let loss = SoftCrossEntropyLoss::new();
         let result = loss.compute(&logits, &logits, 1.0).unwrap();
         let value: f32 = result.item();
@@ -266,8 +264,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_soft_ce_different_distributions() {
-        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
-        let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
 
         let loss = SoftCrossEntropyLoss::new();
 
@@ -291,8 +289,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_soft_ce_temperature_effect() {
-        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
-        let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
 
         let loss = SoftCrossEntropyLoss::new();
 
@@ -317,8 +315,8 @@ mod tests {
     #[serial]
     fn test_soft_ce_batch_processing() {
         // Test with batch of sequences
-        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 2.0, 3.0, 4.0, 5.0], &[2, 1, 4]);
-        let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0, 5.0, 4.0, 3.0, 2.0], &[2, 1, 4]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 2.0, 3.0, 4.0, 5.0], &[2, 1, 4]);
+        let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0, 5.0, 4.0, 3.0, 2.0], &[2, 1, 4]);
 
         let loss = SoftCrossEntropyLoss::new();
         let result = loss.compute(&teacher, &student, 1.0).unwrap();
@@ -333,33 +331,32 @@ mod tests {
     #[test]
     #[serial]
     fn test_soft_cross_entropy_gradient_flow() {
-        use mlx_rs::transforms::value_and_grad;
+        use pmetal_bridge::compat::nn::value_and_grad;
 
-        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
 
-        let loss_fn = |inputs: &[Array]| -> Vec<Array> {
+        let loss_fn = |inputs: &[Array]| -> Array {
             let student = &inputs[0];
             let temp = Array::from_f32(2.0);
-            let teacher_scaled = teacher.divide(&temp).unwrap();
-            let student_scaled = student.divide(&temp).unwrap();
+            let teacher_scaled = teacher.divide(&temp);
+            let student_scaled = student.divide(&temp);
 
             let teacher_probs = softmax(&teacher_scaled, -1).unwrap();
-            let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1).unwrap();
+            let student_log_probs = student_scaled.log_softmax(-1);
 
             // CE = -sum(p * log(q)), sum over vocab, mean over batch
-            let neg_ce = teacher_probs.multiply(&student_log_probs).unwrap();
-            let ce_per_token = neg_ce.sum_axes(&[-1], Some(false)).unwrap();
-            let loss = ce_per_token.negative().unwrap().mean(None).unwrap();
-            vec![loss]
+            let neg_ce = teacher_probs.multiply(&student_log_probs);
+            let ce_per_token = neg_ce.sum_axes(&[-1], false);
+            ce_per_token.negative().mean_all()
         };
 
-        let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
-        let (values, grads) = value_and_grad(loss_fn)(&[student]).unwrap();
+        let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
+        let (loss_val_arr, grads) = value_and_grad(loss_fn, &[student], &[]).unwrap();
 
-        values[0].eval().unwrap();
-        grads[0].eval().unwrap();
+        loss_val_arr.eval();
+        grads[0].eval();
 
-        let loss_val: f32 = values[0].item();
+        let loss_val: f32 = loss_val_arr.item();
         assert!(
             loss_val.is_finite(),
             "soft CE loss must be finite, got {}",
@@ -371,7 +368,7 @@ mod tests {
             loss_val
         );
 
-        let grad_data: Vec<f32> = grads[0].as_slice().to_vec();
+        let grad_data: Vec<f32> = grads[0].clone().to_f32_vec(4).unwrap();
         let grad_norm: f32 = grad_data.iter().map(|&g| g * g).sum::<f32>().sqrt();
         assert!(
             grad_norm.is_finite(),
@@ -408,11 +405,11 @@ mod tests {
             .map(|i| ((i * 7 % 100) as f32 - 50.0) / 10.0)
             .collect();
 
-        let teacher = Array::from_slice(
+        let teacher = Array::from_f32_slice(
             &teacher_data,
             &[batch_size as i32, seq_len as i32, vocab_size as i32],
         );
-        let student = Array::from_slice(
+        let student = Array::from_f32_slice(
             &student_data,
             &[batch_size as i32, seq_len as i32, vocab_size as i32],
         );
@@ -445,8 +442,8 @@ mod tests {
         let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
             .map(|i| (i * 3 % 40) as f32 - 20.0)
             .collect();
-        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
-        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+        let teacher = Array::from_f32_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_f32_slice(&student_data, &[batch, seq, student_vocab]);
 
         let loss = SoftCrossEntropyLoss::new().with_sparse_top_k(32);
         let result = loss.compute(&teacher, &student, 2.0).unwrap();
@@ -471,8 +468,8 @@ mod tests {
         let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
             .map(|i| (i * 3 % 40) as f32 - 20.0)
             .collect();
-        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
-        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+        let teacher = Array::from_f32_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_f32_slice(&student_data, &[batch, seq, student_vocab]);
 
         let loss = SoftCrossEntropyLoss::new().with_sparse_top_k(32);
         let result = loss.compute(&teacher, &student, 2.0).unwrap();
@@ -497,8 +494,8 @@ mod tests {
         let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
             .map(|i| i as f32)
             .collect();
-        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
-        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+        let teacher = Array::from_f32_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_f32_slice(&student_data, &[batch, seq, student_vocab]);
 
         let loss = SoftCrossEntropyLoss::new().with_sparse_top_k(4);
         let result = loss.compute(&teacher, &student, 1.0).unwrap();
@@ -513,11 +510,11 @@ mod tests {
     #[test]
     #[serial]
     fn test_soft_ce_with_sparse_top_k_builder() {
-        let teacher = Array::from_slice(
+        let teacher = Array::from_f32_slice(
             &(0..200).map(|i| i as f32).collect::<Vec<_>>(),
             &[1, 1, 200],
         );
-        let student = Array::from_slice(
+        let student = Array::from_f32_slice(
             &(0..150).map(|i| i as f32).collect::<Vec<_>>(),
             &[1, 1, 150],
         );

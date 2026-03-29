@@ -5,10 +5,41 @@
 //! and lives for the process lifetime (the MLX C API does not expose a
 //! public free function for groups — they are reference-counted internally).
 
-use mlx_sys::{
-    mlx_distributed_group, mlx_distributed_group_rank, mlx_distributed_group_size,
-    mlx_distributed_group_split, mlx_distributed_init, mlx_distributed_is_available,
-};
+// ── Local FFI declarations for MLX distributed group API ─────────────────────
+//
+// These mirror the `mlx_distributed_*` symbols from mlx-sys / mlx-c but are
+// declared here so that pmetal-distributed does not need the mlx-sys crate.
+// All types are plain C structs with a single `ctx: *mut c_void` field.
+
+use std::ffi::c_void;
+
+/// Opaque handle for an MLX distributed communication group.
+///
+/// Matches `mlx_distributed_group` in `mlx/c/distributed.h`.  The `ctx`
+/// field is an opaque pointer to the C++ `Group` shared_ptr wrapper.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct MlxDistributedGroup {
+    pub(crate) ctx: *mut c_void,
+}
+
+#[allow(unsafe_code)]
+unsafe impl Send for MlxDistributedGroup {}
+#[allow(unsafe_code)]
+unsafe impl Sync for MlxDistributedGroup {}
+
+#[allow(unsafe_code)]
+unsafe extern "C" {
+    fn mlx_distributed_is_available() -> bool;
+    fn mlx_distributed_init(strict: bool) -> MlxDistributedGroup;
+    fn mlx_distributed_group_rank(group: MlxDistributedGroup) -> i32;
+    fn mlx_distributed_group_size(group: MlxDistributedGroup) -> i32;
+    fn mlx_distributed_group_split(
+        group: MlxDistributedGroup,
+        color: i32,
+        key: i32,
+    ) -> MlxDistributedGroup;
+}
 
 /// A communication group for distributed operations.
 ///
@@ -18,7 +49,7 @@ use mlx_sys::{
 ///
 /// [`init`]: DistributedGroup::init
 pub struct DistributedGroup {
-    inner: mlx_distributed_group,
+    pub(crate) inner: MlxDistributedGroup,
 }
 
 // SAFETY: The MLX distributed group is thread-safe — the underlying C++
@@ -94,18 +125,11 @@ impl DistributedGroup {
         }
     }
 
-    /// Get the raw MLX C handle.
-    ///
-    /// Used by [`ops`] functions that need to pass the group to C API calls.
-    pub(crate) fn as_raw(&self) -> mlx_distributed_group {
-        self.inner
-    }
-
     /// Create a null group handle (represents "use default group").
     ///
     /// When passed to collective ops, the default global group is used.
-    pub(crate) fn null_handle() -> mlx_distributed_group {
-        mlx_distributed_group {
+    pub(crate) fn null_handle() -> MlxDistributedGroup {
+        MlxDistributedGroup {
             ctx: std::ptr::null_mut(),
         }
     }

@@ -195,6 +195,19 @@ unsafe extern "C" {
     fn mlx_inline_get_peak_memory() -> usize;
     fn mlx_inline_reset_peak_memory();
 
+    // ── FFT ops ──
+    fn mlx_inline_rfft(dst: *mut RawBuf, a: *const RawBuf, n_fft: i32, axis: i32);
+    fn mlx_inline_irfft(dst: *mut RawBuf, a: *const RawBuf, n_fft: i32, axis: i32);
+
+    // ── leaky_relu ──
+    fn mlx_inline_leaky_relu(dst: *mut RawBuf, a: *const RawBuf, neg_slope: f32);
+
+    // ── squeeze_all (remove all size-1 axes) ──
+    fn mlx_inline_squeeze_all(dst: *mut RawBuf, a: *const RawBuf);
+
+    // ── pad ──
+    fn mlx_inline_pad(dst: *mut RawBuf, a: *const RawBuf, pad_widths: *const i32, ndim: i32, fill_value: f32);
+
     // ── Additional ops for complete model inference ──
     fn mlx_inline_concatenate_2(
         dst: *mut RawBuf,
@@ -388,6 +401,7 @@ unsafe extern "C" {
     fn mlx_inline_nbytes(a: *const RawBuf) -> usize;
     fn mlx_inline_data_ptr(a: *const RawBuf, out_ptr: *mut *const std::ffi::c_void) -> i32;
     fn mlx_inline_stop_gradient(dst: *mut RawBuf, a: *const RawBuf);
+    fn mlx_inline_tri_inv(dst: *mut RawBuf, a: *const RawBuf, upper: bool, use_cpu: bool);
 
     // ── Autograd: value_and_grad ──
     fn mlx_inline_value_and_grad(
@@ -420,6 +434,23 @@ unsafe extern "C" {
 
     // Create a 1-D int32 array from a Rust slice.
     fn mlx_inline_from_i32_slice(dst: *mut RawBuf, data: *const i32, len: i32);
+
+    // ── Linalg: SVD ──
+    fn mlx_inline_svd(dst_u: *mut RawBuf, dst_s: *mut RawBuf, dst_vt: *mut RawBuf, a: *const RawBuf);
+
+    // ── Missing ops for pmetal-models migration ──
+    fn mlx_inline_rsqrt(dst: *mut RawBuf, a: *const RawBuf);
+    fn mlx_inline_zeros_like(dst: *mut RawBuf, a: *const RawBuf);
+    fn mlx_inline_ones_like(dst: *mut RawBuf, a: *const RawBuf);
+    fn mlx_inline_tile(dst: *mut RawBuf, a: *const RawBuf, reps: *const i32, ndim: i32);
+    fn mlx_inline_linspace(dst: *mut RawBuf, start: f32, stop: f32, n: i32, dtype: i32);
+    fn mlx_inline_split_sections(dst_arr: *mut RawBuf, a: *const RawBuf, sections: i32, axis: i32, out_count: *mut i32);
+    fn mlx_inline_scatter_add(dst: *mut RawBuf, a: *const RawBuf, indices: *const RawBuf, updates: *const RawBuf, axis: i32);
+    fn mlx_inline_topk(dst: *mut RawBuf, a: *const RawBuf, k: i32, axis: i32);
+    fn mlx_inline_put_along_axis(dst: *mut RawBuf, a: *const RawBuf, indices: *const RawBuf, values: *const RawBuf, axis: i32);
+    fn mlx_inline_layer_norm(dst: *mut RawBuf, x: *const RawBuf, weight: *const RawBuf, bias: *const RawBuf, eps: f32);
+    fn mlx_inline_addmm(dst: *mut RawBuf, c: *const RawBuf, a: *const RawBuf, b: *const RawBuf);
+    fn mlx_inline_conv2d(dst: *mut RawBuf, input: *const RawBuf, weight: *const RawBuf, stride_h: i32, stride_w: i32, pad_h: i32, pad_w: i32, dil_h: i32, dil_w: i32, groups: i32);
 
     // ── Full Qwen3.5 forward pass — single C++ function, zero FFI overhead ──
     // See bridge.h for the complete weight/cache/config layout documentation.
@@ -818,6 +849,37 @@ impl InlineArray {
         Self::from_f32(0.0)
     }
 
+    /// Identity constructor — clone an existing array.
+    ///
+    /// Compatible with mlx-rs `Array::from_array(arr)` which was a no-op copy.
+    /// Since `Array = InlineArray` in this bridge, this is just `.clone()`.
+    #[inline]
+    pub fn from_array(other: &Self) -> Self {
+        other.clone()
+    }
+
+    /// Scalar integer array constructor.
+    ///
+    /// Compatible with mlx-rs `Array::from_int(val)`.
+    #[inline]
+    pub fn from_int(val: i32) -> Self {
+        Self::from_i32(val)
+    }
+
+    /// Construct an array from an iterator of integers with an explicit shape.
+    ///
+    /// Compatible with mlx-rs `Array::from_iter(iter, shape)`.
+    /// The iterator is collected into a `Vec<i32>` and shaped.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let a = Array::from_iter(0..n, &[n]);
+    /// ```
+    pub fn from_iter(iter: impl IntoIterator<Item = i32>, shape: &[i32]) -> Self {
+        let v: Vec<i32> = iter.into_iter().collect();
+        Self::from_i32_slice_shaped(&v, shape)
+    }
+
     pub fn from_f32(val: f32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
@@ -948,6 +1010,14 @@ impl InlineArray {
                 raw: dst.assume_init(),
             }
         }
+    }
+
+    /// Cast to a Rust primitive type `T` — compatible with mlx-rs `as_type::<T>()`.
+    ///
+    /// Uses the [`AsDtype`] sealed trait to map Rust types to MLX dtypes.
+    #[inline]
+    pub fn as_type<T: AsDtype>(&self) -> Self {
+        self.as_dtype(T::DTYPE_ID)
     }
 
     // ── Gather / MoE ─────────────────────────────────────────────────────
@@ -1137,6 +1207,14 @@ impl InlineArray {
         unsafe { mlx_inline_dtype(&self.raw) }
     }
 
+    /// Returns the dtype as a [`crate::compat::Dtype`] enum.
+    ///
+    /// Equivalent to mlx-rs `Array::dtype()`.
+    #[inline]
+    pub fn dtype(&self) -> crate::compat::Dtype {
+        crate::compat::Dtype::from_raw(self.dtype_raw())
+    }
+
     // ── Eval ─────────────────────────────────────────────────────────────
 
     pub fn eval(&mut self) {
@@ -1265,6 +1343,25 @@ impl InlineArray {
         }
     }
 
+    /// Create a shaped int32 array from a Rust slice.
+    ///
+    /// Shape must satisfy `shape.iter().product::<i32>() == data.len() as i32`.
+    pub fn from_i32_slice_shaped(data: &[i32], shape: &[i32]) -> Self {
+        Self::from_i32_slice(data).reshape(shape)
+    }
+
+    /// Generic `from_slice` compatible with mlx-rs `Array::from_slice::<T>(data, shape)`.
+    ///
+    /// Supports `i32`, `f32`, and `u32` element types via the [`ArrayElement`] trait.
+    /// Typical usage:
+    /// ```ignore
+    /// let arr = Array::from_slice(&[1i32, 2, 3], &[1, 3]);
+    /// let arr = Array::from_slice(&[0.1f32, 0.2], &[2]);
+    /// ```
+    pub fn from_slice<T: ArrayElement>(data: &[T], shape: &[i32]) -> Self {
+        T::into_array(data, shape)
+    }
+
     /// Create a range [0, 1, ..., n-1] with full Metal buffer (no broadcast).
     /// Useful for benchmarks — ensures matmuls read real data from GPU memory.
     pub fn arange(n: i32, dtype: i32) -> Self {
@@ -1299,6 +1396,10 @@ impl InlineArray {
     }
 
     /// Element-wise absolute value.
+    #[inline]
+    pub fn abs(&self) -> Self { self.abs_val() }
+
+    /// Element-wise absolute value (alias to avoid f32::abs conflict in some contexts).
     #[inline]
     pub fn abs_val(&self) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
@@ -1471,6 +1572,23 @@ impl InlineArray {
         unsafe { mlx_inline_fused_precise_swiglu(dst.as_mut_ptr(), &x.raw, &gate.raw); Self { raw: dst.assume_init() } }
     }
 
+    // ── Slice access (requires prior eval) ───────────────────────────────
+
+    /// Return a borrowed slice of the array's f32 data.
+    ///
+    /// # Panics
+    /// Panics if the array has not been evaluated (GPU→CPU sync), if the
+    /// dtype is not Float32, or if the data pointer is null.
+    pub fn as_slice<T: crate::inline_array::BridgeScalar>(&self) -> &[T] {
+        let ptr = self.data_ptr() as *const T;
+        assert!(!ptr.is_null(), "as_slice: array not evaluated (null data ptr)");
+        let n = self.size();
+        // SAFETY: `data_ptr` returns a valid pointer into MLX's heap allocation
+        // for the lifetime of `self`. The array must have been `eval()`d first
+        // so the pointer is on the CPU (not on the GPU).
+        unsafe { std::slice::from_raw_parts(ptr, n) }
+    }
+
     // ── Item extraction ───────────────────────────────────────────────────
 
     pub fn item_f32(&mut self) -> f32 {
@@ -1564,6 +1682,19 @@ impl InlineArray {
         }
     }
 
+    /// Squeeze all size-1 dimensions (multi-axis compat alias).
+    #[inline]
+    pub fn squeeze_axes(&self, axes: &[i32]) -> Self {
+        let mut result = self.clone();
+        // Process axes in descending order to maintain correct indices
+        let mut sorted = axes.to_vec();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        for &ax in &sorted {
+            result = result.squeeze(ax);
+        }
+        result
+    }
+
     #[inline]
     pub fn expand_dims(&self, axis: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
@@ -1573,6 +1704,21 @@ impl InlineArray {
                 raw: dst.assume_init(),
             }
         }
+    }
+
+    /// Multi-axis expand_dims — insert a new size-1 axis at each position.
+    ///
+    /// Compatible with mlx-rs `expand_dims_axes(&[ax1, ax2, ...])`.
+    #[inline]
+    pub fn expand_dims_axes(&self, axes: &[i32]) -> Self {
+        let mut result = self.clone();
+        // Insert axes in ascending order (each insertion shifts subsequent axes)
+        let mut sorted = axes.to_vec();
+        sorted.sort_unstable();
+        for &ax in &sorted {
+            result = result.expand_dims(ax);
+        }
+        result
     }
 
     #[inline]
@@ -1817,10 +1963,45 @@ impl InlineArray {
     unop!(reciprocal, mlx_inline_reciprocal);
     unop!(sin, mlx_inline_sin);
     unop!(cos, mlx_inline_cos);
+    unop!(rsqrt, mlx_inline_rsqrt);
+    unop!(zeros_like, mlx_inline_zeros_like);
+    unop!(ones_like, mlx_inline_ones_like);
     unop!(square, mlx_inline_square);
     unop!(relu, mlx_inline_relu);
     unop!(gelu, mlx_inline_gelu);
     unop!(stop_gradient, mlx_inline_stop_gradient);
+
+    /// Compute the inverse of a triangular matrix (batched over leading dims).
+    ///
+    /// `upper=false` (default) inverts a lower-triangular matrix.
+    /// `use_cpu=true` dispatches on the CPU stream — matches mlx-lm's GDN
+    /// WY factorization which calls `tri_inv(StreamOrDevice::cpu())` because
+    /// `tri_inv` has no registered VJP and must stay off the autograd tape.
+    pub fn tri_inv(&self, upper: bool, use_cpu: bool) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_tri_inv(dst.as_mut_ptr(), &self.raw, upper, use_cpu);
+            Self { raw: dst.assume_init() }
+        }
+    }
+
+    /// Singular Value Decomposition — returns `(U, S, Vt)`.
+    ///
+    /// Economy/thin SVD: `U` is `[m, k]`, `S` is `[k]`, `Vt` is `[k, n]`
+    /// where `k = min(m, n)`.  Always runs on the CPU stream.
+    pub fn svd(&self) -> (Self, Self, Self) {
+        let mut u   = MaybeUninit::<RawBuf>::uninit();
+        let mut s   = MaybeUninit::<RawBuf>::uninit();
+        let mut vt  = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_svd(u.as_mut_ptr(), s.as_mut_ptr(), vt.as_mut_ptr(), &self.raw);
+            (
+                Self { raw: u.assume_init()  },
+                Self { raw: s.assume_init()  },
+                Self { raw: vt.assume_init() },
+            )
+        }
+    }
 
     /// Clip values to [lo, hi]. Either bound can be None.
     pub fn clip(&self, lo: Option<&Self>, hi: Option<&Self>) -> Self {
@@ -2002,6 +2183,25 @@ impl InlineArray {
 
     // ── Training ops: misc ────────────────────────────────────────────────
 
+    /// Alias for pow (mlx-rs compat).
+    pub fn power(&self, other: &Self) -> Self { self.pow(other) }
+
+    /// gt/lt/ge/le aliases for compat with mlx-rs naming.
+    pub fn gt(&self, other: &Self) -> Self { self.greater(other) }
+    pub fn lt(&self, other: &Self) -> Self { self.less(other) }
+    pub fn ge(&self, other: &Self) -> Self { self.greater_equal(other) }
+    pub fn le(&self, other: &Self) -> Self { self.less_equal(other) }
+
+    /// Swap two axes.
+    pub fn swap_axes(&self, a: i32, b: i32) -> Self {
+        let ndim = self.ndim();
+        let mut perm: Vec<i32> = (0..ndim).map(|i| i as i32).collect();
+        let a_idx = if a < 0 { ndim as i32 + a } else { a } as usize;
+        let b_idx = if b < 0 { ndim as i32 + b } else { b } as usize;
+        perm.swap(a_idx, b_idx);
+        self.transpose_axes(&perm)
+    }
+
     /// Total element count.
     pub fn size(&self) -> usize {
         unsafe { mlx_inline_size(&self.raw) }
@@ -2019,6 +2219,235 @@ impl InlineArray {
         unsafe { mlx_inline_data_ptr(&self.raw, &mut ptr) };
         ptr
     }
+
+    // ── FFT ───────────────────────────────────────────────────────────────
+
+    /// Real-valued FFT along `axis`. Pass `n_fft = -1` to use the full axis length.
+    #[inline]
+    pub fn rfft(&self, n_fft: i32, axis: i32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe { mlx_inline_rfft(dst.as_mut_ptr(), &self.raw, n_fft, axis); Self { raw: dst.assume_init() } }
+    }
+
+    /// Inverse real-valued FFT along `axis`. Pass `n_fft = -1` to infer from input.
+    #[inline]
+    pub fn irfft(&self, n_fft: i32, axis: i32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe { mlx_inline_irfft(dst.as_mut_ptr(), &self.raw, n_fft, axis); Self { raw: dst.assume_init() } }
+    }
+
+    // ── leaky_relu ────────────────────────────────────────────────────────
+
+    /// Leaky ReLU: `max(neg_slope * x, x)`.
+    #[inline]
+    pub fn leaky_relu(&self, neg_slope: f32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe { mlx_inline_leaky_relu(dst.as_mut_ptr(), &self.raw, neg_slope); Self { raw: dst.assume_init() } }
+    }
+
+    // ── squeeze all ───────────────────────────────────────────────────────
+
+    /// Remove all size-1 dimensions.
+    #[inline]
+    pub fn squeeze_all(&self) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe { mlx_inline_squeeze_all(dst.as_mut_ptr(), &self.raw); Self { raw: dst.assume_init() } }
+    }
+
+    // ── pad ───────────────────────────────────────────────────────────────
+
+    /// Pad array with constant value.
+    ///
+    /// `pad_widths`: slice of `(before, after)` pairs for each axis, flattened:
+    /// `[before_0, after_0, before_1, after_1, ...]`.  Length must be `2 * ndim`.
+    /// Tile `self` by `reps` along each axis.
+    pub fn tile(&self, reps: &[i32]) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_tile(dst.as_mut_ptr(), &self.raw, reps.as_ptr(), reps.len() as i32);
+            Self { raw: dst.assume_init() }
+        }
+    }
+
+    /// Linspace scalar creation — returns a 1-D array of `n` evenly-spaced values.
+    pub fn linspace(start: f32, stop: f32, n: i32, dtype: i32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_linspace(dst.as_mut_ptr(), start, stop, n, dtype);
+            Self { raw: dst.assume_init() }
+        }
+    }
+
+    /// Split into `sections` equal parts along `axis`.
+    pub fn split_sections(&self, sections: i32, axis: i32) -> Vec<Self> {
+        // Allocate enough output slots.
+        let max = sections as usize;
+        let mut buf: Vec<MaybeUninit<RawBuf>> = (0..max).map(|_| MaybeUninit::uninit()).collect();
+        let mut out_count: i32 = 0;
+        unsafe {
+            mlx_inline_split_sections(
+                buf[0].as_mut_ptr(),
+                &self.raw,
+                sections,
+                axis,
+                &mut out_count,
+            );
+        }
+        (0..out_count as usize).map(|i| unsafe {
+            Self { raw: buf[i].assume_init() }
+        }).collect()
+    }
+
+    /// Scatter-add: `self[indices] += updates` along `axis`.
+    pub fn scatter_add_axis(&self, indices: &Self, updates: &Self, axis: i32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_scatter_add(dst.as_mut_ptr(), &self.raw, &indices.raw, &updates.raw, axis);
+            Self { raw: dst.assume_init() }
+        }
+    }
+
+    /// Top-k values along `axis`.
+    pub fn topk(&self, k: i32, axis: i32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_topk(dst.as_mut_ptr(), &self.raw, k, axis);
+            Self { raw: dst.assume_init() }
+        }
+    }
+
+    /// Put values at `indices` along `axis` (in-place scatter).
+    pub fn put_along_axis_op(&self, indices: &Self, values: &Self, axis: i32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_put_along_axis(dst.as_mut_ptr(), &self.raw, &indices.raw, &values.raw, axis);
+            Self { raw: dst.assume_init() }
+        }
+    }
+
+    /// Layer normalisation. `weight` and `bias` may be null (use `std::ptr::null()`).
+    pub fn layer_norm(&self, weight: Option<&Self>, bias: Option<&Self>, eps: f32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        let w_ptr = weight.map(|w| &w.raw as *const RawBuf).unwrap_or(std::ptr::null());
+        let b_ptr = bias.map(|b| &b.raw as *const RawBuf).unwrap_or(std::ptr::null());
+        unsafe {
+            mlx_inline_layer_norm(dst.as_mut_ptr(), &self.raw, w_ptr, b_ptr, eps);
+            Self { raw: dst.assume_init() }
+        }
+    }
+
+    /// `c + a @ b` (addmm).
+    pub fn addmm(c: &Self, a: &Self, b: &Self) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_addmm(dst.as_mut_ptr(), &c.raw, &a.raw, &b.raw);
+            Self { raw: dst.assume_init() }
+        }
+    }
+
+    /// 2-D convolution (NHWC format, MLX standard).
+    pub fn conv2d(&self, weight: &Self, stride_h: i32, stride_w: i32,
+                  pad_h: i32, pad_w: i32, dil_h: i32, dil_w: i32, groups: i32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_conv2d(dst.as_mut_ptr(), &self.raw, &weight.raw,
+                              stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups);
+            Self { raw: dst.assume_init() }
+        }
+    }
+
+    pub fn pad_constant(&self, pad_widths_flat: &[i32], fill_value: f32) -> Self {
+        debug_assert_eq!(pad_widths_flat.len(), 2 * self.ndim() as usize);
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_pad(
+                dst.as_mut_ptr(),
+                &self.raw,
+                pad_widths_flat.as_ptr(),
+                (pad_widths_flat.len() / 2) as i32,
+                fill_value,
+            );
+            Self { raw: dst.assume_init() }
+        }
+    }
+
+    // ── item generic ──────────────────────────────────────────────────────
+
+    /// Extract the scalar value from a 0-d array. Evaluates lazily if needed.
+    /// `T` must be `f32` or `u32` (the only types exported by the bridge).
+    pub fn item<T: BridgeScalar>(&mut self) -> T {
+        T::extract(self)
+    }
+
+    // ── max / min scalar reductions ───────────────────────────────────────
+
+    /// Reduce to the global maximum (returns scalar array).
+    pub fn max(&self, _axis: Option<i32>) -> Self {
+        // The vocoder code uses `.max(None)` for global max.
+        // We reduce all axes by flattening first.
+        let flat = self.flatten(0, -1);
+        flat.max_axis(0, false)
+    }
+
+    /// Reduce to the global minimum (returns scalar array).
+    pub fn min(&self, _axis: Option<i32>) -> Self {
+        let flat = self.flatten(0, -1);
+        flat.min_axis(0, false)
+    }
+
+    /// Reduce to the global sum (returns scalar array).
+    pub fn sum(&self, _axis: Option<i32>) -> Self {
+        self.sum_all()
+    }
+
+    /// Reduce to the global mean (returns scalar array).
+    pub fn mean(&self, _axis: Option<i32>) -> Self {
+        self.mean_all()
+    }
+
+    // ── mlx-rs compat constructors ────────────────────────────────────────
+
+    /// Convenience constructor: zeros with float32 dtype.
+    /// Matches mlx-rs `Array::zeros::<f32>(&[n])`.
+    #[inline]
+    pub fn zeros_f32(shape: &[i32]) -> Self {
+        Self::zeros(shape, crate::compat::Dtype::Float32.as_i32())
+    }
+
+    /// Convenience constructor: ones with float32 dtype.
+    /// Matches mlx-rs `Array::ones::<f32>(&[n])`.
+    #[inline]
+    pub fn ones_f32(shape: &[i32]) -> Self {
+        Self::ones(shape, crate::compat::Dtype::Float32.as_i32())
+    }
+
+    /// Convenience constructor: zeros with int32 dtype.
+    /// Matches mlx-rs `Array::zeros::<i32>(&[n])`.
+    #[inline]
+    pub fn zeros_i32(shape: &[i32]) -> Self {
+        Self::zeros(shape, crate::compat::Dtype::Int32.as_i32())
+    }
+
+    /// Cast to the specified dtype enum value.
+    /// Matches mlx-rs `as_dtype(Dtype::X)` — bridge normally takes `i32`.
+    #[inline]
+    pub fn cast(&self, dtype: crate::compat::Dtype) -> Self {
+        self.as_dtype(dtype.as_i32())
+    }
+
+    /// Cast to the same dtype as another array.
+    /// Convenient replacement for `arr.as_dtype(other.dtype_raw())`.
+    #[inline]
+    pub fn cast_like(&self, other: &Self) -> Self {
+        self.as_dtype(other.dtype_raw())
+    }
+}
+
+// ── Trait impls ────────────────────────────────────────────────────────────
+
+impl AsRef<InlineArray> for InlineArray {
+    #[inline]
+    fn as_ref(&self) -> &InlineArray { self }
 }
 
 // ── Autograd ──────────────────────────────────────────────────────────────
@@ -2089,6 +2518,44 @@ where
     (loss, grads)
 }
 
+// ── Crate-internal helpers for compat.rs ─────────────────────────────────
+
+/// Copy-construct a RawBuf — equivalent to `mlx::core::array` copy constructor.
+/// Used by `compat::ops` when it needs to build a contiguous slice of buffers.
+#[inline]
+pub(crate) unsafe fn raw_copy_buf(dst: *mut RawBuf, src: *const RawBuf) {
+    unsafe { mlx_inline_init_copy(dst, src) }
+}
+
+/// Destroy a raw buffer — calls the `mlx::core::array` destructor.
+#[inline]
+pub(crate) unsafe fn raw_destroy(a: *mut RawBuf) {
+    unsafe { mlx_inline_destroy(a) }
+}
+
+/// Concatenate a contiguous slice of RawBufs along `axis`.
+#[inline]
+pub(crate) unsafe fn raw_concatenate(dst: *mut RawBuf, arrays: *const RawBuf, num: i32, axis: i32) {
+    unsafe { mlx_inline_concatenate(dst, arrays, num, axis) }
+}
+
+/// Stack a contiguous slice of RawBufs along a new `axis`.
+#[inline]
+pub(crate) unsafe fn raw_stack(dst: *mut RawBuf, arrays: *const RawBuf, num: i32, axis: i32) {
+    unsafe { mlx_inline_stack(dst, arrays, num, axis) }
+}
+
+/// Wrap a raw RawBuf (already placement-new'd by C++) into an `InlineArray`.
+///
+/// # Safety
+/// `raw` must have been initialised by a C++ placement-new (e.g. via one of
+/// the `mlx_inline_*` FFI functions).  Ownership is transferred: `Drop` will
+/// call the C++ destructor.
+#[inline]
+pub(crate) unsafe fn from_raw_buf(raw: RawBuf) -> InlineArray {
+    InlineArray { raw }
+}
+
 // ── Verify buffer dimensions at startup ──────────────────────────────────
 
 /// Panic at runtime if the Rust buffer constants don't match the C++ values.
@@ -2104,6 +2571,105 @@ pub fn verify_buffer_layout() {
         al <= ARRAY_BUF_ALIGN,
         "mlx::core::array alignment is {al} but ARRAY_BUF_ALIGN={ARRAY_BUF_ALIGN}"
     );
+}
+
+// ── AsDtype: sealed trait for as_type<T>() ──────────────────────────────
+
+/// Sealed trait mapping Rust primitive types to MLX dtype IDs.
+///
+/// Used by [`InlineArray::as_type::<T>()`] to cast arrays by Rust type.
+pub trait AsDtype {
+    const DTYPE_ID: i32;
+}
+
+impl AsDtype for f32    { const DTYPE_ID: i32 = 10; }  // Float32
+impl AsDtype for f16    { const DTYPE_ID: i32 = 9;  }  // Float16 (using half::f16 or similar)
+impl AsDtype for u8     { const DTYPE_ID: i32 = 1;  }  // Uint8
+impl AsDtype for u16    { const DTYPE_ID: i32 = 2;  }  // Uint16
+impl AsDtype for u32    { const DTYPE_ID: i32 = 3;  }  // Uint32
+impl AsDtype for u64    { const DTYPE_ID: i32 = 4;  }  // Uint64
+impl AsDtype for i8     { const DTYPE_ID: i32 = 5;  }  // Int8
+impl AsDtype for i16    { const DTYPE_ID: i32 = 6;  }  // Int16
+impl AsDtype for i32    { const DTYPE_ID: i32 = 7;  }  // Int32
+impl AsDtype for i64    { const DTYPE_ID: i32 = 8;  }  // Int64
+impl AsDtype for bool   { const DTYPE_ID: i32 = 0;  }  // Bool
+
+/// Half-precision float marker type for `as_type::<f16>()`.
+/// Use `half::f16` from the `half` crate, or this zero-sized stub.
+#[allow(non_camel_case_types)]
+pub struct f16;
+
+/// Bfloat16 marker type for `as_type::<bf16>()`.
+#[allow(non_camel_case_types)]
+pub struct bf16;
+
+impl AsDtype for bf16   { const DTYPE_ID: i32 = 11; }  // Bfloat16
+
+// ── ArrayElement: trait for from_slice<T>() ──────────────────────────────
+
+/// Trait for element types supported by [`InlineArray::from_slice`].
+///
+/// Implemented for `f32`, `i32`, `u32`, and `i64`.
+pub trait ArrayElement {
+    fn into_array(data: &[Self], shape: &[i32]) -> InlineArray where Self: Sized;
+}
+
+impl ArrayElement for f32 {
+    fn into_array(data: &[f32], shape: &[i32]) -> InlineArray {
+        InlineArray::from_f32_slice(data, shape)
+    }
+}
+
+impl ArrayElement for i32 {
+    fn into_array(data: &[i32], shape: &[i32]) -> InlineArray {
+        InlineArray::from_i32_slice_shaped(data, shape)
+    }
+}
+
+impl ArrayElement for u32 {
+    fn into_array(data: &[u32], shape: &[i32]) -> InlineArray {
+        // Convert to i32 then create array
+        let i32_data: Vec<i32> = data.iter().map(|&x| x as i32).collect();
+        InlineArray::from_i32_slice_shaped(&i32_data, shape)
+    }
+}
+
+impl ArrayElement for i64 {
+    fn into_array(data: &[i64], shape: &[i32]) -> InlineArray {
+        let i32_data: Vec<i32> = data.iter().map(|&x| x as i32).collect();
+        InlineArray::from_i32_slice_shaped(&i32_data, shape)
+    }
+}
+
+impl ArrayElement for usize {
+    fn into_array(data: &[usize], shape: &[i32]) -> InlineArray {
+        let i32_data: Vec<i32> = data.iter().map(|&x| x as i32).collect();
+        InlineArray::from_i32_slice_shaped(&i32_data, shape)
+    }
+}
+
+// ── BridgeScalar: sealed trait for item<T>() ─────────────────────────────
+
+/// Sealed trait for extracting a scalar value from an [`InlineArray`].
+///
+/// Only `f32` and `u32` are supported — they are the types the bridge FFI
+/// exposes via `mlx_inline_item_f32` / `mlx_inline_item_u32`.
+pub trait BridgeScalar: private::Sealed {
+    fn extract(arr: &mut InlineArray) -> Self;
+}
+
+mod private {
+    pub trait Sealed {}
+    impl Sealed for f32 {}
+    impl Sealed for u32 {}
+}
+
+impl BridgeScalar for f32 {
+    fn extract(arr: &mut InlineArray) -> f32 { arr.item_f32() }
+}
+
+impl BridgeScalar for u32 {
+    fn extract(arr: &mut InlineArray) -> u32 { arr.item_u32() }
 }
 
 #[cfg(test)]

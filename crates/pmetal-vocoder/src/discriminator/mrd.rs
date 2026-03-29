@@ -7,7 +7,7 @@ use super::DiscriminatorOutput;
 use crate::audio::{StftConfig, stft};
 use crate::error::Result;
 use crate::nn::WeightNormConv1d;
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, nn};
 
 /// Multi-Resolution Discriminator.
 ///
@@ -141,16 +141,16 @@ impl ResolutionDiscriminator {
     /// Discriminator output with logits and feature maps
     pub fn forward(&self, audio: &Array) -> Result<DiscriminatorOutput> {
         // Remove channel dimension for STFT: [B, 1, T] -> [B, T]
-        let audio_2d = audio.squeeze()?;
+        let audio_2d = audio.squeeze_all();
 
         // Compute STFT magnitude spectrogram
         let stft_out = stft(&audio_2d, &self.stft_config)?;
-        let magnitude = stft_out.abs()?;
+        let magnitude = stft_out.abs_val();
 
         // magnitude shape: [B, freq, frames] or [freq, frames]
         // Ensure batch dimension
         let x = if magnitude.ndim() == 2 {
-            magnitude.reshape(&[1, magnitude.dim(0), magnitude.dim(1)])?
+            magnitude.reshape(&[1, magnitude.dim(0), magnitude.dim(1)])
         } else {
             magnitude
         };
@@ -161,7 +161,7 @@ impl ResolutionDiscriminator {
 
         for conv in &self.convs {
             x = conv.forward(&x)?;
-            x = mlx_rs::nn::leaky_relu(&x, 0.1)?;
+            x = nn::leaky_relu(&x, 0.1);
             features.push(x.clone());
         }
 
@@ -180,9 +180,10 @@ mod tests {
     fn test_resolution_discriminator() {
         let disc = ResolutionDiscriminator::new(1024, 256, 1024).unwrap();
 
-        let audio = mlx_rs::random::normal::<f32>(&[1, 1, 4096], None, None, None).unwrap();
+        let audio = Array::random_normal(&[1, 1, 4096], 10);
         let output = disc.forward(&audio).unwrap();
-        output.logits.eval().unwrap();
+        let mut l2 = output.logits.clone();
+        l2.eval();
 
         assert!(!output.features.is_empty());
     }
@@ -191,7 +192,7 @@ mod tests {
     fn test_mrd() {
         let mrd = MultiResolutionDiscriminator::new().unwrap();
 
-        let audio = mlx_rs::random::normal::<f32>(&[1, 1, 8000], None, None, None).unwrap();
+        let audio = Array::random_normal(&[1, 1, 8000], 10);
         let outputs = mrd.forward(&audio).unwrap();
 
         assert_eq!(outputs.len(), 3); // 3 resolutions

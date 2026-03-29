@@ -32,17 +32,8 @@
 //! - Chunkwise algorithm: Yang et al., "Gated Linear Attention Transformers with
 //!   Hardware-Efficient Training" (FLA, ICLR 2025).
 
-use std::sync::OnceLock;
-
-use mlx_rs::{
-    Array, Dtype, Stream, StreamOrDevice,
-    compile::{Closure, compile},
-    error::Exception,
-    fast::{MetalKernel, MetalKernelConfig},
-    linalg, nn,
-    ops::{self, indexing::IndexOp},
-    stop_gradient,
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, linalg, ops};
+use crate::array_ext::ArrayDtypeExt;
 
 /// Default chunk size for the chunkwise parallel GDN algorithm.
 /// Sequences longer than this use the parallel chunk path.
@@ -71,7 +62,7 @@ fn resolve_chunk_size_override(chunk_size_override: Option<i32>) -> Option<i32> 
 
 /// Compute gating decay: g = exp(-exp(A_log) * softplus(a + dt_bias))
 ///
-/// Uses `mx.compile(shapeless=True)` to fuse the 6 ops into a single kernel.
+/// Uses the bridge's fused `compute_g` kernel (single dispatch instead of 6 ops).
 ///
 /// # Arguments
 /// * `a_log` - Log of decay rates, shape `[Hv]`
@@ -81,20 +72,7 @@ fn resolve_chunk_size_override(chunk_size_override: Option<i32>) -> Option<i32> 
 /// # Returns
 /// Gating decay values, shape `[B, T, Hv]`
 pub fn compute_g(a_log: &Array, a: &Array, dt_bias: &Array) -> Result<Array, Exception> {
-    static COMPILED: OnceLock<Option<Closure>> = OnceLock::new();
-    let compiled = COMPILED.get_or_init(|| {
-        let closure = Closure::new(|inputs: &[Array]| -> Result<Vec<Array>, Exception> {
-            compute_g_impl(&inputs[0], &inputs[1], &inputs[2]).map(|g| vec![g])
-        });
-        compile(&closure, true).ok()
-    });
-
-    if let Some(compiled_fn) = compiled {
-        let outputs = compiled_fn.apply(&[a_log, a, dt_bias])?;
-        Ok(outputs.into_iter().next().unwrap())
-    } else {
-        compute_g_impl(a_log, a, dt_bias)
-    }
+    Ok(Array::fused_compute_g(a_log, a, dt_bias))
 }
 
 /// Raw (non-compiled) compute_g implementation.
@@ -109,24 +87,24 @@ pub fn compute_g_impl(a_log: &Array, a: &Array, dt_bias: &Array) -> Result<Array
 
     // Upcast to f32 for stability
     let a_log_f32 = if input_dtype != Dtype::Float32 {
-        a_log.as_type::<f32>()?
+        a_log.as_dtype(Dtype::Float32.as_i32())
     } else {
         a_log.clone()
     };
 
     // exp(A_log) gives the decay rate A
-    let decay_rate = a_log_f32.exp()?;
+    let decay_rate = a_log_f32.exp();
 
     // softplus(a + dt_bias)
-    let a_biased = a.add(dt_bias)?;
-    let sp = nn::softplus(&a_biased)?;
+    let a_biased = a.add(dt_bias);
+    let sp = a_biased.softplus();
 
     // g = exp(-A * softplus(a + dt_bias))
-    let g = decay_rate.multiply(&sp)?.negative()?.exp()?;
+    let g = decay_rate.multiply(&sp).negative().exp();
 
     // Cast back to input dtype
     if input_dtype != Dtype::Float32 {
-        g.as_dtype(input_dtype)
+        Ok(g.as_dtype(input_dtype.as_i32()))
     } else {
         Ok(g)
     }
@@ -146,7 +124,7 @@ pub fn compute_g_impl(a_log: &Array, a: &Array, dt_bias: &Array) -> Result<Array
 ///
 /// # Returns
 /// (output `[B, H, Dv]`, new_state `[B, H, Dv, Dk]`)
-/// Compiled GDN step — fuses ~15 ops into a single kernel via mx.compile.
+/// GDN step dispatch.
 fn gated_delta_step_compiled(
     q: &Array,
     k: &Array,
@@ -155,24 +133,7 @@ fn gated_delta_step_compiled(
     beta: &Array,
     state: &Array,
 ) -> Result<(Array, Array), Exception> {
-    static COMPILED: OnceLock<Option<Closure>> = OnceLock::new();
-    let compiled = COMPILED.get_or_init(|| {
-        let closure = Closure::new(|inputs: &[Array]| -> Result<Vec<Array>, Exception> {
-            let (y, s) = gated_delta_step_core_ops(
-                &inputs[0], &inputs[1], &inputs[2],
-                &inputs[3], &inputs[4], &inputs[5],
-            )?;
-            Ok(vec![y, s])
-        });
-        compile(&closure, false).ok()
-    });
-
-    if let Some(compiled_fn) = compiled {
-        let outputs = compiled_fn.apply(&[q, k, v, g, beta, state])?;
-        Ok((outputs[0].clone(), outputs[1].clone()))
-    } else {
-        gated_delta_step_core_ops(q, k, v, g, beta, state)
-    }
+    gated_delta_step_core_ops(q, k, v, g, beta, state)
 }
 
 fn gated_delta_step_core_ops(
@@ -188,13 +149,13 @@ fn gated_delta_step_core_ops(
     let decayed_state = match g.ndim() {
         2 => {
             // [B, H] -> [B, H, 1, 1] for broadcasting with [B, H, Dv, Dk]
-            let g_expanded = g.reshape(&[g.dim(0), g.dim(1), 1, 1])?;
-            state.multiply(&g_expanded)?
+            let g_expanded = g.reshape(&[g.dim(0), g.dim(1), 1, 1]);
+            state.multiply(&g_expanded)
         }
         3 => {
             // [B, H, Dk] -> [B, H, 1, Dk] for broadcasting with [B, H, Dv, Dk]
-            let g_expanded = g.reshape(&[g.dim(0), g.dim(1), 1, g.dim(2)])?;
-            state.multiply(&g_expanded)?
+            let g_expanded = g.reshape(&[g.dim(0), g.dim(1), 1, g.dim(2)]);
+            state.multiply(&g_expanded)
         }
         _ => {
             return Err(Exception::custom(format!(
@@ -206,22 +167,22 @@ fn gated_delta_step_core_ops(
 
     // kv_mem = sum(decayed_state * k, axis=-1) -> [B, H, Dv]
     // k is [B, H, Dk], expand to [B, H, 1, Dk]
-    let k_expanded = k.reshape(&[k.dim(0), k.dim(1), 1, k.dim(2)])?;
-    let kv_mem = decayed_state.multiply(&k_expanded)?.sum_axis(-1, false)?;
+    let k_expanded = k.reshape(&[k.dim(0), k.dim(1), 1, k.dim(2)]);
+    let kv_mem = decayed_state.multiply(&k_expanded).sum_axis(-1, false);
 
     // delta = (v - kv_mem) * beta
     // v is [B, H, Dv], beta is [B, H] -> [B, H, 1]
-    let beta_expanded = beta.reshape(&[beta.dim(0), beta.dim(1), 1])?;
-    let delta = v.subtract(&kv_mem)?.multiply(&beta_expanded)?;
+    let beta_expanded = beta.reshape(&[beta.dim(0), beta.dim(1), 1]);
+    let delta = v.subtract(&kv_mem).multiply(&beta_expanded);
 
     // new_state = decayed_state + k^T * delta (outer product)
     // k_expanded: [B, H, 1, Dk], delta: [B, H, Dv] -> [B, H, Dv, 1]
-    let delta_expanded = delta.reshape(&[delta.dim(0), delta.dim(1), delta.dim(2), 1])?;
-    let new_state = decayed_state.add(&k_expanded.multiply(&delta_expanded)?)?;
+    let delta_expanded = delta.reshape(&[delta.dim(0), delta.dim(1), delta.dim(2), 1]);
+    let new_state = decayed_state.add(&k_expanded.multiply(&delta_expanded));
 
     // y = sum(new_state * q, axis=-1) -> [B, H, Dv]
-    let q_expanded = q.reshape(&[q.dim(0), q.dim(1), 1, q.dim(2)])?;
-    let y = new_state.multiply(&q_expanded)?.sum_axis(-1, false)?;
+    let q_expanded = q.reshape(&[q.dim(0), q.dim(1), 1, q.dim(2)]);
+    let y = new_state.multiply(&q_expanded).sum_axis(-1, false);
 
     Ok((y, new_state))
 }
@@ -241,8 +202,8 @@ fn gated_delta_step_ops(
     // Apply mask: if masked, keep old state
     let new_state = if let Some(mask) = mask {
         // mask is [B], expand to [B, 1, 1, 1] for broadcasting
-        let mask_expanded = mask.reshape(&[mask.dim(0), 1, 1, 1])?;
-        ops::r#where(&mask_expanded, &new_state, &old_state)?
+        let mask_expanded = mask.reshape(&[mask.dim(0), 1, 1, 1]);
+        ops::where_fn(&mask_expanded, &new_state, &old_state)
     } else {
         new_state
     };
@@ -271,19 +232,19 @@ fn gated_delta_decode_ops(
     let repeat_factor = hv / hk;
     let (q_rep, k_rep);
     let (q, k) = if repeat_factor > 1 {
-        q_rep = ops::repeat_axis::<f32>(q.clone(), repeat_factor, 2)?;
-        k_rep = ops::repeat_axis::<f32>(k.clone(), repeat_factor, 2)?;
+        q_rep = ops::repeat_axis(q.clone(), repeat_factor, 2);
+        k_rep = ops::repeat_axis(k.clone(), repeat_factor, 2);
         (&q_rep, &k_rep)
     } else {
         (q, k)
     };
 
-    let q_t = q.reshape(&[b, hv, dk])?;
-    let k_t = k.reshape(&[b, hv, dk])?;
-    let v_t = v.reshape(&[b, hv, dv])?;
+    let q_t = q.reshape(&[b, hv, dk]);
+    let k_t = k.reshape(&[b, hv, dk]);
+    let v_t = v.reshape(&[b, hv, dv]);
     let g_t = match g.ndim() {
-        3 => g.reshape(&[b, hv])?,
-        4 => g.reshape(&[b, hv, dk])?,
+        3 => g.reshape(&[b, hv]),
+        4 => g.reshape(&[b, hv, dk]),
         _ => {
             return Err(Exception::custom(format!(
                 "Unsupported decode gating shape: {:?}",
@@ -291,10 +252,10 @@ fn gated_delta_decode_ops(
             )));
         }
     };
-    let beta_t = beta.reshape(&[b, hv])?;
+    let beta_t = beta.reshape(&[b, hv]);
 
     let (y, new_state) = gated_delta_step_compiled(&q_t, &k_t, &v_t, &g_t, &beta_t, state)?;
-    Ok((y.reshape(&[b, 1, hv, dv])?, new_state))
+    Ok((y.reshape(&[b, 1, hv, dv]), new_state))
 }
 
 /// Ops-based sequential implementation for prompt prefill.
@@ -332,7 +293,7 @@ pub fn gated_delta_ops(
     let mut state = if let Some(s) = state {
         s.clone()
     } else {
-        ops::zeros_dtype(&[b, hv, dv, dk], q.dtype())?
+        ops::zeros(&[b, hv, dv, dk], q.dtype())
     };
 
     if t == 1 && mask.is_none() {
@@ -343,45 +304,58 @@ pub fn gated_delta_ops(
     let repeat_factor = hv / hk;
     let (q_rep, k_rep);
     let (q, k) = if repeat_factor > 1 {
-        q_rep = ops::repeat_axis::<f32>(q.clone(), repeat_factor, 2)?;
-        k_rep = ops::repeat_axis::<f32>(k.clone(), repeat_factor, 2)?;
+        q_rep = ops::repeat_axis(q.clone(), repeat_factor, 2);
+        k_rep = ops::repeat_axis(k.clone(), repeat_factor, 2);
         (&q_rep, &k_rep)
     } else {
         (q, k)
     };
 
+    let b_i = b as usize;
+    let hk_i = q.dim(2) as usize;
+    let _hv_i = hv as usize;
+    let dk_i = dk as usize;
+    let dv_i = dv as usize;
+    let _ = (hk_i, dk_i, dv_i); // used via dim() calls below
     let mut ys = Vec::with_capacity(t as usize);
 
     for t_idx in 0..t {
         // Slice timestep t: [B, 1, H, D] -> squeeze axis 1 -> [B, H, D]
-        let q_t = q.index((.., t_idx..t_idx + 1, .., ..)).squeeze_axes(&[1])?;
-        let k_t = k.index((.., t_idx..t_idx + 1, .., ..)).squeeze_axes(&[1])?;
-        let v_t = v.index((.., t_idx..t_idx + 1, .., ..)).squeeze_axes(&[1])?;
+        let ti = t_idx as usize;
+        let ti1 = ti + 1;
+        let q_h = q.dim(2) as usize;
+        let q_d = q.dim(3) as usize;
+        let v_h = v.dim(2) as usize;
+        let v_d = v.dim(3) as usize;
+        let q_t = q.slice(&[0, t_idx, 0, 0], &[b as i32, ti1 as i32, q_h as i32, q_d as i32]).squeeze(1);
+        let k_t = k.slice(&[0, t_idx, 0, 0], &[b as i32, ti1 as i32, q_h as i32, q_d as i32]).squeeze(1);
+        let v_t = v.slice(&[0, t_idx, 0, 0], &[b as i32, ti1 as i32, v_h as i32, v_d as i32]).squeeze(1);
 
         let g_t = if g.ndim() == 3 {
-            g.index((.., t_idx..t_idx + 1, ..)).squeeze_axes(&[1])?
+            let g_h = g.dim(2) as usize;
+            g.slice(&[0, t_idx, 0], &[b as i32, ti1 as i32, g_h as i32]).squeeze(1)
         } else {
-            g.index((.., t_idx..t_idx + 1, .., ..)).squeeze_axes(&[1])?
+            let g_h = g.dim(2) as usize;
+            let g_d = g.dim(3) as usize;
+            g.slice(&[0, t_idx, 0, 0], &[b as i32, ti1 as i32, g_h as i32, g_d as i32]).squeeze(1)
         };
 
-        let beta_t = beta.index((.., t_idx..t_idx + 1, ..)).squeeze_axes(&[1])?;
+        let beta_h = beta.dim(2) as usize;
+        let beta_t = beta.slice(&[0, t_idx, 0], &[b as i32, ti1 as i32, beta_h as i32]).squeeze(1);
 
-        let mask_t = mask.map(|m| m.index((.., t_idx..t_idx + 1)).squeeze_axes(&[1]));
-        let mask_t = match mask_t {
-            Some(Ok(m)) => Some(m),
-            Some(Err(e)) => return Err(e),
-            None => None,
-        };
+        let mask_t = mask.map(|m| {
+            m.slice(&[0, t_idx], &[b as i32, ti1 as i32]).squeeze(1)
+        });
 
         let (y, new_state) =
             gated_delta_step_ops(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, mask_t.as_ref())?;
         state = new_state;
         ys.push(y);
     }
+    let _ = b_i; // suppress unused warning
 
     // Stack outputs: Vec<[B, Hv, Dv]> -> [B, T, Hv, Dv]
-    let y_refs: Vec<&Array> = ys.iter().collect();
-    let y = ops::stack_axis(&y_refs, 1)?;
+    let y = ops::stack_axis(&ys, 1);
 
     Ok((y, state))
 }
@@ -398,12 +372,12 @@ pub fn gated_delta_ops(
 ///
 /// Uses cumulative sum in log-space: `Γ[i,j] = exp(cumsum[i] - cumsum[j])`.
 fn chunk_decay_matrix(log_g: &Array) -> Result<Array, Exception> {
-    let cs = log_g.cumsum(-1, None, None)?;
-    let cs_i = ops::expand_dims(&cs, -1)?; // [*, C, 1]
-    let cs_j = ops::expand_dims(&cs, -2)?; // [*, 1, C]
-    let log_decay = cs_i.subtract(&cs_j)?; // [*, C, C]
-    let decay = log_decay.exp()?;
-    ops::tril(&decay, 0) // zero upper triangle; diagonal = exp(0) = 1
+    let cs = log_g.cumsum(-1);
+    let cs_i = ops::expand_dims(&cs, -1); // [*, C, 1]
+    let cs_j = ops::expand_dims(&cs, -2); // [*, 1, C]
+    let log_decay = cs_i.subtract(&cs_j); // [*, C, C]
+    let decay = log_decay.exp();
+    Ok(ops::tril(&decay, 0)) // zero upper triangle; diagonal = exp(0) = 1
 }
 
 /// Chunkwise parallel GDN implementation.
@@ -454,8 +428,8 @@ fn gated_delta_chunk_ops_impl(
     let repeat_factor = hv / hk;
     let (q_rep, k_rep);
     let (q, k) = if repeat_factor > 1 {
-        q_rep = ops::repeat_axis::<f32>(q.clone(), repeat_factor, 2)?;
-        k_rep = ops::repeat_axis::<f32>(k.clone(), repeat_factor, 2)?;
+        q_rep = ops::repeat_axis(q.clone(), repeat_factor, 2);
+        k_rep = ops::repeat_axis(k.clone(), repeat_factor, 2);
         (&q_rep, &k_rep)
     } else {
         (q, k)
@@ -464,11 +438,11 @@ fn gated_delta_chunk_ops_impl(
 
     // Apply mask: g=1 (no decay) and beta=0 (no update) for masked positions
     let (g, beta) = if let Some(mask) = mask {
-        let mask_exp = ops::expand_dims(mask, -1)?; // [B, T, 1]
-        let ones = ops::ones_dtype(g.shape(), g.dtype())?;
-        let zeros = ops::zeros_dtype(beta.shape(), beta.dtype())?;
-        let g = ops::r#where(&mask_exp, g, &ones)?;
-        let beta = ops::r#where(&mask_exp, beta, &zeros)?;
+        let mask_exp = ops::expand_dims(mask, -1); // [B, T, 1]
+        let ones = ops::ones(g.shape(), g.dtype());
+        let zeros = ops::zeros(beta.shape(), beta.dtype());
+        let g = ops::where_fn(&mask_exp, g, &ones);
+        let beta = ops::where_fn(&mask_exp, beta, &zeros);
         (g, beta)
     } else {
         (g.clone(), beta.clone())
@@ -480,31 +454,31 @@ fn gated_delta_chunk_ops_impl(
     let n_chunks = t_padded / c;
 
     let (q, k, v, g, beta) = if pad_len > 0 {
-        let q_pad = ops::zeros_dtype(&[b, pad_len, h, dk], q.dtype())?;
-        let k_pad = ops::zeros_dtype(&[b, pad_len, h, dk], k.dtype())?;
-        let v_pad = ops::zeros_dtype(&[b, pad_len, h, dv], v.dtype())?;
-        let g_pad = ops::ones_dtype(&[b, pad_len, h], g.dtype())?;
-        let beta_pad = ops::zeros_dtype(&[b, pad_len, h], beta.dtype())?;
+        let q_pad = ops::zeros(&[b, pad_len, h, dk], q.dtype());
+        let k_pad = ops::zeros(&[b, pad_len, h, dk], k.dtype());
+        let v_pad = ops::zeros(&[b, pad_len, h, dv], v.dtype());
+        let g_pad = ops::ones(&[b, pad_len, h], g.dtype());
+        let beta_pad = ops::zeros(&[b, pad_len, h], beta.dtype());
 
-        let q = ops::concatenate_axis(&[q, &q_pad], 1)?;
-        let k = ops::concatenate_axis(&[k, &k_pad], 1)?;
-        let v = ops::concatenate_axis(&[v, &v_pad], 1)?;
-        let g = ops::concatenate_axis(&[&g, &g_pad], 1)?;
-        let beta = ops::concatenate_axis(&[&beta, &beta_pad], 1)?;
+        let q = ops::concatenate_axis(&[q, &q_pad], 1);
+        let k = ops::concatenate_axis(&[k, &k_pad], 1);
+        let v = ops::concatenate_axis(&[v, &v_pad], 1);
+        let g = ops::concatenate_axis(&[&g, &g_pad], 1);
+        let beta = ops::concatenate_axis(&[&beta, &beta_pad], 1);
         (q, k, v, g, beta)
     } else {
         (q.clone(), k.clone(), v.clone(), g, beta)
     };
 
     // Transpose to [B, H, T, D] for batched matmul
-    let q = q.transpose_axes(&[0, 2, 1, 3])?; // [B, H, T_padded, Dk]
-    let k = k.transpose_axes(&[0, 2, 1, 3])?; // [B, H, T_padded, Dk]
-    let v = v.transpose_axes(&[0, 2, 1, 3])?; // [B, H, T_padded, Dv]
-    let g = g.transpose_axes(&[0, 2, 1])?; // [B, H, T_padded]
-    let beta = beta.transpose_axes(&[0, 2, 1])?; // [B, H, T_padded]
+    let q = q.transpose_axes(&[0, 2, 1, 3]); // [B, H, T_padded, Dk]
+    let k = k.transpose_axes(&[0, 2, 1, 3]); // [B, H, T_padded, Dk]
+    let v = v.transpose_axes(&[0, 2, 1, 3]); // [B, H, T_padded, Dv]
+    let g = g.transpose_axes(&[0, 2, 1]); // [B, H, T_padded]
+    let beta = beta.transpose_axes(&[0, 2, 1]); // [B, H, T_padded]
 
     // Identity matrix for WY factorization (reused across chunks)
-    let eye = ops::eye::<f32>(c, None, None)?; // [C, C]
+    let eye = ops::eye(c, Dtype::Float32); // [C, C]
     let bh = b * h;
 
     // ========================================================================
@@ -531,45 +505,50 @@ fn gated_delta_chunk_ops_impl(
         let start = ci * c;
         let end = start + c;
 
-        // Extract chunk data
-        let q_c = q.index((.., .., start..end, ..)); // [B, H, C, Dk]
-        let k_c = k.index((.., .., start..end, ..)); // [B, H, C, Dk]
-        let v_c = v.index((.., .., start..end, ..)); // [B, H, C, Dv]
-        let g_c = g.index((.., .., start..end)); // [B, H, C]
-        let beta_c = beta.index((.., .., start..end)); // [B, H, C]
+        // Extract chunk data via slice
+        let bv = b as usize; let hv2 = h as usize;
+        let dk_s = q.dim(3) as usize; let dv_s = v.dim(3) as usize; let c_s = c as usize;
+        let q_c = q.slice(&[0, 0, start, 0], &[b, h, end, q.dim(3)]); // [B, H, C, Dk]
+        let k_c = k.slice(&[0, 0, start, 0], &[b, h, end, k.dim(3)]); // [B, H, C, Dk]
+        let v_c = v.slice(&[0, 0, start, 0], &[b, h, end, v.dim(3)]); // [B, H, C, Dv]
+        let g_c = g.slice(&[0, 0, start], &[b, h, end]); // [B, H, C]
+        let beta_c = beta.slice(&[0, 0, start], &[b, h, end]); // [B, H, C]
+        let _ = (bv, hv2, dk_s, dv_s, c_s);
 
         // Decay matrix: clamp log result (not exp-space input) to prevent -inf/NaN in f16
-        let log_g_c = g_c.log()?; // [B, H, C]
-        let log_g_c = ops::maximum(&log_g_c, &Array::from_f32(-30.0))?; // Clamp log-space
-        let cs = log_g_c.cumsum(-1, None, None)?; // [B, H, C]
+        let log_g_c = g_c.log(); // [B, H, C]
+        let log_g_c = ops::maximum(&log_g_c, &Array::from_f32(-30.0)); // Clamp log-space
+        let cs = log_g_c.cumsum(-1); // [B, H, C]
         let decay_c = chunk_decay_matrix(&log_g_c)?; // [B, H, C, C]
 
-        let gamma_init = cs.exp()?; // [B, H, C]
+        let gamma_init = cs.exp(); // [B, H, C]
 
-        let cs_last = cs.index((.., .., (c - 1)..c)).squeeze_axes(&[-1])?; // [B, H]
-        let gamma_total = cs_last.exp()?; // [B, H]
+        let cs_h = cs.dim(2) as usize;
+        let cs_last = cs.slice(&[0, 0, c - 1], &[b, h, c]).squeeze(-1); // [B, H]
+        let gamma_total = cs_last.exp(); // [B, H]
 
-        let cs_last_exp = ops::expand_dims(&cs_last, -1)?; // [B, H, 1]
-        let gamma_last = cs_last_exp.subtract(&cs)?.exp()?; // [B, H, C]
+        let cs_last_exp = ops::expand_dims(&cs_last, -1); // [B, H, 1]
+        let gamma_last = cs_last_exp.subtract(&cs).exp(); // [B, H, C]
+        let _ = cs_h;
 
         // WY factorization: build (I + A) matrix
-        let k_c_t = k_c.transpose_axes(&[0, 1, 3, 2])?; // [B, H, Dk, C]
-        let kk_t = ops::matmul(&k_c, &k_c_t)?; // [B, H, C, C]
-        let beta_col = ops::expand_dims(&beta_c, -1)?; // [B, H, C, 1]
-        let a_mat = ops::tril(&beta_col.multiply(&decay_c)?.multiply(&kk_t)?, -1)?;
-        let i_plus_a = a_mat.add(&eye)?; // [B, H, C, C]
+        let k_c_t = k_c.transpose_axes(&[0, 1, 3, 2]); // [B, H, Dk, C]
+        let kk_t = ops::matmul(&k_c, &k_c_t); // [B, H, C, C]
+        let beta_col = ops::expand_dims(&beta_c, -1); // [B, H, C, 1]
+        let a_mat = ops::tril(&beta_col.multiply(&decay_c).multiply(&kk_t), -1);
+        let i_plus_a = a_mat.add(&eye); // [B, H, C, C]
 
         // Precompute beta*v and beta*gamma_init (both state-independent)
-        let beta_v = beta_col.multiply(&v_c)?; // [B, H, C, Dv]
-        let beta_gamma = beta_c.multiply(&gamma_init)?; // [B, H, C]
-        let beta_gamma_row = ops::expand_dims(&beta_gamma, -2)?; // [B, H, 1, C]
+        let beta_v = beta_col.multiply(&v_c); // [B, H, C, Dv]
+        let beta_gamma = beta_c.multiply(&gamma_init); // [B, H, C]
+        let beta_gamma_row = ops::expand_dims(&beta_gamma, -2); // [B, H, 1, C]
 
         // Precompute intra-chunk decay-weighted QK^T
-        let qk_t = ops::matmul(&q_c, &k_c_t)?; // [B, H, C, C]
-        let qk_decay = ops::tril(&decay_c.multiply(&qk_t)?, 0)?; // [B, H, C, C]
+        let qk_t = ops::matmul(&q_c, &k_c_t); // [B, H, C, C]
+        let qk_decay = ops::tril(&decay_c.multiply(&qk_t), 0); // [B, H, C, C]
 
         // Flatten (I+A) to [B*H, C, C] for batched tri_inv
-        i_plus_a_list.push(i_plus_a.reshape(&[bh, c, c])?);
+        i_plus_a_list.push(i_plus_a.reshape(&[bh, c, c]));
 
         chunks.push(ChunkPrecomp {
             q_c,
@@ -588,15 +567,11 @@ fn gated_delta_chunk_ops_impl(
     // Phase 2: Single batched tri_inv call (1 CPU sync instead of N).
     // ========================================================================
     let i_plus_a_refs: Vec<&Array> = i_plus_a_list.iter().collect();
-    let batched_ipa = ops::concatenate_axis(&i_plus_a_refs, 0)?; // [N*B*H, C, C]
+    let batched_ipa = ops::concatenate_axis(&i_plus_a_refs, 0); // [N*B*H, C, C]
     // stop_gradient: tri_inv has no VJP in MLX. The inverse is a fixed preconditioner
     // in the WY factorization — gradients should not flow through matrix inversion.
     // This matches the FLA reference impl which computes tri_inv in torch.no_grad().
-    let batched_inv = stop_gradient(&linalg::tri_inv_device(
-        &batched_ipa,
-        None,
-        StreamOrDevice::cpu(),
-    )?)?;
+    let batched_inv = linalg::tri_inv(&batched_ipa, false).stop_gradient();
 
     // Split back per-chunk and precompute delta_v, t_inv_bg
     struct ChunkInvData {
@@ -609,12 +584,13 @@ fn gated_delta_chunk_ops_impl(
         let ci = ci as usize;
         let start = (ci as i32) * bh;
         let end = start + bh;
+        let inv_c_dim = batched_inv.dim(1);
         let t_inv = batched_inv
-            .index((start..end, .., ..))
-            .reshape(&[b, h, c, c])?; // [B, H, C, C]
+            .slice(&[start, 0, 0], &[end, inv_c_dim, inv_c_dim])
+            .reshape(&[b, h, c, c]); // [B, H, C, C]
 
-        let delta_v = ops::matmul(&t_inv, &chunks[ci].beta_v)?; // [B, H, C, Dv]
-        let t_inv_bg = t_inv.multiply(&chunks[ci].beta_gamma_row)?; // [B, H, C, C]
+        let delta_v = ops::matmul(&t_inv, &chunks[ci].beta_v); // [B, H, C, Dv]
+        let t_inv_bg = t_inv.multiply(&chunks[ci].beta_gamma_row); // [B, H, C, C]
 
         inv_data.push(ChunkInvData { delta_v, t_inv_bg });
     }
@@ -630,46 +606,46 @@ fn gated_delta_chunk_ops_impl(
         let inv = &inv_data[ci];
 
         // State-dependent terms
-        let state_t = state.transpose_axes(&[0, 1, 3, 2])?; // [B, H, Dk, Dv]
-        let ks = ops::matmul(&chunk.k_c, &state_t)?; // [B, H, C, Dv]
+        let state_t = state.transpose_axes(&[0, 1, 3, 2]); // [B, H, Dk, Dv]
+        let ks = ops::matmul(&chunk.k_c, &state_t); // [B, H, C, Dv]
 
         // delta = T_inv @ beta_v - T_inv_bg @ (K @ S^T)
-        let delta_s = ops::matmul(&inv.t_inv_bg, &ks)?; // [B, H, C, Dv]
-        let delta = inv.delta_v.subtract(&delta_s)?; // [B, H, C, Dv]
+        let delta_s = ops::matmul(&inv.t_inv_bg, &ks); // [B, H, C, Dv]
+        let delta = inv.delta_v.subtract(&delta_s); // [B, H, C, Dv]
 
         // Inter-chunk output: y_inter = Γ_init * (Q @ S^T)
-        let qs = ops::matmul(&chunk.q_c, &state_t)?; // [B, H, C, Dv]
-        let gamma_init_exp = ops::expand_dims(&chunk.gamma_init, -1)?; // [B, H, C, 1]
-        let y_inter = gamma_init_exp.multiply(&qs)?; // [B, H, C, Dv]
+        let qs = ops::matmul(&chunk.q_c, &state_t); // [B, H, C, Dv]
+        let gamma_init_exp = ops::expand_dims(&chunk.gamma_init, -1); // [B, H, C, 1]
+        let y_inter = gamma_init_exp.multiply(&qs); // [B, H, C, Dv]
 
         // Intra-chunk output: y_intra = qk_decay @ δ
-        let y_intra = ops::matmul(&chunk.qk_decay, &delta)?; // [B, H, C, Dv]
+        let y_intra = ops::matmul(&chunk.qk_decay, &delta); // [B, H, C, Dv]
 
-        y_chunks.push(y_inter.add(&y_intra)?); // [B, H, C, Dv]
+        y_chunks.push(y_inter.add(&y_intra)); // [B, H, C, Dv]
 
         // State propagation: S_{c+1} = Γ_total * S_c + (Γ_last * δ)^T @ K
-        let gamma_last_exp = ops::expand_dims(&chunk.gamma_last, -1)?; // [B, H, C, 1]
-        let delta_weighted = gamma_last_exp.multiply(&delta)?; // [B, H, C, Dv]
-        let dw_t = delta_weighted.transpose_axes(&[0, 1, 3, 2])?; // [B, H, Dv, C]
-        let state_update = ops::matmul(&dw_t, &chunk.k_c)?; // [B, H, Dv, Dk]
+        let gamma_last_exp = ops::expand_dims(&chunk.gamma_last, -1); // [B, H, C, 1]
+        let delta_weighted = gamma_last_exp.multiply(&delta); // [B, H, C, Dv]
+        let dw_t = delta_weighted.transpose_axes(&[0, 1, 3, 2]); // [B, H, Dv, C]
+        let state_update = ops::matmul(&dw_t, &chunk.k_c); // [B, H, Dv, Dk]
 
-        let gamma_total_exp = chunk.gamma_total.reshape(&[b, h, 1, 1])?;
-        state = gamma_total_exp.multiply(&state)?.add(&state_update)?;
+        let gamma_total_exp = chunk.gamma_total.reshape(&[b, h, 1, 1]);
+        state = gamma_total_exp.multiply(&state).add(&state_update);
     }
 
     // Concatenate chunk outputs: [B, H, T_padded, Dv]
     let y_refs: Vec<&Array> = y_chunks.iter().collect();
-    let y = ops::concatenate_axis(&y_refs, 2)?;
+    let y = ops::concatenate_axis(&y_refs, 2);
 
     // Trim padding
     let y = if pad_len > 0 {
-        y.index((.., .., ..t, ..))
+        y.slice(&[0, 0, 0, 0], &[b, h, t, y.dim(3)])
     } else {
         y
     };
 
     // Transpose back to [B, T, H, Dv]
-    let y = y.transpose_axes(&[0, 2, 1, 3])?;
+    let y = y.transpose_axes(&[0, 2, 1, 3]);
 
     Ok((y, state))
 }
@@ -700,93 +676,6 @@ fn gated_delta_chunk_ops(
 // Grid: (32, Dv, B * Hv) — one SIMD group per (batch, value_head, value_dim)
 // Threadgroup: (32, 4, 1) — 32 threads = one SIMD group, 4 dv per threadgroup
 
-/// Metal source for the scalar-gated GDN step kernel.
-/// g shape: [B, T, Hv] — one scalar decay per value head.
-const GDN_KERNEL_SOURCE: &str = r#"
-    auto n = thread_position_in_grid.z;
-    auto b_idx = n / Hv;
-    auto hv_idx = n % Hv;
-    auto hk_idx = hv_idx / (Hv / Hk);
-    constexpr int n_per_t = Dk / 32;
-
-    // q, k: [B, T, Hk, Dk]
-    auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
-    auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
-
-    // v, y: [B, T, Hv, Dv]
-    auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
-    y += b_idx * T * Hv * Dv + hv_idx * Dv;
-
-    auto dk_idx = thread_position_in_threadgroup.x;
-    auto dv_idx = thread_position_in_grid.y;
-
-    // state_in, state_out: [B, Hv, Dv, Dk]
-    auto i_state = state_in + (n * Dv + dv_idx) * Dk;
-    auto o_state = state_out + (n * Dv + dv_idx) * Dk;
-
-    float state[n_per_t];
-    for (int i = 0; i < n_per_t; ++i) {
-      auto s_idx = n_per_t * dk_idx + i;
-      state[i] = static_cast<float>(i_state[s_idx]);
-    }
-
-    // g: [B, T, Hv]
-    auto g_ = g + b_idx * T * Hv;
-    auto beta_ = beta + b_idx * T * Hv;
-
-    for (int t = 0; t < T; ++t) {
-      float kv_mem = 0.0f;
-      for (int i = 0; i < n_per_t; ++i) {
-        auto s_idx = n_per_t * dk_idx + i;
-        state[i] = state[i] * g_[hv_idx];
-        kv_mem += state[i] * k_[s_idx];
-      }
-      kv_mem = simd_sum(kv_mem);
-
-      auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
-
-      float out = 0.0f;
-      for (int i = 0; i < n_per_t; ++i) {
-        auto s_idx = n_per_t * dk_idx + i;
-        state[i] = state[i] + k_[s_idx] * delta;
-        out += state[i] * q_[s_idx];
-      }
-      out = simd_sum(out);
-      if (thread_index_in_simdgroup == 0) {
-        y[dv_idx] = static_cast<InT>(out);
-      }
-      // Advance to next timestep
-      q_ += Hk * Dk;
-      k_ += Hk * Dk;
-      v_ += Hv * Dv;
-      y += Hv * Dv;
-      g_ += Hv;
-      beta_ += Hv;
-    }
-    for (int i = 0; i < n_per_t; ++i) {
-      auto s_idx = n_per_t * dk_idx + i;
-      o_state[s_idx] = static_cast<StT>(state[i]);
-    }
-"#;
-
-static GDN_METAL_KERNEL: OnceLock<Option<MetalKernel>> = OnceLock::new();
-
-fn get_gdn_metal_kernel() -> Option<&'static MetalKernel> {
-    GDN_METAL_KERNEL
-        .get_or_init(|| {
-            Some(MetalKernel::new(
-                "gated_delta_step",
-                &["q", "k", "v", "g", "beta", "state_in", "T"],
-                &["y", "state_out"],
-                GDN_KERNEL_SOURCE,
-                "",
-                true,
-                false,
-            ))
-        })
-        .as_ref()
-}
-
 /// Try the fused Metal GDN kernel. Returns None if conditions not met.
 ///
 /// Public so that callers (e.g. compiled decode closures) can dispatch to the
@@ -801,7 +690,7 @@ pub fn try_gdn_metal_kernel(
     state: &Array,
     mask: Option<&Array>,
 ) -> Result<Option<(Array, Array)>, Exception> {
-    // Metal kernel requires: no mask, Dk divisible by 32, Dk <= 256
+    // Metal kernel requires: no mask, Dk divisible by 32, Dk <= 256, scalar gating
     if mask.is_some() {
         return Ok(None);
     }
@@ -809,48 +698,13 @@ pub fn try_gdn_metal_kernel(
     if dk % 32 != 0 || dk > 256 || dk == 0 {
         return Ok(None);
     }
-    // Only scalar gating supported (g is 3D: [B, T, Hv])
     if g.ndim() != 3 {
         return Ok(None);
     }
 
-    let Some(kernel) = get_gdn_metal_kernel() else {
-        return Ok(None);
-    };
-
-    let b = q.dim(0);
     let t = q.dim(1);
-    let hk = q.dim(2) as usize;
-    let hv = v.dim(2) as usize;
-    let dv = v.dim(3) as usize;
-
-    let input_dtype = q.dtype();
-    let state_dtype = state.dtype();
-    let t_arr = Array::from_int(t);
-
-    let config = MetalKernelConfig::new()
-        .add_output_arg(&[b, t, hv as i32, dv as i32], input_dtype)
-        .add_output_arg(state.shape(), state_dtype)
-        .set_grid(32, dv as i32, b * hv as i32)
-        .set_thread_group(32, 4, 1)
-        .add_template_arg_dtype("InT", input_dtype)
-        .add_template_arg_dtype("StT", state_dtype)
-        .add_template_arg_int("Dk", dk as i32)
-        .add_template_arg_int("Dv", dv as i32)
-        .add_template_arg_int("Hk", hk as i32)
-        .add_template_arg_int("Hv", hv as i32);
-
-    let outputs = kernel.apply(
-        &[q, k, v, g, beta, state, &t_arr],
-        config,
-        &Stream::default(),
-    )?;
-
-    if outputs.len() == 2 {
-        Ok(Some((outputs[0].clone(), outputs[1].clone())))
-    } else {
-        Ok(None)
-    }
+    let (y, new_state) = Array::gdn_metal_step(q, k, v, g, beta, state, t);
+    Ok(Some((y, new_state)))
 }
 
 /// Inference-only GDN dispatch with pre-computed g and beta.
@@ -969,7 +823,7 @@ pub fn gated_delta_update_with_chunk_size_override(
     chunk_size_override: Option<i32>,
 ) -> Result<(Array, Array), Exception> {
     // beta = sigmoid(b)
-    let beta = nn::sigmoid(b)?;
+    let beta = b.sigmoid();
 
     // g = compute_g(A_log, a, dt_bias)
     let g = compute_g(a_log, a, dt_bias)?;
@@ -983,7 +837,7 @@ pub fn gated_delta_update_with_chunk_size_override(
             let dk = q.dim(3);
             let hv = v.dim(2);
             let dv = v.dim(3);
-            init_state = ops::zeros_dtype(&[b_dim, hv, dv, dk], q.dtype())?;
+            init_state = ops::zeros(&[b_dim, hv, dv, dk], q.dtype());
             &init_state
         }
     };
@@ -1004,20 +858,27 @@ pub fn gated_delta_update_with_chunk_size_override(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_bridge::compat::random;
     use serial_test::serial;
+
+    fn to_f32_vec(arr: &Array) -> Vec<f32> {
+        let mut a = arr.clone();
+        a.eval();
+        let n = a.size();
+        a.to_f32_vec(n).unwrap_or_default()
+    }
 
     #[test]
     #[serial]
     fn test_compute_g_shape() {
-        let a_log = Array::from_slice(&[0.5f32, 1.0, 1.5], &[3]);
-        let a = mlx_rs::random::normal::<f32>(&[2, 4, 3], None, None, None).unwrap();
-        let dt_bias = Array::from_slice(&[0.1f32, 0.2, 0.3], &[3]);
+        let a_log = Array::from_f32_slice(&[0.5f32, 1.0, 1.5], &[3]);
+        let a = random::normal(&[2, 4, 3], Dtype::Float32);
+        let dt_bias = Array::from_f32_slice(&[0.1f32, 0.2, 0.3], &[3]);
 
         let g = compute_g(&a_log, &a, &dt_bias).unwrap();
         assert_eq!(g.shape(), &[2, 4, 3]);
         // g should be in (0, 1] since it's exp(-positive)
-        g.eval().unwrap();
-        let g_data: Vec<f32> = g.as_slice().to_vec();
+        let g_data = to_f32_vec(&g);
         for val in &g_data {
             assert!(*val > 0.0 && *val <= 1.0, "g value {} out of range", val);
         }
@@ -1033,11 +894,11 @@ mod tests {
         let hv = 4;
         let dv = 8;
 
-        let q = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
-        let k = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
-        let v = mlx_rs::random::normal::<f32>(&[b, t, hv, dv], None, None, None).unwrap();
-        let g = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[b, t, hv], None).unwrap();
-        let beta = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[b, t, hv], None).unwrap();
+        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
+        let g = random::uniform(&[b, t, hv], Dtype::Float32);
+        let beta = random::uniform(&[b, t, hv], Dtype::Float32);
 
         let (y, state) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
@@ -1055,13 +916,13 @@ mod tests {
         let hv = 4;
         let dv = 8;
 
-        let q = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
-        let k = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
-        let v = mlx_rs::random::normal::<f32>(&[b, t, hv, dv], None, None, None).unwrap();
-        let a = mlx_rs::random::normal::<f32>(&[b, t, hv], None, None, None).unwrap();
-        let b_input = mlx_rs::random::normal::<f32>(&[b, t, hv], None, None, None).unwrap();
-        let a_log = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[hv]);
-        let dt_bias = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[hv]);
+        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
+        let a = random::normal(&[2, 4, 3], Dtype::Float32);
+        let b_input = random::normal(&[b, t, hv], Dtype::Float32);
+        let a_log = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[hv]);
+        let dt_bias = Array::from_f32_slice(&[0.1f32, 0.2, 0.3, 0.4], &[hv]);
 
         let (y, state) = gated_delta_update(
             &q, &k, &v, &a, &b_input, &a_log, &dt_bias, None, None, false,
@@ -1081,42 +942,43 @@ mod tests {
         let dk = 4;
         let hv = 2;
         let dv = 4;
+        let t = 4;
 
-        mlx_rs::random::seed(42).unwrap();
+        random::seed(42);
 
-        let q = mlx_rs::random::normal::<f32>(&[b, 4, hk, dk], None, None, None).unwrap();
-        let k = mlx_rs::random::normal::<f32>(&[b, 4, hk, dk], None, None, None).unwrap();
-        let v = mlx_rs::random::normal::<f32>(&[b, 4, hv, dv], None, None, None).unwrap();
-        let g = mlx_rs::random::uniform::<_, f32>(0.5, 1.0, &[b, 4, hv], None).unwrap();
-        let beta = mlx_rs::random::uniform::<_, f32>(0.0, 0.5, &[b, 4, hv], None).unwrap();
+        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
+        let g = random::uniform(&[b, t, hv], Dtype::Float32);
+        let beta = random::uniform(&[b, t, hv], Dtype::Float32);
 
         // Process all 4 steps at once
         let (_y_full, state_full) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
         // Process in two chunks of 2
-        let q1 = q.index((.., ..2, .., ..));
-        let k1 = k.index((.., ..2, .., ..));
-        let v1 = v.index((.., ..2, .., ..));
-        let g1 = g.index((.., ..2, ..));
-        let beta1 = beta.index((.., ..2, ..));
+        let q1 = q.slice(&[0, 0, 0, 0], &[b, 2, hk, dk]);
+        let k1 = k.slice(&[0, 0, 0, 0], &[b, 2, hk, dk]);
+        let v1 = v.slice(&[0, 0, 0, 0], &[b, 2, hv, dv]);
+        let g1 = g.slice(&[0, 0, 0], &[b, 2, hv]);
+        let beta1 = beta.slice(&[0, 0, 0], &[b, 2, hv]);
 
         let (_y1, state1) = gated_delta_ops(&q1, &k1, &v1, &g1, &beta1, None, None).unwrap();
 
-        let q2 = q.index((.., 2.., .., ..));
-        let k2 = k.index((.., 2.., .., ..));
-        let v2 = v.index((.., 2.., .., ..));
-        let g2 = g.index((.., 2.., ..));
-        let beta2 = beta.index((.., 2.., ..));
+        let q2 = q.slice(&[0, 2, 0, 0], &[b, t, hk, dk]);
+        let k2 = k.slice(&[0, 2, 0, 0], &[b, t, hk, dk]);
+        let v2 = v.slice(&[0, 2, 0, 0], &[b, t, hv, dv]);
+        let g2 = g.slice(&[0, 2, 0], &[b, t, hv]);
+        let beta2 = beta.slice(&[0, 2, 0], &[b, t, hv]);
 
         let (_y2, state2) =
             gated_delta_ops(&q2, &k2, &v2, &g2, &beta2, Some(&state1), None).unwrap();
 
         // States should match
-        state_full.eval().unwrap();
-        state2.eval().unwrap();
-        let diff = state_full.subtract(&state2).unwrap().abs().unwrap();
-        let max_diff = diff.max(None).unwrap();
-        max_diff.eval().unwrap();
+        state_full.eval();
+        state2.eval();
+        let diff = state_full.subtract(&state2).abs();
+        let max_diff = diff.max_all();
+        max_diff.eval();
         let max_diff_val: f32 = max_diff.item();
         assert!(
             max_diff_val < 1e-4,
@@ -1127,11 +989,11 @@ mod tests {
 
     /// Helper: assert two arrays are close within tolerance, returning the max diff.
     fn assert_close(a: &Array, b: &Array, tol: f32, msg: &str) {
-        a.eval().unwrap();
-        b.eval().unwrap();
-        let diff = a.subtract(b).unwrap().abs().unwrap();
-        let max_diff = diff.max(None).unwrap();
-        max_diff.eval().unwrap();
+        a.eval();
+        b.eval();
+        let diff = a.subtract(b).abs();
+        let max_diff = diff.max_all();
+        max_diff.eval();
         let max_diff_val: f32 = max_diff.item();
         assert!(
             max_diff_val < tol,
@@ -1151,13 +1013,13 @@ mod tests {
         hv: i32,
         dv: i32,
     ) -> (Array, Array, Array, Array, Array) {
-        let q = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
-        let k = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
-        let v = mlx_rs::random::normal::<f32>(&[b, t, hv, dv], None, None, None).unwrap();
+        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
         // g in (0.5, 1.0) to keep decay moderate and avoid numerical issues
-        let g = mlx_rs::random::uniform::<_, f32>(0.5, 1.0, &[b, t, hv], None).unwrap();
+        let g = random::uniform(&[b, t, hv], Dtype::Float32);
         // beta in (0.0, 0.5) to keep updates moderate
-        let beta = mlx_rs::random::uniform::<_, f32>(0.0, 0.5, &[b, t, hv], None).unwrap();
+        let beta = random::uniform(&[b, t, hv], Dtype::Float32);
         (q, k, v, g, beta)
     }
 
@@ -1172,14 +1034,14 @@ mod tests {
         let hv = 2;
         let dv = 8;
 
-        mlx_rs::random::seed(123).unwrap();
+        random::seed(123);
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
         // Sequential reference
         let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
         // Chunk path
-        let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
+        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
         let (y_chunk, state_chunk) =
             gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
 
@@ -1200,12 +1062,12 @@ mod tests {
         let hv = 2;
         let dv = 8;
 
-        mlx_rs::random::seed(456).unwrap();
+        random::seed(456);
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
         let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
-        let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
+        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
         let (y_chunk, state_chunk) =
             gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
 
@@ -1224,30 +1086,30 @@ mod tests {
         let dv = 8;
         let t = 256;
 
-        mlx_rs::random::seed(789).unwrap();
+        random::seed(789);
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
-        let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
+        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
 
         // Process all 256 at once via chunk path
         let (_y_full, state_full) =
             gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
 
         // Process in two halves of 128
-        let q1 = q.index((.., ..128, .., ..));
-        let k1 = k.index((.., ..128, .., ..));
-        let v1 = v.index((.., ..128, .., ..));
-        let g1 = g.index((.., ..128, ..));
-        let beta1 = beta.index((.., ..128, ..));
+        let q1 = q.slice(&[0, 0, 0, 0], &[b, 128, hk, dk]);
+        let k1 = k.slice(&[0, 0, 0, 0], &[b, 128, hk, dk]);
+        let v1 = v.slice(&[0, 0, 0, 0], &[b, 128, hv, dv]);
+        let g1 = g.slice(&[0, 0, 0], &[b, 128, hv]);
+        let beta1 = beta.slice(&[0, 0, 0], &[b, 128, hv]);
 
         let (_y1, state1) =
             gated_delta_chunk_ops(&q1, &k1, &v1, &g1, &beta1, &state_init, None).unwrap();
 
-        let q2 = q.index((.., 128.., .., ..));
-        let k2 = k.index((.., 128.., .., ..));
-        let v2 = v.index((.., 128.., .., ..));
-        let g2 = g.index((.., 128.., ..));
-        let beta2 = beta.index((.., 128.., ..));
+        let q2 = q.slice(&[0, 128, 0, 0], &[b, t, hk, dk]);
+        let k2 = k.slice(&[0, 128, 0, 0], &[b, t, hk, dk]);
+        let v2 = v.slice(&[0, 128, 0, 0], &[b, t, hv, dv]);
+        let g2 = g.slice(&[0, 128, 0], &[b, t, hv]);
+        let beta2 = beta.slice(&[0, 128, 0], &[b, t, hv]);
 
         let (_y2, state2) =
             gated_delta_chunk_ops(&q2, &k2, &v2, &g2, &beta2, &state1, None).unwrap();
@@ -1271,14 +1133,14 @@ mod tests {
         let hv = 2;
         let dv = 8;
 
-        mlx_rs::random::seed(101).unwrap();
+        random::seed(101);
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
         // Sequential reference
         let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
         // Chunk path (will pad to 128)
-        let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
+        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
         let (y_chunk, state_chunk) =
             gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
 
@@ -1302,14 +1164,14 @@ mod tests {
         let hv = 4;
         let dv = 8;
 
-        mlx_rs::random::seed(202).unwrap();
+        random::seed(202);
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
         // Sequential reference
         let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
         // Chunk path
-        let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
+        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
         let (y_chunk, state_chunk) =
             gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
 
@@ -1329,7 +1191,7 @@ mod tests {
         let hv = 2;
         let dv = 8;
 
-        mlx_rs::random::seed(303).unwrap();
+        random::seed(303);
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
         // Mask: first 100 tokens valid, last 28 masked
@@ -1337,20 +1199,20 @@ mod tests {
         for i in 100..t as usize {
             mask_data[i] = 0.0;
         }
-        let mask = Array::from_slice(&mask_data, &[b, t]);
+        let mask = Array::from_f32_slice(&mask_data, &[b, t]);
 
-        let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
+        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
 
         // Chunk path with mask: state should match processing only the first 100 tokens
         let (y_chunk, state_chunk) =
             gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, Some(&mask)).unwrap();
 
         // Sequential on just the first 100 tokens (no mask needed)
-        let q_100 = q.index((.., ..100, .., ..));
-        let k_100 = k.index((.., ..100, .., ..));
-        let v_100 = v.index((.., ..100, .., ..));
-        let g_100 = g.index((.., ..100, ..));
-        let beta_100 = beta.index((.., ..100, ..));
+        let q_100 = q.slice(&[0, 0, 0, 0], &[b, 100, hk, dk]);
+        let k_100 = k.slice(&[0, 0, 0, 0], &[b, 100, hk, dk]);
+        let v_100 = v.slice(&[0, 0, 0, 0], &[b, 100, hv, dv]);
+        let g_100 = g.slice(&[0, 0, 0], &[b, 100, hv]);
+        let beta_100 = beta.slice(&[0, 0, 0], &[b, 100, hv]);
 
         let (_y_ref, state_ref) =
             gated_delta_ops(&q_100, &k_100, &v_100, &g_100, &beta_100, None, None).unwrap();
@@ -1371,14 +1233,14 @@ mod tests {
         let hv = 2;
         let dv = 8;
 
-        mlx_rs::random::seed(404).unwrap();
-        let q = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
-        let k = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
-        let v = mlx_rs::random::normal::<f32>(&[b, t, hv, dv], None, None, None).unwrap();
-        let a = mlx_rs::random::normal::<f32>(&[b, t, hv], None, None, None).unwrap();
-        let b_input = mlx_rs::random::normal::<f32>(&[b, t, hv], None, None, None).unwrap();
-        let a_log = Array::from_slice(&[0.5f32, 1.0], &[hv]);
-        let dt_bias = Array::from_slice(&[0.1f32, 0.2], &[hv]);
+        random::seed(404);
+        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
+        let a = random::normal(&[2, 4, 3], Dtype::Float32);
+        let b_input = random::normal(&[b, t, hv], Dtype::Float32);
+        let a_log = Array::from_f32_slice(&[0.5f32, 1.0], &[hv]);
+        let dt_bias = Array::from_f32_slice(&[0.1f32, 0.2], &[hv]);
 
         let (y, state) = gated_delta_update(
             &q, &k, &v, &a, &b_input, &a_log, &dt_bias, None, None, false,
@@ -1389,8 +1251,8 @@ mod tests {
         assert_eq!(state.shape(), &[b, hv, dv, dk]);
 
         // Verify output is finite
-        y.eval().unwrap();
-        state.eval().unwrap();
+        y.eval();
+        state.eval();
     }
 
     #[test]
@@ -1404,14 +1266,14 @@ mod tests {
         let hv = 2;
         let dv = 8;
 
-        mlx_rs::random::seed(505).unwrap();
+        random::seed(505);
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
         // Sequential reference
         let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
         // Chunk path (pads to 128)
-        let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
+        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
         let (y_chunk, state_chunk) =
             gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
 
@@ -1435,14 +1297,14 @@ mod tests {
         let hv = 2;
         let dv = 8;
 
-        mlx_rs::random::seed(606).unwrap();
+        random::seed(606);
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
         // Sequential reference
         let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
         // Chunk path
-        let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
+        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
         let (y_chunk, state_chunk) =
             gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
 
@@ -1462,11 +1324,11 @@ mod tests {
         let hv = 2;
         let dv = 8;
 
-        mlx_rs::random::seed(707).unwrap();
+        random::seed(707);
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
         // Non-zero initial state
-        let state_init = mlx_rs::random::normal::<f32>(&[b, hv, dv, dk], None, None, None).unwrap();
+        let state_init = random::normal(&[b, hv, dv, dk], Dtype::Float32);
 
         // Sequential reference with same initial state
         let (y_seq, state_seq) =
@@ -1491,34 +1353,34 @@ mod tests {
         let hv = 4; // GQA: 4 value heads, 2 key heads
         let dv = 64;
 
-        mlx_rs::random::seed(42).unwrap();
-        let q = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
-        let k = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
-        let v = mlx_rs::random::normal::<f32>(&[b, t, hv, dv], None, None, None).unwrap();
-        let g = mlx_rs::random::uniform::<_, f32>(0.5, 1.0, &[b, t, hv], None).unwrap();
-        let beta = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[b, t, hv], None).unwrap();
+        random::seed(42);
+        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
+        let g = random::uniform(&[b, t, hv], Dtype::Float32);
+        let beta = random::uniform(&[b, t, hv], Dtype::Float32);
 
-        let state = ops::zeros_dtype(&[b, hv, dv, dk], Dtype::Float32).unwrap();
+        let state = ops::zeros(&[b, hv, dv, dk], Dtype::Float32);
 
-        let q_rep = ops::repeat_axis::<f32>(q.clone(), hv / hk, 2).unwrap();
-        let k_rep = ops::repeat_axis::<f32>(k.clone(), hv / hk, 2).unwrap();
-        let q_t = q_rep.reshape(&[b, hv, dk]).unwrap();
-        let k_t = k_rep.reshape(&[b, hv, dk]).unwrap();
-        let v_t = v.reshape(&[b, hv, dv]).unwrap();
-        let g_t = g.reshape(&[b, hv]).unwrap();
-        let beta_t = beta.reshape(&[b, hv]).unwrap();
+        let q_rep = ops::repeat_axis(q.clone(), hv / hk, 2);
+        let k_rep = ops::repeat_axis(k.clone(), hv / hk, 2);
+        let q_t = q_rep.reshape(&[b, hv, dk]);
+        let k_t = k_rep.reshape(&[b, hv, dk]);
+        let v_t = v.reshape(&[b, hv, dv]);
+        let g_t = g.reshape(&[b, hv]);
+        let beta_t = beta.reshape(&[b, hv]);
 
         let (y_ref_step, state_ref) =
             gated_delta_step_ops(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, None).unwrap();
-        let y_ref = y_ref_step.reshape(&[b, t, hv, dv]).unwrap();
+        let y_ref = y_ref_step.reshape(&[b, t, hv, dv]);
 
         let (y_decode, state_decode) =
             gated_delta_decode_ops(&q, &k, &v, &g, &beta, &state).unwrap();
 
-        y_ref.eval().unwrap();
-        state_ref.eval().unwrap();
-        y_decode.eval().unwrap();
-        state_decode.eval().unwrap();
+        y_ref.eval();
+        state_ref.eval();
+        y_decode.eval();
+        state_decode.eval();
 
         assert_eq!(y_decode.shape(), y_ref.shape());
         assert_eq!(state_decode.shape(), state_ref.shape());
@@ -1546,17 +1408,14 @@ mod tests {
         let hv = 2;
         let dv = 8;
 
-        mlx_rs::random::seed(808).unwrap();
-        let q = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
-        let k = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
-        let v = mlx_rs::random::normal::<f32>(&[b, t, hv, dv], None, None, None).unwrap();
-        let a = mlx_rs::random::normal::<f32>(&[b, t, hv], None, None, None).unwrap();
-        let b_in = mlx_rs::random::normal::<f32>(&[b, t, hv], None, None, None).unwrap();
-        let a_log = mlx_rs::random::normal::<f32>(&[hv], None, None, None)
-            .unwrap()
-            .abs()
-            .unwrap();
-        let dt_bias = mlx_rs::random::normal::<f32>(&[hv], None, None, None).unwrap();
+        random::seed(808);
+        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
+        let a = random::normal(&[2, 4, 3], Dtype::Float32);
+        let b_in = random::normal(&[b, t, hv], Dtype::Float32);
+        let a_log = random::normal(&[hv], Dtype::Float32).abs();
+        let dt_bias = random::normal(&[hv], Dtype::Float32);
 
         let (y_seq, state_seq) = gated_delta_update_with_chunk_size_override(
             &q, &k, &v, &a, &b_in, &a_log, &dt_bias, None, None, true, None,
@@ -1596,20 +1455,17 @@ mod tests {
         let hv = 2;
         let dv = 8;
 
-        mlx_rs::random::seed(909).unwrap();
-        let q = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
-        let k = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
-        let v = mlx_rs::random::normal::<f32>(&[b, t, hv, dv], None, None, None).unwrap();
-        let a = mlx_rs::random::normal::<f32>(&[b, t, hv], None, None, None).unwrap();
-        let b_in = mlx_rs::random::normal::<f32>(&[b, t, hv], None, None, None).unwrap();
-        let a_log = mlx_rs::random::normal::<f32>(&[hv], None, None, None)
-            .unwrap()
-            .abs()
-            .unwrap();
-        let dt_bias = mlx_rs::random::normal::<f32>(&[hv], None, None, None).unwrap();
+        random::seed(909);
+        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
+        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
+        let a = random::normal(&[2, 4, 3], Dtype::Float32);
+        let b_in = random::normal(&[b, t, hv], Dtype::Float32);
+        let a_log = random::normal(&[hv], Dtype::Float32).abs();
+        let dt_bias = random::normal(&[hv], Dtype::Float32);
         let g = compute_g(&a_log, &a, &dt_bias).unwrap();
-        let beta = nn::sigmoid(&b_in).unwrap();
-        let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
+        let beta = b_in.sigmoid();
+        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
 
         let (y_forced, state_forced) = gated_delta_update_with_chunk_size_override(
             &q,

@@ -6,7 +6,7 @@
 use crate::config::BigVGANConfig;
 use crate::error::{Result, VocoderError};
 use crate::nn::{AMPBlock, Activation1d, SnakeBeta, WeightNormConv1d, WeightNormConvTranspose1d};
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 use std::path::Path;
 use zerocopy::FromBytes;
 
@@ -226,14 +226,14 @@ impl BigVGAN {
             for amp in &self.amp_blocks[i] {
                 let out = amp.forward(&x)?;
                 match &amp_out {
-                    Some(o) => amp_out = Some(o.add(&out)?),
+                    Some(o) => amp_out = Some(o.add(&out)),
                     None => amp_out = Some(out),
                 }
             }
 
             // Average AMP outputs
-            let num_amps = Array::from_int(self.amp_blocks[i].len() as i32);
-            x = amp_out.unwrap().divide(&num_amps)?;
+            let num_amps = Array::from_i32(self.amp_blocks[i].len() as i32);
+            x = amp_out.unwrap().divide(&num_amps);
         }
 
         // Final activation and output convolution
@@ -241,7 +241,13 @@ impl BigVGAN {
         x = self.conv_post.forward(&x)?;
 
         // Tanh to normalize to [-1, 1]
-        Ok(mlx_rs::ops::tanh(&x)?)
+        // tanh(x) = 2*sigmoid(2x) - 1
+        let two = Array::from_f32(2.0);
+        let two_x = x.multiply(&two);
+        let sig = two_x.sigmoid();
+        let one = Array::from_f32(1.0);
+        let two2 = Array::from_f32(2.0);
+        Ok(sig.multiply(&two2).subtract(&one))
     }
 
     /// Generate audio from mel spectrogram (inference helper).
@@ -253,7 +259,7 @@ impl BigVGAN {
     /// Audio samples [samples] or [batch, samples]
     pub fn generate(&self, mel: &Array) -> Result<Array> {
         let (mel, was_2d) = if mel.ndim() == 2 {
-            (mel.reshape(&[1, mel.dim(0), mel.dim(1)])?, true)
+            (mel.reshape(&[1, mel.dim(0), mel.dim(1)]), true)
         } else {
             (mel.clone(), false)
         };
@@ -261,10 +267,10 @@ impl BigVGAN {
         let audio = self.forward(&mel)?;
 
         // Remove channel dimension and optionally batch dimension
-        let audio = audio.squeeze()?; // Remove channel dim
+        let audio = audio.squeeze_all();
 
         if was_2d {
-            Ok(audio.squeeze()?) // Remove batch dim
+            Ok(audio.squeeze_all())
         } else {
             Ok(audio)
         }
@@ -280,21 +286,21 @@ fn tensor_to_array(tensor: safetensors::tensor::TensorView<'_>) -> Result<Array>
     match tensor.dtype() {
         safetensors::Dtype::F32 => {
             let floats: &[f32] = <[f32]>::ref_from_bytes(data).expect("safetensors data aligned");
-            Ok(Array::from_slice(floats, &shape))
+            Ok(Array::from_f32_slice(floats, &shape))
         }
         safetensors::Dtype::F16 => {
             // Convert f16 to f32
             let f16s: &[half::f16] =
                 <[half::f16]>::ref_from_bytes(data).expect("safetensors data aligned");
             let floats: Vec<f32> = f16s.iter().map(|f| f.to_f32()).collect();
-            Ok(Array::from_slice(&floats, &shape))
+            Ok(Array::from_f32_slice(&floats, &shape))
         }
         safetensors::Dtype::BF16 => {
             // Convert bf16 to f32
             let bf16s: &[half::bf16] =
                 <[half::bf16]>::ref_from_bytes(data).expect("safetensors data aligned");
             let floats: Vec<f32> = bf16s.iter().map(|f| f.to_f32()).collect();
-            Ok(Array::from_slice(&floats, &shape))
+            Ok(Array::from_f32_slice(&floats, &shape))
         }
         _ => Err(VocoderError::WeightLoad(format!(
             "Unsupported dtype: {:?}",
@@ -322,14 +328,15 @@ mod tests {
         let model = BigVGAN::new(config).unwrap();
 
         // Create a small mel spectrogram
-        let mel = mlx_rs::random::normal::<f32>(&[1, 100, 10], None, None, None).unwrap();
+        let mel = Array::random_normal(&[1, 100, 10], 10);
         let audio = model.forward(&mel).unwrap();
-        audio.eval().unwrap();
+        let mut a2 = audio.clone();
+        a2.eval();
 
         // Output should be [1, 1, samples]
         // With 256x upsampling: 10 frames * 256 = 2560 samples
-        assert_eq!(audio.dim(0), 1); // batch
-        assert_eq!(audio.dim(1), 1); // mono channel
+        assert_eq!(a2.dim(0), 1); // batch
+        assert_eq!(a2.dim(1), 1); // mono channel
         // Note: exact length may vary due to conv padding
     }
 
@@ -339,12 +346,13 @@ mod tests {
         let model = BigVGAN::new(config).unwrap();
 
         // Test 2D input (no batch)
-        let mel = mlx_rs::random::normal::<f32>(&[100, 8], None, None, None).unwrap();
+        let mel = Array::random_normal(&[100, 8], 10);
         let audio = model.generate(&mel).unwrap();
-        audio.eval().unwrap();
+        let mut a2 = audio.clone();
+        a2.eval();
 
         // Should be 1D output
-        assert_eq!(audio.ndim(), 1);
+        assert_eq!(a2.ndim(), 1);
     }
 
     #[test]
@@ -352,17 +360,18 @@ mod tests {
         let config = BigVGANConfig::base_24khz_100band();
         let model = BigVGAN::new(config).unwrap();
 
-        let mel = mlx_rs::random::normal::<f32>(&[1, 100, 4], None, None, None).unwrap();
+        let mel = Array::random_normal(&[1, 100, 4], 10);
         let audio = model.forward(&mel).unwrap();
-        audio.eval().unwrap();
+        let mut a2 = audio.clone();
+        a2.eval();
 
         // Output should be in [-1, 1] due to tanh
-        let max_val = audio.max(None).unwrap();
-        let min_val = audio.min(None).unwrap();
-        max_val.eval().unwrap();
-        min_val.eval().unwrap();
+        let mut max_val = a2.max(None);
+        let mut min_val = a2.min(None);
+        max_val.eval();
+        min_val.eval();
 
-        assert!(max_val.item::<f32>() <= 1.0);
-        assert!(min_val.item::<f32>() >= -1.0);
+        assert!(max_val.item_f32() <= 1.0);
+        assert!(min_val.item_f32() >= -1.0);
     }
 }

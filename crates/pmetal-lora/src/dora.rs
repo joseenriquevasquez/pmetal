@@ -13,7 +13,7 @@
 //! and direction of updates to be learned separately, closer to full fine-tuning.
 
 use crate::lora::LoraError;
-use mlx_rs::{Array, error::Exception, nn};
+use pmetal_bridge::compat::{Array, Exception, nn};
 use pmetal_core::LoraConfig;
 
 /// DoRA Linear layer implementing weight decomposition.
@@ -73,15 +73,15 @@ impl DoraLinear {
 
         // Initialize LoRA A with Kaiming uniform
         let bound = (3.0_f32 / in_features as f32).sqrt();
-        let lora_a = mlx_rs::random::uniform::<_, f32>(-bound, bound, &[rank, in_features], None)?;
+        let lora_a = pmetal_bridge::compat::random::uniform_range(-bound, bound, &[rank, in_features], pmetal_bridge::compat::Dtype::Float32);
 
         // Initialize LoRA B with zeros
-        let lora_b = mlx_rs::ops::zeros::<f32>(&[out_features, rank])?;
+        let lora_b = pmetal_bridge::compat::ops::zeros(&[out_features, rank], pmetal_bridge::compat::Dtype::Float32);
 
         // Initialize magnitude with column norms of base weight
         // weight is [out, in], so we want norms along dim 1 to get [out, 1]
         // Use sum_axis(axis, keep_dims)
-        let magnitude = weight.square()?.sum_axis(1, true)?.sqrt()?;
+        let magnitude = weight.square().sum_axis(1, true).sqrt();
 
         // Clone bias if present
         let bias = linear.bias.value.as_ref().cloned();
@@ -122,19 +122,19 @@ impl DoraLinear {
         // Initialize base weight with Kaiming uniform
         let bound = (3.0_f32 / in_features as f32).sqrt();
         let weight =
-            mlx_rs::random::uniform::<_, f32>(-bound, bound, &[out_features, in_features], None)?;
+            pmetal_bridge::compat::random::uniform_range(-bound, bound, &[out_features, in_features], pmetal_bridge::compat::Dtype::Float32);
 
         let bias = if use_bias {
-            Some(mlx_rs::ops::zeros::<f32>(&[out_features])?)
+            Some(pmetal_bridge::compat::ops::zeros(&[out_features], pmetal_bridge::compat::Dtype::Float32))
         } else {
             None
         };
 
-        let lora_a = mlx_rs::random::uniform::<_, f32>(-bound, bound, &[rank, in_features], None)?;
-        let lora_b = mlx_rs::ops::zeros::<f32>(&[out_features, rank])?;
+        let lora_a = pmetal_bridge::compat::random::uniform_range(-bound, bound, &[rank, in_features], pmetal_bridge::compat::Dtype::Float32);
+        let lora_b = pmetal_bridge::compat::ops::zeros(&[out_features, rank], pmetal_bridge::compat::Dtype::Float32);
 
         // Initialize magnitude from weight norms
-        let magnitude = weight.square()?.sum_axis(1, true)?.sqrt()?;
+        let magnitude = weight.square().sum_axis(1, true).sqrt();
 
         Ok(Self {
             in_features,
@@ -190,46 +190,46 @@ impl DoraLinear {
     /// For the merged path (inference), the exact merged weight is used directly.
     pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         if self.merged {
-            let y = x.matmul(&self.weight.t())?;
+            let y = x.matmul(&self.weight.t());
             if let Some(ref bias) = self.bias {
-                Ok(y.add(bias)?)
+                Ok(y.add(bias))
             } else {
                 Ok(y)
             }
         } else {
             // Base projection: y_base = x @ W.T
-            let y_base = x.matmul(&self.weight.t())?;
+            let y_base = x.matmul(&self.weight.t());
 
             // Low-rank LoRA correction (no full weight materialization):
             //   y_lora = scale * (x @ A.T) @ B.T
             // Shape: x [*, in] -> xa [*, r] -> xab [*, out]
             let xa = if self.training && self.lora_dropout > 0.0 {
-                crate::lora::apply_dropout(x, self.lora_dropout)?.matmul(&self.lora_a.t())?
+                crate::lora::apply_dropout(x, self.lora_dropout)?.matmul(&self.lora_a.t())
             } else {
-                x.matmul(&self.lora_a.t())?
+                x.matmul(&self.lora_a.t())
             };
-            let xab = xa.matmul(&self.lora_b.t())?;
+            let xab = xa.matmul(&self.lora_b.t());
             let scale_arr = Array::from_f32(self.scale);
 
             // Combined output before magnitude rescaling
-            let y_combined = y_base.add(&xab.multiply(&scale_arr)?)?;
+            let y_combined = y_base.add(&xab.multiply(&scale_arr));
 
             // Per-row column norms of the frozen weight W: shape [out, 1].
             // We use ||W||_col as an approximation for ||V||_col = ||W + scale*B@A||_col.
             // This is exact at init (B=0) and accurate throughout training when the
             // low-rank update is small relative to the frozen weight magnitude.
-            let w_col_norm = self.weight.square()?.sum_axis(1, true)?.sqrt()?;
+            let w_col_norm = self.weight.square().sum_axis(1, true).sqrt();
             let eps = Array::from_f32(1e-6);
-            let norm_safe = w_col_norm.add(&eps)?;
+            let norm_safe = w_col_norm.add(&eps);
 
             // Magnitude rescaling: y = y_combined * (m / ||W||_col)
             // magnitude is [out, 1], norm_safe is [out, 1] → divide gives [out, 1],
             // squeeze to [out] for correct broadcast against y_combined [*, out].
-            let scale_factor = self.magnitude.divide(&norm_safe)?.squeeze_axes(&[-1])?;
-            let y = y_combined.multiply(&scale_factor)?;
+            let scale_factor = self.magnitude.divide(&norm_safe).squeeze_axes(&[-1]);
+            let y = y_combined.multiply(&scale_factor);
 
             if let Some(ref bias) = self.bias {
-                Ok(y.add(bias)?)
+                Ok(y.add(bias))
             } else {
                 Ok(y)
             }
@@ -253,17 +253,17 @@ impl DoraLinear {
         self.original_weight = Some(self.weight.clone());
 
         // Reconstruct the full effective weight: V = W + scale * B @ A
-        let ba = self.lora_b.matmul(&self.lora_a)?;
+        let ba = self.lora_b.matmul(&self.lora_a);
         let scale_arr = Array::from_f32(self.scale);
-        let update = ba.multiply(&scale_arr)?;
-        let v = self.weight.add(&update)?;
+        let update = ba.multiply(&scale_arr);
+        let v = self.weight.add(&update);
 
         // Normalise column-wise: V_norm = V / ||V||_c
-        let v_norm = v.square()?.sum_axis(1, true)?.sqrt()?;
-        let normalized_v = v.divide(&v_norm.add(&Array::from_f32(1e-6))?)?;
+        let v_norm = v.square().sum_axis(1, true).sqrt();
+        let normalized_v = v.divide(&v_norm.add(&Array::from_f32(1e-6)));
 
         // Apply magnitude: W_merged = m * V_norm
-        let w_final = normalized_v.multiply(&self.magnitude)?;
+        let w_final = normalized_v.multiply(&self.magnitude);
 
         self.weight = w_final;
         self.merged = true;
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn test_dora_forward_pass() {
         let mut dora = DoraLinear::new(32, 64, 4, 8.0, false, false).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 32], pmetal_bridge::compat::Dtype::Float32);
 
         let output = dora.forward(&x).unwrap();
         assert_eq!(output.shape(), &[2, 4, 64]);
@@ -401,7 +401,7 @@ mod tests {
         // When lora_b is zero (as initialised), the merged weight should produce
         // the same output as the unmerged forward pass.
         let mut dora = DoraLinear::new(16, 32, 4, 8.0, false, false).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 16], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 16], pmetal_bridge::compat::Dtype::Float32);
 
         let unmerged_out = dora.forward(&x).unwrap();
         dora.merge().unwrap();

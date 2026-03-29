@@ -6,7 +6,7 @@
 //! bounded in [0, 1], making it easy to interpret and compare across runs.
 
 use crate::Result;
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, ops};
 
 use super::DistillLoss;
 
@@ -40,26 +40,26 @@ impl DistillLoss for TvdLoss {
         let temp = Array::from_f32(temperature);
 
         // Temperature-scaled softmax
-        let teacher_scaled = teacher_logits.divide(&temp)?;
-        let student_scaled = student_logits.divide(&temp)?;
+        let teacher_scaled = teacher_logits.divide(&temp);
+        let student_scaled = student_logits.divide(&temp);
 
         let teacher_probs = super::softmax(&teacher_scaled, -1)?;
         let student_probs = super::softmax(&student_scaled, -1)?;
 
         // TVD = 0.5 * sum(|P - Q|, axis=-1)
-        let diff = teacher_probs.subtract(&student_probs)?;
-        let abs_diff = mlx_rs::ops::abs(&diff)?;
-        let tvd_per_token = abs_diff.sum_axes(&[-1], None)?;
-        let tvd_per_token = tvd_per_token.multiply(&Array::from_f32(0.5))?;
+        let diff = teacher_probs.subtract(&student_probs);
+        let abs_diff = ops::abs(&diff);
+        let tvd_per_token = abs_diff.sum_axes(&[-1], false);
+        let tvd_per_token = tvd_per_token.multiply(&Array::from_f32(0.5));
 
         if let Some(w) = weights {
-            let weighted = tvd_per_token.multiply(w)?;
-            let sum = weighted.sum(false)?;
-            let w_sum = w.sum(false)?;
-            let safe_sum = mlx_rs::ops::maximum(&w_sum, &Array::from_f32(1.0))?;
-            Ok(sum.divide(&safe_sum)?)
+            let weighted = tvd_per_token.multiply(w);
+            let sum = weighted.sum_all();
+            let w_sum = w.sum_all();
+            let safe_sum = ops::maximum(&w_sum, &Array::from_f32(1.0));
+            Ok(sum.divide(&safe_sum))
         } else {
-            Ok(tvd_per_token.mean(None)?)
+            Ok(tvd_per_token.mean_all())
         }
     }
 
@@ -74,32 +74,32 @@ mod tests {
 
     #[test]
     fn identical_distributions_zero_loss() {
-        let logits = Array::from_slice(&[1.0f32, 2.0, 3.0, 1.0, 2.0, 3.0], &[2, 3]);
+        let logits = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 1.0, 2.0, 3.0], &[2, 3]);
         let loss = TvdLoss::new();
         let result = loss.compute(&logits, &logits, 1.0).unwrap();
-        result.eval().unwrap();
+        result.eval();
         let val: f32 = result.item();
         assert!(val.abs() < 1e-5, "TVD of identical should be 0, got {val}");
     }
 
     #[test]
     fn different_distributions_positive_loss() {
-        let teacher = Array::from_slice(&[10.0f32, 0.0, 0.0], &[1, 3]);
-        let student = Array::from_slice(&[0.0f32, 0.0, 10.0], &[1, 3]);
+        let teacher = Array::from_f32_slice(&[10.0f32, 0.0, 0.0], &[1, 3]);
+        let student = Array::from_f32_slice(&[0.0f32, 0.0, 10.0], &[1, 3]);
         let loss = TvdLoss::new();
         let result = loss.compute(&teacher, &student, 1.0).unwrap();
-        result.eval().unwrap();
+        result.eval();
         let val: f32 = result.item();
         assert!(val > 0.9, "TVD of disjoint should be ~1.0, got {val}");
     }
 
     #[test]
     fn tvd_bounded_zero_to_one() {
-        let teacher = Array::from_slice(&[5.0f32, -5.0, 0.0], &[1, 3]);
-        let student = Array::from_slice(&[-5.0f32, 5.0, 0.0], &[1, 3]);
+        let teacher = Array::from_f32_slice(&[5.0f32, -5.0, 0.0], &[1, 3]);
+        let student = Array::from_f32_slice(&[-5.0f32, 5.0, 0.0], &[1, 3]);
         let loss = TvdLoss::new();
         let result = loss.compute(&teacher, &student, 1.0).unwrap();
-        result.eval().unwrap();
+        result.eval();
         let val: f32 = result.item();
         assert!(
             (0.0..=1.001).contains(&val),

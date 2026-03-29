@@ -62,12 +62,10 @@ pub use sequence_packing::*;
 pub use smart_checkpoint::*;
 pub use speculative::*;
 
-// Re-export mlx-rs types for convenience
-pub use mlx_rs::builder::Builder;
-pub use mlx_rs::error::{Exception, Result};
-pub use mlx_rs::module::{Module, ModuleParameters, Param};
-pub use mlx_rs::nn::Linear;
-pub use mlx_rs::{Array, Dtype};
+// Re-export bridge types for convenience
+pub use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, Param};
+pub use pmetal_bridge::compat::builder::Builder;
+pub type Result<T> = std::result::Result<T, Exception>;
 
 /// Prelude module for convenient imports.
 pub mod prelude {
@@ -87,7 +85,5 @@ pub mod prelude {
     pub use crate::sequence_packing::*;
     pub use crate::smart_checkpoint::*;
     pub use crate::speculative::*;
-    pub use mlx_rs::builder::Builder;
-    pub use mlx_rs::module::{Module, ModuleParameters, Param};
-    pub use mlx_rs::{Array, Dtype};
+    pub use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, Param};
 }

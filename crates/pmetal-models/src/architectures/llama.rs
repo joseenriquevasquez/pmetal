@@ -4,9 +4,8 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::{
-    Array, builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
-};
+use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, nn, random};
+use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, differentiable_attention, fused_sdpa,
     get_training_context,
@@ -119,7 +118,7 @@ impl Default for LlamaConfig {
 }
 
 /// Llama attention layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct LlamaAttention {
     /// Number of attention heads.
     pub n_heads: i32,
@@ -139,21 +138,18 @@ pub struct LlamaAttention {
     pub layer_id: usize,
 
     /// Query projection.
-    #[param]
     pub q_proj: nn::Linear,
     /// Key projection.
-    #[param]
     pub k_proj: nn::Linear,
     /// Value projection.
-    #[param]
     pub v_proj: nn::Linear,
     /// Output projection.
-    #[param]
     pub o_proj: nn::Linear,
     /// RoPE layer (used for non-cached forward).
-    #[param]
     pub rope: nn::Rope,
 }
+impl_module_params!(LlamaAttention; q_proj, k_proj, v_proj, o_proj, rope);
+
 
 impl LlamaAttention {
     /// Create a new attention layer.
@@ -278,14 +274,14 @@ impl LlamaAttention {
 
         // Reshape for multi-head attention: [B, L, heads, head_dim] -> [B, heads, L, head_dim]
         let queries = queries
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
         let keys = keys
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
         let values = values
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
 
         // Get RoPE offset and apply RoPE
         let (queries, keys, values) = if let Some((cache_ref, _layer_idx)) = cache.as_ref() {
@@ -339,8 +335,8 @@ impl LlamaAttention {
                     &attn_config,
                 )? {
                     let output = output
-                        .transpose_axes(&[0, 2, 1, 3])?
-                        .reshape(&[batch, seq_len, -1])?;
+                        .transpose_axes(&[0, 2, 1, 3])
+                        .reshape(&[batch, seq_len, -1]);
                     return Module::forward(&mut self.o_proj, &output);
                 }
             }
@@ -367,8 +363,8 @@ impl LlamaAttention {
 
         // Reshape back: [B, heads, L, head_dim] -> [B, L, hidden]
         let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
 
         // Output projection
         Module::forward(&mut self.o_proj, &output)
@@ -376,18 +372,17 @@ impl LlamaAttention {
 }
 
 /// Llama MLP layer (SwiGLU).
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct LlamaMLP {
     /// Gate projection.
-    #[param]
     pub gate_proj: nn::Linear,
     /// Up projection.
-    #[param]
     pub up_proj: nn::Linear,
     /// Down projection.
-    #[param]
     pub down_proj: nn::Linear,
 }
+impl_module_params!(LlamaMLP; gate_proj, up_proj, down_proj);
+
 
 impl LlamaMLP {
     /// Create a new MLP layer.
@@ -413,29 +408,27 @@ impl LlamaMLP {
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         // SwiGLU: down_proj(silu(gate_proj(x)) * up_proj(x))
         let gate = Module::forward(&mut self.gate_proj, x)?;
-        let gate = nn::silu(gate)?;
+        let gate = nn::silu(&gate);
         let up = Module::forward(&mut self.up_proj, x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = gate.multiply(&up);
         Module::forward(&mut self.down_proj, &hidden)
     }
 }
 
 /// Llama transformer block.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct LlamaDecoderLayer {
     /// Self-attention layer.
-    #[param]
     pub self_attn: LlamaAttention,
     /// MLP layer.
-    #[param]
     pub mlp: LlamaMLP,
     /// Input layer norm.
-    #[param]
     pub input_layernorm: nn::RmsNorm,
     /// Post-attention layer norm.
-    #[param]
     pub post_attention_layernorm: nn::RmsNorm,
 }
+impl_module_params!(LlamaDecoderLayer; self_attn, mlp, input_layernorm, post_attention_layernorm);
+
 
 impl LlamaDecoderLayer {
     /// Create a new decoder layer.
@@ -445,7 +438,9 @@ impl LlamaDecoderLayer {
     /// * `layer_id` - Layer index (used for training cache)
     pub fn new(config: &LlamaConfig, layer_id: usize) -> Result<Self, Exception> {
         let self_attn = LlamaAttention::new(config, layer_id)?;
+
         let mlp = LlamaMLP::new(config)?;
+
 
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
@@ -477,30 +472,29 @@ impl LlamaDecoderLayer {
         // Pre-norm + attention + residual
         let normed = Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         // Pre-norm + MLP + residual
         let normed = Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        h.add(&mlp_out)
+        Ok(h.add(&mlp_out))
     }
 }
 
 /// Llama base model (without LM head).
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct LlamaModel {
     /// Configuration (not a parameter).
     pub config: LlamaConfig,
     /// Token embeddings.
-    #[param]
     pub embed_tokens: nn::Embedding,
     /// Transformer layers.
-    #[param]
     pub layers: Vec<LlamaDecoderLayer>,
     /// Final layer norm.
-    #[param]
     pub norm: nn::RmsNorm,
 }
+impl_module_params!(LlamaModel; embed_tokens, layers, norm);
+
 
 impl LlamaModel {
     /// Create a new Llama model.
@@ -555,11 +549,13 @@ impl LlamaModel {
 
         // Create causal mask if not provided and not using cache
         // When using cache for decode step (seq_len=1), we don't need a mask
+        let mask_owned;
         let mask = if mask.is_none() && cache.is_none() {
             let seq_len = input_ids.dim(1);
-            Some(create_causal_mask(seq_len)?)
+            mask_owned = create_causal_mask(seq_len)?;
+            Some(&mask_owned)
         } else {
-            mask.cloned()
+            mask
         };
 
         // Pass through transformer layers
@@ -568,14 +564,14 @@ impl LlamaModel {
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
                     hidden_states = layer.forward_with_cache(
                         &hidden_states,
-                        mask.as_ref(),
+                        mask,
                         Some((cache, layer_idx)),
                     )?;
                 }
             }
             None => {
                 for layer in &mut self.layers {
-                    hidden_states = layer.forward(&hidden_states, mask.as_ref())?;
+                    hidden_states = layer.forward(&hidden_states, mask)?;
                 }
             }
         }
@@ -586,15 +582,15 @@ impl LlamaModel {
 }
 
 /// Llama model with language modeling head.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct LlamaForCausalLM {
     /// Base model.
-    #[param]
     pub model: LlamaModel,
     /// LM head (optional, may share weights with embeddings).
-    #[param]
     pub lm_head: Option<nn::Linear>,
 }
+impl_module_params!(LlamaForCausalLM; model, lm_head);
+
 
 impl LlamaForCausalLM {
     /// Create a new Llama model with LM head.
@@ -648,7 +644,7 @@ impl LlamaForCausalLM {
             Module::forward(lm_head, &hidden_states)
         } else {
             // Tie weights: use embedding weight transposed
-            self.model.embed_tokens.as_linear(&hidden_states)
+            Ok(self.model.embed_tokens.as_linear(&hidden_states))
         }
     }
 
@@ -752,13 +748,7 @@ impl crate::traits::CausalLMModel for LlamaForCausalLM {
     }
 
     fn eval(&self) -> Result<(), Exception> {
-        // Eval all parameters to materialize them on device
-        use mlx_rs::module::ModuleParameters;
-        let params = self.parameters().flatten();
-        for (_, param) in params {
-            param.eval()?;
-        }
-        Ok(())
+        pmetal_bridge::compat::ModuleParametersExt::eval(self)
     }
 }
 
@@ -792,7 +782,7 @@ mod tests {
         let config = small_config();
         let mut attn = LlamaAttention::new(&config, 0).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -804,7 +794,7 @@ mod tests {
         let config = small_config();
         let mut mlp = LlamaMLP::new(&config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
         let output = mlp.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -816,7 +806,7 @@ mod tests {
         let config = small_config();
         let mut layer = LlamaDecoderLayer::new(&config, 0).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
         let output = layer.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -828,7 +818,7 @@ mod tests {
         let config = small_config();
         let mut model = LlamaModel::new(config).unwrap();
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_bridge::compat::Array::from_i32_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let output = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -840,7 +830,7 @@ mod tests {
         let config = small_config();
         let mut model = LlamaForCausalLM::new(config).unwrap();
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_bridge::compat::Array::from_i32_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]); // [batch, seq, vocab]

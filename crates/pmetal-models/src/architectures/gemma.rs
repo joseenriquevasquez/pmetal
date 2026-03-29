@@ -6,15 +6,9 @@
 //! - GeGLU instead of SwiGLU (uses GELU instead of SiLU)
 //! - Embedding scaling by sqrt(hidden_size)
 //! - Gemma2: Attention logit softcapping, sliding window, extra normalization
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops, random};
+use pmetal_bridge::impl_module_params;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, Param},
-    nn,
-};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopeScaling, apply_rope},
@@ -235,20 +229,21 @@ impl GemmaConfig {
 ///
 /// Unlike standard RMSNorm (x * weight), Gemma uses:
 /// output = x * (1 + weight)
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GemmaRmsNorm {
     /// Weight parameter.
-    #[param]
     pub weight: Param<Array>,
     /// Epsilon for numerical stability.
     pub eps: f32,
 }
+impl_module_params!(GemmaRmsNorm; weight);
+
 
 impl GemmaRmsNorm {
     /// Create a new GemmaRmsNorm layer.
     pub fn new(hidden_size: i32, eps: f32) -> Result<Self, Exception> {
         // Initialize weights to zeros (will become 1 after +1 offset)
-        let weight = mlx_rs::ops::zeros::<f32>(&[hidden_size])?;
+        let weight = pmetal_bridge::compat::ops::zeros(&[hidden_size], Dtype::Float32);
 
         Ok(Self {
             weight: Param::new(weight),
@@ -259,23 +254,23 @@ impl GemmaRmsNorm {
     /// Forward pass.
     pub fn forward(&self, x: &Array) -> Result<Array, Exception> {
         // Compute RMS
-        let x_sq = x.multiply(x)?;
-        let mean_sq = x_sq.mean_axis(-1, Some(true))?;
+        let x_sq = x.multiply(x);
+        let mean_sq = x_sq.mean_axis(-1, true);
         let eps_arr = Array::from_f32(self.eps);
-        let rms = mean_sq.add(&eps_arr)?.sqrt()?;
+        let rms = mean_sq.add(&eps_arr).sqrt();
 
         // Normalize
-        let normed = x.divide(&rms)?;
+        let normed = x.divide(&rms);
 
         // Apply weight with +1 offset: output = normed * (1 + weight)
         let one = Array::from_f32(1.0);
-        let scale = self.weight.as_ref().add(&one)?;
-        normed.multiply(&scale)
+        let scale = self.weight.as_ref().add(&one);
+        Ok(normed.multiply(&scale))
     }
 }
 
 /// GELU activation with tanh approximation.
-fn gelu_tanh(x: &Array) -> Result<Array, Exception> {
+fn gelu_tanh(x: &Array) -> Array {
     // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     // Use tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
     let sqrt_2_over_pi = (2.0_f32 / std::f32::consts::PI).sqrt();
@@ -285,21 +280,21 @@ fn gelu_tanh(x: &Array) -> Result<Array, Exception> {
     let two = Array::from_f32(2.0);
     let sqrt_2_pi = Array::from_f32(sqrt_2_over_pi);
 
-    let x_cubed = x.multiply(x)?.multiply(x)?;
-    let inner = x.add(&x_cubed.multiply(&coef)?)?;
-    let inner = inner.multiply(&sqrt_2_pi)?;
+    let x_cubed = x.multiply(x).multiply(x);
+    let inner = x.add(&x_cubed.multiply(&coef));
+    let inner = inner.multiply(&sqrt_2_pi);
 
     // tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
-    let exp_2x = inner.multiply(&two)?.exp()?;
-    let tanh_val = exp_2x.subtract(&one)?.divide(&exp_2x.add(&one)?)?;
+    let exp_2x = inner.multiply(&two).exp();
+    let tanh_val = exp_2x.subtract(&one).divide(&exp_2x.add(&one));
 
-    let gate = one.add(&tanh_val)?.multiply(&half)?;
+    let gate = one.add(&tanh_val).multiply(&half);
 
     x.multiply(&gate)
 }
 
 /// Gemma attention layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GemmaAttention {
     /// Number of attention heads.
     pub n_heads: i32,
@@ -325,21 +320,18 @@ pub struct GemmaAttention {
     pub sliding_window: Option<i32>,
 
     /// Query projection.
-    #[param]
     pub q_proj: nn::Linear,
     /// Key projection.
-    #[param]
     pub k_proj: nn::Linear,
     /// Value projection.
-    #[param]
     pub v_proj: nn::Linear,
     /// Output projection.
-    #[param]
     pub o_proj: nn::Linear,
     /// RoPE layer.
-    #[param]
     pub rope: nn::Rope,
 }
+impl_module_params!(GemmaAttention; q_proj, k_proj, v_proj, o_proj, rope);
+
 
 impl GemmaAttention {
     /// Create a new attention layer.
@@ -432,14 +424,14 @@ impl GemmaAttention {
 
         // Reshape for multi-head attention: [B, L, heads, head_dim] -> [B, heads, L, head_dim]
         let queries = queries
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
         let keys = keys
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
         let values = values
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
 
         // Apply RoPE
         let (queries, keys, values) = if let Some((cache_ref, _)) = cache.as_ref() {
@@ -500,8 +492,8 @@ impl GemmaAttention {
                     &attn_config,
                 )? {
                     let output = output
-                        .transpose_axes(&[0, 2, 1, 3])?
-                        .reshape(&[batch, seq_len, -1])?;
+                        .transpose_axes(&[0, 2, 1, 3])
+                        .reshape(&[batch, seq_len, -1]);
                     return Module::forward(&mut self.o_proj, &output);
                 }
             }
@@ -519,28 +511,27 @@ impl GemmaAttention {
 
         // Reshape back: [B, heads, L, head_dim] -> [B, L, hidden]
         let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
 
         Module::forward(&mut self.o_proj, &output)
     }
 }
 
 /// Gemma MLP layer (GeGLU).
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GemmaMLP {
     /// Gate projection.
-    #[param]
     pub gate_proj: nn::Linear,
     /// Up projection.
-    #[param]
     pub up_proj: nn::Linear,
     /// Down projection.
-    #[param]
     pub down_proj: nn::Linear,
     /// Hidden activation function name.
     hidden_act: String,
 }
+impl_module_params!(GemmaMLP; gate_proj, up_proj, down_proj);
+
 
 impl GemmaMLP {
     /// Create a new MLP layer.
@@ -564,11 +555,11 @@ impl GemmaMLP {
     }
 
     /// Apply the configured activation function.
-    fn apply_activation(&self, x: &Array) -> Result<Array, Exception> {
+    fn apply_activation(&self, x: &Array) -> Array {
         match self.hidden_act.as_str() {
             "gelu" | "gelu_pytorch_tanh" | "gelu_tanh" => gelu_tanh(x),
-            "silu" | "swish" => mlx_rs::nn::silu(x),
-            "relu" => mlx_rs::nn::relu(x),
+            "silu" | "swish" => pmetal_bridge::compat::nn::silu(&x),
+            "relu" => pmetal_bridge::compat::nn::relu(&x),
             _ => gelu_tanh(x), // Default to gelu_tanh for Gemma
         }
     }
@@ -576,35 +567,35 @@ impl GemmaMLP {
     /// Forward pass with configurable activation (GeGLU/SwiGLU/ReGLU).
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = Module::forward(&mut self.gate_proj, x)?;
-        let gate = self.apply_activation(&gate)?;
+        let gate = self.apply_activation(&gate);
         let up = Module::forward(&mut self.up_proj, x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = gate.multiply(&up);
         Module::forward(&mut self.down_proj, &hidden)
     }
 }
 
 /// Gemma decoder layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GemmaDecoderLayer {
     /// Self-attention layer.
-    #[param]
     pub self_attn: GemmaAttention,
     /// MLP layer.
-    #[param]
     pub mlp: GemmaMLP,
     /// Input layer norm.
-    #[param]
     pub input_layernorm: GemmaRmsNorm,
     /// Post-attention layer norm.
-    #[param]
     pub post_attention_layernorm: GemmaRmsNorm,
 }
+impl_module_params!(GemmaDecoderLayer; self_attn, mlp, input_layernorm, post_attention_layernorm);
+
 
 impl GemmaDecoderLayer {
     /// Create a new decoder layer.
     pub fn new(config: &GemmaConfig, layer_idx: usize) -> Result<Self, Exception> {
         let self_attn = GemmaAttention::new(config, layer_idx)?;
+
         let mlp = GemmaMLP::new(config)?;
+
 
         let input_layernorm = GemmaRmsNorm::new(config.hidden_size, config.rms_norm_eps)?;
         let post_attention_layernorm = GemmaRmsNorm::new(config.hidden_size, config.rms_norm_eps)?;
@@ -632,43 +623,41 @@ impl GemmaDecoderLayer {
         // Pre-norm + attention + residual
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         // Pre-norm + MLP + residual
         let normed = self.post_attention_layernorm.forward(&h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        h.add(&mlp_out)
+        Ok(h.add(&mlp_out))
     }
 }
 
 /// Gemma2 decoder layer with extra normalization.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Gemma2DecoderLayer {
     /// Self-attention layer.
-    #[param]
     pub self_attn: GemmaAttention,
     /// MLP layer.
-    #[param]
     pub mlp: GemmaMLP,
     /// Input layer norm.
-    #[param]
     pub input_layernorm: GemmaRmsNorm,
     /// Post-attention layer norm.
-    #[param]
     pub post_attention_layernorm: GemmaRmsNorm,
     /// Pre-feedforward layer norm (Gemma2 specific).
-    #[param]
     pub pre_feedforward_layernorm: GemmaRmsNorm,
     /// Post-feedforward layer norm (Gemma2 specific).
-    #[param]
     pub post_feedforward_layernorm: GemmaRmsNorm,
 }
+impl_module_params!(Gemma2DecoderLayer; self_attn, mlp, input_layernorm, post_attention_layernorm, pre_feedforward_layernorm, post_feedforward_layernorm);
+
 
 impl Gemma2DecoderLayer {
     /// Create a new Gemma2 decoder layer.
     pub fn new(config: &GemmaConfig, layer_idx: usize) -> Result<Self, Exception> {
         let self_attn = GemmaAttention::new(config, layer_idx)?;
+
         let mlp = GemmaMLP::new(config)?;
+
 
         let input_layernorm = GemmaRmsNorm::new(config.hidden_size, config.rms_norm_eps)?;
         let post_attention_layernorm = GemmaRmsNorm::new(config.hidden_size, config.rms_norm_eps)?;
@@ -702,40 +691,39 @@ impl Gemma2DecoderLayer {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
         let attn_out = self.post_attention_layernorm.forward(&attn_out)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         // Pre-norm + MLP + post-norm + residual
         let normed = self.pre_feedforward_layernorm.forward(&h)?;
         let mlp_out = self.mlp.forward(&normed)?;
         let mlp_out = self.post_feedforward_layernorm.forward(&mlp_out)?;
-        h.add(&mlp_out)
+        Ok(h.add(&mlp_out))
     }
 }
 
 /// Gemma transformer layers container.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GemmaLayers {
-    #[param]
     pub gemma1: Option<Vec<GemmaDecoderLayer>>,
-    #[param]
     pub gemma2: Option<Vec<Gemma2DecoderLayer>>,
 }
+impl_module_params!(GemmaLayers; gemma1, gemma2);
+
 
 /// Gemma base model (without LM head).
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GemmaModel {
     /// Configuration.
     pub config: GemmaConfig,
     /// Token embeddings.
-    #[param]
     pub embed_tokens: nn::Embedding,
     /// Transformer layers.
-    #[param]
     pub layers: GemmaLayers,
     /// Final layer norm.
-    #[param]
     pub norm: GemmaRmsNorm,
 }
+impl_module_params!(GemmaModel; embed_tokens, layers, norm);
+
 
 impl GemmaModel {
     /// Create a new Gemma model.
@@ -790,26 +778,28 @@ impl GemmaModel {
         // Get embeddings and scale
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
         let scale = Array::from_f32(self.config.embedding_scale());
-        hidden_states = hidden_states.multiply(&scale)?;
+        hidden_states = hidden_states.multiply(&scale);
 
         // Create causal mask if not provided and not using cache
+        let mask_owned;
         let mask = if mask.is_none() && cache.is_none() {
             let seq_len = input_ids.dim(1);
-            Some(create_causal_mask(seq_len)?)
+            mask_owned = create_causal_mask(seq_len)?;
+            Some(&mask_owned)
         } else {
-            mask.cloned()
+            mask
         };
 
         // Pass through transformer layers
         if let Some(ref mut layers) = self.layers.gemma1 {
             for (idx, layer) in layers.iter_mut().enumerate() {
                 let c = cache.as_deref_mut().map(|c| (c, idx));
-                hidden_states = layer.forward_with_cache(&hidden_states, mask.as_ref(), c)?;
+                hidden_states = layer.forward_with_cache(&hidden_states, mask, c)?;
             }
         } else if let Some(ref mut layers) = self.layers.gemma2 {
             for (idx, layer) in layers.iter_mut().enumerate() {
                 let c = cache.as_deref_mut().map(|c| (c, idx));
-                hidden_states = layer.forward_with_cache(&hidden_states, mask.as_ref(), c)?;
+                hidden_states = layer.forward_with_cache(&hidden_states, mask, c)?;
             }
         }
 
@@ -819,13 +809,14 @@ impl GemmaModel {
 }
 
 /// Gemma model with language modeling head.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GemmaForCausalLM {
     /// Base model.
-    #[param]
     pub model: GemmaModel,
     // Note: LM head is tied to embedding weights. Gemma always ties embeddings.
 }
+impl_module_params!(GemmaForCausalLM; model);
+
 
 impl GemmaForCausalLM {
     /// Create a new Gemma model with LM head.
@@ -848,7 +839,7 @@ impl GemmaForCausalLM {
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
         // Gemma always ties embeddings
-        self.model.embed_tokens.as_linear(&hidden_states)
+        Ok(self.model.embed_tokens.as_linear(&hidden_states))
     }
 
     /// Create a KV cache for this model.
@@ -930,11 +921,7 @@ impl CausalLMModel for GemmaForCausalLM {
     }
 
     fn eval(&self) -> Result<(), Exception> {
-        use mlx_rs::module::ModuleParameters;
-        for (_, p) in self.parameters().flatten() {
-            p.eval()?;
-        }
-        Ok(())
+        pmetal_bridge::compat::ModuleParametersExt::eval(self)
     }
 }
 
@@ -985,7 +972,7 @@ mod tests {
     #[serial]
     fn test_gemma_rms_norm() {
         let norm = GemmaRmsNorm::new(64, 1e-6).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
         let output = norm.forward(&x).unwrap();
         assert_eq!(output.shape(), &[1, 4, 64]);
     }
@@ -993,8 +980,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_gelu_tanh() {
-        let x = mlx_rs::Array::from_slice(&[-1.0f32, 0.0, 1.0, 2.0], &[4]);
-        let output = gelu_tanh(&x).unwrap();
+        let x = pmetal_bridge::compat::Array::from_i32_slice(&[-1.0f32, 0.0, 1.0, 2.0], &[4]);
+        let output = gelu_tanh(&x);
         output.eval().unwrap();
         // GELU(0) should be 0
         // GELU(-x) ≈ 0 for large negative x
@@ -1007,7 +994,7 @@ mod tests {
         let config = small_config();
         let mut attn = GemmaAttention::new(&config, 0).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1019,7 +1006,7 @@ mod tests {
         let config = small_config();
         let mut mlp = GemmaMLP::new(&config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
         let output = mlp.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1031,7 +1018,7 @@ mod tests {
         let config = small_config();
         let mut layer = GemmaDecoderLayer::new(&config, 0).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
         let output = layer.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1043,7 +1030,7 @@ mod tests {
         let config = small_config();
         let mut model = GemmaModel::new(config).unwrap();
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_bridge::compat::Array::from_i32_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let output = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1055,7 +1042,7 @@ mod tests {
         let config = small_config();
         let mut model = GemmaForCausalLM::new(config).unwrap();
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_bridge::compat::Array::from_i32_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]); // [batch, seq, vocab]
@@ -1071,7 +1058,7 @@ mod tests {
 
         let mut layer = Gemma2DecoderLayer::new(&config, 0).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
         let output = layer.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1084,7 +1071,7 @@ mod tests {
         config.attn_logit_softcapping = Some(50.0);
 
         let mut attn = GemmaAttention::new(&config, 0).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1100,7 +1087,7 @@ mod tests {
         let mut cache = model.create_cache(32);
 
         // First forward (prompt)
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_bridge::compat::Array::from_i32_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let logits = model
             .forward_with_cache(&input_ids, None, Some(&mut cache))
             .unwrap();
@@ -1109,7 +1096,7 @@ mod tests {
         assert_eq!(logits.shape(), &[1, 4, 1000]);
 
         // Second forward (incremental)
-        let next_token = mlx_rs::Array::from_slice(&[5_i32], &[1, 1]);
+        let next_token = pmetal_bridge::compat::Array::from_i32_slice(&[5_i32], &[1, 1]);
         let logits = model
             .forward_with_cache(&next_token, None, Some(&mut cache))
             .unwrap();
@@ -1128,7 +1115,7 @@ mod tests {
 
         let mut model = GemmaForCausalLM::new(config).unwrap();
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_bridge::compat::Array::from_i32_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]);

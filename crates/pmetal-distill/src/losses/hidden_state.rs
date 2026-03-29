@@ -16,7 +16,7 @@
 #![allow(unsafe_code)]
 
 use crate::{HiddenStateLossType, Result};
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 
 #[cfg(feature = "metal")]
 use std::sync::Arc;
@@ -105,7 +105,7 @@ impl HiddenStateLoss {
         // Apply projection if dimensions don't match
         let student_aligned = if let Some(proj) = &self.projection {
             // student_hidden @ projection -> [batch, seq, hidden_teacher]
-            student_hidden.matmul(proj)?
+            student_hidden.matmul(proj)
         } else {
             student_hidden.clone()
         };
@@ -181,12 +181,12 @@ impl HiddenStateLoss {
         let student_elements = num_tokens * student_dim;
 
         // Flatten to [num_tokens, hidden] for Metal kernel
-        let teacher_flat = teacher_hidden.reshape(&[-1, teacher_dim as i32])?;
-        let student_flat = student_hidden.reshape(&[-1, student_dim as i32])?;
+        let mut teacher_flat = teacher_hidden.reshape(&[-1, teacher_dim as i32]);
+        let mut student_flat = student_hidden.reshape(&[-1, student_dim as i32]);
 
         // Evaluate the arrays to ensure data is computed and available
-        teacher_flat.eval()?;
-        student_flat.eval()?;
+        teacher_flat.eval();
+        student_flat.eval();
 
         // Get raw data pointers via mlx_sys which returns a legitimate *mut f32
         // backed by the array's unified-memory allocation.
@@ -203,10 +203,8 @@ impl HiddenStateLoss {
         //   1. The data is valid unified memory owned by the evaluated MLX arrays.
         //   2. We only read from the Metal buffer (kernel input).
         //   3. teacher_flat/student_flat remain alive for the duration of this fn.
-        let teacher_ptr =
-            unsafe { mlx_sys::mlx_array_data_float32(teacher_flat.as_ptr()) as *mut f32 };
-        let student_ptr =
-            unsafe { mlx_sys::mlx_array_data_float32(student_flat.as_ptr()) as *mut f32 };
+        let teacher_ptr = teacher_flat.data_ptr() as *mut f32;
+        let student_ptr = student_flat.data_ptr() as *mut f32;
 
         if teacher_ptr.is_null() || student_ptr.is_null() {
             return Err(crate::DistillError::Metal(
@@ -244,9 +242,9 @@ impl HiddenStateLoss {
 
     /// MSE loss on hidden states (MLX fallback).
     fn mse_loss_mlx(&self, teacher: &Array, student: &Array) -> Result<Array> {
-        let diff = student.subtract(teacher)?;
-        let squared = diff.multiply(&diff)?;
-        Ok(squared.mean(None)?)
+        let diff = student.subtract(teacher);
+        let squared = diff.multiply(&diff);
+        Ok(squared.mean_all())
     }
 
     /// Cosine similarity loss (1 - cosine_similarity) (MLX fallback).
@@ -255,35 +253,35 @@ impl HiddenStateLoss {
         // cos(t, s) = (t · s) / (||t|| * ||s||)
 
         // Dot product
-        let dot = teacher.multiply(student)?.sum_axes(&[-1], Some(true))?;
+        let dot = teacher.multiply(student).sum_axes(&[-1], true);
 
         // Norms
         let teacher_norm = teacher
-            .multiply(teacher)?
-            .sum_axes(&[-1], Some(true))?
-            .sqrt()?;
+            .multiply(teacher)
+            .sum_axes(&[-1], true)
+            .sqrt();
         let student_norm = student
-            .multiply(student)?
-            .sum_axes(&[-1], Some(true))?
-            .sqrt()?;
+            .multiply(student)
+            .sum_axes(&[-1], true)
+            .sqrt();
 
         // Cosine similarity with epsilon for stability
         let eps = Array::from_f32(1e-8);
-        let norms = teacher_norm.multiply(&student_norm)?.add(&eps)?;
-        let cosine_sim = dot.divide(&norms)?;
+        let norms = teacher_norm.multiply(&student_norm).add(&eps);
+        let cosine_sim = dot.divide(&norms);
 
         // Loss = 1 - cosine_similarity
         let one = Array::from_f32(1.0);
-        let loss = one.subtract(&cosine_sim)?;
+        let loss = one.subtract(&cosine_sim);
 
-        Ok(loss.mean(None)?)
+        Ok(loss.mean_all())
     }
 
     /// L1 loss on hidden states (MLX only - no Metal kernel).
     fn l1_loss_mlx(&self, teacher: &Array, student: &Array) -> Result<Array> {
-        let diff = student.subtract(teacher)?;
-        let abs_diff = diff.abs()?;
-        Ok(abs_diff.mean(None)?)
+        let diff = student.subtract(teacher);
+        let abs_diff = diff.abs_val();
+        Ok(abs_diff.mean_all())
     }
 
     /// Get the name of this loss.
@@ -398,7 +396,7 @@ impl LayerDistillation {
                     &teacher_hiddens[*teacher_idx],
                     &student_hiddens[*student_idx],
                 )?;
-                total_loss = total_loss.add(&loss.multiply(&Array::from_f32(w))?)?;
+                total_loss = total_loss.add(&loss.multiply(&Array::from_f32(w)));
                 weight_total += w;
             } else {
                 tracing::warn!(
@@ -414,8 +412,8 @@ impl LayerDistillation {
         }
 
         if weight_total > 0.0 {
-            let avg = total_loss.divide(&Array::from_f32(weight_total))?;
-            Ok(avg.multiply(&Array::from_f32(self.global_weight))?)
+            let avg = total_loss.divide(&Array::from_f32(weight_total));
+            Ok(avg.multiply(&Array::from_f32(self.global_weight)))
         } else {
             Ok(Array::from_f32(0.0))
         }
@@ -467,8 +465,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_mse_hidden_loss() {
-        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
-        let student = Array::from_slice(&[2.0_f32, 3.0, 4.0, 5.0], &[1, 2, 2]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
+        let student = Array::from_f32_slice(&[2.0_f32, 3.0, 4.0, 5.0], &[1, 2, 2]);
 
         let loss = HiddenStateLoss::mse();
         let result = loss.compute(&teacher, &student).unwrap();
@@ -485,7 +483,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_cosine_identical_vectors() {
-        let hidden = Array::from_slice(&[1.0_f32, 0.0, 0.0, 1.0], &[1, 2, 2]);
+        let hidden = Array::from_f32_slice(&[1.0_f32, 0.0, 0.0, 1.0], &[1, 2, 2]);
 
         let loss = HiddenStateLoss::cosine();
         let result = loss.compute(&hidden, &hidden).unwrap();
@@ -503,8 +501,8 @@ mod tests {
     #[serial]
     fn test_cosine_orthogonal_vectors() {
         // Orthogonal vectors: [1, 0] and [0, 1]
-        let teacher = Array::from_slice(&[1.0_f32, 0.0], &[1, 1, 2]);
-        let student = Array::from_slice(&[0.0_f32, 1.0], &[1, 1, 2]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 0.0], &[1, 1, 2]);
+        let student = Array::from_f32_slice(&[0.0_f32, 1.0], &[1, 1, 2]);
 
         let loss = HiddenStateLoss::cosine();
         let result = loss.compute(&teacher, &student).unwrap();
@@ -521,8 +519,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_l1_hidden_loss() {
-        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
-        let student = Array::from_slice(&[2.0_f32, 3.0, 4.0, 5.0], &[1, 2, 2]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
+        let student = Array::from_f32_slice(&[2.0_f32, 3.0, 4.0, 5.0], &[1, 2, 2]);
 
         let loss = HiddenStateLoss::l1();
         let result = loss.compute(&teacher, &student).unwrap();
@@ -552,10 +550,10 @@ mod tests {
     #[serial]
     fn test_layer_distillation_compute() {
         let teacher_hiddens: Vec<Array> = (0..4)
-            .map(|_| Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 2, 2]))
+            .map(|_| Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 2, 2]))
             .collect();
         let student_hiddens: Vec<Array> = (0..2)
-            .map(|_| Array::from_slice(&[2.0_f32, 3.0, 4.0, 5.0], &[1, 2, 2]))
+            .map(|_| Array::from_f32_slice(&[2.0_f32, 3.0, 4.0, 5.0], &[1, 2, 2]))
             .collect();
 
         let mapping = vec![(0, 0), (2, 1)]; // Map teacher 0 -> student 0, teacher 2 -> student 1
@@ -595,11 +593,11 @@ mod tests {
             .map(|i| ((i * 7 % 100) as f32 - 50.0) / 100.0)
             .collect();
 
-        let teacher = Array::from_slice(
+        let teacher = Array::from_f32_slice(
             &teacher_data,
             &[batch_size as i32, seq_len as i32, hidden_dim as i32],
         );
-        let student = Array::from_slice(
+        let student = Array::from_f32_slice(
             &student_data,
             &[batch_size as i32, seq_len as i32, hidden_dim as i32],
         );

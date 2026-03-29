@@ -5,13 +5,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    module::{ModuleParamMut, ModuleParamRef, ModuleParameters},
-    nested::NestedValue,
-    nn,
+use pmetal_bridge::compat::{
+    Array, Exception, nn,
+    ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
 };
 
 use pmetal_core::LoraConfig;
@@ -149,18 +145,18 @@ impl LlamaLoraAttention {
 
         // Reshape for multi-head attention: [B, L, heads, head_dim]
         let queries = queries
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?; // [B, heads, L, head_dim]
         let keys = keys
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
         let values = values
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Apply RoPE
-        let queries = mlx_rs::module::Module::forward(&mut self.rope, &queries)?;
-        let keys = mlx_rs::module::Module::forward(&mut self.rope, &keys)?;
+        let queries = pmetal_bridge::compat::Module::forward(&mut self.rope, &queries)?;
+        let keys = pmetal_bridge::compat::Module::forward(&mut self.rope, &keys)?;
 
         // Expand KV heads for GQA if needed
         let keys = if self.n_kv_heads < self.n_heads {
@@ -177,18 +173,18 @@ impl LlamaLoraAttention {
         };
 
         // Scaled dot-product attention
-        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2])?)?;
+        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]))?;
         let scores = scores.multiply(Array::from_f32(self.scale))?;
 
         // Apply mask if provided
         let scores = if let Some(m) = mask {
-            scores.add(m)?
+            scores.add(m)
         } else {
             scores
         };
 
         // Softmax
-        let weights = mlx_rs::ops::softmax_axis(&scores, -1, None)?;
+        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1, None)?;
 
         // Attention output
         let output = weights.matmul(&values)?;
@@ -222,13 +218,13 @@ impl LlamaLoraAttention {
         let values = self.v_proj.forward(x)?;
 
         let queries = queries
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
         let keys = keys
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
         let values = values
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Apply RoPE with explicit position IDs so packed sequences get correct positions.
@@ -266,16 +262,16 @@ impl LlamaLoraAttention {
             values
         };
 
-        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2])?)?;
+        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]))?;
         let scores = scores.multiply(Array::from_f32(self.scale))?;
 
         let scores = if let Some(m) = mask {
-            scores.add(m)?
+            scores.add(m)
         } else {
             scores
         };
 
-        let weights = mlx_rs::ops::softmax_axis(&scores, -1, None)?;
+        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1, None)?;
         let output = weights.matmul(&values)?;
 
         let output = output
@@ -311,13 +307,13 @@ impl LlamaLoraAttention {
 
         // Reshape for multi-head attention: [B, L, heads, head_dim]
         let queries = queries
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?; // [B, heads, L, head_dim]
         let keys = keys
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
         let values = values
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Get RoPE offset and apply RoPE
@@ -327,8 +323,8 @@ impl LlamaLoraAttention {
             let keys = apply_rope(&keys, self.head_dim, false, self.rope.base, 1.0, offset)?;
             (queries, keys, values)
         } else {
-            let queries = mlx_rs::module::Module::forward(&mut self.rope, &queries)?;
-            let keys = mlx_rs::module::Module::forward(&mut self.rope, &keys)?;
+            let queries = pmetal_bridge::compat::Module::forward(&mut self.rope, &queries)?;
+            let keys = pmetal_bridge::compat::Module::forward(&mut self.rope, &keys)?;
             (queries, keys, values)
         };
 
@@ -376,7 +372,7 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
     let head_dim = shape[3];
 
     let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
-    let x = mlx_rs::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
+    let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
     x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])
 }
 
@@ -488,14 +484,14 @@ impl LlamaLoraDecoderLayer {
     /// Forward pass.
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         // Pre-norm + attention + residual
-        let normed = mlx_rs::module::Module::forward(&mut self.input_layernorm, x)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward(&normed, mask)?;
         let h = x.add(&attn_out)?;
 
         // Pre-norm + MLP + residual
-        let normed = mlx_rs::module::Module::forward(&mut self.post_attention_layernorm, &h)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out)?)
+        Ok(h.add(&mlp_out))
     }
 
     /// Forward pass with KV cache for efficient inference.
@@ -511,14 +507,14 @@ impl LlamaLoraDecoderLayer {
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, LoraError> {
         // Pre-norm + attention + residual
-        let normed = mlx_rs::module::Module::forward(&mut self.input_layernorm, x)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
         let h = x.add(&attn_out)?;
 
         // Pre-norm + MLP + residual
-        let normed = mlx_rs::module::Module::forward(&mut self.post_attention_layernorm, &h)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out)?)
+        Ok(h.add(&mlp_out))
     }
 
     /// Forward pass with explicit position IDs for packed sequence training.
@@ -528,15 +524,15 @@ impl LlamaLoraDecoderLayer {
         mask: Option<&Array>,
         position_ids: &Array,
     ) -> Result<Array, LoraError> {
-        let normed = mlx_rs::module::Module::forward(&mut self.input_layernorm, x)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self
             .self_attn
             .forward_with_positions(&normed, mask, position_ids)?;
         let h = x.add(&attn_out)?;
 
-        let normed = mlx_rs::module::Module::forward(&mut self.post_attention_layernorm, &h)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out)?)
+        Ok(h.add(&mlp_out))
     }
 
     /// Get number of trainable parameters.
@@ -599,7 +595,7 @@ impl LlamaLoraModel {
         checkpoint_config: Option<&CheckpointConfig>,
     ) -> Result<Array, LoraError> {
         // Embed tokens
-        let mut hidden_states = mlx_rs::module::Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states = pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // Compute noise magnitude: alpha / sqrt(seq_len * embed_dim)
         let seq_len = input_ids.dim(1) as f32;
@@ -607,7 +603,7 @@ impl LlamaLoraModel {
         let mag = noise_alpha / (seq_len * embed_dim).sqrt();
 
         // Add uniform noise U(-mag, mag) — auto-diffable through the noise
-        let noise = mlx_rs::random::uniform::<_, f32>(-mag, mag, hidden_states.shape(), None)?;
+        let noise = pmetal_bridge::compat::random::uniform_range(-mag, mag, hidden_states.shape(), pmetal_bridge::compat::Dtype::Float32);
         hidden_states = hidden_states.add(&noise)?;
 
         // Create causal mask if not provided
@@ -631,7 +627,7 @@ impl LlamaLoraModel {
             }
         }
 
-        Ok(mlx_rs::module::Module::forward(
+        Ok(pmetal_bridge::compat::Module::forward(
             &mut self.norm,
             &hidden_states,
         )?)
@@ -660,7 +656,7 @@ impl LlamaLoraModel {
         checkpoint_config: Option<&CheckpointConfig>,
     ) -> Result<Array, LoraError> {
         // Get embeddings
-        let mut hidden_states = mlx_rs::module::Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states = pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // Create causal mask if not provided
         let mask = if mask.is_none() {
@@ -689,7 +685,7 @@ impl LlamaLoraModel {
         }
 
         // Final norm
-        Ok(mlx_rs::module::Module::forward(
+        Ok(pmetal_bridge::compat::Module::forward(
             &mut self.norm,
             &hidden_states,
         )?)
@@ -708,7 +704,7 @@ impl LlamaLoraModel {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, LoraError> {
         // Get embeddings
-        let mut hidden_states = mlx_rs::module::Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states = pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // Don't create explicit causal mask - fused SDPA handles it internally
         // with proper dtype handling. Only pass through user-provided masks.
@@ -729,7 +725,7 @@ impl LlamaLoraModel {
         }
 
         // Final norm
-        Ok(mlx_rs::module::Module::forward(
+        Ok(pmetal_bridge::compat::Module::forward(
             &mut self.norm,
             &hidden_states,
         )?)
@@ -745,7 +741,7 @@ impl LlamaLoraModel {
         mask: Option<&Array>,
         position_ids: &Array,
     ) -> Result<Array, LoraError> {
-        let mut hidden_states = mlx_rs::module::Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states = pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // The caller provides a pre-built block-diagonal attention mask for packed sequences;
         // do not auto-generate a causal mask here.
@@ -753,7 +749,7 @@ impl LlamaLoraModel {
             hidden_states = layer.forward_with_positions(&hidden_states, mask, position_ids)?;
         }
 
-        Ok(mlx_rs::module::Module::forward(
+        Ok(pmetal_bridge::compat::Module::forward(
             &mut self.norm,
             &hidden_states,
         )?)
@@ -889,7 +885,7 @@ impl LlamaLoraForCausalLM {
 
         // Get logits from LM head or shared embeddings
         if let Some(ref mut lm_head) = self.lm_head {
-            Ok(mlx_rs::module::Module::forward(lm_head, &hidden_states)?)
+            Ok(pmetal_bridge::compat::Module::forward(lm_head, &hidden_states)?)
         } else {
             // Tie weights: use embedding weight transposed
             Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
@@ -951,7 +947,7 @@ impl LlamaLoraForCausalLM {
                 .forward_noised(input_ids, mask, noise_alpha, checkpoint_config.as_ref())?;
 
         if let Some(ref mut lm_head) = self.lm_head {
-            Ok(mlx_rs::module::Module::forward(lm_head, &hidden_states)?)
+            Ok(pmetal_bridge::compat::Module::forward(lm_head, &hidden_states)?)
         } else {
             Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
         }
@@ -976,7 +972,7 @@ impl LlamaLoraForCausalLM {
 
         // Get logits from LM head or shared embeddings
         if let Some(ref mut lm_head) = self.lm_head {
-            Ok(mlx_rs::module::Module::forward(lm_head, &hidden_states)?)
+            Ok(pmetal_bridge::compat::Module::forward(lm_head, &hidden_states)?)
         } else {
             // Tie weights: use embedding weight transposed
             Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
@@ -1166,7 +1162,7 @@ impl LlamaLoraForCausalLM {
         &mut self,
         weights: &std::collections::HashMap<String, Array>,
     ) -> Result<(), LoraError> {
-        use mlx_rs::module::Param;
+        use pmetal_bridge::compat::Param;
 
         // Load embed_tokens
         if let Some(w) = weights.get("model.embed_tokens.weight") {
@@ -1561,10 +1557,10 @@ crate::impl_trainable_model!(LlamaLoraForCausalLM);
 
 /// Create a causal attention mask.
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;
+    let mask = pmetal_bridge::compat::ops::tri::<f32>(seq_len, None, None)?;
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
-    mlx_rs::ops::r#where(&mask.eq(&zero)?, &neg_inf, &zero)
+    pmetal_bridge::compat::ops::where_fn(&mask.eq(&zero), &neg_inf, &zero)
 }
 
 #[cfg(test)]
@@ -1612,7 +1608,7 @@ mod tests {
         let lora_config = small_lora_config();
         let mut attn = LlamaLoraAttention::new(&config, &lora_config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1624,7 +1620,7 @@ mod tests {
         let lora_config = small_lora_config();
         let mut model = LlamaLoraForCausalLM::new(config, lora_config).unwrap();
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]);
@@ -1650,7 +1646,7 @@ mod tests {
         let lora_config = small_lora_config();
         let mut model = LlamaLoraForCausalLM::new(config, lora_config).unwrap();
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
 
         // Get output before merge
         let output_before = model.forward(&input_ids, None).unwrap();

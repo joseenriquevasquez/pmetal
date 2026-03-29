@@ -44,8 +44,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use mlx_rs::Array;
-use mlx_rs::module::{FlattenedModuleParam, ModuleParameters};
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception,
+    module::{FlattenedModuleParam, ModuleParameters},
+    ops, transforms,
+};
 use thiserror::Error;
 
 // Note: metal_buffer_from_ptr and MetalBufferView are available for future
@@ -65,7 +68,7 @@ pub enum MlxMetalOptimizerError {
     Metal(#[from] MetalError),
     /// MLX error.
     #[error("MLX error: {0}")]
-    Mlx(#[from] mlx_rs::error::Exception),
+    Mlx(#[from] Exception),
     /// Parameter mismatch.
     #[error("Parameter count mismatch: expected {expected}, got {actual}")]
     ParamCountMismatch { expected: usize, actual: usize },
@@ -433,7 +436,7 @@ impl MlxMetalOptimizer {
         // Validate all parameters are f32 and contiguous
         for name in &self.layout.names {
             let arr = &params[name];
-            if arr.dtype() != mlx_rs::Dtype::Float32 {
+            if arr.dtype_raw() != Dtype::Float32.as_i32() {
                 return Err(MlxMetalOptimizerError::UnsupportedDtype {
                     name: name.to_string(),
                 });
@@ -459,8 +462,8 @@ impl MlxMetalOptimizer {
         self.state.clear();
         for (idx, name) in self.layout.names.iter().enumerate() {
             let shape = &self.layout.shapes[idx];
-            let m = Array::zeros::<f32>(shape)?;
-            let v = Array::zeros::<f32>(shape)?;
+            let m = ops::zeros_dtype(shape, Dtype::Float32);
+            let v = ops::zeros_dtype(shape, Dtype::Float32);
             self.state.insert(name.clone(), (m, v));
         }
 
@@ -505,13 +508,17 @@ impl MlxMetalOptimizer {
 
         for name in &self.layout.names {
             let arr = &params[name];
-            arr.eval()?;
+            arr.eval();
 
             let size = arr.size();
-            let src_ptr = unsafe { mlx_sys::mlx_array_data_float32(arr.as_ptr()) };
+            let src_data = arr.as_slice::<f32>();
 
             unsafe {
-                std::ptr::copy_nonoverlapping(src_ptr, flat_slice.as_mut_ptr().add(offset), size);
+                std::ptr::copy_nonoverlapping(
+                    src_data.as_ptr(),
+                    flat_slice.as_mut_ptr().add(offset),
+                    size,
+                );
             }
 
             offset += size;
@@ -560,9 +567,9 @@ impl MlxMetalOptimizer {
 
         for (i, name) in self.layout.names.iter().enumerate() {
             if let Some(grad) = grads.get(name) {
-                grad.eval()?;
+                grad.eval();
 
-                // Debug: verify eval worked and check raw pointer data
+                // Debug: verify eval worked and check data
                 if i == 0 && self.step <= 3 {
                     let slice = grad.as_slice::<f32>();
                     let max = slice.iter().cloned().fold(0.0f32, f32::max);
@@ -575,26 +582,14 @@ impl MlxMetalOptimizer {
                         min,
                         &slice[..4.min(slice.len())]
                     );
-
-                    // Also check raw pointer path
-                    let src_ptr = unsafe { mlx_sys::mlx_array_data_float32(grad.as_ptr()) };
-                    let ptr_slice = unsafe { std::slice::from_raw_parts(src_ptr, grad.size()) };
-                    let ptr_max = ptr_slice.iter().cloned().fold(0.0f32, f32::max);
-                    let ptr_min = ptr_slice.iter().cloned().fold(0.0f32, f32::min);
-                    tracing::info!(
-                        "raw_ptr - max={:.6}, min={:.6}, first4={:?}",
-                        ptr_max,
-                        ptr_min,
-                        &ptr_slice[..4.min(ptr_slice.len())]
-                    );
                 }
 
                 let size = grad.size();
-                let src_ptr = unsafe { mlx_sys::mlx_array_data_float32(grad.as_ptr()) };
+                let src_data = grad.as_slice::<f32>();
 
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        src_ptr,
+                        src_data.as_ptr(),
                         flat_slice.as_mut_ptr().add(offset),
                         size,
                     );
@@ -630,7 +625,7 @@ impl MlxMetalOptimizer {
             let shape = params[name].shape().to_vec();
 
             // Create new array with updated values
-            let new_arr = Array::from_slice(updated_data, &shape);
+            let new_arr = Array::from_f32_slice(updated_data, &shape);
 
             // Replace the parameter
             params.insert(name.clone(), new_arr);
@@ -809,7 +804,7 @@ impl MlxMetalOptimizer {
         &mut self,
         model: &mut M,
         gradients: &FlattenedModuleParam,
-    ) -> std::result::Result<(), mlx_rs::error::Exception> {
+    ) -> std::result::Result<(), Exception> {
         // Delegate to SOTA vectorized implementation
         self.update_vectorized(model, gradients)
     }
@@ -827,9 +822,7 @@ impl MlxMetalOptimizer {
         &mut self,
         model: &mut M,
         gradients: &FlattenedModuleParam,
-    ) -> std::result::Result<(), mlx_rs::error::Exception> {
-        use mlx_rs::ops::{concatenate_axis, split_sections};
-
+    ) -> std::result::Result<(), Exception> {
         // Initialize layout if needed
         if !self.initialized {
             let params: FlattenedModuleParam = model
@@ -839,7 +832,7 @@ impl MlxMetalOptimizer {
                 .map(|(k, v)| (k, v.clone()))
                 .collect();
             self.initialize_from_params(&params)
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+                .map_err(|e| Exception::custom(e.to_string()))?;
         }
 
         // Get mutable model parameters
@@ -863,10 +856,10 @@ impl MlxMetalOptimizer {
             .names
             .iter()
             .map(|name| match model_params.get(&**name) {
-                Some(p) => (*p).reshape(&[-1]).unwrap_or_else(|_| (*p).clone()),
+                Some(p) => (*p).reshape(&[-1]),
                 None => {
                     missing_params.push(name);
-                    Array::zeros::<f32>(&[0]).unwrap()
+                    ops::zeros_dtype(&[0], Dtype::Float32)
                 }
             })
             .collect();
@@ -878,11 +871,11 @@ impl MlxMetalOptimizer {
             .enumerate()
             .map(|(i, name)| {
                 match gradients.get(name) {
-                    Some(g) => g.reshape(&[-1]).unwrap_or_else(|_| g.clone()),
+                    Some(g) => g.reshape(&[-1]),
                     None => {
                         missing_grads.push(name);
                         // Use zeros with correct size from layout
-                        Array::zeros::<f32>(&[self.layout.sizes[i] as i32]).unwrap()
+                        ops::zeros_dtype(&[self.layout.sizes[i] as i32], Dtype::Float32)
                     }
                 }
             })
@@ -892,7 +885,7 @@ impl MlxMetalOptimizer {
         if !missing_grads.is_empty() {
             // If ALL gradients are missing, this is a critical error
             if missing_grads.len() == self.layout.names.len() {
-                return Err(mlx_rs::error::Exception::custom(
+                return Err(Exception::custom(
                     "MlxMetalOptimizer: All gradients are missing. \
                      This indicates backward pass was not called or gradients were lost.",
                 ));
@@ -910,7 +903,7 @@ impl MlxMetalOptimizer {
 
         // Missing params after initialization is a critical error - fail fast
         if !missing_params.is_empty() {
-            return Err(mlx_rs::error::Exception::custom(format!(
+            return Err(Exception::custom(format!(
                 "MlxMetalOptimizer: {} parameter(s) missing from model after initialization: {:?}. \
                  This indicates the model structure changed. Re-initialize the optimizer.",
                 missing_params.len(),
@@ -922,8 +915,8 @@ impl MlxMetalOptimizer {
         let param_refs: Vec<&Array> = param_arrays.iter().collect();
         let grad_refs: Vec<&Array> = grad_arrays.iter().collect();
 
-        let flat_params = concatenate_axis(&param_refs, 0)?;
-        let flat_grads = concatenate_axis(&grad_refs, 0)?;
+        let flat_params = ops::concatenate_axis(&param_refs, 0);
+        let flat_grads = ops::concatenate_axis(&grad_refs, 0);
 
         // Optional NaN/Inf validation for debugging numerical issues
         if self.config.validate_numerics {
@@ -932,15 +925,15 @@ impl MlxMetalOptimizer {
 
         // Initialize flat_m/flat_v on first step
         if self.flat_m.is_none() {
-            self.flat_m = Some(Array::zeros::<f32>(&[self.layout.total_elements as i32])?);
-            self.flat_v = Some(Array::zeros::<f32>(&[self.layout.total_elements as i32])?);
+            self.flat_m = Some(ops::zeros_dtype(&[self.layout.total_elements as i32], Dtype::Float32));
+            self.flat_v = Some(ops::zeros_dtype(&[self.layout.total_elements as i32], Dtype::Float32));
         }
 
         let flat_m = self.flat_m.as_ref().ok_or_else(|| {
-            mlx_rs::error::Exception::custom("Optimizer momentum state (flat_m) not initialized")
+            Exception::custom("Optimizer momentum state (flat_m) not initialized")
         })?;
         let flat_v = self.flat_v.as_ref().ok_or_else(|| {
-            mlx_rs::error::Exception::custom("Optimizer velocity state (flat_v) not initialized")
+            Exception::custom("Optimizer velocity state (flat_v) not initialized")
         })?;
 
         // SINGLE VECTORIZED ADAMW UPDATE (4 MLX ops instead of 392 × 4)
@@ -954,32 +947,32 @@ impl MlxMetalOptimizer {
 
         // m = beta1 * m + (1-beta1) * grad
         let new_flat_m = beta1
-            .multiply(flat_m)?
-            .add(&one_minus_b1.multiply(&flat_grads)?)?;
+            .multiply(flat_m)
+            .add(&one_minus_b1.multiply(&flat_grads));
 
         // v = beta2 * v + (1-beta2) * grad²
-        let grad_sq = flat_grads.multiply(&flat_grads)?;
+        let grad_sq = flat_grads.multiply(&flat_grads);
         let new_flat_v = beta2
-            .multiply(flat_v)?
-            .add(&one_minus_b2.multiply(&grad_sq)?)?;
+            .multiply(flat_v)
+            .add(&one_minus_b2.multiply(&grad_sq));
 
         // update = m / (sqrt(v) + eps)
-        let denom = new_flat_v.sqrt()?.add(eps)?;
-        let update = new_flat_m.divide(&denom)?;
+        let denom = new_flat_v.sqrt().add(eps);
+        let update = new_flat_m.divide(&denom);
 
         // new_params = params * (1 - lr*wd) - lr * update
         let new_flat_params = flat_params
-            .multiply(&one_minus_lr_wd)?
-            .subtract(&lr.multiply(&update)?)?;
+            .multiply(&one_minus_lr_wd)
+            .subtract(&lr.multiply(&update));
 
         // LAZY SPLIT: O(1) - just builds computation graph
-        let new_param_arrays = split_sections(&new_flat_params, &self.layout.split_indices, 0)?;
+        let new_param_arrays = ops::split_sections(&new_flat_params, &self.layout.split_indices, 0);
 
         // Reshape and assign back to model (still lazy)
         for (i, name) in self.layout.names.iter().enumerate() {
             if let Some(param) = model_params.get_mut(&**name) {
                 let shape = &self.layout.shapes[i];
-                **param = new_param_arrays[i].reshape(shape)?;
+                **param = new_param_arrays[i].reshape(shape);
             }
         }
 
@@ -997,7 +990,7 @@ impl MlxMetalOptimizer {
             }
             to_eval.push(self.flat_m.as_ref().unwrap());
             to_eval.push(self.flat_v.as_ref().unwrap());
-            mlx_rs::transforms::eval(to_eval)?;
+            transforms::eval(to_eval);
         }
 
         Ok(())
@@ -1023,7 +1016,7 @@ impl MlxMetalOptimizer {
         &mut self,
         model: &mut M,
         gradients: &FlattenedModuleParam,
-    ) -> std::result::Result<(), mlx_rs::error::Exception> {
+    ) -> std::result::Result<(), Exception> {
         // Initialize layout if needed
         if !self.initialized {
             let params: FlattenedModuleParam = model
@@ -1033,7 +1026,7 @@ impl MlxMetalOptimizer {
                 .map(|(k, v)| (k, v.clone()))
                 .collect();
             self.initialize_from_params(&params)
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))?;
+                .map_err(|e| Exception::custom(e.to_string()))?;
         }
 
         // Get mutable model parameters ONCE at the start
@@ -1072,14 +1065,14 @@ impl MlxMetalOptimizer {
             ) {
                 // Debug: Log first param details
                 if debug_idx == 0 && self.step <= 3 {
-                    grad.eval()?;
-                    (*m).eval()?;
-                    (*v).eval()?;
-                    (**param).eval()?;
-                    let g_val = unsafe { *mlx_sys::mlx_array_data_float32(grad.as_ptr()) };
-                    let m_val = unsafe { *mlx_sys::mlx_array_data_float32(m.as_ptr()) };
-                    let v_val = unsafe { *mlx_sys::mlx_array_data_float32(v.as_ptr()) };
-                    let p_val = unsafe { *mlx_sys::mlx_array_data_float32((*param).as_ptr()) };
+                    grad.eval();
+                    (*m).eval();
+                    (*v).eval();
+                    (**param).eval();
+                    let g_val = grad.as_slice::<f32>()[0];
+                    let m_val = m.as_slice::<f32>()[0];
+                    let v_val = v.as_slice::<f32>()[0];
+                    let p_val = (**param).as_slice::<f32>()[0];
                     tracing::info!(
                         "MLX BEFORE[0]: step={}, lr={:.6}, p={:.8}, g={:.8e}, m={:.8e}, v={:.8e}",
                         self.step,
@@ -1095,30 +1088,30 @@ impl MlxMetalOptimizer {
                 // m/v are MLX Arrays from state - no from_slice needed!
                 // Use references to m/v to avoid move (we need to assign back to them)
                 let new_m = beta1_arr
-                    .multiply(&*m)?
-                    .add(&one_minus_b1.multiply(grad)?)?;
-                let grad_sq = grad.multiply(grad)?;
+                    .multiply(&*m)
+                    .add(&one_minus_b1.multiply(grad));
+                let grad_sq = grad.multiply(grad);
                 let new_v = beta2_arr
-                    .multiply(&*v)?
-                    .add(&one_minus_b2.multiply(&grad_sq)?)?;
+                    .multiply(&*v)
+                    .add(&one_minus_b2.multiply(&grad_sq));
 
                 // Compute update using MLX ops
-                let denom = new_v.sqrt()?.add(eps_arr)?;
-                let update = new_m.divide(&denom)?;
+                let denom = new_v.sqrt().add(eps_arr);
+                let update = new_m.divide(&denom);
 
                 // KEY: Use the actual param (**param) in the computation!
                 // This maintains the MLX computational graph connection.
-                let decayed_param = (**param).multiply(&one_minus_lr_wd)?;
-                let new_param = decayed_param.subtract(&lr_arr.multiply(&update)?)?;
+                let decayed_param = (**param).multiply(&one_minus_lr_wd);
+                let new_param = decayed_param.subtract(&lr_arr.multiply(&update));
 
                 // Debug: Log first param after update (before move)
                 if debug_idx == 0 && self.step <= 3 {
-                    new_m.eval()?;
-                    new_v.eval()?;
-                    new_param.eval()?;
-                    let m_new = unsafe { *mlx_sys::mlx_array_data_float32(new_m.as_ptr()) };
-                    let v_new = unsafe { *mlx_sys::mlx_array_data_float32(new_v.as_ptr()) };
-                    let p_new = unsafe { *mlx_sys::mlx_array_data_float32(new_param.as_ptr()) };
+                    new_m.eval();
+                    new_v.eval();
+                    new_param.eval();
+                    let m_new = new_m.as_slice::<f32>()[0];
+                    let v_new = new_v.as_slice::<f32>()[0];
+                    let p_new = new_param.as_slice::<f32>()[0];
                     tracing::info!(
                         "MLX AFTER[0]: p={:.8}, m={:.8e}, v={:.8e}",
                         p_new,
@@ -1152,7 +1145,7 @@ impl MlxMetalOptimizer {
 
         // Single eval call for all arrays
         // Pass Vec directly since Vec<&Array> implements IntoIterator<Item = &Array>
-        mlx_rs::transforms::eval(arrays_to_eval)?;
+        transforms::eval(arrays_to_eval);
 
         Ok(())
     }
@@ -1164,39 +1157,24 @@ impl MlxMetalOptimizer {
     fn validate_gradients(
         &self,
         flat_grads: &Array,
-    ) -> std::result::Result<(), mlx_rs::error::Exception> {
-        use mlx_rs::ops::{any, is_inf, is_nan, logical_or};
-
+    ) -> std::result::Result<(), Exception> {
         // Build lazy check (single eval for both NaN and Inf)
-        let has_nan = any(is_nan(flat_grads)?, None)?;
-        let has_inf = any(is_inf(flat_grads)?, None)?;
-        let has_bad = logical_or(&has_nan, &has_inf)?;
+        let has_nan = ops::any(&ops::is_nan(flat_grads), None, false);
+        let has_inf = ops::any(&ops::is_inf(flat_grads), None, false);
+        let has_bad = ops::logical_or(&has_nan, &has_inf);
 
         // Eval the check
-        has_bad.eval()?;
+        has_bad.eval();
 
         // Extract result (scalar bool)
-        let bad_values = {
-            let ptr = unsafe { mlx_sys::mlx_array_data_bool(has_bad.as_ptr()) };
-            if ptr.is_null() {
-                false // If we can't check, assume OK
-            } else {
-                unsafe { *ptr }
-            }
-        };
+        let bad_values = ops::item_bool(&has_bad);
 
         if bad_values {
             // Determine which type of bad value
-            has_nan.eval()?;
-            has_inf.eval()?;
-            let nan_present = {
-                let ptr = unsafe { mlx_sys::mlx_array_data_bool(has_nan.as_ptr()) };
-                !ptr.is_null() && unsafe { *ptr }
-            };
-            let inf_present = {
-                let ptr = unsafe { mlx_sys::mlx_array_data_bool(has_inf.as_ptr()) };
-                !ptr.is_null() && unsafe { *ptr }
-            };
+            has_nan.eval();
+            has_inf.eval();
+            let nan_present = ops::item_bool(&has_nan);
+            let inf_present = ops::item_bool(&has_inf);
 
             let issue = match (nan_present, inf_present) {
                 (true, true) => "NaN and Inf values",
@@ -1216,7 +1194,7 @@ impl MlxMetalOptimizer {
             );
 
             // Return error to stop training early
-            return Err(mlx_rs::error::Exception::custom(format!(
+            return Err(Exception::custom(format!(
                 "Gradient validation failed: {} detected at step {}",
                 issue, self.step
             )));
@@ -1344,8 +1322,6 @@ mod tests {
 
     #[test]
     fn test_fused_step() {
-        use mlx_rs::array;
-
         let mut opt = MlxMetalOptimizerBuilder::new(0.1)
             .weight_decay(0.0)
             .build()
@@ -1353,12 +1329,12 @@ mod tests {
 
         // Create simple parameters
         let mut params: FlattenedModuleParam = HashMap::new();
-        params.insert(Rc::from("weight"), array!([1.0f32, 2.0, 3.0, 4.0]));
+        params.insert(Rc::from("weight"), Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]));
 
         // Create gradients (constant)
         let grads: FlattenedModuleParam = {
             let mut g = HashMap::new();
-            g.insert(Rc::from("weight"), array!([0.1f32, 0.1, 0.1, 0.1]));
+            g.insert(Rc::from("weight"), Array::from_f32_slice(&[0.1f32, 0.1, 0.1, 0.1], &[4]));
             g
         };
 
@@ -1367,7 +1343,7 @@ mod tests {
 
         // Verify params were updated (should decrease with positive gradients)
         let updated = params.get(&Rc::from("weight")).unwrap();
-        updated.eval().unwrap();
+        updated.eval();
 
         let values: Vec<f32> = updated.as_slice().to_vec();
         assert!(values[0] < 1.0, "Weight should decrease, got {}", values[0]);
@@ -1377,8 +1353,6 @@ mod tests {
     /// Both should produce the same parameter updates given the same inputs.
     #[test]
     fn test_mlx_vs_fused_equivalence() {
-        use mlx_rs::array;
-
         // Create two identical optimizers
         let mut opt_mlx = MlxMetalOptimizerBuilder::new(0.1)
             .weight_decay(0.01)
@@ -1391,8 +1365,8 @@ mod tests {
             .unwrap();
 
         // Create identical initial parameters
-        let p0 = array!([1.0f32, 2.0, 3.0, 4.0]);
-        let g0 = array!([0.1f32, 0.2, 0.3, 0.4]);
+        let p0 = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
+        let g0 = Array::from_f32_slice(&[0.1f32, 0.2, 0.3, 0.4], &[4]);
 
         // Initialize both with same layout
         let mut params_mlx: FlattenedModuleParam = HashMap::new();

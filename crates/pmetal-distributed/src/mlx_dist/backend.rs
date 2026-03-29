@@ -2,15 +2,15 @@
 //!
 //! Bridges the existing `DistributedBackend` trait (which operates on raw
 //! byte buffers) to MLX's native collective operations (which operate on
-//! `mlx_rs::Array`). This enables using JACCL/RDMA over Thunderbolt 5
-//! for gradient synchronization in the training loop.
+//! `pmetal_bridge::compat::Array`). This enables using JACCL/RDMA over
+//! Thunderbolt 5 for gradient synchronization in the training loop.
 
 use super::group::DistributedGroup;
 use super::ops;
 use crate::{DistributedBackend, ReduceOp};
 use anyhow::Result;
 use async_trait::async_trait;
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 use tracing::debug;
 
 /// Distributed backend using MLX native collectives (JACCL/Ring).
@@ -87,36 +87,32 @@ impl DistributedBackend for MlxDistributedBackend {
             std::slice::from_raw_parts(buffer.as_ptr().cast::<f32>(), num_elements)
         };
 
-        // Create an MLX array from the buffer (this is a view, not a copy,
-        // on unified memory).
+        // Create an MLX array from the buffer.
         let shape = [num_elements as i32];
-        let arr = Array::from_slice(f32_slice, &shape);
+        let arr = Array::from_f32_slice(f32_slice, &shape);
 
         // Perform all_sum using MLX native collectives.
         let reduced = ops::all_sum(&arr, Some(&self.group))
             .map_err(|e| anyhow::anyhow!("mlx all_sum failed: {e}"))?;
 
         // If Mean reduction, divide by world_size.
-        // Array's Div operator returns Array directly (panics on type mismatch,
-        // which cannot happen here since both operands are f32).
         let result = match op {
             ReduceOp::Sum => reduced,
             ReduceOp::Mean => {
-                let divisor = Array::from_slice(&[self.group.size() as f32], &[1]);
-                &reduced / &divisor
+                let divisor = Array::from_f32_slice(&[self.group.size() as f32], &[1]);
+                reduced.divide(&divisor)
             }
         };
 
-        // Evaluate the computation graph. as_slice() also evaluates internally,
-        // but calling eval() here lets us surface the error properly.
-        result
-            .eval()
-            .map_err(|e| anyhow::anyhow!("mlx eval failed: {e}"))?;
+        // Evaluate the computation graph.
+        let mut result = result;
+        result.eval();
 
         // Copy the result back into the caller's buffer.
-        // as_slice() panics on dtype mismatch or null data; neither can
-        // occur here because we built the array from f32 slices above.
-        let result_data = result.as_slice::<f32>();
+        let result_data = result
+            .to_f32_vec(num_elements)
+            .ok_or_else(|| anyhow::anyhow!("mlx eval failed: could not extract f32 data"))?;
+
         #[allow(unsafe_code)]
         let out_f32 = unsafe {
             // SAFETY: buffer is valid for writes, properly aligned for f32,
@@ -131,12 +127,11 @@ impl DistributedBackend for MlxDistributedBackend {
     async fn barrier(&self) -> Result<()> {
         // MLX doesn't have an explicit barrier. Use all_sum of a zero scalar
         // as a synchronization point — all ranks must participate.
-        let zero = Array::from_slice(&[0.0f32], &[1]);
+        let zero = Array::from_f32_slice(&[0.0f32], &[1]);
         let result = ops::all_sum(&zero, Some(&self.group))
             .map_err(|e| anyhow::anyhow!("mlx barrier (all_sum) failed: {e}"))?;
-        result
-            .eval()
-            .map_err(|e| anyhow::anyhow!("mlx barrier eval failed: {e}"))?;
+        let mut result = result;
+        result.eval();
         Ok(())
     }
 }

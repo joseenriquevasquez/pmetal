@@ -18,7 +18,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result};
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 
 // =============================================================================
 // Shared tensor-preparation logic
@@ -51,12 +51,12 @@ impl RamVectors {
         let mut nonzero_mask: Vec<Vec<bool>> = Vec::with_capacity(n_models);
 
         // Pull base onto CPU once
-        let base_flat = base.reshape(&[-1])?;
-        let base_vals: Vec<f32> = base_flat.as_slice().to_vec();
+        let mut base_clone = base.reshape(&[-1]);
+        let base_vals: Vec<f32> = base_clone.to_f32_vec(n_params).unwrap_or_default();
 
         for tensor in tensors {
-            let t_flat = tensor.reshape(&[-1])?;
-            let t_vals: Vec<f32> = t_flat.as_slice().to_vec();
+            let mut t_flat = tensor.reshape(&[-1]);
+            let t_vals: Vec<f32> = t_flat.to_f32_vec(n_params).unwrap_or_default();
 
             let delta: Vec<f32> = t_vals
                 .iter()
@@ -222,9 +222,9 @@ impl RamMerge {
             }
         }
 
-        let delta = Array::from_slice(&merged, &[n_params as i32]);
-        let delta = delta.reshape(&original_shape)?;
-        Ok(base.add(&delta)?)
+        let delta = Array::from_f32_slice(&merged, &[n_params as i32]);
+        let delta = delta.reshape(&original_shape);
+        Ok(base.add(&delta))
     }
 }
 
@@ -268,7 +268,7 @@ mod tests {
     use super::*;
 
     fn base() -> Array {
-        Array::from_slice(&[0.0_f32, 0.0, 0.0, 0.0], &[4])
+        Array::from_f32_slice(&[0.0_f32, 0.0, 0.0, 0.0], &[4])
     }
 
     #[test]
@@ -276,12 +276,12 @@ mod tests {
         // With one model every delta is "unique": result = base + delta
         let ram = RamMerge::new();
         let base = base();
-        let model = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[4]);
+        let model = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[4]);
         let params = vec![MergeParameters::default()];
         let global = MergeParameters::default();
 
-        let result = ram.merge(&[model], Some(&base), &params, &global).unwrap();
-        let r: Vec<f32> = result.as_slice().to_vec();
+        let mut result = ram.merge(&[model], Some(&base), &params, &global).unwrap();
+        let r = result.to_f32_vec(4).unwrap();
         assert!((r[0] - 1.0).abs() < 1e-5);
         assert!((r[1] - 2.0).abs() < 1e-5);
         assert!((r[2] - 3.0).abs() < 1e-5);
@@ -293,13 +293,13 @@ mod tests {
         // Model A modifies position 0, model B modifies position 1 — both unique.
         let ram = RamMerge::new();
         let base = base();
-        let m1 = Array::from_slice(&[1.0_f32, 0.0, 0.0, 0.0], &[4]);
-        let m2 = Array::from_slice(&[0.0_f32, 2.0, 0.0, 0.0], &[4]);
+        let m1 = Array::from_f32_slice(&[1.0_f32, 0.0, 0.0, 0.0], &[4]);
+        let m2 = Array::from_f32_slice(&[0.0_f32, 2.0, 0.0, 0.0], &[4]);
         let params = vec![MergeParameters::default(); 2];
         let global = MergeParameters::default();
 
-        let result = ram.merge(&[m1, m2], Some(&base), &params, &global).unwrap();
-        let r: Vec<f32> = result.as_slice().to_vec();
+        let mut result = ram.merge(&[m1, m2], Some(&base), &params, &global).unwrap();
+        let r = result.to_f32_vec(4).unwrap();
         // Both unique, both kept
         assert!((r[0] - 1.0).abs() < 1e-5);
         assert!((r[1] - 2.0).abs() < 1e-5);
@@ -312,13 +312,13 @@ mod tests {
         // Both models modify position 0 → shared → averaged.
         let ram = RamMerge::new();
         let base = base();
-        let m1 = Array::from_slice(&[1.0_f32, 0.0, 0.0, 0.0], &[4]);
-        let m2 = Array::from_slice(&[3.0_f32, 0.0, 0.0, 0.0], &[4]);
+        let m1 = Array::from_f32_slice(&[1.0_f32, 0.0, 0.0, 0.0], &[4]);
+        let m2 = Array::from_f32_slice(&[3.0_f32, 0.0, 0.0, 0.0], &[4]);
         let params = vec![MergeParameters::default(); 2];
         let global = MergeParameters::default();
 
-        let result = ram.merge(&[m1, m2], Some(&base), &params, &global).unwrap();
-        let r: Vec<f32> = result.as_slice().to_vec();
+        let mut result = ram.merge(&[m1, m2], Some(&base), &params, &global).unwrap();
+        let r = result.to_f32_vec(4).unwrap();
         // Shared → average of deltas (1.0 + 3.0) / 2 = 2.0
         assert!((r[0] - 2.0).abs() < 1e-5);
     }
@@ -330,16 +330,17 @@ mod tests {
         let params: Vec<MergeParameters> = vec![];
         let global = MergeParameters::default();
 
-        let result = ram.merge(&[], Some(&base), &params, &global).unwrap();
-        let r: Vec<f32> = result.as_slice().to_vec();
-        let b: Vec<f32> = base.as_slice().to_vec();
+        let mut result = ram.merge(&[], Some(&base), &params, &global).unwrap();
+        let r = result.to_f32_vec(4).unwrap();
+        let mut base_clone = base.clone();
+        let b = base_clone.to_f32_vec(4).unwrap();
         assert_eq!(r, b);
     }
 
     #[test]
     fn test_ram_requires_base() {
         let ram = RamMerge::new();
-        let model = Array::from_slice(&[1.0_f32, 2.0], &[2]);
+        let model = Array::from_f32_slice(&[1.0_f32, 2.0], &[2]);
         let params = vec![MergeParameters::default()];
         let global = MergeParameters::default();
         assert!(ram.merge(&[model], None, &params, &global).is_err());
@@ -348,8 +349,8 @@ mod tests {
     #[test]
     fn test_ram_preserves_shape() {
         let ram = RamMerge::new();
-        let base = Array::from_slice(&[0.0_f32; 12], &[3, 4]);
-        let model = Array::from_slice(&[1.0_f32; 12], &[3, 4]);
+        let base = Array::from_f32_slice(&[0.0_f32; 12], &[3, 4]);
+        let model = Array::from_f32_slice(&[1.0_f32; 12], &[3, 4]);
         let params = vec![MergeParameters::default()];
         let global = MergeParameters::default();
 
@@ -365,15 +366,15 @@ mod tests {
         let base = base();
         // Both models touch position 0: shared
         // Only m1 touches position 1: unique
-        let m1 = Array::from_slice(&[1.0_f32, 1.0, 1.0, 0.0], &[4]);
-        let m2 = Array::from_slice(&[1.0_f32, 0.0, 1.0, 1.0], &[4]);
+        let m1 = Array::from_f32_slice(&[1.0_f32, 1.0, 1.0, 0.0], &[4]);
+        let m2 = Array::from_f32_slice(&[1.0_f32, 0.0, 1.0, 1.0], &[4]);
         let params = vec![MergeParameters::default(); 2];
         let global = MergeParameters::default();
 
-        let result = ram_plus
+        let mut result = ram_plus
             .merge(&[m1, m2], Some(&base), &params, &global)
             .unwrap();
-        let r: Vec<f32> = result.as_slice().to_vec();
+        let r = result.to_f32_vec(4).unwrap();
 
         // Shared positions (0, 2): averaged as in basic RAM → 1.0
         assert!((r[0] - 1.0).abs() < 1e-5, "shared pos 0: {}", r[0]);

@@ -26,17 +26,10 @@
 //! Reference: tiiuae/falcon-h1 on Hugging Face
 //! Reference: transformers.models.falcon_h1.modeling_falcon_h1
 
+use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops};
+use pmetal_bridge::impl_module_params;
 use std::collections::HashMap;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, ModuleParameters as ModuleParametersTrait, Param},
-    nn,
-    ops::indexing::IndexOp,
-};
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use serde::Deserialize;
@@ -251,15 +244,11 @@ impl crate::traits::ModelConfig for FalconH1Config {
 // ============================================================================
 
 /// GQA attention with RoPE and optional key multiplier.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct FalconH1Attention {
-    #[param]
     pub q_proj: nn::Linear,
-    #[param]
     pub k_proj: nn::Linear,
-    #[param]
     pub v_proj: nn::Linear,
-    #[param]
     pub o_proj: nn::Linear,
 
     pub num_heads: i32,
@@ -270,6 +259,8 @@ pub struct FalconH1Attention {
     /// Scalar multiplied into keys before RoPE.
     pub key_multiplier: f32,
 }
+impl_module_params!(FalconH1Attention; q_proj, k_proj, v_proj, o_proj);
+
 
 impl FalconH1Attention {
     pub fn new(config: &FalconH1Config) -> Result<Self, Exception> {
@@ -324,18 +315,18 @@ impl FalconH1Attention {
         let v = Module::forward(&mut self.v_proj, x)?;
 
         // Reshape to multi-head format [B, L, heads, head_dim]
-        let q = q.reshape(&[batch, seq_len, self.num_heads, self.head_dim])?;
-        let k = k.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
-        let v = v.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
+        let q = q.reshape(&[batch, seq_len, self.num_heads, self.head_dim]);
+        let k = k.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim]);
+        let v = v.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim]);
 
         // Transpose to attention format [B, heads, L, head_dim]
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        let q = q.transpose_axes(&[0, 2, 1, 3]);
+        let k = k.transpose_axes(&[0, 2, 1, 3]);
+        let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Apply key multiplier BEFORE RoPE (matches HF reference implementation)
         let k = if (self.key_multiplier - 1.0).abs() > 1e-7 {
-            k.multiply(&Array::from_f32(self.key_multiplier))?
+            k.multiply(&Array::from_f32(self.key_multiplier))
         } else {
             k
         };
@@ -354,11 +345,10 @@ impl FalconH1Attention {
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
                 if let Some(output) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
-                {
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)? {
                     let output = output
-                        .transpose_axes(&[0, 2, 1, 3])?
-                        .reshape(&[batch, seq_len, -1])?;
+                        .transpose_axes(&[0, 2, 1, 3])
+                        .reshape(&[batch, seq_len, -1]);
                     return Module::forward(&mut self.o_proj, &output);
                 }
             }
@@ -375,8 +365,8 @@ impl FalconH1Attention {
 
         // [B, heads, L, head_dim] -> [B, L, hidden]
         let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
 
         Module::forward(&mut self.o_proj, &output)
     }
@@ -392,16 +382,13 @@ impl FalconH1Attention {
 /// from NemotronH (`ssm_update_single` for single-token decode, `ssm_attention`
 /// for multi-token prefill).  Weight names follow the HF convention:
 /// `model.layers.{i}.mamba.*`.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct FalconH1Mamba {
     /// Input projection: hidden_size -> (intermediate + conv_dim + num_heads)
-    #[param]
     pub in_proj: nn::Linear,
     /// Depthwise causal conv1d over conv_dim channels.
-    #[param]
     pub conv1d: nn::Conv1d,
     /// Output projection: intermediate -> hidden_size.
-    #[param]
     pub out_proj: nn::Linear,
 
     // SSM parameters: loaded from checkpoint, not re-derived.
@@ -425,6 +412,8 @@ pub struct FalconH1Mamba {
     pub time_step_min: f32,
     pub time_step_max: f32,
 }
+impl_module_params!(FalconH1Mamba; in_proj, conv1d, out_proj);
+
 
 impl FalconH1Mamba {
     pub fn new(config: &FalconH1Config) -> Result<Self, Exception> {
@@ -455,9 +444,9 @@ impl FalconH1Mamba {
 
         // SSM parameter arrays – initialised to neutral values, overwritten at
         // weight-load time.
-        let a_log = Array::zeros::<f32>(&[mamba_num_heads])?;
-        let d = Array::ones::<f32>(&[mamba_num_heads])?;
-        let dt_bias = Array::ones::<f32>(&[mamba_num_heads])?;
+        let a_log = Array::zeros_f32(&[mamba_num_heads]);
+        let d = Array::ones_f32(&[mamba_num_heads]);
+        let dt_bias = Array::ones_f32(&[mamba_num_heads]);
 
         let norm = MambaRMSNormGated::new(
             intermediate_size,
@@ -506,7 +495,7 @@ impl FalconH1Mamba {
 
         // Split along last axis: gate | conv_input | dt
         let split_at = &[intermediate_size, intermediate_size + conv_dim];
-        let parts = mlx_rs::ops::split_sections(&projected, split_at, -1)?;
+        let parts = pmetal_bridge::compat::ops::split_sections(&projected, split_at, -1);
         let gate = &parts[0]; // [B, L, intermediate_size]
         let conv_input = &parts[1]; // [B, L, conv_dim]
         let dt = &parts[2]; // [B, L, num_heads]
@@ -522,19 +511,19 @@ impl FalconH1Mamba {
                     let padded = mc.update_conv_state(conv_input, conv_kernel)?;
                     let out = Module::forward(&mut self.conv1d, &padded)?;
                     let out_len = out.dim(1);
-                    let out = out.index((.., (out_len - seq_len).., ..));
-                    nn::silu(&out)?
+                    let out = pmetal_bridge::compat::ops::slice_axis_from(&out, 1, (out_len - seq_len) as i32);
+                    nn::silu(&out)
                 }
                 None => {
                     let pad_amount = (conv_kernel - 1) as i32;
-                    let padded = mlx_rs::ops::pad(
+                    let padded = pmetal_bridge::compat::ops::pad(
                         conv_input,
                         &[(0i32, 0i32), (pad_amount, 0), (0, 0)],
-                        Array::from_int(0),
                         None,
-                    )?;
+                        Some(0.0),
+                    );
                     let out = Module::forward(&mut self.conv1d, &padded)?;
-                    nn::silu(&out)?
+                    nn::silu(&out)
                 }
             }
         };
@@ -542,15 +531,15 @@ impl FalconH1Mamba {
         // Split conv output: hidden_states | B | C
         let bc_size = n_groups * ssm_state_size;
         let conv_split_at = &[intermediate_size, intermediate_size + bc_size];
-        let conv_parts = mlx_rs::ops::split_sections(&conv_activated, conv_split_at, -1)?;
+        let conv_parts = pmetal_bridge::compat::ops::split_sections(&conv_activated, conv_split_at, -1);
         let hidden_states = &conv_parts[0]; // [B, L, intermediate_size]
         let b_proj = &conv_parts[1]; // [B, L, n_groups * ssm_state_size]
         let c_proj = &conv_parts[2]; // [B, L, n_groups * ssm_state_size]
 
         // Reshape for multi-head SSM computation
-        let x_heads = hidden_states.reshape(&[batch, seq_len, num_heads, head_dim])?;
-        let b_reshaped = b_proj.reshape(&[batch, seq_len, n_groups, ssm_state_size])?;
-        let c_reshaped = c_proj.reshape(&[batch, seq_len, n_groups, ssm_state_size])?;
+        let x_heads = hidden_states.reshape(&[batch, seq_len, num_heads, head_dim]);
+        let b_reshaped = b_proj.reshape(&[batch, seq_len, n_groups, ssm_state_size]);
+        let c_reshaped = c_proj.reshape(&[batch, seq_len, n_groups, ssm_state_size]);
 
         // SSM forward: single-token fast path (decode) or full attention (prefill)
         let prev_state = cache.as_ref().and_then(|mc| mc.get_ssm_state());
@@ -586,7 +575,7 @@ impl FalconH1Mamba {
         }
 
         // Reshape back: [B, 1/L, H, D] -> [B, L, intermediate_size]
-        let y = y.reshape(&[batch, seq_len, intermediate_size])?;
+        let y = y.reshape(&[batch, seq_len, intermediate_size]);
 
         // Gated RMS norm: normalise y with silu(gate) as the gate signal
         let y_normed = self.norm.forward(&y, Some(gate))?;
@@ -603,15 +592,14 @@ impl FalconH1Mamba {
 /// SwiGLU feed-forward network.
 ///
 /// Computes: `down_proj(silu(gate_proj(x)) * up_proj(x))`.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct FalconH1MLP {
-    #[param]
     pub gate_proj: nn::Linear,
-    #[param]
     pub up_proj: nn::Linear,
-    #[param]
     pub down_proj: nn::Linear,
 }
+impl_module_params!(FalconH1MLP; gate_proj, up_proj, down_proj);
+
 
 impl FalconH1MLP {
     pub fn new(config: &FalconH1Config) -> Result<Self, Exception> {
@@ -635,7 +623,7 @@ impl FalconH1MLP {
         let gate = Module::forward(&mut self.gate_proj, x)?;
         let up = Module::forward(&mut self.up_proj, x)?;
         // SwiGLU: silu(gate) * up
-        let activated = nn::silu(&gate)?.multiply(&up)?;
+        let activated = nn::silu(&gate).multiply(&up);
         Module::forward(&mut self.down_proj, &activated)
     }
 }
@@ -649,17 +637,12 @@ impl FalconH1MLP {
 /// Every layer runs both Attention and Mamba in parallel on the same
 /// normalised input, scales each branch by its per-layer multiplier, sums
 /// them, adds the residual, then passes through SwiGLU MLP.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct FalconH1DecoderLayer {
-    #[param]
     pub input_layernorm: nn::RmsNorm,
-    #[param]
     pub self_attn: FalconH1Attention,
-    #[param]
     pub mamba: FalconH1Mamba,
-    #[param]
     pub pre_ff_layernorm: nn::RmsNorm,
-    #[param]
     pub feed_forward: FalconH1MLP,
 
     /// Per-layer attention output scale (baked in at construction time).
@@ -667,6 +650,8 @@ pub struct FalconH1DecoderLayer {
     /// Per-layer SSM output scale (baked in at construction time).
     pub ssm_out_multiplier: f32,
 }
+impl_module_params!(FalconH1DecoderLayer; input_layernorm, self_attn, mamba, pre_ff_layernorm, feed_forward);
+
 
 impl FalconH1DecoderLayer {
     pub fn new(config: &FalconH1Config, layer_idx: usize) -> Result<Self, Exception> {
@@ -680,8 +665,11 @@ impl FalconH1DecoderLayer {
             .build()?;
 
         let self_attn = FalconH1Attention::new(config)?;
+
         let mamba = FalconH1Mamba::new(config)?;
+
         let feed_forward = FalconH1MLP::new(config)?;
+
 
         let attn_out_multiplier = config.attn_multiplier_for_layer(layer_idx);
         let ssm_out_multiplier = config.ssm_multiplier_for_layer(layer_idx);
@@ -716,13 +704,13 @@ impl FalconH1DecoderLayer {
         let mamba_scaled = scale_if_needed(mamba_out, self.ssm_out_multiplier)?;
 
         // Sum branches and add residual
-        let mixed = attn_scaled.add(&mamba_scaled)?;
-        let h = x.add(&mixed)?;
+        let mixed = attn_scaled.add(&mamba_scaled);
+        let h = x.add(&mixed);
 
         // MLP sub-layer
         let normed2 = Module::forward(&mut self.pre_ff_layernorm, &h)?;
         let mlp_out = self.feed_forward.forward(&normed2)?;
-        h.add(&mlp_out)
+        Ok(h.add(&mlp_out))
     }
 }
 
@@ -731,7 +719,7 @@ impl FalconH1DecoderLayer {
 #[inline]
 fn scale_if_needed(x: Array, multiplier: f32) -> Result<Array, Exception> {
     if (multiplier - 1.0).abs() > 1e-7 {
-        x.multiply(&Array::from_f32(multiplier))
+        Ok(x.multiply(&Array::from_f32(multiplier)))
     } else {
         Ok(x)
     }
@@ -742,16 +730,15 @@ fn scale_if_needed(x: Array, multiplier: f32) -> Result<Array, Exception> {
 // ============================================================================
 
 /// FalconH1 backbone (embedding + layers + final norm).
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct FalconH1Model {
-    #[param]
     pub embed_tokens: nn::Embedding,
-    #[param]
     pub layers: Vec<FalconH1DecoderLayer>,
-    #[param]
     pub final_layernorm: nn::RmsNorm,
     pub config: FalconH1Config,
 }
+impl_module_params!(FalconH1Model; embed_tokens, layers, final_layernorm);
+
 
 impl FalconH1Model {
     pub fn new(config: FalconH1Config) -> Result<Self, Exception> {
@@ -805,14 +792,14 @@ impl FalconH1Model {
 // ============================================================================
 
 /// FalconH1 for causal language modelling.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct FalconH1ForCausalLM {
-    #[param]
     pub model: FalconH1Model,
     /// Present when tie_word_embeddings = false; absent otherwise.
-    #[param]
     pub lm_head: Option<nn::Linear>,
 }
+impl_module_params!(FalconH1ForCausalLM; model, lm_head);
+
 
 impl FalconH1ForCausalLM {
     pub fn new(config: FalconH1Config) -> Result<Self, Exception> {
@@ -865,14 +852,14 @@ impl FalconH1ForCausalLM {
             Module::forward(head, &hidden)
         } else {
             // Tied embeddings: use embedding matrix transposed as the output projection
-            self.model.embed_tokens.as_linear(&hidden)
+            Ok(self.model.embed_tokens.as_linear(&hidden))
         }
     }
 
     /// Evaluate (materialise) all parameters onto the device.
-    pub fn eval(&self) -> Result<(), Exception> {
-        for (_, p) in self.parameters().flatten() {
-            p.eval()?;
+    pub fn eval(&mut self) -> Result<(), Exception> {
+        for (_, p) in self.flatten_params_mut() {
+            p.eval();
         }
         Ok(())
     }
@@ -969,7 +956,7 @@ pub fn load_falcon_h1_weights(
         // conv1d weights: transpose from PyTorch [out, in/groups, kernel]
         //                 to MLX format      [out, kernel, in/groups]
         if let Some(w) = weights.get(&format!("{p}.mamba.conv1d.weight")) {
-            let w_mlx = w.transpose_axes(&[0, 2, 1])?;
+            let w_mlx = w.transpose_axes(&[0, 2, 1]);
             layer.mamba.conv1d.weight = Param::new(w_mlx);
         }
         if let Some(b) = weights.get(&format!("{p}.mamba.conv1d.bias")) {

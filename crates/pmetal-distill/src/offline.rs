@@ -17,7 +17,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read as _, Write};
 use std::path::{Path, PathBuf};
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -312,7 +312,7 @@ impl LogitCompressor {
     /// Decompress logits.
     pub fn decompress(&self, compressed: &CompressedLogits, vocab_size: usize) -> Result<Array> {
         match compressed {
-            CompressedLogits::Full { data, shape } => Ok(Array::from_slice(data, shape)),
+            CompressedLogits::Full { data, shape } => Ok(Array::from_f32_slice(data, shape)),
             CompressedLogits::TopK {
                 values,
                 indices,
@@ -335,7 +335,9 @@ impl LogitCompressor {
     }
 
     fn compress_none(&self, logits: &Array) -> Result<CompressedLogits> {
-        let data: Vec<f32> = logits.as_slice().to_vec();
+        let n: usize = logits.shape().iter().map(|&s| s as usize).product();
+        let data: Vec<f32> = logits.clone().to_f32_vec(n)
+            .ok_or_else(|| crate::DistillError::LogitCache("failed to read logits as f32".to_string()))?;
         let shape = logits.shape().to_vec();
         Ok(CompressedLogits::Full { data, shape })
     }
@@ -351,15 +353,16 @@ impl LogitCompressor {
             logits.clone()
         } else {
             let num_tokens: i32 = shape[..shape.len() - 1].iter().product();
-            logits.reshape(&[num_tokens, vocab_size as i32])?
+            logits.reshape(&[num_tokens, vocab_size as i32])
         };
         let num_tokens = flat.dim(0) as usize;
 
         // CPU top-k selection: offline compression is a preprocessing step run once
         // per dataset, not a training hot path. CPU partial sort is simpler and more
         // predictable than navigating MLX lazy-eval semantics for index arrays.
-        flat.eval()?;
-        let data_slice: &[f32] = flat.as_slice();
+        let data_owned: Vec<f32> = flat.clone().to_f32_vec(num_tokens * vocab_size)
+            .ok_or_else(|| crate::DistillError::LogitCache("failed to read flat logits as f32".to_string()))?;
+        let data_slice: &[f32] = &data_owned;
 
         let mut all_values = Vec::with_capacity(num_tokens * k);
         let mut all_indices = Vec::with_capacity(num_tokens * k);
@@ -423,15 +426,17 @@ impl LogitCompressor {
             }
         }
 
-        Ok(Array::from_slice(
+        Ok(Array::from_f32_slice(
             &full,
             &[num_tokens as i32, vocab_size as i32],
         ))
     }
 
     fn compress_int8(&self, logits: &Array) -> Result<CompressedLogits> {
-        let data: Vec<f32> = logits.as_slice().to_vec();
         let shape = logits.shape().to_vec();
+        let n: usize = shape.iter().map(|&s| s as usize).product();
+        let data: Vec<f32> = logits.clone().to_f32_vec(n)
+            .ok_or_else(|| crate::DistillError::LogitCache("failed to read logits as f32".to_string()))?;
 
         // Per-token quantization: compute min/max per row so that each token's
         // dynamic range is captured independently. This avoids a single outlier
@@ -526,20 +531,22 @@ impl LogitCompressor {
                 }
             }
 
-            Ok(Array::from_slice(&dequantized, shape))
+            Ok(Array::from_f32_slice(&dequantized, shape))
         } else {
             // Legacy global-scale format.
             let dequantized: Vec<f32> = data
                 .iter()
                 .map(|&q| (q as f32) * scale + zero_point)
                 .collect();
-            Ok(Array::from_slice(&dequantized, shape))
+            Ok(Array::from_f32_slice(&dequantized, shape))
         }
     }
 
     fn compress_int4(&self, logits: &Array) -> Result<CompressedLogits> {
-        let data: Vec<f32> = logits.as_slice().to_vec();
         let shape = logits.shape().to_vec();
+        let n: usize = shape.iter().map(|&s| s as usize).product();
+        let data: Vec<f32> = logits.clone().to_f32_vec(n)
+            .ok_or_else(|| crate::DistillError::LogitCache("failed to read logits as f32".to_string()))?;
 
         // Find min/max
         let min = data.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -592,7 +599,7 @@ impl LogitCompressor {
         }
 
         dequantized.truncate(num_elements);
-        Ok(Array::from_slice(&dequantized, shape))
+        Ok(Array::from_f32_slice(&dequantized, shape))
     }
 }
 
@@ -627,7 +634,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_topk_compression() {
-        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
 
         let compressor = LogitCompressor::new(CompressionMethod::TopK, 2);
         let compressed = compressor.compress(&logits).unwrap();
@@ -669,13 +676,13 @@ mod tests {
     #[test]
     #[serial]
     fn test_topk_roundtrip() {
-        let logits = Array::from_slice(&[1.0_f32, 2.0, 10.0, 4.0, 5.0, 6.0, 20.0, 8.0], &[2, 4]);
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 10.0, 4.0, 5.0, 6.0, 20.0, 8.0], &[2, 4]);
 
         let compressor = LogitCompressor::new(CompressionMethod::TopK, 2);
         let compressed = compressor.compress(&logits).unwrap();
         let decompressed = compressor.decompress(&compressed, 4).unwrap();
 
-        let data: Vec<f32> = decompressed.as_slice().to_vec();
+        let data: Vec<f32> = decompressed.clone().to_f32_vec(8).unwrap();
         println!("decompressed: {:?}", &data);
         if let CompressedLogits::TopK {
             ref values,
@@ -696,14 +703,14 @@ mod tests {
     #[test]
     #[serial]
     fn test_int8_roundtrip() {
-        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
 
         let compressor = LogitCompressor::new(CompressionMethod::Int8, 128);
         let compressed = compressor.compress(&logits).unwrap();
         let decompressed = compressor.decompress(&compressed, 4).unwrap();
 
-        let original: Vec<f32> = logits.as_slice().to_vec();
-        let recovered: Vec<f32> = decompressed.as_slice().to_vec();
+        let original: Vec<f32> = logits.clone().to_f32_vec(8).unwrap();
+        let recovered: Vec<f32> = decompressed.clone().to_f32_vec(8).unwrap();
 
         // Should be close (within quantization error)
         for (o, r) in original.iter().zip(recovered.iter()) {
@@ -714,14 +721,14 @@ mod tests {
     #[test]
     #[serial]
     fn test_int4_roundtrip() {
-        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
 
         let compressor = LogitCompressor::new(CompressionMethod::Int4, 128);
         let compressed = compressor.compress(&logits).unwrap();
         let decompressed = compressor.decompress(&compressed, 4).unwrap();
 
-        let original: Vec<f32> = logits.as_slice().to_vec();
-        let recovered: Vec<f32> = decompressed.as_slice().to_vec();
+        let original: Vec<f32> = logits.clone().to_f32_vec(8).unwrap();
+        let recovered: Vec<f32> = decompressed.clone().to_f32_vec(8).unwrap();
 
         // Int4 has lower precision
         for (o, r) in original.iter().zip(recovered.iter()) {
@@ -732,14 +739,14 @@ mod tests {
     #[test]
     #[serial]
     fn test_none_compression() {
-        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[2, 2]);
 
         let compressor = LogitCompressor::new(CompressionMethod::None, 128);
         let compressed = compressor.compress(&logits).unwrap();
         let decompressed = compressor.decompress(&compressed, 2).unwrap();
 
-        let original: Vec<f32> = logits.as_slice().to_vec();
-        let recovered: Vec<f32> = decompressed.as_slice().to_vec();
+        let original: Vec<f32> = logits.clone().to_f32_vec(4).unwrap();
+        let recovered: Vec<f32> = decompressed.clone().to_f32_vec(4).unwrap();
 
         assert_eq!(original, recovered);
     }

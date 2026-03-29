@@ -12,7 +12,8 @@
 //!
 //! - Reference: <https://mistral.ai/news/pixtral-12b/>
 
-use mlx_rs::{Array, error::Exception, macros::ModuleParameters};
+use pmetal_bridge::compat::{Array, Exception, ModuleParameters};
+use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 use crate::architectures::mistral::{MistralConfig, MistralForCausalLM};
@@ -151,19 +152,21 @@ impl ModelConfig for PixtralConfig {
 ///
 /// This implementation wraps the Mistral language model for VLM inference.
 /// Vision features should be pre-computed and passed as input embeddings.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Pixtral {
     /// The underlying language model.
-    #[param]
     pub language_model: MistralForCausalLM,
     /// Full configuration.
     pub config: PixtralConfig,
 }
+impl_module_params!(Pixtral; language_model);
+
 
 impl Pixtral {
     /// Create a new Pixtral model.
     pub fn new(config: PixtralConfig) -> Result<Self, Exception> {
         let language_model = MistralForCausalLM::new(config.text_config.clone())?;
+
         Ok(Self {
             language_model,
             config,

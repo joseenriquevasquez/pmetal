@@ -21,16 +21,9 @@
 //! - Configurable reasoning effort (low/medium/high)
 //! - Tool use optimization
 //! - Apache 2.0 license
+use pmetal_bridge::compat::{Array, Exception, ModuleParameters, Param, indexing, nn, ops, random};
+use pmetal_bridge::impl_module_params;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, ModuleParameters as ModuleParametersTrait},
-    nn,
-    ops::indexing::IndexOp,
-};
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
@@ -322,7 +315,7 @@ impl Default for GptOssConfig {
 }
 
 /// GPT-OSS attention with alternating sliding/full patterns and GQA.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GptOssAttention {
     /// Configuration.
     config: GptOssConfig,
@@ -343,18 +336,16 @@ pub struct GptOssAttention {
     /// Attention type for this layer.
     attention_type: AttentionType,
     /// Query projection.
-    #[param]
     pub q_proj: nn::Linear,
     /// Key projection.
-    #[param]
     pub k_proj: nn::Linear,
     /// Value projection.
-    #[param]
     pub v_proj: nn::Linear,
     /// Output projection.
-    #[param]
     pub o_proj: nn::Linear,
 }
+impl_module_params!(GptOssAttention; q_proj, k_proj, v_proj, o_proj);
+
 
 impl GptOssAttention {
     /// Create a new attention layer.
@@ -412,19 +403,19 @@ impl GptOssAttention {
         let mut cache = cache;
 
         // Project Q, K, V
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let q = self.q_proj.forward(x);
+        let k = self.k_proj.forward(x);
+        let v = self.v_proj.forward(x);
 
         // Reshape to [batch, seq, heads, head_dim]
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?;
-        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
+        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
+        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // Transpose to [batch, heads, seq, head_dim]
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        let q = q.transpose_axes(&[0, 2, 1, 3]);
+        let k = k.transpose_axes(&[0, 2, 1, 3]);
+        let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Apply RoPE
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
@@ -452,11 +443,10 @@ impl GptOssAttention {
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
                 if let Some(output) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
-                {
-                    let output = output.transpose_axes(&[0, 2, 1, 3])?;
-                    let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
-                    return self.o_proj.forward(&output);
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)? {
+                    let output = output.transpose_axes(&[0, 2, 1, 3]);
+                    let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
+                    return Ok(self.o_proj.forward(&output));
                 }
             }
         }
@@ -471,28 +461,27 @@ impl GptOssAttention {
         let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
 
         // Transpose back and project
-        let output = output.transpose_axes(&[0, 2, 1, 3])?;
-        let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
+        let output = output.transpose_axes(&[0, 2, 1, 3]);
+        let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
 
-        self.o_proj.forward(&output)
+        Ok(self.o_proj.forward(&output))
     }
 }
 
 /// SwiGLU MLP with clamping for GPT-OSS.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GptOssMLP {
     /// SwiGLU limit (clamp value).
     swiglu_limit: f32,
     /// Gate projection.
-    #[param]
     pub gate_proj: nn::Linear,
     /// Up projection.
-    #[param]
     pub up_proj: nn::Linear,
     /// Down projection.
-    #[param]
     pub down_proj: nn::Linear,
 }
+impl_module_params!(GptOssMLP; gate_proj, up_proj, down_proj);
+
 
 impl GptOssMLP {
     /// Create a new MLP.
@@ -522,38 +511,37 @@ impl GptOssMLP {
 
     /// Forward pass through MLP with SwiGLU and clamping.
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
+        let gate = self.gate_proj.forward(x);
+        let up = self.up_proj.forward(x);
 
         let clamped = clamp_swiglu_hidden(&gate, &up, self.swiglu_limit)?;
 
-        self.down_proj.forward(&clamped)
+        Ok(self.down_proj.forward(&clamped))
     }
 }
 
 fn clamp_swiglu_hidden(gate: &Array, up: &Array, limit: f32) -> Result<Array, Exception> {
-    let activated = nn::silu(gate)?.multiply(up)?;
-    let limit = Array::from_f32(limit);
+    let activated = nn::silu(&gate).multiply(up);
+    let mut limit = Array::from_f32(limit);
     let neg_limit = Array::from_f32(-limit.item::<f32>());
-    let clamped = mlx_rs::ops::minimum(&activated, &limit)?;
-    mlx_rs::ops::maximum(&clamped, &neg_limit)
+    let clamped = pmetal_bridge::compat::ops::minimum(&activated, &limit);
+    Ok(pmetal_bridge::compat::ops::maximum(&clamped, &neg_limit))
 }
 
 /// GPT-OSS expert MLP with bias and SwiGLU clamping.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GptOssMoEExpert {
     /// SwiGLU limit (clamp value).
     swiglu_limit: f32,
     /// Gate projection.
-    #[param]
     pub gate_proj: nn::Linear,
     /// Up projection.
-    #[param]
     pub up_proj: nn::Linear,
     /// Down projection.
-    #[param]
     pub down_proj: nn::Linear,
 }
+impl_module_params!(GptOssMoEExpert; gate_proj, up_proj, down_proj);
+
 
 impl GptOssMoEExpert {
     /// Create a new expert.
@@ -578,25 +566,23 @@ impl GptOssMoEExpert {
 
     /// Forward pass through a single expert.
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
+        let gate = self.gate_proj.forward(x);
+        let up = self.up_proj.forward(x);
         let clamped = clamp_swiglu_hidden(&gate, &up, self.swiglu_limit)?;
-        self.down_proj.forward(&clamped)
+        Ok(self.down_proj.forward(&clamped))
     }
 }
 
 /// GPT-OSS MoE block with sigmoid routing.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GptOssMoE {
     /// Top-k experts per token.
     top_k: usize,
     /// Router auxiliary loss coefficient.
     router_aux_loss_coef: f32,
     /// Gate projection (routes to experts).
-    #[param]
     gate: nn::Linear,
     /// Expert MLPs.
-    #[param]
     experts: Vec<GptOssMoEExpert>,
     /// SwiGLU limit for clamping.
     swiglu_limit: f32,
@@ -615,6 +601,8 @@ pub struct GptOssMoE {
     /// Signature of the current expert weight/bias handles.
     stacked_signature: Option<Vec<usize>>,
 }
+impl_module_params!(GptOssMoE; gate, experts);
+
 
 impl GptOssMoE {
     /// Create a new MoE block.
@@ -652,34 +640,34 @@ impl GptOssMoE {
     fn current_signature(&self) -> Vec<usize> {
         let mut signature = Vec::with_capacity(self.experts.len() * 6);
         for expert in &self.experts {
-            signature.push(expert.gate_proj.weight.as_ref().as_ptr().ctx as usize);
+            signature.push(expert.gate_proj.weight.as_ref().data_ptr() as usize);
             signature.push(
                 expert
                     .gate_proj
                     .bias
                     .as_ref()
                     .as_ref()
-                    .map(|bias| bias.as_ptr().ctx as usize)
+                    .map(|bias| bias.data_ptr() as usize)
                     .unwrap_or(0),
             );
-            signature.push(expert.up_proj.weight.as_ref().as_ptr().ctx as usize);
+            signature.push(expert.up_proj.weight.as_ref().data_ptr() as usize);
             signature.push(
                 expert
                     .up_proj
                     .bias
                     .as_ref()
                     .as_ref()
-                    .map(|bias| bias.as_ptr().ctx as usize)
+                    .map(|bias| bias.data_ptr() as usize)
                     .unwrap_or(0),
             );
-            signature.push(expert.down_proj.weight.as_ref().as_ptr().ctx as usize);
+            signature.push(expert.down_proj.weight.as_ref().data_ptr() as usize);
             signature.push(
                 expert
                     .down_proj
                     .bias
                     .as_ref()
                     .as_ref()
-                    .map(|bias| bias.as_ptr().ctx as usize)
+                    .map(|bias| bias.data_ptr() as usize)
                     .unwrap_or(0),
             );
         }
@@ -708,8 +696,8 @@ impl GptOssMoE {
             .experts
             .iter()
             .map(|expert| {
-                expert.gate_proj.bias.as_ref().clone().unwrap_or_else(|| {
-                    Array::zeros::<f32>(&[expert.gate_proj.weight.as_ref().dim(0)]).unwrap()
+                expert.gate_proj.bias.as_ref().map(|b| b.as_ref().clone()).unwrap_or_else(|| {
+                    Array::zeros_f32(&[expert.gate_proj.weight.as_ref().dim(0)])
                 })
             })
             .collect();
@@ -717,8 +705,8 @@ impl GptOssMoE {
             .experts
             .iter()
             .map(|expert| {
-                expert.up_proj.bias.as_ref().clone().unwrap_or_else(|| {
-                    Array::zeros::<f32>(&[expert.up_proj.weight.as_ref().dim(0)]).unwrap()
+                expert.up_proj.bias.as_ref().map(|b| b.as_ref().clone()).unwrap_or_else(|| {
+                    Array::zeros_f32(&[expert.up_proj.weight.as_ref().dim(0)])
                 })
             })
             .collect();
@@ -726,26 +714,19 @@ impl GptOssMoE {
             .experts
             .iter()
             .map(|expert| {
-                expert.down_proj.bias.as_ref().clone().unwrap_or_else(|| {
-                    Array::zeros::<f32>(&[expert.down_proj.weight.as_ref().dim(0)]).unwrap()
+                expert.down_proj.bias.as_ref().map(|b| b.as_ref().clone()).unwrap_or_else(|| {
+                    Array::zeros_f32(&[expert.down_proj.weight.as_ref().dim(0)])
                 })
             })
             .collect();
 
-        let gate_weight_refs: Vec<&Array> = gate_weights.iter().collect();
-        let up_weight_refs: Vec<&Array> = up_weights.iter().collect();
-        let down_weight_refs: Vec<&Array> = down_weights.iter().collect();
-        let gate_bias_refs: Vec<&Array> = gate_biases.iter().collect();
-        let up_bias_refs: Vec<&Array> = up_biases.iter().collect();
-        let down_bias_refs: Vec<&Array> = down_biases.iter().collect();
-
         Ok((
-            mlx_rs::ops::stack_axis(&gate_weight_refs, 0)?,
-            mlx_rs::ops::stack_axis(&up_weight_refs, 0)?,
-            mlx_rs::ops::stack_axis(&down_weight_refs, 0)?,
-            mlx_rs::ops::stack_axis(&gate_bias_refs, 0)?,
-            mlx_rs::ops::stack_axis(&up_bias_refs, 0)?,
-            mlx_rs::ops::stack_axis(&down_bias_refs, 0)?,
+            pmetal_bridge::compat::ops::stack_axis(&gate_weights, 0),
+            pmetal_bridge::compat::ops::stack_axis(&up_weights, 0),
+            pmetal_bridge::compat::ops::stack_axis(&down_weights, 0),
+            pmetal_bridge::compat::ops::stack_axis(&gate_biases, 0),
+            pmetal_bridge::compat::ops::stack_axis(&up_biases, 0),
+            pmetal_bridge::compat::ops::stack_axis(&down_biases, 0),
         ))
     }
 
@@ -761,19 +742,19 @@ impl GptOssMoE {
 
         if needs_refresh {
             let (
-                stacked_gate_proj,
-                stacked_up_proj,
-                stacked_down_proj,
-                stacked_gate_bias,
-                stacked_up_bias,
-                stacked_down_bias,
+                mut stacked_gate_proj,
+                mut stacked_up_proj,
+                mut stacked_down_proj,
+                mut stacked_gate_bias,
+                mut stacked_up_bias,
+                mut stacked_down_bias,
             ) = self.stack_expert_weights()?;
-            stacked_gate_proj.eval()?;
-            stacked_up_proj.eval()?;
-            stacked_down_proj.eval()?;
-            stacked_gate_bias.eval()?;
-            stacked_up_bias.eval()?;
-            stacked_down_bias.eval()?;
+            stacked_gate_proj.eval();
+            stacked_up_proj.eval();
+            stacked_down_proj.eval();
+            stacked_gate_bias.eval();
+            stacked_up_bias.eval();
+            stacked_down_bias.eval();
             self.stacked_gate_proj = Some(stacked_gate_proj);
             self.stacked_up_proj = Some(stacked_up_proj);
             self.stacked_down_proj = Some(stacked_down_proj);
@@ -805,23 +786,23 @@ impl GptOssMoE {
         let batch_seq = hidden_flat.dim(0);
         let hidden_size = hidden_flat.dim(1);
 
-        let gate_logits = self.gate.forward(hidden_flat)?;
-        let scores = mlx_rs::ops::sigmoid(&gate_logits)?;
+        let gate_logits = self.gate.forward(hidden_flat);
+        let scores = pmetal_bridge::compat::ops::sigmoid(&gate_logits);
         let neg_k = -(self.top_k as i32);
-        let part_indices = mlx_rs::ops::argpartition_axis(&scores, neg_k, -1)?;
-        let top_indices = part_indices.index((.., neg_k..)).as_type::<i32>()?;
-        let top_weights = scores.take_along_axis(&top_indices, -1)?;
-        let weight_sum = top_weights.sum_axis(-1, Some(true))?;
-        let safe_sum = mlx_rs::ops::maximum(&weight_sum, &Array::from_f32(1e-8))?;
-        let normalized_weights = top_weights.divide(&safe_sum)?;
+        let part_indices = pmetal_bridge::compat::ops::argpartition_axis(&scores, neg_k, -1);
+        let top_indices = pmetal_bridge::compat::ops::slice_axis_from(&part_indices, -1, neg_k).as_type::<i32>();
+        let top_weights = scores.take_along_axis(&top_indices, -1);
+        let weight_sum = top_weights.sum_axis(-1, true);
+        let safe_sum = pmetal_bridge::compat::ops::maximum(&weight_sum, &Array::from_f32(1e-8));
+        let normalized_weights = top_weights.divide(&safe_sum);
 
         Ok((batch_seq, hidden_size, top_indices, normalized_weights))
     }
 
     fn batched_matmul(&self, x: &Array, w: &Array) -> Result<Array, Exception> {
-        let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)])?;
-        let result = mlx_rs::ops::matmul(&x_expanded, w)?;
-        result.squeeze_axes(&[1])
+        let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)]);
+        let result = pmetal_bridge::compat::ops::matmul(&x_expanded, w);
+        Ok(result.squeeze_axes(&[1]))
     }
 
     #[cfg(test)]
@@ -829,12 +810,12 @@ impl GptOssMoE {
         let shape = x.shape();
         let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
         let hidden_size = shape[shape.len() - 1];
-        let hidden_flat = x.reshape(&[batch_seq, hidden_size])?;
+        let hidden_flat = x.reshape(&[batch_seq, hidden_size]);
         let (_batch_seq, _hidden_size, top_indices, normalized_weights) =
             self.route_topk(&hidden_flat)?;
 
-        top_indices.eval()?;
-        normalized_weights.eval()?;
+        top_indices.eval();
+        normalized_weights.eval();
         let expert_indices: Vec<i32> = top_indices.as_slice().to_vec();
         let expert_weights: Vec<f32> = normalized_weights.as_slice().to_vec();
         let mut assignments: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.experts.len()];
@@ -849,7 +830,7 @@ impl GptOssMoE {
             }
         }
 
-        let mut output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
+        let mut output = pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
         for (expert_idx, expert_assignments) in assignments.iter().enumerate() {
             if expert_assignments.is_empty() {
                 continue;
@@ -865,11 +846,11 @@ impl GptOssMoE {
 
             let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
             let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
-            let expert_input = hidden_flat.take_axis(&idx_array, 0)?;
-            let expert_out = self.experts[expert_idx].forward(&expert_input)?;
-            let weighted = expert_out.multiply(&weight_array)?;
-            let updates = weighted.reshape(&[token_indices.len() as i32, 1, hidden_size])?;
-            output = mlx_rs::ops::indexing::scatter_add_single(&output, &idx_array, &updates, 0)?;
+            let expert_input = hidden_flat.take_axis(&idx_array, 0);
+            let expert_out = self.experts[expert_idx].forward(&expert_input);
+            let weighted = expert_out.multiply(&weight_array);
+            let updates = weighted.reshape(&[token_indices.len() as i32, 1, hidden_size]);
+            output = pmetal_bridge::compat::indexing::scatter_add_single(&output, &idx_array, &updates, 0);
         }
 
         let mut output_shape = shape.to_vec();
@@ -878,68 +859,68 @@ impl GptOssMoE {
     }
 
     fn forward_stacked(&mut self, x: &Array) -> Result<Array, Exception> {
-        self.ensure_stacked()?;
+        self.ensure_stacked();
 
         let shape = x.shape();
         let hidden_flat = x.reshape(&[
             shape[..shape.len() - 1].iter().product(),
             shape[shape.len() - 1],
-        ])?;
+        ]);
         let (batch_seq, hidden_size, top_indices, normalized_weights) =
             self.route_topk(&hidden_flat)?;
         let top_k = self.top_k as i32;
-        let mut output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
+        let mut output = pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
 
         for slot in 0..top_k {
-            let slot_experts = top_indices.index((.., slot));
-            let slot_weights = normalized_weights.index((.., slot..slot + 1));
+            let slot_experts = pmetal_bridge::compat::ops::slice_axis(&top_indices, -1, slot, slot + 1).reshape(&[top_indices.dim(0)]);
+            let slot_weights = pmetal_bridge::compat::ops::slice_axis(&normalized_weights, -1, slot, slot + 1);
             let gate_weights = self
                 .stacked_gate_proj
                 .as_ref()
                 .unwrap()
-                .take_axis(&slot_experts, 0)?;
+                .take_axis(&slot_experts, 0);
             let up_weights = self
                 .stacked_up_proj
                 .as_ref()
                 .unwrap()
-                .take_axis(&slot_experts, 0)?;
+                .take_axis(&slot_experts, 0);
             let down_weights = self
                 .stacked_down_proj
                 .as_ref()
                 .unwrap()
-                .take_axis(&slot_experts, 0)?;
+                .take_axis(&slot_experts, 0);
             let gate_bias = self
                 .stacked_gate_bias
                 .as_ref()
                 .unwrap()
-                .take_axis(&slot_experts, 0)?;
+                .take_axis(&slot_experts, 0);
             let up_bias = self
                 .stacked_up_bias
                 .as_ref()
                 .unwrap()
-                .take_axis(&slot_experts, 0)?;
+                .take_axis(&slot_experts, 0);
             let down_bias = self
                 .stacked_down_bias
                 .as_ref()
                 .unwrap()
-                .take_axis(&slot_experts, 0)?;
+                .take_axis(&slot_experts, 0);
 
             let gate_out = self
                 .batched_matmul(&hidden_flat, &gate_weights)?
-                .add(&gate_bias)?;
+                .add(&gate_bias);
             let up_out = self
                 .batched_matmul(&hidden_flat, &up_weights)?
-                .add(&up_bias)?;
+                .add(&up_bias);
             let clamped = clamp_swiglu_hidden(&gate_out, &up_out, self.swiglu_limit)?;
             let slot_out = self
                 .batched_matmul(&clamped, &down_weights)?
-                .add(&down_bias)?;
-            output = output.add(&slot_out.multiply(&slot_weights)?)?;
+                .add(&down_bias);
+            output = output.add(&slot_out.multiply(&slot_weights));
         }
 
         let mut output_shape = shape.to_vec();
         output_shape[shape.len() - 1] = hidden_size;
-        output.reshape(&output_shape)
+        Ok(output.reshape(&output_shape))
     }
 
     /// Forward pass through MoE.
@@ -950,26 +931,25 @@ impl GptOssMoE {
 }
 
 /// GPT-OSS decoder layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GptOssDecoderLayer {
     /// Self-attention.
-    #[param]
     pub self_attn: GptOssAttention,
     /// MoE or dense MLP.
-    #[param]
     mlp: GptOssMoE,
     /// Input layer norm.
-    #[param]
     pub input_layernorm: nn::RmsNorm,
     /// Post-attention layer norm.
-    #[param]
     pub post_attention_layernorm: nn::RmsNorm,
 }
+impl_module_params!(GptOssDecoderLayer; self_attn, mlp, input_layernorm, post_attention_layernorm);
+
 
 impl GptOssDecoderLayer {
     /// Create a new decoder layer.
     pub fn new(config: GptOssConfig, layer_idx: usize) -> Result<Self, Exception> {
         let self_attn = GptOssAttention::new(config.clone(), layer_idx)?;
+
 
         let mlp = GptOssMoE::new(
             config.hidden_size,
@@ -1004,15 +984,15 @@ impl GptOssDecoderLayer {
     ) -> Result<Array, Exception> {
         // Pre-norm attention
         let residual = x;
-        let hidden = self.input_layernorm.forward(x)?;
+        let hidden = self.input_layernorm.forward(x);
         let hidden = self.self_attn.forward(&hidden, mask, cache)?;
-        let hidden = residual.add(&hidden)?;
+        let hidden = residual.add(&hidden);
 
         // Pre-norm MLP
         let residual = &hidden;
-        let hidden = self.post_attention_layernorm.forward(&hidden)?;
+        let hidden = self.post_attention_layernorm.forward(&hidden);
         let hidden = self.mlp.forward(&hidden)?;
-        residual.add(&hidden)
+        Ok(residual.add(&hidden))
     }
 
     /// Eagerly build the stacked expert cache for this layer's MoE block.
@@ -1022,20 +1002,19 @@ impl GptOssDecoderLayer {
 }
 
 /// GPT-OSS model.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GptOssModel {
     /// Configuration.
     config: GptOssConfig,
     /// Token embeddings.
-    #[param]
     pub embed_tokens: nn::Embedding,
     /// Decoder layers.
-    #[param]
     pub layers: Vec<GptOssDecoderLayer>,
     /// Final layer norm.
-    #[param]
     pub norm: nn::RmsNorm,
 }
+impl_module_params!(GptOssModel; embed_tokens, layers, norm);
+
 
 impl GptOssModel {
     /// Create a new GPT-OSS model.
@@ -1065,7 +1044,7 @@ impl GptOssModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        let mut hidden = self.embed_tokens.forward(input_ids)?;
+        let mut hidden = self.embed_tokens.forward(input_ids);
 
         match cache {
             Some(cache) => {
@@ -1080,13 +1059,13 @@ impl GptOssModel {
             }
         }
 
-        self.norm.forward(&hidden)
+        Ok(self.norm.forward(&hidden))
     }
 
     /// Eagerly build stacked expert caches for all decoder layers.
     pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
         for layer in &mut self.layers {
-            layer.init_stacked_moe()?;
+            layer.init_stacked_moe();
         }
         Ok(())
     }
@@ -1098,15 +1077,15 @@ impl GptOssModel {
 }
 
 /// GPT-OSS for causal language modeling.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GptOssForCausalLM {
     /// Base model.
-    #[param]
     pub model: GptOssModel,
     /// Language model head.
-    #[param]
     pub lm_head: nn::Linear,
 }
+impl_module_params!(GptOssForCausalLM; model, lm_head);
+
 
 impl GptOssForCausalLM {
     /// Create a new GPT-OSS for causal LM.
@@ -1128,7 +1107,7 @@ impl GptOssForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward(input_ids, mask, cache)?;
-        self.lm_head.forward(&hidden)
+        Ok(self.lm_head.forward(&hidden))
     }
 
     /// Eagerly build stacked expert caches for all MoE layers.
@@ -1175,12 +1154,12 @@ impl LoraLinear {
     /// Create LoRA linear from base nn::Linear.
     pub fn from_linear(linear: &nn::Linear, rank: i32, alpha: f32) -> Result<Self, Exception> {
         // Access weight through the parameter
-        let params = linear.parameters();
-        let flat = params.flatten();
-        let weight_ref = flat
+        use pmetal_bridge::compat::ModuleParametersExt;
+        let flat = linear.flatten_params();
+        let weight = flat
             .get("weight")
-            .ok_or_else(|| Exception::from("Missing weight in Linear"))?;
-        let weight = (*weight_ref).clone();
+            .ok_or_else(|| Exception::from("Missing weight in Linear"))?
+            .clone();
 
         let shape = weight.shape();
         let out_features = shape[0];
@@ -1190,7 +1169,7 @@ impl LoraLinear {
         let scale = alpha / rank as f32;
 
         // Get bias if present (need to clone the inner Array)
-        let bias = flat.get("bias").map(|b| (*b).clone());
+        let bias = flat.get("bias").cloned();
 
         Ok(Self {
             weight,
@@ -1207,14 +1186,14 @@ impl LoraLinear {
         if self.lora_active {
             let out = fused_lora_forward(x, &self.weight, &self.lora_a, &self.lora_b, self.scale)?;
             if let Some(ref bias) = self.bias {
-                out.add(bias)
+                Ok(out.add(bias))
             } else {
                 Ok(out)
             }
         } else {
-            let out = x.matmul(&self.weight.t())?;
+            let out = x.matmul(&self.weight.t());
             if let Some(ref bias) = self.bias {
-                out.add(bias)
+                Ok(out.add(bias))
             } else {
                 Ok(out)
             }
@@ -1225,10 +1204,10 @@ impl LoraLinear {
     pub fn merge(&mut self) -> Result<(), Exception> {
         if self.lora_active {
             // merged = W + scale * B @ A
-            let lora_contrib = self.lora_b.matmul(&self.lora_a)?;
+            let lora_contrib = self.lora_b.matmul(&self.lora_a);
             let scale_arr = Array::from_f32(self.scale);
-            let scaled = lora_contrib.multiply(&scale_arr)?;
-            self.weight = self.weight.add(&scaled)?;
+            let scaled = lora_contrib.multiply(&scale_arr);
+            self.weight = self.weight.add(&scaled);
             self.lora_active = false;
         }
         Ok(())
@@ -1351,14 +1330,14 @@ impl GptOssLoraAttention {
         let v = self.v_proj.forward(x)?;
 
         // Reshape to [batch, seq, heads, head_dim]
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?;
-        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
+        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
+        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // Transpose to [batch, heads, seq, head_dim]
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        let q = q.transpose_axes(&[0, 2, 1, 3]);
+        let k = k.transpose_axes(&[0, 2, 1, 3]);
+        let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Apply RoPE
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
@@ -1386,10 +1365,9 @@ impl GptOssLoraAttention {
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
                 if let Some(output) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
-                {
-                    let output = output.transpose_axes(&[0, 2, 1, 3])?;
-                    let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)? {
+                    let output = output.transpose_axes(&[0, 2, 1, 3]);
+                    let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
                     return self.o_proj.forward(&output);
                 }
             }
@@ -1405,8 +1383,8 @@ impl GptOssLoraAttention {
         let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
 
         // Transpose back and project
-        let output = output.transpose_axes(&[0, 2, 1, 3])?;
-        let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
+        let output = output.transpose_axes(&[0, 2, 1, 3]);
+        let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
 
         self.o_proj.forward(&output)
     }
@@ -1431,10 +1409,10 @@ impl GptOssLoraAttention {
 
     /// Merge all LoRA weights.
     pub fn merge(&mut self) -> Result<(), Exception> {
-        self.q_proj.merge()?;
-        self.k_proj.merge()?;
-        self.v_proj.merge()?;
-        self.o_proj.merge()?;
+        self.q_proj.merge();
+        self.k_proj.merge();
+        self.v_proj.merge();
+        self.o_proj.merge();
         Ok(())
     }
 }
@@ -1460,6 +1438,7 @@ impl GptOssLoraDecoderLayer {
     ) -> Result<Self, Exception> {
         let self_attn = GptOssLoraAttention::from_attention(layer.self_attn, lora_config)?;
 
+
         Ok(Self {
             self_attn,
             mlp: layer.mlp,
@@ -1477,15 +1456,15 @@ impl GptOssLoraDecoderLayer {
     ) -> Result<Array, Exception> {
         // Pre-norm attention
         let residual = x;
-        let hidden = self.input_layernorm.forward(x)?;
+        let hidden = self.input_layernorm.forward(x);
         let hidden = self.self_attn.forward(&hidden, mask, cache)?;
-        let hidden = residual.add(&hidden)?;
+        let hidden = residual.add(&hidden);
 
         // Pre-norm MLP
         let residual = &hidden;
-        let hidden = self.post_attention_layernorm.forward(&hidden)?;
+        let hidden = self.post_attention_layernorm.forward(&hidden);
         let hidden = self.mlp.forward(&hidden)?;
-        residual.add(&hidden)
+        Ok(residual.add(&hidden))
     }
 
     /// Get trainable parameters.
@@ -1516,15 +1495,16 @@ impl GptOssLoraModel {
     /// Create LoRA model from base model.
     pub fn from_model(model: GptOssModel, lora_config: &LoraConfig) -> Result<Self, Exception> {
         let layers = model
+
             .layers
             .into_iter()
             .map(|layer| GptOssLoraDecoderLayer::from_layer(layer, lora_config))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>();
 
         Ok(Self {
             config: model.config,
             embed_tokens: model.embed_tokens,
-            layers,
+            layers: layers?,
             norm: model.norm,
         })
     }
@@ -1536,7 +1516,7 @@ impl GptOssLoraModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        let mut hidden = self.embed_tokens.forward(input_ids)?;
+        let mut hidden = self.embed_tokens.forward(input_ids);
 
         match cache {
             Some(cache) => {
@@ -1551,7 +1531,7 @@ impl GptOssLoraModel {
             }
         }
 
-        self.norm.forward(&hidden)
+        Ok(self.norm.forward(&hidden))
     }
 
     /// Get all trainable parameters.
@@ -1568,7 +1548,7 @@ impl GptOssLoraModel {
     /// Merge all LoRA weights.
     pub fn merge(&mut self) -> Result<(), Exception> {
         for layer in &mut self.layers {
-            layer.merge()?;
+            layer.merge();
         }
         Ok(())
     }
@@ -1603,6 +1583,7 @@ impl GptOssLoraForCausalLM {
         lora_config: &LoraConfig,
     ) -> Result<Self, Exception> {
         let model = GptOssLoraModel::from_model(base.model, lora_config)?;
+
         Ok(Self {
             model,
             lm_head: base.lm_head,
@@ -1617,7 +1598,7 @@ impl GptOssLoraForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward(input_ids, mask, cache)?;
-        self.lm_head.forward(&hidden)
+        Ok(self.lm_head.forward(&hidden))
     }
 
     /// Get trainable parameters.
@@ -1705,7 +1686,7 @@ mod tests {
             config.router_aux_loss_coef,
         )
         .unwrap();
-        let x = Array::zeros::<f32>(&[2, 5, config.hidden_size]).unwrap();
+        let x = Array::zeros_f32(&[2, 5, config.hidden_size]);
         let out = moe.forward(&x).unwrap();
         assert_eq!(out.shape(), &[2, 5, config.hidden_size]);
         assert!(moe.has_stacked_moe());
@@ -1724,7 +1705,7 @@ mod tests {
             config.router_aux_loss_coef,
         )
         .unwrap();
-        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
+        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
             .unwrap();
 
         let reference = moe.forward_reference(&x).unwrap();
@@ -1759,12 +1740,12 @@ mod tests {
             config.router_aux_loss_coef,
         )
         .unwrap();
-        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
+        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
             .unwrap();
 
         let _ = moe.forward(&x).unwrap();
-        moe.experts[0].gate_proj.weight = mlx_rs::module::Param::new(
-            Array::zeros::<f32>(&[config.intermediate_size, config.hidden_size]).unwrap(),
+        moe.experts[0].gate_proj.weight = pmetal_bridge::compat::module::Param::new(
+            Array::zeros_f32(&[config.intermediate_size, config.hidden_size]),
         );
 
         let reference = moe.forward_reference(&x).unwrap();
@@ -1828,9 +1809,9 @@ mod tests {
 
     #[test]
     fn test_lora_linear_creation() {
-        use mlx_rs::builder::Builder;
+        use pmetal_bridge::compat::builder::Builder;
 
-        let linear = nn::LinearBuilder::new(256, 512).bias(true).build().unwrap();
+        let linear = nn::LinearBuilder::new(256, 512).bias(true).build()?.unwrap();
 
         let lora_linear = LoraLinear::from_linear(&linear, 8, 16.0).unwrap();
 
@@ -1842,12 +1823,12 @@ mod tests {
 
     #[test]
     fn test_lora_linear_forward_shape() {
-        use mlx_rs::builder::Builder;
+        use pmetal_bridge::compat::builder::Builder;
 
-        let linear = nn::LinearBuilder::new(64, 128).bias(false).build().unwrap();
+        let linear = nn::LinearBuilder::new(64, 128).bias(false).build()?.unwrap();
 
         let lora_linear = LoraLinear::from_linear(&linear, 4, 8.0).unwrap();
-        let x = Array::zeros::<f32>(&[2, 8, 64]).unwrap();
+        let x = Array::zeros_f32(&[2, 8, 64]);
         let out = lora_linear.forward(&x).unwrap();
 
         assert_eq!(out.shape(), &[2, 8, 128]);
@@ -1855,9 +1836,9 @@ mod tests {
 
     #[test]
     fn test_lora_linear_merge() {
-        use mlx_rs::builder::Builder;
+        use pmetal_bridge::compat::builder::Builder;
 
-        let linear = nn::LinearBuilder::new(32, 64).bias(false).build().unwrap();
+        let linear = nn::LinearBuilder::new(32, 64).bias(false).build()?.unwrap();
 
         let mut lora_linear = LoraLinear::from_linear(&linear, 4, 8.0).unwrap();
         assert!(lora_linear.lora_active);
@@ -1866,16 +1847,16 @@ mod tests {
         assert!(!lora_linear.lora_active);
 
         // Forward should still work
-        let x = Array::zeros::<f32>(&[1, 4, 32]).unwrap();
+        let x = Array::zeros_f32(&[1, 4, 32]);
         let out = lora_linear.forward(&x).unwrap();
         assert_eq!(out.shape(), &[1, 4, 64]);
     }
 
     #[test]
     fn test_lora_trainable_params() {
-        use mlx_rs::builder::Builder;
+        use pmetal_bridge::compat::builder::Builder;
 
-        let linear = nn::LinearBuilder::new(32, 64).bias(false).build().unwrap();
+        let linear = nn::LinearBuilder::new(32, 64).bias(false).build()?.unwrap();
 
         let lora_linear = LoraLinear::from_linear(&linear, 4, 8.0).unwrap();
         let params = lora_linear.trainable_parameters();

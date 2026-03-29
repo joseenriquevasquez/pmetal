@@ -44,7 +44,7 @@
 
 use std::time::Duration;
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 use tracing::{debug, info};
 
 use crate::loader::TensorLoader;
@@ -438,8 +438,8 @@ impl AsyncMergePipeline {
         // Step 1: Compute task vectors
         let task_vectors: Vec<Array> = tensors
             .iter()
-            .map(|t| t.subtract(base).map_err(MergeError::from))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|t| t.subtract(base))
+            .collect::<Vec<_>>();
 
         // Step 2: Sparsify
         let sparse_vectors = crate::sparsify_batch_by_magnitude(&task_vectors, densities)?;
@@ -448,8 +448,8 @@ impl AsyncMergePipeline {
         let weighted_sum = crate::sign_consensus(&sparse_vectors, weights)?;
 
         // Step 4: Scale and add to base
-        let result = weighted_sum.multiply(Array::from_f32(lambda))?;
-        Ok(base.add(&result)?)
+        let result = weighted_sum.multiply(&Array::from_f32(lambda));
+        Ok(base.add(&result))
     }
 
     /// Get pipeline statistics.

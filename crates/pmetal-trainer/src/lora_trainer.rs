@@ -5,9 +5,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::{
-    Array, error::Exception, module::ModuleParameters, nn, ops::indexing::IndexOp,
-    optimizers::Optimizer, transforms::eval_params,
+use pmetal_bridge::compat::{
+    Array, Exception, module::ModuleParameters, nn, ops::indexing::IndexOp,
+    optimizers::Optimizer, eval_params,
 };
 use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_lora::LlamaLoraForCausalLM;
@@ -126,7 +126,7 @@ impl LoraTrainer {
         // Compute loss first
         let loss = self.compute_loss(input_ids, labels)?;
         loss.eval()?;
-        let loss_val = loss.item::<f32>();
+        let loss_val = loss.item_f32();
 
         // Get learning rate
         let lr = self.get_learning_rate();
@@ -197,7 +197,7 @@ impl LoraTrainer {
         // Compute loss and gradients
         let (loss, gradients) = loss_and_grad_fn(&mut self.model, (input_ids, labels))?;
         loss.eval()?;
-        let loss_val = loss.item::<f32>();
+        let loss_val = loss.item_f32();
 
         // Update parameters with optimizer
         optimizer.update(&mut self.model, gradients)?;
@@ -411,7 +411,7 @@ where
         // Compute loss (no gradient update in this simple version)
         let loss = trainer.compute_loss(&input_ids, &labels)?;
         loss.eval()?;
-        let loss_val = loss.item::<f32>() as f64;
+        let loss_val = loss.item_f32() as f64;
 
         trainer.running_loss = if step == 0 {
             loss_val
@@ -502,10 +502,10 @@ mod tests {
         let labels = Array::from_slice(&[2_i32, 3, 4, 5], &[1, 4]);
 
         let loss = trainer.compute_loss(&input_ids, &labels).unwrap();
-        loss.eval().unwrap();
+        loss.eval();
 
         // Loss should be positive
-        assert!(loss.item::<f32>() > 0.0);
+        assert!(loss.item_f32() > 0.0);
     }
 
     #[test]
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn test_train_step_autodiff() {
-        use mlx_rs::optimizers::Sgd;
+        use pmetal_bridge::compat::optimizers::Sgd;
 
         let mut trainer =
             LoraTrainer::new(small_config(), small_lora_config(), small_training_config()).unwrap();
@@ -540,8 +540,8 @@ mod tests {
 
         // Get initial loss
         let initial_loss = trainer.compute_loss(&input_ids, &labels).unwrap();
-        initial_loss.eval().unwrap();
-        let initial_loss_val = initial_loss.item::<f32>();
+        initial_loss.eval();
+        let initial_loss_val = initial_loss.item_f32();
 
         // Perform training step with autodiff
         let stats = trainer

@@ -4,9 +4,7 @@
 //! periodic inductive bias for modeling audio harmonics.
 
 use crate::error::Result;
-use mlx_rs::Array;
-use mlx_rs::macros::ModuleParameters;
-use mlx_rs::module::Param;
+use pmetal_bridge::compat::{Array, Param, ops};
 
 /// Snake activation function.
 ///
@@ -14,10 +12,9 @@ use mlx_rs::module::Param;
 ///
 /// The learnable parameter α controls the frequency of the periodic component.
 /// Higher α values capture higher frequency content.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Snake {
     /// Learnable frequency parameter.
-    #[param]
     pub alpha: Param<Array>,
     /// Whether alpha is in log scale (exp(alpha) is used).
     pub alpha_logscale: bool,
@@ -33,7 +30,7 @@ impl Snake {
         // Initialize alpha to 1.0 (or log(1) = 0 for logscale)
         let init_val = if alpha_logscale { 0.0 } else { 1.0 };
         let alpha = Array::from_f32(init_val);
-        let alpha = mlx_rs::ops::broadcast_to(&alpha, &[1, channels, 1])?;
+        let alpha = ops::broadcast_to(&alpha, &[1, channels, 1]);
 
         Ok(Self {
             alpha: Param::new(alpha),
@@ -50,18 +47,18 @@ impl Snake {
     /// Activated tensor with same shape
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let alpha = if self.alpha_logscale {
-            self.alpha.as_ref().exp()?
+            self.alpha.value.exp()
         } else {
-            self.alpha.as_ref().clone()
+            self.alpha.value.clone()
         };
 
         // Snake(x) = x + (1/α) * sin²(αx)
-        let ax = x.multiply(&alpha)?;
-        let sin_ax = ax.sin()?;
-        let sin_sq = sin_ax.multiply(&sin_ax)?;
-        let scaled = sin_sq.divide(&alpha)?;
+        let ax = x.multiply(&alpha);
+        let sin_ax = ax.sin();
+        let sin_sq = sin_ax.multiply(&sin_ax);
+        let scaled = sin_sq.divide(&alpha);
 
-        Ok(x.add(&scaled)?)
+        Ok(x.add(&scaled))
     }
 }
 
@@ -71,13 +68,11 @@ impl Snake {
 ///
 /// Extends Snake with separate α (frequency) and β (magnitude) parameters.
 /// This provides more expressiveness for modeling complex audio signals.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct SnakeBeta {
     /// Learnable frequency parameter.
-    #[param]
     pub alpha: Param<Array>,
     /// Learnable magnitude parameter.
-    #[param]
     pub beta: Param<Array>,
     /// Whether parameters are in log scale.
     pub logscale: bool,
@@ -93,8 +88,8 @@ impl SnakeBeta {
         // Initialize to 1.0 (or log(1) = 0 for logscale)
         let init_val = if logscale { 0.0 } else { 1.0 };
         let init = Array::from_f32(init_val);
-        let alpha = mlx_rs::ops::broadcast_to(&init, &[1, channels, 1])?;
-        let beta = mlx_rs::ops::broadcast_to(&init, &[1, channels, 1])?;
+        let alpha = ops::broadcast_to(&init, &[1, channels, 1]);
+        let beta = ops::broadcast_to(&init, &[1, channels, 1]);
 
         Ok(Self {
             alpha: Param::new(alpha),
@@ -112,18 +107,18 @@ impl SnakeBeta {
     /// Activated tensor with same shape
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let (alpha, beta) = if self.logscale {
-            (self.alpha.as_ref().exp()?, self.beta.as_ref().exp()?)
+            (self.alpha.value.exp(), self.beta.value.exp())
         } else {
-            (self.alpha.as_ref().clone(), self.beta.as_ref().clone())
+            (self.alpha.value.clone(), self.beta.value.clone())
         };
 
         // SnakeBeta(x) = x + (1/β) * sin²(αx)
-        let ax = x.multiply(&alpha)?;
-        let sin_ax = ax.sin()?;
-        let sin_sq = sin_ax.multiply(&sin_ax)?;
-        let scaled = sin_sq.divide(&beta)?;
+        let ax = x.multiply(&alpha);
+        let sin_ax = ax.sin();
+        let sin_sq = sin_ax.multiply(&sin_ax);
+        let scaled = sin_sq.divide(&beta);
 
-        Ok(x.add(&scaled)?)
+        Ok(x.add(&scaled))
     }
 }
 
@@ -225,7 +220,7 @@ fn create_kaiser_filter(taps: i32, cutoff: f32) -> Result<Array> {
         *v /= sum;
     }
 
-    Ok(Array::from_slice(&filter, &[1, 1, taps]))
+    Ok(Array::from_f32_slice(&filter, &[1, 1, taps]))
 }
 
 /// Upsample 1D signal by inserting zeros.
@@ -241,11 +236,11 @@ fn upsample_1d(x: &Array, ratio: i32) -> Result<Array> {
 
     // Insert zeros between samples
     // [B, C, L] -> [B, C, L, ratio] -> [B, C, L*ratio]
-    let zeros = mlx_rs::ops::zeros::<f32>(&[batch, channels, length, ratio - 1])?;
-    let x_expanded = x.reshape(&[batch, channels, length, 1])?;
-    let interleaved = mlx_rs::ops::concatenate_axis(&[&x_expanded, &zeros], -1)?;
+    let zeros = Array::zeros(&[batch, channels, length, ratio - 1], 10); // 10 = float32
+    let x_expanded = x.reshape(&[batch, channels, length, 1]);
+    let interleaved = ops::concatenate_axis(&[&x_expanded, &zeros], -1);
 
-    Ok(interleaved.reshape(&[batch, channels, length * ratio])?)
+    Ok(interleaved.reshape(&[batch, channels, length * ratio]))
 }
 
 /// Downsample 1D signal with anti-aliasing filter.
@@ -263,16 +258,19 @@ fn downsample_1d(x: &Array, ratio: i32, filter: &Array) -> Result<Array> {
 
     // Group convolution (each channel independently)
     // Expand filter for group conv: [1, 1, taps] -> [channels, 1, taps]
-    let _filter_exp = mlx_rs::ops::broadcast_to(filter, &[channels, 1, filter.dim(2)])?;
+    let _filter_exp = ops::broadcast_to(filter, &[channels, 1, filter.dim(2)]);
 
     // Simplified: downsample without group conv1d filtering.
-    // Full implementation needs conv1d with groups support in mlx-rs.
+    // Full implementation needs conv1d with groups support.
 
-    // Take every ratio-th sample
+    // Take every ratio-th sample using slice
     let indices: Vec<i32> = (0..length).step_by(ratio as usize).collect();
-    let indices_arr = Array::from_slice(&indices, &[indices.len() as i32]);
-
-    x.take_axis(&indices_arr, 2).map_err(Into::into)
+    let indices_arr = Array::from_f32_slice(
+        &indices.iter().map(|&i| i as f32).collect::<Vec<_>>(),
+        &[indices.len() as i32],
+    )
+    .as_dtype(7); // 7 = int32
+    Ok(x.take_axis(&indices_arr, 2))
 }
 
 #[cfg(test)]
@@ -282,47 +280,51 @@ mod tests {
     #[test]
     fn test_snake_forward() {
         let snake = Snake::new(4, true).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 16], None, None, None).unwrap();
+        let x = Array::random_normal(&[1, 4, 16], 10);
 
         let y = snake.forward(&x).unwrap();
-        y.eval().unwrap();
+        let mut y2 = y.clone();
+        y2.eval();
 
-        assert_eq!(y.shape(), &[1, 4, 16]);
+        assert_eq!(y2.shape(), &[1, 4, 16]);
     }
 
     #[test]
     fn test_snakebeta_forward() {
         let snake = SnakeBeta::new(8, true).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[2, 8, 32], None, None, None).unwrap();
+        let x = Array::random_normal(&[2, 8, 32], 10);
 
         let y = snake.forward(&x).unwrap();
-        y.eval().unwrap();
+        let mut y2 = y.clone();
+        y2.eval();
 
-        assert_eq!(y.shape(), &[2, 8, 32]);
+        assert_eq!(y2.shape(), &[2, 8, 32]);
     }
 
     #[test]
     fn test_snake_values() {
         // Snake(0) should be 0 (since sin(0) = 0)
         let snake = Snake::new(1, false).unwrap();
-        let x = mlx_rs::ops::zeros::<f32>(&[1, 1, 4]).unwrap();
+        let x = Array::zeros(&[1, 1, 4], 10);
 
         let y = snake.forward(&x).unwrap();
-        y.eval().unwrap();
+        let mut y2 = y.clone();
+        y2.eval();
 
         // Output should be close to 0
-        let sum = y.sum(None).unwrap();
-        sum.eval().unwrap();
-        assert!(sum.item::<f32>().abs() < 1e-5);
+        let mut sum = y2.sum_all();
+        sum.eval();
+        assert!(sum.item_f32().abs() < 1e-5);
     }
 
     #[test]
     fn test_upsample_1d() {
-        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let x = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let y = upsample_1d(&x, 2).unwrap();
-        y.eval().unwrap();
+        let mut y2 = y.clone();
+        y2.eval();
 
-        assert_eq!(y.shape(), &[1, 1, 8]);
+        assert_eq!(y2.shape(), &[1, 1, 8]);
         // Should be [1, 0, 2, 0, 3, 0, 4, 0]
     }
 
@@ -331,11 +333,12 @@ mod tests {
         let snake = Snake::new(4, true).unwrap();
         let act1d = Activation1d::new(snake, Some(2), Some(2)).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 16], None, None, None).unwrap();
+        let x = Array::random_normal(&[1, 4, 16], 10);
         let y = act1d.forward(&x).unwrap();
-        y.eval().unwrap();
+        let mut y2 = y.clone();
+        y2.eval();
 
         // Output should have same shape (up 2x, down 2x)
-        assert_eq!(y.shape(), &[1, 4, 16]);
+        assert_eq!(y2.shape(), &[1, 4, 16]);
     }
 }

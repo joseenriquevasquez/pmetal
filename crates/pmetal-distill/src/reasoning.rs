@@ -40,7 +40,7 @@
 //! - "Distilling Reasoning Capabilities into Smaller Language Models" (2025)
 
 use crate::{DistillLoss, Result};
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, Dtype, ops};
 
 /// Rationale-Based Knowledge Distillation Loss.
 ///
@@ -134,18 +134,18 @@ impl RationaleLoss {
         temperature: f32,
     ) -> Result<Array> {
         let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp)?;
-        let student_scaled = student_logits.divide(&temp)?;
+        let teacher_scaled = teacher_logits.divide(&temp);
+        let student_scaled = student_logits.divide(&temp);
 
-        let teacher_logprobs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
-        let student_logprobs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
+        let teacher_logprobs = teacher_scaled.log_softmax(-1);
+        let student_logprobs = student_scaled.log_softmax(-1);
 
-        let teacher_probs = teacher_logprobs.exp()?;
-        let log_ratio = teacher_logprobs.subtract(&student_logprobs)?;
-        let kl_per_vocab = teacher_probs.multiply(&log_ratio)?;
+        let teacher_probs = teacher_logprobs.exp();
+        let log_ratio = teacher_logprobs.subtract(&student_logprobs);
+        let kl_per_vocab = teacher_probs.multiply(&log_ratio);
 
         // Sum over vocab dimension -> [batch, seq]
-        Ok(kl_per_vocab.sum_axis(-1, false)?)
+        Ok(kl_per_vocab.sum_axes(&[-1], false))
     }
 
     /// Compute per-token entropy of the teacher distribution.
@@ -157,16 +157,16 @@ impl RationaleLoss {
     /// * `temperature` - Softmax temperature
     pub fn compute_entropy(&self, teacher_logits: &Array, temperature: f32) -> Result<Array> {
         let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp)?;
+        let teacher_scaled = teacher_logits.divide(&temp);
 
-        let teacher_logprobs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
-        let teacher_probs = teacher_logprobs.exp()?;
+        let teacher_logprobs = teacher_scaled.log_softmax(-1);
+        let teacher_probs = teacher_logprobs.exp();
 
         // H = -sum(p * log(p)) over vocab -> [batch, seq]
-        let p_log_p = teacher_probs.multiply(&teacher_logprobs)?;
+        let p_log_p = teacher_probs.multiply(&teacher_logprobs);
         Ok(p_log_p
-            .sum_axis(-1, false)?
-            .multiply(&Array::from_f32(-1.0))?)
+            .sum_axes(&[-1], false)
+            .multiply(&Array::from_f32(-1.0)))
     }
 }
 
@@ -183,46 +183,46 @@ impl DistillLoss for RationaleLoss {
         external_weights: Option<&Array>,
     ) -> Result<Array> {
         let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp)?;
-        let student_scaled = student_logits.divide(&temp)?;
+        let teacher_scaled = teacher_logits.divide(&temp);
+        let student_scaled = student_logits.divide(&temp);
 
         // 1. Compute per-token KL divergence stably
-        let teacher_logprobs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
-        let student_logprobs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
+        let teacher_logprobs = teacher_scaled.log_softmax(-1);
+        let student_logprobs = student_scaled.log_softmax(-1);
 
-        let teacher_probs = teacher_logprobs.exp()?;
-        let log_ratio = teacher_logprobs.subtract(&student_logprobs)?;
-        let kl_per_vocab = teacher_probs.multiply(&log_ratio)?;
-        let kl_per_token = kl_per_vocab.sum_axis(-1, false)?;
+        let teacher_probs = teacher_logprobs.exp();
+        let log_ratio = teacher_logprobs.subtract(&student_logprobs);
+        let kl_per_vocab = teacher_probs.multiply(&log_ratio);
+        let kl_per_token = kl_per_vocab.sum_axes(&[-1], false);
 
         // 2. Compute internal reasoning weights based on teacher entropy
-        let p_log_p = teacher_probs.multiply(&teacher_logprobs)?;
+        let p_log_p = teacher_probs.multiply(&teacher_logprobs);
         let entropy = p_log_p
-            .sum_axis(-1, false)?
-            .multiply(&Array::from_f32(-1.0))?;
+            .sum_axes(&[-1], false)
+            .multiply(&Array::from_f32(-1.0));
 
         // Normalize entropy in-graph (no .item() to preserve autodiff)
-        let max_entropy = entropy.max(false)?;
-        let safe_max = mlx_rs::ops::maximum(&max_entropy, &Array::from_f32(1e-6))?;
-        let normalized_entropy = entropy.divide(&safe_max)?;
+        let max_entropy = entropy.max(None);
+        let safe_max = ops::maximum(&max_entropy, &Array::from_f32(1e-6));
+        let normalized_entropy = entropy.divide(&safe_max);
 
         let mut internal_weight = normalized_entropy
-            .multiply(&Array::from_f32(self.reasoning_weight))?
-            .add(&Array::from_f32(1.0))?;
+            .multiply(&Array::from_f32(self.reasoning_weight))
+            .add(&Array::from_f32(1.0));
 
         // 3. Combine with external weights (e.g., from reasoning markers or outcome supervision)
         if let Some(w) = external_weights {
-            internal_weight = internal_weight.multiply(w)?;
+            internal_weight = internal_weight.multiply(w);
         }
 
         // 4. Apply weights and compute mean
-        let weighted_loss = kl_per_token.multiply(&internal_weight)?;
+        let weighted_loss = kl_per_token.multiply(&internal_weight);
 
         // Weighted mean in-graph (no .item() to preserve autodiff)
-        let total_weighted_loss = weighted_loss.sum(false)?;
-        let total_weights = internal_weight.sum(false)?;
-        let safe_weights = mlx_rs::ops::maximum(&total_weights, &Array::from_f32(1e-6))?;
-        Ok(total_weighted_loss.divide(&safe_weights)?)
+        let total_weighted_loss = weighted_loss.sum_all();
+        let total_weights = internal_weight.sum_all();
+        let safe_weights = ops::maximum(&total_weights, &Array::from_f32(1e-6));
+        Ok(total_weighted_loss.divide(&safe_weights))
     }
 }
 
@@ -233,25 +233,28 @@ impl DistillLoss for RationaleLoss {
 /// * `start_token` - Token ID for the start of reasoning (e.g., "<think>")
 /// * `end_token` - Token ID for the end of reasoning (e.g., "</think>")
 pub fn generate_reasoning_mask(tokens: &Array, start_token: u32, end_token: u32) -> Result<Array> {
-    let start_arr = Array::from_int(start_token as i32);
-    let end_arr = Array::from_int(end_token as i32);
+    let start_arr = Array::from_i32(start_token as i32);
+    let end_arr = Array::from_i32(end_token as i32);
 
-    let is_start = tokens.eq(&start_arr)?;
-    let is_end = tokens.eq(&end_arr)?;
+    let is_start = tokens.equal(&start_arr);
+    let is_end = tokens.equal(&end_arr);
 
     // Use cumulative sum to track being "inside" reasoning tags.
     // exclusive cumsum for start: the start token itself should NOT be included.
     // inclusive cumsum for end: the end token position should mark the boundary.
-    let start_cumsum =
-        mlx_rs::ops::cumsum(&is_start.as_dtype(mlx_rs::Dtype::Int32)?, 1, None, None)?;
-    let end_cumsum = mlx_rs::ops::cumsum(&is_end.as_dtype(mlx_rs::Dtype::Int32)?, 1, None, None)?;
+    let start_cumsum = ops::cumsum(&is_start.as_dtype(Dtype::Int32.as_i32()), 1);
+    let end_cumsum = ops::cumsum(&is_end.as_dtype(Dtype::Int32.as_i32()), 1);
 
-    let mask = start_cumsum.subtract(&end_cumsum)?;
+    let mask = start_cumsum.subtract(&end_cumsum);
 
     // Clamp to [0, 1] to handle multiple/nested reasoning blocks correctly
-    let mask = mlx_rs::ops::clip(&mask, (&Array::from_int(0), &Array::from_int(1)))?;
+    let mask = ops::clip(
+        &mask,
+        Some(&Array::from_i32(0)),
+        Some(&Array::from_i32(1)),
+    );
 
-    Ok(mask.as_dtype(mlx_rs::Dtype::Float32)?)
+    Ok(mask.as_dtype(Dtype::Float32.as_i32()))
 }
 
 /// Outcome-Supervised Rationale Distillation Loss.
@@ -282,7 +285,7 @@ impl OutcomeSupervisedRationaleLoss {
         correctness: &Array,
     ) -> Result<Array> {
         // Expand correctness from [batch] to [batch, 1] for broadcasting
-        let weight = correctness.reshape(&[-1, 1])?;
+        let weight = correctness.reshape(&[-1, 1]);
         self.base_loss
             .compute_weighted(teacher_logits, student_logits, temperature, Some(&weight))
     }
@@ -315,13 +318,13 @@ mod tests {
     fn test_generate_reasoning_mask() {
         // Tokens: [CLS, "Hello", "<think>", " reasoning", " steps", "</think>", " final", " answer"]
         // Indices:  0,      1,         2,          3,        4,         5,        6,        7
-        let tokens = Array::from_slice(&[0_i32, 1, 2, 3, 4, 5, 6, 7], &[1, 8]);
+        let tokens = Array::from_i32_slice(&[0_i32, 1, 2, 3, 4, 5, 6, 7], &[1, 8]);
         let start_token = 2;
         let end_token = 5;
 
         let mask = generate_reasoning_mask(&tokens, start_token, end_token).unwrap();
-        mask.eval().unwrap();
-        let mask_vals: Vec<f32> = mask.as_slice().to_vec();
+        mask.eval();
+        let mask_vals: Vec<f32> = mask.clone().to_f32_vec(8).unwrap();
 
         // Indices 3 and 4 should be 1.0 (inside tags)
         // Indices 2 and 5 behavior depends on implementation (currently 2 is 1.0, 5 is 0.0 due to cumsum timing)
@@ -335,25 +338,25 @@ mod tests {
     #[serial]
     fn test_outcome_supervised_loss() {
         // Use asymmetric logits so the two samples have different KL divergences
-        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 1.0], &[2, 1, 2]);
-        let student = Array::from_slice(&[2.0_f32, 1.0, 1.0, 3.0], &[2, 1, 2]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 1.0], &[2, 1, 2]);
+        let student = Array::from_f32_slice(&[2.0_f32, 1.0, 1.0, 3.0], &[2, 1, 2]);
 
         let loss = OutcomeSupervisedRationaleLoss::new(1.0);
 
         // Case 1: First sample is correct, second is incorrect
-        let correctness = Array::from_slice(&[1.0_f32, 0.0], &[2]);
+        let correctness = Array::from_f32_slice(&[1.0_f32, 0.0], &[2]);
         let result = loss
             .compute_with_outcome(&teacher, &student, 1.0, &correctness)
             .unwrap();
-        result.eval().unwrap();
+        result.eval();
         let val1: f32 = result.item();
 
         // Case 2: Both correct
-        let correctness_all = Array::from_slice(&[1.0_f32, 1.0], &[2]);
+        let correctness_all = Array::from_f32_slice(&[1.0_f32, 1.0], &[2]);
         let result_all = loss
             .compute_with_outcome(&teacher, &student, 1.0, &correctness_all)
             .unwrap();
-        result_all.eval().unwrap();
+        result_all.eval();
         let val_all: f32 = result_all.item();
 
         assert!(val1 > 0.0);
@@ -389,10 +392,10 @@ mod tests {
     #[test]
     #[serial]
     fn test_identical_distributions() {
-        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let loss = RationaleLoss::new(1.0);
         let result = loss.compute(&logits, &logits, 1.0).unwrap();
-        result.eval().unwrap();
+        result.eval();
         let value: f32 = result.item();
 
         // KL of identical distributions should be ~0
@@ -406,12 +409,12 @@ mod tests {
     #[test]
     #[serial]
     fn test_different_distributions() {
-        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
-        let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
 
         let loss = RationaleLoss::new(1.0);
         let result = loss.compute(&teacher, &student, 1.0).unwrap();
-        result.eval().unwrap();
+        result.eval();
         let value: f32 = result.item();
 
         // Loss should be positive
@@ -424,7 +427,7 @@ mod tests {
         // Create distributions where some positions have higher entropy
         // Position 0: low entropy (peaked distribution)
         // Position 1: high entropy (uniform-ish distribution)
-        let teacher = Array::from_slice(
+        let teacher = Array::from_f32_slice(
             &[
                 // Position 0: peaked at index 3
                 0.0_f32, 0.0, 0.0, 10.0, // Position 1: more uniform
@@ -432,7 +435,7 @@ mod tests {
             ],
             &[1, 2, 4],
         );
-        let student = Array::from_slice(
+        let student = Array::from_f32_slice(
             &[
                 // Position 0: wrong but peaked
                 10.0_f32, 0.0, 0.0, 0.0, // Position 1: also wrong
@@ -444,13 +447,13 @@ mod tests {
         // With low reasoning weight, high-entropy position contributes equally
         let low_weight_loss = RationaleLoss::new(0.0);
         let loss_low = low_weight_loss.compute(&teacher, &student, 1.0).unwrap();
-        loss_low.eval().unwrap();
+        loss_low.eval();
         let val_low: f32 = loss_low.item();
 
         // With high reasoning weight, high-entropy position contributes more
         let high_weight_loss = RationaleLoss::new(5.0);
         let loss_high = high_weight_loss.compute(&teacher, &student, 1.0).unwrap();
-        loss_high.eval().unwrap();
+        loss_high.eval();
         let val_high: f32 = loss_high.item();
 
         // Both should be positive
@@ -468,13 +471,13 @@ mod tests {
     #[test]
     #[serial]
     fn test_per_token_kl_shape() {
-        let teacher = Array::from_slice(
+        let teacher = Array::from_f32_slice(
             &[
                 1.0_f32, 2.0, 3.0, 4.0, 2.0, 3.0, 4.0, 5.0, 3.0, 4.0, 5.0, 6.0,
             ],
             &[2, 3, 2], // batch=2, seq=3, vocab=2
         );
-        let student = Array::from_slice(
+        let student = Array::from_f32_slice(
             &[
                 4.0_f32, 3.0, 5.0, 4.0, 6.0, 5.0, 3.0, 2.0, 4.0, 3.0, 5.0, 4.0,
             ],
@@ -483,7 +486,7 @@ mod tests {
 
         let loss = RationaleLoss::new(1.0);
         let kl = loss.per_token_kl(&teacher, &student, 1.0).unwrap();
-        kl.eval().unwrap();
+        kl.eval();
 
         // Should be [batch, seq] = [2, 3]
         assert_eq!(kl.shape(), &[2, 3]);
@@ -492,7 +495,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_entropy_shape() {
-        let teacher = Array::from_slice(
+        let teacher = Array::from_f32_slice(
             &[
                 1.0_f32, 2.0, 3.0, 4.0, 2.0, 3.0, 4.0, 5.0, 3.0, 4.0, 5.0, 6.0,
             ],
@@ -501,13 +504,13 @@ mod tests {
 
         let loss = RationaleLoss::new(1.0);
         let entropy = loss.compute_entropy(&teacher, 1.0).unwrap();
-        entropy.eval().unwrap();
+        entropy.eval();
 
         // Should be [batch, seq] = [2, 3]
         assert_eq!(entropy.shape(), &[2, 3]);
 
         // Entropy should be non-negative
-        let vals: Vec<f32> = entropy.as_slice().to_vec();
+        let vals: Vec<f32> = entropy.clone().to_f32_vec(6).unwrap();
         for &v in &vals {
             assert!(v >= 0.0, "Entropy should be non-negative");
         }
@@ -527,18 +530,18 @@ mod tests {
             .map(|i| ((i * 7 % 100) as f32 - 50.0) / 10.0)
             .collect();
 
-        let teacher = Array::from_slice(
+        let teacher = Array::from_f32_slice(
             &teacher_data,
             &[batch_size as i32, seq_len as i32, vocab_size as i32],
         );
-        let student = Array::from_slice(
+        let student = Array::from_f32_slice(
             &student_data,
             &[batch_size as i32, seq_len as i32, vocab_size as i32],
         );
 
         let loss = RationaleLoss::new(1.5);
         let result = loss.compute(&teacher, &student, 2.0).unwrap();
-        result.eval().unwrap();
+        result.eval();
         let value: f32 = result.item();
 
         assert!(value > 0.0, "Loss should be positive");

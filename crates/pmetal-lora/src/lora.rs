@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::{Array, Dtype, error::Exception, nn};
+use pmetal_bridge::compat::{Array, Dtype, Exception, nn};
 
 use pmetal_core::LoraConfig;
 
@@ -113,9 +113,9 @@ pub(crate) fn apply_dropout(x: &Array, p: f32) -> Result<Array, Exception> {
         return Ok(x.clone());
     }
     let one_minus_p = 1.0 - p;
-    let mask = mlx_rs::random::bernoulli(&Array::from_f32(one_minus_p), x.shape(), None)?;
+    let mask = pmetal_bridge::compat::random::bernoulli(&Array::from_f32(one_minus_p), x.shape());
     let scale = Array::from_f32(1.0 / one_minus_p);
-    x.multiply(&mask.multiply(&scale)?)
+    Ok(x.multiply(&mask.multiply(&scale)))
 }
 
 /// Error type for LoRA operations.
@@ -126,7 +126,7 @@ pub enum LoraError {
     Mlx(#[from] Exception),
     /// IO error.
     #[error("IO error: {0}")]
-    Io(#[from] mlx_rs::error::IoError),
+    Io(String),
     /// Shape mismatch error.
     #[error("Shape mismatch: {0}")]
     ShapeMismatch(String),
@@ -149,7 +149,7 @@ pub fn sanitize_loaded_weights(
     let mut sanitized = HashMap::with_capacity(weights.len());
     for (name, weight) in weights {
         let weight = if weight.dtype() == Dtype::Bfloat16 {
-            weight.as_dtype(Dtype::Float16)?
+            weight.as_dtype(Dtype::Float16.as_i32())
         } else {
             weight
         };
@@ -227,16 +227,16 @@ impl LoraLinear {
             } else {
                 (3.0_f32 / in_features as f32).sqrt()
             };
-            mlx_rs::random::uniform::<_, f32>(-bound, bound, &[rank, in_features], None)?
+            pmetal_bridge::compat::random::uniform_range(-bound, bound, &[rank, in_features], Dtype::Float32)
         } else {
-            mlx_rs::ops::zeros::<f32>(&[1, in_features])? // Dummy small array
+            pmetal_bridge::compat::ops::zeros(&[1, in_features], Dtype::Float32) // Dummy small array
         };
 
         // Initialize LoRA B with zeros
         let lora_b = if rank > 0 {
-            mlx_rs::ops::zeros::<f32>(&[out_features, rank])?
+            pmetal_bridge::compat::ops::zeros(&[out_features, rank], Dtype::Float32)
         } else {
-            mlx_rs::ops::zeros::<f32>(&[out_features, 1])? // Dummy
+            pmetal_bridge::compat::ops::zeros(&[out_features, 1], Dtype::Float32) // Dummy
         };
 
         // Clone bias if present
@@ -282,11 +282,11 @@ impl LoraLinear {
         // Initialize base weight with Kaiming uniform
         let bound = (3.0_f32 / in_features as f32).sqrt();
         let weight =
-            mlx_rs::random::uniform::<_, f32>(-bound, bound, &[out_features, in_features], None)?;
+            pmetal_bridge::compat::random::uniform_range(-bound, bound, &[out_features, in_features], Dtype::Float32);
 
         // Initialize bias if needed
         let bias = if use_bias {
-            Some(mlx_rs::ops::zeros::<f32>(&[out_features])?)
+            Some(pmetal_bridge::compat::ops::zeros(&[out_features], Dtype::Float32))
         } else {
             None
         };
@@ -301,21 +301,21 @@ impl LoraLinear {
             bound
         };
         let lora_a = if rank > 0 {
-            mlx_rs::random::uniform::<_, f32>(
+            pmetal_bridge::compat::random::uniform_range(
                 -lora_a_bound,
                 lora_a_bound,
                 &[rank, in_features],
-                None,
-            )?
+                Dtype::Float32,
+            )
         } else {
-            mlx_rs::ops::zeros::<f32>(&[1, in_features])?
+            pmetal_bridge::compat::ops::zeros(&[1, in_features], Dtype::Float32)
         };
 
         // Initialize LoRA B with zeros
         let lora_b = if rank > 0 {
-            mlx_rs::ops::zeros::<f32>(&[out_features, rank])?
+            pmetal_bridge::compat::ops::zeros(&[out_features, rank], Dtype::Float32)
         } else {
-            mlx_rs::ops::zeros::<f32>(&[out_features, 1])?
+            pmetal_bridge::compat::ops::zeros(&[out_features, 1], Dtype::Float32)
         };
 
         Ok(Self {
@@ -355,12 +355,12 @@ impl LoraLinear {
         // Honor init_lora_weights: if false, initialize B with random instead of zeros
         if !config.init_lora_weights && layer.rank > 0 {
             let bound = (1.0_f32 / layer.rank as f32).sqrt();
-            layer.lora_b = mlx_rs::random::uniform::<_, f32>(
+            layer.lora_b = pmetal_bridge::compat::random::uniform_range(
                 -bound,
                 bound,
                 &[out_features, layer.rank],
-                None,
-            )?;
+                Dtype::Float32,
+            );
         }
 
         Ok(layer)
@@ -375,7 +375,7 @@ impl LoraLinear {
             // Use base weight directly if merged or rank=0 (frozen)
             let y = x.matmul(&self.weight.t())?;
             if let Some(ref bias) = self.bias {
-                Ok(y.add(bias)?)
+                Ok(y.add(bias))
             } else {
                 Ok(y)
             }
@@ -401,7 +401,7 @@ impl LoraLinear {
 
             // Add bias if present
             if let Some(ref bias) = self.bias {
-                Ok(y.add(bias)?)
+                Ok(y.add(bias))
             } else {
                 Ok(y)
             }
@@ -479,8 +479,8 @@ impl LoraLinear {
         learning_rate: f32,
     ) -> Result<(), LoraError> {
         let lr = Array::from_f32(learning_rate);
-        self.lora_a = self.lora_a.subtract(&grads.d_lora_a.multiply(&lr)?)?;
-        self.lora_b = self.lora_b.subtract(&grads.d_lora_b.multiply(&lr)?)?;
+        self.lora_a = self.lora_a.subtract(&grads.d_lora_a.multiply(&lr))?;
+        self.lora_b = self.lora_b.subtract(&grads.d_lora_b.multiply(&lr))?;
         Ok(())
     }
 
@@ -691,7 +691,7 @@ pub fn fused_lora_forward(
     let y_lora = xab.multiply(&scale_arr)?;
 
     // Combined output
-    Ok(y_base.add(&y_lora)?)
+    Ok(y_base.add(&y_lora))
 }
 
 /// Compute the effective LoRA rank for a given module name, respecting `target_modules`.
@@ -908,7 +908,7 @@ mod tests {
     fn test_lora_linear_forward() {
         let mut lora = LoraLinear::new(32, 64, 4, 8.0, false, false).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 32], pmetal_bridge::compat::Dtype::Float32);
         let output = lora.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[2, 4, 64]);
@@ -918,7 +918,7 @@ mod tests {
     fn test_lora_linear_with_bias() {
         let mut lora = LoraLinear::new(32, 64, 4, 8.0, false, true).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 32], pmetal_bridge::compat::Dtype::Float32);
         let output = lora.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[2, 4, 64]);
@@ -930,7 +930,7 @@ mod tests {
         // With B initialized to zeros, LoRA should have minimal effect initially
         let mut lora = LoraLinear::new(32, 64, 8, 16.0, false, false).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], pmetal_bridge::compat::Dtype::Float32);
         let output = lora.forward(&x).unwrap();
 
         // Check base forward without LoRA
@@ -951,9 +951,9 @@ mod tests {
         let mut lora = LoraLinear::new(32, 64, 4, 8.0, false, false).unwrap();
 
         // Initialize B to non-zero for merge to have effect
-        lora.lora_b = mlx_rs::random::normal::<f32>(&[64, 4], None, None, None).unwrap();
+        lora.lora_b = pmetal_bridge::compat::random::normal(&[64, 4], pmetal_bridge::compat::Dtype::Float32);
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], pmetal_bridge::compat::Dtype::Float32);
 
         // Get output before merge
         let output_before = lora.forward(&x).unwrap();
@@ -1008,11 +1008,11 @@ mod tests {
         let scale = 2.0;
 
         // Create random weights
-        let x = mlx_rs::random::normal::<f32>(&[2, 4, in_features], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, in_features], pmetal_bridge::compat::Dtype::Float32);
         let weight =
-            mlx_rs::random::normal::<f32>(&[out_features, in_features], None, None, None).unwrap();
-        let lora_a = mlx_rs::random::normal::<f32>(&[rank, in_features], None, None, None).unwrap();
-        let lora_b = mlx_rs::ops::zeros::<f32>(&[out_features, rank]).unwrap();
+            pmetal_bridge::compat::random::normal(&[out_features, in_features], pmetal_bridge::compat::Dtype::Float32);
+        let lora_a = pmetal_bridge::compat::random::normal(&[rank, in_features], pmetal_bridge::compat::Dtype::Float32);
+        let lora_b = pmetal_bridge::compat::ops::zeros(&[out_features, rank], pmetal_bridge::compat::Dtype::Float32);
 
         let output = fused_lora_forward(&x, &weight, &lora_a, &lora_b, scale).unwrap();
 

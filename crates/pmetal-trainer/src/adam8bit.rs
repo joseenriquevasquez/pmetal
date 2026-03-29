@@ -45,11 +45,8 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::{
-    Array, Dtype,
-    error::{Exception, Result},
-    ops::indexing::IndexOp,
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops::indexing::IndexOp};
+type Result<T> = std::result::Result<T, Exception>;
 
 /// Error type for 8-bit Adam operations.
 #[derive(Debug, thiserror::Error)]
@@ -371,20 +368,20 @@ impl Adam8bit {
             "apply_update called with step=0; call update_single() or update() instead"
         );
 
-        gradient.eval()?;
-        parameter.eval()?;
+        gradient.eval();
+        parameter.eval();
 
         // Validate dtypes — quantization assumes Float32
-        if gradient.dtype() != Dtype::Float32 {
+        if gradient.dtype_raw() != Dtype::Float32.as_i32() {
             return Err(Exception::custom(format!(
-                "Adam8bit requires Float32 gradients, got {:?}",
-                gradient.dtype()
+                "Adam8bit requires Float32 gradients, got dtype={}",
+                gradient.dtype_raw()
             )));
         }
-        if parameter.dtype() != Dtype::Float32 {
+        if parameter.dtype_raw() != Dtype::Float32.as_i32() {
             return Err(Exception::custom(format!(
-                "Adam8bit requires Float32 parameters, got {:?}",
-                parameter.dtype()
+                "Adam8bit requires Float32 parameters, got dtype={}",
+                parameter.dtype_raw()
             )));
         }
 
@@ -418,14 +415,14 @@ impl Adam8bit {
             let m_data = self.dequantize_signed(&state.m_quantized, &state.m_scales);
             let v_data = self.dequantize_unsigned(&state.v_quantized, &state.v_scales);
             (
-                Array::from_slice(&m_data, &[size as i32]),
-                Array::from_slice(&v_data, &[size as i32]),
+                Array::from_f32_slice(&m_data, &[size as i32]),
+                Array::from_f32_slice(&v_data, &[size as i32]),
             )
         } else {
             // Initialize to zeros
             (
-                Array::from_slice(&vec![0.0f32; size], &[size as i32]),
-                Array::from_slice(&vec![0.0f32; size], &[size as i32]),
+                Array::from_f32_slice(&vec![0.0f32; size], &[size as i32]),
+                Array::from_f32_slice(&vec![0.0f32; size], &[size as i32]),
             )
         };
 
@@ -433,42 +430,42 @@ impl Adam8bit {
         let beta1_arr = Array::from_f32(self.config.beta1);
         let one_minus_beta1 = Array::from_f32(1.0 - self.config.beta1);
         let m_new = m_array
-            .multiply(&beta1_arr)?
-            .add(&flat_grad.multiply(&one_minus_beta1)?)?;
+            .multiply(&beta1_arr)
+            .add(&flat_grad.multiply(&one_minus_beta1));
 
         // v = beta2 * v + (1 - beta2) * g^2
         let beta2_arr = Array::from_f32(self.config.beta2);
         let one_minus_beta2 = Array::from_f32(1.0 - self.config.beta2);
-        let grad_sq = flat_grad.multiply(&flat_grad)?;
+        let grad_sq = flat_grad.multiply(&flat_grad);
         let v_new = v_array
-            .multiply(&beta2_arr)?
-            .add(&grad_sq.multiply(&one_minus_beta2)?)?;
+            .multiply(&beta2_arr)
+            .add(&grad_sq.multiply(&one_minus_beta2));
 
         // Bias-corrected estimates
         let bc1 = Array::from_f32(bias_correction1);
         let bc2 = Array::from_f32(bias_correction2);
-        let m_hat = m_new.divide(&bc1)?;
-        let v_hat = v_new.divide(&bc2)?;
+        let m_hat = m_new.divide(&bc1);
+        let v_hat = v_new.divide(&bc2);
 
         // Compute update: lr * m_hat / (sqrt(v_hat) + eps)
         let lr_arr = Array::from_f32(self.config.lr);
         let eps_arr = Array::from_f32(self.config.eps);
-        let v_sqrt = v_hat.sqrt()?;
-        let denom = v_sqrt.add(&eps_arr)?;
-        let update = m_hat.divide(&denom)?.multiply(&lr_arr)?;
+        let v_sqrt = v_hat.sqrt();
+        let denom = v_sqrt.add(&eps_arr);
+        let update = m_hat.divide(&denom).multiply(&lr_arr);
 
         // Apply weight decay (AdamW-style) and update parameter
         let param_new = if self.config.weight_decay > 0.0 {
             let wd_factor = Array::from_f32(1.0 - self.config.lr * self.config.weight_decay);
-            flat_param.multiply(&wd_factor)?.subtract(&update)?
+            flat_param.multiply(&wd_factor).subtract(&update)
         } else {
-            flat_param.subtract(&update)?
+            flat_param.subtract(&update)
         };
 
         // Evaluate to get data for quantization
-        m_new.eval()?;
-        v_new.eval()?;
-        param_new.eval()?;
+        m_new.eval();
+        v_new.eval();
+        param_new.eval();
 
         // Extract data for quantization (this is still needed for 8-bit storage)
         let m_data = self.array_to_vec(&m_new)?;
@@ -503,14 +500,14 @@ impl Adam8bit {
     /// Debug-asserts that the array is Float32. In release builds, a dtype
     /// mismatch would produce garbage data.
     fn array_to_vec(&self, arr: &Array) -> Result<Vec<f32>> {
-        arr.eval()?;
-        let flat = arr.flatten(None, None)?;
-        flat.eval()?;
+        arr.eval();
+        let flat = arr.flatten(None, None);
+        flat.eval();
         debug_assert_eq!(
-            flat.dtype(),
-            Dtype::Float32,
-            "array_to_vec called with {:?}, expected Float32",
-            flat.dtype()
+            flat.dtype_raw(),
+            Dtype::Float32.as_i32(),
+            "array_to_vec called with dtype={}, expected Float32",
+            flat.dtype_raw()
         );
         Ok(flat.as_slice::<f32>().to_vec())
     }
@@ -645,8 +642,8 @@ mod tests {
         let mut optimizer = Adam8bitBuilder::new(0.1).build();
 
         // Create test parameter and gradient
-        let mut param = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
-        let grad = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[4]);
+        let mut param = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
+        let grad = Array::from_f32_slice(&[0.1f32, 0.2, 0.3, 0.4], &[4]);
 
         let key: Rc<str> = Rc::from("test.weight");
         optimizer.update_single(&key, &grad, &mut param).unwrap();
@@ -656,7 +653,7 @@ mod tests {
         let p0 = param.index(0);
         p0.eval().unwrap();
         // After one step, param should be updated
-        assert!((p0.item::<f32>() - 1.0).abs() > 1e-6);
+        assert!((p0.item_f32() - 1.0).abs() > 1e-6);
 
         // State should exist
         assert!(optimizer.state.contains_key(&key));
@@ -667,8 +664,8 @@ mod tests {
         let mut optimizer = Adam8bitBuilder::new(0.1).with_block_size(64).build();
 
         // Add some parameters
-        let mut param1 = Array::from_slice(&vec![1.0f32; 1024], &[1024]);
-        let grad1 = Array::from_slice(&vec![0.01f32; 1024], &[1024]);
+        let mut param1 = Array::from_f32_slice(&vec![1.0f32; 1024], &[1024]);
+        let grad1 = Array::from_f32_slice(&vec![0.01f32; 1024], &[1024]);
 
         let key: Rc<str> = Rc::from("layer1.weight");
         optimizer.update_single(&key, &grad1, &mut param1).unwrap();
@@ -729,12 +726,12 @@ mod tests {
     fn test_multiple_updates() {
         let mut optimizer = Adam8bitBuilder::new(0.01).build();
 
-        let mut param = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
+        let mut param = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
         let key: Rc<str> = Rc::from("test.weight");
 
         // Multiple updates should accumulate moments
         for i in 0..10 {
-            let grad = Array::from_slice(&[0.1f32 * (i as f32 + 1.0); 4], &[4]);
+            let grad = Array::from_f32_slice(&[0.1f32 * (i as f32 + 1.0); 4], &[4]);
             optimizer.update_single(&key, &grad, &mut param).unwrap();
         }
 
@@ -746,6 +743,6 @@ mod tests {
         let p0 = param.index(0);
         p0.eval().unwrap();
         // Check that param moved from original 1.0
-        assert!((p0.item::<f32>() - 1.0).abs() > 0.001);
+        assert!((p0.item_f32() - 1.0).abs() > 0.001);
     }
 }

@@ -45,7 +45,7 @@
 //! LoRA or SFT training forward pass. Next step: wire into the embedding layer of each
 //! training architecture, guarded by a `NEFTuneConfig::enabled` flag in the trainer config.
 
-use mlx_rs::{Array, error::Exception};
+use pmetal_bridge::compat::{Array, Dtype, Exception, random};
 
 /// Configuration for NEFTune.
 #[derive(Debug, Clone)]
@@ -130,13 +130,13 @@ pub fn apply_neftune(embeddings: &Array, config: &NEFTuneConfig) -> Result<Array
     let magnitude = config.alpha / (seq_len * hidden_dim).sqrt();
 
     // Generate uniform noise in [-1, 1]
-    let noise = mlx_rs::random::uniform::<_, f32>(-1.0f32, 1.0f32, shape, None)?;
+    let noise = random::uniform(shape, Dtype::Float32);
 
     // Scale noise
-    let scaled_noise = noise.multiply(Array::from_f32(magnitude))?;
+    let scaled_noise = noise.multiply(&Array::from_f32(magnitude));
 
     // Add to embeddings
-    embeddings.add(&scaled_noise)
+    Ok(embeddings.add(&scaled_noise))
 }
 
 /// NEFTune-aware embedding wrapper.

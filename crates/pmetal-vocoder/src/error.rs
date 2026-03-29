@@ -1,6 +1,6 @@
 //! Error types for the vocoder crate.
 
-use mlx_rs::error::Exception;
+use pmetal_bridge::compat::Exception;
 use thiserror::Error;
 
 /// Result type for vocoder operations.

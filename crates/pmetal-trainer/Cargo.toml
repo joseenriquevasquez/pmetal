@@ -27,8 +27,7 @@ pmetal-distill = { workspace = true }
 pmetal-metal = { workspace = true }
 pmetal-distributed = { workspace = true, optional = true }
 pmetal-hub = { workspace = true, optional = true }
-mlx-rs = { workspace = true }
-mlx-sys = { workspace = true }
+pmetal-bridge = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

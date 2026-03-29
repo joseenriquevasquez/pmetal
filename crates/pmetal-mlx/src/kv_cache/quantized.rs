@@ -1,12 +1,8 @@
 //! Quantized KV cache - MLX-LM parity implementation.
 
-use mlx_rs::{
-    Array, Dtype,
-    error::Exception,
-    ops::concatenate_axis,
-    ops::indexing::IndexOp,
-    ops::{dequantize, quantize},
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
+
+use crate::array_ext::ArrayDtypeExt;
 
 /// Quantized representation of cached K/V tensors.
 #[derive(Debug, Clone)]
@@ -138,7 +134,7 @@ impl QuantizedKVCache {
     /// 1. Cast to float32 (quantize requires a floating-point input).
     /// 2. Reshape `[B, H, S, D]` → `[B*H*S, D]` so the last axis is the head
     ///    dimension, which is where the group structure lives.
-    /// 3. Invoke `mlx_rs::ops::quantize`, which returns
+    /// 3. Invoke `ops::quantize`, which returns
     ///    `(w_q [rows, D/el_per_int], scales [rows, D/group_size], biases [rows, D/group_size])`.
     /// 4. Reshape each of those 2-D results back to 4-D so they can be
     ///    concatenated across the sequence dimension later.
@@ -156,29 +152,29 @@ impl QuantizedKVCache {
         let dim = shape[3] as usize;
 
         // MLX quantize requires a float32 input.
-        let float_tensor = tensor.as_type::<f32>()?;
+        let float_tensor = tensor.as_dtype(Dtype::Float32.as_i32());
 
         // Collapse the three leading dimensions into one so the last axis is
         // the head dimension that we want to quantize over.
         let rows = (batch * heads * seq) as i32;
-        let flat = float_tensor.reshape(&[rows, dim as i32])?;
+        let flat = float_tensor.reshape(&[rows, dim as i32]);
 
-        // mlx_rs::ops::quantize returns (w_q, scales, biases).
+        // ops::quantize returns (w_q, scales, biases).
         //   w_q    : [rows, dim * bits / 32]   (packed u32)
         //   scales : [rows, dim / group_size]
         //   biases : [rows, dim / group_size]
         let group_size_i32 = self.group_size as i32;
         let bits_i32 = bits as i32;
-        let (w_q, scales_2d, biases_2d) = quantize(&flat, group_size_i32, bits_i32)?;
+        let (w_q, scales_2d, biases_2d) = flat.quantize_weights(group_size_i32, bits_i32);
 
         // Reshape packed data back to [B, H, S, packed_dim].
         let packed_dim = w_q.dim(1);
-        let data = w_q.reshape(&[batch as i32, heads as i32, seq as i32, packed_dim])?;
+        let data = w_q.reshape(&[batch as i32, heads as i32, seq as i32, packed_dim]);
 
         // Reshape scales/biases back to [B, H, S, num_groups].
         let num_groups = scales_2d.dim(1);
-        let scales = scales_2d.reshape(&[batch as i32, heads as i32, seq as i32, num_groups])?;
-        let biases = biases_2d.reshape(&[batch as i32, heads as i32, seq as i32, num_groups])?;
+        let scales = scales_2d.reshape(&[batch as i32, heads as i32, seq as i32, num_groups]);
+        let biases = biases_2d.reshape(&[batch as i32, heads as i32, seq as i32, num_groups]);
 
         Ok(QuantizedTensor {
             data,
@@ -192,7 +188,7 @@ impl QuantizedKVCache {
     /// This is the exact inverse of [`Self::quantize_with_bits`]:
     ///
     /// 1. Flatten the 4-D packed data and metadata to 2-D.
-    /// 2. Invoke `mlx_rs::ops::dequantize`, which reconstructs a float32
+    /// 2. Invoke `ops::dequantize`, which reconstructs a float32
     ///    matrix `[rows, D]`.
     /// 3. Reshape back to `[B, H, S, D]` and cast to the original dtype that
     ///    was fed in (stored in `self.dtype`).
@@ -213,26 +209,20 @@ impl QuantizedKVCache {
         let rows = (batch * heads * seq) as i32;
 
         // Flatten to 2D for the MLX op.
-        let flat_data = qtensor.data.reshape(&[rows, packed_dim as i32])?;
-        let flat_scales = qtensor.scales.reshape(&[rows, qtensor.scales.dim(3)])?;
-        let flat_biases = qtensor.biases.reshape(&[rows, qtensor.biases.dim(3)])?;
+        let flat_data = qtensor.data.reshape(&[rows, packed_dim as i32]);
+        let flat_scales = qtensor.scales.reshape(&[rows, qtensor.scales.dim(3)]);
+        let flat_biases = qtensor.biases.reshape(&[rows, qtensor.biases.dim(3)]);
 
         // dequantize returns a float32 array [rows, dim].
         let group_size_i32 = self.group_size as i32;
         let bits_i32 = bits as i32;
-        let flat_float = dequantize(
-            &flat_data,
-            &flat_scales,
-            &flat_biases,
-            group_size_i32,
-            bits_i32,
-        )?;
+        let flat_float = flat_data.dequantize(&flat_scales, &flat_biases, group_size_i32, bits_i32);
 
         // Restore 4-D layout [B, H, S, D] and cast to the original dtype.
-        let out_4d = flat_float.reshape(&[batch as i32, heads as i32, seq as i32, dim as i32])?;
+        let out_4d = flat_float.reshape(&[batch as i32, heads as i32, seq as i32, dim as i32]);
 
         // Cast back to the dtype we received (typically f16 / bf16).
-        out_4d.as_dtype(self.dtype)
+        Ok(out_4d.as_dtype(self.dtype.as_i32()))
     }
 
     /// Update cache with new keys and values.
@@ -257,14 +247,14 @@ impl QuantizedKVCache {
             let existing_v = self.values.as_ref().unwrap();
 
             self.keys = Some(QuantizedTensor {
-                data: concatenate_axis(&[&existing_k.data, &q_keys.data], 2)?,
-                scales: concatenate_axis(&[&existing_k.scales, &q_keys.scales], 2)?,
-                biases: concatenate_axis(&[&existing_k.biases, &q_keys.biases], 2)?,
+                data: ops::concatenate_axis(&[&existing_k.data, &q_keys.data], 2),
+                scales: ops::concatenate_axis(&[&existing_k.scales, &q_keys.scales], 2),
+                biases: ops::concatenate_axis(&[&existing_k.biases, &q_keys.biases], 2),
             });
             self.values = Some(QuantizedTensor {
-                data: concatenate_axis(&[&existing_v.data, &q_values.data], 2)?,
-                scales: concatenate_axis(&[&existing_v.scales, &q_values.scales], 2)?,
-                biases: concatenate_axis(&[&existing_v.biases, &q_values.biases], 2)?,
+                data: ops::concatenate_axis(&[&existing_v.data, &q_values.data], 2),
+                scales: ops::concatenate_axis(&[&existing_v.scales, &q_values.scales], 2),
+                biases: ops::concatenate_axis(&[&existing_v.biases, &q_values.biases], 2),
             });
         }
 
@@ -296,15 +286,47 @@ impl QuantizedKVCache {
             self.keys = None;
             self.values = None;
         } else if let (Some(k), Some(v)) = (&mut self.keys, &mut self.values) {
+            // Slice to [.., .., ..new_offset, ..] for each component
+            let kb = k.data.dim(0) as usize;
+            let kh = k.data.dim(1) as usize;
+            let kd = k.data.dim(3) as usize;
+            let ks = k.scales.dim(3) as usize;
+            let kb2 = k.biases.dim(3) as usize;
+
             *k = QuantizedTensor {
-                data: k.data.index((.., .., ..new_offset as i32, ..)),
-                scales: k.scales.index((.., .., ..new_offset as i32, ..)),
-                biases: k.biases.index((.., .., ..new_offset as i32, ..)),
+                data: k.data.slice(
+                    &[0, 0, 0, 0],
+                    &[kb as i32, kh as i32, new_offset as i32, kd as i32],
+                ),
+                scales: k.scales.slice(
+                    &[0, 0, 0, 0],
+                    &[kb as i32, kh as i32, new_offset as i32, ks as i32],
+                ),
+                biases: k.biases.slice(
+                    &[0, 0, 0, 0],
+                    &[kb as i32, kh as i32, new_offset as i32, kb2 as i32],
+                ),
             };
+
+            let vb = v.data.dim(0) as usize;
+            let vh = v.data.dim(1) as usize;
+            let vd = v.data.dim(3) as usize;
+            let vs = v.scales.dim(3) as usize;
+            let vb2 = v.biases.dim(3) as usize;
+
             *v = QuantizedTensor {
-                data: v.data.index((.., .., ..new_offset as i32, ..)),
-                scales: v.scales.index((.., .., ..new_offset as i32, ..)),
-                biases: v.biases.index((.., .., ..new_offset as i32, ..)),
+                data: v.data.slice(
+                    &[0, 0, 0, 0],
+                    &[vb as i32, vh as i32, new_offset as i32, vd as i32],
+                ),
+                scales: v.scales.slice(
+                    &[0, 0, 0, 0],
+                    &[vb as i32, vh as i32, new_offset as i32, vs as i32],
+                ),
+                biases: v.biases.slice(
+                    &[0, 0, 0, 0],
+                    &[vb as i32, vh as i32, new_offset as i32, vb2 as i32],
+                ),
             };
         }
         self.offset = new_offset;

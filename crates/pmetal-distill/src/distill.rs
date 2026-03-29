@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, Dtype, ops};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -323,17 +323,17 @@ impl Distiller {
 
         // Scale by temperature squared (to maintain gradient magnitude)
         let t_squared = temperature * temperature;
-        let soft_scaled = soft_loss.multiply(&Array::from_f32(t_squared))?;
+        let soft_scaled = soft_loss.multiply(&Array::from_f32(t_squared));
 
         // Combined with hard labels if provided
         let (total_loss, hard_loss_opt) = if let Some(labels) = labels {
             let hard_loss = compute_hard_loss(student_logits, labels)?;
 
             // total = alpha * soft + (1 - alpha) * hard
-            let soft_weighted = soft_scaled.multiply(&Array::from_f32(alpha))?;
-            let hard_weighted = hard_loss.multiply(&Array::from_f32(1.0 - alpha))?;
+            let soft_weighted = soft_scaled.multiply(&Array::from_f32(alpha));
+            let hard_weighted = hard_loss.multiply(&Array::from_f32(1.0 - alpha));
 
-            let total = soft_weighted.add(&hard_weighted)?;
+            let total = soft_weighted.add(&hard_weighted);
             (total, Some(hard_loss))
         } else {
             (soft_scaled.clone(), None)
@@ -378,7 +378,7 @@ impl Distiller {
                 );
 
                 let hidden = layer_distill.compute(teacher_hiddens, student_hiddens)?;
-                output.total = output.total.add(&hidden)?;
+                output.total = output.total.add(&hidden);
                 output.hidden = Some(hidden);
             }
         }
@@ -423,38 +423,36 @@ pub struct DistillLossOutput {
 
 /// Compute hard cross-entropy loss with labels.
 fn compute_hard_loss(logits: &Array, labels: &Array) -> Result<Array> {
-    use mlx_rs::ops::indexing::take_along_axis;
-
     // All operations stay in the MLX graph so gradients flow correctly.
 
     // Log-softmax for numerical stability
-    let log_probs = mlx_rs::nn::log_softmax(logits, -1)?;
+    let log_probs = logits.log_softmax(-1);
 
     // Flatten to [batch*seq, vocab] for gather
     let vocab_size = logits.dim(-1);
-    let log_probs_flat = log_probs.reshape(&[-1, vocab_size])?;
-    let labels_flat = labels.reshape(&[-1])?;
+    let log_probs_flat = log_probs.reshape(&[-1, vocab_size]);
+    let labels_flat = labels.reshape(&[-1]);
 
     // Build ignore mask: labels >= 0 (ignore_index = -100 or any negative)
-    let zero_i = Array::from_int(0);
-    let valid_mask = labels_flat.ge(&zero_i)?.as_dtype(mlx_rs::Dtype::Float32)?;
+    let zero_i = Array::from_i32(0);
+    let valid_mask = labels_flat.greater_equal(&zero_i).as_dtype(Dtype::Float32.as_i32());
 
     // Clamp labels to valid range for gather (ignored positions won't contribute to loss)
-    let labels_clamped = mlx_rs::ops::maximum(&labels_flat, &zero_i)?
-        .as_dtype(mlx_rs::Dtype::Int32)?
-        .reshape(&[-1, 1])?;
+    let labels_clamped = ops::maximum(&labels_flat, &zero_i)
+        .as_dtype(Dtype::Int32.as_i32())
+        .reshape(&[-1, 1]);
 
     // Gather log-probs at label positions using take_along_axis (stays in graph)
-    let gathered = take_along_axis(&log_probs_flat, &labels_clamped, -1)?;
-    let gathered = gathered.squeeze()?;
+    let gathered = log_probs_flat.take_along_axis(&labels_clamped, -1);
+    let gathered = gathered.squeeze(-1);
 
     // Apply mask: only count non-ignored tokens
-    let neg_log_probs = gathered.negative()?.multiply(&valid_mask)?;
+    let neg_log_probs = gathered.negative().multiply(&valid_mask);
 
     // Mean over valid tokens (avoid division by zero)
-    let num_valid = valid_mask.sum(None)?;
-    let safe_num = mlx_rs::ops::maximum(&num_valid, &Array::from_f32(1.0))?;
-    Ok(neg_log_probs.sum(None)?.divide(&safe_num)?)
+    let num_valid = valid_mask.sum_all();
+    let safe_num = ops::maximum(&num_valid, &Array::from_f32(1.0));
+    Ok(neg_log_probs.sum_all().divide(&safe_num))
 }
 
 #[cfg(test)]
@@ -502,8 +500,8 @@ mod tests {
         let config = test_config();
         let distiller = Distiller::new(config).unwrap();
 
-        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
-        let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
+        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
 
         let output = distiller
             .compute_loss(&teacher, &student, None, None, 0, 1000)

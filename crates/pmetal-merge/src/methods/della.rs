@@ -43,7 +43,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result, sign_consensus};
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, Dtype};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -123,7 +123,7 @@ impl DellaMerge {
 
     /// Compute task vector δ = W_ft - W_base.
     fn task_vector(tensor: &Array, base: &Array) -> Result<Array> {
-        Ok(tensor.subtract(base)?)
+        Ok(tensor.subtract(base))
     }
 
     /// Compute element-wise drop probabilities using exponential (softmax) scaling.
@@ -200,14 +200,13 @@ impl DellaMerge {
             return Ok(delta.clone());
         }
         if density <= 0.0 {
-            return Ok(Array::zeros::<f32>(delta.shape())?);
+            return Ok(Array::zeros(delta.shape(), Dtype::Float32.as_i32()));
         }
 
         let original_shape = delta.shape().to_vec();
-        let flat = delta.reshape(&[-1])?;
-        flat.eval()?;
-        let values: Vec<f32> = flat.as_slice().to_vec();
-        let n = values.len();
+        let mut flat = delta.reshape(&[-1]);
+        let n = original_shape.iter().map(|&d| d as usize).product::<usize>();
+        let values: Vec<f32> = flat.to_f32_vec(n).unwrap_or_default();
 
         // Compute absolute values for probability computation.
         let abs_vals: Vec<f32> = values.iter().map(|v| v.abs()).collect();
@@ -247,8 +246,8 @@ impl DellaMerge {
             // Otherwise: result_vals[i] = 0.0 (already initialised above).
         }
 
-        let result_flat = Array::from_slice(&result_vals, &[n as i32]);
-        Ok(result_flat.reshape(&original_shape)?)
+        let result_flat = Array::from_f32_slice(&result_vals, &[n as i32]);
+        Ok(result_flat.reshape(&original_shape))
     }
 }
 
@@ -322,17 +321,17 @@ impl MergeMethod for DellaMerge {
             sign_consensus(&sparse_vectors, &weights)?
         } else {
             let shape = task_vectors[0].shape();
-            let mut acc = Array::zeros::<f32>(shape)?;
+            let mut acc = Array::zeros(shape, Dtype::Float32.as_i32());
             for (vector, weight) in sparse_vectors.iter().zip(weights.iter()) {
-                let weighted = vector.multiply(Array::from_f32(*weight))?;
-                acc = acc.add(&weighted)?;
+                let weighted = vector.multiply(&Array::from_f32(*weight));
+                acc = acc.add(&weighted);
             }
             acc
         };
 
         // Scale by lambda and add back to base model.
-        let delta = weighted_sum.multiply(Array::from_f32(lambda))?;
-        Ok(base.add(&delta)?)
+        let delta = weighted_sum.multiply(&Array::from_f32(lambda));
+        Ok(base.add(&delta))
     }
 }
 
@@ -408,8 +407,8 @@ mod tests {
     fn test_della_preserves_base_with_zero_lambda() {
         let della = DellaMerge::new().with_seed(42);
 
-        let base = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t1 = Array::from_slice(&[2.0_f32, 3.0, 4.0], &[3]);
+        let base = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t1 = Array::from_f32_slice(&[2.0_f32, 3.0, 4.0], &[3]);
 
         let params = vec![MergeParameters {
             weight: Some(1.0_f32.into()),
@@ -422,9 +421,10 @@ mod tests {
             ..Default::default()
         };
 
-        let result = della.merge(&[t1], Some(&base), &params, &global).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
-        let base_slice: Vec<f32> = base.as_slice().to_vec();
+        let mut result = della.merge(&[t1], Some(&base), &params, &global).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
+        let mut base_clone = base.clone();
+        let base_slice = base_clone.to_f32_vec(3).unwrap();
 
         // With lambda=0, result should equal base regardless of sparsification.
         for (r, b) in result_slice.iter().zip(base_slice.iter()) {
@@ -438,8 +438,8 @@ mod tests {
         // With a single model and lambda=1, result should equal the fine-tuned model.
         let della = DellaMerge::new().with_seed(42);
 
-        let base = Array::from_slice(&[0.0_f32, 0.0, 0.0], &[3]);
-        let t1 = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let base = Array::from_f32_slice(&[0.0_f32, 0.0, 0.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
 
         let params = vec![MergeParameters {
             weight: Some(1.0_f32.into()),
@@ -451,8 +451,8 @@ mod tests {
             ..Default::default()
         };
 
-        let result = della.merge(&[t1], Some(&base), &params, &global).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = della.merge(&[t1], Some(&base), &params, &global).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
 
         // density=1.0 means no dropout → result equals t1
         for (i, r) in result_slice.iter().enumerate() {
@@ -470,8 +470,8 @@ mod tests {
     fn test_della_zero_density_gives_base() {
         let della = DellaMerge::new().with_seed(42);
 
-        let base = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t1 = Array::from_slice(&[5.0_f32, 6.0, 7.0], &[3]);
+        let base = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t1 = Array::from_f32_slice(&[5.0_f32, 6.0, 7.0], &[3]);
 
         let params = vec![MergeParameters {
             weight: Some(1.0_f32.into()),
@@ -483,9 +483,10 @@ mod tests {
             ..Default::default()
         };
 
-        let result = della.merge(&[t1], Some(&base), &params, &global).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
-        let base_slice: Vec<f32> = base.as_slice().to_vec();
+        let mut result = della.merge(&[t1], Some(&base), &params, &global).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
+        let mut base_clone = base.clone();
+        let base_slice = base_clone.to_f32_vec(3).unwrap();
 
         // density=0.0 → all task vector entries dropped → result equals base
         for (r, b) in result_slice.iter().zip(base_slice.iter()) {
@@ -496,8 +497,8 @@ mod tests {
     #[test]
     fn test_della_output_shape_preserved() {
         let della = DellaMerge::new().with_seed(7);
-        let base = Array::from_slice(&[0.0_f32; 12], &[3, 4]);
-        let t1 = Array::from_slice(&[1.0_f32; 12], &[3, 4]);
+        let base = Array::from_f32_slice(&[0.0_f32; 12], &[3, 4]);
+        let t1 = Array::from_f32_slice(&[1.0_f32; 12], &[3, 4]);
 
         let params = vec![MergeParameters::default()];
         let global = MergeParameters::default();
@@ -514,8 +515,8 @@ mod tests {
 
     #[test]
     fn test_della_seeded_reproducible() {
-        let base = Array::from_slice(&[0.0_f32; 8], &[8]);
-        let t1 = Array::from_slice(&[1.0_f32, 0.5, 2.0, 0.1, 0.8, 0.3, 1.5, 0.6], &[8]);
+        let base = Array::from_f32_slice(&[0.0_f32; 8], &[8]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 0.5, 2.0, 0.1, 0.8, 0.3, 1.5, 0.6], &[8]);
 
         let params = vec![MergeParameters {
             weight: Some(1.0_f32.into()),
@@ -527,25 +528,25 @@ mod tests {
             ..Default::default()
         };
 
-        let r1 = DellaMerge::new()
+        let mut r1 = DellaMerge::new()
             .with_seed(99)
             .merge(std::slice::from_ref(&t1), Some(&base), &params, &global)
             .unwrap();
-        let r2 = DellaMerge::new()
+        let mut r2 = DellaMerge::new()
             .with_seed(99)
             .merge(&[t1], Some(&base), &params, &global)
             .unwrap();
 
-        let s1: Vec<f32> = r1.as_slice().to_vec();
-        let s2: Vec<f32> = r2.as_slice().to_vec();
+        let s1 = r1.to_f32_vec(8).unwrap();
+        let s2 = r2.to_f32_vec(8).unwrap();
         assert_eq!(s1, s2, "same seed must produce identical results");
     }
 
     #[test]
     fn test_della_linear_vs_exponential_differ() {
         // The two variants should produce different results on non-trivial input.
-        let base = Array::from_slice(&[0.0_f32; 8], &[8]);
-        let t1 = Array::from_slice(&[0.1_f32, 5.0, 0.2, 4.0, 0.3, 3.0, 0.4, 2.0], &[8]);
+        let base = Array::from_f32_slice(&[0.0_f32; 8], &[8]);
+        let t1 = Array::from_f32_slice(&[0.1_f32, 5.0, 0.2, 4.0, 0.3, 3.0, 0.4, 2.0], &[8]);
 
         let params = vec![MergeParameters {
             weight: Some(1.0_f32.into()),
@@ -558,17 +559,17 @@ mod tests {
         };
 
         // Use same seed to ensure the only difference is the probability computation.
-        let exp_result = DellaMerge::new()
+        let mut exp_result = DellaMerge::new()
             .with_seed(42)
             .merge(std::slice::from_ref(&t1), Some(&base), &params, &global)
             .unwrap();
-        let lin_result = DellaMerge::linear()
+        let mut lin_result = DellaMerge::linear()
             .with_seed(42)
             .merge(&[t1], Some(&base), &params, &global)
             .unwrap();
 
-        let s_exp: Vec<f32> = exp_result.as_slice().to_vec();
-        let s_lin: Vec<f32> = lin_result.as_slice().to_vec();
+        let s_exp = exp_result.to_f32_vec(8).unwrap();
+        let s_lin = lin_result.to_f32_vec(8).unwrap();
 
         // Results will differ because softmax vs linear produce different probabilities.
         // The test just verifies both run without errors and produce finite values.

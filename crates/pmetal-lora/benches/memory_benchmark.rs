@@ -7,8 +7,8 @@
 
 use std::time::Instant;
 
-use mlx_rs::Array;
-use mlx_rs::transforms::eval;
+use pmetal_bridge::compat::Array;
+use pmetal_bridge::compat::eval;
 use pmetal_core::LoraConfig;
 use pmetal_lora::{Qwen3CustomTrainer, Qwen3LoraForCausalLM};
 use pmetal_models::ModelConfig;
@@ -56,26 +56,9 @@ fn create_lora_config() -> LoraConfig {
     }
 }
 
-/// Get current GPU memory size available (Metal).
+/// Get current GPU peak memory (Metal).
 fn get_memory_size() -> u64 {
-    let _ = eval(&[]);
-
-    unsafe {
-        let dev = mlx_sys::mlx_device_new_type(mlx_sys::mlx_device_type__MLX_GPU, 0);
-        let mut info = mlx_sys::mlx_device_info_new();
-        let ret = mlx_sys::mlx_device_info_get(&mut info, dev);
-        if ret != 0 {
-            mlx_sys::mlx_device_info_free(info);
-            mlx_sys::mlx_device_free(dev);
-            return 0;
-        }
-        let mut value: usize = 0;
-        let key = c"max_recommended_working_set_size";
-        mlx_sys::mlx_device_info_get_size(&mut value, info, key.as_ptr());
-        mlx_sys::mlx_device_info_free(info);
-        mlx_sys::mlx_device_free(dev);
-        value as u64
-    }
+    pmetal_bridge::inline_array::get_peak_memory() as u64
 }
 
 fn benchmark_custom_autograd(

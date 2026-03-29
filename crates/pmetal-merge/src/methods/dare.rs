@@ -19,7 +19,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result, sign_consensus};
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, Dtype};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -105,11 +105,11 @@ impl DareMerge {
             }
         };
 
-        let mut mask_array = Array::from_slice(&mask, shape);
+        let mut mask_array = Array::from_f32_slice(&mask, shape);
 
         // Rescale to maintain expected value
         if rescale && density > 0.0 && density < 1.0 {
-            mask_array = mask_array.divide(Array::from_f32(density))?;
+            mask_array = mask_array.divide(&Array::from_f32(density));
         }
 
         Ok(mask_array)
@@ -121,16 +121,16 @@ impl DareMerge {
             return Ok(delta.clone());
         }
         if density <= 0.0 {
-            return Ok(Array::zeros::<f32>(delta.shape())?);
+            return Ok(Array::zeros(delta.shape(), Dtype::Float32.as_i32()));
         }
 
         let mask = Self::random_mask(delta.shape(), density, rescale, self.seed)?;
-        Ok(delta.multiply(&mask)?)
+        Ok(delta.multiply(&mask))
     }
 
     /// Compute task vector (delta from base).
     fn task_vector(tensor: &Array, base: &Array) -> Result<Array> {
-        Ok(tensor.subtract(base)?)
+        Ok(tensor.subtract(base))
     }
 }
 
@@ -199,17 +199,17 @@ impl MergeMethod for DareMerge {
             sign_consensus(&sparse_vectors, &weights)?
         } else {
             // Compute weighted sum without sign filtering.
-            let mut acc = Array::zeros::<f32>(task_vectors[0].shape())?;
+            let mut acc = Array::zeros(task_vectors[0].shape(), Dtype::Float32.as_i32());
             for (vector, weight) in sparse_vectors.iter().zip(weights.iter()) {
-                let weighted = vector.multiply(Array::from_f32(*weight))?;
-                acc = acc.add(&weighted)?;
+                let weighted = vector.multiply(&Array::from_f32(*weight));
+                acc = acc.add(&weighted);
             }
             acc
         };
 
         // Scale by lambda and add back to base
-        let result = weighted_sum.multiply(Array::from_f32(lambda))?;
-        Ok(base.add(&result)?)
+        let result = weighted_sum.multiply(&Array::from_f32(lambda));
+        Ok(base.add(&result))
     }
 }
 
@@ -220,31 +220,31 @@ mod tests {
     #[test]
     fn test_dare_random_mask() {
         // With density=1.0, all elements should be kept
-        let mask = DareMerge::random_mask(&[100], 1.0, false, Some(42)).unwrap();
-        let mask_slice: Vec<f32> = mask.as_slice().to_vec();
+        let mut mask = DareMerge::random_mask(&[100], 1.0, false, Some(42)).unwrap();
+        let mask_slice = mask.to_f32_vec(100).unwrap();
         assert!(mask_slice.iter().all(|&x| x == 1.0));
 
         // With density=0.0, all elements should be dropped
-        let mask = DareMerge::random_mask(&[100], 0.0, false, Some(42)).unwrap();
-        let mask_slice: Vec<f32> = mask.as_slice().to_vec();
+        let mut mask = DareMerge::random_mask(&[100], 0.0, false, Some(42)).unwrap();
+        let mask_slice = mask.to_f32_vec(100).unwrap();
         assert!(mask_slice.iter().all(|&x| x == 0.0));
     }
 
     #[test]
     fn test_dare_random_mask_seeded_reproducible() {
         // Same seed must produce identical masks.
-        let m1 = DareMerge::random_mask(&[1000], 0.5, false, Some(99)).unwrap();
-        let m2 = DareMerge::random_mask(&[1000], 0.5, false, Some(99)).unwrap();
-        let s1: Vec<f32> = m1.as_slice().to_vec();
-        let s2: Vec<f32> = m2.as_slice().to_vec();
+        let mut m1 = DareMerge::random_mask(&[1000], 0.5, false, Some(99)).unwrap();
+        let mut m2 = DareMerge::random_mask(&[1000], 0.5, false, Some(99)).unwrap();
+        let s1 = m1.to_f32_vec(1000).unwrap();
+        let s2 = m2.to_f32_vec(1000).unwrap();
         assert_eq!(s1, s2);
     }
 
     #[test]
     fn test_dare_rescaling() {
         // With rescale=true, kept values should be divided by density
-        let mask = DareMerge::random_mask(&[1000], 0.5, true, Some(42)).unwrap();
-        let mask_slice: Vec<f32> = mask.as_slice().to_vec();
+        let mut mask = DareMerge::random_mask(&[1000], 0.5, true, Some(42)).unwrap();
+        let mask_slice = mask.to_f32_vec(1000).unwrap();
 
         // Non-zero values should be 2.0 (1.0 / 0.5)
         for &v in &mask_slice {
@@ -256,8 +256,8 @@ mod tests {
     fn test_dare_preserves_base_with_zero_lambda() {
         let merge = DareMerge::linear();
 
-        let base = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t1 = Array::from_slice(&[2.0_f32, 3.0, 4.0], &[3]);
+        let base = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t1 = Array::from_f32_slice(&[2.0_f32, 3.0, 4.0], &[3]);
 
         let params = vec![MergeParameters {
             weight: Some(1.0_f32.into()),
@@ -270,9 +270,10 @@ mod tests {
             ..Default::default()
         };
 
-        let result = merge.merge(&[t1], Some(&base), &params, &global).unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
-        let base_slice: Vec<f32> = base.as_slice().to_vec();
+        let mut result = merge.merge(&[t1], Some(&base), &params, &global).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
+        let mut base_clone = base.clone();
+        let base_slice = base_clone.to_f32_vec(3).unwrap();
 
         // With lambda=0, result should equal base
         for (r, b) in result_slice.iter().zip(base_slice.iter()) {

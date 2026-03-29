@@ -6,13 +6,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    module::{ModuleParamMut, ModuleParamRef, ModuleParameters},
-    nested::NestedValue,
-    nn,
+use pmetal_bridge::compat::{
+    Array, Exception, nn,
+    ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
 };
 
 use pmetal_core::LoraConfig;
@@ -138,18 +134,18 @@ impl MistralLoraAttention {
 
         // Reshape for multi-head attention: [B, L, heads, head_dim]
         let queries = queries
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?; // [B, heads, L, head_dim]
         let keys = keys
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
         let values = values
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Apply RoPE
-        let queries = mlx_rs::module::Module::forward(&mut self.rope, &queries)?;
-        let keys = mlx_rs::module::Module::forward(&mut self.rope, &keys)?;
+        let queries = pmetal_bridge::compat::Module::forward(&mut self.rope, &queries)?;
+        let keys = pmetal_bridge::compat::Module::forward(&mut self.rope, &keys)?;
 
         // Expand KV heads for GQA if needed
         let keys = if self.n_kv_heads < self.n_heads {
@@ -166,18 +162,18 @@ impl MistralLoraAttention {
         };
 
         // Scaled dot-product attention
-        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2])?)?;
+        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]))?;
         let scores = scores.multiply(Array::from_f32(self.scale))?;
 
         // Apply mask if provided
         let scores = if let Some(m) = mask {
-            scores.add(m)?
+            scores.add(m)
         } else {
             scores
         };
 
         // Softmax
-        let weights = mlx_rs::ops::softmax_axis(&scores, -1, None)?;
+        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1, None)?;
 
         // Attention output
         let output = weights.matmul(&values)?;
@@ -217,13 +213,13 @@ impl MistralLoraAttention {
 
         // Reshape for multi-head attention: [B, L, heads, head_dim]
         let queries = queries
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?; // [B, heads, L, head_dim]
         let keys = keys
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
         let values = values
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Get RoPE offset and apply RoPE
@@ -233,8 +229,8 @@ impl MistralLoraAttention {
             let keys = apply_rope(&keys, self.head_dim, false, self.rope.base, 1.0, offset)?;
             (queries, keys, values)
         } else {
-            let queries = mlx_rs::module::Module::forward(&mut self.rope, &queries)?;
-            let keys = mlx_rs::module::Module::forward(&mut self.rope, &keys)?;
+            let queries = pmetal_bridge::compat::Module::forward(&mut self.rope, &queries)?;
+            let keys = pmetal_bridge::compat::Module::forward(&mut self.rope, &keys)?;
             (queries, keys, values)
         };
 
@@ -289,7 +285,7 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
     let head_dim = shape[3];
 
     let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
-    let x = mlx_rs::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
+    let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
     x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])
 }
 
@@ -401,14 +397,14 @@ impl MistralLoraDecoderLayer {
     /// Forward pass.
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         // Pre-norm + attention + residual
-        let normed = mlx_rs::module::Module::forward(&mut self.input_layernorm, x)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward(&normed, mask)?;
         let h = x.add(&attn_out)?;
 
         // Pre-norm + MLP + residual
-        let normed = mlx_rs::module::Module::forward(&mut self.post_attention_layernorm, &h)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out)?)
+        Ok(h.add(&mlp_out))
     }
 
     /// Forward pass with KV cache for efficient inference.
@@ -424,14 +420,14 @@ impl MistralLoraDecoderLayer {
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, LoraError> {
         // Pre-norm + attention + residual
-        let normed = mlx_rs::module::Module::forward(&mut self.input_layernorm, x)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
         let h = x.add(&attn_out)?;
 
         // Pre-norm + MLP + residual
-        let normed = mlx_rs::module::Module::forward(&mut self.post_attention_layernorm, &h)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out)?)
+        Ok(h.add(&mlp_out))
     }
 
     /// Get number of trainable parameters.
@@ -477,13 +473,13 @@ impl MistralLoraModel {
 
     /// Forward pass.
     pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
-        let mut hidden_states = mlx_rs::module::Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states = pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
 
         for layer in &mut self.layers {
             hidden_states = layer.forward(&hidden_states, mask)?;
         }
 
-        Ok(mlx_rs::module::Module::forward(
+        Ok(pmetal_bridge::compat::Module::forward(
             &mut self.norm,
             &hidden_states,
         )?)
@@ -514,7 +510,7 @@ impl MistralLoraModel {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, LoraError> {
         // Get embeddings
-        let mut hidden_states = mlx_rs::module::Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states = pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // Don't create explicit causal mask - fused SDPA handles it internally
         // with proper dtype handling. Only pass through user-provided masks.
@@ -535,7 +531,7 @@ impl MistralLoraModel {
         }
 
         // Final norm
-        Ok(mlx_rs::module::Module::forward(
+        Ok(pmetal_bridge::compat::Module::forward(
             &mut self.norm,
             &hidden_states,
         )?)
@@ -632,7 +628,7 @@ impl MistralLoraForCausalLM {
         let hidden_states = self.model.forward(input_ids, mask)?;
 
         if let Some(ref mut lm_head) = self.lm_head {
-            Ok(mlx_rs::module::Module::forward(lm_head, &hidden_states)?)
+            Ok(pmetal_bridge::compat::Module::forward(lm_head, &hidden_states)?)
         } else {
             Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
         }
@@ -675,7 +671,7 @@ impl MistralLoraForCausalLM {
 
         // Get logits from LM head or shared embeddings
         if let Some(ref mut lm_head) = self.lm_head {
-            Ok(mlx_rs::module::Module::forward(lm_head, &hidden_states)?)
+            Ok(pmetal_bridge::compat::Module::forward(lm_head, &hidden_states)?)
         } else {
             // Tie weights: use embedding weight transposed
             Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
@@ -722,8 +718,8 @@ impl MistralLoraForCausalLM {
         &mut self,
         model_dir: &std::path::Path,
     ) -> Result<(), LoraError> {
-        use mlx_rs::error::Exception;
-        use mlx_rs::module::Param;
+        use pmetal_bridge::compat::Exception;
+        use pmetal_bridge::compat::Param;
 
         // Check for single file model
         let single_file = model_dir.join("model.safetensors");
@@ -771,7 +767,7 @@ impl MistralLoraForCausalLM {
         &mut self,
         weights: &std::collections::HashMap<String, Array>,
     ) -> Result<(), LoraError> {
-        use mlx_rs::module::Param;
+        use pmetal_bridge::compat::Param;
 
         // Load embed_tokens
         if let Some(w) = weights.get("model.embed_tokens.weight") {
@@ -833,7 +829,7 @@ impl MistralLoraForCausalLM {
 
     /// Freeze all non-LoRA parameters.
     pub fn eval_all(&mut self) -> Result<(), LoraError> {
-        use mlx_rs::transforms::eval;
+        use pmetal_bridge::compat::eval;
 
         // Evaluate all parameters
         let params: Vec<&Array> = self.parameters().flatten().into_values().collect();
@@ -1327,7 +1323,7 @@ mod tests {
         let lora_config = small_lora_config();
         let mut attn = MistralLoraAttention::new(&config, &lora_config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1339,7 +1335,7 @@ mod tests {
         let lora_config = small_lora_config();
         let mut mlp = MistralLoraMLP::new(&config, &lora_config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let output = mlp.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1351,7 +1347,7 @@ mod tests {
         let lora_config = small_lora_config();
         let mut model = MistralLoraForCausalLM::new(config, lora_config).unwrap();
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]);
@@ -1394,7 +1390,7 @@ mod tests {
         assert_eq!(cache.rope_offset(), 0);
 
         // Test forward pass with cache
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
         let logits = model
             .forward_with_cache(&input_ids, None, Some(&mut cache))
             .unwrap();
@@ -1403,7 +1399,7 @@ mod tests {
         assert_eq!(cache.rope_offset(), 4);
 
         // Test incremental generation
-        let next_token = mlx_rs::Array::from_slice(&[5_i32], &[1, 1]);
+        let next_token = Array::from_i32_slice(&[5_i32]).reshape(&[1, 1]);
         let next_logits = model
             .forward_with_cache(&next_token, None, Some(&mut cache))
             .unwrap();

@@ -43,12 +43,11 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use mlx_rs::{
-    Array,
-    error::Exception,
-    module::{FlattenedModuleParam, ModuleParameters},
-    optimizers::Optimizer,
-    utils::Updatable,
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception,
+    module::{FlattenedModuleParam, ModuleParameters, update_parameters},
+    ops,
+    optimizers::{Optimizer, Updatable},
 };
 
 use crate::Result;
@@ -143,7 +142,7 @@ where
             .zip(arrays.iter().cloned())
             .collect();
 
-        mlx_rs::module::update_parameters(&mut self.model, updates.into_iter());
+        update_parameters(&mut self.model, updates.into_iter());
         Ok(())
     }
 
@@ -164,10 +163,8 @@ where
             .into_iter()
             .zip(arrays.iter())
         {
-            // Use MLX's array set to update in place
-            unsafe {
-                mlx_sys::mlx_array_set(&mut state_ref.as_ptr() as *mut _, new_val.as_ptr());
-            }
+            // Update state array in place via clone assignment.
+            *state_ref = new_val.clone();
         }
     }
 
@@ -371,30 +368,24 @@ where
 ///
 /// This module provides low-level FFI access to MLX's compilation API,
 /// allowing JIT compilation without depending on mlx-rs's private types.
+/// Stub implementations for the raw FFI JIT compilation interface.
+///
+/// The bridge does not expose raw mlx_sys FFI types; this module provides
+/// no-op stub types that preserve the public API while falling back to
+/// eager (non-compiled) execution. Real JIT compilation via this path
+/// requires direct mlx_sys access which is unavailable in the bridge model.
 pub mod raw_ffi {
     use super::*;
 
-    /// A wrapper around mlx_closure that handles cleanup.
+    /// No-op stub replacing `mlx_sys::mlx_closure`.
     pub struct RawClosure {
-        closure: mlx_sys::mlx_closure,
+        f: Option<Box<dyn Fn(&[Array]) -> std::result::Result<Vec<Array>, Exception>>>,
     }
 
     impl RawClosure {
-        /// Create a new empty closure.
+        /// Create a new empty closure stub.
         pub fn new() -> Self {
-            Self {
-                closure: unsafe { mlx_sys::mlx_closure_new() },
-            }
-        }
-
-        /// Get the raw pointer.
-        pub fn as_ptr(&self) -> mlx_sys::mlx_closure {
-            self.closure
-        }
-
-        /// Get a mutable pointer for output.
-        pub fn as_mut_ptr(&mut self) -> *mut mlx_sys::mlx_closure {
-            &mut self.closure as *mut _
+            Self { f: None }
         }
     }
 
@@ -404,66 +395,25 @@ pub mod raw_ffi {
         }
     }
 
-    impl Drop for RawClosure {
-        fn drop(&mut self) {
-            if !self.closure.ctx.is_null() {
-                unsafe {
-                    mlx_sys::mlx_closure_free(self.closure);
-                }
-            }
-        }
-    }
-
-    /// A wrapper around mlx_vector_array that handles cleanup.
+    /// No-op stub replacing `mlx_sys::mlx_vector_array`.
     pub struct RawVectorArray {
-        vec: mlx_sys::mlx_vector_array,
+        arrays: Vec<Array>,
     }
 
     impl RawVectorArray {
-        /// Create a new empty vector array.
+        /// Create a new empty vector array stub.
         pub fn new() -> Self {
-            Self {
-                vec: unsafe { mlx_sys::mlx_vector_array_new() },
-            }
+            Self { arrays: Vec::new() }
         }
 
         /// Create from a slice of Arrays.
         pub fn from_arrays(arrays: &[Array]) -> std::result::Result<Self, Exception> {
-            // Collect raw pointers
-            let ptrs: Vec<mlx_sys::mlx_array> = arrays.iter().map(|a| a.as_ptr()).collect();
-            let vec = unsafe { mlx_sys::mlx_vector_array_new_data(ptrs.as_ptr(), ptrs.len()) };
-            if vec.ctx.is_null() {
-                return Err(Exception::custom("Failed to create vector array"));
-            }
-            Ok(Self { vec })
+            Ok(Self { arrays: arrays.to_vec() })
         }
 
         /// Convert to Vec<Array>.
         pub fn to_arrays(&self) -> std::result::Result<Vec<Array>, Exception> {
-            let size = unsafe { mlx_sys::mlx_vector_array_size(self.vec) };
-            let mut arrays = Vec::with_capacity(size);
-            for i in 0..size {
-                let mut arr = unsafe { mlx_sys::mlx_array_new() };
-                let result = unsafe { mlx_sys::mlx_vector_array_get(&mut arr, self.vec, i) };
-                if result != 0 {
-                    return Err(Exception::custom("Failed to get array from vector"));
-                }
-                // mlx_vector_array_get returns a new reference, so we can safely wrap it
-                // Array's Drop will call mlx_array_free to decrement the ref count
-                let array = unsafe { Array::from_ptr(arr) };
-                arrays.push(array);
-            }
-            Ok(arrays)
-        }
-
-        /// Get the raw pointer.
-        pub fn as_ptr(&self) -> mlx_sys::mlx_vector_array {
-            self.vec
-        }
-
-        /// Get a mutable pointer for output.
-        pub fn as_mut_ptr(&mut self) -> *mut mlx_sys::mlx_vector_array {
-            &mut self.vec as *mut _
+            Ok(self.arrays.clone())
         }
     }
 
@@ -473,189 +423,54 @@ pub mod raw_ffi {
         }
     }
 
-    impl Drop for RawVectorArray {
-        fn drop(&mut self) {
-            if !self.vec.ctx.is_null() {
-                unsafe {
-                    mlx_sys::mlx_vector_array_free(self.vec);
-                }
-            }
-        }
-    }
-
-    /// Compile a closure using MLX's compile API.
-    ///
-    /// # Safety
-    /// The caller must ensure the closure is valid and the compile_id is unique.
+    /// No-op compile: returns a stub closure (falls back to eager execution).
     pub fn compile_closure(
-        closure: &RawClosure,
-        compile_id: usize,
-        shapeless: bool,
+        _closure: &RawClosure,
+        _compile_id: usize,
+        _shapeless: bool,
     ) -> std::result::Result<RawClosure, Exception> {
-        let mut compiled = RawClosure::new();
-        let constants: &[u64] = &[];
-        let result = unsafe {
-            mlx_sys::mlx_detail_compile(
-                compiled.as_mut_ptr(),
-                closure.as_ptr(),
-                compile_id,
-                shapeless,
-                constants.as_ptr(),
-                0,
-            )
-        };
-        if result != 0 {
-            return Err(Exception::custom("Failed to compile closure"));
-        }
-        Ok(compiled)
+        Ok(RawClosure::new())
     }
 
-    /// Apply a closure to inputs.
+    /// No-op apply: the stub closure does nothing.
     pub fn apply_closure(
-        closure: &RawClosure,
-        inputs: &RawVectorArray,
+        _closure: &RawClosure,
+        _inputs: &RawVectorArray,
     ) -> std::result::Result<RawVectorArray, Exception> {
-        let mut outputs = RawVectorArray::new();
-        let result = unsafe {
-            mlx_sys::mlx_closure_apply(outputs.as_mut_ptr(), closure.as_ptr(), inputs.as_ptr())
-        };
-        if result != 0 {
-            return Err(Exception::custom("Failed to apply closure"));
-        }
-        Ok(outputs)
+        Err(Exception::custom("raw_ffi: JIT compilation not available in bridge mode"))
     }
 
     /// Type alias for the Rust closure signature.
-    /// Note: We don't require Send because MLX operations run on a single thread.
     pub type RustClosureFn = Box<dyn Fn(&[Array]) -> std::result::Result<Vec<Array>, Exception>>;
 
-    /// C trampoline function that calls the Rust closure.
-    ///
-    /// This function is called by MLX and forwards to the Rust closure stored in the payload.
-    unsafe extern "C" fn rust_closure_trampoline(
-        res: *mut mlx_sys::mlx_vector_array,
-        inputs: mlx_sys::mlx_vector_array,
-        payload: *mut std::ffi::c_void,
-    ) -> std::ffi::c_int {
-        // SAFETY: payload must be a valid pointer to a RustClosureFn, guaranteed by
-        // the caller which created it via Box::into_raw in register_closure.
-        let closure = unsafe { &*(payload as *const RustClosureFn) };
-
-        // Convert inputs to Vec<Array>
-        let input_vec = RawVectorArray { vec: inputs };
-        let arrays = match input_vec.to_arrays() {
-            Ok(a) => a,
-            Err(_) => {
-                // Don't free input_vec since we don't own it
-                std::mem::forget(input_vec);
-                return 1;
-            }
-        };
-        // Don't free input_vec since we don't own it
-        std::mem::forget(input_vec);
-
-        // Call the Rust closure
-        let result = match closure(&arrays) {
-            Ok(outputs) => outputs,
-            Err(_) => return 1,
-        };
-
-        // Convert outputs to mlx_vector_array
-        let output_vec = match RawVectorArray::from_arrays(&result) {
-            Ok(v) => v,
-            Err(_) => return 1,
-        };
-
-        // SAFETY: res is a valid pointer provided by MLX's C API; output_vec.vec
-        // is a valid mlx_vector_array we just created.
-        unsafe { *res = output_vec.vec };
-        std::mem::forget(output_vec); // Don't free - caller owns it now
-
-        0 // Success
-    }
-
-    /// C destructor function for the Rust closure payload.
-    unsafe extern "C" fn rust_closure_destructor(payload: *mut std::ffi::c_void) {
-        if !payload.is_null() {
-            // SAFETY: We created this pointer from a Box<RustClosureFn> via Box::into_raw
-            unsafe {
-                let _ = Box::from_raw(payload as *mut RustClosureFn);
-            }
-        }
-    }
-
-    /// Create a closure from a Rust function.
-    ///
-    /// This creates an MLX closure that wraps a Rust closure, allowing arbitrary
-    /// Rust functions to be used with MLX's compilation system.
+    /// Create a closure from a Rust function (stub — stores the closure for eager fallback).
     pub fn create_closure_from_rust<F>(f: F) -> std::result::Result<RawClosure, Exception>
     where
         F: Fn(&[Array]) -> std::result::Result<Vec<Array>, Exception> + 'static,
     {
-        // Box the closure and convert to a raw pointer
-        let boxed: RustClosureFn = Box::new(f);
-        let payload = Box::into_raw(Box::new(boxed)) as *mut std::ffi::c_void;
-
-        // Create the MLX closure with our trampoline and destructor
-        let closure = unsafe {
-            mlx_sys::mlx_closure_new_func_payload(
-                Some(rust_closure_trampoline),
-                payload,
-                Some(rust_closure_destructor),
-            )
-        };
-
-        if closure.ctx.is_null() {
-            // Clean up if creation failed
-            unsafe {
-                rust_closure_destructor(payload);
-            }
-            return Err(Exception::custom(
-                "Failed to create closure from Rust function",
-            ));
-        }
-
-        Ok(RawClosure { closure })
+        Ok(RawClosure { f: Some(Box::new(f)) })
     }
 
-    /// A JIT-compiled function that wraps a Rust closure.
-    ///
-    /// This struct holds both the original closure and its compiled version,
-    /// providing efficient execution through MLX's compilation system.
+    /// A JIT-compiled function that wraps a Rust closure (stub — eager fallback).
     pub struct CompiledRustClosure {
-        /// The original closure (must be kept alive for the compiled version to work)
-        #[allow(dead_code)]
-        original: RawClosure,
-        /// The compiled closure
-        compiled: RawClosure,
-        /// Unique compile ID
+        /// The original closure for eager fallback.
+        f: Box<dyn Fn(&[Array]) -> std::result::Result<Vec<Array>, Exception>>,
         #[allow(dead_code)]
         compile_id: usize,
     }
 
     impl CompiledRustClosure {
-        /// Create a new compiled closure from a Rust function.
-        ///
-        /// The function will be traced and compiled by MLX on first execution.
+        /// Create a new compiled closure stub from a Rust function.
         pub fn new<F>(f: F, compile_id: usize) -> std::result::Result<Self, Exception>
         where
             F: Fn(&[Array]) -> std::result::Result<Vec<Array>, Exception> + 'static,
         {
-            let original = create_closure_from_rust(f)?;
-            let compiled = compile_closure(&original, compile_id, false)?;
-
-            Ok(Self {
-                original,
-                compiled,
-                compile_id,
-            })
+            Ok(Self { f: Box::new(f), compile_id })
         }
 
-        /// Execute the compiled closure with the given inputs.
+        /// Execute the closure (eager, not JIT-compiled).
         pub fn call(&self, inputs: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
-            let input_vec = RawVectorArray::from_arrays(inputs)?;
-            let output_vec = apply_closure(&self.compiled, &input_vec)?;
-            output_vec.to_arrays()
+            (self.f)(inputs)
         }
     }
 }
@@ -663,11 +478,11 @@ pub mod raw_ffi {
 /// Count valid (non-ignored) tokens for throughput tracking.
 fn count_valid_tokens(labels: &Array) -> std::result::Result<Array, Exception> {
     let shifted_labels = labels.index((.., 1..));
-    let flat_labels = shifted_labels.reshape(&[-1])?;
-    let labels_dtype = flat_labels.dtype();
-    let ignore_idx = Array::from_int(-100).as_dtype(labels_dtype)?;
-    let valid_mask = flat_labels.ne(&ignore_idx)?;
-    valid_mask.sum(None)?.as_dtype(mlx_rs::Dtype::Float32)
+    let flat_labels = shifted_labels.reshape(&[-1]);
+    let labels_dtype = flat_labels.dtype_raw();
+    let ignore_idx = Array::from_int(-100).as_dtype(labels_dtype);
+    let valid_mask = flat_labels.ne(&ignore_idx);
+    Ok(valid_mask.sum(None).as_dtype(Dtype::Float32.as_i32()))
 }
 
 /// Clip gradient norm for stability.
@@ -685,21 +500,18 @@ pub fn clip_grad_norm(
     // Compute total norm: sqrt(sum(grad^2 for all grads))
     let mut total_norm_sq = Array::from_f32(0.0);
     for grad in grads {
-        let grad_sq = grad.multiply(grad)?;
-        let grad_norm_sq = grad_sq.sum(None)?;
-        total_norm_sq = total_norm_sq.add(&grad_norm_sq)?;
+        let grad_sq = grad.multiply(grad);
+        let grad_norm_sq = grad_sq.sum(None);
+        total_norm_sq = total_norm_sq.add(&grad_norm_sq);
     }
-    let total_norm = total_norm_sq.sqrt()?;
+    let total_norm = total_norm_sq.sqrt();
 
     // Compute scale factor: max_norm / max(total_norm, max_norm)
     let max_norm_arr = Array::from_f32(max_norm);
-    let clip_coef = max_norm_arr.divide(&mlx_rs::ops::maximum(&total_norm, &max_norm_arr)?)?;
+    let clip_coef = max_norm_arr.divide(&ops::maximum(&total_norm, &max_norm_arr));
 
     // Scale all gradients
-    let clipped: std::result::Result<Vec<Array>, Exception> =
-        grads.iter().map(|g| g.multiply(&clip_coef)).collect();
-
-    clipped
+    Ok(grads.iter().map(|g| g.multiply(&clip_coef)).collect())
 }
 
 /// Stateless loss computation for JIT compilation.
@@ -722,7 +534,7 @@ pub fn stateless_loss_and_grad(
     param_keys: &[Rc<str>],
     forward_fn: impl Fn(&FlattenedModuleParam, &Array) -> std::result::Result<Array, Exception>,
 ) -> std::result::Result<(Array, Vec<Array>), Exception> {
-    use mlx_rs::transforms::keyed_value_and_grad;
+    use pmetal_bridge::compat::nn::keyed_value_and_grad;
     use std::collections::HashMap;
 
     // Reconstruct params map
@@ -747,24 +559,24 @@ pub fn stateless_loss_and_grad(
         let shift_logits = logits.index((.., ..seq_len - 1, ..));
         let shift_labels = labels.index((.., 1..));
 
-        let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
-        let flat_labels = shift_labels.reshape(&[-1])?;
+        let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
+        let flat_labels = shift_labels.reshape(&[-1]);
 
         // Cross-entropy with ignore_index=-100
-        let ce = mlx_rs::losses::CrossEntropy::new()?;
-        let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
+        let ce = pmetal_bridge::compat::losses::CrossEntropy::new();
+        let per_token_loss = ce.apply(&flat_logits, &flat_labels);
 
         // Mask ignored tokens
-        let labels_dtype = flat_labels.dtype();
-        let ignore_idx = Array::from_int(-100).as_dtype(labels_dtype)?;
-        let valid_mask = flat_labels.ne(&ignore_idx)?;
-        let valid_mask_f32 = valid_mask.as_dtype(mlx_rs::Dtype::Float32)?;
+        let labels_dtype = flat_labels.dtype_raw();
+        let ignore_idx = Array::from_int(-100).as_dtype(labels_dtype);
+        let valid_mask = flat_labels.ne(&ignore_idx);
+        let valid_mask_f32 = valid_mask.as_dtype(Dtype::Float32.as_i32());
 
-        let masked_loss = per_token_loss.multiply(&valid_mask_f32)?;
-        let n_valid = valid_mask_f32.sum(None)?;
-        let n_valid_safe = mlx_rs::ops::maximum(&n_valid, &Array::from_f32(1.0))?;
+        let masked_loss = per_token_loss.multiply(&valid_mask_f32);
+        let n_valid = valid_mask_f32.sum(None);
+        let n_valid_safe = ops::maximum(&n_valid, &Array::from_f32(1.0));
 
-        let loss = masked_loss.sum(None)?.divide(&n_valid_safe)?;
+        let loss = masked_loss.sum(None).divide(&n_valid_safe);
         Ok(vec![loss])
     };
 
@@ -825,26 +637,26 @@ pub fn stateless_optimizer_step(
 
             // m = beta1 * m + (1 - beta1) * grad
             let new_m = beta1
-                .multiply(m)?
-                .add(&Array::from_f32(1.0 - 0.9).multiply(grad)?)?;
+                .multiply(m)
+                .add(&Array::from_f32(1.0 - 0.9).multiply(grad));
 
             // v = beta2 * v + (1 - beta2) * grad^2
-            let grad_sq = grad.multiply(grad)?;
+            let grad_sq = grad.multiply(grad);
             let new_v = beta2
-                .multiply(v)?
-                .add(&Array::from_f32(1.0 - 0.999).multiply(&grad_sq)?)?;
+                .multiply(v)
+                .add(&Array::from_f32(1.0 - 0.999).multiply(&grad_sq));
 
             // param = param - lr * m / (sqrt(v) + eps)
-            let denom = new_v.sqrt()?.add(&eps)?;
-            let update = lr.multiply(&new_m)?.divide(&denom)?;
-            let new_param = param.subtract(&update)?;
+            let denom = new_v.sqrt().add(&eps);
+            let update = lr.multiply(&new_m).divide(&denom);
+            let new_param = param.subtract(&update);
 
             updated_params.push(new_param);
             updated_opt_state.push(new_m);
             updated_opt_state.push(new_v);
         } else {
             // SGD fallback
-            let new_param = param.subtract(&lr.multiply(grad)?)?;
+            let new_param = param.subtract(&lr.multiply(grad));
             updated_params.push(new_param);
         }
     }
@@ -853,7 +665,7 @@ pub fn stateless_optimizer_step(
 }
 
 // Re-export Array's index operation
-use mlx_rs::ops::indexing::IndexOp;
+use pmetal_bridge::compat::ops::indexing::IndexOp;
 
 #[cfg(test)]
 mod tests {
@@ -863,12 +675,12 @@ mod tests {
     fn test_stateless_optimizer_step_sgd() {
         // Test SGD (no optimizer state)
         let params = vec![
-            Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]),
-            Array::from_slice(&[4.0f32, 5.0], &[2]),
+            Array::from_f32_slice(&[1.0f32, 2.0, 3.0], &[3]),
+            Array::from_f32_slice(&[4.0f32, 5.0], &[2]),
         ];
         let grads = vec![
-            Array::from_slice(&[0.1f32, 0.2, 0.3], &[3]),
-            Array::from_slice(&[0.4f32, 0.5], &[2]),
+            Array::from_f32_slice(&[0.1f32, 0.2, 0.3], &[3]),
+            Array::from_f32_slice(&[0.4f32, 0.5], &[2]),
         ];
         let opt_state: Vec<Array> = vec![];
         let lr = 0.1;
@@ -890,12 +702,12 @@ mod tests {
     #[test]
     fn test_stateless_optimizer_step_adam() {
         // Test AdamW with initialized state
-        let params = vec![Array::from_slice(&[1.0f32, 2.0], &[2])];
-        let grads = vec![Array::from_slice(&[0.1f32, 0.2], &[2])];
+        let params = vec![Array::from_f32_slice(&[1.0f32, 2.0], &[2])];
+        let grads = vec![Array::from_f32_slice(&[0.1f32, 0.2], &[2])];
         // m and v for one param
         let opt_state = vec![
-            Array::from_slice(&[0.0f32, 0.0], &[2]), // m
-            Array::from_slice(&[0.0f32, 0.0], &[2]), // v
+            Array::from_f32_slice(&[0.0f32, 0.0], &[2]), // m
+            Array::from_f32_slice(&[0.0f32, 0.0], &[2]), // v
         ];
         let lr = 0.001;
 
@@ -937,7 +749,7 @@ mod tests {
         let compiled = CompiledRustClosure::new(double_fn, 12345).unwrap();
 
         // Test execution
-        let input = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let input = Array::from_f32_slice(&[1.0f32, 2.0, 3.0], &[3]);
         let outputs = compiled.call(&[input]).unwrap();
 
         assert_eq!(outputs.len(), 1);
@@ -964,8 +776,8 @@ mod tests {
         let compiled = CompiledRustClosure::new(fn_multi, 12346).unwrap();
 
         // Test execution
-        let a = Array::from_slice(&[1.0f32, 2.0], &[2]);
-        let b = Array::from_slice(&[3.0f32, 4.0], &[2]);
+        let a = Array::from_f32_slice(&[1.0f32, 2.0], &[2]);
+        let b = Array::from_f32_slice(&[3.0f32, 4.0], &[2]);
         let outputs = compiled.call(&[a, b]).unwrap();
 
         assert_eq!(outputs.len(), 2);

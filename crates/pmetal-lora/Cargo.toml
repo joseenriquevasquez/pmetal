@@ -18,15 +18,14 @@ metal-fused = ["pmetal-metal"]
 pmetal-core = { workspace = true }
 pmetal-gguf = { workspace = true }
 pmetal-metal = { workspace = true, optional = true }
+pmetal-bridge = { workspace = true }
 pmetal-mlx = { workspace = true }
 pmetal-models = { workspace = true }
 half = { workspace = true }
-mlx-rs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-mlx-sys = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }

@@ -7,7 +7,7 @@
 //!   loss += max(0, margin - (P_student[i] - P_student[j]))
 
 use crate::Result;
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, Dtype, ops};
 
 use super::DistillLoss;
 
@@ -57,69 +57,76 @@ impl DistillLoss for HingeRankingLoss {
         let k = self.top_k;
 
         // Teacher probabilities
-        let teacher_scaled = teacher_logits.divide(&temp)?;
+        let teacher_scaled = teacher_logits.divide(&temp);
         let teacher_probs = super::softmax(&teacher_scaled, -1)?;
 
         // Top-k indices via argpartition (O(V) not O(V log V))
         let vocab = teacher_logits.dim(-1);
         let k = k.min((vocab - 1).max(0)); // argpartition requires kth < axis size
-        let neg_teacher = teacher_probs.negative()?;
-        let partitioned = mlx_rs::ops::argpartition_axis(&neg_teacher, k, -1)?;
-        use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
-        let top_k_idx = partitioned.index((Ellipsis, ..k));
+        let neg_teacher = teacher_probs.negative();
+        let partitioned = ops::argpartition_axis(&neg_teacher, k, -1);
+        // Slice first k along the last axis: reshape to 2D, slice, reshape back
+        let part_shape = partitioned.shape().to_vec();
+        let part_ndim = part_shape.len();
+        let part_n: i32 = part_shape[..part_ndim - 1].iter().product();
+        let part_2d = partitioned.reshape(&[part_n, vocab]);
+        let top_k_2d = part_2d.slice(&[0, 0], &[part_n, k]);
+        let mut top_k_shape: Vec<i32> = part_shape[..part_ndim - 1].to_vec();
+        top_k_shape.push(k);
+        let top_k_idx = top_k_2d.reshape(&top_k_shape);
 
         // Gather teacher probs at top-k
-        let t_gathered = teacher_probs.take_along_axis(&top_k_idx, -1)?;
+        let t_gathered = teacher_probs.take_along_axis(&top_k_idx, -1);
 
         // Student probs at same positions
-        let student_scaled = student_logits.divide(&temp)?;
+        let student_scaled = student_logits.divide(&temp);
         let student_probs = super::softmax(&student_scaled, -1)?;
-        let s_gathered = student_probs.take_along_axis(&top_k_idx, -1)?;
+        let s_gathered = student_probs.take_along_axis(&top_k_idx, -1);
 
         // Flatten to [N, K] where N = batch * seq
         let shape = teacher_logits.shape();
         let ndim = shape.len();
         let n: i32 = shape[..ndim - 1].iter().product();
 
-        let t_flat = t_gathered.reshape(&[n, k])?;
-        let s_flat = s_gathered.reshape(&[n, k])?;
+        let t_flat = t_gathered.reshape(&[n, k]);
+        let s_flat = s_gathered.reshape(&[n, k]);
 
         // Pairwise: [N, K, 1] - [N, 1, K] → [N, K, K]
-        let t_i = t_flat.reshape(&[n, k, 1])?;
-        let t_j = t_flat.reshape(&[n, 1, k])?;
-        let s_i = s_flat.reshape(&[n, k, 1])?;
-        let s_j = s_flat.reshape(&[n, 1, k])?;
+        let t_i = t_flat.reshape(&[n, k, 1]);
+        let t_j = t_flat.reshape(&[n, 1, k]);
+        let s_i = s_flat.reshape(&[n, k, 1]);
+        let s_j = s_flat.reshape(&[n, 1, k]);
 
-        let teacher_margin = t_i.subtract(&t_j)?;
-        let student_diff = s_i.subtract(&s_j)?;
+        let teacher_margin = t_i.subtract(&t_j);
+        let student_diff = s_i.subtract(&s_j);
 
         // Valid pairs: teacher[i] > teacher[j] + eps
         let eps_arr = Array::from_f32(self.eps);
         let valid_mask = teacher_margin
-            .gt(&eps_arr)?
-            .as_dtype(mlx_rs::Dtype::Float32)?;
+            .greater(&eps_arr)
+            .as_dtype(Dtype::Float32.as_i32());
 
         // Hinge: relu(margin - student_diff)
-        let violation = teacher_margin.subtract(&student_diff)?;
+        let violation = teacher_margin.subtract(&student_diff);
         let zero = Array::from_f32(0.0);
-        let hinge = mlx_rs::ops::maximum(&violation, &zero)?;
+        let hinge = ops::maximum(&violation, &zero);
 
         // Masked mean over pairs → per-token scalar
-        let masked = hinge.multiply(&valid_mask)?;
-        let pair_sum = masked.sum_axes(&[-1, -2], None)?; // [N]
-        let pair_count = valid_mask.sum_axes(&[-1, -2], None)?;
-        let safe_count = mlx_rs::ops::maximum(&pair_count, &Array::from_f32(1.0))?;
-        let per_token = pair_sum.divide(&safe_count)?;
+        let masked = hinge.multiply(&valid_mask);
+        let pair_sum = masked.sum_axes(&[-1, -2], false); // [N]
+        let pair_count = valid_mask.sum_axes(&[-1, -2], false);
+        let safe_count = ops::maximum(&pair_count, &Array::from_f32(1.0));
+        let per_token = pair_sum.divide(&safe_count);
 
         if let Some(w) = weights {
-            let w_flat = w.reshape(&[-1])?;
-            let weighted = per_token.multiply(&w_flat)?;
-            let sum = weighted.sum(false)?;
-            let w_sum = w_flat.sum(false)?;
-            let safe_sum = mlx_rs::ops::maximum(&w_sum, &Array::from_f32(1.0))?;
-            Ok(sum.divide(&safe_sum)?)
+            let w_flat = w.reshape(&[-1]);
+            let weighted = per_token.multiply(&w_flat);
+            let sum = weighted.sum_all();
+            let w_sum = w_flat.sum_all();
+            let safe_sum = ops::maximum(&w_sum, &Array::from_f32(1.0));
+            Ok(sum.divide(&safe_sum))
         } else {
-            Ok(per_token.mean(None)?)
+            Ok(per_token.mean_all())
         }
     }
 
@@ -134,10 +141,10 @@ mod tests {
 
     #[test]
     fn identical_distributions_zero_loss() {
-        let logits = Array::from_slice(&[3.0f32, 2.0, 1.0, 0.5, 3.0, 2.0, 1.0, 0.5], &[1, 2, 4]);
+        let logits = Array::from_f32_slice(&[3.0f32, 2.0, 1.0, 0.5, 3.0, 2.0, 1.0, 0.5], &[1, 2, 4]);
         let loss = HingeRankingLoss::new().with_top_k(4);
         let result = loss.compute(&logits, &logits, 1.0).unwrap();
-        result.eval().unwrap();
+        result.eval();
         let val: f32 = result.item();
         assert!(
             val.abs() < 1e-4,
@@ -147,11 +154,11 @@ mod tests {
 
     #[test]
     fn reversed_ranking_positive_loss() {
-        let teacher = Array::from_slice(&[10.0f32, 0.0, -10.0], &[1, 1, 3]);
-        let student = Array::from_slice(&[-10.0f32, 0.0, 10.0], &[1, 1, 3]);
+        let teacher = Array::from_f32_slice(&[10.0f32, 0.0, -10.0], &[1, 1, 3]);
+        let student = Array::from_f32_slice(&[-10.0f32, 0.0, 10.0], &[1, 1, 3]);
         let loss = HingeRankingLoss::new().with_top_k(3);
         let result = loss.compute(&teacher, &student, 1.0).unwrap();
-        result.eval().unwrap();
+        result.eval();
         let val: f32 = result.item();
         assert!(val > 0.1, "Reversed ranking → positive hinge, got {val}");
     }

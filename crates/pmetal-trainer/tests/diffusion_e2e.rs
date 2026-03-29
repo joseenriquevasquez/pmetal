@@ -12,8 +12,8 @@
 
 #![allow(clippy::manual_contains)]
 
-use mlx_rs::Array;
-use mlx_rs::optimizers::Sgd;
+use pmetal_bridge::compat::Array;
+use pmetal_bridge::compat::optimizers::Sgd;
 use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_data::{DataLoaderConfig, Sample, TrainingDataset};
 use pmetal_lora::Qwen3LoraForCausalLM;
@@ -73,7 +73,7 @@ fn create_dummy_dataset(num_samples: usize, seq_len: usize) -> TrainingDataset {
 #[serial]
 fn test_forward_process_gpu() {
     // Test GPU-native forward masking process
-    let input_ids = Array::from_slice(&[1_i32, 2, 3, 4, 5, 6, 7, 8], &[1, 8]);
+    let input_ids = Array::from_i32_slice_shaped(&[1_i32, 2, 3, 4, 5, 6, 7, 8], &[1, 8]);
     let mask_token_id = 255_i64;
     let t = 0.5; // 50% masking probability
 
@@ -85,8 +85,8 @@ fn test_forward_process_gpu() {
     assert_eq!(mask.shape(), &[1, 8]);
 
     // Verify dtype
-    x_t.eval().expect("Should eval");
-    mask.eval().expect("Should eval mask");
+    x_t.eval();
+    mask.eval();
 
     // Verify some tokens are masked (with 50% probability, high chance of masking)
     let x_t_data: Vec<i32> = x_t.as_slice().to_vec();
@@ -102,14 +102,14 @@ fn test_forward_process_gpu() {
 fn test_diffusion_loss_gpu() {
     // Test GPU-native diffusion loss
     // Create dummy logits: [batch=1, seq_len=4, vocab_size=8]
-    let logits =
-        mlx_rs::random::normal::<f32>(&[1, 4, 8], None, None, None).expect("Random logits");
+    let logits = pmetal_bridge::compat::random::normal(&[1, 4, 8], pmetal_bridge::compat::Dtype::Float32);
 
     // Create targets: [batch=1, seq_len=4]
-    let targets = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+    let targets = Array::from_i32_slice_shaped(&[1_i32, 2, 3, 4], &[1, 4]);
 
     // Create mask: [batch=1, seq_len=4] - first two positions masked
-    let mask = Array::from_slice(&[true, true, false, false], &[1, 4]);
+    // Bridge doesn't have from_bool_slice, use from_i32 cast to bool
+    let mask = Array::from_i32_slice_shaped(&[1_i32, 1, 0, 0], &[1, 4]).as_dtype(pmetal_bridge::compat::Dtype::Bool.as_i32());
 
     let t = 0.5;
     let use_elbo = true;
@@ -118,8 +118,8 @@ fn test_diffusion_loss_gpu() {
     let loss = diffusion_loss_gpu(&logits, &targets, &mask, t, use_elbo, ignore_index)
         .expect("Diffusion loss should succeed");
 
-    loss.eval().expect("Should eval loss");
-    let loss_val = loss.item::<f32>();
+    loss.eval();
+    let loss_val = loss.item_f32();
 
     // Loss should be positive (cross-entropy is always positive)
     assert!(loss_val > 0.0, "Loss should be positive, got {}", loss_val);
@@ -347,22 +347,21 @@ fn test_noise_schedules() {
 #[serial]
 fn test_elbo_weighting() {
     // Test that ELBO weighting increases loss at low noise levels
-    let logits =
-        mlx_rs::random::normal::<f32>(&[1, 4, 8], None, None, None).expect("Random logits");
-    let targets = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
-    let mask = Array::from_slice(&[true, true, true, true], &[1, 4]);
+    let logits = pmetal_bridge::compat::random::normal(&[1, 4, 8], pmetal_bridge::compat::Dtype::Float32);
+    let targets = Array::from_i32_slice_shaped(&[1_i32, 2, 3, 4], &[1, 4]);
+    let mask = Array::from_i32_slice_shaped(&[1_i32, 1, 1, 1], &[1, 4]).as_dtype(pmetal_bridge::compat::Dtype::Bool.as_i32());
 
     // Loss at t=0.5 without ELBO
     let loss_no_elbo =
         diffusion_loss_gpu(&logits, &targets, &mask, 0.5, false, -100).expect("Loss without ELBO");
-    loss_no_elbo.eval().expect("Eval");
+    loss_no_elbo.eval();
 
     // Loss at t=0.5 with ELBO (should be ~2x higher due to 1/t weighting)
     let loss_elbo =
         diffusion_loss_gpu(&logits, &targets, &mask, 0.5, true, -100).expect("Loss with ELBO");
-    loss_elbo.eval().expect("Eval");
+    loss_elbo.eval();
 
-    let ratio = loss_elbo.item::<f32>() / loss_no_elbo.item::<f32>();
+    let ratio = loss_elbo.item_f32() / loss_no_elbo.item_f32();
     // ELBO weighting at t=0.5 should multiply loss by 1/0.5 = 2
     assert!(
         (ratio - 2.0).abs() < 0.1,

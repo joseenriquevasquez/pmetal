@@ -29,7 +29,8 @@
 //!
 //! This maximizes GPU utilization by processing all experts in parallel.
 
-use mlx_rs::{Array, error::Exception, ops::indexing::TryIndexOp};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops, random};
+use crate::ArrayDtypeExt;
 
 /// Configuration for Grouped GEMM MoE.
 #[derive(Debug, Clone)]
@@ -140,29 +141,21 @@ impl GroupedExpertWeights {
         intermediate_size: i32,
         use_swiglu: bool,
     ) -> Result<Self, Exception> {
-        let std_dev = (2.0 / (hidden_size + intermediate_size) as f32).sqrt();
-
-        let w1 = mlx_rs::random::normal::<f32>(
+        let w1 = random::normal(
             &[num_experts as i32, hidden_size, intermediate_size],
-            None,
-            Some(std_dev),
-            None,
-        )?;
+            Dtype::Float32,
+        );
 
-        let w2 = mlx_rs::random::normal::<f32>(
+        let w2 = random::normal(
             &[num_experts as i32, intermediate_size, hidden_size],
-            None,
-            Some(std_dev),
-            None,
-        )?;
+            Dtype::Float32,
+        );
 
         let w3 = if use_swiglu {
-            Some(mlx_rs::random::normal::<f32>(
+            Some(random::normal(
                 &[num_experts as i32, hidden_size, intermediate_size],
-                None,
-                Some(std_dev),
-                None,
-            )?)
+                Dtype::Float32,
+            ))
         } else {
             None
         };
@@ -211,29 +204,10 @@ impl SharedExpert {
         intermediate_size: i32,
         use_swiglu: bool,
     ) -> Result<Self, Exception> {
-        let std_dev = (2.0 / (hidden_size + intermediate_size) as f32).sqrt();
-
-        let w1 = mlx_rs::random::normal::<f32>(
-            &[hidden_size, intermediate_size],
-            None,
-            Some(std_dev),
-            None,
-        )?;
-
-        let w2 = mlx_rs::random::normal::<f32>(
-            &[intermediate_size, hidden_size],
-            None,
-            Some(std_dev),
-            None,
-        )?;
-
+        let w1 = random::normal(&[hidden_size, intermediate_size], Dtype::Float32);
+        let w2 = random::normal(&[intermediate_size, hidden_size], Dtype::Float32);
         let w3 = if use_swiglu {
-            Some(mlx_rs::random::normal::<f32>(
-                &[hidden_size, intermediate_size],
-                None,
-                Some(std_dev),
-                None,
-            )?)
+            Some(random::normal(&[hidden_size, intermediate_size], Dtype::Float32))
         } else {
             None
         };
@@ -244,20 +218,20 @@ impl SharedExpert {
     /// Forward pass through shared expert.
     pub fn forward(&self, x: &Array) -> Result<Array, Exception> {
         // Gate: x @ w1 -> [batch, intermediate]
-        let gate = x.matmul(&self.w1)?;
+        let gate = x.matmul(&self.w1);
 
         let hidden = if let Some(ref w3) = self.w3 {
             // SwiGLU: silu(gate) * (x @ w3)
-            let gate_activated = mlx_rs::nn::silu(&gate)?;
-            let up = x.matmul(w3)?;
-            gate_activated.multiply(&up)?
+            let gate_activated = gate.silu();
+            let up = x.matmul(w3);
+            gate_activated.multiply(&up)
         } else {
             // GELU
-            mlx_rs::nn::gelu(&gate)?
+            gate.gelu()
         };
 
         // Down: hidden @ w2 -> [batch, hidden]
-        hidden.matmul(&self.w2)
+        Ok(hidden.matmul(&self.w2))
     }
 }
 
@@ -265,12 +239,10 @@ impl GroupedGemmMoE {
     /// Create a new Grouped GEMM MoE layer.
     pub fn new(config: GroupedGemmMoEConfig) -> Result<Self, Exception> {
         // Initialize gate
-        let gate = mlx_rs::random::normal::<f32>(
+        let gate = random::normal(
             &[config.hidden_size, config.num_experts as i32],
-            None,
-            Some(0.01),
-            None,
-        )?;
+            Dtype::Float32,
+        );
 
         // Initialize grouped expert weights
         let experts = GroupedExpertWeights::new_random(
@@ -306,7 +278,7 @@ impl GroupedGemmMoE {
     }
 
     /// Set evaluation mode.
-    pub fn eval(&mut self) {
+    pub fn eval_mode(&mut self) {
         self.training = false;
     }
 
@@ -323,34 +295,33 @@ impl GroupedGemmMoE {
         let hidden_size = shape[shape.len() - 1];
 
         // Flatten input
-        let x = hidden_states.reshape(&[batch_seq, hidden_size])?;
+        let x = hidden_states.reshape(&[batch_seq, hidden_size]);
 
         // Step 1: Compute router logits
-        let router_logits = x.matmul(&self.gate)?; // [batch_seq, num_experts]
+        let router_logits = x.matmul(&self.gate); // [batch_seq, num_experts]
 
         // Add jitter during training
         let router_logits = if self.training && self.config.router_jitter > 0.0 {
-            let noise = mlx_rs::random::uniform::<_, f32>(
-                -self.config.router_jitter,
-                self.config.router_jitter,
-                router_logits.shape(),
-                None,
-            )?;
-            router_logits.add(&noise)?
+            let noise = random::uniform(router_logits.shape(), Dtype::Float32);
+            // Scale to [-jitter, jitter]
+            let scaled = noise
+                .multiply(&Array::from_f32(2.0 * self.config.router_jitter))
+                .subtract(&Array::from_f32(self.config.router_jitter));
+            router_logits.add(&scaled)
         } else {
             router_logits
         };
 
         // Softmax for routing probabilities
-        let routing_probs = mlx_rs::ops::softmax_axis(&router_logits, -1, None)?;
+        let routing_probs = router_logits.softmax(-1);
 
         // Step 2: Top-k expert selection
-        let (top_weights, top_indices) = self.topk_experts(&routing_probs)?;
+        let (top_weights, top_indices) = self.topk_experts(&routing_probs);
 
         // Normalize weights with epsilon guard to prevent division by zero
-        let weight_sum = top_weights.sum_axis(-1, Some(true))?;
-        let safe_sum = mlx_rs::ops::maximum(&weight_sum, &Array::from_f32(1e-8))?;
-        let top_weights = top_weights.divide(&safe_sum)?;
+        let weight_sum = top_weights.sum_axis(-1, true);
+        let safe_sum = weight_sum.maximum(&Array::from_f32(1e-8));
+        let top_weights = top_weights.divide(&safe_sum);
 
         // Step 3: Grouped GEMM expert computation
         let expert_output = self.grouped_expert_forward(&x, &top_weights, &top_indices)?;
@@ -358,13 +329,13 @@ impl GroupedGemmMoE {
         // Step 4: Add shared expert contribution if enabled
         let output = if let Some(ref shared) = self.shared_expert {
             let shared_out = shared.forward(&x)?;
-            expert_output.add(&shared_out)?
+            expert_output.add(&shared_out)
         } else {
             expert_output
         };
 
         // Reshape back to original shape
-        let output = output.reshape(shape)?;
+        let output = output.reshape(shape);
 
         // Step 5: Compute auxiliary loss
         let aux_loss = if self.config.use_aux_loss {
@@ -377,14 +348,20 @@ impl GroupedGemmMoE {
     }
 
     /// Top-k expert selection on GPU.
-    fn topk_experts(&self, probs: &Array) -> Result<(Array, Array), Exception> {
-        let neg_k = -(self.config.num_experts_per_tok as i32);
-        let partitioned_indices = mlx_rs::ops::argpartition_axis(probs, neg_k, -1)?;
+    fn topk_experts(&self, probs: &Array) -> (Array, Array) {
+        let k = self.config.num_experts_per_tok;
+        let neg_k = -(k as i32);
+        let partitioned_indices = probs.argpartition(neg_k, -1);
+
+        // Slice last k columns: [N, E] -> [N, k]
+        let n_rows = partitioned_indices.dim(0);
+        let n_cols = partitioned_indices.dim(1);
+        let col_start = n_cols + neg_k; // n_cols - k
         let indices = partitioned_indices
-            .try_index((.., neg_k..))?
-            .as_type::<i32>()?;
-        let values = probs.take_along_axis(&indices, -1)?;
-        Ok((values, indices))
+            .slice(&[0, col_start], &[n_rows, n_cols])
+            .as_dtype(Dtype::Int32.as_i32());
+        let values = probs.take_along_axis(&indices, -1);
+        (values, indices)
     }
 
     /// Grouped GEMM forward pass.
@@ -398,30 +375,31 @@ impl GroupedGemmMoE {
         weights: &Array,
         expert_indices: &Array,
     ) -> Result<Array, Exception> {
-        expert_indices.eval()?;
-        weights.eval()?;
+        let mut ei_owned = expert_indices.clone();
+        ei_owned.eval();
+        let mut wt_owned = weights.clone();
+        wt_owned.eval();
 
         let n_tokens = x.dim(0) as usize;
         let hidden_size = x.dim(1) as usize;
         let k = self.config.num_experts_per_tok;
 
         // For each expert slot (0 to k-1), gather tokens and process
-        // This is more efficient than per-expert processing
-        let zero = Array::from_f32(0.0);
-        let mut output = mlx_rs::ops::broadcast_to(&zero, &[n_tokens as i32, hidden_size as i32])?;
+        let mut output = ops::zeros(&[n_tokens as i32, hidden_size as i32], Dtype::Float32);
 
         // Process each expert slot
         for slot in 0..k {
-            // Get expert indices for this slot
-            let slot_experts = expert_indices.try_index((.., slot as i32))?; // [n_tokens]
-            let slot_weights = weights.try_index((.., slot as i32))?; // [n_tokens]
+            // Get expert indices for this slot: slice col `slot` from [N, k] -> [N]
+            let col = slot as i32;
+            let slot_experts = ei_owned.slice(&[0, col], &[n_tokens as i32, col + 1]).squeeze(1);
+            let slot_weights = wt_owned.slice(&[0, col], &[n_tokens as i32, col + 1]).squeeze(1);
 
             // Process all tokens through their assigned experts using gather/scatter
             let slot_output = self.batched_expert_compute(x, &slot_experts)?;
 
-            // Weight the output
-            let weighted = slot_output.multiply(&slot_weights.reshape(&[-1, 1])?)?;
-            output = output.add(&weighted)?;
+            // Weight the output: reshape weights to [n_tokens, 1] for broadcasting
+            let weighted = slot_output.multiply(&slot_weights.reshape(&[n_tokens as i32, 1]));
+            output = output.add(&weighted);
         }
 
         Ok(output)
@@ -435,41 +413,34 @@ impl GroupedGemmMoE {
         x: &Array,
         expert_indices: &Array,
     ) -> Result<Array, Exception> {
-        let _n_tokens = x.dim(0);
-
         // Gather w1 for each token's expert: [n_tokens, hidden, intermediate]
-        let w1_gathered = self.experts.w1.take_axis(expert_indices, 0)?;
+        let w1_gathered = self.experts.w1.take_axis(expert_indices, 0);
 
         // Compute gate: batched einsum "bh,bhi->bi"
         // For each token: x[b] @ w1_gathered[b]
-        let gate = self.batched_matmul(x, &w1_gathered)?;
+        let gate = self.batched_matmul(x, &w1_gathered);
 
-        let hidden = if let Some(ref _w3) = self.experts.w3 {
+        let hidden = if let Some(ref w3) = self.experts.w3 {
             // SwiGLU path
             // Gather w3 for each token's expert
-            let w3_gathered = self
-                .experts
-                .w3
-                .as_ref()
-                .unwrap()
-                .take_axis(expert_indices, 0)?;
+            let w3_gathered = w3.take_axis(expert_indices, 0);
 
             // Compute up projection
-            let up = self.batched_matmul(x, &w3_gathered)?;
+            let up = self.batched_matmul(x, &w3_gathered);
 
             // SwiGLU activation
-            let gate_activated = mlx_rs::nn::silu(&gate)?;
-            gate_activated.multiply(&up)?
+            let gate_activated = gate.silu();
+            gate_activated.multiply(&up)
         } else {
             // GELU path
-            mlx_rs::nn::gelu(&gate)?
+            gate.gelu()
         };
 
         // Gather w2 for each token's expert: [n_tokens, intermediate, hidden]
-        let w2_gathered = self.experts.w2.take_axis(expert_indices, 0)?;
+        let w2_gathered = self.experts.w2.take_axis(expert_indices, 0);
 
         // Compute down projection
-        self.batched_matmul(&hidden, &w2_gathered)
+        Ok(self.batched_matmul(&hidden, &w2_gathered))
     }
 
     /// Batched matrix multiply: y[b] = x[b] @ W[b]
@@ -477,15 +448,15 @@ impl GroupedGemmMoE {
     /// x: [batch, M]
     /// W: [batch, M, N]
     /// y: [batch, N]
-    fn batched_matmul(&self, x: &Array, w: &Array) -> Result<Array, Exception> {
+    fn batched_matmul(&self, x: &Array, w: &Array) -> Array {
         // Expand x for batched matmul: [batch, 1, M]
-        let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)])?;
+        let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)]);
 
         // Batched matmul: [batch, 1, M] @ [batch, M, N] -> [batch, 1, N]
-        let result = mlx_rs::ops::matmul(&x_expanded, w)?;
+        let result = x_expanded.matmul(w);
 
         // Squeeze: [batch, 1, N] -> [batch, N]
-        result.squeeze_axes(&[1])
+        result.squeeze(1)
     }
 
     /// Compute load balancing auxiliary loss.
@@ -498,26 +469,27 @@ impl GroupedGemmMoE {
         let n_tokens = routing_probs.dim(0) as f32;
 
         // Compute fraction of tokens routed to each expert
-        expert_indices.eval()?;
-        let indices_flat = expert_indices.flatten(None, None)?;
+        let mut ei_owned = expert_indices.clone();
+        ei_owned.eval();
+        let indices_flat = ei_owned.flatten(0, -1);
 
         // Count tokens per expert using identity matrix indexing
         // one_hot[i] = identity[indices[i]] where identity is [n_experts, n_experts]
-        let identity = mlx_rs::ops::eye::<f32>(n_experts, None, None)?;
-        let one_hot = identity.take_axis(&indices_flat, 0)?;
-        let tokens_per_expert = one_hot.sum_axis(0, None)?;
-        let fraction_tokens = tokens_per_expert.divide(&Array::from_f32(n_tokens))?;
+        let identity = Array::eye(n_experts, Dtype::Float32.as_i32());
+        let one_hot = identity.take_axis(&indices_flat, 0);
+        let tokens_per_expert = one_hot.sum_axis(0, false);
+        let fraction_tokens = tokens_per_expert.divide(&Array::from_f32(n_tokens));
 
         // Mean routing probability per expert
-        let mean_routing_prob = routing_probs.mean_axis(0, None)?;
+        let mean_routing_prob = routing_probs.mean_axis(0, false);
 
         // Aux loss: n_experts * sum(fraction * mean_prob)
         // Encourages load balancing
-        let product = fraction_tokens.multiply(&mean_routing_prob)?;
-        let aux_loss = product.sum(None)?;
-        aux_loss.multiply(&Array::from_f32(
+        let product = fraction_tokens.multiply(&mean_routing_prob);
+        let aux_loss = product.sum(None);
+        Ok(aux_loss.multiply(&Array::from_f32(
             n_experts as f32 * self.config.aux_loss_coef,
-        ))
+        )))
     }
 }
 
@@ -585,12 +557,13 @@ mod tests {
 
         let moe = GroupedGemmMoE::new(config).unwrap();
 
-        let hidden = Array::zeros::<f32>(&[2, 4, 64]).unwrap();
+        let hidden = ops::zeros(&[2, 4, 64], Dtype::Float32);
         let (output, aux_loss) = moe.forward(&hidden).unwrap();
 
-        output.eval().unwrap();
+        let mut out_owned = output.clone();
+        out_owned.eval();
 
-        assert_eq!(output.shape(), &[2, 4, 64]);
+        assert_eq!(out_owned.shape(), &[2, 4, 64]);
         assert!(aux_loss.is_none());
     }
 
@@ -602,15 +575,17 @@ mod tests {
 
         let moe = GroupedGemmMoE::new(config).unwrap();
 
-        let hidden = mlx_rs::random::normal::<f32>(&[2, 4, 64], None, None, None).unwrap();
+        let hidden = random::normal(&[2, 4, 64], Dtype::Float32);
         let (output, aux_loss) = moe.forward(&hidden).unwrap();
 
-        output.eval().unwrap();
+        let mut out_owned = output.clone();
+        out_owned.eval();
         assert!(aux_loss.is_some());
 
         let loss = aux_loss.unwrap();
-        loss.eval().unwrap();
-        assert_eq!(loss.ndim(), 0);
+        let mut loss_owned = loss.clone();
+        loss_owned.eval();
+        assert_eq!(loss_owned.ndim(), 0);
     }
 
     #[test]
@@ -622,22 +597,24 @@ mod tests {
         let moe = GroupedGemmMoE::new(config).unwrap();
         assert!(moe.shared_expert.is_some());
 
-        let hidden = Array::zeros::<f32>(&[2, 4, 64]).unwrap();
+        let hidden = ops::zeros(&[2, 4, 64], Dtype::Float32);
         let (output, _) = moe.forward(&hidden).unwrap();
 
-        output.eval().unwrap();
-        assert_eq!(output.shape(), &[2, 4, 64]);
+        let mut out_owned = output.clone();
+        out_owned.eval();
+        assert_eq!(out_owned.shape(), &[2, 4, 64]);
     }
 
     #[test]
     fn test_shared_expert_forward() {
         let expert = SharedExpert::new(64, 256, true).unwrap();
 
-        let x = Array::zeros::<f32>(&[4, 64]).unwrap();
+        let x = ops::zeros(&[4, 64], Dtype::Float32);
         let out = expert.forward(&x).unwrap();
 
-        out.eval().unwrap();
-        assert_eq!(out.shape(), &[4, 64]);
+        let mut out_owned = out.clone();
+        out_owned.eval();
+        assert_eq!(out_owned.shape(), &[4, 64]);
     }
 
     #[test]
@@ -646,13 +623,14 @@ mod tests {
         let moe = GroupedGemmMoE::new(config).unwrap();
 
         // x: [4, 64], w: [4, 64, 128]
-        let x = Array::zeros::<f32>(&[4, 64]).unwrap();
-        let w = Array::zeros::<f32>(&[4, 64, 128]).unwrap();
+        let x = ops::zeros(&[4, 64], Dtype::Float32);
+        let w = ops::zeros(&[4, 64, 128], Dtype::Float32);
 
-        let result = moe.batched_matmul(&x, &w).unwrap();
-        result.eval().unwrap();
+        let result = moe.batched_matmul(&x, &w);
+        let mut res_owned = result.clone();
+        res_owned.eval();
 
-        assert_eq!(result.shape(), &[4, 128]);
+        assert_eq!(res_owned.shape(), &[4, 128]);
     }
 
     #[test]
@@ -660,19 +638,34 @@ mod tests {
         let config = GroupedGemmMoEConfig::new(64, 128, 4).with_top_k(2);
         let moe = GroupedGemmMoE::new(config).unwrap();
 
-        let probs = Array::from_slice(&[0.1f32, 0.4, 0.2, 0.3, 0.3, 0.1, 0.4, 0.2], &[2, 4]);
+        let probs = Array::from_f32_slice(
+            &[0.1f32, 0.4, 0.2, 0.3, 0.3, 0.1, 0.4, 0.2],
+            &[2, 4],
+        );
 
-        let (values, indices) = moe.topk_experts(&probs).unwrap();
-        values.eval().unwrap();
-        indices.eval().unwrap();
+        let (values, indices) = moe.topk_experts(&probs);
+        let mut val_owned = values.clone();
+        val_owned.eval();
+        let mut idx_owned = indices.clone();
+        idx_owned.eval();
 
-        assert_eq!(values.shape(), &[2, 2]);
-        assert_eq!(indices.shape(), &[2, 2]);
+        assert_eq!(val_owned.shape(), &[2, 2]);
+        assert_eq!(idx_owned.shape(), &[2, 2]);
 
-        let value_data: Vec<f32> = values.as_slice::<f32>().to_vec();
-        let idx_data: Vec<i32> = indices.as_slice().to_vec();
+        let v_n = val_owned.size();
+        let i_n = idx_owned.size();
+        let value_data: Vec<f32> = val_owned.to_f32_vec(v_n).unwrap_or_default();
+        let idx_data: Vec<i32> = idx_owned
+            .to_f32_vec(i_n)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
 
-        let probs_data: Vec<f32> = probs.as_slice::<f32>().to_vec();
+        let mut probs_owned = probs.clone();
+        probs_owned.eval();
+        let p_n = probs_owned.size();
+        let probs_data: Vec<f32> = probs_owned.to_f32_vec(p_n).unwrap_or_default();
         for row in 0..2 {
             let mut expected: Vec<(i32, f32)> = probs_data[row * 4..(row + 1) * 4]
                 .iter()

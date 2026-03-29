@@ -48,7 +48,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result};
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 
 /// Nearswap merge implementation.
 ///
@@ -65,7 +65,7 @@ impl NearswapMerge {
 
     /// Compute task vector δ = W_ft - W_base.
     fn task_vector(tensor: &Array, base: &Array) -> Result<Array> {
-        Ok(tensor.subtract(base)?)
+        Ok(tensor.subtract(base))
     }
 }
 
@@ -111,27 +111,25 @@ impl MergeMethod for NearswapMerge {
             }
             // Interpolate: base + lambda * (t - base)
             let tv = Self::task_vector(&tensors[0], base)?;
-            let scaled = tv.multiply(Array::from_f32(lambda))?;
-            return Ok(base.add(&scaled)?);
+            let scaled = tv.multiply(&Array::from_f32(lambda));
+            return Ok(base.add(&scaled));
         }
 
         // General case: for each element pick the model closest to base.
         //
         // We work in flat (1-D) space and restore the original shape afterwards.
         let original_shape = base.shape().to_vec();
+        let n: usize = original_shape.iter().map(|&d| d as usize).product();
 
-        // Flatten base and all source tensors for element-wise processing.
-        let base_flat = base.reshape(&[-1])?;
-        base_flat.eval()?;
-        let base_vals: Vec<f32> = base_flat.as_slice().to_vec();
-        let n = base_vals.len();
+        // Flatten base and get values.
+        let mut base_flat = base.reshape(&[-1]);
+        let base_vals: Vec<f32> = base_flat.to_f32_vec(n).unwrap_or_default();
 
-        // Flatten every source tensor and evaluate eagerly.
+        // Flatten every source tensor and collect values.
         let mut flat_tensors: Vec<Vec<f32>> = Vec::with_capacity(tensors.len());
         for t in tensors.iter() {
-            let flat = t.reshape(&[-1])?;
-            flat.eval()?;
-            flat_tensors.push(flat.as_slice().to_vec());
+            let mut flat = t.reshape(&[-1]);
+            flat_tensors.push(flat.to_f32_vec(n).unwrap_or_default());
         }
 
         // For each position, select the value from the nearest model.
@@ -163,8 +161,8 @@ impl MergeMethod for NearswapMerge {
             }
         }
 
-        let result_flat = Array::from_slice(&result_vals, &[n as i32]);
-        Ok(result_flat.reshape(&original_shape)?)
+        let result_flat = Array::from_f32_slice(&result_vals, &[n as i32]);
+        Ok(result_flat.reshape(&original_shape))
     }
 }
 
@@ -182,16 +180,16 @@ mod tests {
     #[test]
     fn test_nearswap_single_model_passthrough() {
         let ns = NearswapMerge::new();
-        let base = Array::from_slice(&[0.0_f32, 0.0, 0.0], &[3]);
-        let t1 = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let base = Array::from_f32_slice(&[0.0_f32, 0.0, 0.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
 
         let params = vec![MergeParameters::default()];
         let global = MergeParameters::default(); // lambda=1.0
 
-        let result = ns
+        let mut result = ns
             .merge(std::slice::from_ref(&t1), Some(&base), &params, &global)
             .unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let result_slice = result.to_f32_vec(3).unwrap();
 
         // Single model, lambda=1 → passthrough
         assert!((result_slice[0] - 1.0).abs() < 1e-5);
@@ -208,16 +206,15 @@ mod tests {
         // Expected selection: [t1[0]=1, t2[1]=1, t1[2]=1]
         let ns = NearswapMerge::new();
 
-        let base = Array::from_slice(&[0.0_f32, 0.0, 0.0], &[3]);
-        let t1 = Array::from_slice(&[1.0_f32, 5.0, 1.0], &[3]);
-        let t2 = Array::from_slice(&[4.0_f32, 1.0, 4.0], &[3]);
+        let base = Array::from_f32_slice(&[0.0_f32, 0.0, 0.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 5.0, 1.0], &[3]);
+        let t2 = Array::from_f32_slice(&[4.0_f32, 1.0, 4.0], &[3]);
 
         let params = vec![MergeParameters::default(), MergeParameters::default()];
         let global = MergeParameters::default();
 
-        let result = ns.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
-        result.eval().unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = ns.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
 
         // Position 0: |1-0|=1 vs |4-0|=4 → t1 wins → 1.0
         assert!(
@@ -248,16 +245,15 @@ mod tests {
         // Expected: pos 0 → t2 (0.5 < 1), pos 1 → t2 (0.1 < 2), pos 2 → t1 (1 < 2)
         let ns = NearswapMerge::new();
 
-        let base = Array::from_slice(&[2.0_f32, 2.0, 2.0], &[3]);
-        let t1 = Array::from_slice(&[3.0_f32, 0.0, 3.0], &[3]);
-        let t2 = Array::from_slice(&[2.5_f32, 2.1, 0.0], &[3]);
+        let base = Array::from_f32_slice(&[2.0_f32, 2.0, 2.0], &[3]);
+        let t1 = Array::from_f32_slice(&[3.0_f32, 0.0, 3.0], &[3]);
+        let t2 = Array::from_f32_slice(&[2.5_f32, 2.1, 0.0], &[3]);
 
         let params = vec![MergeParameters::default(), MergeParameters::default()];
         let global = MergeParameters::default();
 
-        let result = ns.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
-        result.eval().unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = ns.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
 
         assert!(
             (result_slice[0] - 2.5).abs() < 1e-5,
@@ -281,9 +277,9 @@ mod tests {
         // With lambda=0, result should equal base.
         let ns = NearswapMerge::new();
 
-        let base = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t1 = Array::from_slice(&[5.0_f32, 6.0, 7.0], &[3]);
-        let t2 = Array::from_slice(&[10.0_f32, 11.0, 12.0], &[3]);
+        let base = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t1 = Array::from_f32_slice(&[5.0_f32, 6.0, 7.0], &[3]);
+        let t2 = Array::from_f32_slice(&[10.0_f32, 11.0, 12.0], &[3]);
 
         let params = vec![MergeParameters::default(), MergeParameters::default()];
         let global = MergeParameters {
@@ -291,10 +287,10 @@ mod tests {
             ..Default::default()
         };
 
-        let result = ns.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
-        result.eval().unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
-        let base_slice: Vec<f32> = base.as_slice().to_vec();
+        let mut result = ns.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
+        let mut base_clone = base.clone();
+        let base_slice = base_clone.to_f32_vec(3).unwrap();
 
         for (r, b) in result_slice.iter().zip(base_slice.iter()) {
             assert!(
@@ -314,9 +310,9 @@ mod tests {
         // result = 0 + 0.5*(2-0) = 1.0
         let ns = NearswapMerge::new();
 
-        let base = Array::from_slice(&[0.0_f32], &[1]);
-        let t1 = Array::from_slice(&[2.0_f32], &[1]);
-        let t2 = Array::from_slice(&[10.0_f32], &[1]);
+        let base = Array::from_f32_slice(&[0.0_f32], &[1]);
+        let t1 = Array::from_f32_slice(&[2.0_f32], &[1]);
+        let t2 = Array::from_f32_slice(&[10.0_f32], &[1]);
 
         let params = vec![MergeParameters::default(), MergeParameters::default()];
         let global = MergeParameters {
@@ -324,9 +320,8 @@ mod tests {
             ..Default::default()
         };
 
-        let result = ns.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
-        result.eval().unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let mut result = ns.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
+        let result_slice = result.to_f32_vec(1).unwrap();
 
         assert!(
             (result_slice[0] - 1.0).abs() < 1e-5,
@@ -342,10 +337,10 @@ mod tests {
         // distances: [1, 3, 0.5] → t3 wins
         let ns = NearswapMerge::new();
 
-        let base = Array::from_slice(&[0.0_f32], &[1]);
-        let t1 = Array::from_slice(&[1.0_f32], &[1]);
-        let t2 = Array::from_slice(&[3.0_f32], &[1]);
-        let t3 = Array::from_slice(&[0.5_f32], &[1]);
+        let base = Array::from_f32_slice(&[0.0_f32], &[1]);
+        let t1 = Array::from_f32_slice(&[1.0_f32], &[1]);
+        let t2 = Array::from_f32_slice(&[3.0_f32], &[1]);
+        let t3 = Array::from_f32_slice(&[0.5_f32], &[1]);
 
         let params = vec![
             MergeParameters::default(),
@@ -354,11 +349,10 @@ mod tests {
         ];
         let global = MergeParameters::default();
 
-        let result = ns
+        let mut result = ns
             .merge(&[t1, t2, t3], Some(&base), &params, &global)
             .unwrap();
-        result.eval().unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let result_slice = result.to_f32_vec(1).unwrap();
 
         assert!(
             (result_slice[0] - 0.5).abs() < 1e-5,
@@ -370,9 +364,9 @@ mod tests {
     #[test]
     fn test_nearswap_preserves_shape() {
         let ns = NearswapMerge::new();
-        let base = Array::from_slice(&[0.0_f32; 12], &[3, 4]);
-        let t1 = Array::from_slice(&[1.0_f32; 12], &[3, 4]);
-        let t2 = Array::from_slice(&[2.0_f32; 12], &[3, 4]);
+        let base = Array::from_f32_slice(&[0.0_f32; 12], &[3, 4]);
+        let t1 = Array::from_f32_slice(&[1.0_f32; 12], &[3, 4]);
+        let t2 = Array::from_f32_slice(&[2.0_f32; 12], &[3, 4]);
 
         let params = vec![MergeParameters::default(), MergeParameters::default()];
         let global = MergeParameters::default();
@@ -386,17 +380,17 @@ mod tests {
         // When all models equal the base, result must equal the base.
         let ns = NearswapMerge::new();
 
-        let base = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t1 = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t2 = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let base = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t2 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
 
         let params = vec![MergeParameters::default(), MergeParameters::default()];
         let global = MergeParameters::default();
 
-        let result = ns.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
-        result.eval().unwrap();
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
-        let base_slice: Vec<f32> = base.as_slice().to_vec();
+        let mut result = ns.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
+        let result_slice = result.to_f32_vec(3).unwrap();
+        let mut base_clone = base.clone();
+        let base_slice = base_clone.to_f32_vec(3).unwrap();
 
         for (r, b) in result_slice.iter().zip(base_slice.iter()) {
             assert!((r - b).abs() < 1e-5);
@@ -406,7 +400,7 @@ mod tests {
     #[test]
     fn test_nearswap_empty_tensors_error() {
         let ns = NearswapMerge::new();
-        let base = Array::from_slice(&[1.0_f32], &[1]);
+        let base = Array::from_f32_slice(&[1.0_f32], &[1]);
         let result = ns.merge(&[], Some(&base), &[], &MergeParameters::default());
         assert!(result.is_err(), "should error on empty tensor list");
     }
@@ -414,7 +408,7 @@ mod tests {
     #[test]
     fn test_nearswap_no_base_error() {
         let ns = NearswapMerge::new();
-        let t1 = Array::from_slice(&[1.0_f32], &[1]);
+        let t1 = Array::from_f32_slice(&[1.0_f32], &[1]);
         let result = ns.merge(
             &[t1],
             None,

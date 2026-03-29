@@ -22,7 +22,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result};
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 
 // =============================================================================
 // Core algorithm (CPU, f32 arithmetic)
@@ -78,11 +78,16 @@ pub fn multislerp(
     // Pull all tensors onto CPU as flat f32
     let flat_tensors: Vec<Vec<f32>> = tensors
         .iter()
-        .map(|t| t.reshape(&[-1]).unwrap().as_slice().to_vec())
+        .map(|t| {
+            let mut flat = t.reshape(&[-1]);
+            flat.to_f32_vec(n_params).unwrap_or_default()
+        })
         .collect();
 
-    let base_flat: Option<Vec<f32>> =
-        base_tensor.map(|b| b.reshape(&[-1]).unwrap().as_slice::<f32>().to_vec());
+    let base_flat: Option<Vec<f32>> = base_tensor.map(|b| {
+        let mut flat = b.reshape(&[-1]);
+        flat.to_f32_vec(n_params).unwrap_or_default()
+    });
 
     // Subtract base if provided
     let flat_vecs: Vec<Vec<f32>> = if let Some(ref bf) = base_flat {
@@ -138,8 +143,8 @@ pub fn multislerp(
                 result
             };
 
-            let arr = Array::from_slice(&result_with_base, &[n_params as i32]);
-            return Ok(arr.reshape(&original_shape)?);
+            let arr = Array::from_f32_slice(&result_with_base, &[n_params as i32]);
+            return Ok(arr.reshape(&original_shape));
         }
         return Err(MergeError::InvalidConfig(
             "Multi-SLERP: weighted sum of unit tensors is zero (antipodal cancellation). \
@@ -204,8 +209,8 @@ pub fn multislerp(
         result_scaled
     };
 
-    let arr = Array::from_slice(&final_result, &[n_params as i32]);
-    Ok(arr.reshape(&original_shape)?)
+    let arr = Array::from_f32_slice(&final_result, &[n_params as i32]);
+    Ok(arr.reshape(&original_shape))
 }
 
 // =============================================================================
@@ -288,15 +293,16 @@ mod tests {
     #[test]
     fn test_multislerp_single_tensor() {
         let ms = MultiSlerpMerge::new();
-        let t = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
         let params = vec![MergeParameters::default()];
         let global = MergeParameters::default();
 
-        let result = ms
+        let mut result = ms
             .merge(std::slice::from_ref(&t), None, &params, &global)
             .unwrap();
-        let r: Vec<f32> = result.as_slice().to_vec();
-        let t_vals: Vec<f32> = t.as_slice().to_vec();
+        let r = result.to_f32_vec(3).unwrap();
+        let mut t_clone = t.clone();
+        let t_vals = t_clone.to_f32_vec(3).unwrap();
         for (rv, tv) in r.iter().zip(t_vals.iter()) {
             assert!((rv - tv).abs() < 1e-5);
         }
@@ -306,13 +312,13 @@ mod tests {
     fn test_multislerp_two_tensors_equal_weights() {
         // Two orthogonal unit vectors; result should be at 45° with the same norm.
         let ms = MultiSlerpMerge::new();
-        let a = Array::from_slice(&[1.0_f32, 0.0], &[2]);
-        let b = Array::from_slice(&[0.0_f32, 1.0], &[2]);
+        let a = Array::from_f32_slice(&[1.0_f32, 0.0], &[2]);
+        let b = Array::from_f32_slice(&[0.0_f32, 1.0], &[2]);
         let params = vec![MergeParameters::default(); 2];
         let global = MergeParameters::default();
 
-        let result = ms.merge(&[a, b], None, &params, &global).unwrap();
-        let r: Vec<f32> = result.as_slice().to_vec();
+        let mut result = ms.merge(&[a, b], None, &params, &global).unwrap();
+        let r = result.to_f32_vec(2).unwrap();
 
         // Result should have equal x and y components (45°)
         assert!((r[0] - r[1]).abs() < 1e-4, "expected x≈y, got {:?}", r);
@@ -324,8 +330,8 @@ mod tests {
     #[test]
     fn test_multislerp_preserves_shape() {
         let ms = MultiSlerpMerge::new();
-        let a = Array::from_slice(&[1.0_f32; 12], &[3, 4]);
-        let b = Array::from_slice(&[2.0_f32; 12], &[3, 4]);
+        let a = Array::from_f32_slice(&[1.0_f32; 12], &[3, 4]);
+        let b = Array::from_f32_slice(&[2.0_f32; 12], &[3, 4]);
         let params = vec![MergeParameters::default(); 2];
         let global = MergeParameters::default();
 
@@ -337,15 +343,16 @@ mod tests {
     fn test_multislerp_identical_tensors() {
         // Merging identical tensors should return the same tensor.
         let ms = MultiSlerpMerge::new();
-        let t = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
         let params = vec![MergeParameters::default(); 3];
         let global = MergeParameters::default();
 
-        let result = ms
+        let mut result = ms
             .merge(&[t.clone(), t.clone(), t.clone()], None, &params, &global)
             .unwrap();
-        let r: Vec<f32> = result.as_slice().to_vec();
-        let t_vals: Vec<f32> = t.as_slice().to_vec();
+        let r = result.to_f32_vec(3).unwrap();
+        let mut t_clone = t.clone();
+        let t_vals = t_clone.to_f32_vec(3).unwrap();
         for (rv, tv) in r.iter().zip(t_vals.iter()) {
             assert!((rv - tv).abs() < 1e-3, "expected {} got {}", tv, rv);
         }
@@ -355,15 +362,15 @@ mod tests {
     fn test_multislerp_with_base_tensor() {
         // With a base tensor, the result should be the mean in delta-space, then add base.
         let ms = MultiSlerpMerge::new();
-        let base = Array::from_slice(&[1.0_f32, 0.0], &[2]);
+        let base = Array::from_f32_slice(&[1.0_f32, 0.0], &[2]);
         // Both deltas are the same → result delta = same, result = base + delta
-        let a = Array::from_slice(&[2.0_f32, 0.0], &[2]); // delta [1, 0]
-        let b = Array::from_slice(&[2.0_f32, 0.0], &[2]); // delta [1, 0]
+        let a = Array::from_f32_slice(&[2.0_f32, 0.0], &[2]); // delta [1, 0]
+        let b = Array::from_f32_slice(&[2.0_f32, 0.0], &[2]); // delta [1, 0]
         let params = vec![MergeParameters::default(); 2];
         let global = MergeParameters::default();
 
-        let result = ms.merge(&[a, b], Some(&base), &params, &global).unwrap();
-        let r: Vec<f32> = result.as_slice().to_vec();
+        let mut result = ms.merge(&[a, b], Some(&base), &params, &global).unwrap();
+        let r = result.to_f32_vec(2).unwrap();
         // result ≈ [2, 0]
         assert!((r[0] - 2.0).abs() < 1e-4, "r[0] = {}", r[0]);
         assert!(r[1].abs() < 1e-4, "r[1] = {}", r[1]);
@@ -382,9 +389,9 @@ mod tests {
         let cos240 = -0.5_f32;
         let sin240 = -(3.0_f32.sqrt() / 2.0);
 
-        let a = Array::from_slice(&[cos0, sin0], &[2]);
-        let b = Array::from_slice(&[cos120, sin120], &[2]);
-        let c = Array::from_slice(&[cos240, sin240], &[2]);
+        let a = Array::from_f32_slice(&[cos0, sin0], &[2]);
+        let b = Array::from_f32_slice(&[cos120, sin120], &[2]);
+        let c = Array::from_f32_slice(&[cos240, sin240], &[2]);
         let params = vec![MergeParameters::default(); 3];
         let global = MergeParameters::default();
 
@@ -400,14 +407,14 @@ mod tests {
     fn test_multislerp_three_models_asymmetric() {
         // Three vectors that do NOT cancel: all in the positive x half-plane.
         let ms = MultiSlerpMerge::new();
-        let a = Array::from_slice(&[1.0_f32, 0.0], &[2]);
-        let b = Array::from_slice(&[0.8_f32, 0.6], &[2]); // ~37°
-        let c = Array::from_slice(&[0.6_f32, 0.8], &[2]); // ~53°
+        let a = Array::from_f32_slice(&[1.0_f32, 0.0], &[2]);
+        let b = Array::from_f32_slice(&[0.8_f32, 0.6], &[2]); // ~37°
+        let c = Array::from_f32_slice(&[0.6_f32, 0.8], &[2]); // ~53°
         let params = vec![MergeParameters::default(); 3];
         let global = MergeParameters::default();
 
-        let result = ms.merge(&[a, b, c], None, &params, &global).unwrap();
-        let r: Vec<f32> = result.as_slice().to_vec();
+        let mut result = ms.merge(&[a, b, c], None, &params, &global).unwrap();
+        let r = result.to_f32_vec(2).unwrap();
         // All inputs have positive x and y → result should too
         assert!(r[0] > 0.0, "expected x>0, got {:?}", r);
         assert!(r[1] > 0.0, "expected y>0, got {:?}", r);
@@ -418,8 +425,8 @@ mod tests {
     fn test_multislerp_weighted_bias() {
         // Heavy weight on tensor A → result closer to A.
         let ms = MultiSlerpMerge::new();
-        let a = Array::from_slice(&[1.0_f32, 0.0], &[2]);
-        let b = Array::from_slice(&[0.0_f32, 1.0], &[2]);
+        let a = Array::from_f32_slice(&[1.0_f32, 0.0], &[2]);
+        let b = Array::from_f32_slice(&[0.0_f32, 1.0], &[2]);
         let params = vec![
             MergeParameters {
                 weight: Some(crate::config::ParameterSetting::Scalar(9.0)),
@@ -432,8 +439,8 @@ mod tests {
         ];
         let global = MergeParameters::default();
 
-        let result = ms.merge(&[a, b], None, &params, &global).unwrap();
-        let r: Vec<f32> = result.as_slice().to_vec();
+        let mut result = ms.merge(&[a, b], None, &params, &global).unwrap();
+        let r = result.to_f32_vec(2).unwrap();
         // Should be strongly biased toward [1, 0]: r[0] >> r[1]
         assert!(r[0] > r[1], "expected x>y for 9:1 weighting, got {:?}", r);
     }

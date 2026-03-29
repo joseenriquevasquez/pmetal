@@ -30,9 +30,8 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-use mlx_rs::Array;
-use mlx_rs::Dtype;
-use mlx_rs::ops::indexing::IndexOp;
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module, indexing, nn};
+use pmetal_bridge::compat::indexing::IndexOp;
 
 use crate::expert_io::ExpertOffloadContext;
 
@@ -412,19 +411,19 @@ impl ExpertPrefetcher {
         &self,
         hidden: &Array,
         gate_w: &[f32],
-    ) -> Result<Vec<usize>, mlx_rs::error::Exception> {
+    ) -> Result<Vec<usize>, pmetal_bridge::compat::Exception> {
         let d = self.hidden_dim as i32;
         let k = self.top_k;
 
-        let hidden_rows = hidden.reshape(&[-1, d])?;
+        let hidden_rows = hidden.reshape(&[-1, d]);
         let last_row_idx = hidden_rows.dim(0) - 1;
-        let hidden_1d = hidden_rows.index((last_row_idx, ..));
-        let hidden_1d = if hidden_1d.dtype() != Dtype::Float32 {
-            hidden_1d.as_type::<f32>()?
+        let hidden_1d = pmetal_bridge::compat::ops::slice_axis(&hidden_rows, 0, last_row_idx, last_row_idx + 1).squeeze_axes(&[0]);
+        let mut hidden_1d = if hidden_1d.dtype() != Dtype::Float32 {
+            hidden_1d.as_type::<f32>()
         } else {
             hidden_1d
         };
-        hidden_1d.eval()?;
+        hidden_1d.eval();
         let hidden_values: &[f32] = hidden_1d.as_slice();
 
         let mut scored: Vec<(f32, usize)> = gate_w
@@ -458,8 +457,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    use mlx_rs::builder::Builder;
-    use mlx_rs::nn;
+    use pmetal_bridge::compat::builder::Builder;
+    use pmetal_bridge::compat::nn;
     use pmetal_mlx::Module;
     use serial_test::serial;
 
@@ -506,7 +505,7 @@ mod tests {
 
         let mut gate = nn::LinearBuilder::new(config.hidden_size, config.num_experts)
             .bias(false)
-            .build()
+            .build()?
             .unwrap();
         let gate_weight = Array::from_slice(
             &[

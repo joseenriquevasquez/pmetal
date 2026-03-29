@@ -7,10 +7,9 @@
 //! - No RoPE scaling support
 //! - Optional sliding window attention (usually disabled)
 
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, nn, ops, random};
+use pmetal_bridge::impl_module_params;
 use crate::traits::ModelConfig;
-use mlx_rs::{
-    Array, builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
-};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopeScaling, apply_rope},
@@ -226,7 +225,7 @@ impl Qwen2Config {
 }
 
 /// Qwen2 attention layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen2Attention {
     /// Number of attention heads.
     pub n_heads: i32,
@@ -248,21 +247,18 @@ pub struct Qwen2Attention {
     pub sliding_window: Option<i32>,
 
     /// Query projection.
-    #[param]
     pub q_proj: nn::Linear,
     /// Key projection.
-    #[param]
     pub k_proj: nn::Linear,
     /// Value projection.
-    #[param]
     pub v_proj: nn::Linear,
     /// Output projection.
-    #[param]
     pub o_proj: nn::Linear,
     /// RoPE layer.
-    #[param]
     pub rope: nn::Rope,
 }
+impl_module_params!(Qwen2Attention; q_proj, k_proj, v_proj, o_proj, rope);
+
 
 impl Qwen2Attention {
     /// Create a new attention layer.
@@ -357,14 +353,14 @@ impl Qwen2Attention {
 
         // Reshape for multi-head attention: [B, L, heads, head_dim] -> [B, heads, L, head_dim]
         let queries = queries
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
         let keys = keys
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
         let values = values
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
 
         // Get RoPE offset and apply RoPE
         let (queries, keys, values) = if let Some((cache_ref, _layer_idx)) = cache.as_ref() {
@@ -421,8 +417,8 @@ impl Qwen2Attention {
                     &attn_config,
                 )? {
                     let output = output
-                        .transpose_axes(&[0, 2, 1, 3])?
-                        .reshape(&[batch, seq_len, -1])?;
+                        .transpose_axes(&[0, 2, 1, 3])
+                        .reshape(&[batch, seq_len, -1]);
                     return Module::forward(&mut self.o_proj, &output);
                 }
             }
@@ -441,8 +437,8 @@ impl Qwen2Attention {
 
         // Reshape back: [B, heads, L, head_dim] -> [B, L, hidden]
         let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
 
         // Output projection
         Module::forward(&mut self.o_proj, &output)
@@ -450,18 +446,17 @@ impl Qwen2Attention {
 }
 
 /// Qwen2 MLP layer (SwiGLU).
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen2MLP {
     /// Gate projection.
-    #[param]
     pub gate_proj: nn::Linear,
     /// Up projection.
-    #[param]
     pub up_proj: nn::Linear,
     /// Down projection.
-    #[param]
     pub down_proj: nn::Linear,
 }
+impl_module_params!(Qwen2MLP; gate_proj, up_proj, down_proj);
+
 
 impl Qwen2MLP {
     /// Create a new MLP layer.
@@ -488,35 +483,35 @@ impl Qwen2MLP {
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         // SwiGLU: down_proj(silu(gate_proj(x)) * up_proj(x))
         let gate = Module::forward(&mut self.gate_proj, x)?;
-        let gate = nn::silu(gate)?;
+        let gate = nn::silu(&gate);
         let up = Module::forward(&mut self.up_proj, x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = gate.multiply(&up);
         Module::forward(&mut self.down_proj, &hidden)
     }
 }
 
 /// Qwen2 transformer block.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen2DecoderLayer {
     /// Self-attention layer.
-    #[param]
     pub self_attn: Qwen2Attention,
     /// MLP layer.
-    #[param]
     pub mlp: Qwen2MLP,
     /// Input layer norm.
-    #[param]
     pub input_layernorm: nn::RmsNorm,
     /// Post-attention layer norm.
-    #[param]
     pub post_attention_layernorm: nn::RmsNorm,
 }
+impl_module_params!(Qwen2DecoderLayer; self_attn, mlp, input_layernorm, post_attention_layernorm);
+
 
 impl Qwen2DecoderLayer {
     /// Create a new decoder layer.
     pub fn new(config: &Qwen2Config) -> Result<Self, Exception> {
         let self_attn = Qwen2Attention::new(config)?;
+
         let mlp = Qwen2MLP::new(config)?;
+
 
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
@@ -548,30 +543,29 @@ impl Qwen2DecoderLayer {
         // Pre-norm + attention + residual
         let normed = Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         // Pre-norm + MLP + residual
         let normed = Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        h.add(&mlp_out)
+        Ok(h.add(&mlp_out))
     }
 }
 
 /// Qwen2 base model (without LM head).
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen2Model {
     /// Configuration (not a parameter).
     pub config: Qwen2Config,
     /// Token embeddings.
-    #[param]
     pub embed_tokens: nn::Embedding,
     /// Transformer layers.
-    #[param]
     pub layers: Vec<Qwen2DecoderLayer>,
     /// Final layer norm.
-    #[param]
     pub norm: nn::RmsNorm,
 }
+impl_module_params!(Qwen2Model; embed_tokens, layers, norm);
+
 
 impl Qwen2Model {
     /// Create a new Qwen2 model.
@@ -618,16 +612,18 @@ impl Qwen2Model {
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // Create causal mask if not provided and not using cache
+        let mask_owned;
         let mask = if mask.is_none() && cache.is_none() {
             let seq_len = input_ids.dim(1);
-            if self.config.use_sliding_window {
+            mask_owned = if self.config.use_sliding_window {
                 let window = self.config.sliding_window.unwrap_or(4096);
-                Some(create_sliding_window_mask(seq_len, window)?)
+                create_sliding_window_mask(seq_len, window)?
             } else {
-                Some(create_causal_mask(seq_len)?)
-            }
+                create_causal_mask(seq_len)?
+            };
+            Some(&mask_owned)
         } else {
-            mask.cloned()
+            mask
         };
 
         // Pass through transformer layers
@@ -636,14 +632,14 @@ impl Qwen2Model {
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
                     hidden_states = layer.forward_with_cache(
                         &hidden_states,
-                        mask.as_ref(),
+                        mask,
                         Some((cache, layer_idx)),
                     )?;
                 }
             }
             None => {
                 for layer in &mut self.layers {
-                    hidden_states = layer.forward(&hidden_states, mask.as_ref())?;
+                    hidden_states = layer.forward(&hidden_states, mask)?;
                 }
             }
         }
@@ -654,15 +650,15 @@ impl Qwen2Model {
 }
 
 /// Qwen2 model with language modeling head.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen2ForCausalLM {
     /// Base model.
-    #[param]
     pub model: Qwen2Model,
     /// LM head (optional, may share weights with embeddings).
-    #[param]
     pub lm_head: Option<nn::Linear>,
 }
+impl_module_params!(Qwen2ForCausalLM; model, lm_head);
+
 
 impl Qwen2ForCausalLM {
     /// Create a new Qwen2 model with LM head.
@@ -709,7 +705,7 @@ impl Qwen2ForCausalLM {
             Module::forward(lm_head, &hidden_states)
         } else {
             // Tie weights: use embedding weight transposed
-            self.model.embed_tokens.as_linear(&hidden_states)
+            Ok(self.model.embed_tokens.as_linear(&hidden_states))
         }
     }
 
@@ -723,27 +719,30 @@ use super::utils::create_causal_mask;
 
 /// Create a sliding window causal attention mask.
 fn create_sliding_window_mask(seq_len: i32, window_size: i32) -> Result<Array, Exception> {
+    use pmetal_bridge::compat::Dtype;
     // Create lower triangular mask
-    let causal_mask = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;
+    let causal_mask = pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, Dtype::Float32);
 
     // Create window mask: positions within window_size distance
-    let indices = mlx_rs::ops::arange::<i32, f32>(0, seq_len, None)?;
-    let row_indices = indices.reshape(&[seq_len, 1])?;
-    let col_indices = indices.reshape(&[1, seq_len])?;
-    let distance = row_indices.subtract(&col_indices)?;
+    let indices = pmetal_bridge::compat::ops::arange_from(0, seq_len)
+        .as_dtype(Dtype::Float32.as_i32());
+    let row_indices = indices.reshape(&[seq_len, 1]);
+    let col_indices = indices.reshape(&[1, seq_len]);
+    let distance = row_indices.subtract(&col_indices);
 
     // Valid if distance >= 0 and distance < window_size
     let window_size_arr = Array::from_f32(window_size as f32);
     let zero = Array::from_f32(0.0);
-    let in_window = distance
-        .ge(&zero)?
-        .logical_and(&distance.lt(&window_size_arr)?)?;
+    let in_window = pmetal_bridge::compat::ops::logical_and(
+        &distance.greater_equal(&zero),
+        &distance.less(&window_size_arr),
+    );
 
     // Combine with causal mask
-    let combined = causal_mask.multiply(&in_window.as_dtype(mlx_rs::Dtype::Float32)?)?;
+    let combined = causal_mask.multiply(&in_window.as_dtype(Dtype::Float32.as_i32()));
 
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    mlx_rs::ops::r#where(&combined.eq(&zero)?, &neg_inf, &zero)
+    Ok(pmetal_bridge::compat::ops::where_fn(&combined.equal(&zero), &neg_inf, &zero))
 }
 
 #[cfg(test)]
@@ -794,7 +793,7 @@ mod tests {
         let config = small_config();
         let mut attn = Qwen2Attention::new(&config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 128], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 128], None, None, None).unwrap();
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 128]);
@@ -806,7 +805,7 @@ mod tests {
         let config = small_config();
         let mut mlp = Qwen2MLP::new(&config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 128], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 128], None, None, None).unwrap();
         let output = mlp.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 128]);
@@ -818,7 +817,7 @@ mod tests {
         let config = small_config();
         let mut layer = Qwen2DecoderLayer::new(&config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 128], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 128], None, None, None).unwrap();
         let output = layer.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 128]);
@@ -830,7 +829,7 @@ mod tests {
         let config = small_config();
         let mut model = Qwen2Model::new(config).unwrap();
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_bridge::compat::Array::from_i32_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let output = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 128]);
@@ -842,7 +841,7 @@ mod tests {
         let config = small_config();
         let mut model = Qwen2ForCausalLM::new(config).unwrap();
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_bridge::compat::Array::from_i32_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]); // [batch, seq, vocab]

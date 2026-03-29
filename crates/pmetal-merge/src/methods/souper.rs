@@ -42,7 +42,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result};
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 use std::path::PathBuf;
 
 /// Souper-Model merge implementation.
@@ -136,11 +136,11 @@ impl SouperMerge {
 
         let mut sum = tensors[0].clone();
         for tensor in tensors.iter().skip(1) {
-            sum = sum.add(tensor)?;
+            sum = sum.add(tensor);
         }
 
         let n = Array::from_f32(tensors.len() as f32);
-        Ok(sum.divide(&n)?)
+        Ok(sum.divide(&n))
     }
 
     /// Compute deviation of each model from the centroid.
@@ -150,21 +150,20 @@ impl SouperMerge {
         let mut deviations = Vec::with_capacity(tensors.len());
 
         for tensor in tensors {
-            let diff = tensor.subtract(centroid)?;
+            let diff = tensor.subtract(centroid);
+            let n = diff.shape().iter().map(|&s| s as usize).product::<usize>();
 
-            // Compute norm (L1 or L2)
-            let deviation = if self.use_l1_norm {
-                // L1 norm: sum of absolute values
-                let abs_diff = diff.abs()?;
-                abs_diff.sum(false)?
+            // Compute norm (L1 or L2) on CPU via to_f32_vec
+            let mut diff_clone = diff.clone();
+            let diff_vals = diff_clone.to_f32_vec(n).unwrap_or_default();
+
+            let deviation: f32 = if self.use_l1_norm {
+                diff_vals.iter().map(|v| v.abs()).sum()
             } else {
-                // L2 norm squared: sum of squared values
-                let sq_diff = diff.square()?;
-                sq_diff.sum(false)?
+                diff_vals.iter().map(|v| v * v).sum()
             };
 
-            deviation.eval()?;
-            deviations.push(deviation.item::<f32>());
+            deviations.push(deviation);
         }
 
         Ok(deviations)
@@ -220,11 +219,11 @@ impl SouperMerge {
             });
         }
 
-        let mut result = tensors[0].multiply(Array::from_f32(weights[0]))?;
+        let mut result = tensors[0].multiply(&Array::from_f32(weights[0]));
 
         for (tensor, &weight) in tensors.iter().zip(weights.iter()).skip(1) {
-            let weighted = tensor.multiply(Array::from_f32(weight))?;
-            result = result.add(&weighted)?;
+            let weighted = tensor.multiply(&Array::from_f32(weight));
+            result = result.add(&weighted);
         }
 
         Ok(result)
@@ -315,18 +314,18 @@ mod tests {
     #[test]
     fn test_souper_single_model() {
         let souper = SouperMerge::new();
-        let t1 = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
 
         let params = vec![MergeParameters::default()];
         let global = MergeParameters::default();
 
-        let result = souper
+        let mut result = souper
             .merge(std::slice::from_ref(&t1), None, &params, &global)
             .unwrap();
-        result.eval().unwrap();
 
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
-        let t1_slice: Vec<f32> = t1.as_slice().to_vec();
+        let result_slice = result.to_f32_vec(3).unwrap();
+        let mut t1_clone = t1.clone();
+        let t1_slice = t1_clone.to_f32_vec(3).unwrap();
 
         for (r, t) in result_slice.iter().zip(t1_slice.iter()) {
             assert!((r - t).abs() < 1e-5);
@@ -338,9 +337,9 @@ mod tests {
         let souper = SouperMerge::new();
 
         // Identical models should produce the same result
-        let t1 = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t2 = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t3 = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t2 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t3 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
 
         let params = vec![
             MergeParameters::default(),
@@ -349,12 +348,11 @@ mod tests {
         ];
         let global = MergeParameters::default();
 
-        let result = souper
+        let mut result = souper
             .merge(&[t1.clone(), t2, t3], None, &params, &global)
             .unwrap();
-        result.eval().unwrap();
 
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let result_slice = result.to_f32_vec(3).unwrap();
         let expected: Vec<f32> = vec![1.0, 2.0, 3.0];
 
         for (r, e) in result_slice.iter().zip(expected.iter()) {
@@ -367,9 +365,9 @@ mod tests {
         let souper = SouperMerge::new();
 
         // Two models agree, one is an outlier
-        let t1 = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t2 = Array::from_slice(&[1.1_f32, 2.1, 3.1], &[3]); // Close to t1
-        let t3 = Array::from_slice(&[10.0_f32, 20.0, 30.0], &[3]); // Outlier
+        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t2 = Array::from_f32_slice(&[1.1_f32, 2.1, 3.1], &[3]); // Close to t1
+        let t3 = Array::from_f32_slice(&[10.0_f32, 20.0, 30.0], &[3]); // Outlier
 
         let params = vec![
             MergeParameters::default(),
@@ -378,10 +376,9 @@ mod tests {
         ];
         let global = MergeParameters::default();
 
-        let result = souper.merge(&[t1, t2, t3], None, &params, &global).unwrap();
-        result.eval().unwrap();
+        let mut result = souper.merge(&[t1, t2, t3], None, &params, &global).unwrap();
 
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let result_slice = result.to_f32_vec(3).unwrap();
 
         // Result should be closer to [1, 2, 3] than [10, 20, 30]
         // because t1 and t2 have lower deviation from centroid
@@ -392,8 +389,8 @@ mod tests {
     fn test_souper_user_weight_priors() {
         let souper = SouperMerge::new();
 
-        let t1 = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t2 = Array::from_slice(&[10.0_f32, 20.0, 30.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t2 = Array::from_f32_slice(&[10.0_f32, 20.0, 30.0], &[3]);
 
         // Give high weight to t2
         let params = vec![
@@ -408,10 +405,9 @@ mod tests {
         ];
         let global = MergeParameters::default();
 
-        let result = souper.merge(&[t1, t2], None, &params, &global).unwrap();
-        result.eval().unwrap();
+        let mut result = souper.merge(&[t1, t2], None, &params, &global).unwrap();
 
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let result_slice = result.to_f32_vec(3).unwrap();
 
         // Result should lean toward t2 due to high prior weight
         // (exact value depends on deviation scores)
@@ -422,8 +418,8 @@ mod tests {
     fn test_souper_without_weight_priors() {
         let souper = SouperMerge::new().without_weight_priors();
 
-        let t1 = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t2 = Array::from_slice(&[10.0_f32, 20.0, 30.0], &[3]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
+        let t2 = Array::from_f32_slice(&[10.0_f32, 20.0, 30.0], &[3]);
 
         // User weights should be ignored
         let params = vec![
@@ -438,12 +434,11 @@ mod tests {
         ];
         let global = MergeParameters::default();
 
-        let result = souper.merge(&[t1, t2], None, &params, &global).unwrap();
-        result.eval().unwrap();
+        let mut result = souper.merge(&[t1, t2], None, &params, &global).unwrap();
 
         // Without priors, weights are computed purely from deviations
         // With 2 models equidistant from centroid, should be 50/50
-        let result_slice: Vec<f32> = result.as_slice().to_vec();
+        let result_slice = result.to_f32_vec(3).unwrap();
 
         // Result should be approximately the mean
         let expected_first = (1.0 + 10.0) / 2.0;
@@ -459,14 +454,13 @@ mod tests {
 
     #[test]
     fn test_compute_centroid() {
-        let t1 = Array::from_slice(&[1.0_f32, 2.0], &[2]);
-        let t2 = Array::from_slice(&[3.0_f32, 4.0], &[2]);
-        let t3 = Array::from_slice(&[5.0_f32, 6.0], &[2]);
+        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0], &[2]);
+        let t2 = Array::from_f32_slice(&[3.0_f32, 4.0], &[2]);
+        let t3 = Array::from_f32_slice(&[5.0_f32, 6.0], &[2]);
 
-        let centroid = SouperMerge::compute_centroid(&[t1, t2, t3]).unwrap();
-        centroid.eval().unwrap();
+        let mut centroid = SouperMerge::compute_centroid(&[t1, t2, t3]).unwrap();
 
-        let centroid_slice: Vec<f32> = centroid.as_slice().to_vec();
+        let centroid_slice = centroid.to_f32_vec(2).unwrap();
         assert!((centroid_slice[0] - 3.0).abs() < 1e-5); // (1+3+5)/3 = 3
         assert!((centroid_slice[1] - 4.0).abs() < 1e-5); // (2+4+6)/3 = 4
     }

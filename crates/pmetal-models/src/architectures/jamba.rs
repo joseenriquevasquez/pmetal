@@ -6,18 +6,17 @@
 //! - Supports massive context (256K) via linear SSM scaling
 //! - ExpertsInt8 quantization support
 
-use mlx_rs::error::Exception;
-use mlx_rs::macros::ModuleParameters;
-use mlx_rs::module::{Module, ModuleParameters, ModuleParametersExt};
-use mlx_rs::nested::NestedHashMap;
-use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{Array, nn, ops};
+// ModuleParameters derive via impl_module_params!
+use pmetal_bridge::compat::{Array, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, ModuleParametersExt, NestedValue, indexing, nn, ops};
+use pmetal_bridge::compat::indexing::IndexOp;
+use pmetal_bridge::impl_module_params;
 use pmetal_core::ModelConfig;
 use pmetal_mlx::Builder;
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use pmetal_mlx::moe::{MoEConfig, MoELayer};
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
+use std::collections::HashMap;
 
 fn default_jamba_mamba_conv_kernel_size() -> i32 {
     4
@@ -61,21 +60,19 @@ impl Default for JambaConfig {
 }
 
 /// Manual attention implementation for Jamba.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct JambaAttention {
-    #[param]
     pub q_proj: nn::Linear,
-    #[param]
     pub k_proj: nn::Linear,
-    #[param]
     pub v_proj: nn::Linear,
-    #[param]
     pub o_proj: nn::Linear,
     pub n_heads: i32,
     pub n_kv_heads: i32,
     pub head_dim: i32,
     pub scale: f32,
 }
+impl_module_params!(JambaAttention; q_proj, k_proj, v_proj, o_proj);
+
 
 impl JambaAttention {
     pub fn new(config: &JambaConfig) -> Result<Self, Exception> {
@@ -85,20 +82,16 @@ impl JambaAttention {
         Ok(Self {
             q_proj: nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             k_proj: nn::LinearBuilder::new(config.hidden_size, n_kv_heads * head_dim)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             v_proj: nn::LinearBuilder::new(config.hidden_size, n_kv_heads * head_dim)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             o_proj: nn::LinearBuilder::new(n_heads * head_dim, config.hidden_size)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -112,27 +105,27 @@ impl JambaAttention {
         let seq_len = shape[1];
         let q = self
             .q_proj
-            .forward(x)?
-            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .forward(x)
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
         let k = self
             .k_proj
-            .forward(x)?
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .forward(x)
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
         let v = self
             .v_proj
-            .forward(x)?
-            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .forward(x)
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
         let config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
             .with_scale(self.scale)
             .with_mask_type(AttentionMaskType::Causal);
         let out = fused_sdpa(&q, &k, &v, &config, None)?;
-        self.o_proj.forward(
-            &out.transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[batch, seq_len, -1])?,
-        )
+        Ok(self.o_proj.forward(
+            &out.transpose_axes(&[0, 2, 1, 3])
+                .reshape(&[batch, seq_len, -1]),
+        ))
     }
 }
 
@@ -140,17 +133,16 @@ impl JambaAttention {
 ///
 /// This replaces the incorrect MoE placeholder with a real sequence-mixing
 /// block that keeps all work on GPU and preserves causal ordering.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct JambaMambaMixer {
-    #[param]
     pub in_proj: nn::Linear,
-    #[param]
     pub conv1d: nn::Conv1d,
-    #[param]
     pub out_proj: nn::Linear,
     pub hidden_size: i32,
     pub conv_kernel_size: i32,
 }
+impl_module_params!(JambaMambaMixer; in_proj, conv1d, out_proj);
+
 
 impl JambaMambaMixer {
     pub fn new(config: &JambaConfig) -> Result<Self, Exception> {
@@ -158,18 +150,15 @@ impl JambaMambaMixer {
         let conv_kernel_size = config.mamba_conv_kernel_size.max(2);
         let in_proj = nn::LinearBuilder::new(hidden_size, hidden_size * 2)
             .bias(false)
-            .build()
-            .map_err(|_| Exception::custom("Build error"))?;
+            .build()?;
         let conv1d = nn::Conv1dBuilder::new(1, hidden_size, conv_kernel_size)
             .groups(hidden_size)
             .bias(false)
             .padding(0)
-            .build()
-            .map_err(|_| Exception::custom("Build error"))?;
+            .build()?;
         let out_proj = nn::LinearBuilder::new(hidden_size, hidden_size)
             .bias(false)
-            .build()
-            .map_err(|_| Exception::custom("Build error"))?;
+            .build()?;
         Ok(Self {
             in_proj,
             conv1d,
@@ -180,20 +169,20 @@ impl JambaMambaMixer {
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let projected = self.in_proj.forward(x)?;
-        let parts = ops::split_sections(&projected, &[self.hidden_size], -1)?;
+        let projected = self.in_proj.forward(x);
+        let parts = ops::split_sections(&projected, &[self.hidden_size], -1);
         let value = &parts[0];
         let gate = &parts[1];
 
         let padded = ops::pad(
             value,
             &[(0i32, 0i32), (self.conv_kernel_size - 1, 0), (0, 0)],
-            Array::from_int(0),
             None,
-        )?;
+            Some(0.0),
+        );
         let mixed = Module::forward(&mut self.conv1d, &padded)?;
-        let gated = nn::silu(gate)?.multiply(&nn::silu(&mixed)?)?;
-        self.out_proj.forward(&gated)
+        let gated = nn::silu(&gate).multiply(&nn::silu(&mixed));
+        Ok(self.out_proj.forward(&gated))
     }
 }
 
@@ -208,28 +197,28 @@ pub struct JambaLayer {
 }
 
 impl ModuleParameters for JambaLayer {
-    fn parameters(&self) -> NestedHashMap<Rc<str>, &Array> {
-        let mut map = NestedHashMap::new();
+    fn parameters(&self) -> ModuleParamRef<'_> {
+        let mut map = HashMap::new();
         if let Some(ref a) = self.attention {
-            map.entries.extend(a.parameters().entries);
+            map.extend(a.parameters());
         }
         if let Some(ref m) = self.mamba {
-            map.entries.extend(m.parameters().entries);
+            map.extend(m.parameters());
         }
-        map.entries.extend(self.mlp.parameters().entries);
-        map.entries.extend(self.norm.parameters().entries);
+        map.extend(self.mlp.parameters());
+        map.extend(self.norm.parameters());
         map
     }
-    fn trainable_parameters(&self) -> NestedHashMap<Rc<str>, &Array> {
-        let mut map = NestedHashMap::new();
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
+        let mut map = HashMap::new();
         if let Some(ref a) = self.attention {
-            map.entries.extend(a.trainable_parameters().entries);
+            map.extend(a.trainable_parameters());
         }
         if let Some(ref m) = self.mamba {
-            map.entries.extend(m.trainable_parameters().entries);
+            map.extend(m.trainable_parameters());
         }
-        map.entries.extend(self.mlp.trainable_parameters().entries);
-        map.entries.extend(self.norm.trainable_parameters().entries);
+        map.extend(self.mlp.trainable_parameters());
+        map.extend(self.norm.trainable_parameters());
         map
     }
     fn num_parameters(&self) -> usize {
@@ -238,16 +227,16 @@ impl ModuleParameters for JambaLayer {
             + self.mlp.num_parameters()
             + self.norm.num_parameters()
     }
-    fn parameters_mut(&mut self) -> NestedHashMap<Rc<str>, &mut Array> {
-        let mut map = NestedHashMap::new();
+    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
+        let mut map = HashMap::new();
         if let Some(ref mut a) = self.attention {
-            map.entries.extend(a.parameters_mut().entries);
+            map.extend(a.parameters_mut());
         }
         if let Some(ref mut m) = self.mamba {
-            map.entries.extend(m.parameters_mut().entries);
+            map.extend(m.parameters_mut());
         }
-        map.entries.extend(self.mlp.parameters_mut().entries);
-        map.entries.extend(self.norm.parameters_mut().entries);
+        map.extend(self.mlp.parameters_mut());
+        map.extend(self.norm.parameters_mut());
         map
     }
     fn freeze_parameters(&mut self, recurse: bool) {
@@ -273,25 +262,25 @@ impl ModuleParameters for JambaLayer {
     fn all_frozen(&self) -> Option<bool> {
         let mut frozen = true;
         if let Some(ref a) = self.attention {
-            frozen &= a.all_frozen()?;
+            frozen &= a.all_frozen().unwrap_or(true);
         }
         if let Some(ref m) = self.mamba {
-            frozen &= m.all_frozen()?;
+            frozen &= m.all_frozen().unwrap_or(true);
         }
-        frozen &= self.mlp.all_frozen()?;
-        frozen &= self.norm.all_frozen()?;
+        frozen &= self.mlp.all_frozen().unwrap_or(true);
+        frozen &= self.norm.all_frozen().unwrap_or(true);
         Some(frozen)
     }
     fn any_frozen(&self) -> Option<bool> {
         let mut frozen = false;
         if let Some(ref a) = self.attention {
-            frozen |= a.any_frozen()?;
+            frozen |= a.any_frozen().unwrap_or(false);
         }
         if let Some(ref m) = self.mamba {
-            frozen |= m.any_frozen()?;
+            frozen |= m.any_frozen().unwrap_or(false);
         }
-        frozen |= self.mlp.any_frozen()?;
-        frozen |= self.norm.any_frozen()?;
+        frozen |= self.mlp.any_frozen().unwrap_or(false);
+        frozen |= self.norm.any_frozen().unwrap_or(false);
         Some(frozen)
     }
 }
@@ -321,36 +310,33 @@ impl JambaLayer {
             mlp: MoELayer::new(moe_config),
             norm: nn::RmsNormBuilder::new(config.hidden_size)
                 .eps(config.rms_norm_eps)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             is_attention,
         })
     }
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let normed = self.norm.forward(x)?;
+        let normed = self.norm.forward(x);
         let branch_out = if self.is_attention {
             self.attention.as_mut().unwrap().forward(&normed)?
         } else {
             self.mamba.as_mut().unwrap().forward(&normed)?
         };
-        let x = x.add(&branch_out)?;
+        let x = x.add(&branch_out);
         let (mlp_out, _) = self.mlp.forward(&x)?;
-        x.add(&mlp_out)
+        Ok(x.add(&mlp_out))
     }
 }
 
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct JambaModel {
-    #[param]
     pub embed: nn::Embedding,
-    #[param]
     pub layers: Vec<JambaLayer>,
-    #[param]
     pub norm: nn::RmsNorm,
-    #[param]
     pub lm_head: nn::Linear,
     pub config: JambaConfig,
 }
+impl_module_params!(JambaModel; embed, layers, norm, lm_head);
+
 
 impl JambaModel {
     pub fn new(config: JambaConfig) -> Result<Self, Exception> {
@@ -362,22 +348,20 @@ impl JambaModel {
             layers,
             norm: nn::RmsNormBuilder::new(config.hidden_size)
                 .eps(config.rms_norm_eps)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             lm_head: nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
                 .bias(false)
-                .build()
-                .map_err(|_| Exception::custom("Build error"))?,
+                .build()?,
             config,
         })
     }
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let mut h = self.embed.forward(x)?;
+        let mut h = self.embed.forward(x);
         for layer in self.layers.iter_mut() {
             h = layer.forward(&h)?;
         }
-        h = self.norm.forward(&h)?;
-        self.lm_head.forward(&h)
+        h = self.norm.forward(&h);
+        Ok(self.lm_head.forward(&h))
     }
     pub fn eval(&self) -> Result<(), Exception> {
         ModuleParametersExt::eval(self)
@@ -425,9 +409,9 @@ mod tests {
         let config = tiny_jamba_config();
         let mut mixer = JambaMambaMixer::new(&config).expect("mixer");
 
-        let baseline = Array::zeros::<f32>(&[1, 4, config.hidden_size]).expect("baseline");
-        let prefix = Array::zeros::<f32>(&[1, 3, config.hidden_size]).expect("prefix");
-        let suffix = Array::ones::<f32>(&[1, 1, config.hidden_size]).expect("suffix");
+        let baseline = Array::zeros_f32(&[1, 4, config.hidden_size]).expect("baseline");
+        let prefix = Array::zeros_f32(&[1, 3, config.hidden_size]).expect("prefix");
+        let suffix = Array::ones_f32(&[1, 1, config.hidden_size]).expect("suffix");
         let changed = ops::concatenate_axis(&[&prefix, &suffix], 1).expect("changed");
 
         let y0 = mixer.forward(&baseline).expect("baseline forward");

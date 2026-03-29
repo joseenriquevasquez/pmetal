@@ -1,7 +1,7 @@
 //! Short-Time Fourier Transform (STFT) implementation using MLX.
 
-use crate::error::{Result, VocoderError};
-use mlx_rs::Array;
+use crate::error::Result;
+use pmetal_bridge::compat::{Array, fft, ops};
 
 /// STFT configuration.
 #[derive(Debug, Clone)]
@@ -51,14 +51,14 @@ impl Default for StftConfig {
 /// Hann window as [size] array
 pub fn hann_window(size: i32) -> Result<Array> {
     // hann[n] = 0.5 * (1 - cos(2*pi*n / (N-1)))
-    let n = mlx_rs::ops::arange::<i32, f32>(0, size, None)?;
+    let n = Array::arange(size, 10); // float32 arange [0..size)
     let pi = std::f32::consts::PI;
     let scale = Array::from_f32(2.0 * pi / (size - 1) as f32);
-    let cos_term = (n.multiply(&scale)?).cos()?;
+    let cos_term = n.multiply(&scale).cos();
     let half = Array::from_f32(0.5);
     let one = Array::from_f32(1.0);
 
-    Ok(half.multiply(&one.subtract(&cos_term)?)?)
+    Ok(half.multiply(&one.subtract(&cos_term)))
 }
 
 /// Compute Short-Time Fourier Transform.
@@ -72,8 +72,6 @@ pub fn hann_window(size: i32) -> Result<Array> {
 pub fn stft(signal: &Array, config: &StftConfig) -> Result<Array> {
     let win_length = config.win_length.unwrap_or(config.n_fft);
 
-    use mlx_rs::ops::indexing::IndexOp;
-
     // Create Hann window
     let window = hann_window(win_length)?;
 
@@ -81,16 +79,16 @@ pub fn stft(signal: &Array, config: &StftConfig) -> Result<Array> {
     let window = if win_length < config.n_fft {
         let pad_left = (config.n_fft - win_length) / 2;
         let pad_right = config.n_fft - win_length - pad_left;
-        let zeros_left = mlx_rs::ops::zeros::<f32>(&[pad_left])?;
-        let zeros_right = mlx_rs::ops::zeros::<f32>(&[pad_right])?;
-        mlx_rs::ops::concatenate_axis(&[&zeros_left, &window, &zeros_right], 0)?
+        let zeros_left = Array::zeros(&[pad_left], 10);
+        let zeros_right = Array::zeros(&[pad_right], 10);
+        ops::concatenate_axis(&[&zeros_left, &window, &zeros_right], 0)
     } else {
         window
     };
 
     // Handle batched vs unbatched input
     let (signal, was_1d) = if signal.ndim() == 1 {
-        (signal.reshape(&[1, -1])?, true)
+        (signal.reshape(&[1, -1]), true)
     } else {
         (signal.clone(), false)
     };
@@ -111,32 +109,31 @@ pub fn stft(signal: &Array, config: &StftConfig) -> Result<Array> {
     // Calculate number of frames
     let num_frames = (padded_length - config.n_fft) / config.hop_length + 1;
 
-    // Frame the signal using as_strided or manual indexing
-    // For now, use a loop-based approach (can optimize later with as_strided)
+    // Frame the signal using slice-based approach
+    let batch = signal.dim(0);
     let mut frames = Vec::with_capacity(num_frames as usize);
     for i in 0..num_frames {
         let start = i * config.hop_length;
         let end = start + config.n_fft;
-        let frame = signal.index((.., start..end));
+        let frame = signal.slice(&[0, start], &[batch, end]);
         frames.push(frame);
     }
 
     // Stack frames: [batch, frames, n_fft]
-    let frame_refs: Vec<&Array> = frames.iter().collect();
-    let framed = mlx_rs::ops::stack_axis(&frame_refs, 1)?;
+    let framed = ops::stack_axis(&frames, 1);
 
     // Apply window: [batch, frames, n_fft] * [n_fft]
-    let windowed = framed.multiply(&window)?;
+    let windowed = framed.multiply(&window);
 
     // Compute FFT along last axis
-    let spectrum = mlx_rs::fft::rfft(&windowed, Some(config.n_fft), -1)?;
+    let spectrum = fft::rfft(&windowed, Some(config.n_fft), -1);
 
     // Transpose to [batch, freq, frames]
-    let spectrum = spectrum.transpose_axes(&[0, 2, 1])?;
+    let spectrum = spectrum.transpose_axes(&[0, 2, 1]);
 
     // Remove batch dim if input was 1D
     if was_1d {
-        Ok(spectrum.squeeze()?)
+        Ok(spectrum.squeeze_all())
     } else {
         Ok(spectrum)
     }
@@ -151,8 +148,6 @@ pub fn stft(signal: &Array, config: &StftConfig) -> Result<Array> {
 /// # Returns
 /// Reconstructed audio signal [batch, samples] or [samples]
 pub fn istft(stft_matrix: &Array, config: &StftConfig) -> Result<Array> {
-    use mlx_rs::ops::indexing::IndexOp;
-
     let win_length = config.win_length.unwrap_or(config.n_fft);
 
     // Create Hann window
@@ -162,9 +157,9 @@ pub fn istft(stft_matrix: &Array, config: &StftConfig) -> Result<Array> {
     let window = if win_length < config.n_fft {
         let pad_left = (config.n_fft - win_length) / 2;
         let pad_right = config.n_fft - win_length - pad_left;
-        let zeros_left = mlx_rs::ops::zeros::<f32>(&[pad_left])?;
-        let zeros_right = mlx_rs::ops::zeros::<f32>(&[pad_right])?;
-        mlx_rs::ops::concatenate_axis(&[&zeros_left, &window, &zeros_right], 0)?
+        let zeros_left = Array::zeros(&[pad_left], 10);
+        let zeros_right = Array::zeros(&[pad_right], 10);
+        ops::concatenate_axis(&[&zeros_left, &window, &zeros_right], 0)
     } else {
         window
     };
@@ -172,7 +167,7 @@ pub fn istft(stft_matrix: &Array, config: &StftConfig) -> Result<Array> {
     // Handle batched input: normalize to [batch, n_fft/2+1, frames]
     let (stft_matrix, was_2d) = if stft_matrix.ndim() == 2 {
         (
-            stft_matrix.reshape(&[1, stft_matrix.dim(0), stft_matrix.dim(1)])?,
+            stft_matrix.reshape(&[1, stft_matrix.dim(0), stft_matrix.dim(1)]),
             true,
         )
     } else {
@@ -185,36 +180,23 @@ pub fn istft(stft_matrix: &Array, config: &StftConfig) -> Result<Array> {
     let hop_length = config.hop_length;
 
     // Transpose to [batch, frames, freq] for irfft along last axis
-    let stft_transposed = stft_matrix.transpose_axes(&[0, 2, 1])?;
+    let stft_transposed = stft_matrix.transpose_axes(&[0, 2, 1]);
 
     // Inverse FFT: [batch, frames, n_fft]
-    let ifft_frames = mlx_rs::fft::irfft(&stft_transposed, Some(n_fft), -1)?;
+    let ifft_frames = fft::irfft(&stft_transposed, Some(n_fft), -1);
 
     // Apply synthesis window: [batch, frames, n_fft] * [n_fft]
-    let windowed_frames = ifft_frames.multiply(&window)?;
+    let windowed_frames = ifft_frames.multiply(&window);
 
     // Calculate full output length before optional center-trim
     let output_length = n_fft + (num_frames - 1) * hop_length;
 
-    // Precompute window norm denominator for each output position using the same
-    // pad-and-sum strategy applied to the squared window.
-    //
-    // window_sq shape: [n_fft]
-    let window_sq = window.multiply(&window)?;
+    // Precompute window norm denominator using squared window
+    let window_sq = window.multiply(&window);
 
-    // Overlap-add via pad-and-sum:
-    //
-    // For each frame index i (0..num_frames):
-    //   - Extract windowed frame: [batch, n_fft]
-    //   - Pad it to [batch, output_length] with `i * hop_length` zeros before
-    //     and `output_length - i * hop_length - n_fft` zeros after (along axis 1)
-    //   - Accumulate into a running sum
-    //
-    // Simultaneously build the normalization denominator using the same offsets
-    // applied to window_sq (shape [n_fft] -> padded [output_length]).
-
-    let mut output_sum = mlx_rs::ops::zeros::<f32>(&[batch_size, output_length])?;
-    let mut norm_sum = mlx_rs::ops::zeros::<f32>(&[output_length])?;
+    // Overlap-add via pad-and-sum
+    let mut output_sum = Array::zeros(&[batch_size, output_length], 10);
+    let mut norm_sum = Array::zeros(&[output_length], 10);
 
     for i in 0..num_frames {
         let offset = i * hop_length;
@@ -222,39 +204,41 @@ pub fn istft(stft_matrix: &Array, config: &StftConfig) -> Result<Array> {
         let pad_after = output_length - offset - n_fft;
 
         // Extract frame i for all batches: [batch, n_fft]
-        let frame = windowed_frames.index((.., i, ..));
+        let frame = windowed_frames.slice(&[0, i, 0], &[batch_size, i + 1, n_fft])
+            .reshape(&[batch_size, n_fft]);
 
-        // Pad frame along axis 1 (the sample axis): [batch, output_length]
-        let padded_frame =
-            mlx_rs::ops::pad(&frame, &[(0i32, 0i32), (pad_before, pad_after)], None, None)?;
+        // Pad frame along axis 1: [batch, output_length]
+        let padded_frame = frame.pad_constant(
+            &[0, 0, pad_before, pad_after],
+            0.0,
+        );
 
-        output_sum = output_sum.add(&padded_frame)?;
+        output_sum = output_sum.add(&padded_frame);
 
         // Pad window_sq (1-D) along axis 0: [output_length]
-        let padded_wsq = mlx_rs::ops::pad(&window_sq, &[(pad_before, pad_after)], None, None)?;
-        norm_sum = norm_sum.add(&padded_wsq)?;
+        let padded_wsq = window_sq.pad_constant(&[pad_before, pad_after], 0.0);
+        norm_sum = norm_sum.add(&padded_wsq);
     }
 
-    // Normalize: divide by window norm, guarding against near-zero denominators.
-    // A threshold of 1e-8 avoids NaN in silence or edge regions.
+    // Normalize: divide by window norm, guarding against near-zero denominators
     let eps = Array::from_f32(1e-8_f32);
-    let norm_safe = mlx_rs::ops::maximum(&norm_sum, &eps)?;
-    // Broadcast norm_safe [output_length] across batch dimension for division.
-    let norm_broadcast = mlx_rs::ops::broadcast_to(&norm_safe, &[batch_size, output_length])?;
-    let output = output_sum.divide(&norm_broadcast)?;
+    let norm_safe = ops::maximum(&norm_sum, &eps);
+    // Broadcast norm_safe [output_length] across batch dimension for division
+    let norm_broadcast = ops::broadcast_to(&norm_safe, &[batch_size, output_length]);
+    let output = output_sum.divide(&norm_broadcast);
 
-    // If center=true was used during forward STFT, trim the n_fft/2 padding on each side.
+    // If center=true was used during forward STFT, trim the n_fft/2 padding on each side
     let output = if config.center {
         let trim = n_fft / 2;
         let trimmed_length = output_length - 2 * trim;
-        // Slice along axis 1: output[:, trim : trim + trimmed_length]
-        output.index((.., trim..trim + trimmed_length))
+        // Slice along axis 1
+        output.slice(&[0, trim], &[batch_size, trim + trimmed_length])
     } else {
         output
     };
 
     if was_2d {
-        Ok(output.squeeze()?)
+        Ok(output.squeeze_all())
     } else {
         Ok(output)
     }
@@ -267,61 +251,57 @@ fn pad_signal(signal: &Array, pad_amount: i32, mode: PadMode) -> Result<Array> {
 
     match mode {
         PadMode::Zeros => {
-            let left_pad = mlx_rs::ops::zeros::<f32>(&[batch_size, pad_amount])?;
-            let right_pad = mlx_rs::ops::zeros::<f32>(&[batch_size, pad_amount])?;
-            mlx_rs::ops::concatenate_axis(&[&left_pad, signal, &right_pad], 1)
+            let left_pad = Array::zeros(&[batch_size, pad_amount], 10);
+            let right_pad = Array::zeros(&[batch_size, pad_amount], 10);
+            Ok(ops::concatenate_axis(&[&left_pad, signal, &right_pad], 1))
         }
         PadMode::Reflect => {
             // Reflect padding: mirror the signal at boundaries
-            // left: signal[pad_amount:0:-1]
-            // right: signal[-2:-pad_amount-2:-1]
-
-            // Left reflection
+            // Left reflection: indices [pad_amount, pad_amount-1, ..., 1]
             let left_indices: Vec<i32> = (1..=pad_amount).rev().collect();
             let left_pad = if !left_indices.is_empty() {
-                let indices = Array::from_slice(&left_indices, &[pad_amount]);
-                signal.take_axis(&indices, 1)?
+                let indices = Array::from_i32_slice(&left_indices);
+                signal.take_axis(&indices, 1)
             } else {
-                mlx_rs::ops::zeros::<f32>(&[batch_size, 0])?
+                Array::zeros(&[batch_size, 0], 10)
             };
 
-            // Right reflection
+            // Right reflection: indices [length-2, length-3, ..., length-pad_amount-1]
             let right_indices: Vec<i32> = ((length - pad_amount - 1)..(length - 1)).rev().collect();
             let right_pad = if !right_indices.is_empty() {
-                let indices = Array::from_slice(&right_indices, &[pad_amount]);
-                signal.take_axis(&indices, 1)?
+                let indices = Array::from_i32_slice(&right_indices);
+                signal.take_axis(&indices, 1)
             } else {
-                mlx_rs::ops::zeros::<f32>(&[batch_size, 0])?
+                Array::zeros(&[batch_size, 0], 10)
             };
 
-            mlx_rs::ops::concatenate_axis(&[&left_pad, signal, &right_pad], 1)
+            Ok(ops::concatenate_axis(&[&left_pad, signal, &right_pad], 1))
         }
         PadMode::Replicate => {
-            use mlx_rs::ops::indexing::IndexOp;
             // Replicate edge values
-            let left_val = signal.index((.., ..1));
-            let right_val = signal.index((.., -1..));
+            let left_val = signal.slice(&[0, 0], &[batch_size, 1]);
+            let right_start = length - 1;
+            let right_val = signal.slice(&[0, right_start], &[batch_size, length]);
 
-            let left_pad = mlx_rs::ops::broadcast_to(&left_val, &[batch_size, pad_amount])?;
-            let right_pad = mlx_rs::ops::broadcast_to(&right_val, &[batch_size, pad_amount])?;
+            let left_pad = ops::broadcast_to(&left_val, &[batch_size, pad_amount]);
+            let right_pad = ops::broadcast_to(&right_val, &[batch_size, pad_amount]);
 
-            mlx_rs::ops::concatenate_axis(&[&left_pad, signal, &right_pad], 1)
+            Ok(ops::concatenate_axis(&[&left_pad, signal, &right_pad], 1))
         }
     }
-    .map_err(VocoderError::from)
 }
 
 /// Compute magnitude spectrogram from complex STFT.
 pub fn stft_magnitude(stft_matrix: &Array) -> Result<Array> {
     // |z| = sqrt(real² + imag²)
-    Ok(stft_matrix.abs()?)
+    Ok(stft_matrix.abs_val())
 }
 
 /// Compute power spectrogram from complex STFT.
 pub fn stft_power(stft_matrix: &Array) -> Result<Array> {
     // |z|² = real² + imag²
-    let mag = stft_matrix.abs()?;
-    Ok(mag.multiply(&mag)?)
+    let mag = stft_matrix.abs_val();
+    Ok(mag.multiply(&mag))
 }
 
 #[cfg(test)]
@@ -331,8 +311,9 @@ mod tests {
     #[test]
     fn test_hann_window() {
         let window = hann_window(4).unwrap();
-        window.eval().unwrap();
-        assert_eq!(window.shape(), &[4]);
+        let mut w2 = window.clone();
+        w2.eval();
+        assert_eq!(w2.shape(), &[4]);
 
         // Hann window should be symmetric and start/end near 0
         // hann(4) = [0, 0.5, 1, 0.5] approximately
@@ -370,25 +351,26 @@ mod tests {
         let samples: Vec<f32> = (0..num_samples)
             .map(|n| (2.0 * pi * 440.0 * n as f32 / 16000.0).sin())
             .collect();
-        let signal = Array::from_slice(&samples, &[num_samples]);
+        let signal = Array::from_f32_slice(&samples, &[num_samples]);
 
         // Forward STFT.
         let spectrum = stft(&signal, &config).unwrap();
 
         // Inverse STFT (overlap-add reconstruction).
         let reconstructed = istft(&spectrum, &config).unwrap();
-        reconstructed.eval().unwrap();
+        let mut r2 = reconstructed.clone();
+        r2.eval();
 
         // The reconstructed signal should have the same length as the original.
-        assert_eq!(reconstructed.shape(), &[num_samples]);
+        assert_eq!(r2.shape(), &[num_samples]);
 
         // Verify reconstruction quality: max absolute error should be < 1e-3.
-        let diff = reconstructed.subtract(&signal).unwrap();
-        let abs_diff = diff.abs().unwrap();
+        let diff = r2.subtract(&signal);
+        let abs_diff = diff.abs_val();
         // Reduce to scalar maximum.
-        let max_err_arr = abs_diff.max(None).unwrap();
-        max_err_arr.eval().unwrap();
-        let max_err: f32 = max_err_arr.item();
+        let mut max_err_arr = abs_diff.max(None);
+        max_err_arr.eval();
+        let max_err: f32 = max_err_arr.item_f32();
         assert!(
             max_err < 1e-3,
             "STFT round-trip error too large: max |error| = {max_err}"
@@ -415,13 +397,14 @@ mod tests {
         let samples: Vec<f32> = (0..(batch_size * num_samples))
             .map(|i| (i as f32 / num_samples as f32).sin())
             .collect();
-        let signal = Array::from_slice(&samples, &[batch_size, num_samples]);
+        let signal = Array::from_f32_slice(&samples, &[batch_size, num_samples]);
 
         let spectrum = stft(&signal, &config).unwrap();
         let reconstructed = istft(&spectrum, &config).unwrap();
-        reconstructed.eval().unwrap();
+        let mut r2 = reconstructed.clone();
+        r2.eval();
 
         // Output batch dimension must be preserved.
-        assert_eq!(reconstructed.dim(0), batch_size);
+        assert_eq!(r2.dim(0), batch_size);
     }
 }

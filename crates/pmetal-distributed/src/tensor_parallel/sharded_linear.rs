@@ -16,8 +16,7 @@
 
 use crate::mlx_dist::group::DistributedGroup;
 use crate::mlx_dist::ops;
-use mlx_rs::Array;
-use mlx_rs::error::Exception;
+use pmetal_bridge::compat::{Array, Exception};
 
 /// Forward pass for a column-sharded linear layer (AllToSharded).
 ///
@@ -53,16 +52,16 @@ pub fn all_to_sharded_forward(
     // automatically aggregate gradients from all ranks.
     let world_size = group.size() as f32;
     let x_synced = ops::all_sum(x, Some(group))?;
-    let divisor = Array::from_slice(&[world_size], &[1]);
-    let x_barrier = &x_synced / &divisor;
+    let divisor = Array::from_f32_slice(&[world_size], &[1]);
+    let x_barrier = x_synced.divide(&divisor);
 
     // Local matmul: x_barrier @ weight.T
     let wt = weight.t();
-    let mut out = x_barrier.matmul(&wt)?;
+    let mut out = x_barrier.matmul(&wt);
 
     // Add bias if present.
     if let Some(b) = bias {
-        out = &out + b;
+        out = out.add(b);
     }
 
     Ok(out)
@@ -93,14 +92,14 @@ pub fn sharded_to_all_forward(
 ) -> Result<Array, Exception> {
     // Local matmul: x @ weight.T (partial result).
     let wt = weight.t();
-    let partial = x.matmul(&wt)?;
+    let partial = x.matmul(&wt);
 
     // All-sum: reduce partial results across all ranks.
     let mut out = ops::all_sum(&partial, Some(group))?;
 
     // Add bias (replicated — same on all ranks).
     if let Some(b) = bias {
-        out = &out + b;
+        out = out.add(b);
     }
 
     Ok(out)

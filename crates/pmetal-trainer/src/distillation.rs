@@ -3,7 +3,7 @@
 //! Implements the training loop for distilling knowledge from a teacher model
 //! to a student model. Supports Online, Offline, and Progressive distillation.
 
-use mlx_rs::{Array, error::Exception, nn, optimizers::Optimizer};
+use pmetal_bridge::compat::{Array, Exception, nn, optimizers::Optimizer};
 use pmetal_data::{DataLoader, TrainingDataset};
 use pmetal_distill::{DistillLossOutput, Distiller};
 use pmetal_lora::TrainableModel;
@@ -130,7 +130,7 @@ impl DistillationTrainer {
             loss_and_grad_fn(student, (&batch.input_ids, &batch.labels, &teacher_logits))?
         };
 
-        let loss_val = loss.item::<f32>();
+        let loss_val = loss.item_f32();
 
         // Apply gradients (gradient accumulation logic handles the actual update)
         // Re-using logic from TrainingLoop would be ideal, but here we manually do it
@@ -372,7 +372,7 @@ impl DistillationTrainer {
                 .compute_loss(&teacher_logits, &student_logits, labels_opt, None, 0, 1)
                 .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
-            total_loss += output.total.item::<f32>() as f64;
+            total_loss += output.total.item_f32() as f64;
             num_batches += 1;
         }
 

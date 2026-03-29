@@ -32,8 +32,9 @@ use std::io::{Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use mlx_rs::error::Exception;
-use mlx_rs::{Array, Dtype};
+use pmetal_bridge::compat::Exception;
+use pmetal_bridge::compat::{Array, Dtype};
+use crate::ArrayDtypeExt;
 use serde::{Deserialize, Serialize};
 
 /// Offloading target for tensors.
@@ -179,7 +180,7 @@ impl OffloadedEmbedding {
                 fs::create_dir_all(dir).map_err(|e| Exception::custom(e.to_string()))?;
 
                 let path = dir.join(format!("embedding_{}.bin", uuid_simple()));
-                save_array_to_disk(&array, &path)?;
+                save_array_to_disk(&array, &path);
                 embedding.disk_path = Some(path);
             }
         }
@@ -218,7 +219,7 @@ impl OffloadedEmbedding {
     /// Look up embeddings for given indices.
     pub fn lookup(&mut self, indices: &Array) -> Result<Array, Exception> {
         let weights = self.get_weights()?;
-        weights.take_axis(indices, 0)
+        Ok(weights.take_axis(indices, 0))
     }
 
     /// Evict GPU cache to free memory.
@@ -485,12 +486,12 @@ impl GradientOffloader {
         if let Some(existing) = self.gradients.get_mut(name) {
             // Add to existing gradient
             if let Some(ref existing_array) = existing.array {
-                let sum = existing_array.add(&grad)?;
+                let sum = existing_array.add(&grad);
                 existing.array = Some(sum);
             } else if let Some(ref path) = existing.disk_path {
                 // Load, add, save
                 let existing_array = load_array_from_disk(path, existing.dtype)?;
-                let sum = existing_array.add(&grad)?;
+                let sum = existing_array.add(&grad);
                 save_array_to_disk(&sum, path)?;
             }
         } else {
@@ -552,7 +553,7 @@ impl GradientOffloader {
             };
 
             // Apply gradient scaling
-            let scaled = array.multiply(&scale_array)?;
+            let scaled = array.multiply(&scale_array);
             result.insert(name, scaled);
         }
 
@@ -754,7 +755,8 @@ impl FrozenParameterManager {
 
             if should_offload {
                 // Evaluate and store
-                array.eval()?;
+                let mut arr_owned = array.clone();
+                arr_owned.eval();
 
                 self.frozen_params.insert(
                     name_str.to_string(),
@@ -783,20 +785,22 @@ impl FrozenParameterManager {
     ///
     /// Returns the array on GPU. The GPU copy is cached until `evict()` is called.
     pub fn get(&mut self, name: &str) -> Result<&Array, Exception> {
-        let param = self
-            .frozen_params
-            .get_mut(name)
-            .ok_or_else(|| Exception::custom(format!("Frozen parameter '{}' not found", name)))?;
+        // Check if GPU cache needs to be populated
+        {
+            let param = self
+                .frozen_params
+                .get_mut(name)
+                .ok_or_else(|| Exception::custom(format!("Frozen parameter '{}' not found", name)))?;
 
-        // If not in GPU cache, load it
-        if param.gpu_cache.is_none() {
-            param.gpu_cache = Some(param.cpu_array.clone());
-            self.stats.gpu_loads += 1;
+            if param.gpu_cache.is_none() {
+                param.gpu_cache = Some(param.cpu_array.clone());
+                self.stats.gpu_loads += 1;
+            }
         }
 
-        param
-            .gpu_cache
-            .as_ref()
+        self.frozen_params
+            .get(name)
+            .and_then(|p| p.gpu_cache.as_ref())
             .ok_or_else(|| Exception::custom("GPU cache should be populated"))
     }
 
@@ -899,12 +903,11 @@ impl<'a> Drop for FrozenModuleForward<'a> {
 
 /// Save an array to disk in binary format.
 fn save_array_to_disk(array: &Array, path: &Path) -> Result<(), Exception> {
-    // Evaluate array first
-    array.eval()?;
-
-    // Get raw data
-    let data: Vec<f32> = array.as_slice().to_vec();
-    let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+    // Evaluate array first and get raw data
+    let mut owned = array.clone();
+    owned.eval();
+    let data: Vec<f32> = owned.to_f32_vec(owned.size()).unwrap_or_default();
+    let bytes: Vec<u8> = data.iter().flat_map(|f: &f32| f.to_le_bytes()).collect();
 
     let mut file = File::create(path).map_err(|e| Exception::custom(e.to_string()))?;
     file.write_all(&bytes)
@@ -926,7 +929,7 @@ fn load_array_from_disk(path: &Path, _dtype: Dtype) -> Result<Array, Exception> 
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect();
 
-    Ok(Array::from_slice(&data, &[data.len() as i32]))
+    Ok(Array::from_f32_slice(&data, &[data.len() as i32]))
 }
 
 /// Get the size of an activation in bytes.
@@ -940,7 +943,6 @@ fn dtype_size(dtype: Dtype) -> usize {
     match dtype {
         Dtype::Float16 | Dtype::Bfloat16 => 2,
         Dtype::Float32 => 4,
-        Dtype::Float64 => 8,
         Dtype::Int8 | Dtype::Uint8 => 1,
         Dtype::Int16 | Dtype::Uint16 => 2,
         Dtype::Int32 | Dtype::Uint32 => 4,
@@ -1003,7 +1005,7 @@ mod tests {
         let config = OffloadConfig::default();
         let mut offloader = ActivationOffloader::new(config).unwrap();
 
-        let activation = mlx_rs::random::normal::<f32>(&[2, 10, 64], None, None, None).unwrap();
+        let activation = random::normal(&[2, 10, 64], Dtype::Float32);
         offloader.store("layer_0", activation.clone()).unwrap();
 
         let loaded = offloader.load("layer_0").unwrap();
@@ -1014,11 +1016,11 @@ mod tests {
 
     #[test]
     fn test_offloaded_embedding() {
-        let weights = mlx_rs::random::normal::<f32>(&[100, 64], None, None, None).unwrap();
+        let weights = random::normal(&[100, 64], Dtype::Float32);
         let mut embedding =
             OffloadedEmbedding::from_array(weights.clone(), OffloadTarget::Cpu, None).unwrap();
 
-        let indices = Array::from_slice(&[0_i32, 5, 10], &[3]);
+        let indices = Array::from_f32_slice(&[0_i32, 5, 10], &[3]);
         let result = embedding.lookup(&indices).unwrap();
         result.eval().unwrap();
 
@@ -1032,7 +1034,7 @@ mod tests {
 
         // Accumulate gradients
         for _ in 0..4 {
-            let grad = mlx_rs::random::normal::<f32>(&[10, 10], None, None, None).unwrap();
+            let grad = random::normal(&[10, 10], Dtype::Float32);
             offloader.accumulate("weight", grad).unwrap();
             offloader.step();
         }
@@ -1053,7 +1055,7 @@ mod tests {
 
     #[test]
     fn test_memory_usage_estimate() {
-        let weights = mlx_rs::random::normal::<f32>(&[1000, 512], None, None, None).unwrap();
+        let weights = random::normal(&[1000, 512], Dtype::Float32);
         let embedding = OffloadedEmbedding::from_array(weights, OffloadTarget::Gpu, None).unwrap();
 
         let expected_bytes = 1000 * 512 * 4; // float32
@@ -1105,21 +1107,21 @@ mod tests {
         let mut params: HashMap<Rc<str>, Array> = HashMap::new();
 
         // Large frozen param (should be offloaded)
-        let frozen_weight = mlx_rs::random::normal::<f32>(&[1024, 4096], None, None, None).unwrap();
+        let frozen_weight = random::normal(&[1024, 4096], Dtype::Float32);
         params.insert(
             Rc::from("model.layers.0.self_attn.q_proj.weight"),
             frozen_weight,
         );
 
         // Small norm (should stay on GPU)
-        let norm_weight = mlx_rs::random::normal::<f32>(&[4096], None, None, None).unwrap();
+        let norm_weight = random::normal(&[4096], Dtype::Float32);
         params.insert(
             Rc::from("model.layers.0.input_layernorm.weight"),
             norm_weight,
         );
 
         // Trainable LoRA (should be skipped)
-        let lora_weight = mlx_rs::random::normal::<f32>(&[4096, 16], None, None, None).unwrap();
+        let lora_weight = random::normal(&[4096, 16], Dtype::Float32);
         params.insert(
             Rc::from("model.layers.0.self_attn.q_proj.lora_A"),
             lora_weight,
@@ -1145,7 +1147,7 @@ mod tests {
         let mut manager = FrozenParameterManager::new(config);
 
         let mut params: HashMap<Rc<str>, Array> = HashMap::new();
-        let weight = mlx_rs::random::normal::<f32>(&[64, 64], None, None, None).unwrap();
+        let weight = random::normal(&[64, 64], Dtype::Float32);
         params.insert(Rc::from("layer.weight"), weight);
 
         manager.register_frozen_params(&params, &[]).unwrap();
@@ -1177,11 +1179,11 @@ mod tests {
         let mut params: HashMap<Rc<str>, Array> = HashMap::new();
 
         // Offloaded param
-        let offloaded = mlx_rs::random::normal::<f32>(&[100, 100], None, None, None).unwrap();
+        let offloaded = random::normal(&[100, 100], Dtype::Float32);
         params.insert(Rc::from("offloaded.weight"), offloaded);
 
         // Kept on GPU param
-        let kept = mlx_rs::random::normal::<f32>(&[100, 100], None, None, None).unwrap();
+        let kept = random::normal(&[100, 100], Dtype::Float32);
         params.insert(Rc::from("keep.weight"), kept);
 
         manager.register_frozen_params(&params, &[]).unwrap();

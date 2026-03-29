@@ -12,13 +12,9 @@ use std::rc::Rc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    module::{ModuleParamMut, ModuleParamRef, ModuleParameters, Param},
-    nested::NestedValue,
-    nn,
+use pmetal_bridge::compat::{
+    Array, Exception, nn, Param,
+    ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
 };
 
 use pmetal_core::LoraConfig;
@@ -195,8 +191,8 @@ impl Qwen3LoraAttention {
         let values = values.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
 
         // Qwen3-specific: Apply Q/K normalization before RoPE
-        let queries = mlx_rs::module::Module::forward(&mut self.q_norm, &queries)?;
-        let keys = mlx_rs::module::Module::forward(&mut self.k_norm, &keys)?;
+        let queries = pmetal_bridge::compat::Module::forward(&mut self.q_norm, &queries)?;
+        let keys = pmetal_bridge::compat::Module::forward(&mut self.k_norm, &keys)?;
 
         // Transpose for attention: [B, heads, L, head_dim]
         let queries = queries.transpose_axes(&[0, 2, 1, 3])?;
@@ -226,8 +222,8 @@ impl Qwen3LoraAttention {
             (q, k)
         } else {
             // Use standard RoPE for sequential positions
-            let q = mlx_rs::module::Module::forward(&mut self.rope, &queries)?;
-            let k = mlx_rs::module::Module::forward(&mut self.rope, &keys)?;
+            let q = pmetal_bridge::compat::Module::forward(&mut self.rope, &queries)?;
+            let k = pmetal_bridge::compat::Module::forward(&mut self.rope, &keys)?;
             (q, k)
         };
 
@@ -314,8 +310,8 @@ impl Qwen3LoraAttention {
         let values = values.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
 
         // Qwen3-specific: Apply Q/K normalization before RoPE
-        let queries = mlx_rs::module::Module::forward(&mut self.q_norm, &queries)?;
-        let keys = mlx_rs::module::Module::forward(&mut self.k_norm, &keys)?;
+        let queries = pmetal_bridge::compat::Module::forward(&mut self.q_norm, &queries)?;
+        let keys = pmetal_bridge::compat::Module::forward(&mut self.k_norm, &keys)?;
 
         // Transpose for attention: [B, heads, L, head_dim]
         let queries = queries.transpose_axes(&[0, 2, 1, 3])?;
@@ -329,8 +325,8 @@ impl Qwen3LoraAttention {
             let keys = apply_rope(&keys, self.head_dim, false, self.rope.base, 1.0, offset)?;
             (queries, keys, values)
         } else {
-            let queries = mlx_rs::module::Module::forward(&mut self.rope, &queries)?;
-            let keys = mlx_rs::module::Module::forward(&mut self.rope, &keys)?;
+            let queries = pmetal_bridge::compat::Module::forward(&mut self.rope, &queries)?;
+            let keys = pmetal_bridge::compat::Module::forward(&mut self.rope, &keys)?;
             (queries, keys, values)
         };
 
@@ -495,14 +491,14 @@ impl Qwen3LoraDecoderLayer {
         position_ids: Option<&Array>,
     ) -> Result<Array, LoraError> {
         // Pre-norm + attention + residual
-        let normed = mlx_rs::module::Module::forward(&mut self.input_layernorm, x)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward(&normed, mask, position_ids)?;
         let h = x.add(&attn_out)?;
 
         // Pre-norm + MLP + residual
-        let normed = mlx_rs::module::Module::forward(&mut self.post_attention_layernorm, &h)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out)?)
+        Ok(h.add(&mlp_out))
     }
 
     /// Forward pass with KV cache for efficient inference.
@@ -518,14 +514,14 @@ impl Qwen3LoraDecoderLayer {
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, LoraError> {
         // Pre-norm + attention + residual
-        let normed = mlx_rs::module::Module::forward(&mut self.input_layernorm, x)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
         let h = x.add(&attn_out)?;
 
         // Pre-norm + MLP + residual
-        let normed = mlx_rs::module::Module::forward(&mut self.post_attention_layernorm, &h)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out)?)
+        Ok(h.add(&mlp_out))
     }
 
     /// Get number of trainable parameters.
@@ -617,7 +613,7 @@ impl Qwen3LoraModel {
         checkpoint_config: Option<&CheckpointConfig>,
     ) -> Result<Array, LoraError> {
         // Get embeddings
-        let mut hidden_states = mlx_rs::module::Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states = pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // Create causal mask if not provided
         let mask = if mask.is_none() {
@@ -644,7 +640,7 @@ impl Qwen3LoraModel {
             // during the backward pass. MLX does not provide a built-in
             // `checkpoint()` primitive, so implementing this requires manually
             // wrapping the per-block forward in a closure registered with
-            // `mlx_rs::transforms::vjp`. Until that is done, this code path
+            // `pmetal_bridge::compat::transforms::vjp`. Until that is done, this code path
             // only logs a warning — no memory savings are applied.
             //
             // Calling `eval()` here would materialize intermediates and break
@@ -660,7 +656,7 @@ impl Qwen3LoraModel {
         }
 
         // Final norm
-        Ok(mlx_rs::module::Module::forward(
+        Ok(pmetal_bridge::compat::Module::forward(
             &mut self.norm,
             &hidden_states,
         )?)
@@ -679,7 +675,7 @@ impl Qwen3LoraModel {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, LoraError> {
         // Get embeddings
-        let mut hidden_states = mlx_rs::module::Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states = pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // Don't create explicit causal mask - fused SDPA handles it internally
         // with proper dtype handling. Only pass through user-provided masks.
@@ -700,7 +696,7 @@ impl Qwen3LoraModel {
         }
 
         // Final norm
-        Ok(mlx_rs::module::Module::forward(
+        Ok(pmetal_bridge::compat::Module::forward(
             &mut self.norm,
             &hidden_states,
         )?)
@@ -848,7 +844,7 @@ impl Qwen3LoraForCausalLM {
 
         // Get logits from LM head or shared embeddings
         if let Some(ref mut lm_head) = self.lm_head {
-            Ok(mlx_rs::module::Module::forward(lm_head, &hidden_states)?)
+            Ok(pmetal_bridge::compat::Module::forward(lm_head, &hidden_states)?)
         } else {
             // Tie weights: use embedding weight transposed
             Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
@@ -899,7 +895,7 @@ impl Qwen3LoraForCausalLM {
 
         // Get logits from LM head or shared embeddings
         if let Some(ref mut lm_head) = self.lm_head {
-            Ok(mlx_rs::module::Module::forward(lm_head, &hidden_states)?)
+            Ok(pmetal_bridge::compat::Module::forward(lm_head, &hidden_states)?)
         } else {
             // Tie weights: use embedding weight transposed
             Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
@@ -1498,16 +1494,16 @@ impl crate::TrainableModel for Qwen3LoraForCausalLM {
 
 /// Create a causal attention mask.
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;
+    let mask = pmetal_bridge::compat::ops::tri::<f32>(seq_len, None, None)?;
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
-    mlx_rs::ops::r#where(&mask.eq(&zero)?, &neg_inf, &zero)
+    pmetal_bridge::compat::ops::where_fn(&mask.eq(&zero), &neg_inf, &zero)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::{Dtype, random};
+    use pmetal_bridge::compat::Dtype; use pmetal_bridge::compat::random;
 
     fn small_config() -> Qwen3Config {
         Qwen3Config {
@@ -1552,7 +1548,7 @@ mod tests {
         let head_dim = shape[3];
 
         let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
-        let x = mlx_rs::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
+        let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
         x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])
     }
 
@@ -1574,8 +1570,8 @@ mod tests {
         let keys = keys.reshape(&[batch, seq_len, attn.n_kv_heads, attn.head_dim])?;
         let values = values.reshape(&[batch, seq_len, attn.n_kv_heads, attn.head_dim])?;
 
-        let queries = mlx_rs::module::Module::forward(&mut attn.q_norm, &queries)?;
-        let keys = mlx_rs::module::Module::forward(&mut attn.k_norm, &keys)?;
+        let queries = pmetal_bridge::compat::Module::forward(&mut attn.q_norm, &queries)?;
+        let keys = pmetal_bridge::compat::Module::forward(&mut attn.k_norm, &keys)?;
 
         let queries = queries.transpose_axes(&[0, 2, 1, 3])?;
         let keys = keys.transpose_axes(&[0, 2, 1, 3])?;
@@ -1601,8 +1597,8 @@ mod tests {
             )?;
             (q, k)
         } else {
-            let q = mlx_rs::module::Module::forward(&mut attn.rope, &queries)?;
-            let k = mlx_rs::module::Module::forward(&mut attn.rope, &keys)?;
+            let q = pmetal_bridge::compat::Module::forward(&mut attn.rope, &queries)?;
+            let k = pmetal_bridge::compat::Module::forward(&mut attn.rope, &keys)?;
             (q, k)
         };
 
@@ -1617,15 +1613,15 @@ mod tests {
             values
         };
 
-        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2])?)?;
+        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]))?;
         let scores = scores.multiply(Array::from_f32(attn.scale))?;
         let scores = if let Some(mask) = mask {
-            scores.add(mask)?
+            scores.add(mask)
         } else {
             let causal_mask = create_causal_mask(seq_len)?.as_dtype(Dtype::Float32)?;
-            scores.add(&causal_mask)?
+            scores.add(&causal_mask)
         };
-        let weights = mlx_rs::ops::softmax_axis(&scores, -1, None)?;
+        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1, None)?;
         let output = weights.matmul(&values)?;
 
         let output = output
@@ -1640,7 +1636,7 @@ mod tests {
         let lora_config = small_lora_config();
         let mut attn = Qwen3LoraAttention::new(&config, &lora_config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let output = attn.forward(&x, None, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1655,7 +1651,7 @@ mod tests {
         random::seed(11).unwrap();
         let mut ref_attn = Qwen3LoraAttention::new(&config, &lora_config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
 
         let fused = fused_attn.forward(&x, None, None).unwrap();
         fused.eval().unwrap();
@@ -1682,7 +1678,7 @@ mod tests {
         random::seed(17).unwrap();
         let mut ref_attn = Qwen3LoraAttention::new(&config, &lora_config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let position_ids = Array::from_slice(&[0_i32, 1, 0, 1], &[4]);
         let packed_mask = Array::from_slice(
             &[
@@ -1732,7 +1728,7 @@ mod tests {
         let lora_config = small_lora_config();
         let mut model = Qwen3LoraForCausalLM::new(config, lora_config).unwrap();
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
         let logits = model.forward(&input_ids, None, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]);
@@ -1744,8 +1740,8 @@ mod tests {
         let lora_config = small_lora_config();
         let mut model = Qwen3LoraForCausalLM::new(config, lora_config).unwrap();
 
-        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
-        let position_ids = mlx_rs::Array::from_slice(&[0_i32, 1, 2, 3], &[4]);
+        let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
+        let position_ids = Array::from_i32_slice(&[0_i32, 1, 2, 3]).reshape(&[4]);
         let causal_mask = create_causal_mask(4).unwrap();
 
         let hidden_without_mask = model

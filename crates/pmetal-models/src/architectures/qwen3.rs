@@ -8,16 +8,10 @@
 //! - No bias in attention projections
 //! - Per-layer sliding window configuration via `layer_types`
 
+use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, random};
+use pmetal_bridge::impl_module_params;
 use std::collections::HashMap;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, ModuleParametersExt, Param},
-    nn,
-};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::ModelConfig;
@@ -29,9 +23,9 @@ use pmetal_mlx::kv_cache::KVCache;
 
 fn zero_linear(out_dims: i32, in_dims: i32, bias: bool) -> Result<nn::Linear, Exception> {
     Ok(nn::Linear {
-        weight: Param::new(Array::zeros::<f32>(&[out_dims, in_dims])?),
+        weight: Param::new(Array::zeros_f32(&[out_dims, in_dims])),
         bias: Param::new(if bias {
-            Some(Array::zeros::<f32>(&[out_dims])?)
+            Some(Array::zeros_f32(&[out_dims]))
         } else {
             None
         }),
@@ -40,7 +34,7 @@ fn zero_linear(out_dims: i32, in_dims: i32, bias: bool) -> Result<nn::Linear, Ex
 
 fn zero_embedding(embedding_count: i32, dimensions: i32) -> Result<nn::Embedding, Exception> {
     Ok(nn::Embedding {
-        weight: Param::new(Array::zeros::<f32>(&[embedding_count, dimensions])?),
+        weight: Param::new(Array::zeros_f32(&[embedding_count, dimensions])),
     })
 }
 
@@ -54,7 +48,7 @@ fn placeholder_embedding() -> Result<nn::Embedding, Exception> {
 
 fn placeholder_rms_norm(eps: f32) -> Result<nn::RmsNorm, Exception> {
     Ok(nn::RmsNorm {
-        weight: Param::new(Array::ones::<f32>(&[1])?),
+        weight: Param::new(Array::ones_f32(&[1])),
         eps,
     })
 }
@@ -225,15 +219,14 @@ impl Default for Qwen3Config {
 }
 
 /// Qwen3 MLP.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3MLP {
-    #[param]
     pub gate_proj: nn::Linear,
-    #[param]
     pub up_proj: nn::Linear,
-    #[param]
     pub down_proj: nn::Linear,
 }
+impl_module_params!(Qwen3MLP; gate_proj, up_proj, down_proj);
+
 
 impl Qwen3MLP {
     pub fn new(config: &Qwen3Config) -> Result<Self, Exception> {
@@ -256,9 +249,9 @@ impl Qwen3MLP {
     #[cfg(test)]
     pub(crate) fn new_zeroed(config: &Qwen3Config) -> Result<Self, Exception> {
         Ok(Self {
-            gate_proj: zero_linear(config.intermediate_size, config.hidden_size, false)?,
-            up_proj: zero_linear(config.intermediate_size, config.hidden_size, false)?,
-            down_proj: zero_linear(config.hidden_size, config.intermediate_size, false)?,
+            gate_proj: zero_linear(config.intermediate_size, config.hidden_size, false),
+            up_proj: zero_linear(config.intermediate_size, config.hidden_size, false),
+            down_proj: zero_linear(config.hidden_size, config.intermediate_size, false),
         })
     }
 
@@ -276,30 +269,24 @@ impl Module<Array> for Qwen3MLP {
     type Error = Exception;
 
     fn forward(&mut self, x: Array) -> Result<Self::Output, Self::Error> {
-        let gate = self.gate_proj.forward(&x)?;
-        let up = self.up_proj.forward(&x)?;
-        self.down_proj.forward(&nn::silu(&gate)?.multiply(&up)?)
+        let gate = self.gate_proj.forward(&x);
+        let up = self.up_proj.forward(&x);
+        Ok(self.down_proj.forward(&nn::silu(&gate).multiply(&up)))
     }
 
     fn training_mode(&mut self, _mode: bool) {}
 }
 
 /// Qwen3 Attention with Q/K RMSNorm before RoPE.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3Attention {
-    #[param]
     pub q_proj: nn::Linear,
-    #[param]
     pub k_proj: nn::Linear,
-    #[param]
     pub v_proj: nn::Linear,
-    #[param]
     pub o_proj: nn::Linear,
     /// Q normalization (Qwen3-specific: RMSNorm over head_dim before RoPE).
-    #[param]
     pub q_norm: nn::RmsNorm,
     /// K normalization (Qwen3-specific: RMSNorm over head_dim before RoPE).
-    #[param]
     pub k_norm: nn::RmsNorm,
     pub n_heads: i32,
     pub n_kv_heads: i32,
@@ -313,6 +300,8 @@ pub struct Qwen3Attention {
     pub use_sliding_window: bool,
     pub sliding_window: Option<i32>,
 }
+impl_module_params!(Qwen3Attention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
+
 
 impl Qwen3Attention {
     pub fn new(config: &Qwen3Config, use_sliding_window: bool) -> Result<Self, Exception> {
@@ -391,14 +380,14 @@ impl Qwen3Attention {
                 config.num_attention_heads * head_dim,
                 config.hidden_size,
                 false,
-            )?,
-            k_proj: zero_linear(n_kv_heads * head_dim, config.hidden_size, false)?,
-            v_proj: zero_linear(n_kv_heads * head_dim, config.hidden_size, false)?,
+            ),
+            k_proj: zero_linear(n_kv_heads * head_dim, config.hidden_size, false),
+            v_proj: zero_linear(n_kv_heads * head_dim, config.hidden_size, false),
             o_proj: zero_linear(
                 config.hidden_size,
                 config.num_attention_heads * head_dim,
                 false,
-            )?,
+            ),
             q_norm: nn::RmsNormBuilder::new(head_dim)
                 .eps(config.rms_norm_eps)
                 .build()?,
@@ -461,23 +450,23 @@ impl Qwen3Attention {
         let l = shape[1];
         let mut cache = cache;
 
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let q = self.q_proj.forward(x);
+        let k = self.k_proj.forward(x);
+        let v = self.v_proj.forward(x);
 
         // Reshape to [B, L, heads, head_dim] for per-head normalization
-        let mut q = q.reshape(&[b, l, self.n_heads, self.head_dim])?;
-        let mut k = k.reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
-        let v = v.reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
+        let mut q = q.reshape(&[b, l, self.n_heads, self.head_dim]);
+        let mut k = k.reshape(&[b, l, self.n_kv_heads, self.head_dim]);
+        let v = v.reshape(&[b, l, self.n_kv_heads, self.head_dim]);
 
         // Apply Q/K RMSNorm before RoPE (Qwen3-specific)
-        q = self.q_norm.forward(&q)?;
-        k = self.k_norm.forward(&k)?;
+        q = self.q_norm.forward(&q);
+        k = self.k_norm.forward(&k);
 
         // Transpose to [B, heads, L, head_dim]
-        q = q.transpose_axes(&[0, 2, 1, 3])?;
-        k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        q = q.transpose_axes(&[0, 2, 1, 3]);
+        k = k.transpose_axes(&[0, 2, 1, 3]);
+        let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Apply RoPE with cache offset
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
@@ -517,14 +506,13 @@ impl Qwen3Attention {
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
                 if let Some(out) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
-                {
-                    let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)? {
+                    let out = out.transpose_axes(&[0, 2, 1, 3]).reshape(&[
                         b,
                         l,
                         self.n_heads * self.head_dim,
-                    ])?;
-                    return self.o_proj.forward(&out);
+                    ]);
+                    return Ok(self.o_proj.forward(&out));
                 }
             }
         }
@@ -538,24 +526,22 @@ impl Qwen3Attention {
 
         let out = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
         let out =
-            out.transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[b, l, self.n_heads * self.head_dim])?;
-        self.o_proj.forward(&out)
+            out.transpose_axes(&[0, 2, 1, 3])
+                .reshape(&[b, l, self.n_heads * self.head_dim]);
+        Ok(self.o_proj.forward(&out))
     }
 }
 
 /// Qwen3 Layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3Layer {
-    #[param]
     pub input_layernorm: nn::RmsNorm,
-    #[param]
     pub self_attn: Qwen3Attention,
-    #[param]
     pub post_attention_layernorm: nn::RmsNorm,
-    #[param]
     pub mlp: Qwen3MLP,
 }
+impl_module_params!(Qwen3Layer; input_layernorm, self_attn, post_attention_layernorm, mlp);
+
 
 impl Qwen3Layer {
     pub fn new(config: &Qwen3Config, use_sliding_window: bool) -> Result<Self, Exception> {
@@ -563,10 +549,12 @@ impl Qwen3Layer {
             .eps(config.rms_norm_eps)
             .build()?;
         let self_attn = Qwen3Attention::new(config, use_sliding_window)?;
+
         let post_attention_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
             .build()?;
         let mlp = Qwen3MLP::new(config)?;
+
 
         Ok(Self {
             input_layernorm,
@@ -584,11 +572,11 @@ impl Qwen3Layer {
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
             .build()?;
-        let self_attn = Qwen3Attention::new_zeroed(config, use_sliding_window)?;
+        let self_attn = Qwen3Attention::new_zeroed(config, use_sliding_window);
         let post_attention_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
             .build()?;
-        let mlp = Qwen3MLP::new_zeroed(config)?;
+        let mlp = Qwen3MLP::new_zeroed(config);
 
         Ok(Self {
             input_layernorm,
@@ -603,9 +591,13 @@ impl Qwen3Layer {
         use_sliding_window: bool,
     ) -> Result<Self, Exception> {
         let input_layernorm = placeholder_rms_norm(config.rms_norm_eps)?;
+
         let self_attn = Qwen3Attention::new_for_loading(config, use_sliding_window)?;
+
         let post_attention_layernorm = placeholder_rms_norm(config.rms_norm_eps)?;
+
         let mlp = Qwen3MLP::new_for_loading()?;
+
 
         Ok(Self {
             input_layernorm,
@@ -622,25 +614,24 @@ impl Qwen3Layer {
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, Exception> {
         let h = x.add(&self.self_attn.forward(
-            &self.input_layernorm.forward(x)?,
+            &self.input_layernorm.forward(x),
             mask,
             cache,
-        )?)?;
-        let mlp_in = self.post_attention_layernorm.forward(&h)?;
-        h.add(&self.mlp.forward(mlp_in)?)
+        )?);
+        let mlp_in = self.post_attention_layernorm.forward(&h);
+        Ok(h.add(&self.mlp.forward(mlp_in)?))
     }
 }
 
 /// Qwen3 Model.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3Model {
-    #[param]
     pub embed_tokens: nn::Embedding,
-    #[param]
     pub layers: Vec<Qwen3Layer>,
-    #[param]
     pub norm: nn::RmsNorm,
 }
+impl_module_params!(Qwen3Model; embed_tokens, layers, norm);
+
 
 impl Qwen3Model {
     pub fn new(config: &Qwen3Config) -> Result<Self, Exception> {
@@ -664,7 +655,7 @@ impl Qwen3Model {
 
     #[cfg(test)]
     pub(crate) fn new_zeroed(config: &Qwen3Config) -> Result<Self, Exception> {
-        let embed_tokens = zero_embedding(config.vocab_size, config.hidden_size)?;
+        let embed_tokens = zero_embedding(config.vocab_size, config.hidden_size);
         let layers = (0..config.num_hidden_layers as usize)
             .map(|i| {
                 let use_sliding = config.use_sliding_window_at(i);
@@ -684,6 +675,7 @@ impl Qwen3Model {
 
     pub(crate) fn new_for_loading(config: &Qwen3Config) -> Result<Self, Exception> {
         let embed_tokens = placeholder_embedding()?;
+
         let layers = (0..config.num_hidden_layers as usize)
             .map(|i| {
                 let use_sliding = config.use_sliding_window_at(i);
@@ -691,6 +683,7 @@ impl Qwen3Model {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let norm = placeholder_rms_norm(config.rms_norm_eps)?;
+
 
         Ok(Self {
             embed_tokens,
@@ -705,29 +698,30 @@ impl Qwen3Model {
         mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        let mut h = self.embed_tokens.forward(input_ids)?;
+        let mut h = self.embed_tokens.forward(input_ids);
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let layer_cache = cache.as_mut().map(|c| (&mut **c, i));
             h = layer.forward(&h, mask, layer_cache)?;
         }
-        self.norm.forward(&h)
+        Ok(self.norm.forward(&h))
     }
 }
 
 /// Qwen3 for Causal LM.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct Qwen3ForCausalLM {
-    #[param]
     pub model: Qwen3Model,
     /// None when `tie_word_embeddings` is true (uses embed_tokens transposed).
-    #[param]
     pub lm_head: Option<nn::Linear>,
     pub config: Qwen3Config,
 }
+impl_module_params!(Qwen3ForCausalLM; model, lm_head);
+
 
 impl Qwen3ForCausalLM {
     pub fn new(config: Qwen3Config) -> Result<Self, Exception> {
         let model = Qwen3Model::new(&config)?;
+
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
@@ -761,6 +755,7 @@ impl Qwen3ForCausalLM {
 
     pub(crate) fn new_for_loading(config: Qwen3Config) -> Result<Self, Exception> {
         let model = Qwen3Model::new_for_loading(&config)?;
+
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
@@ -777,7 +772,7 @@ impl Qwen3ForCausalLM {
         if let Some(ref mut lm_head) = self.lm_head {
             lm_head.forward(h)
         } else {
-            self.model.embed_tokens.as_linear(h)
+            Ok(self.model.embed_tokens.as_linear(h))
         }
     }
 
@@ -815,13 +810,13 @@ impl crate::traits::CausalLMModel for Qwen3ForCausalLM {
     fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), Exception> {
         for (name, weight) in weights {
             if name == "model.embed_tokens.weight" {
-                self.model.embed_tokens.weight = mlx_rs::module::Param::new(weight.clone());
+                self.model.embed_tokens.weight = pmetal_bridge::compat::module::Param::new(weight.clone());
             } else if name == "lm_head.weight" {
                 if let Some(ref mut lm_head) = self.lm_head {
-                    lm_head.weight = mlx_rs::module::Param::new(weight.clone());
+                    lm_head.weight = pmetal_bridge::compat::module::Param::new(weight.clone());
                 }
             } else if name == "model.norm.weight" {
-                self.model.norm.weight = mlx_rs::module::Param::new(weight.clone());
+                self.model.norm.weight = pmetal_bridge::compat::module::Param::new(weight.clone());
             } else if name.starts_with("model.layers.") {
                 let parts: Vec<&str> = name.split('.').collect();
                 let i: usize = parts[2].parse().map_err(|_| {
@@ -834,38 +829,38 @@ impl crate::traits::CausalLMModel for Qwen3ForCausalLM {
                 let layer = &mut self.model.layers[i];
                 match suffix.as_str() {
                     "input_layernorm.weight" => {
-                        layer.input_layernorm.weight = mlx_rs::module::Param::new(weight.clone())
+                        layer.input_layernorm.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "post_attention_layernorm.weight" => {
                         layer.post_attention_layernorm.weight =
-                            mlx_rs::module::Param::new(weight.clone())
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.q_proj.weight" => {
-                        layer.self_attn.q_proj.weight = mlx_rs::module::Param::new(weight.clone())
+                        layer.self_attn.q_proj.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.k_proj.weight" => {
-                        layer.self_attn.k_proj.weight = mlx_rs::module::Param::new(weight.clone())
+                        layer.self_attn.k_proj.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.v_proj.weight" => {
-                        layer.self_attn.v_proj.weight = mlx_rs::module::Param::new(weight.clone())
+                        layer.self_attn.v_proj.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.o_proj.weight" => {
-                        layer.self_attn.o_proj.weight = mlx_rs::module::Param::new(weight.clone())
+                        layer.self_attn.o_proj.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.q_norm.weight" => {
-                        layer.self_attn.q_norm.weight = mlx_rs::module::Param::new(weight.clone())
+                        layer.self_attn.q_norm.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.k_norm.weight" => {
-                        layer.self_attn.k_norm.weight = mlx_rs::module::Param::new(weight.clone())
+                        layer.self_attn.k_norm.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "mlp.gate_proj.weight" => {
-                        layer.mlp.gate_proj.weight = mlx_rs::module::Param::new(weight.clone())
+                        layer.mlp.gate_proj.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "mlp.up_proj.weight" => {
-                        layer.mlp.up_proj.weight = mlx_rs::module::Param::new(weight.clone())
+                        layer.mlp.up_proj.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "mlp.down_proj.weight" => {
-                        layer.mlp.down_proj.weight = mlx_rs::module::Param::new(weight.clone())
+                        layer.mlp.down_proj.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     _ => {}
                 }
@@ -964,7 +959,7 @@ mod tests {
         let config = tiny_config();
         let mut mlp = Qwen3MLP::new(&config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], None, None, None).unwrap();
         let output = mlp.forward(x).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 32]);
@@ -976,7 +971,7 @@ mod tests {
         let config = tiny_config();
         let mut attn = Qwen3Attention::new(&config, false).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], None, None, None).unwrap();
         let output = attn.forward(&x, None, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 32]);
@@ -988,7 +983,7 @@ mod tests {
         let config = tiny_config();
         let mut layer = Qwen3Layer::new(&config, false).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], None, None, None).unwrap();
         let output = layer.forward(&x, None, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 32]);

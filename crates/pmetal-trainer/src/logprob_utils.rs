@@ -12,8 +12,7 @@
 //!
 //! This is the technique used by DeepSeek V3/R1.
 
-use mlx_rs::Array;
-use mlx_rs::error::Exception;
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops, nn};
 
 /// Selective log softmax: compute log probabilities only at target indices.
 ///
@@ -51,38 +50,38 @@ pub fn selective_log_softmax_with_temperature(
 ) -> Result<(Array, Array), Exception> {
     // Apply temperature scaling if requested
     let logits = match temperature {
-        Some(t) if (t - 1.0).abs() > 1e-8 && t > 0.0 => logits.divide(&Array::from_f32(t))?,
+        Some(t) if (t - 1.0).abs() > 1e-8 && t > 0.0 => logits.divide(&Array::from_f32(t)),
         _ => logits.clone(),
     };
     let logits = &logits;
     // Match label dtype for comparisons (labels may be Int32 or Int64)
-    let labels_dtype = labels.dtype();
-    let zero = Array::from_int(0).as_dtype(labels_dtype)?;
-    let ignore_val = Array::from_int(-100).as_dtype(labels_dtype)?;
+    let labels_dtype = labels.dtype_raw();
+    let zero = Array::from_int(0).as_dtype(labels_dtype);
+    let ignore_val = Array::from_int(-100).as_dtype(labels_dtype);
 
     // Replace -100 with 0 so gather doesn't go out-of-bounds
-    let gather_labels = mlx_rs::ops::maximum(labels, &zero)?;
+    let gather_labels = ops::maximum(labels, &zero);
 
     // [B, S] -> [B, S, 1] for take_along_axis
-    let gather_indices = gather_labels.expand_dims(-1i32)?;
+    let gather_indices = gather_labels.expand_dims(-1i32);
 
     // Gather the single logit at each target position: [B, S, 1]
-    let selected_logits = logits.take_along_axis(&gather_indices, -1)?;
+    let selected_logits = logits.take_along_axis(&gather_indices, -1);
 
     // logsumexp over vocab dim, keepdims for broadcast: [B, S, 1]
-    let lse = logits.logsumexp_axis(-1, true)?;
+    let lse = logits.logsumexp(-1, true);
 
     // log_softmax(x)[i] = x[i] - logsumexp(x)  =>  [B, S, 1]
-    let log_probs = selected_logits.subtract(&lse)?;
+    let log_probs = selected_logits.subtract(&lse);
 
     // Squeeze back to [B, S]
-    let log_probs = log_probs.squeeze_axes(&[-1i32])?;
+    let log_probs = log_probs.squeeze(-1);
 
     // Build valid mask: 1.0 where label != -100, 0.0 otherwise
-    let valid_mask = labels.ne(&ignore_val)?.as_dtype(mlx_rs::Dtype::Float32)?;
+    let valid_mask = labels.ne(&ignore_val).as_dtype(Dtype::Float32 as i32);
 
     // Zero out ignored positions so downstream sums are correct
-    let log_probs = log_probs.multiply(&valid_mask)?;
+    let log_probs = log_probs.multiply(&valid_mask);
 
     Ok((log_probs, valid_mask))
 }
@@ -100,17 +99,16 @@ pub fn selective_log_softmax_with_temperature(
 /// Per-position entropy with the last dimension reduced: `[...]`
 pub fn efficient_entropy(logits: &Array) -> Result<Array, Exception> {
     // H = logsumexp(x) - sum(softmax(x) * x, axis=-1)
-    let lse = logits.logsumexp_axis(-1, false)?; // [...] (no keepdims)
-    let probs = mlx_rs::ops::softmax_axis(logits, -1, None)?; // [..., V]
-    let weighted = probs.multiply(logits)?; // [..., V]
-    let weighted_sum = weighted.sum_axis(-1, None)?; // [...]
-    lse.subtract(&weighted_sum)
+    let lse = logits.logsumexp(-1, false); // [...] (no keepdims)
+    let probs = ops::softmax_axis(logits, -1); // [..., V]
+    let weighted = probs.multiply(logits); // [..., V]
+    let weighted_sum = weighted.sum_axis(-1, false); // [...]
+    Ok(lse.subtract(&weighted_sum))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::Dtype;
 
     #[test]
     fn test_selective_matches_full_log_softmax() {
@@ -125,15 +123,15 @@ mod tests {
         let labels = Array::from_slice(&[2i32, 0, -100], &[1, 3]);
 
         let (log_probs, mask) = selective_log_softmax(&logits, &labels).unwrap();
-        log_probs.eval().unwrap();
-        mask.eval().unwrap();
+        log_probs.eval();
+        mask.eval();
 
         assert_eq!(log_probs.shape(), &[1, 3]);
         assert_eq!(mask.shape(), &[1, 3]);
 
         // Compare with reference: full log_softmax + gather
-        let full_log_softmax = mlx_rs::nn::log_softmax(&logits, -1).unwrap();
-        full_log_softmax.eval().unwrap();
+        let full_log_softmax = nn::log_softmax(&logits, -1);
+        full_log_softmax.eval();
 
         let lp: &[f32] = log_probs.as_slice();
         let m: &[f32] = mask.as_slice();
@@ -179,8 +177,8 @@ mod tests {
         let labels = Array::from_slice(&[-100i32, -100], &[1, 2]);
 
         let (log_probs, mask) = selective_log_softmax(&logits, &labels).unwrap();
-        log_probs.eval().unwrap();
-        mask.eval().unwrap();
+        log_probs.eval();
+        mask.eval();
 
         let lp: &[f32] = log_probs.as_slice();
         let m: &[f32] = mask.as_slice();
@@ -204,8 +202,8 @@ mod tests {
         let labels = Array::from_slice(&[1i32, 2, 0, -100], &[2, 2]);
 
         let (log_probs, mask) = selective_log_softmax(&logits, &labels).unwrap();
-        log_probs.eval().unwrap();
-        mask.eval().unwrap();
+        log_probs.eval();
+        mask.eval();
 
         assert_eq!(log_probs.shape(), &[2, 2]);
         assert_eq!(mask.shape(), &[2, 2]);
@@ -229,20 +227,17 @@ mod tests {
 
         // Efficient entropy
         let ent = efficient_entropy(&logits).unwrap();
-        ent.eval().unwrap();
+        ent.eval();
         assert_eq!(ent.shape(), &[1, 3]);
 
         // Naive reference: -sum(softmax(x) * log_softmax(x), axis=-1)
-        let log_probs = mlx_rs::nn::log_softmax(&logits, -1).unwrap();
-        let probs = log_probs.exp().unwrap();
+        let log_probs = nn::log_softmax(&logits, -1);
+        let probs = log_probs.exp();
         let naive_ent = probs
             .multiply(&log_probs)
-            .unwrap()
-            .sum_axis(-1, None)
-            .unwrap()
-            .negative()
-            .unwrap();
-        naive_ent.eval().unwrap();
+            .sum_axis(-1, false)
+            .negative();
+        naive_ent.eval();
 
         let ent_vals: &[f32] = ent.as_slice();
         let naive_vals: &[f32] = naive_ent.as_slice();
@@ -273,7 +268,7 @@ mod tests {
         let logits = Array::from_slice(&[1.0f32, 2.0, 3.0, 0.0, 0.0, 0.0], &[2, 3]);
 
         let ent = efficient_entropy(&logits).unwrap();
-        ent.eval().unwrap();
+        ent.eval();
         assert_eq!(ent.shape(), &[2]);
 
         let ent_vals: &[f32] = ent.as_slice();
@@ -296,8 +291,8 @@ mod tests {
         let labels = Array::from_slice(&[0i32, 0], &[1, 2]);
 
         let (log_probs, mask) = selective_log_softmax(&logits, &labels).unwrap();
-        log_probs.eval().unwrap();
-        mask.eval().unwrap();
+        log_probs.eval();
+        mask.eval();
 
         let lp: &[f32] = log_probs.as_slice();
         let m: &[f32] = mask.as_slice();
@@ -325,13 +320,13 @@ mod tests {
         let labels = Array::from_slice(&[1i32], &[1, 1]);
 
         let (log_probs, _mask) = selective_log_softmax(&logits, &labels).unwrap();
-        log_probs.eval().unwrap();
+        log_probs.eval();
 
         let lp: &[f32] = log_probs.as_slice();
 
         // Compare against reference log_softmax
-        let ref_lp = mlx_rs::nn::log_softmax(&logits, -1).unwrap();
-        ref_lp.eval().unwrap();
+        let ref_lp = nn::log_softmax(&logits, -1);
+        ref_lp.eval();
         let ref_vals: &[f32] = ref_lp.as_slice();
         // label=1 → index 1 in the vocab dimension
         assert!(
@@ -346,7 +341,7 @@ mod tests {
         let extreme = Array::from_slice(&[1e7_f32, 1e7 + 1.0, 1e7 - 1.0], &[1, 1, 3]);
         let labels_ext = Array::from_slice(&[0i32], &[1, 1]);
         let (lp_ext, _) = selective_log_softmax(&extreme, &labels_ext).unwrap();
-        lp_ext.eval().unwrap();
+        lp_ext.eval();
         let lp_ext_val: &[f32] = lp_ext.as_slice();
         assert!(
             lp_ext_val[0].is_finite(),
@@ -362,13 +357,13 @@ mod tests {
         let labels = Array::from_slice(&[1i32], &[1, 1]);
 
         let (log_probs, _mask) = selective_log_softmax(&logits, &labels).unwrap();
-        log_probs.eval().unwrap();
+        log_probs.eval();
 
         let lp: &[f32] = log_probs.as_slice();
 
         // Compare against reference log_softmax
-        let ref_lp = mlx_rs::nn::log_softmax(&logits, -1).unwrap();
-        ref_lp.eval().unwrap();
+        let ref_lp = nn::log_softmax(&logits, -1);
+        ref_lp.eval();
         let ref_vals: &[f32] = ref_lp.as_slice();
         assert!(
             (lp[0] - ref_vals[1]).abs() < 1e-5,
@@ -382,7 +377,7 @@ mod tests {
         let extreme = Array::from_slice(&[-1e7_f32, -1e7 + 1.0, -1e7 - 1.0], &[1, 1, 3]);
         let labels_ext = Array::from_slice(&[0i32], &[1, 1]);
         let (lp_ext, _) = selective_log_softmax(&extreme, &labels_ext).unwrap();
-        lp_ext.eval().unwrap();
+        lp_ext.eval();
         let lp_ext_val: &[f32] = lp_ext.as_slice();
         assert!(
             lp_ext_val[0].is_finite(),
@@ -396,12 +391,11 @@ mod tests {
         // Labels as Int64 (common when loaded from datasets)
         let logits = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[1, 2, 3]);
         let labels_i64 = Array::from_slice(&[2i32, -100], &[1, 2])
-            .as_dtype(Dtype::Int64)
-            .unwrap();
+            .as_dtype(Dtype::Int64 as i32);
 
         let (log_probs, mask) = selective_log_softmax(&logits, &labels_i64).unwrap();
-        log_probs.eval().unwrap();
-        mask.eval().unwrap();
+        log_probs.eval();
+        mask.eval();
 
         let lp: &[f32] = log_probs.as_slice();
         let m: &[f32] = mask.as_slice();
@@ -429,8 +423,8 @@ mod tests {
         let labels = Array::from_slice(&[0i32, -100], &[1, 2]);
 
         let (log_probs, mask) = selective_log_softmax(&logits, &labels).unwrap();
-        log_probs.eval().unwrap();
-        mask.eval().unwrap();
+        log_probs.eval();
+        mask.eval();
 
         let lp: &[f32] = log_probs.as_slice();
         let m: &[f32] = mask.as_slice();
@@ -454,7 +448,7 @@ mod tests {
         let logits = Array::from_slice(&[42.0f32, -7.0], &[1, 2, 1]);
 
         let ent = efficient_entropy(&logits).unwrap();
-        ent.eval().unwrap();
+        ent.eval();
 
         let ent_vals: &[f32] = ent.as_slice();
         assert!(
@@ -475,7 +469,7 @@ mod tests {
         let logits = Array::from_slice(&[100.0f32, 0.0, 0.0, 0.0, 0.0], &[1, 1, 5]);
 
         let ent = efficient_entropy(&logits).unwrap();
-        ent.eval().unwrap();
+        ent.eval();
 
         let ent_vals: &[f32] = ent.as_slice();
         // softmax([100, 0, 0, 0, 0]) ≈ [1, 0, 0, 0, 0] → entropy ≈ 0
@@ -494,19 +488,16 @@ mod tests {
         let logits = Array::from_slice(&[1e3_f32, 1e3 + 0.5, 1e3 - 0.5], &[1, 1, 3]);
 
         let ent = efficient_entropy(&logits).unwrap();
-        ent.eval().unwrap();
+        ent.eval();
 
         // Compare against naive entropy
-        let naive_log_probs = mlx_rs::nn::log_softmax(&logits, -1).unwrap();
-        let naive_probs = naive_log_probs.exp().unwrap();
+        let naive_log_probs = nn::log_softmax(&logits, -1);
+        let naive_probs = naive_log_probs.exp();
         let naive_ent = naive_probs
             .multiply(&naive_log_probs)
-            .unwrap()
-            .sum_axis(-1, None)
-            .unwrap()
-            .negative()
-            .unwrap();
-        naive_ent.eval().unwrap();
+            .sum_axis(-1, false)
+            .negative();
+        naive_ent.eval();
 
         let ent_vals: &[f32] = ent.as_slice();
         let naive_vals: &[f32] = naive_ent.as_slice();
@@ -526,7 +517,7 @@ mod tests {
         // Verify extreme magnitudes produce finite non-negative results
         let extreme = Array::from_slice(&[1e7_f32, 1e7 + 1.0, 1e7 - 1.0], &[1, 1, 3]);
         let ent_ext = efficient_entropy(&extreme).unwrap();
-        ent_ext.eval().unwrap();
+        ent_ext.eval();
         let ent_ext_vals: &[f32] = ent_ext.as_slice();
         assert!(
             ent_ext_vals[0].is_finite(),

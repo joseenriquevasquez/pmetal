@@ -19,7 +19,7 @@
 //! let view = unsafe { metal_buffer_from_ptr(&ctx, ptr, len)? };
 //! ```
 
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -150,19 +150,19 @@ impl TensorLoader for SafetensorsLoader {
             safetensors::Dtype::F32 => {
                 let floats: &[f32] =
                     <[f32]>::ref_from_bytes(data).expect("safetensors data aligned");
-                Array::from_slice(floats, &shape)
+                Array::from_f32_slice(floats, &shape)
             }
             safetensors::Dtype::F16 => {
                 let halfs: &[half::f16] =
                     <[half::f16]>::ref_from_bytes(data).expect("safetensors data aligned");
                 let floats: Vec<f32> = halfs.iter().map(|h| h.to_f32()).collect();
-                Array::from_slice(&floats, &shape)
+                Array::from_f32_slice(&floats, &shape)
             }
             safetensors::Dtype::BF16 => {
                 let halfs: &[half::bf16] =
                     <[half::bf16]>::ref_from_bytes(data).expect("safetensors data aligned");
                 let floats: Vec<f32> = halfs.iter().map(|h| h.to_f32()).collect();
-                Array::from_slice(&floats, &shape)
+                Array::from_f32_slice(&floats, &shape)
             }
             dtype => {
                 return Err(MergeError::ModelLoad(format!(
@@ -439,19 +439,19 @@ impl TensorLoader for ZeroCopyLoader {
             safetensors::Dtype::F32 => {
                 let floats: &[f32] =
                     <[f32]>::ref_from_bytes(data).expect("safetensors data aligned");
-                Array::from_slice(floats, &shape)
+                Array::from_f32_slice(floats, &shape)
             }
             safetensors::Dtype::F16 => {
                 let halfs: &[half::f16] =
                     <[half::f16]>::ref_from_bytes(data).expect("safetensors data aligned");
                 let floats: Vec<f32> = halfs.iter().map(|h| h.to_f32()).collect();
-                Array::from_slice(&floats, &shape)
+                Array::from_f32_slice(&floats, &shape)
             }
             safetensors::Dtype::BF16 => {
                 let halfs: &[half::bf16] =
                     <[half::bf16]>::ref_from_bytes(data).expect("safetensors data aligned");
                 let floats: Vec<f32> = halfs.iter().map(|h| h.to_f32()).collect();
-                Array::from_slice(&floats, &shape)
+                Array::from_f32_slice(&floats, &shape)
             }
             dtype => {
                 return Err(MergeError::ModelLoad(format!(
@@ -679,9 +679,10 @@ impl TensorWriter {
     /// Write a tensor.
     pub fn write_tensor(&mut self, name: &str, tensor: &Array) -> Result<()> {
         // Convert to f32 for storage
-        let tensor = tensor.as_type::<f32>()?;
+        let mut tensor = tensor.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
         let shape = tensor.shape().to_vec();
-        let data: Vec<f32> = tensor.as_slice().to_vec();
+        let n = shape.iter().map(|&s| s as usize).product();
+        let data: Vec<f32> = tensor.to_f32_vec(n).unwrap_or_default();
         let size = data.len() * 4;
 
         // Check if we need to flush current shard
@@ -848,8 +849,8 @@ mod tests {
         assert!(matches!(ptr.dtype, safetensors::Dtype::F32));
 
         // Test load_tensor
-        let array = loader.load_tensor("test_tensor").unwrap();
-        let slice: Vec<f32> = array.as_slice().to_vec();
+        let mut array = loader.load_tensor("test_tensor").unwrap();
+        let slice = array.to_f32_vec(4).unwrap();
         assert_eq!(slice, vec![1.0, 2.0, 3.0, 4.0]);
     }
 }

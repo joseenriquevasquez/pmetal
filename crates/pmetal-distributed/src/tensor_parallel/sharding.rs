@@ -1,17 +1,17 @@
 //! Core sharding abstractions for tensor parallelism.
 
-use mlx_rs::Array;
-use mlx_rs::error::Exception;
+use pmetal_bridge::compat::{Array, Exception};
 use std::collections::HashMap;
 
 /// Slice a contiguous range along `axis` using `take_axis`.
 ///
 /// Equivalent to `x[..., start:start+len, ...]`. There is no `narrow` method
-/// in mlx-rs; this helper builds the index array and calls `take_axis`.
+/// in the bridge compat layer; this helper builds the index array and calls
+/// `take_axis`.
 fn narrow(x: &Array, axis: i32, start: i32, len: i32) -> Result<Array, Exception> {
     let indices: Vec<i32> = (start..start + len).collect();
-    let idx = Array::from_slice(&indices, &[len]);
-    x.take_axis(&idx, axis)
+    let idx = Array::from_i32_slice(&indices);
+    Ok(x.take_axis(&idx, axis))
 }
 
 /// Describes how a single weight tensor is distributed across ranks.
@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn shard_weight_replicated() {
-        let w = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let w = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
         let result = shard_weight(&w, &ShardingDirective::Replicated, 0, 2).unwrap();
         assert_eq!(result.shape(), &[2, 2]);
     }
@@ -228,7 +228,7 @@ mod tests {
     fn shard_weight_column_split() {
         // [4, 2] weight split along axis 0 into 2 ranks → [2, 2] each
         let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
-        let w = Array::from_slice(&data, &[4, 2]);
+        let w = Array::from_f32_slice(&data, &[4, 2]);
 
         let shard0 = shard_weight(&w, &ShardingDirective::AllToSharded { axis: 0 }, 0, 2).unwrap();
         let shard1 = shard_weight(&w, &ShardingDirective::AllToSharded { axis: 0 }, 1, 2).unwrap();
@@ -241,7 +241,7 @@ mod tests {
     fn shard_weight_row_split() {
         // [2, 4] weight split along axis 1 into 2 ranks → [2, 2] each
         let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
-        let w = Array::from_slice(&data, &[2, 4]);
+        let w = Array::from_f32_slice(&data, &[2, 4]);
 
         let shard0 = shard_weight(&w, &ShardingDirective::ShardedToAll { axis: 1 }, 0, 2).unwrap();
         let shard1 = shard_weight(&w, &ShardingDirective::ShardedToAll { axis: 1 }, 1, 2).unwrap();
@@ -254,7 +254,7 @@ mod tests {
     fn shard_weight_expert_sharded() {
         // [8, 3, 4] → 8 experts, split into 4 ranks → [2, 3, 4] each
         let data: Vec<f32> = (0..96).map(|i| i as f32).collect();
-        let w = Array::from_slice(&data, &[8, 3, 4]);
+        let w = Array::from_f32_slice(&data, &[8, 3, 4]);
 
         let shard = shard_weight(
             &w,
@@ -272,11 +272,11 @@ mod tests {
         let mut weights = HashMap::new();
         weights.insert(
             "q.weight".to_string(),
-            Array::from_slice(&[0.0f32; 8], &[4, 2]),
+            Array::from_f32_slice(&[0.0f32; 8], &[4, 2]),
         );
         weights.insert(
             "norm.weight".to_string(),
-            Array::from_slice(&[1.0f32; 4], &[4]),
+            Array::from_f32_slice(&[1.0f32; 4], &[4]),
         );
 
         let mut plan = ShardingPlan::new();

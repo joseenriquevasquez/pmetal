@@ -1,5 +1,4 @@
-use mlx_rs::Array;
-use mlx_rs::error::Exception;
+use pmetal_bridge::compat::{Array, Exception};
 
 pub(crate) fn pad_u32_sequences(
     sequences: &[Vec<u32>],

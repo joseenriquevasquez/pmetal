@@ -1,4 +1,4 @@
-use mlx_rs::Array;
+use pmetal_bridge::compat::{Array, Dtype};
 
 use crate::{MergeMethod, MergeParameters, Result, error::MergeError};
 
@@ -71,28 +71,28 @@ impl MergeMethod for TaskArithmeticMerge {
         let lambda = global_params.lambda();
 
         // Accumulate weighted task vectors
-        let mut accumulated_task_vector = mlx_rs::ops::zeros_like(base)?;
+        let mut accumulated_task_vector = Array::zeros(base.shape(), Dtype::Float32.as_i32());
 
         for (i, model_tensor) in tensors.iter().enumerate() {
             let weight = get_weight(i);
 
             // Task vector = Model - Base
-            let task_vector = model_tensor.subtract(base)?;
+            let task_vector = model_tensor.subtract(base);
 
             // Weighted task vector
             let weight_arr = Array::from_f32(weight);
-            let weighted_task = task_vector.multiply(&weight_arr)?;
+            let weighted_task = task_vector.multiply(&weight_arr);
 
             // Accumulate
-            accumulated_task_vector = accumulated_task_vector.add(&weighted_task)?;
+            accumulated_task_vector = accumulated_task_vector.add(&weighted_task);
         }
 
         // Apply global scaling factor (lambda)
         let lambda_arr = Array::from_f32(lambda);
-        let final_delta = accumulated_task_vector.multiply(&lambda_arr)?;
+        let final_delta = accumulated_task_vector.multiply(&lambda_arr);
 
         // Add back to base
-        let merged = base.add(&final_delta)?;
+        let merged = base.add(&final_delta);
 
         Ok(merged)
     }

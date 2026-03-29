@@ -11,16 +11,9 @@
 //! - SwiGLU activation
 //! - RMSNorm
 //! - Shared input/output embeddings
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops, random};
+use pmetal_bridge::impl_module_params;
 
-use mlx_rs::{
-    Array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::{Module, Param},
-    nn,
-    ops::softmax_axis,
-};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::ModelConfig;
@@ -231,15 +224,14 @@ impl ModelConfig for GraniteConfig {
 // =============================================================================
 
 /// SwiGLU MLP for Granite.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GraniteMLP {
-    #[param]
     pub gate_proj: nn::Linear,
-    #[param]
     pub up_proj: nn::Linear,
-    #[param]
     pub down_proj: nn::Linear,
 }
+impl_module_params!(GraniteMLP; gate_proj, up_proj, down_proj);
+
 
 impl GraniteMLP {
     pub fn new(hidden_size: i32, intermediate_size: i32) -> Result<Self, Exception> {
@@ -262,30 +254,28 @@ impl GraniteMLP {
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         // SwiGLU: silu(gate) * up
         let gate = Module::forward(&mut self.gate_proj, x)?;
-        let gate = nn::silu(gate)?;
+        let gate = nn::silu(&gate);
         let up = Module::forward(&mut self.up_proj, x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = gate.multiply(&up);
         Module::forward(&mut self.down_proj, &hidden)
     }
 }
 
 /// Granite attention with GQA and RoPE.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GraniteAttention {
     pub n_heads: i32,
     pub n_kv_heads: i32,
     pub head_dim: i32,
     pub scale: f32,
 
-    #[param]
     pub q_proj: nn::Linear,
-    #[param]
     pub k_proj: nn::Linear,
-    #[param]
     pub v_proj: nn::Linear,
-    #[param]
     pub o_proj: nn::Linear,
 }
+impl_module_params!(GraniteAttention; q_proj, k_proj, v_proj, o_proj);
+
 
 impl GraniteAttention {
     pub fn new(config: &GraniteConfig) -> Result<Self, Exception> {
@@ -333,31 +323,31 @@ impl GraniteAttention {
         let v = Module::forward(&mut self.v_proj, x)?;
 
         // Reshape for attention
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?;
-        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
+        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
+        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // RoPE would be applied here
 
         // Transpose for attention
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        let q = q.transpose_axes(&[0, 2, 1, 3]);
+        let k = k.transpose_axes(&[0, 2, 1, 3]);
+        let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Attention scores
-        let k_t = k.transpose_axes(&[0, 1, 3, 2])?;
-        let mut scores = q.matmul(&k_t)?;
-        scores = scores.multiply(&Array::from_f32(self.scale))?;
+        let k_t = k.transpose_axes(&[0, 1, 3, 2]);
+        let mut scores = q.matmul(&k_t);
+        scores = scores.multiply(&Array::from_f32(self.scale));
 
         if let Some(m) = mask {
-            scores = scores.add(m)?;
+            scores = scores.add(m);
         }
 
-        let probs = softmax_axis(&scores, -1, None)?;
-        let output = probs.matmul(&v)?;
+        let probs = ops::softmax_axis(&scores, -1);
+        let output = probs.matmul(&v);
 
-        let output = output.transpose_axes(&[0, 2, 1, 3])?;
-        let output = output.reshape(&[batch, seq_len, -1])?;
+        let output = output.transpose_axes(&[0, 2, 1, 3]);
+        let output = output.reshape(&[batch, seq_len, -1]);
         Module::forward(&mut self.o_proj, &output)
     }
 }
@@ -366,18 +356,17 @@ impl GraniteAttention {
 ///
 /// Note: Full Mamba2 requires custom kernels for efficient implementation.
 /// This is a simplified version that approximates the behavior.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GraniteMamba2 {
     pub state_dim: i32,
     pub conv_dim: i32,
 
-    #[param]
     pub in_proj: nn::Linear,
-    #[param]
     pub conv1d_weight: Param<Array>,
-    #[param]
     pub out_proj: nn::Linear,
 }
+impl_module_params!(GraniteMamba2; in_proj, conv1d_weight, out_proj);
+
 
 impl GraniteMamba2 {
     pub fn new(config: &GraniteConfig) -> Result<Self, Exception> {
@@ -392,7 +381,7 @@ impl GraniteMamba2 {
 
         // 1D conv weight [conv_dim, hidden_size]
         let conv1d_weight =
-            mlx_rs::random::normal::<f32>(&[conv_dim, hidden_size], None, None, None)?;
+            pmetal_bridge::compat::random::normal(&[conv_dim, hidden_size], Dtype::Float32);
 
         let out_proj = nn::LinearBuilder::new(hidden_size, hidden_size)
             .bias(false)
@@ -417,13 +406,13 @@ impl GraniteMamba2 {
 
         // Split into x and z (gate) using split operation
         // xz: [batch, seq, 2*hidden] -> split along axis -1 into 2 parts
-        let parts = xz.split(2, -1)?;
+        let parts = pmetal_bridge::compat::ops::split(&xz, 2, -1);
         let x_half = parts[0].clone();
         let z = parts[1].clone();
 
         // Simplified: apply gate with SiLU
-        let z_gate = nn::silu(z)?;
-        let gated = x_half.multiply(&z_gate)?;
+        let z_gate = nn::silu(&z);
+        let gated = x_half.multiply(&z_gate);
 
         // Project out
         Module::forward(&mut self.out_proj, &gated)
@@ -431,21 +420,18 @@ impl GraniteMamba2 {
 }
 
 /// Granite decoder layer.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GraniteDecoderLayer {
     pub layer_type: GraniteLayerType,
 
-    #[param]
     pub attention: Option<GraniteAttention>,
-    #[param]
     pub mamba: Option<GraniteMamba2>,
-    #[param]
     pub mlp: GraniteMLP,
-    #[param]
     pub input_layernorm: nn::RmsNorm,
-    #[param]
     pub post_attention_layernorm: nn::RmsNorm,
 }
+impl_module_params!(GraniteDecoderLayer; attention, mamba, mlp, input_layernorm, post_attention_layernorm);
+
 
 impl GraniteDecoderLayer {
     pub fn new(config: &GraniteConfig, layer_idx: usize) -> Result<Self, Exception> {
@@ -457,6 +443,7 @@ impl GraniteDecoderLayer {
         };
 
         let mlp = GraniteMLP::new(config.hidden_size, config.intermediate_size)?;
+
 
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
@@ -490,33 +477,32 @@ impl GraniteDecoderLayer {
                 self.attention
                     .as_mut()
                     .unwrap()
-                    .forward(&normed, mask, position_ids)?
+                    .forward(&normed, mask, position_ids)
             }
-            GraniteLayerType::Mamba2 => self.mamba.as_mut().unwrap().forward(&normed)?,
-        };
+            GraniteLayerType::Mamba2 => self.mamba.as_mut().unwrap().forward(&normed),
+        }?;
 
-        let h = x.add(&mixer_out)?;
+        let h = x.add(&mixer_out);
 
         // FFN
         let normed = Module::forward(&mut self.post_attention_layernorm, &h)?;
         let ffn_out = self.mlp.forward(&normed)?;
 
-        h.add(&ffn_out)
+        Ok(h.add(&ffn_out))
     }
 }
 
 /// Granite model.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GraniteModel {
     pub config: GraniteConfig,
 
-    #[param]
     pub embed_tokens: nn::Embedding,
-    #[param]
     pub layers: Vec<GraniteDecoderLayer>,
-    #[param]
     pub norm: nn::RmsNorm,
 }
+impl_module_params!(GraniteModel; embed_tokens, layers, norm);
+
 
 impl GraniteModel {
     pub fn new(config: GraniteConfig) -> Result<Self, Exception> {
@@ -555,15 +541,15 @@ impl GraniteModel {
 }
 
 /// Granite for causal language modeling.
-#[derive(Debug, ModuleParameters)]
+#[derive(Debug)]
 pub struct GraniteForCausalLM {
     pub config: GraniteConfig,
 
-    #[param]
     pub model: GraniteModel,
-    #[param]
     pub lm_head: Option<nn::Linear>,
 }
+impl_module_params!(GraniteForCausalLM; model, lm_head);
+
 
 impl GraniteForCausalLM {
     pub fn new(config: GraniteConfig) -> Result<Self, Exception> {
@@ -579,6 +565,7 @@ impl GraniteForCausalLM {
         };
 
         let model = GraniteModel::new(config.clone())?;
+
 
         Ok(Self {
             config,
@@ -602,7 +589,7 @@ impl GraniteForCausalLM {
             // logits = hidden @ embed.weight.T
             let embed_weight = self.model.embed_tokens.weight.as_ref();
             let embed_t = embed_weight.t();
-            hidden_states.matmul(&embed_t)
+            Ok(hidden_states.matmul(&embed_t))
         }
     }
 }
@@ -610,7 +597,7 @@ impl GraniteForCausalLM {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::module::ModuleParameters;
+    use pmetal_bridge::compat::ModuleParameters;
     use serial_test::serial;
 
     #[test]
@@ -628,7 +615,7 @@ mod tests {
     #[serial]
     fn test_granite_mlp() {
         let mlp = GraniteMLP::new(64, 256).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[1, 10, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 10, 64], None, None, None).unwrap();
 
         let mut mlp = mlp;
         let out = mlp.forward(&x).unwrap();
@@ -652,7 +639,7 @@ mod tests {
 
         let model = GraniteForCausalLM::new(config).unwrap();
 
-        let params = model.parameters().flatten();
+        let params = model.flatten_params();
         assert!(params.len() > 0);
     }
 }
