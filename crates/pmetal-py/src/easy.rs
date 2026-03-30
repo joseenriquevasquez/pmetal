@@ -229,7 +229,7 @@ pub fn infer(
                     |input, cache| {
                         model
                             .forward_with_cache(input, None, Some(cache))
-                            .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
+                            .map_err(|e| pmetal_mlx::Exception::custom(e.to_string()))
                     },
                     &input_ids,
                     gen_config,

@@ -3,8 +3,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use futures::FutureExt;
-use mlx_rs::builder::Builder as _;
-use mlx_rs::ops;
+use pmetal_bridge::compat::ops;
 use pmetal::prelude::TrainingCallback;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
@@ -2762,7 +2761,7 @@ async fn run_grpo_in_process(
     let control_file = PathBuf::from(&output_dir).join(".lr_control.json");
     trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
 
-    let mut optimizer = mlx_rs::optimizers::AdamWBuilder::new(
+    let mut optimizer = pmetal_bridge::compat::optimizers::AdamWBuilder::new(
         config.learning_rate.unwrap_or(5e-6) as f32,
     )
     .build()
@@ -2779,7 +2778,7 @@ async fn run_grpo_in_process(
             &rewards,
             &mut optimizer,
             |opt, lr| {
-                opt.lr = mlx_rs::array!(lr);
+                opt.lr = pmetal_bridge::array!(lr);
             },
         )
         .map_err(|e| AppError(e.to_string()))?;
@@ -2832,8 +2831,13 @@ fn run_fuse_in_process(
 
     let mut base_weights =
         pmetal::models::loader::load_weights(&model_dir).map_err(|e| AppError(e.to_string()))?;
-    let lora_weights = pmetal::mlx::Array::load_safetensors(&lora_file)
-        .map_err(|e| AppError(e.to_string()))?;
+    let lora_file_str = lora_file
+        .to_str()
+        .ok_or_else(|| AppError(format!("non-UTF-8 LoRA path: {}", lora_file.display())))?;
+    let lora_weights: HashMap<String, pmetal::mlx::Array> =
+        pmetal_bridge::inline_array::load_safetensors_shard(lora_file_str)
+            .map(|pairs| pairs.into_iter().collect())
+            .ok_or_else(|| AppError(format!("failed to load safetensors: {}", lora_file.display())))?;
 
     let lora_dir = if Path::new(lora_path).is_dir() {
         PathBuf::from(lora_path)
@@ -2876,8 +2880,8 @@ fn run_fuse_in_process(
         }
     }
 
-    for (layer_name, lora_a) in &lora_a_map {
-        let Some(lora_b) = lora_b_map.get(layer_name) else {
+    for (layer_name, &lora_a) in &lora_a_map {
+        let Some(&lora_b) = lora_b_map.get(layer_name) else {
             continue;
         };
         let base_key = if layer_name.starts_with("model.") {
@@ -2889,17 +2893,14 @@ fn run_fuse_in_process(
             continue;
         };
 
-        let base_dtype = base_weight.dtype();
-        let delta = ops::matmul(lora_b, lora_a)
-            .map_err(|e| AppError(e.to_string()))?;
-        let scaled_delta = ops::multiply(&delta, pmetal::mlx::Array::from_f32(scale))
-            .map_err(|e| AppError(e.to_string()))?;
-        let fused = ops::add(base_weight, &scaled_delta)
-            .map_err(|e| AppError(e.to_string()))?;
+        let base_dtype = base_weight.dtype_raw();
+        let delta = ops::matmul(lora_b, lora_a);
+        let scaled_delta = ops::multiply(&delta, &pmetal::mlx::Array::from_f32(scale));
+        let fused = ops::add(base_weight, &scaled_delta);
         // Cast back to base dtype (LoRA is f32, base is typically bf16/f16 —
         // without this cast the fused model is 2x larger than necessary)
-        let fused = if fused.dtype() != base_dtype {
-            fused.as_dtype(base_dtype).map_err(|e| AppError(e.to_string()))?
+        let fused = if fused.dtype_raw() != base_dtype {
+            fused.as_dtype(base_dtype)
         } else {
             fused
         };
@@ -2924,9 +2925,14 @@ fn run_fuse_in_process(
     }
 
     let output_file = output_dir.join("model.safetensors");
-    let metadata = std::collections::HashMap::from([("format".to_string(), "mlx".to_string())]);
-    pmetal::mlx::Array::save_safetensors(&base_weights, Some(&metadata), &output_file)
-        .map_err(|e| AppError(e.to_string()))?;
+    let output_file_str = output_file
+        .to_str()
+        .ok_or_else(|| AppError(format!("non-UTF-8 output path: {}", output_file.display())))?;
+    let entries: Vec<(&str, &pmetal::mlx::Array)> = base_weights
+        .iter()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect();
+    pmetal::mlx::Array::save_safetensors(output_file_str, &entries);
 
     // Generate model.safetensors.index.json (required by LM Studio and other tools)
     let mut weight_map = serde_json::Map::new();
@@ -2997,15 +3003,14 @@ fn run_quantize_in_process(
             .ok_or_else(|| AppError(format!("Tensor {name} not found")))?;
         let shape_u64: Vec<u64> = tensor.shape().iter().map(|&d| d as u64).collect();
         let target_type = quantizer.get_tensor_type(name, &shape_u64);
-        tensor.eval().map_err(|e| AppError(e.to_string()))?;
+        let mut tensor = tensor.clone();
+        tensor.eval();
 
         let data_f32: Vec<f32> = match tensor.dtype() {
             pmetal::mlx::Dtype::Float32 => tensor.as_slice::<f32>().to_vec(),
             pmetal::mlx::Dtype::Float16 | pmetal::mlx::Dtype::Bfloat16 => {
-                let t_f32 = tensor
-                    .as_dtype(pmetal::mlx::Dtype::Float32)
-                    .map_err(|e| AppError(e.to_string()))?;
-                t_f32.eval().map_err(|e| AppError(e.to_string()))?;
+                let mut t_f32 = tensor.as_dtype(pmetal::mlx::Dtype::Float32.as_i32());
+                t_f32.eval();
                 t_f32.as_slice::<f32>().to_vec()
             }
             _ => continue,

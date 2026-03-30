@@ -42,8 +42,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6"
 reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
 pmetal = { path = "../../pmetal", features = ["full"] }
-# TODO: migrate direct mlx-rs usage to pmetal re-exports, then remove this dep
-mlx-rs = { version = "0.25.8", package = "pmetal-mlx-rs", features = ["safetensors"] }
+pmetal-bridge = { path = "../../pmetal-bridge" }
 
 # Optimize all dependencies in dev builds — training/tokenization is CPU-bound
 # and ~10x slower without optimizations. The GUI's own code stays at opt-level 1
