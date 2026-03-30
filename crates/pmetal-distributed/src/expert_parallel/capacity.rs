@@ -4,7 +4,7 @@
 //! imbalanced workloads where some experts are overloaded while
 //! others are idle.
 
-use pmetal_bridge::compat::{ops, Array, Dtype, Exception};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 
 /// Policy for handling tokens that exceed expert capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +88,11 @@ pub fn apply_capacity(
     // integer values so we use to_f32_vec (which evals and casts) and round.
     let idx_data: Vec<i32> = match idx_i32_opt {
         Some(v) => v.into_iter().map(|x| x as i32).collect(),
-        None => return Err(Exception::custom("apply_capacity: failed to read routing indices")),
+        None => {
+            return Err(Exception::custom(
+                "apply_capacity: failed to read routing indices",
+            ));
+        }
     };
 
     // Count assignments per expert and cap at capacity.
@@ -147,13 +151,17 @@ pub fn auxiliary_load_balance_loss(
 
     let idx_data: Vec<i32> = match routing_indices.to_f32_vec(total_assignments) {
         Some(v) => v.into_iter().map(|x| x as i32).collect(),
-        None => return Err(Exception::custom("auxiliary_load_balance_loss: failed to read routing indices")),
+        None => {
+            return Err(Exception::custom(
+                "auxiliary_load_balance_loss: failed to read routing indices",
+            ));
+        }
     };
 
     let prob_total = num_tokens * num_experts;
-    let prob_data: Vec<f32> = routing_probs
-        .to_f32_vec(prob_total)
-        .ok_or_else(|| Exception::custom("auxiliary_load_balance_loss: failed to read routing probs"))?;
+    let prob_data: Vec<f32> = routing_probs.to_f32_vec(prob_total).ok_or_else(|| {
+        Exception::custom("auxiliary_load_balance_loss: failed to read routing probs")
+    })?;
 
     // Compute f_i (fraction of tokens routed to each expert).
     let mut token_counts = vec![0usize; num_experts];
@@ -191,10 +199,7 @@ mod tests {
 
     #[test]
     fn capacity_unlimited_passes_all() {
-        let indices = Array::from_f32_slice(
-            &[0.0f32, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0],
-            &[4, 2],
-        );
+        let indices = Array::from_f32_slice(&[0.0f32, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0], &[4, 2]);
         let indices = indices.as_dtype(Dtype::Int32.as_i32());
         let config = CapacityConfig::unlimited();
         let (capped, mask) = apply_capacity(&indices, &config, 4).unwrap();
@@ -219,7 +224,12 @@ mod tests {
         capped.eval();
         mask.eval();
 
-        let capped_data: Vec<i32> = capped.to_f32_vec(4).unwrap().into_iter().map(|x| x as i32).collect();
+        let capped_data: Vec<i32> = capped
+            .to_f32_vec(4)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
         let mask_data: Vec<f32> = mask.to_f32_vec(4).unwrap();
 
         // First 2 tokens should pass, last 2 should be dropped.

@@ -156,8 +156,7 @@ impl JensenShannonLoss {
 
         if teacher_ptr.is_null() || student_ptr.is_null() {
             return Err(crate::DistillError::Metal(
-                "data_ptr returned null — array may not be f32 or not evaluated"
-                    .to_string(),
+                "data_ptr returned null — array may not be f32 or not evaluated".to_string(),
             ));
         }
 
@@ -352,7 +351,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_jensen_shannon_gradient_flow() {
-        use pmetal_bridge::compat::nn::value_and_grad;
+        use pmetal_bridge::compat::nn::value_and_grad_explicit;
 
         let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
 
@@ -368,25 +367,21 @@ mod tests {
 
             // log(M) = log(0.5*(P+Q)) via log-sum-exp
             let log2 = Array::from_f32(2.0_f32.ln());
-            let log_mixture = log_sum_exp(&teacher_log_probs, &student_log_probs)
-                .subtract(&log2);
+            let log_mixture = log_sum_exp(&teacher_log_probs, &student_log_probs).subtract(&log2);
 
-            let kl_teacher_m = teacher_probs
-                .multiply(&teacher_log_probs.subtract(&log_mixture));
+            let kl_teacher_m = teacher_probs.multiply(&teacher_log_probs.subtract(&log_mixture));
             let student_probs = student_log_probs.exp();
-            let kl_student_m = student_probs
-                .multiply(&student_log_probs.subtract(&log_mixture));
+            let kl_student_m = student_probs.multiply(&student_log_probs.subtract(&log_mixture));
 
             let half = Array::from_f32(0.5);
-            let js = kl_teacher_m
-                .add(&kl_student_m)
-                .multiply(&half);
+            let js = kl_teacher_m.add(&kl_student_m).multiply(&half);
             let js_sum = js.sum_axes(&[-1], false);
             js_sum.mean_all()
         };
 
         let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
-        let (loss_val_arr, grads) = value_and_grad(loss_fn, &[student], &[]).unwrap();
+        let (mut loss_val_arr, mut grads) =
+            value_and_grad_explicit(loss_fn, &[student], &[]).unwrap();
 
         loss_val_arr.eval();
         grads[0].eval();

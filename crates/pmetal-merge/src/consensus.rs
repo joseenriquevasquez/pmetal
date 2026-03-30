@@ -65,7 +65,9 @@ pub fn sign_consensus(tensors: &[Array], weights: &[f32]) -> Result<Array> {
         // sign product > 0 means agreement; <= 0 means disagreement or zero.
         let product = s.multiply(&maj_sign);
         let zero = Array::from_f32(0.0);
-        let agrees = product.greater(&zero).as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+        let agrees = product
+            .greater(&zero)
+            .as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
 
         // Add weight * tensor where the model agrees with the majority sign.
         let contribution = tensor.multiply(&Array::from_f32(*weight));

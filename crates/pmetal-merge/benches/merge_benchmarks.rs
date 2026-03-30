@@ -3,7 +3,7 @@
 //! Run with: cargo bench -p pmetal-merge
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use mlx_rs::Array;
+use pmetal_bridge::compat::Array;
 use pmetal_merge::{
     gpu_merge::GpuMerger, sign_consensus, sparsify_batch_by_magnitude, sparsify_by_magnitude,
     sparsify_by_magnitude_online,

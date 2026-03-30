@@ -315,8 +315,7 @@ impl DataLoader {
         let input_ids = Array::from_i32_slice(&components.input_ids_flat).reshape(shape);
         let labels_i32: Vec<i32> = components.labels_flat.iter().map(|&x| x as i32).collect();
         let labels = Array::from_i32_slice(&labels_i32).reshape(shape);
-        let attention_mask =
-            Array::from_i32_slice(&components.attention_mask_flat).reshape(shape);
+        let attention_mask = Array::from_i32_slice(&components.attention_mask_flat).reshape(shape);
 
         let pixel_values = if !components.pixel_tensors.is_empty() {
             let refs: Vec<&Array> = components.pixel_tensors.iter().collect();

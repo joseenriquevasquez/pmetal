@@ -202,15 +202,11 @@ fn array_from_handle(handle: MlxArray) -> Array {
 pub fn all_sum(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exception> {
     let _stream = StreamGuard(default_stream());
     let x_handle = ArrayHandle::from_array(x);
-    let mut result = MlxArray { ctx: std::ptr::null_mut() };
-    let status = unsafe {
-        mlx_distributed_all_sum(
-            &mut result,
-            x_handle.0,
-            group_handle(group),
-            _stream.0,
-        )
+    let mut result = MlxArray {
+        ctx: std::ptr::null_mut(),
     };
+    let status =
+        unsafe { mlx_distributed_all_sum(&mut result, x_handle.0, group_handle(group), _stream.0) };
     if status != SUCCESS {
         return Err(Exception::custom("mlx_distributed_all_sum failed"));
     }
@@ -225,14 +221,11 @@ pub fn all_sum(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exc
 pub fn all_gather(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exception> {
     let _stream = StreamGuard(default_stream());
     let x_handle = ArrayHandle::from_array(x);
-    let mut result = MlxArray { ctx: std::ptr::null_mut() };
+    let mut result = MlxArray {
+        ctx: std::ptr::null_mut(),
+    };
     let status = unsafe {
-        mlx_distributed_all_gather(
-            &mut result,
-            x_handle.0,
-            group_handle(group),
-            _stream.0,
-        )
+        mlx_distributed_all_gather(&mut result, x_handle.0, group_handle(group), _stream.0)
     };
     if status != SUCCESS {
         return Err(Exception::custom("mlx_distributed_all_gather failed"));
@@ -245,15 +238,11 @@ pub fn all_gather(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, 
 pub fn all_max(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exception> {
     let _stream = StreamGuard(default_stream());
     let x_handle = ArrayHandle::from_array(x);
-    let mut result = MlxArray { ctx: std::ptr::null_mut() };
-    let status = unsafe {
-        mlx_distributed_all_max(
-            &mut result,
-            x_handle.0,
-            group_handle(group),
-            _stream.0,
-        )
+    let mut result = MlxArray {
+        ctx: std::ptr::null_mut(),
     };
+    let status =
+        unsafe { mlx_distributed_all_max(&mut result, x_handle.0, group_handle(group), _stream.0) };
     if status != SUCCESS {
         return Err(Exception::custom("mlx_distributed_all_max failed"));
     }
@@ -265,15 +254,11 @@ pub fn all_max(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exc
 pub fn all_min(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exception> {
     let _stream = StreamGuard(default_stream());
     let x_handle = ArrayHandle::from_array(x);
-    let mut result = MlxArray { ctx: std::ptr::null_mut() };
-    let status = unsafe {
-        mlx_distributed_all_min(
-            &mut result,
-            x_handle.0,
-            group_handle(group),
-            _stream.0,
-        )
+    let mut result = MlxArray {
+        ctx: std::ptr::null_mut(),
     };
+    let status =
+        unsafe { mlx_distributed_all_min(&mut result, x_handle.0, group_handle(group), _stream.0) };
     if status != SUCCESS {
         return Err(Exception::custom("mlx_distributed_all_min failed"));
     }
@@ -289,14 +274,11 @@ pub fn all_min(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exc
 pub fn sum_scatter(x: &Array, group: Option<&DistributedGroup>) -> Result<Array, Exception> {
     let _stream = StreamGuard(default_stream());
     let x_handle = ArrayHandle::from_array(x);
-    let mut result = MlxArray { ctx: std::ptr::null_mut() };
+    let mut result = MlxArray {
+        ctx: std::ptr::null_mut(),
+    };
     let status = unsafe {
-        mlx_distributed_sum_scatter(
-            &mut result,
-            x_handle.0,
-            group_handle(group),
-            _stream.0,
-        )
+        mlx_distributed_sum_scatter(&mut result, x_handle.0, group_handle(group), _stream.0)
     };
     if status != SUCCESS {
         return Err(Exception::custom("mlx_distributed_sum_scatter failed"));
@@ -312,15 +294,11 @@ pub fn sum_scatter(x: &Array, group: Option<&DistributedGroup>) -> Result<Array,
 pub fn send(x: &Array, dst: i32, group: Option<&DistributedGroup>) -> Result<Array, Exception> {
     let _stream = StreamGuard(default_stream());
     let x_handle = ArrayHandle::from_array(x);
-    let mut result = MlxArray { ctx: std::ptr::null_mut() };
+    let mut result = MlxArray {
+        ctx: std::ptr::null_mut(),
+    };
     let status = unsafe {
-        mlx_distributed_send(
-            &mut result,
-            x_handle.0,
-            dst,
-            group_handle(group),
-            _stream.0,
-        )
+        mlx_distributed_send(&mut result, x_handle.0, dst, group_handle(group), _stream.0)
     };
     if status != SUCCESS {
         return Err(Exception::custom("mlx_distributed_send failed"));
@@ -339,7 +317,9 @@ pub fn recv(
     group: Option<&DistributedGroup>,
 ) -> Result<Array, Exception> {
     let _stream = StreamGuard(default_stream());
-    let mut result = MlxArray { ctx: std::ptr::null_mut() };
+    let mut result = MlxArray {
+        ctx: std::ptr::null_mut(),
+    };
     let dtype_i32 = dtype.as_i32();
     let status = unsafe {
         mlx_distributed_recv(
@@ -370,15 +350,11 @@ pub fn recv_like(
 ) -> Result<Array, Exception> {
     let _stream = StreamGuard(default_stream());
     let x_handle = ArrayHandle::from_array(x);
-    let mut result = MlxArray { ctx: std::ptr::null_mut() };
+    let mut result = MlxArray {
+        ctx: std::ptr::null_mut(),
+    };
     let status = unsafe {
-        mlx_distributed_recv_like(
-            &mut result,
-            x_handle.0,
-            src,
-            group_handle(group),
-            _stream.0,
-        )
+        mlx_distributed_recv_like(&mut result, x_handle.0, src, group_handle(group), _stream.0)
     };
     if status != SUCCESS {
         return Err(Exception::custom("mlx_distributed_recv_like failed"));

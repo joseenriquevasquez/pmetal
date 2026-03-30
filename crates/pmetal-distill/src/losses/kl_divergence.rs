@@ -248,14 +248,10 @@ impl DistillLoss for KlDivergenceLoss {
 
         let kl_per_token = if self.reverse {
             let log_ratio = student_log_probs.subtract(&teacher_log_probs);
-            student_probs
-                .multiply(&log_ratio)
-                .sum_axes(&[-1], false)
+            student_probs.multiply(&log_ratio).sum_axes(&[-1], false)
         } else {
             let log_ratio = teacher_log_probs.subtract(&student_log_probs);
-            teacher_probs
-                .multiply(&log_ratio)
-                .sum_axes(&[-1], false)
+            teacher_probs.multiply(&log_ratio).sum_axes(&[-1], false)
         };
 
         if let Some(w) = weights {
@@ -382,7 +378,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_kl_divergence_gradient_flow() {
-        use pmetal_bridge::compat::nn::value_and_grad;
+        use pmetal_bridge::compat::nn::value_and_grad_explicit;
 
         let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let teacher_clone = teacher.clone();
@@ -404,7 +400,8 @@ mod tests {
         };
 
         let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
-        let (loss_val_arr, grads) = value_and_grad(loss_fn, &[student], &[]).unwrap();
+        let (mut loss_val_arr, mut grads) =
+            value_and_grad_explicit(loss_fn, &[student], &[]).unwrap();
 
         loss_val_arr.eval();
         grads[0].eval();

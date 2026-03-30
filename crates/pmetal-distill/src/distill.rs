@@ -435,7 +435,9 @@ fn compute_hard_loss(logits: &Array, labels: &Array) -> Result<Array> {
 
     // Build ignore mask: labels >= 0 (ignore_index = -100 or any negative)
     let zero_i = Array::from_i32(0);
-    let valid_mask = labels_flat.greater_equal(&zero_i).as_dtype(Dtype::Float32.as_i32());
+    let valid_mask = labels_flat
+        .greater_equal(&zero_i)
+        .as_dtype(Dtype::Float32.as_i32());
 
     // Clamp labels to valid range for gather (ignored positions won't contribute to loss)
     let labels_clamped = ops::maximum(&labels_flat, &zero_i)

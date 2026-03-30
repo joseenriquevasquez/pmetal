@@ -147,8 +147,7 @@ impl SoftCrossEntropyLoss {
 
         if teacher_ptr.is_null() || student_ptr.is_null() {
             return Err(crate::DistillError::Metal(
-                "data_ptr returned null — array may not be f32 or not evaluated"
-                    .to_string(),
+                "data_ptr returned null — array may not be f32 or not evaluated".to_string(),
             ));
         }
 
@@ -315,8 +314,10 @@ mod tests {
     #[serial]
     fn test_soft_ce_batch_processing() {
         // Test with batch of sequences
-        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 2.0, 3.0, 4.0, 5.0], &[2, 1, 4]);
-        let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0, 5.0, 4.0, 3.0, 2.0], &[2, 1, 4]);
+        let teacher =
+            Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 2.0, 3.0, 4.0, 5.0], &[2, 1, 4]);
+        let student =
+            Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0, 5.0, 4.0, 3.0, 2.0], &[2, 1, 4]);
 
         let loss = SoftCrossEntropyLoss::new();
         let result = loss.compute(&teacher, &student, 1.0).unwrap();
@@ -331,7 +332,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_soft_cross_entropy_gradient_flow() {
-        use pmetal_bridge::compat::nn::value_and_grad;
+        use pmetal_bridge::compat::nn::value_and_grad_explicit;
 
         let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
 
@@ -351,7 +352,8 @@ mod tests {
         };
 
         let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
-        let (loss_val_arr, grads) = value_and_grad(loss_fn, &[student], &[]).unwrap();
+        let (mut loss_val_arr, mut grads) =
+            value_and_grad_explicit(loss_fn, &[student], &[]).unwrap();
 
         loss_val_arr.eval();
         grads[0].eval();

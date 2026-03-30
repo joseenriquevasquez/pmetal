@@ -248,11 +248,7 @@ pub fn generate_reasoning_mask(tokens: &Array, start_token: u32, end_token: u32)
     let mask = start_cumsum.subtract(&end_cumsum);
 
     // Clamp to [0, 1] to handle multiple/nested reasoning blocks correctly
-    let mask = ops::clip(
-        &mask,
-        Some(&Array::from_i32(0)),
-        Some(&Array::from_i32(1)),
-    );
+    let mask = ops::clip(&mask, Some(&Array::from_i32(0)), Some(&Array::from_i32(1)));
 
     Ok(mask.as_dtype(Dtype::Float32.as_i32()))
 }
@@ -318,7 +314,7 @@ mod tests {
     fn test_generate_reasoning_mask() {
         // Tokens: [CLS, "Hello", "<think>", " reasoning", " steps", "</think>", " final", " answer"]
         // Indices:  0,      1,         2,          3,        4,         5,        6,        7
-        let tokens = Array::from_i32_slice(&[0_i32, 1, 2, 3, 4, 5, 6, 7], &[1, 8]);
+        let tokens = Array::from_slice(&[0_i32, 1, 2, 3, 4, 5, 6, 7], &[1, 8]);
         let start_token = 2;
         let end_token = 5;
 

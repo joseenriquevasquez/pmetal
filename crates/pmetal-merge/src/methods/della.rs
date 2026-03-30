@@ -205,7 +205,10 @@ impl DellaMerge {
 
         let original_shape = delta.shape().to_vec();
         let mut flat = delta.reshape(&[-1]);
-        let n = original_shape.iter().map(|&d| d as usize).product::<usize>();
+        let n = original_shape
+            .iter()
+            .map(|&d| d as usize)
+            .product::<usize>();
         let values: Vec<f32> = flat.to_f32_vec(n).unwrap_or_default();
 
         // Compute absolute values for probability computation.

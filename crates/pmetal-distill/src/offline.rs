@@ -336,8 +336,9 @@ impl LogitCompressor {
 
     fn compress_none(&self, logits: &Array) -> Result<CompressedLogits> {
         let n: usize = logits.shape().iter().map(|&s| s as usize).product();
-        let data: Vec<f32> = logits.clone().to_f32_vec(n)
-            .ok_or_else(|| crate::DistillError::LogitCache("failed to read logits as f32".to_string()))?;
+        let data: Vec<f32> = logits.clone().to_f32_vec(n).ok_or_else(|| {
+            crate::DistillError::LogitCache("failed to read logits as f32".to_string())
+        })?;
         let shape = logits.shape().to_vec();
         Ok(CompressedLogits::Full { data, shape })
     }
@@ -360,8 +361,12 @@ impl LogitCompressor {
         // CPU top-k selection: offline compression is a preprocessing step run once
         // per dataset, not a training hot path. CPU partial sort is simpler and more
         // predictable than navigating MLX lazy-eval semantics for index arrays.
-        let data_owned: Vec<f32> = flat.clone().to_f32_vec(num_tokens * vocab_size)
-            .ok_or_else(|| crate::DistillError::LogitCache("failed to read flat logits as f32".to_string()))?;
+        let data_owned: Vec<f32> = flat
+            .clone()
+            .to_f32_vec(num_tokens * vocab_size)
+            .ok_or_else(|| {
+                crate::DistillError::LogitCache("failed to read flat logits as f32".to_string())
+            })?;
         let data_slice: &[f32] = &data_owned;
 
         let mut all_values = Vec::with_capacity(num_tokens * k);
@@ -435,8 +440,9 @@ impl LogitCompressor {
     fn compress_int8(&self, logits: &Array) -> Result<CompressedLogits> {
         let shape = logits.shape().to_vec();
         let n: usize = shape.iter().map(|&s| s as usize).product();
-        let data: Vec<f32> = logits.clone().to_f32_vec(n)
-            .ok_or_else(|| crate::DistillError::LogitCache("failed to read logits as f32".to_string()))?;
+        let data: Vec<f32> = logits.clone().to_f32_vec(n).ok_or_else(|| {
+            crate::DistillError::LogitCache("failed to read logits as f32".to_string())
+        })?;
 
         // Per-token quantization: compute min/max per row so that each token's
         // dynamic range is captured independently. This avoids a single outlier
@@ -545,8 +551,9 @@ impl LogitCompressor {
     fn compress_int4(&self, logits: &Array) -> Result<CompressedLogits> {
         let shape = logits.shape().to_vec();
         let n: usize = shape.iter().map(|&s| s as usize).product();
-        let data: Vec<f32> = logits.clone().to_f32_vec(n)
-            .ok_or_else(|| crate::DistillError::LogitCache("failed to read logits as f32".to_string()))?;
+        let data: Vec<f32> = logits.clone().to_f32_vec(n).ok_or_else(|| {
+            crate::DistillError::LogitCache("failed to read logits as f32".to_string())
+        })?;
 
         // Find min/max
         let min = data.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -676,7 +683,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_topk_roundtrip() {
-        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 10.0, 4.0, 5.0, 6.0, 20.0, 8.0], &[2, 4]);
+        let logits =
+            Array::from_f32_slice(&[1.0_f32, 2.0, 10.0, 4.0, 5.0, 6.0, 20.0, 8.0], &[2, 4]);
 
         let compressor = LogitCompressor::new(CompressionMethod::TopK, 2);
         let compressed = compressor.compress(&logits).unwrap();

@@ -3,7 +3,7 @@
 use super::placement::ExpertPlacement;
 use crate::mlx_dist::group::DistributedGroup;
 use crate::mlx_dist::ops;
-use pmetal_bridge::compat::{ops as mlx_ops, Array, Dtype, Exception};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops as mlx_ops};
 
 /// Slice a contiguous range along `axis` using `take_axis`.
 ///
@@ -137,12 +137,8 @@ impl ExpertDispatcher {
                 // Receive computed results from remote rank.
                 let result_shape = vec![token_indices.len() as i32, hidden_dim as i32];
                 // Use Float32 as the receive dtype (matches the hidden_states dtype assumption).
-                let mut result = ops::recv(
-                    &result_shape,
-                    Dtype::Float32,
-                    dest as i32,
-                    Some(group),
-                )?;
+                let mut result =
+                    ops::recv(&result_shape, Dtype::Float32, dest as i32, Some(group))?;
                 result.eval();
                 received_results[dest] = Some(result);
             }
@@ -161,12 +157,7 @@ impl ExpertDispatcher {
             }
 
             let incoming_shape = vec![expected_tokens as i32, hidden_dim as i32];
-            let mut incoming = ops::recv(
-                &incoming_shape,
-                Dtype::Float32,
-                src as i32,
-                Some(group),
-            )?;
+            let mut incoming = ops::recv(&incoming_shape, Dtype::Float32, src as i32, Some(group))?;
             incoming.eval();
 
             let result = local_expert_fn(&incoming, &expert_for_token[src])?;

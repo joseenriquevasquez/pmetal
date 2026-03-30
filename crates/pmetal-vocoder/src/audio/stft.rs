@@ -204,14 +204,12 @@ pub fn istft(stft_matrix: &Array, config: &StftConfig) -> Result<Array> {
         let pad_after = output_length - offset - n_fft;
 
         // Extract frame i for all batches: [batch, n_fft]
-        let frame = windowed_frames.slice(&[0, i, 0], &[batch_size, i + 1, n_fft])
+        let frame = windowed_frames
+            .slice(&[0, i, 0], &[batch_size, i + 1, n_fft])
             .reshape(&[batch_size, n_fft]);
 
         // Pad frame along axis 1: [batch, output_length]
-        let padded_frame = frame.pad_constant(
-            &[0, 0, pad_before, pad_after],
-            0.0,
-        );
+        let padded_frame = frame.pad_constant(&[0, 0, pad_before, pad_after], 0.0);
 
         output_sum = output_sum.add(&padded_frame);
 

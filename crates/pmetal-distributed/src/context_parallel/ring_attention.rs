@@ -25,7 +25,7 @@
 
 use crate::mlx_dist::group::DistributedGroup;
 use crate::mlx_dist::ops;
-use pmetal_bridge::compat::{ops as mlx_ops, Array, Exception};
+use pmetal_bridge::compat::{Array, Exception, ops as mlx_ops};
 
 /// Context parallelism communication mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,7 +219,9 @@ fn online_softmax_update(
     let correction2 = lse2.subtract(&new_lse).exp();
 
     // Combined output.
-    let new_output = output1.multiply(&correction1).add(&output2.multiply(&correction2));
+    let new_output = output1
+        .multiply(&correction1)
+        .add(&output2.multiply(&correction2));
 
     Ok((new_output, new_lse))
 }

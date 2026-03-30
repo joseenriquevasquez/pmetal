@@ -141,7 +141,8 @@ mod tests {
 
     #[test]
     fn identical_distributions_zero_loss() {
-        let logits = Array::from_f32_slice(&[3.0f32, 2.0, 1.0, 0.5, 3.0, 2.0, 1.0, 0.5], &[1, 2, 4]);
+        let logits =
+            Array::from_f32_slice(&[3.0f32, 2.0, 1.0, 0.5, 3.0, 2.0, 1.0, 0.5], &[1, 2, 4]);
         let loss = HingeRankingLoss::new().with_top_k(4);
         let result = loss.compute(&logits, &logits, 1.0).unwrap();
         result.eval();

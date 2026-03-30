@@ -311,8 +311,8 @@ pub fn align_vocab_with_k(
     // Out-of-range positions are masked below so clamping to 0 is safe here.
     let student_vocab_minus1 = Array::from_i32((student_vocab as i32) - 1);
     let zero = Array::from_i32(0);
-    let clamped = ops::minimum(&top_k_indices, &student_vocab_minus1)
-        .as_dtype(Dtype::Int32.as_i32());
+    let clamped =
+        ops::minimum(&top_k_indices, &student_vocab_minus1).as_dtype(Dtype::Int32.as_i32());
     let clamped = ops::maximum(&clamped, &zero);
 
     // Gather student logits at clamped positions.

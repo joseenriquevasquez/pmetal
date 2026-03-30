@@ -491,9 +491,7 @@ impl TaidDistiller {
                 let kl_target = target_probs.multiply(&log_target.subtract(&log_m));
                 let kl_student = student_probs.multiply(&student_log_probs.subtract(&log_m));
 
-                let js = kl_target
-                    .add(&kl_student)
-                    .multiply(&Array::from_f32(0.5));
+                let js = kl_target.add(&kl_student).multiply(&Array::from_f32(0.5));
                 js.sum_axes(&[-1], false).mean_all()
             }
             TaidLossType::ReverseKl => {
@@ -731,7 +729,7 @@ mod tests {
 
         let teacher_logits = Array::from_f32_slice(&[2.0f32, 1.0, 0.0], &[1, 1, 3]);
         let student_logits = Array::from_f32_slice(&[1.0f32, 1.0, 1.0], &[1, 1, 3]);
-        let labels = Array::from_i32_slice(&[0i32], &[1, 1]);
+        let labels = Array::from_slice(&[0i32], &[1, 1]);
 
         let output = distiller
             .compute_loss(&teacher_logits, &student_logits, 50, 100, Some(&labels))

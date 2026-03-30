@@ -256,14 +256,8 @@ impl HiddenStateLoss {
         let dot = teacher.multiply(student).sum_axes(&[-1], true);
 
         // Norms
-        let teacher_norm = teacher
-            .multiply(teacher)
-            .sum_axes(&[-1], true)
-            .sqrt();
-        let student_norm = student
-            .multiply(student)
-            .sum_axes(&[-1], true)
-            .sqrt();
+        let teacher_norm = teacher.multiply(teacher).sum_axes(&[-1], true).sqrt();
+        let student_norm = student.multiply(student).sum_axes(&[-1], true).sqrt();
 
         // Cosine similarity with epsilon for stability
         let eps = Array::from_f32(1e-8);

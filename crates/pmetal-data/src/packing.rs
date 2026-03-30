@@ -651,8 +651,7 @@ impl PackedTrainingBatch {
             Array::from_i32_slice(&labels_i32)
         } else {
             // Default: next token prediction (shift input_ids by 1)
-            let mut labels_i32: Vec<i32> =
-                batch.input_ids[1..].iter().map(|&x| x as i32).collect();
+            let mut labels_i32: Vec<i32> = batch.input_ids[1..].iter().map(|&x| x as i32).collect();
             labels_i32.push(-100); // Ignore last token prediction
             Array::from_i32_slice(&labels_i32)
         };

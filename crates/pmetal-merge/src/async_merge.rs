@@ -436,10 +436,7 @@ impl AsyncMergePipeline {
         lambda: f32,
     ) -> Result<Array> {
         // Step 1: Compute task vectors
-        let task_vectors: Vec<Array> = tensors
-            .iter()
-            .map(|t| t.subtract(base))
-            .collect::<Vec<_>>();
+        let task_vectors: Vec<Array> = tensors.iter().map(|t| t.subtract(base)).collect::<Vec<_>>();
 
         // Step 2: Sparsify
         let sparse_vectors = crate::sparsify_batch_by_magnitude(&task_vectors, densities)?;

@@ -103,7 +103,11 @@ impl ModelStockMerge {
         let tau2_vals = tau2_clone.to_f32_vec(n).unwrap_or_default();
         let mut v1_clone = v1.clone();
         let v1_vals = v1_clone.to_f32_vec(n).unwrap_or_default();
-        let proj_coeff: f32 = tau2_vals.iter().zip(v1_vals.iter()).map(|(a, b)| a * b).sum();
+        let proj_coeff: f32 = tau2_vals
+            .iter()
+            .zip(v1_vals.iter())
+            .map(|(a, b)| a * b)
+            .sum();
 
         let proj = v1.multiply(&Array::from_f32(proj_coeff));
         let v2_unnorm = tau2.subtract(&proj);

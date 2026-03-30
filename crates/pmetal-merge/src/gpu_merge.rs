@@ -178,17 +178,15 @@ impl GpuMerger {
         let mut weights_shape: Vec<i32> = Vec::with_capacity(1 + tensor_ndim_usize);
         weights_shape.push(num_models as i32);
         weights_shape.extend(std::iter::repeat_n(1_i32, tensor_ndim_usize));
-        let weights_bcast = Array::from_f32_slice(weights, &[num_models as i32])
-            .reshape(&weights_shape);
+        let weights_bcast =
+            Array::from_f32_slice(weights, &[num_models as i32]).reshape(&weights_shape);
 
         // 5a. Element-wise signs for every model and every parameter: [M, ...].
         let signs = stacked_sparse.sign();
 
         // 5b. Weighted sign vote collapsed over the model axis:
         //     vote[i] = sum_m( weight_m * sign(sparse_m[i]) )  ->  shape [...]
-        let vote = signs
-            .multiply(&weights_bcast)
-            .sum_axis(0, false);
+        let vote = signs.multiply(&weights_bcast).sum_axis(0, false);
 
         // 5c. Majority sign at each parameter position (+1, -1, or 0 when tied).
         let maj_sign = vote.sign();
@@ -223,10 +221,7 @@ impl GpuMerger {
         lambda: f32,
     ) -> Result<Array> {
         // Step 1: Compute task vectors
-        let task_vectors: Vec<Array> = tensors
-            .iter()
-            .map(|t| t.subtract(base))
-            .collect();
+        let task_vectors: Vec<Array> = tensors.iter().map(|t| t.subtract(base)).collect();
 
         // Step 2: Batch sparsify (uses O(n) quickselect)
         let sparse_vectors = crate::sparsify_batch_by_magnitude(&task_vectors, densities)?;
@@ -249,10 +244,7 @@ impl GpuMerger {
         lambda: f32,
     ) -> Result<Array> {
         // Step 1: Compute task vectors
-        let task_vectors: Vec<Array> = tensors
-            .iter()
-            .map(|t| t.subtract(base))
-            .collect();
+        let task_vectors: Vec<Array> = tensors.iter().map(|t| t.subtract(base)).collect();
 
         // Step 2: Sparsify each task vector
         let sparse_vectors: Vec<Array> = task_vectors

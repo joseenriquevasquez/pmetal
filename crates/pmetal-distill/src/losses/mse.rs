@@ -146,7 +146,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_mse_gradient_flow() {
-        use pmetal_bridge::compat::nn::value_and_grad;
+        use pmetal_bridge::compat::nn::value_and_grad_explicit;
 
         let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
 
@@ -157,7 +157,8 @@ mod tests {
         };
 
         let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
-        let (loss_val_arr, grads) = value_and_grad(loss_fn, &[student], &[]).unwrap();
+        let (mut loss_val_arr, mut grads) =
+            value_and_grad_explicit(loss_fn, &[student], &[]).unwrap();
 
         loss_val_arr.eval();
         grads[0].eval();
@@ -191,8 +192,10 @@ mod tests {
     #[test]
     #[serial]
     fn test_mse_batch_processing() {
-        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 1, 4]);
-        let student = Array::from_f32_slice(&[2.0_f32, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], &[2, 1, 4]);
+        let teacher =
+            Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 1, 4]);
+        let student =
+            Array::from_f32_slice(&[2.0_f32, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], &[2, 1, 4]);
 
         let loss = MseLoss::new();
         let result = loss.compute(&teacher, &student, 1.0).unwrap();

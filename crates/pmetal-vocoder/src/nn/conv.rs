@@ -363,7 +363,14 @@ fn conv_transpose_1d_manual(
     if stride == 1 && padding == 0 && output_padding == 0 && dilation == 1 {
         // Simple case: just apply conv with flipped kernel
         let weight_flipped = flip_axis(weight, 2)?; // Flip along kernel axis (axis 2 in OIK)
-        return Ok(run_conv1d(x, &weight_flipped, 1, kernel_size - 1, 1, groups));
+        return Ok(run_conv1d(
+            x,
+            &weight_flipped,
+            1,
+            kernel_size - 1,
+            1,
+            groups,
+        ));
     }
 
     // General case: insert zeros then convolve
@@ -377,10 +384,7 @@ fn conv_transpose_1d_manual(
         let interleaved = ops::concatenate_axis(&[&x_expanded, &zeros_between], -1);
         let interleaved = interleaved.reshape(&[batch, in_channels, in_length * stride]);
         // Trim last (stride-1) zeros using slice
-        let upsampled = interleaved.slice(
-            &[0, 0, 0],
-            &[batch, in_channels, upsampled_length],
-        );
+        let upsampled = interleaved.slice(&[0, 0, 0], &[batch, in_channels, upsampled_length]);
 
         // Step 2: Flip kernel and apply convolution
         let weight_flipped = flip_axis(weight, 2)?;
@@ -411,7 +415,14 @@ fn conv_transpose_1d_manual(
         let conv_padding = dilation * (kernel_size - 1) - padding;
         let conv_padding = conv_padding.max(0);
 
-        Ok(run_conv1d(x, &weight_flipped, 1, conv_padding, dilation, groups))
+        Ok(run_conv1d(
+            x,
+            &weight_flipped,
+            1,
+            conv_padding,
+            dilation,
+            groups,
+        ))
     }
 }
 

@@ -406,10 +406,7 @@ impl Fp8Merger {
         debug!("FP8 TIES merge: {} tensors", tensors.len());
 
         // Step 1: Compute task vectors (can stay in FP8 for subtraction)
-        let task_vectors: Vec<Array> = tensors
-            .iter()
-            .map(|t| t.subtract(base))
-            .collect();
+        let task_vectors: Vec<Array> = tensors.iter().map(|t| t.subtract(base)).collect();
 
         // Step 2: Sparsification - needs full precision for magnitude comparison
         let sparse_vectors = if self.config.force_dequant_for_sparsify {
