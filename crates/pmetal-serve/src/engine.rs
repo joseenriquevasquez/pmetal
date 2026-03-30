@@ -2,10 +2,10 @@
 
 use crate::error::{ServeError, ServeResult};
 use crate::types::ChatMessage;
-use pmetal_mlx::{Array, Dtype, ModuleParameters as _};
 use pmetal_data::chat_templates::{ChatTemplate, ChatTemplateType, detect_chat_template};
 use pmetal_data::inference_config::collect_all_stop_tokens;
 use pmetal_mlx::kv_cache::{CacheMode, KVCache, KVCacheConfig, MambaCache};
+use pmetal_mlx::{Array, Dtype, ModuleParameters as _};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::{GenerationConfig, Sampler};
 use pmetal_models::{
@@ -868,8 +868,8 @@ impl InferenceEngine {
         // take_axis with a 1-element index array extracts position last_idx
         // along axis 1 → [1, 1, vocab_size].  reshape flattens to [vocab_size].
         let idx = Array::from_slice(&[last_idx], &[1]);
-        let last = logits.take_axis(&idx, 1).map_err(ServeError::Model)?;
-        last.reshape(&[vocab_size]).map_err(ServeError::Model)
+        let last = logits.take_axis(&idx, 1);
+        Ok(last.reshape(&[vocab_size]))
     }
 
     /// Generate tokens from input IDs (non-streaming).
@@ -929,7 +929,7 @@ impl InferenceEngine {
                 .map_err(ServeError::Model)?;
             // Blocked on mlx_rs::eval_async — would allow GPU pipeline overlap
             // between eval and the next decode step for higher throughput.
-            logits.eval().map_err(ServeError::Model)?;
+            logits.eval();
 
             // Sampler must be created inside spawn_blocking — it holds
             // MLX Arrays and is !Send.
@@ -976,7 +976,7 @@ impl InferenceEngine {
                         .map_err(ServeError::Model)?;
                     // Sync eval required — lazy graph grows unbounded without it.
                     // Blocked on mlx_rs::eval_async for pipeline overlap.
-                    logits.eval().map_err(ServeError::Model)?;
+                    logits.eval();
                 }
             }
 
@@ -1094,10 +1094,7 @@ impl InferenceEngine {
             };
             // Sync eval required — lazy graph grows unbounded without it.
             // Blocked on mlx_rs::eval_async for pipeline overlap.
-            if let Err(e) = logits.eval() {
-                send!(TokenEvent::Error(e.to_string()));
-                return;
-            }
+            logits.eval();
 
             // Sampler created inside spawn_blocking — it holds MLX Arrays.
             let mut sampler = Sampler::new(gen_config);
@@ -1161,10 +1158,7 @@ impl InferenceEngine {
                     };
                     // Sync eval required — prevents unbounded lazy graph growth.
                     // Blocked on mlx_rs::eval_async for pipeline overlap.
-                    if let Err(e) = logits.eval() {
-                        send!(TokenEvent::Error(e.to_string()));
-                        return;
-                    }
+                    logits.eval();
                 }
             }
 
