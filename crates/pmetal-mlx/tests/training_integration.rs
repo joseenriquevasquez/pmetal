@@ -5,15 +5,14 @@
 
 #![allow(clippy::expect_fun_call)]
 
-use mlx_rs::Array;
-use mlx_rs::random::uniform;
+use pmetal_bridge::compat::{Array, Dtype, random};
 use pmetal_mlx::kernels::{
     FusedAttentionConfig, compute_attention_gradients, differentiable_attention,
     init_training_context, with_training_mode,
 };
 
 fn random_tensor(shape: &[i32]) -> Array {
-    uniform::<_, f32>(0.0, 1.0, shape, None).unwrap()
+    random::uniform_range(0.0, 1.0, shape, Dtype::Float32)
 }
 
 #[test]
@@ -40,21 +39,22 @@ fn test_training_attention_forward_backward() {
     let config = FusedAttentionConfig::new(n_heads, n_kv_heads, head_dim);
 
     // Forward pass
-    let output = differentiable_attention(0, &queries, &keys, &values, &config)
+    let mut output = differentiable_attention(0, &queries, &keys, &values, &config)
         .expect("Forward pass failed");
 
-    output.eval().expect("Eval failed");
+    output.eval();
     assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
 
     // Simulate upstream gradient
     let d_output = random_tensor(&[batch, n_heads, seq_len, head_dim]);
 
     // Backward pass
-    let (d_q, d_k, d_v) = compute_attention_gradients(0, &d_output).expect("Backward pass failed");
+    let (mut d_q, mut d_k, mut d_v) =
+        compute_attention_gradients(0, &d_output).expect("Backward pass failed");
 
-    d_q.eval().expect("Eval d_q failed");
-    d_k.eval().expect("Eval d_k failed");
-    d_v.eval().expect("Eval d_v failed");
+    d_q.eval();
+    d_k.eval();
+    d_v.eval();
 
     // Verify gradient shapes
     assert_eq!(d_q.shape(), &[batch, n_heads, seq_len, head_dim]);
@@ -62,13 +62,13 @@ fn test_training_attention_forward_backward() {
     assert_eq!(d_v.shape(), &[batch, n_kv_heads, seq_len, head_dim]);
 
     // Verify gradients are non-zero (basic sanity check)
-    let d_q_sum = d_q.abs().unwrap().sum(None).unwrap();
-    let d_k_sum = d_k.abs().unwrap().sum(None).unwrap();
-    let d_v_sum = d_v.abs().unwrap().sum(None).unwrap();
+    let mut d_q_sum = d_q.abs().sum(None);
+    let mut d_k_sum = d_k.abs().sum(None);
+    let mut d_v_sum = d_v.abs().sum(None);
 
-    d_q_sum.eval().unwrap();
-    d_k_sum.eval().unwrap();
-    d_v_sum.eval().unwrap();
+    d_q_sum.eval();
+    d_k_sum.eval();
+    d_v_sum.eval();
 
     assert!(d_q_sum.item::<f32>() > 0.0, "d_q should be non-zero");
     assert!(d_k_sum.item::<f32>() > 0.0, "d_k should be non-zero");
@@ -98,15 +98,16 @@ fn test_with_training_mode_helper() {
         let config = FusedAttentionConfig::new(n_heads, n_kv_heads, head_dim);
 
         // Forward pass
-        let output = differentiable_attention(0, &queries, &keys, &values, &config)?;
-        output.eval()?;
+        let mut output = differentiable_attention(0, &queries, &keys, &values, &config)?;
+        output.eval();
 
         // Backward pass
         let d_output = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let (d_q, _d_k, _d_v) = compute_attention_gradients(0, &d_output)?;
-        d_q.eval()?;
+        let (mut d_q, _d_k, _d_v) = compute_attention_gradients(0, &d_output)?;
+        d_q.eval();
 
-        Ok(output.sum(None).unwrap().item::<f32>())
+        let mut loss = output.sum(None);
+        Ok(loss.item::<f32>())
     });
 
     assert!(
@@ -142,9 +143,9 @@ fn test_multi_layer_training() {
         let keys = random_tensor(&[batch, n_kv_heads, seq_len, head_dim]);
         let values = random_tensor(&[batch, n_kv_heads, seq_len, head_dim]);
 
-        let output = differentiable_attention(layer_id, &queries, &keys, &values, &config)
+        let mut output = differentiable_attention(layer_id, &queries, &keys, &values, &config)
             .expect(&format!("Forward pass failed for layer {}", layer_id));
-        output.eval().expect("Eval failed");
+        output.eval();
         outputs.push(output);
     }
 
@@ -161,12 +162,12 @@ fn test_multi_layer_training() {
     // Simulate backward pass (in reverse order, like real backprop)
     for layer_id in (0..num_layers).rev() {
         let d_output = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let (d_q, d_k, d_v) = compute_attention_gradients(layer_id, &d_output)
+        let (mut d_q, mut d_k, mut d_v) = compute_attention_gradients(layer_id, &d_output)
             .expect(&format!("Backward pass failed for layer {}", layer_id));
 
-        d_q.eval().expect("Eval d_q failed");
-        d_k.eval().expect("Eval d_k failed");
-        d_v.eval().expect("Eval d_v failed");
+        d_q.eval();
+        d_k.eval();
+        d_v.eval();
 
         // Verify gradient shapes (accounting for GQA)
         assert_eq!(d_q.shape(), &[batch, n_heads, seq_len, head_dim]);
@@ -205,10 +206,10 @@ fn test_inference_mode_no_cache() {
     let config = FusedAttentionConfig::new(n_heads, n_kv_heads, head_dim);
 
     // Forward pass in inference mode
-    let output = differentiable_attention(0, &queries, &keys, &values, &config)
+    let mut output = differentiable_attention(0, &queries, &keys, &values, &config)
         .expect("Forward pass failed");
 
-    output.eval().expect("Eval failed");
+    output.eval();
     assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
 
     // Verify no cache was stored
@@ -244,20 +245,21 @@ fn test_gqa_gradients() {
     let config = FusedAttentionConfig::new(n_heads, n_kv_heads, head_dim);
 
     // Forward pass
-    let output = differentiable_attention(0, &queries, &keys, &values, &config)
+    let mut output = differentiable_attention(0, &queries, &keys, &values, &config)
         .expect("Forward pass failed");
-    output.eval().expect("Eval failed");
+    output.eval();
 
     // Output should have full head count
     assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
 
     // Backward pass
     let d_output = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-    let (d_q, d_k, d_v) = compute_attention_gradients(0, &d_output).expect("Backward pass failed");
+    let (mut d_q, mut d_k, mut d_v) =
+        compute_attention_gradients(0, &d_output).expect("Backward pass failed");
 
-    d_q.eval().expect("Eval d_q failed");
-    d_k.eval().expect("Eval d_k failed");
-    d_v.eval().expect("Eval d_v failed");
+    d_q.eval();
+    d_k.eval();
+    d_v.eval();
 
     // Gradient shapes should match input shapes
     assert_eq!(d_q.shape(), &[batch, n_heads, seq_len, head_dim]);

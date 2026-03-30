@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn test_apply_neftune_shape() {
         let config = NEFTuneConfig::default();
-        let embeds = Array::zeros::<f32>(&[2, 10, 768]).unwrap();
+        let embeds = Array::zeros_f32(&[2, 10, 768]);
 
         let noisy = apply_neftune(&embeds, &config).unwrap();
 
@@ -266,14 +266,14 @@ mod tests {
     #[test]
     fn test_apply_neftune_adds_noise() {
         let config = NEFTuneConfig::new(5.0);
-        let embeds = Array::zeros::<f32>(&[2, 10, 768]).unwrap();
+        let embeds = Array::zeros_f32(&[2, 10, 768]);
 
-        let noisy = apply_neftune(&embeds, &config).unwrap();
-        noisy.eval().unwrap();
+        let mut noisy = apply_neftune(&embeds, &config).unwrap();
+        noisy.eval();
 
         // Sum should not be zero (noise was added)
-        let sum = noisy.abs().unwrap().sum(None).unwrap();
-        sum.eval().unwrap();
+        let mut sum = noisy.abs().sum(None);
+        sum.eval();
         let sum_val = sum.item::<f32>();
         assert!(sum_val > 0.0);
     }
@@ -281,16 +281,15 @@ mod tests {
     #[test]
     fn test_apply_neftune_disabled() {
         let config = NEFTuneConfig::disabled();
-        let embeds = Array::ones::<f32>(&[2, 10, 768]).unwrap();
+        let embeds = Array::ones_f32(&[2, 10, 768]);
 
-        let result = apply_neftune(&embeds, &config).unwrap();
-        result.eval().unwrap();
-        embeds.eval().unwrap();
+        let mut result = apply_neftune(&embeds, &config).unwrap();
+        result.eval();
 
         // Should be exactly the same
-        let diff = result.subtract(&embeds).unwrap();
-        let sum = diff.abs().unwrap().sum(None).unwrap();
-        sum.eval().unwrap();
+        let diff = result.subtract(&embeds);
+        let mut sum = diff.abs().sum(None);
+        sum.eval();
         assert!(sum.item::<f32>() < 1e-6);
     }
 
@@ -302,17 +301,17 @@ mod tests {
 
         let seq_len = 100;
         let hidden_dim = 1000;
-        let embeds = Array::zeros::<f32>(&[1, seq_len, hidden_dim]).unwrap();
+        let embeds = Array::zeros_f32(&[1, seq_len, hidden_dim]);
 
-        let noisy = apply_neftune(&embeds, &config).unwrap();
-        noisy.eval().unwrap();
+        let mut noisy = apply_neftune(&embeds, &config).unwrap();
+        noisy.eval();
 
         // Expected magnitude: alpha / sqrt(seq_len * hidden_dim)
         let expected_magnitude = alpha / ((seq_len * hidden_dim) as f32).sqrt();
 
         // Max value should be around the expected magnitude
-        let max_val = noisy.abs().unwrap().max(None).unwrap();
-        max_val.eval().unwrap();
+        let mut max_val = noisy.abs().max(None);
+        max_val.eval();
         let max_f32 = max_val.item::<f32>();
 
         // Should be close to expected magnitude (uniform in [-mag, mag])
@@ -336,14 +335,14 @@ mod tests {
     #[test]
     fn test_neftune_embedding_forward_training() {
         let wrapper = NEFTuneEmbedding::new(NEFTuneConfig::default());
-        let embeds = Array::zeros::<f32>(&[2, 10, 768]).unwrap();
+        let embeds = Array::zeros_f32(&[2, 10, 768]);
 
-        let output = wrapper.forward(&embeds).unwrap();
-        output.eval().unwrap();
+        let mut output = wrapper.forward(&embeds).unwrap();
+        output.eval();
 
         // Should have noise added
-        let sum = output.abs().unwrap().sum(None).unwrap();
-        sum.eval().unwrap();
+        let mut sum = output.abs().sum(None);
+        sum.eval();
         assert!(sum.item::<f32>() > 0.0);
     }
 
@@ -352,16 +351,15 @@ mod tests {
         let mut wrapper = NEFTuneEmbedding::new(NEFTuneConfig::default());
         wrapper.eval();
 
-        let embeds = Array::ones::<f32>(&[2, 10, 768]).unwrap();
-        let output = wrapper.forward(&embeds).unwrap();
+        let embeds = Array::ones_f32(&[2, 10, 768]);
+        let mut output = wrapper.forward(&embeds).unwrap();
 
-        output.eval().unwrap();
-        embeds.eval().unwrap();
+        output.eval();
 
         // Should be unchanged
-        let diff = output.subtract(&embeds).unwrap();
-        let sum = diff.abs().unwrap().sum(None).unwrap();
-        sum.eval().unwrap();
+        let diff = output.subtract(&embeds);
+        let mut sum = diff.abs().sum(None);
+        sum.eval();
         assert!(sum.item::<f32>() < 1e-6);
     }
 
@@ -388,7 +386,7 @@ mod tests {
     fn test_neftune_2d_input() {
         // Should work with 2D input [seq, hidden]
         let config = NEFTuneConfig::default();
-        let embeds = Array::zeros::<f32>(&[10, 768]).unwrap();
+        let embeds = Array::zeros_f32(&[10, 768]);
 
         let noisy = apply_neftune(&embeds, &config).unwrap();
         assert_eq!(noisy.shape(), embeds.shape());
@@ -398,7 +396,7 @@ mod tests {
     fn test_neftune_invalid_input() {
         // Should fail with 1D input
         let config = NEFTuneConfig::default();
-        let embeds = Array::zeros::<f32>(&[768]).unwrap();
+        let embeds = Array::zeros_f32(&[768]);
 
         let result = apply_neftune(&embeds, &config);
         assert!(result.is_err());

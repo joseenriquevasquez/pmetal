@@ -12,9 +12,12 @@
 
 #![allow(missing_docs)]
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, ops, random};
-use pmetal_bridge::impl_module_params;
 use crate::ArrayDtypeExt;
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, ops,
+    random,
+};
+use pmetal_bridge::impl_module_params;
 use std::rc::Rc;
 
 /// Configuration for Mixture of Experts.

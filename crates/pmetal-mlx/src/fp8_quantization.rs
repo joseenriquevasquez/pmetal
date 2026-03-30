@@ -29,8 +29,8 @@
 //! loops. Next step: hook into the weight-loading path and expose an `--fp8` flag in
 //! the training/inference CLI.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, random};
 use crate::ArrayDtypeExt;
+use pmetal_bridge::compat::{Array, Dtype, Exception, random};
 use serde::{Deserialize, Serialize};
 
 // FP8 bridge stubs — MLX native to_fp8/from_fp8 are not yet exposed in pmetal-bridge.

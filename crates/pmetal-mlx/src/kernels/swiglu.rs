@@ -40,11 +40,7 @@ pub fn reglu(gate: &Array, up: &Array) -> Result<Array> {
 }
 
 /// Apply gated activation based on type.
-pub fn gated_activation(
-    gate: &Array,
-    up: &Array,
-    activation: GatedActivation,
-) -> Result<Array> {
+pub fn gated_activation(gate: &Array, up: &Array, activation: GatedActivation) -> Result<Array> {
     match activation {
         GatedActivation::SwiGLU => swiglu(gate, up),
         GatedActivation::GEGLU => geglu(gate, up),

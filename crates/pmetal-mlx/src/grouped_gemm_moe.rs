@@ -29,8 +29,8 @@
 //!
 //! This maximizes GPU utilization by processing all experts in parallel.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops, random};
 use crate::ArrayDtypeExt;
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops, random};
 
 /// Configuration for Grouped GEMM MoE.
 #[derive(Debug, Clone)]
@@ -207,7 +207,10 @@ impl SharedExpert {
         let w1 = random::normal(&[hidden_size, intermediate_size], Dtype::Float32);
         let w2 = random::normal(&[intermediate_size, hidden_size], Dtype::Float32);
         let w3 = if use_swiglu {
-            Some(random::normal(&[hidden_size, intermediate_size], Dtype::Float32))
+            Some(random::normal(
+                &[hidden_size, intermediate_size],
+                Dtype::Float32,
+            ))
         } else {
             None
         };
@@ -391,8 +394,12 @@ impl GroupedGemmMoE {
         for slot in 0..k {
             // Get expert indices for this slot: slice col `slot` from [N, k] -> [N]
             let col = slot as i32;
-            let slot_experts = ei_owned.slice(&[0, col], &[n_tokens as i32, col + 1]).squeeze(1);
-            let slot_weights = wt_owned.slice(&[0, col], &[n_tokens as i32, col + 1]).squeeze(1);
+            let slot_experts = ei_owned
+                .slice(&[0, col], &[n_tokens as i32, col + 1])
+                .squeeze(1);
+            let slot_weights = wt_owned
+                .slice(&[0, col], &[n_tokens as i32, col + 1])
+                .squeeze(1);
 
             // Process all tokens through their assigned experts using gather/scatter
             let slot_output = self.batched_expert_compute(x, &slot_experts)?;
@@ -638,10 +645,7 @@ mod tests {
         let config = GroupedGemmMoEConfig::new(64, 128, 4).with_top_k(2);
         let moe = GroupedGemmMoE::new(config).unwrap();
 
-        let probs = Array::from_f32_slice(
-            &[0.1f32, 0.4, 0.2, 0.3, 0.3, 0.1, 0.4, 0.2],
-            &[2, 4],
-        );
+        let probs = Array::from_f32_slice(&[0.1f32, 0.4, 0.2, 0.3, 0.3, 0.1, 0.4, 0.2], &[2, 4]);
 
         let (values, indices) = moe.topk_experts(&probs);
         let mut val_owned = values.clone();

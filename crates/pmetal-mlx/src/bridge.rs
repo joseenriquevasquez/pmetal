@@ -246,8 +246,8 @@ mod tests {
     #[test]
     fn test_view_f32_rejects_f16() {
         let ctx = MetalContext::new().unwrap();
-        let array = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4])
-            .as_dtype(Dtype::Float16.as_i32());
+        let array =
+            Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]).as_dtype(Dtype::Float16.as_i32());
 
         let result = MlxMetalBridge::view_f32(&ctx, &array);
         assert!(result.is_err());

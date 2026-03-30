@@ -295,12 +295,8 @@ fn apply_activation(x: &Array, activation: GatedActivationType) -> Array {
             // silu(x) = x * sigmoid(x)
             x.silu()
         }
-        GatedActivationType::GEGLU => {
-            x.gelu()
-        }
-        GatedActivationType::ReGLU => {
-            x.relu()
-        }
+        GatedActivationType::GEGLU => x.gelu(),
+        GatedActivationType::ReGLU => x.relu(),
     }
 }
 

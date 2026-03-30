@@ -750,8 +750,8 @@ impl LongContextManager {
         // Serialize each array as raw f32 bytes with a simple multi-array format.
         // Format: for each entry, write name_len (u32), name bytes, data_len (u32), f32 data.
         {
-            let mut file = File::create(&segment_path)
-                .map_err(|e| Exception::custom(e.to_string()))?;
+            let mut file =
+                File::create(&segment_path).map_err(|e| Exception::custom(e.to_string()))?;
             for (name, array) in &mut evaled {
                 let name_bytes = name.as_bytes();
                 let name_len = name_bytes.len() as u32;
@@ -976,16 +976,26 @@ fn load_segment_from_disk(path: &Path) -> Result<HashMap<String, Array>, Excepti
     let mut pos = 0usize;
 
     while pos + 4 <= bytes.len() {
-        let name_len = u32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]) as usize;
+        let name_len =
+            u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                as usize;
         pos += 4;
-        if pos + name_len > bytes.len() { break; }
-        let name = String::from_utf8_lossy(&bytes[pos..pos+name_len]).into_owned();
+        if pos + name_len > bytes.len() {
+            break;
+        }
+        let name = String::from_utf8_lossy(&bytes[pos..pos + name_len]).into_owned();
         pos += name_len;
 
-        if pos + 4 > bytes.len() { break; }
-        let data_len = u32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]) as usize;
+        if pos + 4 > bytes.len() {
+            break;
+        }
+        let data_len =
+            u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                as usize;
         pos += 4;
-        if pos + data_len * 4 > bytes.len() { break; }
+        if pos + data_len * 4 > bytes.len() {
+            break;
+        }
         let data: Vec<f32> = bytes[pos..pos + data_len * 4]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

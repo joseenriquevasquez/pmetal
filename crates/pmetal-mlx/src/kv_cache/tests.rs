@@ -97,6 +97,50 @@ fn test_kv_cache_asymmetric_head_dims() {
 }
 
 #[test]
+fn test_sanitize_cache_mode_adjusts_group_size_for_asymmetric_dims() {
+    let config = KVCacheConfig::new(1, 32, 2, 96).with_value_head_dim(64);
+    let safe = sanitize_cache_mode_for_config(
+        &config,
+        CacheMode::Quantized {
+            bits: 4,
+            group_size: 128,
+        },
+    );
+
+    assert_eq!(
+        safe,
+        CacheMode::Quantized {
+            bits: 4,
+            group_size: 32
+        }
+    );
+}
+
+#[test]
+fn test_sanitize_cache_mode_clamps_turboquant_outliers_per_tensor_dim() {
+    let config = KVCacheConfig::new(1, 32, 2, 8).with_value_head_dim(4);
+    let safe = sanitize_cache_mode_for_config(
+        &config,
+        CacheMode::TurboQuant {
+            config: TurboQuantConfig {
+                keys: TurboQuantTensorConfig::mixed(2, 4, 99),
+                values: TurboQuantTensorConfig::mixed(3, 5, 99),
+            },
+        },
+    );
+
+    assert_eq!(
+        safe,
+        CacheMode::TurboQuant {
+            config: TurboQuantConfig {
+                keys: TurboQuantTensorConfig::mixed(2, 4, 7),
+                values: TurboQuantTensorConfig::mixed(3, 5, 3),
+            }
+        }
+    );
+}
+
+#[test]
 fn test_kv_cache_accumulation() {
     let config = KVCacheConfig::new(1, 100, 4, 64);
     let mut cache = KVCache::new(config);

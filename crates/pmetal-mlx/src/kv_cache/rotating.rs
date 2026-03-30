@@ -258,7 +258,10 @@ impl RotatingKVCache {
 
         // Build updated cache by concatenating before, new, and after
         let before_k = if self._idx > 0 {
-            Some(k.slice(&[0, 0, 0, 0], &[kb as i32, kh as i32, self._idx as i32, kd as i32]))
+            Some(k.slice(
+                &[0, 0, 0, 0],
+                &[kb as i32, kh as i32, self._idx as i32, kd as i32],
+            ))
         } else {
             None
         };
@@ -272,7 +275,10 @@ impl RotatingKVCache {
         };
 
         let before_v = if self._idx > 0 {
-            Some(v.slice(&[0, 0, 0, 0], &[kb as i32, kh as i32, self._idx as i32, vd as i32]))
+            Some(v.slice(
+                &[0, 0, 0, 0],
+                &[kb as i32, kh as i32, self._idx as i32, vd as i32],
+            ))
         } else {
             None
         };

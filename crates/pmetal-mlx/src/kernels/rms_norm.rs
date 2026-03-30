@@ -16,11 +16,7 @@ pub type Result<T> = std::result::Result<T, Exception>;
 ///
 /// # Returns
 /// Normalized tensor of same shape as input.
-pub fn rms_norm(
-    x: &Array,
-    weight: Option<&Array>,
-    eps: f32,
-) -> Array {
+pub fn rms_norm(x: &Array, weight: Option<&Array>, eps: f32) -> Array {
     pmetal_bridge::compat::fast::rms_norm_opt(x, weight, eps)
 }
 

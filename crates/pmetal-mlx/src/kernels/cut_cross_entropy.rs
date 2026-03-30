@@ -31,8 +31,8 @@
 //!
 //! - Apple ML: https://github.com/apple/ml-cross-entropy
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 use crate::ArrayDtypeExt;
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 
 /// Configuration for Cut Cross Entropy.
 #[derive(Debug, Clone)]
@@ -210,12 +210,8 @@ impl CutCrossEntropy {
             self.compute_target_logits(hidden_states, lm_head_weight, targets, lm_head_bias);
 
         // Step 2: Compute logsumexp in chunks
-        let logsumexp = self.compute_chunked_logsumexp(
-            hidden_states,
-            lm_head_weight,
-            lm_head_bias,
-            vocab_size,
-        );
+        let logsumexp =
+            self.compute_chunked_logsumexp(hidden_states, lm_head_weight, lm_head_bias, vocab_size);
 
         // Step 3: Compute per-token loss
         // loss[i] = logsumexp[i] - target_logits[i]
@@ -226,8 +222,7 @@ impl CutCrossEntropy {
 
         // Step 5: Compute mean loss
         let safe_n_valid = n_valid.max(1);
-        let n_valid_arr = Array::from_i32(safe_n_valid as i32)
-            .as_dtype(Dtype::Float32.as_i32());
+        let n_valid_arr = Array::from_i32(safe_n_valid as i32).as_dtype(Dtype::Float32.as_i32());
         let loss = masked_loss.sum_all().divide(&n_valid_arr);
 
         // Cache for backward if needed
@@ -422,8 +417,7 @@ impl CutCrossEntropy {
             let chunk_len = end - start;
 
             // Get weight chunk
-            let weight_chunk =
-                lm_head_weight.slice(&[start as i32, 0], &[end as i32, hidden_dim]);
+            let weight_chunk = lm_head_weight.slice(&[start as i32, 0], &[end as i32, hidden_dim]);
 
             // Compute chunk logits
             let weight_t = weight_chunk.t();
@@ -436,7 +430,8 @@ impl CutCrossEntropy {
             // Subtract 1 at target positions if target is in this chunk
             let start_arr = Array::from_i32(start as i32);
             let end_arr = Array::from_i32(end as i32);
-            let in_chunk = targets_i32.greater_equal(&start_arr)
+            let in_chunk = targets_i32
+                .greater_equal(&start_arr)
                 .multiply(&targets_i32.less(&end_arr));
 
             // Local targets (clamped)
@@ -466,7 +461,9 @@ impl CutCrossEntropy {
         // Apply ignore mask
         let ignore_arr = Array::from_i32(self.config.ignore_index);
         let valid_mask = targets_i32.not_equal(&ignore_arr);
-        let valid_mask_f32 = valid_mask.as_dtype(Dtype::Float32.as_i32()).reshape(&[-1, 1]);
+        let valid_mask_f32 = valid_mask
+            .as_dtype(Dtype::Float32.as_i32())
+            .reshape(&[-1, 1]);
 
         // Scale by 1/n_valid
         let safe_n_valid = output.n_valid.max(1);
@@ -613,7 +610,9 @@ mod tests {
 
         let config_no_cap = CutCrossEntropyConfig::new().with_vocab_chunk_size(4);
         let cce_no_cap = CutCrossEntropy::new(config_no_cap);
-        let output_no_cap = cce_no_cap.forward(&hidden, &weight, &targets, None).unwrap();
+        let output_no_cap = cce_no_cap
+            .forward(&hidden, &weight, &targets, None)
+            .unwrap();
         let mut loss_eval_no_cap = output_no_cap.loss.clone();
         loss_eval_no_cap.eval();
 

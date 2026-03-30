@@ -31,7 +31,8 @@ pub fn array_to_metal_buffer_f16(ctx: &MetalContext, array: &Array) -> Result<Me
     let mut f32_arr = array.as_dtype(Dtype::Float32.as_i32());
     f32_arr.eval();
     let n = f32_arr.size();
-    let f32_data = f32_arr.to_f32_vec(n)
+    let f32_data = f32_arr
+        .to_f32_vec(n)
         .ok_or_else(|| MlxError::Metal("failed to read array data as f32".to_string()))?;
     let f16_data: Vec<f16> = f32_data.iter().map(|&x| f16::from_f32(x)).collect();
 
@@ -65,7 +66,8 @@ pub fn array_to_metal_buffer_f32(ctx: &MetalContext, array: &Array) -> Result<Me
     converted.eval();
 
     let n = converted.size();
-    let data = converted.to_f32_vec(n)
+    let data = converted
+        .to_f32_vec(n)
         .ok_or_else(|| MlxError::Metal("failed to read array data as f32".to_string()))?;
     MetalBuffer::from_slice(ctx, &data, BufferUsage::Shared)
         .map_err(|e| MlxError::Metal(e.to_string()))

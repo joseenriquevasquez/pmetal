@@ -6,8 +6,8 @@
 //! - Logit scaling for Cohere models
 //! - Proper ignore_index handling with masking
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 use crate::ArrayDtypeExt;
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 
 /// Maximum vocabulary size for single-pass computation.
 /// For larger vocabularies, we use chunked computation.
@@ -269,12 +269,17 @@ fn cross_entropy_loss_with_smoothing(
     let uniform_loss = log_probs.negative().mean_axis(-1, false); // [N]
     let alpha = Array::from_f32(1.0 - label_smoothing);
     let beta = Array::from_f32(label_smoothing);
-    let per_token_loss = nll.negative().multiply(&alpha).add(&uniform_loss.multiply(&beta));
+    let per_token_loss = nll
+        .negative()
+        .multiply(&alpha)
+        .add(&uniform_loss.multiply(&beta));
 
     // Handle ignore_index masking
     if let Some(ignore_idx) = ignore_index {
         let ignore_arr = Array::from_i32(ignore_idx as i32);
-        let mask = flat_targets.as_dtype(Dtype::Int32.as_i32()).not_equal(&ignore_arr);
+        let mask = flat_targets
+            .as_dtype(Dtype::Int32.as_i32())
+            .not_equal(&ignore_arr);
         let mask_f32 = mask.as_dtype(Dtype::Float32.as_i32());
         let count = mask_f32.sum_all();
         let safe_count = count.maximum(&Array::from_f32(1.0));
@@ -392,7 +397,9 @@ pub fn cross_entropy_loss_with_lengths(
         let uniform_loss = log_probs.negative().mean_axis(-1, false);
         let alpha = Array::from_f32(1.0 - label_smoothing);
         let beta = Array::from_f32(label_smoothing);
-        nll.negative().multiply(&alpha).add(&uniform_loss.multiply(&beta))
+        nll.negative()
+            .multiply(&alpha)
+            .add(&uniform_loss.multiply(&beta))
     } else {
         nll.negative()
     };
@@ -508,10 +515,7 @@ mod tests {
 
     #[test]
     fn test_fast_cross_entropy_config() {
-        let logits = Array::from_f32_slice(
-            &[1.0_f32, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0],
-            &[2, 4],
-        );
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0], &[2, 4]);
         let targets = Array::from_i32_slice(&[3_i32, 0]).reshape(&[2]);
 
         let config = CrossEntropyConfig::new().with_ignore_index(-100);
@@ -537,10 +541,7 @@ mod tests {
 
     #[test]
     fn test_gemma2_cross_entropy() {
-        let logits = Array::from_f32_slice(
-            &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[2, 4],
-        );
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
         let targets = Array::from_i32_slice(&[3_i32, 0]).reshape(&[2]);
 
         let loss = gemma2_cross_entropy_loss(&logits, &targets, None).unwrap();
@@ -629,8 +630,8 @@ mod tests {
             .collect();
         let logits = Array::from_f32_slice(&logits_data, &[batch_size, seq_len, vocab_size]);
 
-        let labels = Array::from_i32_slice(&[1i32, 2, 3, 4, 5, 6, 7, 8])
-            .reshape(&[batch_size, seq_len]);
+        let labels =
+            Array::from_i32_slice(&[1i32, 2, 3, 4, 5, 6, 7, 8]).reshape(&[batch_size, seq_len]);
 
         let lengths = Array::from_i32_slice(&[3i32, 4]).reshape(&[batch_size]);
 
@@ -639,7 +640,11 @@ mod tests {
         loss_eval.eval();
 
         let loss_val = loss_eval.item_f32();
-        assert!(loss_val.is_finite(), "Loss should be finite, got {}", loss_val);
+        assert!(
+            loss_val.is_finite(),
+            "Loss should be finite, got {}",
+            loss_val
+        );
         assert!(loss_val > 0.0, "Loss should be positive");
     }
 

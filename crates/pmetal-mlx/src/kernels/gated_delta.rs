@@ -32,8 +32,8 @@
 //! - Chunkwise algorithm: Yang et al., "Gated Linear Attention Transformers with
 //!   Hardware-Efficient Training" (FLA, ICLR 2025).
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, linalg, ops};
 use crate::array_ext::ArrayDtypeExt;
+use pmetal_bridge::compat::{Array, Dtype, Exception, linalg, ops};
 
 /// Default chunk size for the chunkwise parallel GDN algorithm.
 /// Sequences longer than this use the parallel chunk path.
@@ -327,25 +327,45 @@ pub fn gated_delta_ops(
         let q_d = q.dim(3) as usize;
         let v_h = v.dim(2) as usize;
         let v_d = v.dim(3) as usize;
-        let q_t = q.slice(&[0, t_idx, 0, 0], &[b as i32, ti1 as i32, q_h as i32, q_d as i32]).squeeze(1);
-        let k_t = k.slice(&[0, t_idx, 0, 0], &[b as i32, ti1 as i32, q_h as i32, q_d as i32]).squeeze(1);
-        let v_t = v.slice(&[0, t_idx, 0, 0], &[b as i32, ti1 as i32, v_h as i32, v_d as i32]).squeeze(1);
+        let q_t = q
+            .slice(
+                &[0, t_idx, 0, 0],
+                &[b as i32, ti1 as i32, q_h as i32, q_d as i32],
+            )
+            .squeeze(1);
+        let k_t = k
+            .slice(
+                &[0, t_idx, 0, 0],
+                &[b as i32, ti1 as i32, q_h as i32, q_d as i32],
+            )
+            .squeeze(1);
+        let v_t = v
+            .slice(
+                &[0, t_idx, 0, 0],
+                &[b as i32, ti1 as i32, v_h as i32, v_d as i32],
+            )
+            .squeeze(1);
 
         let g_t = if g.ndim() == 3 {
             let g_h = g.dim(2) as usize;
-            g.slice(&[0, t_idx, 0], &[b as i32, ti1 as i32, g_h as i32]).squeeze(1)
+            g.slice(&[0, t_idx, 0], &[b as i32, ti1 as i32, g_h as i32])
+                .squeeze(1)
         } else {
             let g_h = g.dim(2) as usize;
             let g_d = g.dim(3) as usize;
-            g.slice(&[0, t_idx, 0, 0], &[b as i32, ti1 as i32, g_h as i32, g_d as i32]).squeeze(1)
+            g.slice(
+                &[0, t_idx, 0, 0],
+                &[b as i32, ti1 as i32, g_h as i32, g_d as i32],
+            )
+            .squeeze(1)
         };
 
         let beta_h = beta.dim(2) as usize;
-        let beta_t = beta.slice(&[0, t_idx, 0], &[b as i32, ti1 as i32, beta_h as i32]).squeeze(1);
+        let beta_t = beta
+            .slice(&[0, t_idx, 0], &[b as i32, ti1 as i32, beta_h as i32])
+            .squeeze(1);
 
-        let mask_t = mask.map(|m| {
-            m.slice(&[0, t_idx], &[b as i32, ti1 as i32]).squeeze(1)
-        });
+        let mask_t = mask.map(|m| m.slice(&[0, t_idx], &[b as i32, ti1 as i32]).squeeze(1));
 
         let (y, new_state) =
             gated_delta_step_ops(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, mask_t.as_ref())?;
@@ -506,8 +526,11 @@ fn gated_delta_chunk_ops_impl(
         let end = start + c;
 
         // Extract chunk data via slice
-        let bv = b as usize; let hv2 = h as usize;
-        let dk_s = q.dim(3) as usize; let dv_s = v.dim(3) as usize; let c_s = c as usize;
+        let bv = b as usize;
+        let hv2 = h as usize;
+        let dk_s = q.dim(3) as usize;
+        let dv_s = v.dim(3) as usize;
+        let c_s = c as usize;
         let q_c = q.slice(&[0, 0, start, 0], &[b, h, end, q.dim(3)]); // [B, H, C, Dk]
         let k_c = k.slice(&[0, 0, start, 0], &[b, h, end, k.dim(3)]); // [B, H, C, Dk]
         let v_c = v.slice(&[0, 0, start, 0], &[b, h, end, v.dim(3)]); // [B, H, C, Dv]
@@ -953,7 +976,7 @@ mod tests {
         let beta = random::uniform(&[b, t, hv], Dtype::Float32);
 
         // Process all 4 steps at once
-        let (_y_full, state_full) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
+        let (_y_full, mut state_full) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
         // Process in two chunks of 2
         let q1 = q.slice(&[0, 0, 0, 0], &[b, 2, hk, dk]);
@@ -970,14 +993,14 @@ mod tests {
         let g2 = g.slice(&[0, 2, 0], &[b, t, hv]);
         let beta2 = beta.slice(&[0, 2, 0], &[b, t, hv]);
 
-        let (_y2, state2) =
+        let (_y2, mut state2) =
             gated_delta_ops(&q2, &k2, &v2, &g2, &beta2, Some(&state1), None).unwrap();
 
         // States should match
         state_full.eval();
         state2.eval();
         let diff = state_full.subtract(&state2).abs();
-        let max_diff = diff.max_all();
+        let mut max_diff = diff.max(None);
         max_diff.eval();
         let max_diff_val: f32 = max_diff.item();
         assert!(
@@ -989,10 +1012,12 @@ mod tests {
 
     /// Helper: assert two arrays are close within tolerance, returning the max diff.
     fn assert_close(a: &Array, b: &Array, tol: f32, msg: &str) {
-        a.eval();
-        b.eval();
-        let diff = a.subtract(b).abs();
-        let max_diff = diff.max_all();
+        let mut a_eval = a.clone();
+        let mut b_eval = b.clone();
+        a_eval.eval();
+        b_eval.eval();
+        let diff = a_eval.subtract(&b_eval).abs();
+        let mut max_diff = diff.max(None);
         max_diff.eval();
         let max_diff_val: f32 = max_diff.item();
         assert!(
@@ -1242,7 +1267,7 @@ mod tests {
         let a_log = Array::from_f32_slice(&[0.5f32, 1.0], &[hv]);
         let dt_bias = Array::from_f32_slice(&[0.1f32, 0.2], &[hv]);
 
-        let (y, state) = gated_delta_update(
+        let (mut y, mut state) = gated_delta_update(
             &q, &k, &v, &a, &b_input, &a_log, &dt_bias, None, None, false,
         )
         .unwrap();
@@ -1376,11 +1401,6 @@ mod tests {
 
         let (y_decode, state_decode) =
             gated_delta_decode_ops(&q, &k, &v, &g, &beta, &state).unwrap();
-
-        y_ref.eval();
-        state_ref.eval();
-        y_decode.eval();
-        state_decode.eval();
 
         assert_eq!(y_decode.shape(), y_ref.shape());
         assert_eq!(state_decode.shape(), state_ref.shape());

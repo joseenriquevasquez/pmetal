@@ -169,6 +169,127 @@ fn describe_turboquant_tensor(config: TurboQuantTensorConfig) -> String {
     }
 }
 
+/// Returns whether a quantized KV cache `group_size` cleanly divides both key
+/// and value head dimensions.
+pub fn group_size_supported_for_dims(
+    key_head_dim: usize,
+    value_head_dim: usize,
+    group_size: usize,
+) -> bool {
+    group_size > 0
+        && (key_head_dim == 0 || key_head_dim % group_size == 0)
+        && (value_head_dim == 0 || value_head_dim % group_size == 0)
+}
+
+/// Returns the best supported quantization group size for a K/V head-dimension
+/// pair, preferring larger group sizes first.
+pub fn compatible_group_size_for_dims(
+    key_head_dim: usize,
+    value_head_dim: usize,
+    preferred: usize,
+) -> usize {
+    if group_size_supported_for_dims(key_head_dim, value_head_dim, preferred) {
+        return preferred;
+    }
+    for candidate in [128, 64, 32, 16, 8, 4, 2, 1] {
+        if group_size_supported_for_dims(key_head_dim, value_head_dim, candidate) {
+            return candidate;
+        }
+    }
+    1
+}
+
+/// Sanitizes a TurboQuant tensor config for a specific head dimension.
+///
+/// Mixed-bit configs clamp their outlier count into the valid per-head range.
+/// Degenerate dimensions fall back to a uniform config using the higher bit
+/// width to avoid invalid mixed schedules.
+pub fn sanitize_turboquant_tensor_config(
+    head_dim: usize,
+    config: TurboQuantTensorConfig,
+) -> TurboQuantTensorConfig {
+    match config {
+        TurboQuantTensorConfig::Uniform { .. } => config,
+        TurboQuantTensorConfig::Mixed {
+            regular_bits,
+            outlier_bits,
+            outlier_count,
+        } => {
+            if head_dim <= 1 {
+                TurboQuantTensorConfig::uniform(outlier_bits.max(regular_bits))
+            } else {
+                TurboQuantTensorConfig::mixed(
+                    regular_bits,
+                    outlier_bits,
+                    outlier_count.clamp(1, head_dim - 1),
+                )
+            }
+        }
+    }
+}
+
+/// Sanitizes a TurboQuant K/V config for concrete key and value head
+/// dimensions.
+pub fn sanitize_turboquant_config(
+    key_head_dim: usize,
+    value_head_dim: usize,
+    config: TurboQuantConfig,
+) -> TurboQuantConfig {
+    TurboQuantConfig {
+        keys: sanitize_turboquant_tensor_config(key_head_dim, config.keys),
+        values: sanitize_turboquant_tensor_config(value_head_dim, config.values),
+    }
+}
+
+/// Sanitizes a cache mode for a concrete pair of key/value head dimensions.
+///
+/// This normalizes quantized group sizes and TurboQuant mixed-bit schedules so
+/// all cache construction sites use the same rules.
+pub fn sanitize_cache_mode_for_dims(
+    key_head_dim: usize,
+    value_head_dim: usize,
+    mode: CacheMode,
+) -> CacheMode {
+    match mode {
+        CacheMode::Quantized { bits, group_size }
+            if !group_size_supported_for_dims(key_head_dim, value_head_dim, group_size) =>
+        {
+            CacheMode::Quantized {
+                bits,
+                group_size: compatible_group_size_for_dims(
+                    key_head_dim,
+                    value_head_dim,
+                    group_size,
+                ),
+            }
+        }
+        CacheMode::AsymmetricQuantized {
+            key_bits,
+            value_bits,
+            group_size,
+        } if !group_size_supported_for_dims(key_head_dim, value_head_dim, group_size) => {
+            CacheMode::AsymmetricQuantized {
+                key_bits,
+                value_bits,
+                group_size: compatible_group_size_for_dims(
+                    key_head_dim,
+                    value_head_dim,
+                    group_size,
+                ),
+            }
+        }
+        CacheMode::TurboQuant { config } => CacheMode::TurboQuant {
+            config: sanitize_turboquant_config(key_head_dim, value_head_dim, config),
+        },
+        other => other,
+    }
+}
+
+/// Sanitizes a cache mode using a base KV cache configuration.
+pub fn sanitize_cache_mode_for_config(config: &KVCacheConfig, mode: CacheMode) -> CacheMode {
+    sanitize_cache_mode_for_dims(config.head_dim, config.value_head_dim, mode)
+}
+
 impl KVCacheConfig {
     /// Create a new KV cache configuration.
     pub fn new(

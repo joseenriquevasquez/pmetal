@@ -413,20 +413,14 @@ impl PagedKVCache {
                 let k_slice = if tokens_in_block < block_size {
                     let h = k_block.dim(0) as usize;
                     let d = k_block.dim(2) as usize;
-                    k_block.slice(
-                        &[0, 0, 0],
-                        &[h as i32, tokens_in_block as i32, d as i32],
-                    )
+                    k_block.slice(&[0, 0, 0], &[h as i32, tokens_in_block as i32, d as i32])
                 } else {
                     k_block.clone()
                 };
                 let v_slice = if tokens_in_block < block_size {
                     let h = v_block.dim(0) as usize;
                     let d = v_block.dim(2) as usize;
-                    v_block.slice(
-                        &[0, 0, 0],
-                        &[h as i32, tokens_in_block as i32, d as i32],
-                    )
+                    v_block.slice(&[0, 0, 0], &[h as i32, tokens_in_block as i32, d as i32])
                 } else {
                     v_block.clone()
                 };

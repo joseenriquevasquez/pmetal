@@ -365,8 +365,8 @@ mod tests {
         let mut kv_cache = KVCache::new(config);
 
         // Add some data to the cache
-        let keys = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
-        let values = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
+        let keys = Array::zeros_f32(&[1, 4, 10, 64]);
+        let values = Array::zeros_f32(&[1, 4, 10, 64]);
         kv_cache.update_and_fetch(0, &keys, &values).unwrap();
         kv_cache.update_and_fetch(1, &keys, &values).unwrap();
 
@@ -386,8 +386,8 @@ mod tests {
         let config = create_test_config();
         let mut kv_cache = KVCache::new(config);
 
-        let keys = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
-        let values = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
+        let keys = Array::zeros_f32(&[1, 4, 10, 64]);
+        let values = Array::zeros_f32(&[1, 4, 10, 64]);
         kv_cache.update_and_fetch(0, &keys, &values).unwrap();
         kv_cache.update_and_fetch(1, &keys, &values).unwrap();
 
@@ -415,8 +415,8 @@ mod tests {
         // Create 3 different caches
         for i in 0..3 {
             let mut kv_cache = KVCache::new(config.clone());
-            let keys = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
-            let values = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
+            let keys = Array::zeros_f32(&[1, 4, 10, 64]);
+            let values = Array::zeros_f32(&[1, 4, 10, 64]);
             kv_cache.update_and_fetch(0, &keys, &values).unwrap();
             kv_cache.update_and_fetch(1, &keys, &values).unwrap();
 
@@ -438,8 +438,8 @@ mod tests {
         let mut kv_cache = KVCache::new(config.clone());
 
         // Add data with specific values
-        let keys = Array::ones::<f32>(&[1, 4, 10, 64]).unwrap();
-        let values = Array::ones::<f32>(&[1, 4, 10, 64]).unwrap();
+        let keys = Array::ones_f32(&[1, 4, 10, 64]);
+        let values = Array::ones_f32(&[1, 4, 10, 64]);
         kv_cache.update_and_fetch(0, &keys, &values).unwrap();
         kv_cache.update_and_fetch(1, &keys, &values).unwrap();
 
@@ -462,8 +462,8 @@ mod tests {
         let config = create_test_config();
         let mut kv_cache = KVCache::new(config.clone());
 
-        let keys = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
-        let values = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
+        let keys = Array::zeros_f32(&[1, 4, 10, 64]);
+        let values = Array::zeros_f32(&[1, 4, 10, 64]);
         kv_cache.update_and_fetch(0, &keys, &values).unwrap();
         kv_cache.update_and_fetch(1, &keys, &values).unwrap();
 
@@ -486,8 +486,8 @@ mod tests {
 
         // Simulate forward pass and cache
         let mut kv_cache = KVCache::new(config.clone());
-        let keys = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
-        let values = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
+        let keys = Array::zeros_f32(&[1, 4, 10, 64]);
+        let values = Array::zeros_f32(&[1, 4, 10, 64]);
         kv_cache.update_and_fetch(0, &keys, &values).unwrap();
         kv_cache.update_and_fetch(1, &keys, &values).unwrap();
         generator.cache_prompt(&tokens, &kv_cache);

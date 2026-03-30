@@ -5,8 +5,8 @@
 
 use std::{sync::OnceLock, time::Instant};
 
-use pmetal_bridge::compat::{Array, Dtype, Exception};
 use crate::ArrayDtypeExt;
+use pmetal_bridge::compat::{Array, Dtype, Exception};
 use pmetal_metal::{
     BufferUsage, MetalBuffer, MetalContext, MppQuantizedGemm, MppQuantizedGemmConfig,
     context::{DeviceProperties, DeviceTier},
@@ -445,10 +445,8 @@ mod tests {
     fn test_quantized_linear_rhs_transposed_best_effort_matches_mlx() {
         clear_cached_quantized_linear_backends();
 
-        let x = random::normal(&[2, 4, 128], Dtype::Float32)
-            .as_dtype(Dtype::Float16.as_i32());
-        let weight = random::normal(&[256, 128], Dtype::Float32)
-            .as_dtype(Dtype::Float16.as_i32());
+        let x = random::normal(&[2, 4, 128], Dtype::Float32).as_dtype(Dtype::Float16.as_i32());
+        let weight = random::normal(&[256, 128], Dtype::Float32).as_dtype(Dtype::Float16.as_i32());
         let (w_q, scales, biases) = weight.quantize_weights(64, 4);
 
         let output =

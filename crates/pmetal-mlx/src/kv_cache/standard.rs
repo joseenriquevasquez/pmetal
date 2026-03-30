@@ -425,9 +425,19 @@ impl KVCache {
         let val_hdim = v_buf.dim(3) as usize;
 
         let k_start = [0i32, 0, prev_offset as i32, 0];
-        let k_stop = [batch as i32, heads as i32, cache.offset as i32, key_hdim as i32];
+        let k_stop = [
+            batch as i32,
+            heads as i32,
+            cache.offset as i32,
+            key_hdim as i32,
+        ];
         let v_start = [0i32, 0, prev_offset as i32, 0];
-        let v_stop = [batch as i32, heads as i32, cache.offset as i32, val_hdim as i32];
+        let v_stop = [
+            batch as i32,
+            heads as i32,
+            cache.offset as i32,
+            val_hdim as i32,
+        ];
 
         cache.keys = Some(k_buf.slice_set(new_keys, &k_start, &k_stop));
         cache.values = Some(v_buf.slice_set(new_values, &v_start, &v_stop));
@@ -541,8 +551,14 @@ impl KVCache {
         let kd = k.dim(3) as usize;
         let vd = v.dim(3) as usize;
         Ok((
-            k.slice(&[0, 0, 0, 0], &[kb as i32, kh as i32, final_offset as i32, kd as i32]),
-            v.slice(&[0, 0, 0, 0], &[kb as i32, kh as i32, final_offset as i32, vd as i32]),
+            k.slice(
+                &[0, 0, 0, 0],
+                &[kb as i32, kh as i32, final_offset as i32, kd as i32],
+            ),
+            v.slice(
+                &[0, 0, 0, 0],
+                &[kb as i32, kh as i32, final_offset as i32, vd as i32],
+            ),
         ))
     }
 
@@ -683,10 +699,7 @@ impl KVCache {
     ///
     /// Returns the current cached keys/values up to the current offset.
     /// The compiled closure will concatenate new K/V and return the full result.
-    pub fn fetch_for_compiled_decode(
-        &self,
-        layer_idx: usize,
-    ) -> Result<(Array, Array), Exception> {
+    pub fn fetch_for_compiled_decode(&self, layer_idx: usize) -> Result<(Array, Array), Exception> {
         let cache = &self.layer_caches[layer_idx];
         if let (Some(k), Some(v)) = (&cache.keys, &cache.values) {
             let kb = k.dim(0) as usize;
@@ -695,8 +708,14 @@ impl KVCache {
             let vd = v.dim(3) as usize;
             let offset = cache.offset;
             Ok((
-                k.slice(&[0, 0, 0, 0], &[kb as i32, kh as i32, offset as i32, kd as i32]),
-                v.slice(&[0, 0, 0, 0], &[kb as i32, kh as i32, offset as i32, vd as i32]),
+                k.slice(
+                    &[0, 0, 0, 0],
+                    &[kb as i32, kh as i32, offset as i32, kd as i32],
+                ),
+                v.slice(
+                    &[0, 0, 0, 0],
+                    &[kb as i32, kh as i32, offset as i32, vd as i32],
+                ),
             ))
         } else {
             // No cache yet — return empty arrays with correct shape

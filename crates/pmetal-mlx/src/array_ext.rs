@@ -10,20 +10,20 @@ type Result<T> = std::result::Result<T, Exception>;
 /// Unknown codes fall back to `Dtype::Float32`.
 pub fn dtype_from_raw(raw: i32) -> Dtype {
     match raw {
-        0  => Dtype::Bool,
-        1  => Dtype::Uint8,
-        2  => Dtype::Uint16,
-        3  => Dtype::Uint32,
-        4  => Dtype::Uint64,
-        5  => Dtype::Int8,
-        6  => Dtype::Int16,
-        7  => Dtype::Int32,
-        8  => Dtype::Int64,
-        9  => Dtype::Float16,
+        0 => Dtype::Bool,
+        1 => Dtype::Uint8,
+        2 => Dtype::Uint16,
+        3 => Dtype::Uint32,
+        4 => Dtype::Uint64,
+        5 => Dtype::Int8,
+        6 => Dtype::Int16,
+        7 => Dtype::Int32,
+        8 => Dtype::Int64,
+        9 => Dtype::Float16,
         10 => Dtype::Float32,
         11 => Dtype::Bfloat16,
         12 => Dtype::Complex64,
-        _  => Dtype::Float32,
+        _ => Dtype::Float32,
     }
 }
 

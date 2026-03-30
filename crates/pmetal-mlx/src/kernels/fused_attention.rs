@@ -13,8 +13,8 @@
 
 use std::{sync::OnceLock, time::Instant};
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops, random};
 use crate::ArrayDtypeExt;
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops, random};
 use pmetal_metal::{
     FlashAttention, FlashAttentionConfig as MetalFlashAttentionConfig, MetalContext,
     MppFlashAttention, MppFlashAttentionConfig,
@@ -474,19 +474,13 @@ fn fast_fused_sdpa(
     // Determine mask to use
     match (&config.mask_type, custom_mask) {
         // Custom mask provided - use it directly
-        (_, Some(mask)) => {
-            Ok(queries.sdpa_with_mask(keys, values, config.scale, Some(mask)))
-        }
+        (_, Some(mask)) => Ok(queries.sdpa_with_mask(keys, values, config.scale, Some(mask))),
 
         // Causal masking - use MLX's built-in causal mask
-        (AttentionMaskType::Causal, None) => {
-            Ok(queries.sdpa(keys, values, config.scale, "causal"))
-        }
+        (AttentionMaskType::Causal, None) => Ok(queries.sdpa(keys, values, config.scale, "causal")),
 
         // No mask (bidirectional attention)
-        (AttentionMaskType::None, None) => {
-            Ok(queries.sdpa(keys, values, config.scale, "none"))
-        }
+        (AttentionMaskType::None, None) => Ok(queries.sdpa(keys, values, config.scale, "none")),
 
         // Sliding window - create custom mask
         (AttentionMaskType::SlidingWindow(window_size), None) => {
@@ -827,7 +821,12 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
 fn create_causal_mask(query_len: i32, key_len: i32) -> Result<Array, Exception> {
     // Create lower triangular mask aligned to bottom-right for KV cache support
     // When query_len < key_len (generation), queries attend to all past keys
-    let mask = Array::tri(query_len, key_len, key_len - query_len, Dtype::Float32.as_i32());
+    let mask = Array::tri(
+        query_len,
+        key_len,
+        key_len - query_len,
+        Dtype::Float32.as_i32(),
+    );
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
 
@@ -856,7 +855,12 @@ fn create_sliding_window_mask(
         key_len - query_len - window_size,
         Dtype::Float32.as_i32(),
     );
-    let upper = Array::tri(query_len, key_len, key_len - query_len, Dtype::Float32.as_i32());
+    let upper = Array::tri(
+        query_len,
+        key_len,
+        key_len - query_len,
+        Dtype::Float32.as_i32(),
+    );
 
     // Valid positions: where upper is 1 AND lower is 0
     let zero = Array::from_f32(0.0);
@@ -1132,9 +1136,12 @@ mod tests {
         let _ = &output; // eval not needed
         let _ = &reference; // eval not needed
 
-        let mut out_m = output.clone(); out_m.eval();
-        let mut ref_m = reference.clone(); ref_m.eval();
-        let out_n = out_m.size(); let ref_n = ref_m.size();
+        let mut out_m = output.clone();
+        out_m.eval();
+        let mut ref_m = reference.clone();
+        ref_m.eval();
+        let out_n = out_m.size();
+        let ref_n = ref_m.size();
         let out_data = out_m.to_f32_vec(out_n).unwrap_or_default();
         let ref_data = ref_m.to_f32_vec(ref_n).unwrap_or_default();
         for (actual, expected) in out_data.iter().zip(ref_data.iter()) {
@@ -1170,9 +1177,12 @@ mod tests {
         let _ = &output; // eval not needed
         let _ = &reference; // eval not needed
 
-        let mut out_s = output.clone(); out_s.eval();
-        let mut ref_s = reference.clone(); ref_s.eval();
-        let out_n2 = out_s.size(); let ref_n2 = ref_s.size();
+        let mut out_s = output.clone();
+        out_s.eval();
+        let mut ref_s = reference.clone();
+        ref_s.eval();
+        let out_n2 = out_s.size();
+        let ref_n2 = ref_s.size();
         let out_data2 = out_s.to_f32_vec(out_n2).unwrap_or_default();
         let ref_data2 = ref_s.to_f32_vec(ref_n2).unwrap_or_default();
         for (actual, expected) in out_data2.iter().zip(ref_data2.iter()) {
@@ -1192,12 +1202,12 @@ mod tests {
         let seq_len = 4;
         let head_dim = 64;
 
-        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim])
-            .as_dtype(Dtype::Float32.as_i32());
-        let keys = random_tensor(&[batch, n_heads, seq_len, head_dim])
-            .as_dtype(Dtype::Float32.as_i32());
-        let values = random_tensor(&[batch, n_heads, seq_len, head_dim])
-            .as_dtype(Dtype::Float32.as_i32());
+        let queries =
+            random_tensor(&[batch, n_heads, seq_len, head_dim]).as_dtype(Dtype::Float32.as_i32());
+        let keys =
+            random_tensor(&[batch, n_heads, seq_len, head_dim]).as_dtype(Dtype::Float32.as_i32());
+        let values =
+            random_tensor(&[batch, n_heads, seq_len, head_dim]).as_dtype(Dtype::Float32.as_i32());
 
         let config = FusedAttentionConfig::new(n_heads, n_heads, head_dim);
         let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
@@ -1228,11 +1238,13 @@ mod tests {
         let _ = &mask; // eval not needed
 
         assert_eq!(mask.shape(), &[1, 1, 1, 6]);
+        let observed = {
+            let mut m_own = mask.clone();
+            m_own.eval();
+            m_own.to_f32_vec(m_own.size()).unwrap_or_default()
+        };
         assert_eq!(
-            {
-                let mut m_own = mask.clone(); m_own.eval();
-                m_own.to_f32_vec(m_own.size()).unwrap_or_default().as_slice()
-            },
+            observed.as_slice(),
             &[
                 f32::NEG_INFINITY,
                 f32::NEG_INFINITY,

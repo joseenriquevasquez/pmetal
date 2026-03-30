@@ -306,7 +306,12 @@ impl SpeculativeDecoder {
         let target_probs = &tp_eval;
 
         // Get token indices as i32
-        let tokens: Vec<i32> = dt_eval.to_f32_vec(dt_eval.size()).unwrap_or_default().into_iter().map(|x| x as i32).collect();
+        let tokens: Vec<i32> = dt_eval
+            .to_f32_vec(dt_eval.size())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
         let mut accepted_tokens = Vec::new();
         let mut rejection_idx = None;
 
@@ -315,8 +320,12 @@ impl SpeculativeDecoder {
             let token = tokens[i];
 
             // Get probability of this token under both models
-            let mut p_draft = draft_probs.slice(&[i as i32, token], &[i as i32 + 1, token + 1]).reshape(&[]);
-            let mut p_target = target_probs.slice(&[i as i32, token], &[i as i32 + 1, token + 1]).reshape(&[]);
+            let mut p_draft = draft_probs
+                .slice(&[i as i32, token], &[i as i32 + 1, token + 1])
+                .reshape(&[]);
+            let mut p_target = target_probs
+                .slice(&[i as i32, token], &[i as i32 + 1, token + 1])
+                .reshape(&[]);
             p_draft.eval();
             p_target.eval();
 
@@ -341,8 +350,12 @@ impl SpeculativeDecoder {
         // Compute correction distribution if rejected
         let correction_logits = if let Some(idx) = rejection_idx {
             // Correction distribution: max(0, p_target - p_draft) normalized
-            let p_draft_row = draft_probs.slice(&[idx as i32, 0], &[idx as i32 + 1, draft_probs.dim(1)]).squeeze(0);
-            let p_target_row = target_probs.slice(&[idx as i32, 0], &[idx as i32 + 1, target_probs.dim(1)]).squeeze(0);
+            let p_draft_row = draft_probs
+                .slice(&[idx as i32, 0], &[idx as i32 + 1, draft_probs.dim(1)])
+                .squeeze(0);
+            let p_target_row = target_probs
+                .slice(&[idx as i32, 0], &[idx as i32 + 1, target_probs.dim(1)])
+                .squeeze(0);
 
             let diff = p_target_row.subtract(&p_draft_row);
             let zero = ops::zeros(&[diff.dim(0)], Dtype::Float32);
@@ -397,11 +410,18 @@ impl SpeculativeDecoder {
         let target_logits = &tl_eval;
 
         // Get token indices as i32
-        let tokens: Vec<i32> = dt_eval.to_f32_vec(dt_eval.size()).unwrap_or_default().into_iter().map(|x| x as i32).collect();
+        let tokens: Vec<i32> = dt_eval
+            .to_f32_vec(dt_eval.size())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
         let mut accepted_tokens = Vec::new();
 
         for i in 0..k {
-            let target_row = target_logits.slice(&[i as i32, 0], &[i as i32 + 1, target_logits.dim(1)]).squeeze(0);
+            let target_row = target_logits
+                .slice(&[i as i32, 0], &[i as i32 + 1, target_logits.dim(1)])
+                .squeeze(0);
             let mut best_idx = target_row.argmax(-1);
             best_idx.eval();
             let best_token = best_idx.item::<u32>() as i32;
@@ -476,7 +496,8 @@ impl SpeculativeDecoder {
 
             // Apply top-p if specified
             let probs = if self.config.top_p < 1.0 {
-                self.apply_top_p(&probs_base).unwrap_or_else(|_| probs_base.clone())
+                self.apply_top_p(&probs_base)
+                    .unwrap_or_else(|_| probs_base.clone())
             } else {
                 probs_base
             };
@@ -490,7 +511,9 @@ impl SpeculativeDecoder {
     fn apply_top_p(&self, probs: &Array) -> Result<Array, Exception> {
         let mut probs_owned = probs.clone();
         probs_owned.eval();
-        let probs_vec: Vec<f32> = probs_owned.to_f32_vec(probs_owned.size()).unwrap_or_default();
+        let probs_vec: Vec<f32> = probs_owned
+            .to_f32_vec(probs_owned.size())
+            .unwrap_or_default();
 
         // Sort indices by probability (descending)
         let mut indexed: Vec<(usize, f32)> = probs_vec.iter().cloned().enumerate().collect();
@@ -528,7 +551,9 @@ impl SpeculativeDecoder {
     fn categorical_sample(&self, probs: &Array) -> Result<i32, Exception> {
         let mut probs_owned = probs.clone();
         probs_owned.eval();
-        let probs_vec: Vec<f32> = probs_owned.to_f32_vec(probs_owned.size()).unwrap_or_default();
+        let probs_vec: Vec<f32> = probs_owned
+            .to_f32_vec(probs_owned.size())
+            .unwrap_or_default();
 
         let r = rand_uniform();
         let mut cumsum = 0.0;

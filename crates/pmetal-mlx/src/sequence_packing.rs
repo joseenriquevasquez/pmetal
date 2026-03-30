@@ -211,8 +211,18 @@ impl SequencePacker {
                 ids_owned.eval();
                 let mut labels_owned: Array = (*labels).clone();
                 labels_owned.eval();
-                let ids_data: Vec<i32> = ids_owned.to_f32_vec(ids_owned.size()).unwrap_or_default().into_iter().map(|x| x as i32).collect();
-                let labels_data: Vec<i32> = labels_owned.to_f32_vec(labels_owned.size()).unwrap_or_default().into_iter().map(|x| x as i32).collect();
+                let ids_data: Vec<i32> = ids_owned
+                    .to_f32_vec(ids_owned.size())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|x| x as i32)
+                    .collect();
+                let labels_data: Vec<i32> = labels_owned
+                    .to_f32_vec(labels_owned.size())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|x| x as i32)
+                    .collect();
 
                 packed_ids.extend_from_slice(&ids_data);
                 packed_labels.extend_from_slice(&labels_data);
@@ -261,13 +271,14 @@ impl SequencePacker {
         }
 
         // Create tensors
-        let input_ids = Array::from_i32_slice(&all_input_ids.concat())
-            .reshape(&[batch_size as i32, max_len]);
-        let labels = Array::from_i32_slice(&all_labels.concat())
-            .reshape(&[batch_size as i32, max_len]);
+        let input_ids =
+            Array::from_i32_slice(&all_input_ids.concat()).reshape(&[batch_size as i32, max_len]);
+        let labels =
+            Array::from_i32_slice(&all_labels.concat()).reshape(&[batch_size as i32, max_len]);
         let position_ids = Array::from_i32_slice(&all_position_ids.concat())
             .reshape(&[batch_size as i32, max_len]);
-        let loss_mask = Array::from_f32_slice(&all_loss_mask.concat(), &[batch_size as i32, max_len]);
+        let loss_mask =
+            Array::from_f32_slice(&all_loss_mask.concat(), &[batch_size as i32, max_len]);
 
         // Create attention mask
         let attention_mask = if self.config.use_block_diagonal_attention {
@@ -656,11 +667,11 @@ mod tests {
         let packer = SequencePacker::new(config);
 
         // Create simple test sequences
-        let seq1_ids = Array::from_f32_slice(&[1i32, 2, 3, 4, 5], &[5]);
-        let seq1_labels = Array::from_f32_slice(&[1i32, 2, 3, 4, 5], &[5]);
+        let seq1_ids = Array::from_slice(&[1i32, 2, 3, 4, 5], &[5]);
+        let seq1_labels = Array::from_slice(&[1i32, 2, 3, 4, 5], &[5]);
 
-        let seq2_ids = Array::from_f32_slice(&[6i32, 7, 8], &[3]);
-        let seq2_labels = Array::from_f32_slice(&[6i32, 7, 8], &[3]);
+        let seq2_ids = Array::from_slice(&[6i32, 7, 8], &[3]);
+        let seq2_labels = Array::from_slice(&[6i32, 7, 8], &[3]);
 
         let sequences = vec![(&seq1_ids, &seq1_labels), (&seq2_ids, &seq2_labels)];
 
@@ -678,11 +689,11 @@ mod tests {
             .with_block_diagonal_attention(true);
         let packer = SequencePacker::new(config);
 
-        let seq1_ids = Array::from_f32_slice(&[1i32, 2, 3], &[3]);
-        let seq1_labels = Array::from_f32_slice(&[1i32, 2, 3], &[3]);
+        let seq1_ids = Array::from_slice(&[1i32, 2, 3], &[3]);
+        let seq1_labels = Array::from_slice(&[1i32, 2, 3], &[3]);
 
-        let seq2_ids = Array::from_f32_slice(&[4i32, 5], &[2]);
-        let seq2_labels = Array::from_f32_slice(&[4i32, 5], &[2]);
+        let seq2_ids = Array::from_slice(&[4i32, 5], &[2]);
+        let seq2_labels = Array::from_slice(&[4i32, 5], &[2]);
 
         let sequences = vec![(&seq1_ids, &seq1_labels), (&seq2_ids, &seq2_labels)];
 
@@ -701,15 +712,20 @@ mod tests {
             .with_block_diagonal_attention(false);
         let packer = SequencePacker::new(config);
 
-        let seq1 = Array::from_f32_slice(&[1i32, 2, 3], &[3]);
-        let seq2 = Array::from_f32_slice(&[4i32, 5], &[2]);
+        let seq1 = Array::from_slice(&[1i32, 2, 3], &[3]);
+        let seq2 = Array::from_slice(&[4i32, 5], &[2]);
 
         let sequences = vec![(&seq1, &seq1), (&seq2, &seq2)];
         let packed = packer.pack_sequences(&sequences).unwrap();
 
         let mut pos_owned = packed.position_ids.clone();
         pos_owned.eval();
-        let positions: Vec<i32> = pos_owned.to_f32_vec(pos_owned.size()).unwrap_or_default().into_iter().map(|x| x as i32).collect();
+        let positions: Vec<i32> = pos_owned
+            .to_f32_vec(pos_owned.size())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
 
         // First 3 positions should be [0, 1, 2] for seq1
         assert_eq!(positions[0], 0);
@@ -726,9 +742,9 @@ mod tests {
         let packer = SequencePacker::new(config);
 
         // Each sequence is 8 tokens - can't fit 2 in max_len=10
-        let seq1 = Array::from_f32_slice(&[1i32; 8], &[8]);
-        let seq2 = Array::from_f32_slice(&[2i32; 8], &[8]);
-        let seq3 = Array::from_f32_slice(&[3i32; 8], &[8]);
+        let seq1 = Array::from_slice(&[1i32; 8], &[8]);
+        let seq2 = Array::from_slice(&[2i32; 8], &[8]);
+        let seq3 = Array::from_slice(&[3i32; 8], &[8]);
 
         let sequences = vec![(&seq1, &seq1), (&seq2, &seq2), (&seq3, &seq3)];
         let packed = packer.pack_sequences(&sequences).unwrap();
@@ -744,15 +760,20 @@ mod tests {
             .with_block_diagonal_attention(false);
         let packer = SequencePacker::new(config);
 
-        let seq_ids = Array::from_f32_slice(&[1i32, 2, 3], &[3]);
-        let seq_labels = Array::from_f32_slice(&[10i32, 20, 30], &[3]);
+        let seq_ids = Array::from_slice(&[1i32, 2, 3], &[3]);
+        let seq_labels = Array::from_slice(&[10i32, 20, 30], &[3]);
 
         let sequences = vec![(&seq_ids, &seq_labels)];
         let packed = packer.pack_sequences(&sequences).unwrap();
 
         let mut labels_owned = packed.labels.clone();
         labels_owned.eval();
-        let labels: Vec<i32> = labels_owned.to_f32_vec(labels_owned.size()).unwrap_or_default().into_iter().map(|x| x as i32).collect();
+        let labels: Vec<i32> = labels_owned
+            .to_f32_vec(labels_owned.size())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
 
         // First 3 should be the labels
         assert_eq!(labels[0], 10);
@@ -770,8 +791,8 @@ mod tests {
         let packer = SequencePacker::new(config);
 
         // Two sequences: 3 tokens and 2 tokens
-        let seq1 = Array::from_f32_slice(&[1i32, 2, 3], &[3]);
-        let seq2 = Array::from_f32_slice(&[4i32, 5], &[2]);
+        let seq1 = Array::from_slice(&[1i32, 2, 3], &[3]);
+        let seq2 = Array::from_slice(&[4i32, 5], &[2]);
 
         let sequences = vec![(&seq1, &seq1), (&seq2, &seq2)];
         let packed = packer.pack_sequences(&sequences).unwrap();
@@ -799,8 +820,8 @@ mod tests {
         let packer = SequencePacker::new(config);
 
         // Two sequences: 3 tokens and 2 tokens
-        let seq1 = Array::from_f32_slice(&[1i32, 2, 3], &[3]);
-        let seq2 = Array::from_f32_slice(&[4i32, 5], &[2]);
+        let seq1 = Array::from_slice(&[1i32, 2, 3], &[3]);
+        let seq2 = Array::from_slice(&[4i32, 5], &[2]);
 
         let sequences = vec![(&seq1, &seq1), (&seq2, &seq2)];
         let packed = packer.pack_sequences(&sequences).unwrap();
@@ -846,8 +867,8 @@ mod tests {
             .with_block_diagonal_attention(false);
         let packer = SequencePacker::new(config);
 
-        let seq1 = Array::from_f32_slice(&[1i32, 2, 3], &[3]);
-        let seq2 = Array::from_f32_slice(&[4i32, 5], &[2]);
+        let seq1 = Array::from_slice(&[1i32, 2, 3], &[3]);
+        let seq2 = Array::from_slice(&[4i32, 5], &[2]);
 
         let sequences = vec![(&seq1, &seq1), (&seq2, &seq2)];
         let packed = packer.pack_sequences(&sequences).unwrap();

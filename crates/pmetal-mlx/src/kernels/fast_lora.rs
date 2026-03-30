@@ -14,8 +14,8 @@
 
 use std::{sync::OnceLock, time::Instant};
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops, random};
 use crate::ArrayDtypeExt;
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops, random};
 use pmetal_metal::{
     MetalBuffer, MetalContext,
     buffer::BufferUsage,
@@ -226,10 +226,7 @@ impl OptimizedLoraParams {
 ///
 /// # Returns
 /// Output tensor of shape [..., out_features]
-pub fn optimized_lora_forward(
-    x: &Array,
-    params: &OptimizedLoraParams,
-) -> Result<Array, Exception> {
+pub fn optimized_lora_forward(x: &Array, params: &OptimizedLoraParams) -> Result<Array, Exception> {
     if params.merged {
         let y = x.matmul(&params.weight_t);
         if let Some(ref bias) = params.bias {
@@ -726,7 +723,9 @@ mod tests {
 
         let scale_arr = Array::from_f32(scale);
         let reference = x.matmul(&weight.t()).add(
-            &x.matmul(&lora_a.t()).matmul(&lora_b.t()).multiply(&scale_arr)
+            &x.matmul(&lora_a.t())
+                .matmul(&lora_b.t())
+                .multiply(&scale_arr),
         );
 
         assert!(max_abs_diff(&output, &reference) < 1e-4);
@@ -753,7 +752,9 @@ mod tests {
 
         let scale_arr = Array::from_f32(scale).as_dtype(Dtype::Float16.as_i32());
         let reference = x.matmul(&weight.t()).add(
-            &x.matmul(&lora_a.t()).matmul(&lora_b.t()).multiply(&scale_arr)
+            &x.matmul(&lora_a.t())
+                .matmul(&lora_b.t())
+                .multiply(&scale_arr),
         );
 
         let output_f32 = output.as_dtype(Dtype::Float32.as_i32());

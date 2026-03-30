@@ -32,10 +32,13 @@ use std::io::{Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use crate::ArrayDtypeExt;
 use pmetal_bridge::compat::Exception;
 use pmetal_bridge::compat::{Array, Dtype};
-use crate::ArrayDtypeExt;
 use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+use pmetal_bridge::compat::random;
 
 /// Offloading target for tensors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -787,10 +790,9 @@ impl FrozenParameterManager {
     pub fn get(&mut self, name: &str) -> Result<&Array, Exception> {
         // Check if GPU cache needs to be populated
         {
-            let param = self
-                .frozen_params
-                .get_mut(name)
-                .ok_or_else(|| Exception::custom(format!("Frozen parameter '{}' not found", name)))?;
+            let param = self.frozen_params.get_mut(name).ok_or_else(|| {
+                Exception::custom(format!("Frozen parameter '{}' not found", name))
+            })?;
 
             if param.gpu_cache.is_none() {
                 param.gpu_cache = Some(param.cpu_array.clone());
@@ -1008,8 +1010,8 @@ mod tests {
         let activation = random::normal(&[2, 10, 64], Dtype::Float32);
         offloader.store("layer_0", activation.clone()).unwrap();
 
-        let loaded = offloader.load("layer_0").unwrap();
-        loaded.eval().unwrap();
+        let mut loaded = offloader.load("layer_0").unwrap();
+        loaded.eval();
 
         assert_eq!(loaded.shape(), activation.shape());
     }
@@ -1020,9 +1022,9 @@ mod tests {
         let mut embedding =
             OffloadedEmbedding::from_array(weights.clone(), OffloadTarget::Cpu, None).unwrap();
 
-        let indices = Array::from_f32_slice(&[0_i32, 5, 10], &[3]);
-        let result = embedding.lookup(&indices).unwrap();
-        result.eval().unwrap();
+        let indices = Array::from_slice(&[0i32, 5, 10], &[3]);
+        let mut result = embedding.lookup(&indices).unwrap();
+        result.eval();
 
         assert_eq!(result.shape(), &[3, 64]);
     }

@@ -1110,7 +1110,9 @@ impl TurboQuantKvCache {
                 layout.key_dim as i32,
             ],
         );
-        Ok(array.transpose_axes(&[0, 2, 1, 3]).as_dtype(self.dtype.as_i32()))
+        Ok(array
+            .transpose_axes(&[0, 2, 1, 3])
+            .as_dtype(self.dtype.as_i32()))
     }
 
     fn dequantize_values(&self) -> Result<Array, Exception> {
@@ -1137,7 +1139,9 @@ impl TurboQuantKvCache {
                 layout.value_dim as i32,
             ],
         );
-        Ok(array.transpose_axes(&[0, 2, 1, 3]).as_dtype(self.dtype.as_i32()))
+        Ok(array
+            .transpose_axes(&[0, 2, 1, 3])
+            .as_dtype(self.dtype.as_i32()))
     }
 }
 
@@ -2085,7 +2089,9 @@ fn select_outlier_mask(row: &[f32], outlier_count: usize) -> Vec<u16> {
 }
 
 fn array_rows_in_bshd_order(array: &Array) -> Result<Vec<f32>, Exception> {
-    let mut seq_major = array.as_dtype(Dtype::Float32.as_i32()).transpose_axes(&[0, 2, 1, 3]);
+    let mut seq_major = array
+        .as_dtype(Dtype::Float32.as_i32())
+        .transpose_axes(&[0, 2, 1, 3]);
     seq_major.eval();
     let n = seq_major.size();
     Ok(seq_major.to_f32_vec(n).unwrap_or_default())

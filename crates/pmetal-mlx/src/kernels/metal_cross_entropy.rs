@@ -37,9 +37,9 @@
 //! )?;
 //! ```
 
+use crate::ArrayDtypeExt;
 use half::f16;
 use pmetal_bridge::compat::{Array, Dtype};
-use crate::ArrayDtypeExt;
 use serde::{Deserialize, Serialize};
 use std::{
     sync::{Arc, OnceLock},
@@ -915,9 +915,9 @@ mod tests {
         let ctx = MetalCrossEntropyContext::new().unwrap();
         let config = MetalCrossEntropyConfig::new().with_ignore_index(-100);
 
-        let output =
+        let mut output =
             metal_fused_linear_cross_entropy(&ctx, &hidden, &weight, &targets, &config).unwrap();
-        output.loss.eval().unwrap();
+        output.loss.eval();
 
         let loss_value = output.loss.item::<f32>();
         assert!(loss_value.is_finite());
@@ -943,8 +943,8 @@ mod tests {
 
         let targets = Array::from_slice(&[0i32, 1, 2, 3, 4, 5, 6, 7], &[8]);
 
-        let loss = fused_linear_cross_entropy_loss(&hidden, &weight, &targets, -100).unwrap();
-        loss.eval().unwrap();
+        let mut loss = fused_linear_cross_entropy_loss(&hidden, &weight, &targets, -100).unwrap();
+        loss.eval();
 
         let loss_value = loss.item::<f32>();
 

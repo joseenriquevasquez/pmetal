@@ -24,7 +24,7 @@
 //! This preserves high-frequency positional information while extending
 //! the effective context length.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops, fast};
+use pmetal_bridge::compat::{Array, Dtype, Exception, fast, ops};
 
 /// RoPE scaling type for extended context.
 #[derive(Debug, Clone)]
@@ -340,13 +340,17 @@ pub fn apply_rope_with_positions(
 
         // Extract even (index 0) and odd (index 1) elements along last dim
         // Use slice: [batch, heads, seq_len, half_dims, 0..1] then squeeze(-1)
-        let x_even = x_pairs.slice(&[0, 0, 0, 0, 0], &[batch, heads, seq_len, half_dims, 1])
+        let x_even = x_pairs
+            .slice(&[0, 0, 0, 0, 0], &[batch, heads, seq_len, half_dims, 1])
             .squeeze(-1); // [batch, heads, seq_len, half_dims]
-        let x_odd = x_pairs.slice(&[0, 0, 0, 0, 1], &[batch, heads, seq_len, half_dims, 2])
+        let x_odd = x_pairs
+            .slice(&[0, 0, 0, 0, 1], &[batch, heads, seq_len, half_dims, 2])
             .squeeze(-1); // [batch, heads, seq_len, half_dims]
 
         // Apply rotation
-        let r_even = x_even.multiply(&cos_theta).subtract(&x_odd.multiply(&sin_theta));
+        let r_even = x_even
+            .multiply(&cos_theta)
+            .subtract(&x_odd.multiply(&sin_theta));
         let r_odd = x_even.multiply(&sin_theta).add(&x_odd.multiply(&cos_theta));
 
         // Interleave back: stack along last dim then reshape
@@ -411,7 +415,14 @@ pub fn apply_rope_scaled(
 ) -> Result<Array, Exception> {
     let effective_base = scaling.effective_base(base, dims);
     let scale = scaling.scale();
-    Ok(fast::rope(x, dims, traditional, effective_base, scale, offset))
+    Ok(fast::rope(
+        x,
+        dims,
+        traditional,
+        effective_base,
+        scale,
+        offset,
+    ))
 }
 
 /// Compute the effective maximum context length after scaling.

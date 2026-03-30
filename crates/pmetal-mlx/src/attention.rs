@@ -378,8 +378,11 @@ impl AttentionDispatcher {
                     logit_softcapping: config.has_softcap().then_some(config.softcap),
                 };
 
-                crate::kernels::fused_attention::fused_sdpa(q, k, v, &fused_config, None)
-                    .map_err(|e: pmetal_bridge::compat::Exception| pmetal_core::PMetalError::Mlx(e.to_string()))?
+                crate::kernels::fused_attention::fused_sdpa(q, k, v, &fused_config, None).map_err(
+                    |e: pmetal_bridge::compat::Exception| {
+                        pmetal_core::PMetalError::Mlx(e.to_string())
+                    },
+                )?
             }
         };
 

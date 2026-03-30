@@ -61,14 +61,12 @@ mod tests {
         let batch_seq = 1i32;
 
         let residual = random::normal(&[batch_seq, dim], Dtype::Float32);
-        let expert_outs =
-            random::normal(&[batch_seq, k, dim], Dtype::Float32);
+        let expert_outs = random::normal(&[batch_seq, k, dim], Dtype::Float32);
         let expert_weights = Array::from_f32_slice(&[0.3f32, 0.25, 0.25, 0.2], &[batch_seq, k]);
-        let shared_out =
-            random::normal(&[batch_seq, dim], Dtype::Float32);
+        let shared_out = random::normal(&[batch_seq, dim], Dtype::Float32);
         let shared_gate_logit = Array::from_f32(0.5);
 
-        let result = moe_combine_mlx(
+        let mut result = moe_combine_mlx(
             &residual,
             &expert_outs,
             &expert_weights,
@@ -97,16 +95,12 @@ mod tests {
         let batch_seq = 4i32;
 
         let residual = random::normal(&[batch_seq, dim], Dtype::Float32);
-        let expert_outs =
-            random::normal(&[batch_seq, k, dim], Dtype::Float32);
-        let expert_weights =
-            random::normal(&[batch_seq, k], Dtype::Float32);
-        let shared_out =
-            random::normal(&[batch_seq, dim], Dtype::Float32);
-        let shared_gate_logit =
-            random::normal(&[batch_seq, 1], Dtype::Float32);
+        let expert_outs = random::normal(&[batch_seq, k, dim], Dtype::Float32);
+        let expert_weights = random::normal(&[batch_seq, k], Dtype::Float32);
+        let shared_out = random::normal(&[batch_seq, dim], Dtype::Float32);
+        let shared_gate_logit = random::normal(&[batch_seq, 1], Dtype::Float32);
 
-        let result = moe_combine_mlx(
+        let mut result = moe_combine_mlx(
             &residual,
             &expert_outs,
             &expert_weights,
