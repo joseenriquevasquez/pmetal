@@ -8,7 +8,9 @@
 //! - No bias in attention projections
 //! - Per-layer sliding window configuration via `layer_types`
 
-use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, random};
+use pmetal_bridge::compat::{
+    Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, random,
+};
 use pmetal_bridge::impl_module_params;
 use std::collections::HashMap;
 
@@ -21,29 +23,29 @@ use pmetal_mlx::kernels::{
 };
 use pmetal_mlx::kv_cache::KVCache;
 
-fn zero_linear(out_dims: i32, in_dims: i32, bias: bool) -> Result<nn::Linear, Exception> {
-    Ok(nn::Linear {
+fn zero_linear(out_dims: i32, in_dims: i32, bias: bool) -> nn::Linear {
+    nn::Linear {
         weight: Param::new(Array::zeros_f32(&[out_dims, in_dims])),
         bias: Param::new(if bias {
             Some(Array::zeros_f32(&[out_dims]))
         } else {
             None
         }),
-    })
+    }
 }
 
-fn zero_embedding(embedding_count: i32, dimensions: i32) -> Result<nn::Embedding, Exception> {
-    Ok(nn::Embedding {
+fn zero_embedding(embedding_count: i32, dimensions: i32) -> nn::Embedding {
+    nn::Embedding {
         weight: Param::new(Array::zeros_f32(&[embedding_count, dimensions])),
-    })
+    }
 }
 
 fn placeholder_linear(bias: bool) -> Result<nn::Linear, Exception> {
-    zero_linear(1, 1, bias)
+    Ok(zero_linear(1, 1, bias))
 }
 
 fn placeholder_embedding() -> Result<nn::Embedding, Exception> {
-    zero_embedding(1, 1)
+    Ok(zero_embedding(1, 1))
 }
 
 fn placeholder_rms_norm(eps: f32) -> Result<nn::RmsNorm, Exception> {
@@ -227,7 +229,6 @@ pub struct Qwen3MLP {
 }
 impl_module_params!(Qwen3MLP; gate_proj, up_proj, down_proj);
 
-
 impl Qwen3MLP {
     pub fn new(config: &Qwen3Config) -> Result<Self, Exception> {
         let gate_proj = nn::LinearBuilder::new(config.hidden_size, config.intermediate_size)
@@ -301,7 +302,6 @@ pub struct Qwen3Attention {
     pub sliding_window: Option<i32>,
 }
 impl_module_params!(Qwen3Attention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
-
 
 impl Qwen3Attention {
     pub fn new(config: &Qwen3Config, use_sliding_window: bool) -> Result<Self, Exception> {
@@ -506,7 +506,8 @@ impl Qwen3Attention {
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
                 if let Some(out) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)? {
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
+                {
                     let out = out.transpose_axes(&[0, 2, 1, 3]).reshape(&[
                         b,
                         l,
@@ -525,9 +526,9 @@ impl Qwen3Attention {
         };
 
         let out = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
-        let out =
-            out.transpose_axes(&[0, 2, 1, 3])
-                .reshape(&[b, l, self.n_heads * self.head_dim]);
+        let out = out
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[b, l, self.n_heads * self.head_dim]);
         Ok(self.o_proj.forward(&out))
     }
 }
@@ -542,7 +543,6 @@ pub struct Qwen3Layer {
 }
 impl_module_params!(Qwen3Layer; input_layernorm, self_attn, post_attention_layernorm, mlp);
 
-
 impl Qwen3Layer {
     pub fn new(config: &Qwen3Config, use_sliding_window: bool) -> Result<Self, Exception> {
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
@@ -554,7 +554,6 @@ impl Qwen3Layer {
             .eps(config.rms_norm_eps)
             .build()?;
         let mlp = Qwen3MLP::new(config)?;
-
 
         Ok(Self {
             input_layernorm,
@@ -572,11 +571,11 @@ impl Qwen3Layer {
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
             .build()?;
-        let self_attn = Qwen3Attention::new_zeroed(config, use_sliding_window);
+        let self_attn = Qwen3Attention::new_zeroed(config, use_sliding_window)?;
         let post_attention_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
             .build()?;
-        let mlp = Qwen3MLP::new_zeroed(config);
+        let mlp = Qwen3MLP::new_zeroed(config)?;
 
         Ok(Self {
             input_layernorm,
@@ -598,7 +597,6 @@ impl Qwen3Layer {
 
         let mlp = Qwen3MLP::new_for_loading()?;
 
-
         Ok(Self {
             input_layernorm,
             self_attn,
@@ -613,11 +611,11 @@ impl Qwen3Layer {
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, Exception> {
-        let h = x.add(&self.self_attn.forward(
-            &self.input_layernorm.forward(x),
-            mask,
-            cache,
-        )?);
+        let h = x.add(
+            &self
+                .self_attn
+                .forward(&self.input_layernorm.forward(x), mask, cache)?,
+        );
         let mlp_in = self.post_attention_layernorm.forward(&h);
         Ok(h.add(&self.mlp.forward(mlp_in)?))
     }
@@ -631,7 +629,6 @@ pub struct Qwen3Model {
     pub norm: nn::RmsNorm,
 }
 impl_module_params!(Qwen3Model; embed_tokens, layers, norm);
-
 
 impl Qwen3Model {
     pub fn new(config: &Qwen3Config) -> Result<Self, Exception> {
@@ -684,7 +681,6 @@ impl Qwen3Model {
             .collect::<Result<Vec<_>, _>>()?;
         let norm = placeholder_rms_norm(config.rms_norm_eps)?;
 
-
         Ok(Self {
             embed_tokens,
             layers,
@@ -717,7 +713,6 @@ pub struct Qwen3ForCausalLM {
 }
 impl_module_params!(Qwen3ForCausalLM; model, lm_head);
 
-
 impl Qwen3ForCausalLM {
     pub fn new(config: Qwen3Config) -> Result<Self, Exception> {
         let model = Qwen3Model::new(&config)?;
@@ -744,7 +739,7 @@ impl Qwen3ForCausalLM {
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            Some(zero_linear(config.vocab_size, config.hidden_size, false)?)
+            Some(zero_linear(config.vocab_size, config.hidden_size, false))
         };
         Ok(Self {
             model,
@@ -810,7 +805,8 @@ impl crate::traits::CausalLMModel for Qwen3ForCausalLM {
     fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), Exception> {
         for (name, weight) in weights {
             if name == "model.embed_tokens.weight" {
-                self.model.embed_tokens.weight = pmetal_bridge::compat::module::Param::new(weight.clone());
+                self.model.embed_tokens.weight =
+                    pmetal_bridge::compat::module::Param::new(weight.clone());
             } else if name == "lm_head.weight" {
                 if let Some(ref mut lm_head) = self.lm_head {
                     lm_head.weight = pmetal_bridge::compat::module::Param::new(weight.clone());
@@ -829,38 +825,48 @@ impl crate::traits::CausalLMModel for Qwen3ForCausalLM {
                 let layer = &mut self.model.layers[i];
                 match suffix.as_str() {
                     "input_layernorm.weight" => {
-                        layer.input_layernorm.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                        layer.input_layernorm.weight =
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "post_attention_layernorm.weight" => {
                         layer.post_attention_layernorm.weight =
                             pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.q_proj.weight" => {
-                        layer.self_attn.q_proj.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                        layer.self_attn.q_proj.weight =
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.k_proj.weight" => {
-                        layer.self_attn.k_proj.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                        layer.self_attn.k_proj.weight =
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.v_proj.weight" => {
-                        layer.self_attn.v_proj.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                        layer.self_attn.v_proj.weight =
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.o_proj.weight" => {
-                        layer.self_attn.o_proj.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                        layer.self_attn.o_proj.weight =
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.q_norm.weight" => {
-                        layer.self_attn.q_norm.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                        layer.self_attn.q_norm.weight =
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "self_attn.k_norm.weight" => {
-                        layer.self_attn.k_norm.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                        layer.self_attn.k_norm.weight =
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "mlp.gate_proj.weight" => {
-                        layer.mlp.gate_proj.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                        layer.mlp.gate_proj.weight =
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "mlp.up_proj.weight" => {
-                        layer.mlp.up_proj.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                        layer.mlp.up_proj.weight =
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     "mlp.down_proj.weight" => {
-                        layer.mlp.down_proj.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                        layer.mlp.down_proj.weight =
+                            pmetal_bridge::compat::module::Param::new(weight.clone())
                     }
                     _ => {}
                 }
@@ -959,7 +965,7 @@ mod tests {
         let config = tiny_config();
         let mut mlp = Qwen3MLP::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], pmetal_bridge::compat::Dtype::Float32);
         let output = mlp.forward(x).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 32]);
@@ -971,7 +977,7 @@ mod tests {
         let config = tiny_config();
         let mut attn = Qwen3Attention::new(&config, false).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], pmetal_bridge::compat::Dtype::Float32);
         let output = attn.forward(&x, None, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 32]);
@@ -983,7 +989,7 @@ mod tests {
         let config = tiny_config();
         let mut layer = Qwen3Layer::new(&config, false).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], pmetal_bridge::compat::Dtype::Float32);
         let output = layer.forward(&x, None, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 32]);

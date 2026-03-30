@@ -346,7 +346,6 @@ pub struct GptOssAttention {
 }
 impl_module_params!(GptOssAttention; q_proj, k_proj, v_proj, o_proj);
 
-
 impl GptOssAttention {
     /// Create a new attention layer.
     pub fn new(config: GptOssConfig, layer_idx: usize) -> Result<Self, Exception> {
@@ -443,7 +442,8 @@ impl GptOssAttention {
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
                 if let Some(output) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)? {
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
+                {
                     let output = output.transpose_axes(&[0, 2, 1, 3]);
                     let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
                     return Ok(self.o_proj.forward(&output));
@@ -481,7 +481,6 @@ pub struct GptOssMLP {
     pub down_proj: nn::Linear,
 }
 impl_module_params!(GptOssMLP; gate_proj, up_proj, down_proj);
-
 
 impl GptOssMLP {
     /// Create a new MLP.
@@ -542,7 +541,6 @@ pub struct GptOssMoEExpert {
 }
 impl_module_params!(GptOssMoEExpert; gate_proj, up_proj, down_proj);
 
-
 impl GptOssMoEExpert {
     /// Create a new expert.
     pub fn new(
@@ -602,7 +600,6 @@ pub struct GptOssMoE {
     stacked_signature: Option<Vec<usize>>,
 }
 impl_module_params!(GptOssMoE; gate, experts);
-
 
 impl GptOssMoE {
     /// Create a new MoE block.
@@ -696,27 +693,36 @@ impl GptOssMoE {
             .experts
             .iter()
             .map(|expert| {
-                expert.gate_proj.bias.as_ref().map(|b| b.as_ref().clone()).unwrap_or_else(|| {
-                    Array::zeros_f32(&[expert.gate_proj.weight.as_ref().dim(0)])
-                })
+                expert
+                    .gate_proj
+                    .bias
+                    .as_ref()
+                    .map(|b| b.as_ref().clone())
+                    .unwrap_or_else(|| Array::zeros_f32(&[expert.gate_proj.weight.as_ref().dim(0)]))
             })
             .collect();
         let up_biases: Vec<Array> = self
             .experts
             .iter()
             .map(|expert| {
-                expert.up_proj.bias.as_ref().map(|b| b.as_ref().clone()).unwrap_or_else(|| {
-                    Array::zeros_f32(&[expert.up_proj.weight.as_ref().dim(0)])
-                })
+                expert
+                    .up_proj
+                    .bias
+                    .as_ref()
+                    .map(|b| b.as_ref().clone())
+                    .unwrap_or_else(|| Array::zeros_f32(&[expert.up_proj.weight.as_ref().dim(0)]))
             })
             .collect();
         let down_biases: Vec<Array> = self
             .experts
             .iter()
             .map(|expert| {
-                expert.down_proj.bias.as_ref().map(|b| b.as_ref().clone()).unwrap_or_else(|| {
-                    Array::zeros_f32(&[expert.down_proj.weight.as_ref().dim(0)])
-                })
+                expert
+                    .down_proj
+                    .bias
+                    .as_ref()
+                    .map(|b| b.as_ref().clone())
+                    .unwrap_or_else(|| Array::zeros_f32(&[expert.down_proj.weight.as_ref().dim(0)]))
             })
             .collect();
 
@@ -790,7 +796,8 @@ impl GptOssMoE {
         let scores = pmetal_bridge::compat::ops::sigmoid(&gate_logits);
         let neg_k = -(self.top_k as i32);
         let part_indices = pmetal_bridge::compat::ops::argpartition_axis(&scores, neg_k, -1);
-        let top_indices = pmetal_bridge::compat::ops::slice_axis_from(&part_indices, -1, neg_k).as_type::<i32>();
+        let top_indices =
+            pmetal_bridge::compat::ops::slice_axis_from(&part_indices, -1, neg_k).as_type::<i32>();
         let top_weights = scores.take_along_axis(&top_indices, -1);
         let weight_sum = top_weights.sum_axis(-1, true);
         let safe_sum = pmetal_bridge::compat::ops::maximum(&weight_sum, &Array::from_f32(1e-8));
@@ -830,7 +837,8 @@ impl GptOssMoE {
             }
         }
 
-        let mut output = pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
+        let mut output =
+            pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
         for (expert_idx, expert_assignments) in assignments.iter().enumerate() {
             if expert_assignments.is_empty() {
                 continue;
@@ -847,19 +855,21 @@ impl GptOssMoE {
             let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
             let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
             let expert_input = hidden_flat.take_axis(&idx_array, 0);
-            let expert_out = self.experts[expert_idx].forward(&expert_input);
+            let expert_out = self.experts[expert_idx].forward(&expert_input)?;
             let weighted = expert_out.multiply(&weight_array);
             let updates = weighted.reshape(&[token_indices.len() as i32, 1, hidden_size]);
-            output = pmetal_bridge::compat::indexing::scatter_add_single(&output, &idx_array, &updates, 0);
+            output = pmetal_bridge::compat::indexing::scatter_add_single(
+                &output, &idx_array, &updates, 0,
+            );
         }
 
         let mut output_shape = shape.to_vec();
         output_shape[shape.len() - 1] = hidden_size;
-        output.reshape(&output_shape)
+        Ok(output.reshape(&output_shape))
     }
 
     fn forward_stacked(&mut self, x: &Array) -> Result<Array, Exception> {
-        self.ensure_stacked();
+        self.ensure_stacked()?;
 
         let shape = x.shape();
         let hidden_flat = x.reshape(&[
@@ -869,11 +879,15 @@ impl GptOssMoE {
         let (batch_seq, hidden_size, top_indices, normalized_weights) =
             self.route_topk(&hidden_flat)?;
         let top_k = self.top_k as i32;
-        let mut output = pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
+        let mut output =
+            pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
 
         for slot in 0..top_k {
-            let slot_experts = pmetal_bridge::compat::ops::slice_axis(&top_indices, -1, slot, slot + 1).reshape(&[top_indices.dim(0)]);
-            let slot_weights = pmetal_bridge::compat::ops::slice_axis(&normalized_weights, -1, slot, slot + 1);
+            let slot_experts =
+                pmetal_bridge::compat::ops::slice_axis(&top_indices, -1, slot, slot + 1)
+                    .reshape(&[top_indices.dim(0)]);
+            let slot_weights =
+                pmetal_bridge::compat::ops::slice_axis(&normalized_weights, -1, slot, slot + 1);
             let gate_weights = self
                 .stacked_gate_proj
                 .as_ref()
@@ -944,12 +958,10 @@ pub struct GptOssDecoderLayer {
 }
 impl_module_params!(GptOssDecoderLayer; self_attn, mlp, input_layernorm, post_attention_layernorm);
 
-
 impl GptOssDecoderLayer {
     /// Create a new decoder layer.
     pub fn new(config: GptOssConfig, layer_idx: usize) -> Result<Self, Exception> {
         let self_attn = GptOssAttention::new(config.clone(), layer_idx)?;
-
 
         let mlp = GptOssMoE::new(
             config.hidden_size,
@@ -1015,7 +1027,6 @@ pub struct GptOssModel {
 }
 impl_module_params!(GptOssModel; embed_tokens, layers, norm);
 
-
 impl GptOssModel {
     /// Create a new GPT-OSS model.
     pub fn new(config: GptOssConfig) -> Result<Self, Exception> {
@@ -1065,7 +1076,7 @@ impl GptOssModel {
     /// Eagerly build stacked expert caches for all decoder layers.
     pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
         for layer in &mut self.layers {
-            layer.init_stacked_moe();
+            layer.init_stacked_moe()?;
         }
         Ok(())
     }
@@ -1085,7 +1096,6 @@ pub struct GptOssForCausalLM {
     pub lm_head: nn::Linear,
 }
 impl_module_params!(GptOssForCausalLM; model, lm_head);
-
 
 impl GptOssForCausalLM {
     /// Create a new GPT-OSS for causal LM.
@@ -1365,7 +1375,8 @@ impl GptOssLoraAttention {
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
                 if let Some(output) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)? {
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
+                {
                     let output = output.transpose_axes(&[0, 2, 1, 3]);
                     let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
                     return self.o_proj.forward(&output);
@@ -1438,7 +1449,6 @@ impl GptOssLoraDecoderLayer {
     ) -> Result<Self, Exception> {
         let self_attn = GptOssLoraAttention::from_attention(layer.self_attn, lora_config)?;
 
-
         Ok(Self {
             self_attn,
             mlp: layer.mlp,
@@ -1495,7 +1505,6 @@ impl GptOssLoraModel {
     /// Create LoRA model from base model.
     pub fn from_model(model: GptOssModel, lora_config: &LoraConfig) -> Result<Self, Exception> {
         let layers = model
-
             .layers
             .into_iter()
             .map(|layer| GptOssLoraDecoderLayer::from_layer(layer, lora_config))
@@ -1705,8 +1714,12 @@ mod tests {
             config.router_aux_loss_coef,
         )
         .unwrap();
-        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
-            .unwrap();
+        let x = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[2, 5, config.hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let reference = moe.forward_reference(&x).unwrap();
         let fast = moe.forward(&x).unwrap();
@@ -1740,13 +1753,19 @@ mod tests {
             config.router_aux_loss_coef,
         )
         .unwrap();
-        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
-            .unwrap();
+        let x = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[1, 4, config.hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let _ = moe.forward(&x).unwrap();
-        moe.experts[0].gate_proj.weight = pmetal_bridge::compat::module::Param::new(
-            Array::zeros_f32(&[config.intermediate_size, config.hidden_size]),
-        );
+        moe.experts[0].gate_proj.weight =
+            pmetal_bridge::compat::module::Param::new(Array::zeros_f32(&[
+                config.intermediate_size,
+                config.hidden_size,
+            ]));
 
         let reference = moe.forward_reference(&x).unwrap();
         let fast = moe.forward(&x).unwrap();
@@ -1809,9 +1828,10 @@ mod tests {
 
     #[test]
     fn test_lora_linear_creation() {
-        use pmetal_bridge::compat::builder::Builder;
-
-        let linear = nn::LinearBuilder::new(256, 512).bias(true).build()?.unwrap();
+        let linear = nn::LinearBuilder::new(256, 512)
+            .bias(true)
+            .build()
+            .unwrap();
 
         let lora_linear = LoraLinear::from_linear(&linear, 8, 16.0).unwrap();
 
@@ -1823,9 +1843,10 @@ mod tests {
 
     #[test]
     fn test_lora_linear_forward_shape() {
-        use pmetal_bridge::compat::builder::Builder;
-
-        let linear = nn::LinearBuilder::new(64, 128).bias(false).build()?.unwrap();
+        let linear = nn::LinearBuilder::new(64, 128)
+            .bias(false)
+            .build()
+            .unwrap();
 
         let lora_linear = LoraLinear::from_linear(&linear, 4, 8.0).unwrap();
         let x = Array::zeros_f32(&[2, 8, 64]);
@@ -1836,9 +1857,10 @@ mod tests {
 
     #[test]
     fn test_lora_linear_merge() {
-        use pmetal_bridge::compat::builder::Builder;
-
-        let linear = nn::LinearBuilder::new(32, 64).bias(false).build()?.unwrap();
+        let linear = nn::LinearBuilder::new(32, 64)
+            .bias(false)
+            .build()
+            .unwrap();
 
         let mut lora_linear = LoraLinear::from_linear(&linear, 4, 8.0).unwrap();
         assert!(lora_linear.lora_active);
@@ -1854,9 +1876,10 @@ mod tests {
 
     #[test]
     fn test_lora_trainable_params() {
-        use pmetal_bridge::compat::builder::Builder;
-
-        let linear = nn::LinearBuilder::new(32, 64).bias(false).build()?.unwrap();
+        let linear = nn::LinearBuilder::new(32, 64)
+            .bias(false)
+            .build()
+            .unwrap();
 
         let lora_linear = LoraLinear::from_linear(&linear, 4, 8.0).unwrap();
         let params = lora_linear.trainable_parameters();

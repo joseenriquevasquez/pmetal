@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module, indexing, nn};
 use pmetal_bridge::compat::indexing::IndexOp;
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module, indexing, nn};
 
 use crate::expert_io::ExpertOffloadContext;
 
@@ -417,7 +417,9 @@ impl ExpertPrefetcher {
 
         let hidden_rows = hidden.reshape(&[-1, d]);
         let last_row_idx = hidden_rows.dim(0) - 1;
-        let hidden_1d = pmetal_bridge::compat::ops::slice_axis(&hidden_rows, 0, last_row_idx, last_row_idx + 1).squeeze_axes(&[0]);
+        let hidden_1d =
+            pmetal_bridge::compat::ops::slice_axis(&hidden_rows, 0, last_row_idx, last_row_idx + 1)
+                .squeeze_axes(&[0]);
         let mut hidden_1d = if hidden_1d.dtype() != Dtype::Float32 {
             hidden_1d.as_type::<f32>()
         } else {
@@ -505,7 +507,7 @@ mod tests {
 
         let mut gate = nn::LinearBuilder::new(config.hidden_size, config.num_experts)
             .bias(false)
-            .build()?
+            .build()
             .unwrap();
         let gate_weight = Array::from_slice(
             &[
@@ -543,7 +545,7 @@ mod tests {
             .predict_topk(&hidden, prefetcher.gate_weights.get(&0).unwrap())
             .unwrap();
         let gate_logits = gate.forward(&hidden).unwrap();
-        let last_row = gate_logits.index((gate_logits.dim(0) - 1, ..));
+        let last_row = pmetal_bridge::compat::ops::select_axis(&gate_logits, gate_logits.dim(0) - 1, 0);
         let last_row = last_row.as_type::<f32>().unwrap();
         let mut actual_scores: Vec<(f32, usize)> = (0..config.num_experts as usize)
             .map(|expert_idx| (last_row.index(expert_idx as i32).item::<f32>(), expert_idx))

@@ -20,7 +20,6 @@ use pmetal_bridge::compat::{Array, Dtype, Exception};
 use std::collections::HashMap;
 use std::path::Path;
 
-
 /// Error type for weight loading.
 #[derive(Debug, thiserror::Error)]
 pub enum WeightFormatError {
@@ -187,7 +186,9 @@ impl WeightLoader {
                 for shard_file in shard_files {
                     let shard_path = path.join(shard_file);
                     let path_str = shard_path.to_str().unwrap_or_default();
-                    if let Some(pairs) = pmetal_bridge::inline_array::load_safetensors_shard(path_str) {
+                    if let Some(pairs) =
+                        pmetal_bridge::inline_array::load_safetensors_shard(path_str)
+                    {
                         for (name, array) in pairs {
                             weights.insert(name, Self::convert_dtype_for_training(array)?);
                         }
@@ -231,8 +232,8 @@ impl WeightLoader {
                     "No .gguf file found in: {}",
                     path.display()
                 ))
-            })
-        }?;
+            })?
+        };
 
         // Read GGUF content
         let content = pmetal_gguf::GgufContent::from_file(&gguf_path)
@@ -585,8 +586,8 @@ pub fn get_gguf_architecture(path: impl AsRef<Path>) -> Result<Option<String>, W
                 "No .gguf file found in: {}",
                 path.display()
             ))
-        })
-    }?;
+        })?
+    };
 
     let content = pmetal_gguf::GgufContent::from_file(&gguf_path)
         .map_err(|e| WeightFormatError::Gguf(e.to_string()))?;

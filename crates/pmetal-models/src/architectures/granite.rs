@@ -11,7 +11,9 @@
 //! - SwiGLU activation
 //! - RMSNorm
 //! - Shared input/output embeddings
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops, random};
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops, random,
+};
 use pmetal_bridge::impl_module_params;
 
 use serde::{Deserialize, Serialize};
@@ -232,7 +234,6 @@ pub struct GraniteMLP {
 }
 impl_module_params!(GraniteMLP; gate_proj, up_proj, down_proj);
 
-
 impl GraniteMLP {
     pub fn new(hidden_size: i32, intermediate_size: i32) -> Result<Self, Exception> {
         let gate_proj = nn::LinearBuilder::new(hidden_size, intermediate_size)
@@ -275,7 +276,6 @@ pub struct GraniteAttention {
     pub o_proj: nn::Linear,
 }
 impl_module_params!(GraniteAttention; q_proj, k_proj, v_proj, o_proj);
-
 
 impl GraniteAttention {
     pub fn new(config: &GraniteConfig) -> Result<Self, Exception> {
@@ -367,7 +367,6 @@ pub struct GraniteMamba2 {
 }
 impl_module_params!(GraniteMamba2; in_proj, conv1d_weight, out_proj);
 
-
 impl GraniteMamba2 {
     pub fn new(config: &GraniteConfig) -> Result<Self, Exception> {
         let hidden_size = config.hidden_size;
@@ -432,7 +431,6 @@ pub struct GraniteDecoderLayer {
 }
 impl_module_params!(GraniteDecoderLayer; attention, mamba, mlp, input_layernorm, post_attention_layernorm);
 
-
 impl GraniteDecoderLayer {
     pub fn new(config: &GraniteConfig, layer_idx: usize) -> Result<Self, Exception> {
         let layer_type = config.layer_type(layer_idx);
@@ -443,7 +441,6 @@ impl GraniteDecoderLayer {
         };
 
         let mlp = GraniteMLP::new(config.hidden_size, config.intermediate_size)?;
-
 
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
@@ -503,7 +500,6 @@ pub struct GraniteModel {
 }
 impl_module_params!(GraniteModel; embed_tokens, layers, norm);
 
-
 impl GraniteModel {
     pub fn new(config: GraniteConfig) -> Result<Self, Exception> {
         let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)?;
@@ -550,7 +546,6 @@ pub struct GraniteForCausalLM {
 }
 impl_module_params!(GraniteForCausalLM; model, lm_head);
 
-
 impl GraniteForCausalLM {
     pub fn new(config: GraniteConfig) -> Result<Self, Exception> {
         // Only create separate lm_head if not tied
@@ -565,7 +560,6 @@ impl GraniteForCausalLM {
         };
 
         let model = GraniteModel::new(config.clone())?;
-
 
         Ok(Self {
             config,
@@ -615,7 +609,7 @@ mod tests {
     #[serial]
     fn test_granite_mlp() {
         let mlp = GraniteMLP::new(64, 256).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[1, 10, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 10, 64], pmetal_bridge::compat::Dtype::Float32);
 
         let mut mlp = mlp;
         let out = mlp.forward(&x).unwrap();

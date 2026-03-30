@@ -348,7 +348,8 @@ fn accept_reject(verify_logits: &Array, draft_tokens: &[u32]) -> Result<Vec<u32>
     // Verify each draft token against the verifier's argmax at that position.
     for (i, &draft_tok) in draft_tokens.iter().enumerate() {
         let pos = (verify_start + i) as i32;
-        let mut logit_row = pmetal_bridge::compat::ops::slice_axis(verify_logits, 1, pos, pos + 1).squeeze_axes(&[0, 1]);
+        let mut logit_row = pmetal_bridge::compat::ops::slice_axis(verify_logits, 1, pos, pos + 1)
+            .squeeze_axes(&[0, 1]);
         logit_row.eval();
         let verifier_token = argmax_1d(&logit_row)?;
 
@@ -362,7 +363,9 @@ fn accept_reject(verify_logits: &Array, draft_tokens: &[u32]) -> Result<Vec<u32>
     // All draft tokens accepted — emit a bonus token from the verifier's
     // prediction at the position after the last draft token.
     let bonus_pos = (verify_start + n) as i32;
-    let mut bonus_row = pmetal_bridge::compat::ops::slice_axis(verify_logits, 1, bonus_pos, bonus_pos + 1).squeeze_axes(&[0, 1]);
+    let mut bonus_row =
+        pmetal_bridge::compat::ops::slice_axis(verify_logits, 1, bonus_pos, bonus_pos + 1)
+            .squeeze_axes(&[0, 1]);
     bonus_row.eval();
     accepted.push(argmax_1d(&bonus_row)?);
 
@@ -382,7 +385,10 @@ fn build_verify_input(input_ids: &Array, draft_tokens: &[u32]) -> Result<Array, 
     }
     let draft_i32: Vec<i32> = draft_tokens.iter().map(|&t| t as i32).collect();
     let draft_arr = Array::from_slice(&draft_i32, &[1, draft_tokens.len() as i32]);
-    Ok(pmetal_bridge::compat::ops::concatenate_axis(&[input_ids, &draft_arr], 1))
+    Ok(pmetal_bridge::compat::ops::concatenate_axis(
+        &[input_ids, &draft_arr],
+        1,
+    ))
 }
 
 /// Extract the last token position from hidden states.
@@ -390,7 +396,12 @@ fn build_verify_input(input_ids: &Array, draft_tokens: &[u32]) -> Result<Array, 
 /// `hidden`: `[batch, seq_len, hidden_dim]` → `[batch, 1, hidden_dim]`
 fn last_token_hidden(hidden: &Array) -> Result<Array, Exception> {
     let seq_len = hidden.dim(1) as i32;
-    Ok(pmetal_bridge::compat::ops::slice_axis(hidden, 1, seq_len - 1, seq_len))
+    Ok(pmetal_bridge::compat::ops::slice_axis(
+        hidden,
+        1,
+        seq_len - 1,
+        seq_len,
+    ))
 }
 
 /// Greedy argmax for a logits tensor of shape `[1, 1, vocab_size]` or
@@ -398,7 +409,8 @@ fn last_token_hidden(hidden: &Array) -> Result<Array, Exception> {
 fn argmax_last(logits: &Array) -> Result<u32, Exception> {
     // logits: [batch=1, seq_len, vocab_size]
     let seq_len = logits.dim(1) as i32;
-    let row = pmetal_bridge::compat::ops::slice_axis(logits, 1, seq_len - 1, seq_len).squeeze_axes(&[0, 1]);
+    let row = pmetal_bridge::compat::ops::slice_axis(logits, 1, seq_len - 1, seq_len)
+        .squeeze_axes(&[0, 1]);
     argmax_1d(&row)
 }
 

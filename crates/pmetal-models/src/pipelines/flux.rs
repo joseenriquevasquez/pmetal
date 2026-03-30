@@ -144,7 +144,10 @@ impl FluxPipeline {
         // 3. Prepare IDs for RoPE
         // Text IDs are [B, text_seq, 3] - usually zeros or indices for Flux.
         let text_seq = prompt_emb.dim(1);
-        let text_ids = pmetal_bridge::compat::ops::zeros(&[batch_size, text_seq, 3], pmetal_bridge::compat::Dtype::Float32);
+        let text_ids = pmetal_bridge::compat::ops::zeros(
+            &[batch_size, text_seq, 3],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Image IDs: grid indices for positional encoding
         let mut image_ids_vec = Vec::with_capacity(latents_seq as usize);
@@ -155,12 +158,14 @@ impl FluxPipeline {
         }
         let image_ids_flat: Vec<f32> = image_ids_vec.into_iter().flatten().collect();
         let image_ids_base = Array::from_f32_slice(&image_ids_flat, &[1, latents_seq as i32, 3]);
-        let image_ids = pmetal_bridge::compat::ops::repeat_axis(image_ids_base, batch_size as i32, 0);
+        let image_ids =
+            pmetal_bridge::compat::ops::repeat_axis(image_ids_base, batch_size as i32, 0);
 
         // 4. Denoising loop
         let scheduler = FlowMatchScheduler::new_flux(num_steps, 1.0, Some(3.0))?;
         let guidance_arr = Array::from_f32(guidance).expand_dims(0);
-        let guidance_arr = pmetal_bridge::compat::ops::repeat_axis(guidance_arr, batch_size as i32, 0);
+        let guidance_arr =
+            pmetal_bridge::compat::ops::repeat_axis(guidance_arr, batch_size as i32, 0);
 
         // Scheduler timesteps are already in descending order (high noise → low noise)
         let timesteps = scheduler.timesteps.as_slice::<f32>().to_vec();
@@ -272,10 +277,8 @@ fn required_component_dir(
 
 fn read_json(path: &Path) -> Result<Value> {
     let raw = std::fs::read_to_string(path).map_err(pmetal_core::PMetalError::Io)?;
-    Ok(
-        serde_json::from_str(&raw)
-            .map_err(|e| pmetal_core::PMetalError::Serialization(e.to_string()))?,
-    )
+    Ok(serde_json::from_str(&raw)
+        .map_err(|e| pmetal_core::PMetalError::Serialization(e.to_string()))?)
 }
 
 fn load_clip_config(component_dir: &Path) -> Result<CLIPConfig> {
@@ -444,8 +447,8 @@ mod tests {
         let mut pipeline = FluxPipeline::new(clip_config, t5_config, flux_config, vae_config);
 
         let batch = 1;
-        let clip_input = zeros::<i32>(&[batch, 77]).unwrap();
-        let t5_input = zeros::<i32>(&[batch, 256]).unwrap();
+        let clip_input = zeros(&[batch, 77], pmetal_bridge::compat::Dtype::Int32);
+        let t5_input = zeros(&[batch, 256], pmetal_bridge::compat::Dtype::Int32);
 
         // Use a very small number of steps for the test
         let out = pipeline.generate(

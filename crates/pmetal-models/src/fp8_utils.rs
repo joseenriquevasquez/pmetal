@@ -22,9 +22,8 @@
 //! `pmetal_bridge::compat::ops::from_fp8` to dequantise before computation — this matches the
 //! semantics already used by `pmetal_mlx::fp8_quantization`.
 
-
-use pmetal_bridge::compat::{Array, Exception, ModuleParameters, ModuleParametersExt, nn, ops};
 use pmetal_bridge::compat::ops::to_fp8;
+use pmetal_bridge::compat::{Array, Exception, ModuleParameters, ModuleParametersExt, nn, ops};
 /// Quantize every `.weight` parameter of `model` to FP8 (E4M3) in-place.
 ///
 /// The function iterates the fully-flattened parameter map and replaces every

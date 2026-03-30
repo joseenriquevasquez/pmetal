@@ -6,15 +6,18 @@
 //! - Fixed-size recurrent state for O(1) memory during generation
 
 // ModuleParameters derive via impl_module_params!
-use pmetal_bridge::compat::{Array, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, indexing, nn, ops};
 use pmetal_bridge::compat::indexing::IndexOp;
+use pmetal_bridge::compat::{
+    Array, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
+    indexing, nn, ops,
+};
 use pmetal_bridge::impl_module_params;
 use pmetal_core::ModelConfig;
 use pmetal_mlx::Builder;
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use serde::{Deserialize, Serialize};
-use std::rc::Rc;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// RecurrentGemma model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +62,6 @@ pub struct RGLRU {
     pub recurrent_state: Option<Array>,
 }
 impl_module_params!(RGLRU; input_proj, gate_proj, output_proj);
-
 
 impl RGLRU {
     pub fn new(config: &RecurrentGemmaConfig) -> Result<Self, Exception> {
@@ -113,15 +115,16 @@ impl RGLRU {
 
             for t in 0..seq_len {
                 let a_t_step = a_t.slice(&[0, t, 0], &[batch, t + 1, self.width]);
-                let input_step =
-                    scaled_input.slice(&[0, t, 0], &[batch, t + 1, self.width]);
+                let input_step = scaled_input.slice(&[0, t, 0], &[batch, t + 1, self.width]);
                 h = a_t_step.multiply(&h).add(&input_step);
                 outputs.push(h.clone());
             }
             self.recurrent_state = Some(h);
 
-            let concatenated =
-                pmetal_bridge::compat::ops::concatenate_axis(&outputs.iter().collect::<Vec<_>>(), 1);
+            let concatenated = pmetal_bridge::compat::ops::concatenate_axis(
+                &outputs.iter().collect::<Vec<_>>(),
+                1,
+            );
             Ok(self.output_proj.forward(&concatenated))
         }
     }
@@ -140,7 +143,6 @@ pub struct RecurrentGemmaAttention {
     pub scale: f32,
 }
 impl_module_params!(RecurrentGemmaAttention; q_proj, k_proj, v_proj, o_proj);
-
 
 impl RecurrentGemmaAttention {
     pub fn new(config: &RecurrentGemmaConfig) -> Result<Self, Exception> {
@@ -339,7 +341,6 @@ pub struct RecurrentGemmaModel {
     pub config: RecurrentGemmaConfig,
 }
 impl_module_params!(RecurrentGemmaModel; embed, layers, norm);
-
 
 impl RecurrentGemmaModel {
     pub fn new(config: RecurrentGemmaConfig) -> Result<Self, Exception> {

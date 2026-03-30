@@ -14,7 +14,9 @@
 //!
 //! Reference: https://arxiv.org/abs/2504.03624
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, Param, indexing, nn, ops};
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception, Module, ModuleParameters, Param, indexing, nn, ops,
+};
 use pmetal_bridge::impl_module_params;
 use std::collections::HashMap;
 
@@ -61,12 +63,7 @@ fn linear_forward_with_optional_fp8(
 }
 
 fn linear_module_forward(linear: &mut nn::Linear, x: &Array) -> Result<Array, Exception> {
-    linear_forward_with_optional_fp8(
-        x,
-        linear.weight.as_ref(),
-        linear.bias.as_ref(),
-        None,
-    )
+    linear_forward_with_optional_fp8(x, linear.weight.as_ref(), linear.bias.as_ref(), None)
 }
 
 fn quantize_linear_weights_fp8(linear: &mut nn::Linear) -> Result<(), Exception> {
@@ -435,7 +432,8 @@ pub fn ssm_attention(
 
     // Compute new state for caching
     // decay_last: [B, H, 1, L] -> [B, L, H, 1]
-    let decay_last = pmetal_bridge::compat::ops::slice_axis(&decay, 2, (seq_len as i32) - 1, seq_len as i32);
+    let decay_last =
+        pmetal_bridge::compat::ops::slice_axis(&decay, 2, (seq_len as i32) - 1, seq_len as i32);
     let decay_last = decay_last.transpose_axes(&[0, 3, 1, 2]);
 
     // B_expanded: [B, G, N, L] -> repeat to [B, H, N, L] -> [B, H, L, N]
@@ -456,10 +454,16 @@ pub fn ssm_attention(
     // If we have previous state, incorporate it
     if let Some(prev_state) = state {
         // exp_dtA_cumsum = exp(cumsum(dtA, axis=-2)): [B, L, H]
-        let exp_dta_cumsum = pmetal_bridge::compat::ops::exp(&pmetal_bridge::compat::ops::cumsum(&dt_a, -2));
+        let exp_dta_cumsum =
+            pmetal_bridge::compat::ops::exp(&pmetal_bridge::compat::ops::cumsum(&dt_a, -2));
 
         // exp_dta_last: [B, 1, H] -> [B, H, 1, 1]
-        let exp_dta_last = pmetal_bridge::compat::ops::slice_axis(&exp_dta_cumsum, 1, (seq_len as i32) - 1, seq_len as i32);
+        let exp_dta_last = pmetal_bridge::compat::ops::slice_axis(
+            &exp_dta_cumsum,
+            1,
+            (seq_len as i32) - 1,
+            seq_len as i32,
+        );
         let exp_dta_last = exp_dta_last.transpose_axes(&[0, 2, 1]);
         let exp_dta_last = pmetal_bridge::compat::ops::expand_dims(&exp_dta_last, -1);
 
@@ -521,7 +525,6 @@ pub struct Expert {
     pub down_proj_input_scale: Option<Array>,
 }
 impl_module_params!(Expert; up_proj, down_proj);
-
 
 impl Expert {
     /// Create a new expert.
@@ -602,7 +605,6 @@ pub struct MoERouter {
 }
 impl_module_params!(MoERouter; gate);
 
-
 impl MoERouter {
     /// Create a new router.
     pub fn new(
@@ -664,8 +666,12 @@ impl MoERouter {
             // Zero out bottom groups using put_along_axis
             let zeros = Array::from_f32(0.0);
             let group_idx_sg = pmetal_bridge::compat::stop_gradient(&group_idx)?;
-            let grouped =
-                pmetal_bridge::compat::indexing::put_along_axis(&grouped, &group_idx_sg, &zeros, Some(-2));
+            let grouped = pmetal_bridge::compat::indexing::put_along_axis(
+                &grouped,
+                &group_idx_sg,
+                &zeros,
+                Some(-2),
+            );
 
             // Flatten back: [B*L, num_experts]
             grouped.reshape(&[-1, self.num_experts])
@@ -711,7 +717,6 @@ pub struct MoELayer {
     pub top_k: i32,
 }
 impl_module_params!(MoELayer; router, experts, shared_expert);
-
 
 impl MoELayer {
     /// Create a new MoE layer.
@@ -794,7 +799,8 @@ impl MoELayer {
             for (k, &expert_idx_u32) in indices_flat.iter().take(self.top_k as usize).enumerate() {
                 let expert_idx = expert_idx_u32 as usize;
                 let ki = k as i32;
-                let expert_weight = pmetal_bridge::compat::ops::slice_axis(&weights, -1, ki, ki + 1);
+                let expert_weight =
+                    pmetal_bridge::compat::ops::slice_axis(&weights, -1, ki, ki + 1);
 
                 // Call only the selected expert
                 let expert_out = self.experts[expert_idx].forward(&x_flat)?;
@@ -820,7 +826,8 @@ impl MoELayer {
                     let weighted = expert_out.multiply(&expert_weights);
                     let zeros = pmetal_bridge::compat::ops::zeros_like(&weighted);
                     let mask_expanded = mask.reshape(&[-1, 1]);
-                    let masked_weighted = pmetal_bridge::compat::ops::where_fn(&mask_expanded, &weighted, &zeros);
+                    let masked_weighted =
+                        pmetal_bridge::compat::ops::where_fn(&mask_expanded, &weighted, &zeros);
                     output = output.add(&masked_weighted);
                 }
             }
@@ -1257,7 +1264,6 @@ pub struct NemotronHMixer {
 }
 impl_module_params!(NemotronHMixer; in_proj, conv1d, out_proj, q_proj, k_proj, v_proj, o_proj, up_proj, down_proj, moe_layer);
 
-
 impl NemotronHMixer {
     /// Create a new Mamba mixer.
     pub fn new_mamba(config: &NemotronHConfig) -> Result<Self, Exception> {
@@ -1603,7 +1609,11 @@ impl NemotronHMixer {
             // Output is [B, padded_len, conv_dim], truncate to [B, seq_len, conv_dim]
             let out_len = conv_out.dim(1);
 
-            let conv_out = pmetal_bridge::compat::ops::slice_axis_from(&conv_out, 1, (out_len - seq_len) as i32);
+            let conv_out = pmetal_bridge::compat::ops::slice_axis_from(
+                &conv_out,
+                1,
+                (out_len - seq_len) as i32,
+            );
             nn::silu(&conv_out)
         } else {
             // No cache: use CAUSAL PADDING for full sequence
@@ -1613,8 +1623,8 @@ impl NemotronHMixer {
             let padded_input = pmetal_bridge::compat::ops::pad(
                 conv_input,
                 &[(0i32, 0i32), (pad_amount, 0), (0, 0)],
-                None,               // mode = Constant (default)
-                Some(0.0),          // pad value = 0
+                None,      // mode = Constant (default)
+                Some(0.0), // pad value = 0
             );
             let conv_out = Module::forward(conv1d, &padded_input)?;
             // Conv output has same length as padded input minus (kernel_size - 1)
@@ -1625,7 +1635,8 @@ impl NemotronHMixer {
         // Split conv output with split_sections (optimization #1)
         let bc_size = n_groups * ssm_state_size;
         let conv_split_indices = &[intermediate_size, intermediate_size + bc_size];
-        let conv_parts = pmetal_bridge::compat::ops::split_sections(&conv_activated, conv_split_indices, -1);
+        let conv_parts =
+            pmetal_bridge::compat::ops::split_sections(&conv_activated, conv_split_indices, -1);
         let hidden_states = &conv_parts[0]; // [B, L, intermediate_size]
         let b_proj = &conv_parts[1]; // [B, L, n_groups * ssm_state_size]
         let c_proj = &conv_parts[2]; // [B, L, n_groups * ssm_state_size]
@@ -1745,7 +1756,8 @@ impl NemotronHMixer {
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
                 if let Some(output) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)? {
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
+                {
                     let output = output
                         .transpose_axes(&[0, 2, 1, 3])
                         .reshape(&[batch, seq_len, -1]);
@@ -1865,7 +1877,6 @@ pub struct NemotronHBlock {
 }
 impl_module_params!(NemotronHBlock; norm, mixer);
 
-
 impl NemotronHBlock {
     pub fn new(config: &NemotronHConfig, block_type: char) -> Result<Self, Exception> {
         let norm = nn::RmsNormBuilder::new(config.hidden_size)
@@ -1906,7 +1917,6 @@ pub struct NemotronHModel {
     pub config: NemotronHConfig,
 }
 impl_module_params!(NemotronHModel; embeddings, layers, norm_f);
-
 
 impl NemotronHModel {
     pub fn new(config: NemotronHConfig) -> Result<Self, Exception> {
@@ -2003,7 +2013,6 @@ pub struct NemotronHForCausalLM {
     pub lm_head: Option<nn::Linear>,
 }
 impl_module_params!(NemotronHForCausalLM; backbone, lm_head);
-
 
 impl NemotronHForCausalLM {
     pub fn new(config: NemotronHConfig) -> Result<Self, Exception> {

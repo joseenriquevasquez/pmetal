@@ -8,16 +8,19 @@
 //! - Multi-token prediction lookahead modules
 
 // ModuleParameters derive via impl_module_params!
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param, indexing, nn, ops, random};
 use pmetal_bridge::compat::indexing::IndexOp;
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
+    Param, indexing, nn, ops, random,
+};
 use pmetal_bridge::impl_module_params;
 use pmetal_mlx::Builder;
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_mlx::moe::{MoEConfig, MoELayer};
 use serde::{Deserialize, Serialize};
-use std::rc::Rc;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Result type for DeepSeek operations.
 pub type Result<T, E = Exception> = std::result::Result<T, E>;
@@ -206,7 +209,6 @@ pub struct DeepSeekAttention {
 }
 impl_module_params!(DeepSeekAttention; q_a_proj, q_a_layernorm, q_b_proj, q_proj, kv_a_proj_with_mqa, kv_a_layernorm, kv_b_proj, o_proj);
 
-
 impl DeepSeekAttention {
     pub fn new(config: &DeepSeekConfig, layer_id: usize) -> Result<Self> {
         let hidden_size = config.hidden_size;
@@ -218,9 +220,7 @@ impl DeepSeekAttention {
                 let q_a = nn::LinearBuilder::new(hidden_size, q_lora_rank)
                     .bias(config.attention_bias)
                     .build()?;
-                let q_a_norm = nn::RmsNormBuilder::new(q_lora_rank)
-                    .eps(1e-6)
-                    .build()?;
+                let q_a_norm = nn::RmsNormBuilder::new(q_lora_rank).eps(1e-6).build()?;
                 let q_b = nn::LinearBuilder::new(q_lora_rank, n_heads * q_head_dim)
                     .bias(false)
                     .build()?;
@@ -405,7 +405,6 @@ pub struct LightningIndexer {
 }
 impl_module_params!(LightningIndexer; q_proj, k_proj);
 
-
 impl LightningIndexer {
     pub fn new(config: &DeepSeekConfig) -> Result<Self> {
         let n_heads = config.lightning_indexer_heads;
@@ -482,7 +481,11 @@ impl TokenSelector {
             scores.clone()
         };
         let neg_k = -self.top_k;
-        Ok(pmetal_bridge::compat::ops::slice_axis_from(&pmetal_bridge::compat::ops::argpartition_axis(&masked_scores, neg_k, -1), -1, neg_k))
+        Ok(pmetal_bridge::compat::ops::slice_axis_from(
+            &pmetal_bridge::compat::ops::argpartition_axis(&masked_scores, neg_k, -1),
+            -1,
+            neg_k,
+        ))
     }
 }
 
@@ -494,7 +497,6 @@ pub struct DeepSeekSparseAttention {
     pub store_indices: bool,
 }
 impl_module_params!(DeepSeekSparseAttention; base_attention, indexer);
-
 
 impl DeepSeekSparseAttention {
     pub fn new(config: &DeepSeekConfig, layer_id: usize) -> Result<Self> {
@@ -528,21 +530,24 @@ impl DeepSeekSparseAttention {
         let val_dim = values.shape()[3];
         let top_k = self.selector.top_k;
         let idx = selected_indices.reshape(&[batch, 1, query_len, top_k]);
-        let idx = pmetal_bridge::compat::ops::broadcast_to(&idx, &[batch, n_heads, query_len, top_k]);
+        let idx =
+            pmetal_bridge::compat::ops::broadcast_to(&idx, &[batch, n_heads, query_len, top_k]);
         let idx_for_keys = idx.reshape(&[batch, n_heads, query_len * top_k, 1]);
         let idx_for_keys = pmetal_bridge::compat::ops::broadcast_to(
             &idx_for_keys,
             &[batch, n_heads, query_len * top_k, key_dim],
         );
-        let gathered_keys = pmetal_bridge::compat::indexing::take_along_axis(&keys, &idx_for_keys, 2)
-            .reshape(&[batch, n_heads, query_len, top_k, key_dim]);
+        let gathered_keys =
+            pmetal_bridge::compat::indexing::take_along_axis(&keys, &idx_for_keys, 2)
+                .reshape(&[batch, n_heads, query_len, top_k, key_dim]);
         let idx_for_vals = idx.reshape(&[batch, n_heads, query_len * top_k, 1]);
         let idx_for_vals = pmetal_bridge::compat::ops::broadcast_to(
             &idx_for_vals,
             &[batch, n_heads, query_len * top_k, val_dim],
         );
-        let gathered_values = pmetal_bridge::compat::indexing::take_along_axis(&values, &idx_for_vals, 2)
-            .reshape(&[batch, n_heads, query_len, top_k, val_dim]);
+        let gathered_values =
+            pmetal_bridge::compat::indexing::take_along_axis(&values, &idx_for_vals, 2)
+                .reshape(&[batch, n_heads, query_len, top_k, val_dim]);
         let q_expanded = queries.reshape(&[batch, n_heads, query_len, 1, key_dim]);
         let attn_scores = q_expanded
             .matmul(&gathered_keys.transpose_axes(&[0, 1, 2, 4, 3]))
@@ -619,14 +624,17 @@ impl DeepSeekMoEGate {
         let token_count: i32 = shape[..shape.len().saturating_sub(1)].iter().product();
         let hidden_flat = x.reshape(&[token_count, hidden_size]);
         let gates = self.weight.forward(&hidden_flat);
-        let scores = pmetal_bridge::compat::ops::sigmoid(&gates.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32()));
+        let scores = pmetal_bridge::compat::ops::sigmoid(
+            &gates.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32()),
+        );
         let scores_with_bias = scores.add(&self.e_score_correction_bias);
         let neg_k = -self.top_k;
         let inds = pmetal_bridge::compat::ops::slice_axis_from(
             &pmetal_bridge::compat::ops::argpartition_axis(&scores_with_bias, neg_k, -1),
             -1,
             neg_k,
-        ).as_type::<i32>();
+        )
+        .as_type::<i32>();
         let top_scores = scores.take_along_axis(&inds, -1);
         let final_scores = if self.norm_topk_prob && self.top_k > 1 {
             top_scores.divide(&top_scores.sum_axis(-1, true))
@@ -824,19 +832,19 @@ impl DeepSeekMoE {
 
     #[cfg(test)]
     fn forward_reference(&mut self, x: &Array) -> Result<Array> {
-        let (expert_indices, expert_weights) = self.gate.forward(x);
+        let (expert_indices, expert_weights) = self.gate.forward(x)?;
         let moe_out = self
             .moe
-            .forward_with_routing(x, &expert_indices, &expert_weights);
+            .forward_with_routing(x, &expert_indices, &expert_weights)?;
         if let Some(ref mut shared) = self.shared_experts {
-            moe_out.add(&shared.forward(x))
+            Ok(moe_out.add(&shared.forward(x)?))
         } else {
             Ok(moe_out)
         }
     }
 
     fn forward_stacked(&mut self, x: &Array) -> Result<Array> {
-        self.ensure_stacked_moe();
+        self.ensure_stacked_moe()?;
 
         let shape = x.shape();
         let hidden_flat = x.reshape(&[
@@ -847,11 +855,15 @@ impl DeepSeekMoE {
         let hidden_size = hidden_flat.dim(1);
         let (expert_indices, expert_weights) = self.gate.forward(&hidden_flat)?;
         let top_k = self.gate.top_k;
-        let mut output = pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
+        let mut output =
+            pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
 
         for slot in 0..top_k {
-            let slot_experts = pmetal_bridge::compat::ops::slice_axis(&expert_indices, 1, slot, slot + 1).reshape(&[expert_indices.dim(0)]);
-            let slot_weights = pmetal_bridge::compat::ops::slice_axis(&expert_weights, 1, slot, slot + 1);
+            let slot_experts =
+                pmetal_bridge::compat::ops::slice_axis(&expert_indices, 1, slot, slot + 1)
+                    .reshape(&[expert_indices.dim(0)]);
+            let slot_weights =
+                pmetal_bridge::compat::ops::slice_axis(&expert_weights, 1, slot, slot + 1);
 
             let gate_weights = self
                 .stacked_gate_proj
@@ -1004,11 +1016,11 @@ impl DeepSeekDecoderLayer {
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array> {
-        let h = x.add(&self.self_attn.forward(
-            &self.input_layernorm.forward(x),
-            mask,
-            cache,
-        )?);
+        let h = x.add(
+            &self
+                .self_attn
+                .forward(&self.input_layernorm.forward(x), mask, cache)?,
+        );
         Ok(h.add(
             &self
                 .mlp
@@ -1075,7 +1087,7 @@ impl DeepSeekModel {
 
     pub fn init_stacked_moe(&mut self) -> Result<()> {
         for layer in &mut self.layers {
-            layer.init_stacked_moe();
+            layer.init_stacked_moe()?;
         }
         Ok(())
     }
@@ -1113,10 +1125,7 @@ impl DeepSeekMTPModule {
     ) -> Result<Array> {
         let hn = self.hnorm.forward(h_prev);
         let en = self.enorm.forward(e_curr);
-        let cat = pmetal_bridge::compat::ops::concatenate_axis(
-            &[&hn, &en],
-            -1,
-        );
+        let cat = pmetal_bridge::compat::ops::concatenate_axis(&[&hn, &en], -1);
         self.layer.forward(&self.eh_proj.forward(&cat), mask, None)
     }
 }
@@ -1180,7 +1189,9 @@ impl DeepSeek {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array> {
-        Ok(self.lm_head.forward(&self.model.forward(input_ids, mask, cache)?))
+        Ok(self
+            .lm_head
+            .forward(&self.model.forward(input_ids, mask, cache)?))
     }
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
         KVCache::new(
@@ -1195,9 +1206,9 @@ impl DeepSeek {
     }
 
     pub fn init_stacked_moe(&mut self) -> Result<()> {
-        self.model.init_stacked_moe();
+        self.model.init_stacked_moe()?;
         for module in &mut self.mtp_modules {
-            module.layer.init_stacked_moe();
+            module.layer.init_stacked_moe()?;
         }
         Ok(())
     }
@@ -1231,8 +1242,12 @@ mod tests {
     fn test_deepseek_moe_stacked_matches_reference() {
         let config = tiny_deepseek_moe_config();
         let mut moe = DeepSeekMoE::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
-            .unwrap();
+        let x = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[2, 5, config.hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let reference = moe.forward_reference(&x).unwrap();
         let fast = moe.forward(&x).unwrap();
@@ -1260,15 +1275,20 @@ mod tests {
     fn test_deepseek_moe_cache_refreshes_after_weight_change() {
         let config = tiny_deepseek_moe_config();
         let mut moe = DeepSeekMoE::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
-            .unwrap();
+        let x = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[1, 4, config.hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let _ = moe.forward(&x).unwrap();
         assert!(moe.has_stacked_moe());
 
-        moe.moe.experts[0].w1.weight = Param::new(
-            Array::zeros_f32(&[config.moe_intermediate_size, config.hidden_size]),
-        );
+        moe.moe.experts[0].w1.weight = Array::zeros_f32(&[
+            config.moe_intermediate_size,
+            config.hidden_size,
+        ]);
 
         let reference = moe.forward_reference(&x).unwrap();
         let fast = moe.forward(&x).unwrap();

@@ -3,8 +3,8 @@
 //! Provides schedulers for diffusion models (Flow-Matching, DDIM, etc.)
 //! optimized for Apple Silicon.
 
-use pmetal_bridge::compat::{Array, Dtype, ops};
 use pmetal_bridge::compat::ops::argmin_axis;
+use pmetal_bridge::compat::{Array, Dtype, ops};
 use pmetal_core::{PMetalError, Result};
 
 /// Flow-Matching scheduler for models like Flux.1 and Wan.
@@ -37,8 +37,7 @@ impl FlowMatchScheduler {
         );
 
         let numerator = sigmas.multiply(&Array::from_f32(shift));
-        let denominator = Array::from_f32(1.0)
-            .add(&sigmas.multiply(&Array::from_f32(shift - 1.0)));
+        let denominator = Array::from_f32(1.0).add(&sigmas.multiply(&Array::from_f32(shift - 1.0)));
         let sigmas = numerator.divide(&denominator);
 
         let timesteps = sigmas.multiply(&Array::from_f32(num_train_timesteps));
@@ -53,7 +52,7 @@ impl FlowMatchScheduler {
     /// Perform a single denoising step.
     pub fn step(&self, model_output: &Array, timestep: &Array, sample: &Array) -> Result<Array> {
         let diff = self.timesteps.subtract(timestep).abs();
-        let timestep_id_arr = argmin_axis(&diff, 0);
+        let mut timestep_id_arr = argmin_axis(&diff, 0);
         let timestep_id = timestep_id_arr.item::<u32>() as i32;
 
         let mut sigma_arr = ops::select_axis(&self.sigmas, timestep_id, 0);
@@ -75,7 +74,7 @@ impl FlowMatchScheduler {
     /// Add noise to a sample.
     pub fn add_noise(&self, original: &Array, noise: &Array, timestep: &Array) -> Result<Array> {
         let diff = self.timesteps.subtract(timestep).abs();
-        let timestep_id_arr = argmin_axis(&diff, 0);
+        let mut timestep_id_arr = argmin_axis(&diff, 0);
         let timestep_id = timestep_id_arr.item::<u32>() as i32;
 
         let mut sigma_arr = ops::select_axis(&self.sigmas, timestep_id, 0);

@@ -11,7 +11,10 @@
 //! Variants:
 //! - **Llama 4 Scout**: 109B total params (16 experts), 17B active, 10M context
 //! - **Llama 4 Maverick**: 402B total params (128 experts), 17B active, 1M context
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, fast, indexing, nn, ops, random};
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, fast, indexing, nn,
+    ops, random,
+};
 use pmetal_bridge::impl_module_params;
 
 use pmetal_mlx::kernels::rope::apply_rope as rope_apply;
@@ -268,7 +271,6 @@ pub struct Llama4Expert {
 }
 impl_module_params!(Llama4Expert; gate_proj, up_proj, down_proj);
 
-
 impl Llama4Expert {
     pub fn new(hidden_size: i32, intermediate_size: i32) -> Result<Self, Exception> {
         let gate_proj = nn::LinearBuilder::new(hidden_size, intermediate_size)
@@ -304,7 +306,6 @@ pub struct Llama4Router {
     pub top_k: i32,
 }
 impl_module_params!(Llama4Router; gate);
-
 
 impl Llama4Router {
     pub fn new(hidden_size: i32, num_experts: i32, top_k: i32) -> Result<Self, Exception> {
@@ -364,7 +365,6 @@ pub struct Llama4ModRouter {
     pub gate: nn::Linear,
 }
 impl_module_params!(Llama4ModRouter; gate);
-
 
 impl Llama4ModRouter {
     pub fn new(hidden_size: i32) -> Result<Self, Exception> {
@@ -428,7 +428,6 @@ pub struct Llama4MoE {
 }
 impl_module_params!(Llama4MoE; router, experts, shared_expert);
 
-
 impl Llama4MoE {
     pub fn new(config: &Llama4TextConfig) -> Result<Self, Exception> {
         let router = Llama4Router::new(
@@ -442,7 +441,6 @@ impl Llama4MoE {
             .collect::<Result<Vec<_>, _>>()?;
 
         let shared_expert = Llama4Expert::new(config.hidden_size, config.intermediate_size)?;
-
 
         Ok(Self {
             config: config.clone(),
@@ -478,7 +476,11 @@ impl Llama4MoE {
 
         let top_k = self.config.num_experts_per_tok as usize;
         let n_tokens = total_tokens as usize;
-        let expert_ids: Vec<i32> = expert_indices.as_slice::<u32>().iter().map(|&x| x as i32).collect();
+        let expert_ids: Vec<i32> = expert_indices
+            .as_slice::<u32>()
+            .iter()
+            .map(|&x| x as i32)
+            .collect();
         let routing_weights: Vec<f32> = expert_weights.as_slice().to_vec();
 
         let mut expert_assignments: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.experts.len()];
@@ -511,8 +513,12 @@ impl Llama4MoE {
             let weighted_out = expert_out.multiply(&weight_array);
 
             let updates = weighted_out.reshape(&[token_indices.len() as i32, 1, hidden_size]);
-            combined_out =
-                pmetal_bridge::compat::indexing::scatter_add_single(&combined_out, &idx_array, &updates, 0);
+            combined_out = pmetal_bridge::compat::indexing::scatter_add_single(
+                &combined_out,
+                &idx_array,
+                &updates,
+                0,
+            );
         }
 
         // Add shared expert contribution and reshape to original shape
@@ -550,7 +556,6 @@ pub struct Llama4Attention {
     pub k_norm: Option<nn::RmsNorm>,
 }
 impl_module_params!(Llama4Attention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
-
 
 impl Llama4Attention {
     pub fn new(config: &Llama4TextConfig, layer_idx: usize) -> Result<Self, Exception> {
@@ -761,7 +766,7 @@ pub struct Llama4DecoderLayer {
 
     pub self_attn: Llama4Attention,
     pub mlp: Option<Llama4Expert>, // Dense MLP (if not MoE)
-    pub moe: Option<Llama4MoE>, // MoE layer (if MoE)
+    pub moe: Option<Llama4MoE>,    // MoE layer (if MoE)
     pub input_layernorm: nn::RmsNorm,
     pub post_attention_layernorm: nn::RmsNorm,
     /// MoD router (present only when this layer uses Mixture-of-Depths).
@@ -773,7 +778,6 @@ pub struct Llama4DecoderLayer {
     pub last_mod_aux_loss: Option<Array>,
 }
 impl_module_params!(Llama4DecoderLayer; self_attn, mlp, moe, input_layernorm, post_attention_layernorm, mod_router);
-
 
 impl Llama4DecoderLayer {
     pub fn new(config: &Llama4TextConfig, layer_idx: usize) -> Result<Self, Exception> {
@@ -965,7 +969,6 @@ pub struct Llama4TextModel {
 }
 impl_module_params!(Llama4TextModel; embed_tokens, layers, norm);
 
-
 impl Llama4TextModel {
     pub fn new(config: Llama4TextConfig) -> Result<Self, Exception> {
         let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)?;
@@ -1039,7 +1042,6 @@ pub struct Llama4ForCausalLM {
 }
 impl_module_params!(Llama4ForCausalLM; model, lm_head);
 
-
 impl Llama4ForCausalLM {
     pub fn new(config: Llama4TextConfig) -> Result<Self, Exception> {
         let lm_head = nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
@@ -1047,7 +1049,6 @@ impl Llama4ForCausalLM {
             .build()?;
 
         let model = Llama4TextModel::new(config.clone())?;
-
 
         Ok(Self {
             config,
@@ -1153,7 +1154,7 @@ mod tests {
     #[serial]
     fn test_llama4_expert() {
         let expert = Llama4Expert::new(64, 256).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[1, 10, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 10, 64], pmetal_bridge::compat::Dtype::Float32);
 
         let mut expert = expert;
         let out = expert.forward(&x).unwrap();
@@ -1174,7 +1175,7 @@ mod tests {
 
         let mut moe = Llama4MoE::new(&config).unwrap();
         let x =
-            pmetal_bridge::compat::random::normal(&[2, 5, config.hidden_size], None, None, None).unwrap();
+            pmetal_bridge::compat::random::normal(&[2, 5, config.hidden_size], pmetal_bridge::compat::Dtype::Float32);
 
         let shape = x.shape().to_vec();
         let hidden_size = *shape.last().unwrap();
@@ -1198,7 +1199,9 @@ mod tests {
             for (expert_idx, expert) in moe.experts.iter_mut().enumerate() {
                 let expert_id = Array::from_int(expert_idx as i32);
                 let mask = slot_indices.eq(&expert_id).unwrap();
-                let mask_f32 = mask.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32()).unwrap();
+                let mask_f32 = mask
+                    .as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32())
+                    .unwrap();
                 let exp_output = expert.forward(&flat_x).unwrap();
                 let masked = exp_output
                     .multiply(&mask_f32.reshape(&[total_tokens, 1]).unwrap())
@@ -1242,10 +1245,10 @@ mod tests {
         config.num_experts_per_tok = 1;
 
         let mut moe = Llama4MoE::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, config.hidden_size], None, None, None)
-            .unwrap()
-            .as_dtype(pmetal_bridge::compat::Dtype::Float16.as_i32())
-            .unwrap();
+        let x =
+            pmetal_bridge::compat::random::normal(&[1, 4, config.hidden_size], pmetal_bridge::compat::Dtype::Float32)
+                .as_dtype(pmetal_bridge::compat::Dtype::Float16.as_i32())
+                .unwrap();
 
         let output = moe.forward(&x).unwrap();
         output.eval().unwrap();
@@ -1316,7 +1319,7 @@ mod tests {
         let capacity = 0.5_f32; // k = 4
 
         let mut router = Llama4ModRouter::new(hidden).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden], pmetal_bridge::compat::Dtype::Float32);
 
         let (selected_indices, router_logits, top_k_mask) = router.route(&x, capacity).unwrap();
         selected_indices.eval().unwrap();
@@ -1343,7 +1346,7 @@ mod tests {
         let capacity = 0.3_f32; // k = floor(0.3 * 10) = 3
 
         let mut router = Llama4ModRouter::new(hidden).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden], pmetal_bridge::compat::Dtype::Float32);
 
         let (_indices, _logits, top_k_mask) = router.route(&x, capacity).unwrap();
         top_k_mask.eval().unwrap();
@@ -1386,7 +1389,7 @@ mod tests {
         let seq_len = 8i32;
         let hidden = config.hidden_size;
 
-        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden], pmetal_bridge::compat::Dtype::Float32);
         let out = layer.forward(&x, None, None).unwrap();
         out.eval().unwrap();
 
@@ -1422,7 +1425,7 @@ mod tests {
             "No MoD router when MoD is disabled"
         );
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 6, 32], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 6, 32], pmetal_bridge::compat::Dtype::Float32);
         let out = layer.forward(&x, None, None).unwrap();
         out.eval().unwrap();
         assert_eq!(out.shape(), &[1, 6, 32]);

@@ -17,11 +17,17 @@
 //! - Uses pmetal_bridge::compat::random::categorical for GPU-native categorical sampling
 //! - Dedicated generation stream for parallel execution
 //! - All tensor operations stay on GPU until final token extraction
-use pmetal_bridge::compat::{Array, Dtype, Exception, Stream, Device, indexing, random, transforms, ops};
-use pmetal_bridge::compat::ops::{take_along_axis, put_along_axis, argsort_axis, argmax_axis, argmin_axis, concatenate_axis, softmax_axis, zeros_like, which, argpartition_axis, logsumexp_axis, logsumexp_axis_keepdims, async_eval, select_axis, take_axis};
+use pmetal_bridge::compat::indexing::{IndexOp, argmax};
 use pmetal_bridge::compat::ops::exp;
-use pmetal_bridge::compat::indexing::{argmax, IndexOp};
+use pmetal_bridge::compat::ops::{
+    argmax_axis, argmin_axis, argpartition_axis, argsort_axis, async_eval, concatenate_axis,
+    logsumexp_axis, logsumexp_axis_keepdims, put_along_axis, select_axis, softmax_axis,
+    take_along_axis, take_axis, which, zeros_like,
+};
 use pmetal_bridge::compat::random::categorical;
+use pmetal_bridge::compat::{
+    Array, Device, Dtype, Exception, Stream, indexing, ops, random, transforms,
+};
 use pmetal_mlx::kv_cache::KVCache;
 use std::collections::HashMap;
 
@@ -75,38 +81,40 @@ fn with_cached_ane_engine<R>(
         ane_seq_len: config.resolve_ane_seq_len(prompt_len),
     };
 
-    ANE_ENGINE_CACHE.with(|cache| -> std::result::Result<R, pmetal_metal::error::MetalError> {
-        let mut cache = cache.borrow_mut();
-        let needs_rebuild = match cache.get(&key) {
-            Some(engine) => engine.config().max_seq_len < config.max_seq_len,
-            None => true,
-        };
+    ANE_ENGINE_CACHE.with(
+        |cache| -> std::result::Result<R, pmetal_metal::error::MetalError> {
+            let mut cache = cache.borrow_mut();
+            let needs_rebuild = match cache.get(&key) {
+                Some(engine) => engine.config().max_seq_len < config.max_seq_len,
+                None => true,
+            };
 
-        if needs_rebuild {
-            tracing::info!(
-                model = %model_path.display(),
-                ane_seq_len = key.ane_seq_len,
-                max_seq_len = config.max_seq_len,
-                "Building cached ANE inference engine"
+            if needs_rebuild {
+                tracing::info!(
+                    model = %model_path.display(),
+                    ane_seq_len = key.ane_seq_len,
+                    max_seq_len = config.max_seq_len,
+                    "Building cached ANE inference engine"
+                );
+                let engine = build_ane_engine(model_path, config.clone(), prompt_len)?;
+                cache.insert(key.clone(), engine);
+            }
+
+            let engine = cache.get_mut(&key).ok_or_else(|| {
+                pmetal_metal::error::MetalError::Internal(
+                    "ANE engine cache missing freshly-built entry".to_string(),
+                )
+            })?;
+            engine.set_generation_params(
+                config.temperature,
+                config.top_k,
+                config.max_tokens,
+                config.eos_token_id,
+                config.real_time_eval,
             );
-            let engine = build_ane_engine(model_path, config.clone(), prompt_len)?;
-            cache.insert(key.clone(), engine);
-        }
-
-        let engine = cache.get_mut(&key).ok_or_else(|| {
-            pmetal_metal::error::MetalError::Internal(
-                "ANE engine cache missing freshly-built entry".to_string(),
-            )
-        })?;
-        engine.set_generation_params(
-            config.temperature,
-            config.top_k,
-            config.max_tokens,
-            config.eos_token_id,
-            config.real_time_eval,
-        );
-        f(engine)
-    })
+            f(engine)
+        },
+    )
 }
 
 #[cfg(feature = "ane")]
@@ -134,36 +142,38 @@ fn with_cached_hybrid_cpu_engine<R>(
         model_path: model_path.to_path_buf(),
     };
 
-    HYBRID_CPU_ENGINE_CACHE.with(|cache| -> std::result::Result<R, pmetal_metal::error::MetalError> {
-        let mut cache = cache.borrow_mut();
-        let needs_rebuild = match cache.get(&key) {
-            Some(engine) => engine.config().max_seq_len < config.max_seq_len,
-            None => true,
-        };
+    HYBRID_CPU_ENGINE_CACHE.with(
+        |cache| -> std::result::Result<R, pmetal_metal::error::MetalError> {
+            let mut cache = cache.borrow_mut();
+            let needs_rebuild = match cache.get(&key) {
+                Some(engine) => engine.config().max_seq_len < config.max_seq_len,
+                None => true,
+            };
 
-        if needs_rebuild {
-            tracing::info!(
-                model = %model_path.display(),
-                max_seq_len = config.max_seq_len,
-                "Building cached CPU-hybrid inference engine"
+            if needs_rebuild {
+                tracing::info!(
+                    model = %model_path.display(),
+                    max_seq_len = config.max_seq_len,
+                    "Building cached CPU-hybrid inference engine"
+                );
+                let engine = build_hybrid_cpu_engine(model_path, config.clone())?;
+                cache.insert(key.clone(), engine);
+            }
+
+            let engine = cache.get_mut(&key).ok_or_else(|| {
+                pmetal_metal::error::MetalError::Internal(
+                    "CPU-hybrid engine cache missing freshly-built entry".to_string(),
+                )
+            })?;
+            engine.set_generation_params(
+                config.temperature,
+                config.top_k,
+                config.max_tokens,
+                config.eos_token_id,
             );
-            let engine = build_hybrid_cpu_engine(model_path, config.clone())?;
-            cache.insert(key.clone(), engine);
-        }
-
-        let engine = cache.get_mut(&key).ok_or_else(|| {
-            pmetal_metal::error::MetalError::Internal(
-                "CPU-hybrid engine cache missing freshly-built entry".to_string(),
-            )
-        })?;
-        engine.set_generation_params(
-            config.temperature,
-            config.top_k,
-            config.max_tokens,
-            config.eos_token_id,
-        );
-        f(engine)
-    })
+            f(engine)
+        },
+    )
 }
 
 /// Wait for a specific array to be ready (computed).
@@ -255,7 +265,9 @@ impl StreamContext {
     /// Create a new stream context, activating the generation stream.
     fn new(_stream: &Stream) -> Self {
         pmetal_bridge::inline_array::set_generation_stream();
-        StreamContext { _marker: std::marker::PhantomData }
+        StreamContext {
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 
@@ -1426,7 +1438,7 @@ where
         // Extract logits for the last position [vocab_size]
         let last_idx = logits.dim(1) - 1;
         let last_logits = select_axis(&logits, last_idx, 1);
-// next squeeze removed - select_axis already reduces dim
+        // next squeeze removed - select_axis already reduces dim
 
         // Sample next token
         let next_token = sampler.sample(&last_logits, &all_tokens)?;
@@ -1489,15 +1501,16 @@ where
     let prompt_len = input_ids.len();
 
     // Prefill: process long prompts in chunks to bound peak allocator pressure.
-    let mut logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
-        forward_fn(chunk_input, cache)
-    })?;
+    let mut logits =
+        run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+            forward_fn(chunk_input, cache)
+        })?;
     logits.eval();
 
     // Get logits for the last position and sample first new token
     let last_idx = logits.dim(1) - 1;
     let last_logits = select_axis(&logits, last_idx, 1);
-// next squeeze removed - select_axis already reduces dim
+    // next squeeze removed - select_axis already reduces dim
 
     let mut next_token = sampler.sample(&last_logits, &all_tokens)?;
 
@@ -1525,7 +1538,7 @@ where
 
         // Get logits for the (only) position
         let last_logits = select_axis(&logits, 0, 1);
-// next squeeze removed - select_axis already reduces dim
+        // next squeeze removed - select_axis already reduces dim
 
         // Sample next token
         next_token = sampler.sample(&last_logits, &all_tokens)?;
@@ -1757,11 +1770,6 @@ where
     };
     async_eval([&current_y, &current_logprobs]);
 
-    // Enable MLX compilation for the decode loop — fuses ops to reduce GPU kernel count.
-    pmetal_bridge::inline_array::enable_compile();
-
-
-
     let mut n = 0;
 
     loop {
@@ -1894,10 +1902,11 @@ where
     let mut token_counts: HashMap<u32, usize> = HashMap::new();
 
     // Get vocab size from the final prefill chunk output.
-    let mut logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
-        let _stream_ctx = StreamContext::new(&generation_stream);
-        forward_fn(chunk_input, cache)
-    })?;
+    let mut logits =
+        run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+            let _stream_ctx = StreamContext::new(&generation_stream);
+            forward_fn(chunk_input, cache)
+        })?;
     let vocab_size = logits.dim(-1) as usize;
 
     // Create Metal sampler with optional seed for reproducibility
@@ -2093,7 +2102,9 @@ where
         // Schedule NEXT (if not at max)
         let next_y = if n < max_tokens - 1 {
             // Convert Uint32 token to Int32 for model input (argmax returns Uint32)
-            let input = y.as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32()).reshape(&[1, 1]);
+            let input = y
+                .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32())
+                .reshape(&[1, 1]);
             // step() wraps forward in stream context
             let next = step(&input, cache)?;
             // async_eval OUTSIDE stream context
@@ -2225,7 +2236,9 @@ where
             let y = {
                 let _stream_ctx = StreamContext::new(&generation_stream);
                 // Convert Uint32 token to Int32 for model input (argmax returns Uint32)
-                let next_input = current_y.as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32()).reshape(&[1, 1]);
+                let next_input = current_y
+                    .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32())
+                    .reshape(&[1, 1]);
                 let next_output = forward_fn(&next_input, cache)?;
                 let next_logits = select_axis(&next_output, 0, 1);
                 compiled_sampler.sample(&next_logits)?
@@ -2688,7 +2701,8 @@ mod tests {
             let seq_len = chunk_input.dim(1);
             seen_chunks.push(seq_len);
 
-            let last_token = select_axis(&select_axis(&chunk_input, 0, 0), (seq_len - 1) as i32, 0).item::<i32>() as usize;
+            let last_token = select_axis(&select_axis(&chunk_input, 0, 0), (seq_len - 1) as i32, 0)
+                .item::<i32>() as usize;
             let vocab = 64usize;
             let mut data = vec![-1000.0f32; seq_len as usize * vocab];
             data[((seq_len as usize - 1) * vocab) + (last_token % vocab)] = 10.0;
@@ -2712,7 +2726,7 @@ mod tests {
 
         let _ = run_cached_prefill_chunks(&input_ids, 0, |chunk_input| {
             seen_chunks.push(chunk_input.dim(1));
-            Array::zeros_f32(&[1, chunk_input.dim(1), 8])
+            Ok(Array::zeros_f32(&[1, chunk_input.dim(1), 8]))
         })
         .unwrap();
 
@@ -2805,7 +2819,7 @@ mod tests {
         let log_probs = Array::from_slice(&[0.0f32, -100.0, -100.0, -100.0, -100.0], &[5]);
 
         // Seed mlx random state for reproducibility
-        let _ = mlx_seed(42);
+        pmetal_bridge::compat::random::seed(42);
 
         // Temperature = 1.0 (no scaling)
         let token = gpu_categorical_sample(&log_probs, 1.0).unwrap();

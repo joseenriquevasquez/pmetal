@@ -109,7 +109,6 @@ pub struct BertEmbeddings {
 }
 impl_module_params!(BertEmbeddings; word_embeddings, position_embeddings, token_type_embeddings, layer_norm);
 
-
 impl BertEmbeddings {
     pub fn new(config: &BertConfig) -> Result<Self, Exception> {
         let h = config.hidden_size as i32;
@@ -180,7 +179,6 @@ pub struct BertSelfAttention {
     pub scale: f32,
 }
 impl_module_params!(BertSelfAttention; query, key, value);
-
 
 impl BertSelfAttention {
     pub fn new(config: &BertConfig) -> Result<Self, Exception> {
@@ -273,7 +271,6 @@ pub struct BertSelfOutput {
 }
 impl_module_params!(BertSelfOutput; dense, layer_norm);
 
-
 impl BertSelfOutput {
     pub fn new(config: &BertConfig) -> Result<Self, Exception> {
         let h = config.hidden_size as i32;
@@ -301,7 +298,6 @@ pub struct BertIntermediate {
     pub act: String,
 }
 impl_module_params!(BertIntermediate; dense);
-
 
 impl BertIntermediate {
     pub fn new(config: &BertConfig) -> Result<Self, Exception> {
@@ -332,7 +328,6 @@ pub struct BertOutput {
     pub layer_norm: nn::LayerNorm,
 }
 impl_module_params!(BertOutput; dense, layer_norm);
-
 
 impl BertOutput {
     pub fn new(config: &BertConfig) -> Result<Self, Exception> {
@@ -366,7 +361,6 @@ pub struct BertLayer {
     pub output: BertOutput,
 }
 impl_module_params!(BertLayer; attention, attention_output, intermediate, output);
-
 
 impl BertLayer {
     pub fn new(config: &BertConfig) -> Result<Self, Exception> {
@@ -410,7 +404,6 @@ pub struct BertModel {
     pub config: BertConfig,
 }
 impl_module_params!(BertModel; embeddings, layers);
-
 
 impl BertModel {
     pub fn new(config: BertConfig) -> Result<Self, Exception> {
@@ -461,7 +454,6 @@ pub struct BertForEmbedding {
     pub model: BertModel,
 }
 impl_module_params!(BertForEmbedding; model);
-
 
 impl BertForEmbedding {
     pub fn new(config: BertConfig) -> Result<Self, Exception> {

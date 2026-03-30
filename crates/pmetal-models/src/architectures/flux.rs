@@ -3,7 +3,9 @@
 //! Implementation of Flux.1 DiT (Diffusion Transformer) optimized for Apple Silicon.
 //! Based on the architecture from Black Forest Labs and DiffSynth-Studio.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ModuleParameters, ModuleParametersExt, fast, nn, ops, random};
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception, ModuleParameters, ModuleParametersExt, fast, nn, ops, random,
+};
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -81,15 +83,16 @@ pub struct AdaLayerNorm {
 }
 impl_module_params!(AdaLayerNorm; linear, norm);
 
-
 impl AdaLayerNorm {
     pub fn new(dim: usize, eps: f32) -> Self {
         let linear = nn::LinearBuilder::new(dim as i32, (dim * 6) as i32)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let norm = nn::LayerNormBuilder::new(dim as i32)
             .affine(false)
             .eps(eps)
-            .build().unwrap();
+            .build()
+            .unwrap();
         Self { linear, norm }
     }
 
@@ -133,15 +136,16 @@ pub struct AdaLayerNormSingle {
 }
 impl_module_params!(AdaLayerNormSingle; linear, norm);
 
-
 impl AdaLayerNormSingle {
     pub fn new(dim: usize, eps: f32) -> Self {
         let linear = nn::LinearBuilder::new(dim as i32, (dim * 3) as i32)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let norm = nn::LayerNormBuilder::new(dim as i32)
             .affine(false)
             .eps(eps)
-            .build().unwrap();
+            .build()
+            .unwrap();
         Self { linear, norm }
     }
 
@@ -171,15 +175,16 @@ pub struct AdaLayerNormContinuous {
 }
 impl_module_params!(AdaLayerNormContinuous; linear, norm);
 
-
 impl AdaLayerNormContinuous {
     pub fn new(dim: usize, eps: f32) -> Self {
         let linear = nn::LinearBuilder::new(dim as i32, (dim * 2) as i32)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let norm = nn::LayerNormBuilder::new(dim as i32)
             .affine(false)
             .eps(eps)
-            .build().unwrap();
+            .build()
+            .unwrap();
         Self { linear, norm }
     }
 
@@ -192,9 +197,7 @@ impl AdaLayerNormContinuous {
         let scale = &chunks[1];
 
         let x = self.norm.forward(x);
-        let x = x
-            .multiply(&(scale.add(&Array::from_f32(1.0))))
-            .add(shift);
+        let x = x.multiply(&(scale.add(&Array::from_f32(1.0)))).add(shift);
 
         Ok(x)
     }
@@ -208,13 +211,14 @@ pub struct TimestepEmbeddings {
 }
 impl_module_params!(TimestepEmbeddings; linear_1, linear_2);
 
-
 impl TimestepEmbeddings {
     pub fn new(dim_in: usize, dim_out: usize) -> Self {
         let linear_1 = nn::LinearBuilder::new(dim_in as i32, dim_out as i32)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let linear_2 = nn::LinearBuilder::new(dim_out as i32, dim_out as i32)
-            .build().unwrap();
+            .build()
+            .unwrap();
         Self { linear_1, linear_2 }
     }
 
@@ -318,7 +322,6 @@ pub struct FluxJointAttention {
 }
 impl_module_params!(FluxJointAttention; a_to_qkv, b_to_qkv, norm_q_a, norm_k_a, norm_q_b, norm_k_b, a_to_out, b_to_out);
 
-
 impl FluxJointAttention {
     pub fn new(dim: usize, num_heads: usize, eps: f32) -> Self {
         let head_dim = dim / num_heads;
@@ -326,25 +329,33 @@ impl FluxJointAttention {
             num_heads,
             head_dim,
             a_to_qkv: nn::LinearBuilder::new(dim as i32, (dim * 3) as i32)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
             b_to_qkv: nn::LinearBuilder::new(dim as i32, (dim * 3) as i32)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
             norm_q_a: nn::RmsNormBuilder::new(head_dim as i32)
                 .eps(eps)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
             norm_k_a: nn::RmsNormBuilder::new(head_dim as i32)
                 .eps(eps)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
             norm_q_b: nn::RmsNormBuilder::new(head_dim as i32)
                 .eps(eps)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
             norm_k_b: nn::RmsNormBuilder::new(head_dim as i32)
                 .eps(eps)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
             a_to_out: nn::LinearBuilder::new(dim as i32, dim as i32)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
             b_to_out: nn::LinearBuilder::new(dim as i32, dim as i32)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
         }
     }
 
@@ -420,11 +431,7 @@ impl FluxJointAttention {
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let attn_out = pmetal_bridge::compat::fast::scaled_dot_product_attention_masked(
-            &q,
-            &k,
-            &v,
-            scale,
-            None,
+            &q, &k, &v, scale, None,
         );
 
         let attn_out = attn_out.transpose_axes(&[0, 2, 1, 3]).reshape(&[
@@ -434,8 +441,10 @@ impl FluxJointAttention {
         ]);
 
         let split_idx = hidden_states_b.dim(1);
-        let hidden_states_b_out = pmetal_bridge::compat::ops::slice_axis(&attn_out, 1, 0, split_idx);
-        let hidden_states_a_out = pmetal_bridge::compat::ops::slice_axis_from(&attn_out, 1, split_idx);
+        let hidden_states_b_out =
+            pmetal_bridge::compat::ops::slice_axis(&attn_out, 1, 0, split_idx);
+        let hidden_states_a_out =
+            pmetal_bridge::compat::ops::slice_axis_from(&attn_out, 1, split_idx);
 
         let hidden_states_a_out = self.a_to_out.forward(&hidden_states_a_out);
         let hidden_states_b_out = self.b_to_out.forward(&hidden_states_b_out);
@@ -457,7 +466,6 @@ pub struct FluxJointTransformerBlock {
 }
 impl_module_params!(FluxJointTransformerBlock; norm1_a, norm1_b, attn, norm2_a, ff_a, norm2_b, ff_b);
 
-
 impl FluxJointTransformerBlock {
     pub fn new(dim: usize, num_heads: usize, eps: f32) -> Self {
         let norm1_a = AdaLayerNorm::new(dim, eps);
@@ -467,23 +475,29 @@ impl FluxJointTransformerBlock {
         let norm2_a = nn::LayerNormBuilder::new(dim as i32)
             .affine(false)
             .eps(eps)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let ff_a = vec![
             nn::LinearBuilder::new(dim as i32, (dim * 4) as i32)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
             nn::LinearBuilder::new((dim * 4) as i32, dim as i32)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
         ];
 
         let norm2_b = nn::LayerNormBuilder::new(dim as i32)
             .affine(false)
             .eps(eps)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let ff_b = vec![
             nn::LinearBuilder::new(dim as i32, (dim * 4) as i32)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
             nn::LinearBuilder::new((dim * 4) as i32, dim as i32)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
         ];
 
         Self {
@@ -549,7 +563,6 @@ pub struct FluxSingleTransformerBlock {
 }
 impl_module_params!(FluxSingleTransformerBlock; norm, to_qkv_mlp, norm_q_a, norm_k_a, proj_out);
 
-
 impl FluxSingleTransformerBlock {
     pub fn new(dim: usize, num_heads: usize, eps: f32) -> Self {
         let head_dim = dim / num_heads;
@@ -559,15 +572,19 @@ impl FluxSingleTransformerBlock {
             head_dim,
             norm: AdaLayerNormSingle::new(dim, eps),
             to_qkv_mlp: nn::LinearBuilder::new(dim as i32, (dim * 7) as i32)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
             norm_q_a: nn::RmsNormBuilder::new(head_dim as i32)
                 .eps(eps)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
             norm_k_a: nn::RmsNormBuilder::new(head_dim as i32)
                 .eps(eps)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
             proj_out: nn::LinearBuilder::new((dim * 5) as i32, dim as i32)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
         }
     }
 
@@ -630,11 +647,7 @@ impl FluxSingleTransformerBlock {
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let attn_out = pmetal_bridge::compat::fast::scaled_dot_product_attention_masked(
-            &q,
-            &k,
-            &v,
-            scale,
-            None,
+            &q, &k, &v, scale, None,
         );
 
         let attn_out = attn_out.transpose_axes(&[0, 2, 1, 3]).reshape(&[
@@ -669,7 +682,6 @@ pub struct FluxDiT {
 }
 impl_module_params!(FluxDiT; time_embedder, guidance_embedder, pooled_text_embedder, context_embedder, x_embedder, blocks, single_blocks, final_norm_out, final_proj_out);
 
-
 impl FluxDiT {
     pub fn new(config: FluxConfig) -> Self {
         let dim = config.hidden_size;
@@ -684,15 +696,19 @@ impl FluxDiT {
 
         let pooled_text_embedder = vec![
             nn::LinearBuilder::new(config.pooled_embed_dim as i32, dim as i32)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
             nn::LinearBuilder::new(dim as i32, dim as i32)
-                .build().unwrap(),
+                .build()
+                .unwrap(),
         ];
 
         let context_embedder = nn::LinearBuilder::new(config.context_embed_dim as i32, dim as i32)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let x_embedder = nn::LinearBuilder::new(config.input_dim as i32, dim as i32)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let eps = config.norm_epsilon;
 
@@ -706,7 +722,8 @@ impl FluxDiT {
 
         let final_norm_out = AdaLayerNormContinuous::new(dim, eps);
         let final_proj_out = nn::LinearBuilder::new(dim as i32, config.input_dim as i32)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         Self {
             pos_embedder,
@@ -801,14 +818,15 @@ mod tests {
         let batch = 1;
         let seq_len = 16 * 16; // 128x128 image patchified with 2x2 patches
         let hidden_states =
-            pmetal_bridge::compat::random::normal(&[batch, seq_len as i32, 64], None, None, None).unwrap();
+            pmetal_bridge::compat::random::normal(&[batch, seq_len as i32, 64], pmetal_bridge::compat::Dtype::Float32);
         let timestep = Array::from_slice(&[1.0f32], &[1]);
         let prompt_emb =
-            pmetal_bridge::compat::random::normal(&[batch, 512, 4096], None, None, None).unwrap();
+            pmetal_bridge::compat::random::normal(&[batch, 512, 4096], pmetal_bridge::compat::Dtype::Float32);
         let pooled_prompt_emb =
-            pmetal_bridge::compat::random::normal(&[batch, 768], None, None, None).unwrap();
+            pmetal_bridge::compat::random::normal(&[batch, 768], pmetal_bridge::compat::Dtype::Float32);
         let text_ids = pmetal_bridge::compat::ops::zeros(&[batch, 512, 3], Dtype::Float32).unwrap();
-        let image_ids = pmetal_bridge::compat::ops::zeros(&[batch, seq_len as i32, 3], Dtype::Float32).unwrap();
+        let image_ids =
+            pmetal_bridge::compat::ops::zeros(&[batch, seq_len as i32, 3], Dtype::Float32).unwrap();
 
         let out = model
             .forward(

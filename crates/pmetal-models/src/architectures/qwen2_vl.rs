@@ -157,7 +157,6 @@ pub struct Qwen2VL {
 }
 impl_module_params!(Qwen2VL; language_model);
 
-
 impl Qwen2VL {
     /// Create a new Qwen2-VL model.
     pub fn new(config: Qwen2VLConfig) -> Result<Self, Exception> {

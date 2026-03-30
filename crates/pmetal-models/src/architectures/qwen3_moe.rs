@@ -6,7 +6,10 @@
 //! - RMSNorm applied to Q and K before RoPE (q_norm, k_norm)
 //! - SwitchGLU-style expert MLP with gather_mm
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, Param, indexing, nn, ops, random};
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, Param, indexing, nn,
+    ops, random,
+};
 use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
@@ -195,7 +198,6 @@ pub struct Qwen3MoEAttention {
 }
 impl_module_params!(Qwen3MoEAttention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
 
-
 impl Qwen3MoEAttention {
     /// Create a new attention layer.
     pub fn new(config: Qwen3MoEConfig) -> Result<Self, Exception> {
@@ -314,7 +316,8 @@ impl Qwen3MoEAttention {
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
                 if let Some(output) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)? {
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
+                {
                     let output = output.transpose_axes(&[0, 2, 1, 3]);
                     let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
                     return Ok(self.o_proj.forward(&output));
@@ -350,7 +353,6 @@ pub struct Qwen3MoEDenseMLP {
     pub down_proj: nn::Linear,
 }
 impl_module_params!(Qwen3MoEDenseMLP; gate_proj, up_proj, down_proj);
-
 
 impl Qwen3MoEDenseMLP {
     /// Create a new MLP.
@@ -408,7 +410,6 @@ pub struct Qwen3MoEBlock {
     pub stacked_weight_signature: Option<Vec<usize>>,
 }
 impl_module_params!(Qwen3MoEBlock; gate, experts);
-
 
 impl Qwen3MoEBlock {
     /// Create a new MoE block.
@@ -519,7 +520,8 @@ impl Qwen3MoEBlock {
         let top_k = self.top_k as i32;
         let neg_k = -top_k;
         let part_indices = pmetal_bridge::compat::ops::argpartition_axis(&routing_probs, neg_k, -1);
-        let top_indices = pmetal_bridge::compat::ops::slice_last_from(&part_indices, neg_k).as_type::<i32>();
+        let top_indices =
+            pmetal_bridge::compat::ops::slice_last_from(&part_indices, neg_k).as_type::<i32>();
         let top_weights = routing_probs.take_along_axis(&top_indices, -1);
 
         let normalized_weights = if self.norm_topk_prob {
@@ -587,7 +589,7 @@ impl Qwen3MoEBlock {
 
         let mut output_shape = shape.to_vec();
         output_shape[shape.len() - 1] = hidden_size;
-        final_output.reshape(&output_shape)
+        Ok(final_output.reshape(&output_shape))
     }
 
     fn batched_matmul(&self, x: &Array, w: &Array) -> Result<Array, Exception> {
@@ -597,7 +599,7 @@ impl Qwen3MoEBlock {
     }
 
     fn forward_stacked(&mut self, x: &Array) -> Result<Array, Exception> {
-        self.ensure_stacked_moe();
+        self.ensure_stacked_moe()?;
 
         let shape = x.shape();
         let hidden_flat = x.reshape(&[
@@ -607,10 +609,12 @@ impl Qwen3MoEBlock {
         let (batch_seq, hidden_size, top_indices, normalized_weights) =
             self.route_topk(&hidden_flat)?;
         let top_k = self.top_k as i32;
-        let mut output = pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
+        let mut output =
+            pmetal_bridge::compat::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype());
         for slot in 0..top_k {
             let slot_experts = pmetal_bridge::compat::ops::select_axis(&top_indices, -1, slot);
-            let slot_weights = pmetal_bridge::compat::ops::slice_axis(&normalized_weights, -1, slot, slot + 1);
+            let slot_weights =
+                pmetal_bridge::compat::ops::slice_axis(&normalized_weights, -1, slot, slot + 1);
 
             let gate_weights = self
                 .stacked_gate_proj
@@ -751,12 +755,10 @@ pub struct Qwen3MoEDecoderLayer {
 }
 impl_module_params!(Qwen3MoEDecoderLayer; self_attn, input_layernorm, post_attention_layernorm, ffn);
 
-
 impl Qwen3MoEDecoderLayer {
     /// Create a new decoder layer.
     pub fn new(config: Qwen3MoEConfig, layer_idx: usize) -> Result<Self, Exception> {
         let self_attn = Qwen3MoEAttention::new(config.clone())?;
-
 
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
@@ -822,7 +824,6 @@ pub struct Qwen3MoEModel {
 }
 impl_module_params!(Qwen3MoEModel; embed_tokens, layers, norm);
 
-
 impl Qwen3MoEModel {
     /// Create a new model.
     pub fn new(config: Qwen3MoEConfig) -> Result<Self, Exception> {
@@ -873,7 +874,7 @@ impl Qwen3MoEModel {
     /// Eagerly build stacked expert caches for all MoE layers.
     pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
         for layer in &mut self.layers {
-            layer.init_stacked_moe();
+            layer.init_stacked_moe()?;
         }
         Ok(())
     }
@@ -894,12 +895,10 @@ pub struct Qwen3MoE {
 }
 impl_module_params!(Qwen3MoE; model, lm_head);
 
-
 impl Qwen3MoE {
     /// Create a new model.
     pub fn new(config: Qwen3MoEConfig) -> Result<Self, Exception> {
         let model = Qwen3MoEModel::new(config.clone())?;
-
 
         let lm_head = if config.tie_word_embeddings {
             // When tied, we use embed_tokens weight in forward - no separate lm_head
@@ -1013,8 +1012,12 @@ mod tests {
         let mut ffn = Qwen3MoEFeedForward::Dense(
             Qwen3MoEDenseMLP::new(config.hidden_size, config.intermediate_size).unwrap(),
         );
-        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
-            .unwrap();
+        let x = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[1, 4, config.hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let out = ffn.forward(&x).unwrap();
         assert_eq!(out.shape(), &[1, 4, config.hidden_size]);
     }
@@ -1024,8 +1027,12 @@ mod tests {
     fn test_feed_forward_moe_dispatch() {
         let config = tiny_moe_config();
         let mut ffn = Qwen3MoEFeedForward::MoE(Qwen3MoEBlock::new(&config).unwrap());
-        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
-            .unwrap();
+        let x = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[1, 4, config.hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let out = ffn.forward(&x).unwrap();
         assert_eq!(out.shape(), &[1, 4, config.hidden_size]);
     }
@@ -1069,7 +1076,7 @@ mod tests {
         );
         let params = ffn_dense.parameters();
         assert!(
-            !params.entries.is_empty(),
+            !params.is_empty(),
             "Dense FFN parameters() should be non-empty"
         );
 
@@ -1081,7 +1088,7 @@ mod tests {
         );
         let params = ffn_moe.parameters();
         assert!(
-            !params.entries.is_empty(),
+            !params.is_empty(),
             "MoE FFN parameters() should be non-empty"
         );
 
@@ -1097,8 +1104,12 @@ mod tests {
     fn test_moe_block_forward_shape() {
         let config = tiny_moe_config();
         let mut block = Qwen3MoEBlock::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
-            .unwrap();
+        let x = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[2, 5, config.hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let out = block.forward(&x).unwrap();
         assert_eq!(out.shape(), &[2, 5, config.hidden_size]);
     }
@@ -1108,8 +1119,12 @@ mod tests {
     fn test_moe_block_stacked_matches_per_expert_path() {
         let config = tiny_moe_config();
         let mut block = Qwen3MoEBlock::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
-            .unwrap();
+        let x = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[2, 5, config.hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let reference = block.forward_per_expert(&x).unwrap();
         let fast = block.forward(&x).unwrap();
@@ -1137,15 +1152,20 @@ mod tests {
     fn test_moe_block_stacked_cache_refreshes_after_weight_change() {
         let config = tiny_moe_config();
         let mut block = Qwen3MoEBlock::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
-            .unwrap();
+        let x = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[1, 4, config.hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let _ = block.forward(&x).unwrap();
         assert!(block.has_stacked_moe());
 
-        block.experts[0].w1.weight = Param::new(
-            Array::zeros_f32(&[config.get_moe_intermediate_size(), config.hidden_size]),
-        );
+        block.experts[0].w1.weight = Array::zeros_f32(&[
+            config.get_moe_intermediate_size(),
+            config.hidden_size,
+        ]);
 
         let reference = block.forward_per_expert(&x).unwrap();
         let fast = block.forward(&x).unwrap();

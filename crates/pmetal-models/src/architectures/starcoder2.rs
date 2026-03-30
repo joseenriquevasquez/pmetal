@@ -58,7 +58,6 @@ pub struct StarCoder2MLP {
 }
 impl_module_params!(StarCoder2MLP; gate_proj, up_proj, down_proj);
 
-
 impl StarCoder2MLP {
     pub fn new(config: &StarCoder2Config) -> Result<Self, Exception> {
         Ok(Self {
@@ -91,7 +90,6 @@ pub struct StarCoder2Layer {
     pub post_attention_layernorm: nn::RmsNorm,
 }
 impl_module_params!(StarCoder2Layer; attention, mlp, input_layernorm, post_attention_layernorm);
-
 
 impl StarCoder2Layer {
     pub fn new(config: &StarCoder2Config, layer_idx: usize) -> Result<Self, Exception> {
@@ -145,7 +143,6 @@ pub struct StarCoder2Model {
     pub config: StarCoder2Config,
 }
 impl_module_params!(StarCoder2Model; embed_tokens, layers, norm, lm_head);
-
 
 impl StarCoder2Model {
     pub fn new(config: StarCoder2Config) -> Result<Self, Exception> {

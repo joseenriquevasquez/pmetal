@@ -54,7 +54,6 @@ pub struct T5RelativePositionBias {
 }
 impl_module_params!(T5RelativePositionBias; embedding);
 
-
 impl T5RelativePositionBias {
     pub fn new(config: &T5Config) -> Self {
         let embedding = nn::Embedding::new(
@@ -98,17 +97,19 @@ impl T5RelativePositionBias {
         let is_small = n.lt(&Array::from_f32(max_exact as f32));
 
         // Log-linear bucketing for large positions
-        let log_ratio = n
-            .divide(&Array::from_f32(max_exact as f32))
-            .log()
-            .divide(&Array::from_f32(
-                (max_distance as f32 / max_exact as f32).ln(),
-            ));
+        let log_ratio =
+            n.divide(&Array::from_f32(max_exact as f32))
+                .log()
+                .divide(&Array::from_f32(
+                    (max_distance as f32 / max_exact as f32).ln(),
+                ));
         let large_val = log_ratio
             .multiply(&Array::from_f32((num_buckets - max_exact) as f32))
             .add(&Array::from_f32(max_exact as f32));
-        let large_val =
-            pmetal_bridge::compat::ops::minimum(&large_val, &Array::from_f32((num_buckets - 1) as f32));
+        let large_val = pmetal_bridge::compat::ops::minimum(
+            &large_val,
+            &Array::from_f32((num_buckets - 1) as f32),
+        );
 
         let buckets = pmetal_bridge::compat::ops::where_fn(&is_small, &n, &large_val);
         let buckets = ret.add(&buckets.as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32()));
@@ -118,8 +119,7 @@ impl T5RelativePositionBias {
     pub fn forward(&mut self, query_length: usize, key_length: usize) -> Result<Array, Exception> {
         let context_position =
             pmetal_bridge::compat::ops::arange(query_length as i32, Dtype::Int32);
-        let memory_position =
-            pmetal_bridge::compat::ops::arange(key_length as i32, Dtype::Int32);
+        let memory_position = pmetal_bridge::compat::ops::arange(key_length as i32, Dtype::Int32);
 
         let relative_position = memory_position
             .expand_dims_axes(&[0])
@@ -147,9 +147,10 @@ impl_module_params!(T5LayerNorm; weight);
 
 impl T5LayerNorm {
     pub fn new(dim: usize, eps: f32) -> Self {
-        let weight = pmetal_bridge::compat::module::Param::new(
-            pmetal_bridge::compat::ops::ones(&[dim as i32], Dtype::Float32),
-        );
+        let weight = pmetal_bridge::compat::module::Param::new(pmetal_bridge::compat::ops::ones(
+            &[dim as i32],
+            Dtype::Float32,
+        ));
         Self {
             weight,
             variance_epsilon: eps,
@@ -174,18 +175,20 @@ pub struct T5DenseGatedActDense {
 }
 impl_module_params!(T5DenseGatedActDense; wi_0, wi_1, wo);
 
-
 impl T5DenseGatedActDense {
     pub fn new(config: &T5Config) -> Self {
         let wi_0 = nn::LinearBuilder::new(config.d_model as i32, config.d_ff as i32)
             .bias(false)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let wi_1 = nn::LinearBuilder::new(config.d_model as i32, config.d_ff as i32)
             .bias(false)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let wo = nn::LinearBuilder::new(config.d_ff as i32, config.d_model as i32)
             .bias(false)
-            .build().unwrap();
+            .build()
+            .unwrap();
         Self { wi_0, wi_1, wo }
     }
 
@@ -211,7 +214,6 @@ pub struct T5Attention {
 }
 impl_module_params!(T5Attention; q, k, v, o, relative_attention_bias);
 
-
 impl T5Attention {
     pub fn new(config: &T5Config, has_relative_attention_bias: bool) -> Self {
         let dim = config.d_model as i32;
@@ -219,16 +221,20 @@ impl T5Attention {
 
         let q = nn::LinearBuilder::new(dim, inner_dim)
             .bias(false)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let k = nn::LinearBuilder::new(dim, inner_dim)
             .bias(false)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let v = nn::LinearBuilder::new(dim, inner_dim)
             .bias(false)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let o = nn::LinearBuilder::new(inner_dim, dim)
             .bias(false)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let relative_attention_bias = if has_relative_attention_bias {
             Some(T5RelativePositionBias::new(config))
@@ -306,7 +312,9 @@ impl T5Attention {
 
         Ok((
             out,
-            bias.unwrap_or_else(|| pmetal_bridge::compat::ops::zeros(&[1, 1, 1], pmetal_bridge::compat::Dtype::Float32)),
+            bias.unwrap_or_else(|| {
+                pmetal_bridge::compat::ops::zeros(&[1, 1, 1], pmetal_bridge::compat::Dtype::Float32)
+            }),
         )) // Return bias for next layers
     }
 }
@@ -320,7 +328,6 @@ pub struct T5Block {
     pub layer_1_mlp: T5DenseGatedActDense,
 }
 impl_module_params!(T5Block; layer_0_norm, layer_0_attn, layer_1_norm, layer_1_mlp);
-
 
 impl T5Block {
     pub fn new(config: &T5Config, has_relative_attention_bias: bool) -> Self {
@@ -366,11 +373,9 @@ pub struct T5EncoderModel {
 }
 impl_module_params!(T5EncoderModel; shared, blocks, final_layer_norm);
 
-
 impl T5EncoderModel {
     pub fn new(config: T5Config) -> Self {
-        let shared = nn::Embedding::new(config.vocab_size as i32, config.d_model as i32)
-            .unwrap();
+        let shared = nn::Embedding::new(config.vocab_size as i32, config.d_model as i32).unwrap();
         let blocks = (0..config.num_layers)
             .map(|i| T5Block::new(&config, i == 0))
             .collect();

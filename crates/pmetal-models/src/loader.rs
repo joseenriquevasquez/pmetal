@@ -2,11 +2,12 @@
 //!
 //! Provides functionality to load model weights from safetensor files,
 //! with support for HuggingFace model formats and weight name mapping.
-use pmetal_bridge::compat::{Array, Exception, ModuleParameters, ModuleParametersExt, Param, nn, transforms};
+use pmetal_bridge::compat::{
+    Array, Exception, ModuleParameters, ModuleParametersExt, Param, nn, transforms,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-
 
 use crate::architectures::bert::BertForEmbedding;
 use crate::architectures::clip::CLIPTextModel;
@@ -74,9 +75,7 @@ fn load_shard(path: &std::path::Path) -> Result<HashMap<String, Array>, LoadErro
     })?;
     pmetal_bridge::inline_array::load_safetensors_shard(path_str)
         .map(|pairs| pairs.into_iter().collect::<HashMap<_, _>>())
-        .ok_or_else(|| {
-            LoadError::SafeTensors(format!("Failed to load safetensors: {}", path_str))
-        })
+        .ok_or_else(|| LoadError::SafeTensors(format!("Failed to load safetensors: {}", path_str)))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -84,7 +83,10 @@ pub struct Qwen3NextLoadOptions {
     pub skip_routed_experts: bool,
 }
 
-fn assign_loaded_weights<M: ModuleParameters + ModuleParametersExt>(model: &mut M, loaded: HashMap<String, Array>) {
+fn assign_loaded_weights<M: ModuleParameters + ModuleParametersExt>(
+    model: &mut M,
+    loaded: HashMap<String, Array>,
+) {
     let mut params = model.flatten_params_mut();
     for (key, value) in loaded {
         if let Some(param) = params.get_mut(&key) {
@@ -93,7 +95,9 @@ fn assign_loaded_weights<M: ModuleParameters + ModuleParametersExt>(model: &mut 
     }
 }
 
-fn eval_loaded_parameters<M: ModuleParameters + ModuleParametersExt>(model: &M) -> Result<(), LoadError> {
+fn eval_loaded_parameters<M: ModuleParameters + ModuleParametersExt>(
+    model: &M,
+) -> Result<(), LoadError> {
     let params = model.flatten_params();
     let arrays: Vec<Array> = params.into_values().collect();
     for chunk in arrays.chunks(PARAM_EVAL_BATCH_SIZE) {
@@ -116,16 +120,19 @@ pub fn load_clip_weights(
 
         match name {
             "embeddings.token_embedding.weight" => {
-                model.token_embedding.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                model.token_embedding.weight =
+                    pmetal_bridge::compat::module::Param::new(weight.clone())
             }
             "embeddings.position_embedding.weight" => {
                 model.position_embedding = pmetal_bridge::compat::module::Param::new(weight.clone())
             }
             "final_layer_norm.weight" => {
-                model.final_layer_norm.weight = pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                model.final_layer_norm.weight =
+                    pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
             }
             "final_layer_norm.bias" => {
-                model.final_layer_norm.bias = pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                model.final_layer_norm.bias =
+                    pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
             }
             _ if name.starts_with("encoder.layers.") => {
                 let parts: Vec<&str> = name.split('.').collect();
@@ -216,9 +223,12 @@ pub fn load_t5_weights(
 ) -> Result<(), LoadError> {
     for (name, weight) in weights {
         match name.as_str() {
-            "shared.weight" => model.shared.weight = pmetal_bridge::compat::module::Param::new(weight.clone()),
+            "shared.weight" => {
+                model.shared.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+            }
             "encoder.final_layer_norm.weight" => {
-                model.final_layer_norm.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                model.final_layer_norm.weight =
+                    pmetal_bridge::compat::module::Param::new(weight.clone())
             }
             _ if name.starts_with("encoder.block.") => {
                 let parts: Vec<&str> = name.split('.').collect();
@@ -250,7 +260,8 @@ pub fn load_t5_weights(
                         if let Some(ref mut rel_bias) =
                             model.blocks[idx].layer_0_attn.relative_attention_bias
                         {
-                            rel_bias.embedding.weight = pmetal_bridge::compat::module::Param::new(weight.clone());
+                            rel_bias.embedding.weight =
+                                pmetal_bridge::compat::module::Param::new(weight.clone());
                         }
                     }
                     "layer.0.layer_norm.weight" => {
@@ -603,14 +614,16 @@ pub fn load_flux_weights(
                 }
 
                 "img_mlp.0.weight" => {
-                    model.blocks[idx].ff_a[0].weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                    model.blocks[idx].ff_a[0].weight =
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "img_mlp.0.bias" => {
                     model.blocks[idx].ff_a[0].bias =
                         pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "img_mlp.2.weight" => {
-                    model.blocks[idx].ff_a[1].weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                    model.blocks[idx].ff_a[1].weight =
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "img_mlp.2.bias" => {
                     model.blocks[idx].ff_a[1].bias =
@@ -618,14 +631,16 @@ pub fn load_flux_weights(
                 }
 
                 "txt_mlp.0.weight" => {
-                    model.blocks[idx].ff_b[0].weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                    model.blocks[idx].ff_b[0].weight =
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "txt_mlp.0.bias" => {
                     model.blocks[idx].ff_b[0].bias =
                         pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "txt_mlp.2.weight" => {
-                    model.blocks[idx].ff_b[1].weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                    model.blocks[idx].ff_b[1].weight =
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "txt_mlp.2.bias" => {
                     model.blocks[idx].ff_b[1].bias =
@@ -681,14 +696,16 @@ pub fn load_flux_weights(
         } else {
             match name {
                 "time_in.in_layer.weight" => {
-                    model.time_embedder.linear_1.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                    model.time_embedder.linear_1.weight =
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "time_in.in_layer.bias" => {
                     model.time_embedder.linear_1.bias =
                         pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "time_in.out_layer.weight" => {
-                    model.time_embedder.linear_2.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                    model.time_embedder.linear_2.weight =
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "time_in.out_layer.bias" => {
                     model.time_embedder.linear_2.bias =
@@ -696,10 +713,12 @@ pub fn load_flux_weights(
                 }
 
                 "txt_in.weight" => {
-                    model.context_embedder.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                    model.context_embedder.weight =
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "txt_in.bias" => {
-                    model.context_embedder.bias = pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                    model.context_embedder.bias =
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "vector_in.in_layer.weight" => {
@@ -721,44 +740,53 @@ pub fn load_flux_weights(
 
                 "guidance_in.in_layer.weight" => {
                     if let Some(ref mut ge) = model.guidance_embedder {
-                        ge.linear_1.weight = pmetal_bridge::compat::module::Param::new(weight.clone());
+                        ge.linear_1.weight =
+                            pmetal_bridge::compat::module::Param::new(weight.clone());
                     }
                 }
                 "guidance_in.in_layer.bias" => {
                     if let Some(ref mut ge) = model.guidance_embedder {
-                        ge.linear_1.bias = pmetal_bridge::compat::module::Param::new(Some(weight.clone()));
+                        ge.linear_1.bias =
+                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()));
                     }
                 }
                 "guidance_in.out_layer.weight" => {
                     if let Some(ref mut ge) = model.guidance_embedder {
-                        ge.linear_2.weight = pmetal_bridge::compat::module::Param::new(weight.clone());
+                        ge.linear_2.weight =
+                            pmetal_bridge::compat::module::Param::new(weight.clone());
                     }
                 }
                 "guidance_in.out_layer.bias" => {
                     if let Some(ref mut ge) = model.guidance_embedder {
-                        ge.linear_2.bias = pmetal_bridge::compat::module::Param::new(Some(weight.clone()));
+                        ge.linear_2.bias =
+                            pmetal_bridge::compat::module::Param::new(Some(weight.clone()));
                     }
                 }
 
                 "img_in.weight" => {
-                    model.x_embedder.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                    model.x_embedder.weight =
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "img_in.bias" => {
-                    model.x_embedder.bias = pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                    model.x_embedder.bias =
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
 
                 "final_layer.adaLN_modulation.1.weight" => {
-                    model.final_norm_out.linear.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                    model.final_norm_out.linear.weight =
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "final_layer.adaLN_modulation.1.bias" => {
                     model.final_norm_out.linear.bias =
                         pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 "final_layer.linear.weight" => {
-                    model.final_proj_out.weight = pmetal_bridge::compat::module::Param::new(weight.clone())
+                    model.final_proj_out.weight =
+                        pmetal_bridge::compat::module::Param::new(weight.clone())
                 }
                 "final_layer.linear.bias" => {
-                    model.final_proj_out.bias = pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
+                    model.final_proj_out.bias =
+                        pmetal_bridge::compat::module::Param::new(Some(weight.clone()))
                 }
                 _ => {}
             }
@@ -1049,49 +1077,49 @@ pub fn load_llama_weights(
             &mut layer.self_attn.q_proj,
             weights,
             &format!("{prefix}.self_attn.q_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.self_attn.k_proj,
             weights,
             &format!("{prefix}.self_attn.k_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.self_attn.v_proj,
             weights,
             &format!("{prefix}.self_attn.v_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.self_attn.o_proj,
             weights,
             &format!("{prefix}.self_attn.o_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.mlp.gate_proj,
             weights,
             &format!("{prefix}.mlp.gate_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.mlp.up_proj,
             weights,
             &format!("{prefix}.mlp.up_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.mlp.down_proj,
             weights,
             &format!("{prefix}.mlp.down_proj"),
-        );
+        )?;
         load_rms_norm_weight(
             &mut layer.input_layernorm,
             weights,
             &format!("{prefix}.input_layernorm"),
-        );
+        )?;
         load_rms_norm_weight(
             &mut layer.post_attention_layernorm,
             weights,
             &format!("{prefix}.post_attention_layernorm"),
-        );
+        )?;
     }
-    load_rms_norm_weight(&mut model.model.norm, weights, "model.norm");
+    load_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
     if let Some(ref mut lm_head) = model.lm_head {
         if let Some(w) = weights.get("lm_head.weight") {
             lm_head.weight = pmetal_bridge::compat::module::Param::new(w.clone());
@@ -1115,49 +1143,49 @@ pub fn load_mistral_weights(
             &mut layer.self_attn.q_proj,
             weights,
             &format!("{prefix}.self_attn.q_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.self_attn.k_proj,
             weights,
             &format!("{prefix}.self_attn.k_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.self_attn.v_proj,
             weights,
             &format!("{prefix}.self_attn.v_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.self_attn.o_proj,
             weights,
             &format!("{prefix}.self_attn.o_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.mlp.gate_proj,
             weights,
             &format!("{prefix}.mlp.gate_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.mlp.up_proj,
             weights,
             &format!("{prefix}.mlp.up_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.mlp.down_proj,
             weights,
             &format!("{prefix}.mlp.down_proj"),
-        );
+        )?;
         load_rms_norm_weight(
             &mut layer.input_layernorm,
             weights,
             &format!("{prefix}.input_layernorm"),
-        );
+        )?;
         load_rms_norm_weight(
             &mut layer.post_attention_layernorm,
             weights,
             &format!("{prefix}.post_attention_layernorm"),
-        );
+        )?;
     }
-    load_rms_norm_weight(&mut model.model.norm, weights, "model.norm");
+    load_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
     if let Some(ref mut lm_head) = model.lm_head {
         if let Some(w) = weights.get("lm_head.weight") {
             lm_head.weight = pmetal_bridge::compat::module::Param::new(w.clone());
@@ -1182,47 +1210,47 @@ pub fn load_gemma_weights(
                 &mut layer.self_attn.q_proj,
                 weights,
                 &format!("{prefix}.self_attn.q_proj"),
-            );
+            )?;
             load_linear_weight(
                 &mut layer.self_attn.k_proj,
                 weights,
                 &format!("{prefix}.self_attn.k_proj"),
-            );
+            )?;
             load_linear_weight(
                 &mut layer.self_attn.v_proj,
                 weights,
                 &format!("{prefix}.self_attn.v_proj"),
-            );
+            )?;
             load_linear_weight(
                 &mut layer.self_attn.o_proj,
                 weights,
                 &format!("{prefix}.self_attn.o_proj"),
-            );
+            )?;
             load_linear_weight(
                 &mut layer.mlp.gate_proj,
                 weights,
                 &format!("{prefix}.mlp.gate_proj"),
-            );
+            )?;
             load_linear_weight(
                 &mut layer.mlp.up_proj,
                 weights,
                 &format!("{prefix}.mlp.up_proj"),
-            );
+            )?;
             load_linear_weight(
                 &mut layer.mlp.down_proj,
                 weights,
                 &format!("{prefix}.mlp.down_proj"),
-            );
+            )?;
             load_gemma_rms_norm_weight(
                 &mut layer.input_layernorm,
                 weights,
                 &format!("{prefix}.input_layernorm"),
-            );
+            )?;
             load_gemma_rms_norm_weight(
                 &mut layer.post_attention_layernorm,
                 weights,
                 &format!("{prefix}.post_attention_layernorm"),
-            );
+            )?;
         }
     } else if let Some(ref mut layers) = model.model.layers.gemma2 {
         for (i, layer) in layers.iter_mut().enumerate() {
@@ -1231,60 +1259,60 @@ pub fn load_gemma_weights(
                 &mut layer.self_attn.q_proj,
                 weights,
                 &format!("{prefix}.self_attn.q_proj"),
-            );
+            )?;
             load_linear_weight(
                 &mut layer.self_attn.k_proj,
                 weights,
                 &format!("{prefix}.self_attn.k_proj"),
-            );
+            )?;
             load_linear_weight(
                 &mut layer.self_attn.v_proj,
                 weights,
                 &format!("{prefix}.self_attn.v_proj"),
-            );
+            )?;
             load_linear_weight(
                 &mut layer.self_attn.o_proj,
                 weights,
                 &format!("{prefix}.self_attn.o_proj"),
-            );
+            )?;
             load_linear_weight(
                 &mut layer.mlp.gate_proj,
                 weights,
                 &format!("{prefix}.mlp.gate_proj"),
-            );
+            )?;
             load_linear_weight(
                 &mut layer.mlp.up_proj,
                 weights,
                 &format!("{prefix}.mlp.up_proj"),
-            );
+            )?;
             load_linear_weight(
                 &mut layer.mlp.down_proj,
                 weights,
                 &format!("{prefix}.mlp.down_proj"),
-            );
+            )?;
             load_gemma_rms_norm_weight(
                 &mut layer.input_layernorm,
                 weights,
                 &format!("{prefix}.input_layernorm"),
-            );
+            )?;
             load_gemma_rms_norm_weight(
                 &mut layer.post_attention_layernorm,
                 weights,
                 &format!("{prefix}.post_attention_layernorm"),
-            );
+            )?;
             load_gemma_rms_norm_weight(
                 &mut layer.pre_feedforward_layernorm,
                 weights,
                 &format!("{prefix}.pre_feedforward_layernorm"),
-            );
+            )?;
             load_gemma_rms_norm_weight(
                 &mut layer.post_feedforward_layernorm,
                 weights,
                 &format!("{prefix}.post_feedforward_layernorm"),
-            );
+            )?;
         }
     }
-    load_gemma_rms_norm_weight(&mut model.model.norm, weights, "model.norm");
+    load_gemma_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
     Ok(())
 }
 
@@ -1303,45 +1331,45 @@ pub fn load_phi_weights(
             &mut layer.self_attn.q_proj,
             weights,
             &format!("{prefix}.self_attn.q_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.self_attn.k_proj,
             weights,
             &format!("{prefix}.self_attn.k_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.self_attn.v_proj,
             weights,
             &format!("{prefix}.self_attn.v_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.self_attn.o_proj,
             weights,
             &format!("{prefix}.self_attn.o_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.mlp.gate_up_proj,
             weights,
             &format!("{prefix}.mlp.gate_up_proj"),
-        );
+        )?;
         load_linear_weight(
             &mut layer.mlp.down_proj,
             weights,
             &format!("{prefix}.mlp.down_proj"),
-        );
+        )?;
         load_phi_rms_norm_weight(
             &mut layer.input_layernorm,
             weights,
             &format!("{prefix}.input_layernorm"),
-        );
+        )?;
         load_phi_rms_norm_weight(
             &mut layer.post_attention_layernorm,
             weights,
             &format!("{prefix}.post_attention_layernorm"),
-        );
+        )?;
     }
-    load_phi_rms_norm_weight(&mut model.model.norm, weights, "model.norm");
-    load_linear_weight(&mut model.lm_head, weights, "lm_head");
+    load_phi_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
+    load_linear_weight(&mut model.lm_head, weights, "lm_head")?;
     Ok(())
 }
 
@@ -1573,11 +1601,12 @@ mod tests {
         path: &Path,
         weights: &HashMap<String, Array>,
     ) -> Result<(), pmetal_bridge::compat::IoError> {
-        Array::save_safetensors(
-            weights.iter().map(|(key, value)| (key.as_str(), value)),
-            None,
-            path,
-        )
+        let entries: Vec<_> = weights
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+            .collect();
+        Array::save_safetensors(path.to_string_lossy().as_ref(), &entries);
+        Ok(())
     }
 
     #[test]

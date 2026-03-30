@@ -161,7 +161,6 @@ pub struct Pixtral {
 }
 impl_module_params!(Pixtral; language_model);
 
-
 impl Pixtral {
     /// Create a new Pixtral model.
     pub fn new(config: PixtralConfig) -> Result<Self, Exception> {

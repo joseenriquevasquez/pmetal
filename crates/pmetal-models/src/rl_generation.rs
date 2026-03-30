@@ -568,7 +568,8 @@ impl BatchedRlGenerator {
                     // seed_logits: [1, 1, vocab] -> select batch 0 -> [1, vocab] -> select seq 0 -> [vocab]
                     let row = pmetal_bridge::compat::ops::select_axis(
                         &pmetal_bridge::compat::ops::select_axis(&seed_logits, 0, 0),
-                        0, 0,
+                        0,
+                        0,
                     );
                     greedy_argmax_1d(&row)
                 };
@@ -580,7 +581,8 @@ impl BatchedRlGenerator {
                     logits.eval();
                     let row = pmetal_bridge::compat::ops::select_axis(
                         &pmetal_bridge::compat::ops::select_axis(&logits, 0, 0),
-                        0, 0,
+                        0,
+                        0,
                     );
                     draft_current = greedy_argmax_1d(&row);
                     draft_tokens.push(draft_current);
@@ -638,7 +640,8 @@ impl BatchedRlGenerator {
                 // is only necessary when the verifier itself uses sampling — RL rollouts
                 // use deterministic verification to keep accept/reject semantics clean.
                 if n_accepted_draft == k {
-                    let bonus_row = pmetal_bridge::compat::ops::select_axis(&vl_no_batch, 0, k as i32);
+                    let bonus_row =
+                        pmetal_bridge::compat::ops::select_axis(&vl_no_batch, 0, k as i32);
                     let bonus_tok = greedy_argmax_1d(&bonus_row);
                     accepted_tokens.push(bonus_tok);
                 }

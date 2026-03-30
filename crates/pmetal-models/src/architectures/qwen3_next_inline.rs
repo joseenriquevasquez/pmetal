@@ -44,7 +44,7 @@ pub struct InlineLayerWeights {
     mlp_down_w: InlineArray, // pre-transposed
 
     // Attention-specific (only if !is_linear)
-    attn_q_w: Option<InlineArray>,  // pre-transposed
+    attn_q_w: Option<InlineArray>, // pre-transposed
     attn_k_w: Option<InlineArray>,
     attn_v_w: Option<InlineArray>,
     attn_o_w: Option<InlineArray>,
@@ -61,10 +61,10 @@ pub struct InlineLayerWeights {
     attn_rope_scale: f32,
 
     // GDN-specific (only if is_linear)
-    gdn_qkv_w: Option<InlineArray>,  // in_proj_qkv, pre-transposed [hidden, conv_dim]
-    gdn_z_w: Option<InlineArray>,    // in_proj_z, pre-transposed [hidden, value_dim]
-    gdn_b_w: Option<InlineArray>,    // in_proj_b, pre-transposed [hidden, num_v_heads]
-    gdn_a_w: Option<InlineArray>,    // in_proj_a, pre-transposed [hidden, num_v_heads]
+    gdn_qkv_w: Option<InlineArray>, // in_proj_qkv, pre-transposed [hidden, conv_dim]
+    gdn_z_w: Option<InlineArray>,   // in_proj_z, pre-transposed [hidden, value_dim]
+    gdn_b_w: Option<InlineArray>,   // in_proj_b, pre-transposed [hidden, num_v_heads]
+    gdn_a_w: Option<InlineArray>,   // in_proj_a, pre-transposed [hidden, num_v_heads]
     gdn_conv_w: Option<InlineArray>,
     gdn_q_nw: Option<InlineArray>,
     gdn_k_nw: Option<InlineArray>,
@@ -72,7 +72,7 @@ pub struct InlineLayerWeights {
     gdn_dt_bias: Option<InlineArray>,
     gdn_norm_w: Option<InlineArray>,
     gdn_norm_eps: f32,
-    gdn_out_w: Option<InlineArray>,  // pre-transposed
+    gdn_out_w: Option<InlineArray>, // pre-transposed
     gdn_nv: i32,
     gdn_nk: i32,
     gdn_dk: i32,
@@ -121,18 +121,18 @@ pub struct InlineGdnCache {
 /// Uses pre-allocated buffers with slice_set for O(1) per-step updates
 /// (matching Python's in-place slice assignment pattern).
 pub struct InlineKvLayerCache {
-    pub keys: Option<InlineArray>,   // [B, H, MAX_T, D] pre-allocated buffer
+    pub keys: Option<InlineArray>, // [B, H, MAX_T, D] pre-allocated buffer
     pub values: Option<InlineArray>, // [B, H, MAX_T, D] pre-allocated buffer
-    pub offset: i32,                 // number of valid tokens in cache
+    pub offset: i32,               // number of valid tokens in cache
 }
 
 /// Full cache for the InlineArray decode path.
 pub struct InlineCache {
-    pub gdn_caches: Vec<InlineGdnCache>,    // indexed by layer position in gdn_layers
-    pub kv_caches: Vec<InlineKvLayerCache>,  // indexed by layer position in attn_layers
-    pub gdn_layer_indices: Vec<usize>,       // which layers are GDN
-    pub attn_layer_indices: Vec<usize>,      // which layers are attention
-    pub rope_offset: i32,                    // current sequence position
+    pub gdn_caches: Vec<InlineGdnCache>, // indexed by layer position in gdn_layers
+    pub kv_caches: Vec<InlineKvLayerCache>, // indexed by layer position in attn_layers
+    pub gdn_layer_indices: Vec<usize>,   // which layers are GDN
+    pub attn_layer_indices: Vec<usize>,  // which layers are attention
+    pub rope_offset: i32,                // current sequence position
 }
 
 impl InlineCache {
@@ -152,16 +152,25 @@ impl InlineCache {
                 gdn_layer_indices.push(i);
                 let entry = mamba_cache.get(i);
                 gdn_caches.push(InlineGdnCache {
-                    conv_state: entry.and_then(|e| e.conv_state.as_ref()).map(|a| ia_from_array(a)),
-                    ssm_state: entry.and_then(|e| e.ssm_state.as_ref()).map(|a| ia_from_array(a)),
+                    conv_state: entry
+                        .and_then(|e| e.conv_state.as_ref())
+                        .map(|a| ia_from_array(a)),
+                    ssm_state: entry
+                        .and_then(|e| e.ssm_state.as_ref())
+                        .map(|a| ia_from_array(a)),
                 });
             } else {
                 attn_layer_indices.push(i);
-                let (keys, values) = kv_cache.fetch_for_compiled_decode(i)
+                let (keys, values) = kv_cache
+                    .fetch_for_compiled_decode(i)
                     .map(|(k, v)| (Some(ia_from_array(&k)), Some(ia_from_array(&v))))
                     .unwrap_or((None, None));
                 let offset = keys.as_ref().map(|k| k.dim(2)).unwrap_or(0);
-                kv_caches.push(InlineKvLayerCache { keys, values, offset });
+                kv_caches.push(InlineKvLayerCache {
+                    keys,
+                    values,
+                    offset,
+                });
             }
         }
 
@@ -178,13 +187,23 @@ impl InlineCache {
     pub fn write_back(&self, kv_cache: &mut KVCache, mamba_cache: &mut MambaCache) {
         for (slot, &layer_idx) in self.gdn_layer_indices.iter().enumerate() {
             if let Some(entry) = mamba_cache.get_mut(layer_idx) {
-                entry.conv_state = self.gdn_caches[slot].conv_state.as_ref().map(|a| ia_to_array(a));
-                entry.ssm_state = self.gdn_caches[slot].ssm_state.as_ref().map(|a| ia_to_array(a));
+                entry.conv_state = self.gdn_caches[slot]
+                    .conv_state
+                    .as_ref()
+                    .map(|a| ia_to_array(a));
+                entry.ssm_state = self.gdn_caches[slot]
+                    .ssm_state
+                    .as_ref()
+                    .map(|a| ia_to_array(a));
             }
         }
         for (slot, &layer_idx) in self.attn_layer_indices.iter().enumerate() {
             if let (Some(k), Some(v)) = (&self.kv_caches[slot].keys, &self.kv_caches[slot].values) {
-                let _ = kv_cache.update_from_compiled_decode(layer_idx, &ia_to_array(k), &ia_to_array(v));
+                let _ = kv_cache.update_from_compiled_decode(
+                    layer_idx,
+                    &ia_to_array(k),
+                    &ia_to_array(v),
+                );
             }
         }
     }
@@ -247,7 +266,10 @@ impl InlineModelWeights {
         let mut embed_w = ia_from_array(model.model.embed_tokens.weight.as_ref());
         let mut final_norm_w = ia_from_array(model.model.norm.weight.as_ref());
         let final_norm_eps = model.model.norm.eps;
-        let mut lm_head_w = model.lm_head.as_ref().map(|l| ia_from_array(l.weight.as_ref()));
+        let mut lm_head_w = model
+            .lm_head
+            .as_ref()
+            .map(|l| ia_from_array(l.weight.as_ref()));
 
         let mut layers = Vec::with_capacity(model.model.layers.len());
         for (li, layer) in model.model.layers.iter_mut().enumerate() {
@@ -262,18 +284,41 @@ impl InlineModelWeights {
                 mlp_up_w: InlineArray::from_f32(0.0),
                 mlp_down_w: InlineArray::from_f32(0.0),
                 // Attention
-                attn_q_w: None, attn_k_w: None, attn_v_w: None, attn_o_w: None,
-                attn_q_norm_w: None, attn_q_norm_eps: 1e-6,
-                attn_k_norm_w: None, attn_k_norm_eps: 1e-6,
-                attn_n_heads: 0, attn_n_kv_heads: 0, attn_head_dim: 0,
-                attn_scale: 0.0, attn_rope_dims: 0, attn_rope_base: 0.0, attn_rope_scale: 0.0,
+                attn_q_w: None,
+                attn_k_w: None,
+                attn_v_w: None,
+                attn_o_w: None,
+                attn_q_norm_w: None,
+                attn_q_norm_eps: 1e-6,
+                attn_k_norm_w: None,
+                attn_k_norm_eps: 1e-6,
+                attn_n_heads: 0,
+                attn_n_kv_heads: 0,
+                attn_head_dim: 0,
+                attn_scale: 0.0,
+                attn_rope_dims: 0,
+                attn_rope_base: 0.0,
+                attn_rope_scale: 0.0,
                 // GDN
-                gdn_qkv_w: None, gdn_z_w: None, gdn_b_w: None, gdn_a_w: None, gdn_conv_w: None,
-                gdn_q_nw: None, gdn_k_nw: None,
-                gdn_a_log: None, gdn_dt_bias: None,
-                gdn_norm_w: None, gdn_norm_eps: 1e-6, gdn_out_w: None,
-                gdn_nv: 0, gdn_nk: 0, gdn_dk: 0, gdn_dv: 0,
-                gdn_kd: 0, gdn_cd: 0, gdn_ck: 0,
+                gdn_qkv_w: None,
+                gdn_z_w: None,
+                gdn_b_w: None,
+                gdn_a_w: None,
+                gdn_conv_w: None,
+                gdn_q_nw: None,
+                gdn_k_nw: None,
+                gdn_a_log: None,
+                gdn_dt_bias: None,
+                gdn_norm_w: None,
+                gdn_norm_eps: 1e-6,
+                gdn_out_w: None,
+                gdn_nv: 0,
+                gdn_nk: 0,
+                gdn_dk: 0,
+                gdn_dv: 0,
+                gdn_kd: 0,
+                gdn_cd: 0,
+                gdn_ck: 0,
             };
 
             // MLP
@@ -285,7 +330,9 @@ impl InlineModelWeights {
                 }
                 super::qwen3_next::Qwen3NextFeedForward::MoE(_) => {
                     // MoE models use the standard Array path for now
-                    return Err(Exception::custom("InlineArray decode not supported for MoE models yet"));
+                    return Err(Exception::custom(
+                        "InlineArray decode not supported for MoE models yet",
+                    ));
                 }
             }
 
@@ -293,9 +340,9 @@ impl InlineModelWeights {
                 let gdn = layer.linear_attn.as_mut().unwrap();
                 // Separate projection weights (pre-transposed), matching Python's 4 Linear layers
                 lw.gdn_qkv_w = Some(ia_from_array(gdn.in_proj_qkv.weight.as_ref()).t());
-                lw.gdn_z_w   = Some(ia_from_array(gdn.in_proj_z.weight.as_ref()).t());
-                lw.gdn_b_w   = Some(ia_from_array(gdn.in_proj_b.weight.as_ref()).t());
-                lw.gdn_a_w   = Some(ia_from_array(gdn.in_proj_a.weight.as_ref()).t());
+                lw.gdn_z_w = Some(ia_from_array(gdn.in_proj_z.weight.as_ref()).t());
+                lw.gdn_b_w = Some(ia_from_array(gdn.in_proj_b.weight.as_ref()).t());
+                lw.gdn_a_w = Some(ia_from_array(gdn.in_proj_a.weight.as_ref()).t());
                 lw.gdn_conv_w = Some(ia_from_array(gdn.conv1d.weight.as_ref()));
                 lw.gdn_q_nw = Some(ia_from_array(&gdn.q_norm_weight));
                 lw.gdn_k_nw = Some(ia_from_array(&gdn.k_norm_weight));
@@ -312,9 +359,16 @@ impl InlineModelWeights {
                 lw.gdn_cd = gdn.conv_dim;
                 lw.gdn_ck = gdn.conv_kernel_size;
                 if li == 0 {
-                    eprintln!("[INLINE-GEN] GDN config: nk={} nv={} dk={} dv={} kd={} cd={} ck={}",
-                        gdn.num_k_heads, gdn.num_v_heads, gdn.head_k_dim, gdn.head_v_dim,
-                        gdn.key_dim, gdn.conv_dim, gdn.conv_kernel_size);
+                    eprintln!(
+                        "[INLINE-GEN] GDN config: nk={} nv={} dk={} dv={} kd={} cd={} ck={}",
+                        gdn.num_k_heads,
+                        gdn.num_v_heads,
+                        gdn.head_k_dim,
+                        gdn.head_v_dim,
+                        gdn.key_dim,
+                        gdn.conv_dim,
+                        gdn.conv_kernel_size
+                    );
                 }
             } else {
                 let attn = layer.self_attn.as_ref().unwrap();
@@ -369,23 +423,57 @@ impl InlineModelWeights {
             lw.mlp_gate_w = copy_fresh(&lw.mlp_gate_w);
             lw.mlp_up_w = copy_fresh(&lw.mlp_up_w);
             lw.mlp_down_w = copy_fresh(&lw.mlp_down_w);
-            if let Some(ref w) = lw.attn_q_w { lw.attn_q_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.attn_k_w { lw.attn_k_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.attn_v_w { lw.attn_v_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.attn_o_w { lw.attn_o_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.attn_q_norm_w { lw.attn_q_norm_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.attn_k_norm_w { lw.attn_k_norm_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_qkv_w { lw.gdn_qkv_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_z_w { lw.gdn_z_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_b_w { lw.gdn_b_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_a_w { lw.gdn_a_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_conv_w { lw.gdn_conv_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_q_nw { lw.gdn_q_nw = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_k_nw { lw.gdn_k_nw = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_a_log { lw.gdn_a_log = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_dt_bias { lw.gdn_dt_bias = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_norm_w { lw.gdn_norm_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_out_w { lw.gdn_out_w = Some(copy_fresh(w)); }
+            if let Some(ref w) = lw.attn_q_w {
+                lw.attn_q_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.attn_k_w {
+                lw.attn_k_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.attn_v_w {
+                lw.attn_v_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.attn_o_w {
+                lw.attn_o_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.attn_q_norm_w {
+                lw.attn_q_norm_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.attn_k_norm_w {
+                lw.attn_k_norm_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_qkv_w {
+                lw.gdn_qkv_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_z_w {
+                lw.gdn_z_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_b_w {
+                lw.gdn_b_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_a_w {
+                lw.gdn_a_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_conv_w {
+                lw.gdn_conv_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_q_nw {
+                lw.gdn_q_nw = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_k_nw {
+                lw.gdn_k_nw = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_a_log {
+                lw.gdn_a_log = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_dt_bias {
+                lw.gdn_dt_bias = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_norm_w {
+                lw.gdn_norm_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_out_w {
+                lw.gdn_out_w = Some(copy_fresh(w));
+            }
         }
         eprintln!("[INLINE-GEN] Force-copied all weights into fresh Metal buffers");
 
@@ -474,18 +562,15 @@ impl InlineModelWeights {
         }
 
         if raw.is_empty() {
-            return Err(format!(
-                "no weights loaded from {}",
-                model_dir.display()
-            ));
+            return Err(format!("no weights loaded from {}", model_dir.display()));
         }
 
         // ── Step 3: Sanitization ────────────────────────────────────────────
         // Detect shift condition before any renaming (mirrors sanitize_weights).
         let has_mtp = raw.keys().any(|k| k.contains("mtp."));
-        let has_unsanitized_conv = raw.iter().any(|(k, v)| {
-            k.contains("conv1d.weight") && v.ndim() == 3 && v.dim(2) != 1
-        });
+        let has_unsanitized_conv = raw
+            .iter()
+            .any(|(k, v)| k.contains("conv1d.weight") && v.ndim() == 3 && v.dim(2) != 1);
         let should_shift_norms = has_mtp || has_unsanitized_conv;
 
         // 3a. Key renaming: strip VLM prefix and rename A_log → a_log.
@@ -521,9 +606,19 @@ impl InlineModelWeights {
             ".q_norm.weight",
             ".k_norm.weight",
         ];
-        let one = InlineArray::from_f32(1.0);
+        let detected_model_dtype = raw
+            .get("model.embed_tokens.weight")
+            .map(|w| w.dtype_raw())
+            .unwrap_or(11); // 11 = bfloat16 fallback
+        let one = InlineArray::from_f32(1.0).as_dtype(detected_model_dtype);
+        let f32_gdn_suffixes = [
+            "linear_attn.a_log",
+            "linear_attn.norm.weight",
+            "linear_attn.q_norm.weight",
+            "linear_attn.k_norm.weight",
+        ];
 
-        // 3d. Conv1d transpose + norm shift.
+        // 3d. Conv1d transpose + norm shift + f32→model_dtype casts.
         let all_keys: Vec<String> = raw.keys().cloned().collect();
         for k in &all_keys {
             if k.contains("conv1d.weight") {
@@ -531,6 +626,14 @@ impl InlineModelWeights {
                     if v.ndim() == 3 && v.dim(2) != 1 {
                         let transposed = v.transpose_axes(&[0, 2, 1]);
                         raw.insert(k.clone(), transposed);
+                    }
+                }
+            }
+            if f32_gdn_suffixes.iter().any(|sfx| k.ends_with(sfx)) {
+                if let Some(v) = raw.get(k) {
+                    if v.dtype_raw() != detected_model_dtype {
+                        let cast = v.as_dtype(detected_model_dtype);
+                        raw.insert(k.clone(), cast);
                     }
                 }
             }
@@ -546,15 +649,17 @@ impl InlineModelWeights {
 
         // ── Step 4: Build InlineModelWeights ───────────────────────────────
         let get = |key: &str| -> Result<InlineArray, String> {
-            raw.get(key)
-                .cloned()
-                .ok_or_else(|| {
-                    // Debug: find closest matching keys
-                    let parts: Vec<&str> = key.rsplitn(2, '.').collect();
-                    let suffix = parts[0];
-                    let close: Vec<&String> = raw.keys().filter(|k| k.ends_with(suffix) || k.contains("q_norm")).take(5).collect();
-                    format!("missing weight key: {key} (close matches: {close:?})")
-                })
+            raw.get(key).cloned().ok_or_else(|| {
+                // Debug: find closest matching keys
+                let parts: Vec<&str> = key.rsplitn(2, '.').collect();
+                let suffix = parts[0];
+                let close: Vec<&String> = raw
+                    .keys()
+                    .filter(|k| k.ends_with(suffix) || k.contains("q_norm"))
+                    .take(5)
+                    .collect();
+                format!("missing weight key: {key} (close matches: {close:?})")
+            })
         };
         let embed_w = get("model.embed_tokens.weight")?;
         let final_norm_w = get("model.norm.weight")?;
@@ -574,7 +679,7 @@ impl InlineModelWeights {
         let dk = config.linear_key_head_dim;
         let dv = config.linear_value_head_dim;
         let ck = config.linear_conv_kernel_dim;
-        let kd = nk * dk;          // total key dimension
+        let kd = nk * dk; // total key dimension
         let cd = kd * 2 + nv * dv; // conv projection dim
 
         // Attention derived dimensions.
@@ -607,25 +712,48 @@ impl InlineModelWeights {
                 mlp_gate_w,
                 mlp_up_w,
                 mlp_down_w,
-                attn_q_w: None, attn_k_w: None, attn_v_w: None, attn_o_w: None,
-                attn_q_norm_w: None, attn_q_norm_eps: config.rms_norm_eps,
-                attn_k_norm_w: None, attn_k_norm_eps: config.rms_norm_eps,
-                attn_n_heads: 0, attn_n_kv_heads: 0, attn_head_dim: 0,
-                attn_scale: 0.0, attn_rope_dims: 0, attn_rope_base: 0.0, attn_rope_scale: 0.0,
-                gdn_qkv_w: None, gdn_z_w: None, gdn_b_w: None, gdn_a_w: None, gdn_conv_w: None,
-                gdn_q_nw: None, gdn_k_nw: None,
-                gdn_a_log: None, gdn_dt_bias: None,
-                gdn_norm_w: None, gdn_norm_eps: config.rms_norm_eps, gdn_out_w: None,
-                gdn_nv: 0, gdn_nk: 0, gdn_dk: 0, gdn_dv: 0,
-                gdn_kd: 0, gdn_cd: 0, gdn_ck: 0,
+                attn_q_w: None,
+                attn_k_w: None,
+                attn_v_w: None,
+                attn_o_w: None,
+                attn_q_norm_w: None,
+                attn_q_norm_eps: config.rms_norm_eps,
+                attn_k_norm_w: None,
+                attn_k_norm_eps: config.rms_norm_eps,
+                attn_n_heads: 0,
+                attn_n_kv_heads: 0,
+                attn_head_dim: 0,
+                attn_scale: 0.0,
+                attn_rope_dims: 0,
+                attn_rope_base: 0.0,
+                attn_rope_scale: 0.0,
+                gdn_qkv_w: None,
+                gdn_z_w: None,
+                gdn_b_w: None,
+                gdn_a_w: None,
+                gdn_conv_w: None,
+                gdn_q_nw: None,
+                gdn_k_nw: None,
+                gdn_a_log: None,
+                gdn_dt_bias: None,
+                gdn_norm_w: None,
+                gdn_norm_eps: config.rms_norm_eps,
+                gdn_out_w: None,
+                gdn_nv: 0,
+                gdn_nk: 0,
+                gdn_dk: 0,
+                gdn_dv: 0,
+                gdn_kd: 0,
+                gdn_cd: 0,
+                gdn_ck: 0,
             };
 
             if is_linear {
                 let la = format!("{p}.linear_attn");
                 lw.gdn_qkv_w = Some(get(&format!("{la}.in_proj_qkv.weight"))?.t());
-                lw.gdn_z_w   = Some(get(&format!("{la}.in_proj_z.weight"))?.t());
-                lw.gdn_b_w   = Some(get(&format!("{la}.in_proj_b.weight"))?.t());
-                lw.gdn_a_w   = Some(get(&format!("{la}.in_proj_a.weight"))?.t());
+                lw.gdn_z_w = Some(get(&format!("{la}.in_proj_z.weight"))?.t());
+                lw.gdn_b_w = Some(get(&format!("{la}.in_proj_b.weight"))?.t());
+                lw.gdn_a_w = Some(get(&format!("{la}.in_proj_a.weight"))?.t());
                 lw.gdn_conv_w = Some(get(&format!("{la}.conv1d.weight"))?);
                 // q_norm_weight / k_norm_weight are SYNTHETIC — they are not stored in
                 // safetensors. They are computed in the model constructor as:
@@ -636,24 +764,28 @@ impl InlineModelWeights {
                 let inv_scale = (dk as f32).sqrt().recip();
                 let q_scale_arr = {
                     let a = InlineArray::ones(&[dk], model_dtype);
-                    let scale = InlineArray::from_f32(inv_scale * inv_scale);
+                    let scale = InlineArray::from_f32(inv_scale * inv_scale).as_dtype(model_dtype);
                     a.multiply(&scale)
                 };
                 let k_scale_arr = {
                     let a = InlineArray::ones(&[dk], model_dtype);
-                    let scale = InlineArray::from_f32(inv_scale);
+                    let scale = InlineArray::from_f32(inv_scale).as_dtype(model_dtype);
                     a.multiply(&scale)
                 };
-                lw.gdn_q_nw = Some(get(&format!("{la}.q_norm_weight"))
-                    .or_else(|_| get(&format!("{la}.q_norm.weight")))
-                    .unwrap_or(q_scale_arr));
-                lw.gdn_k_nw = Some(get(&format!("{la}.k_norm_weight"))
-                    .or_else(|_| get(&format!("{la}.k_norm.weight")))
-                    .unwrap_or(k_scale_arr));
-                lw.gdn_a_log  = Some(get(&format!("{la}.a_log"))?);
+                lw.gdn_q_nw = Some(
+                    get(&format!("{la}.q_norm_weight"))
+                        .or_else(|_| get(&format!("{la}.q_norm.weight")))
+                        .unwrap_or(q_scale_arr),
+                );
+                lw.gdn_k_nw = Some(
+                    get(&format!("{la}.k_norm_weight"))
+                        .or_else(|_| get(&format!("{la}.k_norm.weight")))
+                        .unwrap_or(k_scale_arr),
+                );
+                lw.gdn_a_log = Some(get(&format!("{la}.a_log"))?);
                 lw.gdn_dt_bias = Some(get(&format!("{la}.dt_bias"))?);
-                lw.gdn_norm_w  = Some(get(&format!("{la}.norm.weight"))?);
-                lw.gdn_out_w   = Some(get(&format!("{la}.out_proj.weight"))?.t());
+                lw.gdn_norm_w = Some(get(&format!("{la}.norm.weight"))?);
+                lw.gdn_out_w = Some(get(&format!("{la}.out_proj.weight"))?.t());
                 lw.gdn_nv = nv;
                 lw.gdn_nk = nk;
                 lw.gdn_dk = dk;
@@ -675,12 +807,12 @@ impl InlineModelWeights {
                 lw.attn_o_w = Some(get(&format!("{sa}.o_proj.weight"))?.t());
                 lw.attn_q_norm_w = Some(get(&format!("{sa}.q_norm.weight"))?);
                 lw.attn_k_norm_w = Some(get(&format!("{sa}.k_norm.weight"))?);
-                lw.attn_n_heads    = n_heads;
+                lw.attn_n_heads = n_heads;
                 lw.attn_n_kv_heads = n_kv_heads;
-                lw.attn_head_dim   = head_dim;
-                lw.attn_scale      = attn_scale;
-                lw.attn_rope_dims  = rope_dims;
-                lw.attn_rope_base  = rope_base;
+                lw.attn_head_dim = head_dim;
+                lw.attn_scale = attn_scale;
+                lw.attn_rope_dims = rope_dims;
+                lw.attn_rope_base = rope_base;
                 lw.attn_rope_scale = rope_scale;
             }
 
@@ -706,29 +838,65 @@ impl InlineModelWeights {
 
         for lw in &mut layers {
             lw.input_ln_w = copy_fresh(&lw.input_ln_w);
-            lw.post_ln_w  = copy_fresh(&lw.post_ln_w);
+            lw.post_ln_w = copy_fresh(&lw.post_ln_w);
             lw.mlp_gate_w = copy_fresh(&lw.mlp_gate_w);
-            lw.mlp_up_w   = copy_fresh(&lw.mlp_up_w);
+            lw.mlp_up_w = copy_fresh(&lw.mlp_up_w);
             lw.mlp_down_w = copy_fresh(&lw.mlp_down_w);
-            if let Some(ref w) = lw.attn_q_w { lw.attn_q_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.attn_k_w { lw.attn_k_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.attn_v_w { lw.attn_v_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.attn_o_w { lw.attn_o_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.attn_q_norm_w { lw.attn_q_norm_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.attn_k_norm_w { lw.attn_k_norm_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_qkv_w  { lw.gdn_qkv_w  = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_z_w    { lw.gdn_z_w    = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_b_w    { lw.gdn_b_w    = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_a_w    { lw.gdn_a_w    = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_conv_w { lw.gdn_conv_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_q_nw   { lw.gdn_q_nw   = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_k_nw   { lw.gdn_k_nw   = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_a_log  { lw.gdn_a_log  = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_dt_bias { lw.gdn_dt_bias = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_norm_w { lw.gdn_norm_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = lw.gdn_out_w  { lw.gdn_out_w  = Some(copy_fresh(w)); }
+            if let Some(ref w) = lw.attn_q_w {
+                lw.attn_q_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.attn_k_w {
+                lw.attn_k_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.attn_v_w {
+                lw.attn_v_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.attn_o_w {
+                lw.attn_o_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.attn_q_norm_w {
+                lw.attn_q_norm_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.attn_k_norm_w {
+                lw.attn_k_norm_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_qkv_w {
+                lw.gdn_qkv_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_z_w {
+                lw.gdn_z_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_b_w {
+                lw.gdn_b_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_a_w {
+                lw.gdn_a_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_conv_w {
+                lw.gdn_conv_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_q_nw {
+                lw.gdn_q_nw = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_k_nw {
+                lw.gdn_k_nw = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_a_log {
+                lw.gdn_a_log = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_dt_bias {
+                lw.gdn_dt_bias = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_norm_w {
+                lw.gdn_norm_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = lw.gdn_out_w {
+                lw.gdn_out_w = Some(copy_fresh(w));
+            }
         }
-        eprintln!("[INLINE-GEN] from_safetensors: force-copied all weights into fresh Metal buffers");
+        eprintln!(
+            "[INLINE-GEN] from_safetensors: force-copied all weights into fresh Metal buffers"
+        );
 
         Ok(Self {
             embed_w,
@@ -817,9 +985,7 @@ pub fn compare_weights(native: &InlineModelWeights, from_model: &InlineModelWeig
         if (a_v - b_v).abs() <= tol {
             msg.push_str(&format!(" val[0]={a_v:.6} OK"));
         } else {
-            msg.push_str(&format!(
-                " val[0] native={a_v:.6} model={b_v:.6} MISMATCH"
-            ));
+            msg.push_str(&format!(" val[0] native={a_v:.6} model={b_v:.6} MISMATCH"));
             ok = false;
         }
 
@@ -828,8 +994,12 @@ pub fn compare_weights(native: &InlineModelWeights, from_model: &InlineModelWeig
     };
 
     // Top-level weights
-    check("embed_w",      &native.embed_w,      &from_model.embed_w);
-    check("final_norm_w", &native.final_norm_w,  &from_model.final_norm_w);
+    check("embed_w", &native.embed_w, &from_model.embed_w);
+    check(
+        "final_norm_w",
+        &native.final_norm_w,
+        &from_model.final_norm_w,
+    );
     match (&native.lm_head_w, &from_model.lm_head_w) {
         (Some(a), Some(b)) => check("lm_head_w", a, b),
         (None, None) => eprintln!("[CMP] lm_head_w: both tied OK"),
@@ -859,11 +1029,23 @@ pub fn compare_weights(native: &InlineModelWeights, from_model: &InlineModelWeig
             );
         }
 
-        check(&format!("{prefix}.input_ln_w"),  &a.input_ln_w,  &b.input_ln_w);
-        check(&format!("{prefix}.post_ln_w"),   &a.post_ln_w,   &b.post_ln_w);
-        check(&format!("{prefix}.mlp_gate_w"),  &a.mlp_gate_w,  &b.mlp_gate_w);
-        check(&format!("{prefix}.mlp_up_w"),    &a.mlp_up_w,    &b.mlp_up_w);
-        check(&format!("{prefix}.mlp_down_w"),  &a.mlp_down_w,  &b.mlp_down_w);
+        check(
+            &format!("{prefix}.input_ln_w"),
+            &a.input_ln_w,
+            &b.input_ln_w,
+        );
+        check(&format!("{prefix}.post_ln_w"), &a.post_ln_w, &b.post_ln_w);
+        check(
+            &format!("{prefix}.mlp_gate_w"),
+            &a.mlp_gate_w,
+            &b.mlp_gate_w,
+        );
+        check(&format!("{prefix}.mlp_up_w"), &a.mlp_up_w, &b.mlp_up_w);
+        check(
+            &format!("{prefix}.mlp_down_w"),
+            &a.mlp_down_w,
+            &b.mlp_down_w,
+        );
 
         if a.is_linear {
             macro_rules! cmp_opt {
@@ -875,17 +1057,17 @@ pub fn compare_weights(native: &InlineModelWeights, from_model: &InlineModelWeig
                     }
                 };
             }
-            cmp_opt!(gdn_qkv_w,   "gdn_qkv_w");
-            cmp_opt!(gdn_z_w,     "gdn_z_w");
-            cmp_opt!(gdn_b_w,     "gdn_b_w");
-            cmp_opt!(gdn_a_w,     "gdn_a_w");
-            cmp_opt!(gdn_conv_w,  "gdn_conv_w");
-            cmp_opt!(gdn_q_nw,    "gdn_q_nw");
-            cmp_opt!(gdn_k_nw,    "gdn_k_nw");
-            cmp_opt!(gdn_a_log,   "gdn_a_log");
+            cmp_opt!(gdn_qkv_w, "gdn_qkv_w");
+            cmp_opt!(gdn_z_w, "gdn_z_w");
+            cmp_opt!(gdn_b_w, "gdn_b_w");
+            cmp_opt!(gdn_a_w, "gdn_a_w");
+            cmp_opt!(gdn_conv_w, "gdn_conv_w");
+            cmp_opt!(gdn_q_nw, "gdn_q_nw");
+            cmp_opt!(gdn_k_nw, "gdn_k_nw");
+            cmp_opt!(gdn_a_log, "gdn_a_log");
             cmp_opt!(gdn_dt_bias, "gdn_dt_bias");
-            cmp_opt!(gdn_norm_w,  "gdn_norm_w");
-            cmp_opt!(gdn_out_w,   "gdn_out_w");
+            cmp_opt!(gdn_norm_w, "gdn_norm_w");
+            cmp_opt!(gdn_out_w, "gdn_out_w");
         } else {
             macro_rules! cmp_opt {
                 ($field:ident, $name:literal) => {
@@ -896,12 +1078,12 @@ pub fn compare_weights(native: &InlineModelWeights, from_model: &InlineModelWeig
                     }
                 };
             }
-            cmp_opt!(attn_q_w,     "attn_q_w");
-            cmp_opt!(attn_k_w,     "attn_k_w");
-            cmp_opt!(attn_v_w,     "attn_v_w");
-            cmp_opt!(attn_o_w,     "attn_o_w");
-            cmp_opt!(attn_q_norm_w,"attn_q_norm_w");
-            cmp_opt!(attn_k_norm_w,"attn_k_norm_w");
+            cmp_opt!(attn_q_w, "attn_q_w");
+            cmp_opt!(attn_k_w, "attn_k_w");
+            cmp_opt!(attn_v_w, "attn_v_w");
+            cmp_opt!(attn_o_w, "attn_o_w");
+            cmp_opt!(attn_q_norm_w, "attn_q_norm_w");
+            cmp_opt!(attn_k_norm_w, "attn_k_norm_w");
         }
     }
 
@@ -918,7 +1100,7 @@ pub fn compare_weights(native: &InlineModelWeights, from_model: &InlineModelWeig
 /// The caller converts to Array once for sampling.
 pub fn inline_decode_step_pure(
     weights: &InlineModelWeights,
-    token_id: &InlineArray,  // [1, 1] int32
+    token_id: &InlineArray, // [1, 1] int32
     cache: &mut InlineCache,
 ) -> InlineArray {
     let b = token_id.dim(0);
@@ -937,11 +1119,20 @@ pub fn inline_decode_step_pure(
 
         // Attention or GDN
         let r = if lw.is_linear {
-            let result = inline_gdn_forward_pure(lw, &normed, b, s, &mut cache.gdn_caches[gdn_slot], dtype);
+            let result =
+                inline_gdn_forward_pure(lw, &normed, b, s, &mut cache.gdn_caches[gdn_slot], dtype);
             gdn_slot += 1;
             result
         } else {
-            let result = inline_attn_forward_pure(lw, &normed, b, s, &mut cache.kv_caches[attn_slot], cache.rope_offset, dtype);
+            let result = inline_attn_forward_pure(
+                lw,
+                &normed,
+                b,
+                s,
+                &mut cache.kv_caches[attn_slot],
+                cache.rope_offset,
+                dtype,
+            );
             attn_slot += 1;
             result
         };
@@ -1018,9 +1209,11 @@ pub fn inline_generate(
     bridge::clear_cache();
     bridge::reset_peak_memory();
 
-    eprintln!("[INLINE-GEN] dtype={} active={:.0}MB",
+    eprintln!(
+        "[INLINE-GEN] dtype={} active={:.0}MB",
         weights.model_dtype,
-        bridge::get_active_memory() as f64 / 1e6);
+        bridge::get_active_memory() as f64 / 1e6
+    );
 
     // Clear Metal buffer cache before decode starts
     bridge::clear_cache();
@@ -1037,14 +1230,20 @@ pub fn inline_generate(
     for step in 0..max_tokens {
         let t0 = std::time::Instant::now();
 
-        if step == 0 { current_y.eval(); }
+        if step == 0 {
+            current_y.eval();
+        }
         let token_val = current_y.item_u32();
 
         // DISABLED for profiling — cache detach adds sync overhead
 
         tokens.push(token_val);
-        if !on_token(token_val) { break; }
-        if step + 1 >= max_tokens { break; }
+        if !on_token(token_val) {
+            break;
+        }
+        if step + 1 >= max_tokens {
+            break;
+        }
 
         let next_input = InlineArray::from_i32(token_val as i32).reshape(&[1, 1]);
         let next_logits = inline_decode_step_pure(weights, &next_input, cache);
@@ -1054,7 +1253,9 @@ pub fn inline_generate(
 
         step_times.push(t0.elapsed().as_secs_f64() * 1000.0);
 
-        if step % 256 == 255 { bridge::clear_cache(); }
+        if step % 256 == 255 {
+            bridge::clear_cache();
+        }
     }
 
     if step_times.len() > 20 {
@@ -1062,8 +1263,10 @@ pub fn inline_generate(
         let skip = 10;
         let avg = step_times[skip..].iter().sum::<f64>() / (step_times.len() - skip) as f64;
         let p50 = step_times[step_times.len() / 2];
-        eprintln!("[INLINE-GEN] per-step: avg={avg:.2}ms p50={p50:.2}ms = {:.0} tok/s",
-            1000.0 / avg);
+        eprintln!(
+            "[INLINE-GEN] per-step: avg={avg:.2}ms p50={p50:.2}ms = {:.0} tok/s",
+            1000.0 / avg
+        );
     }
 
     tokens
@@ -1071,15 +1274,7 @@ pub fn inline_generate(
 
 /// Sample one token from logits (greedy or temperature).
 fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
-    if temperature <= 0.0 {
-        logits_2d.argmax(-1)
-    } else {
-        let inv_temp = InlineArray::from_f32(1.0 / temperature);
-        let lse = logits_2d.logsumexp(-1, true);
-        let log_probs = logits_2d.subtract(&lse);
-        let scaled = log_probs.multiply(&inv_temp);
-        scaled.categorical()
-    }
+    pmetal_bridge::decode::sample_token(logits_2d, temperature)
 }
 
 // ============================================================================
@@ -1109,9 +1304,13 @@ fn inline_gdn_forward_pure(
     // This replays a pre-recorded tape instead of building+traversing a graph,
     // eliminating ~10ms of per-step dispatch overhead.
     if s == 1 {
-        let conv_state = cache.conv_state.take()
+        let conv_state = cache
+            .conv_state
+            .take()
             .unwrap_or_else(|| InlineArray::zeros(&[b, ck - 1, cd], dtype));
-        let ssm_state = cache.ssm_state.take()
+        let ssm_state = cache
+            .ssm_state
+            .take()
             .unwrap_or_else(|| InlineArray::zeros(&[b, nv, dv, dk], 10));
 
         let (output, new_conv, new_state) = InlineArray::compiled_gdn_layer_fixed(
@@ -1129,7 +1328,14 @@ fn inline_gdn_forward_pure(
             lw.gdn_out_w.as_ref().unwrap(),
             &conv_state,
             &ssm_state,
-            nv, nk, dk, dv, cd, ck, kd, lw.gdn_norm_eps,
+            nv,
+            nk,
+            dk,
+            dv,
+            cd,
+            ck,
+            kd,
+            lw.gdn_norm_eps,
         );
 
         cache.conv_state = Some(new_conv);
@@ -1140,33 +1346,50 @@ fn inline_gdn_forward_pure(
     // For T>1 (prefill): use direct ops (shapes vary per prompt length)
     // 4 separate projections — matches Python's in_proj_qkv/z/b/a exactly
     let qkv = normed.matmul(lw.gdn_qkv_w.as_ref().unwrap());
-    let z = normed.matmul(lw.gdn_z_w.as_ref().unwrap()).reshape(&[b, s, nv, dv]);
+    let z = normed
+        .matmul(lw.gdn_z_w.as_ref().unwrap())
+        .reshape(&[b, s, nv, dv]);
     let b_val = normed.matmul(lw.gdn_b_w.as_ref().unwrap());
     let a_val = normed.matmul(lw.gdn_a_w.as_ref().unwrap());
 
     // Conv state + conv1d + fused silu
-    let conv_state = cache.conv_state.take()
+    let conv_state = cache
+        .conv_state
+        .take()
         .unwrap_or_else(|| InlineArray::zeros(&[b, ck - 1, cd], dtype));
     let conv_in = conv_state.concatenate_2(&qkv, 1);
     let new_conv = conv_in.slice(&[0, 1, 0], &[b, ck, cd]);
-    let conv_out = conv_in.conv1d(lw.gdn_conv_w.as_ref().unwrap(), 1, 0, 1, cd)
+    let conv_out = conv_in
+        .conv1d(lw.gdn_conv_w.as_ref().unwrap(), 1, 0, 1, cd)
         .fused_silu();
 
     // Split conv_out → q, k, v via slices
-    let q = conv_out.slice(&[0, 0, 0], &[b, s, kd]).reshape(&[b, s, nk, dk]);
-    let k = conv_out.slice(&[0, 0, kd], &[b, s, kd * 2]).reshape(&[b, s, nk, dk]);
-    let v = conv_out.slice(&[0, 0, kd * 2], &[b, s, cd]).reshape(&[b, s, nv, dv]);
+    let q = conv_out
+        .slice(&[0, 0, 0], &[b, s, kd])
+        .reshape(&[b, s, nk, dk]);
+    let k = conv_out
+        .slice(&[0, 0, kd], &[b, s, kd * 2])
+        .reshape(&[b, s, nk, dk]);
+    let v = conv_out
+        .slice(&[0, 0, kd * 2], &[b, s, cd])
+        .reshape(&[b, s, nv, dv]);
 
     // Q/K normalization
     let q = q.rms_norm(lw.gdn_q_nw.as_ref(), 1e-6);
     let k = k.rms_norm(lw.gdn_k_nw.as_ref(), 1e-6);
 
     // Gating
-    let g = InlineArray::fused_compute_g(lw.gdn_a_log.as_ref().unwrap(), &a_val, lw.gdn_dt_bias.as_ref().unwrap());
+    let g = InlineArray::fused_compute_g(
+        lw.gdn_a_log.as_ref().unwrap(),
+        &a_val,
+        lw.gdn_dt_bias.as_ref().unwrap(),
+    );
     let beta = b_val.sigmoid();
 
     // GDN Metal kernel
-    let ssm_state = cache.ssm_state.take()
+    let ssm_state = cache
+        .ssm_state
+        .take()
         .unwrap_or_else(|| InlineArray::zeros(&[b, nv, dv, dk], 10));
     let (out, new_state) = InlineArray::gdn_metal_step(&q, &k, &v, &g, &beta, &ssm_state, s);
 
@@ -1176,7 +1399,9 @@ fn inline_gdn_forward_pure(
     // Output: rms_norm → precise_swiglu → reshape → matmul
     let out_n = out.rms_norm(lw.gdn_norm_w.as_ref(), lw.gdn_norm_eps);
     let gated = InlineArray::fused_precise_swiglu(&out_n, &z);
-    gated.reshape(&[b, s, -1]).matmul(lw.gdn_out_w.as_ref().unwrap())
+    gated
+        .reshape(&[b, s, -1])
+        .matmul(lw.gdn_out_w.as_ref().unwrap())
 }
 
 /// Pure InlineArray attention forward — zero mlx-rs.
@@ -1205,7 +1430,8 @@ fn inline_attn_forward_pure(
     let new_values = normed.matmul(lw.attn_v_w.as_ref().unwrap());
 
     let queries = queries.rms_norm(lw.attn_q_norm_w.as_ref(), lw.attn_q_norm_eps);
-    let keys = new_keys.reshape(&[b, s, n_kv_heads, head_dim])
+    let keys = new_keys
+        .reshape(&[b, s, n_kv_heads, head_dim])
         .rms_norm(lw.attn_k_norm_w.as_ref(), lw.attn_k_norm_eps);
     let values = new_values.reshape(&[b, s, n_kv_heads, head_dim]);
 
@@ -1214,8 +1440,20 @@ fn inline_attn_forward_pure(
     let values = values.transpose_axes(&[0, 2, 1, 3]);
 
     // RoPE — pure InlineArray
-    let queries = queries.rope(lw.attn_rope_dims, false, lw.attn_rope_base, lw.attn_rope_scale, rope_offset);
-    let keys = keys.rope(lw.attn_rope_dims, false, lw.attn_rope_base, lw.attn_rope_scale, rope_offset);
+    let queries = queries.rope(
+        lw.attn_rope_dims,
+        false,
+        lw.attn_rope_base,
+        lw.attn_rope_scale,
+        rope_offset,
+    );
+    let keys = keys.rope(
+        lw.attn_rope_dims,
+        false,
+        lw.attn_rope_base,
+        lw.attn_rope_scale,
+        rope_offset,
+    );
 
     // KV cache update — O(1) slice_set into pre-allocated buffer (matching Python)
     let prev = cache.offset;
@@ -1253,11 +1491,21 @@ fn inline_attn_forward_pure(
     cache.offset = next;
 
     // SDPA on the valid portion of the buffer
-    let valid_keys = cache.keys.as_ref().unwrap().slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
-    let valid_values = cache.values.as_ref().unwrap().slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+    let valid_keys = cache
+        .keys
+        .as_ref()
+        .unwrap()
+        .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+    let valid_values = cache
+        .values
+        .as_ref()
+        .unwrap()
+        .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
     let output = queries.sdpa(&valid_keys, &valid_values, scale, "causal");
 
-    let output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[b, s, n_heads * head_dim]);
+    let output = output
+        .transpose_axes(&[0, 2, 1, 3])
+        .reshape(&[b, s, n_heads * head_dim]);
     let gated = output.multiply(&gate.sigmoid());
     gated.matmul(lw.attn_o_w.as_ref().unwrap())
 }
@@ -1279,34 +1527,48 @@ fn inline_gdn_forward(
     let kd = lw.gdn_kd;
     let cd = lw.gdn_cd;
     let ck = lw.gdn_ck;
+    let dtype = normed.dtype_raw();
 
     // Separate input projections (4 matmuls — matches Python exactly)
-    let qkv   = normed.matmul(lw.gdn_qkv_w.as_ref().unwrap());
-    let z     = normed.matmul(lw.gdn_z_w.as_ref().unwrap()).reshape(&[b, s, nv, dv]);
+    let qkv = normed.matmul(lw.gdn_qkv_w.as_ref().unwrap());
+    let z = normed
+        .matmul(lw.gdn_z_w.as_ref().unwrap())
+        .reshape(&[b, s, nv, dv]);
     let b_val = normed.matmul(lw.gdn_b_w.as_ref().unwrap());
-    let a     = normed.matmul(lw.gdn_a_w.as_ref().unwrap());
+    let a = normed.matmul(lw.gdn_a_w.as_ref().unwrap());
 
     // Conv state management
-    let entry = mamba_cache.get_mut(layer_idx)
+    let entry = mamba_cache
+        .get_mut(layer_idx)
         .ok_or_else(|| Exception::custom(format!("missing mamba cache for layer {layer_idx}")))?;
 
-    let conv_state = entry.conv_state.as_ref()
+    let conv_state = entry
+        .conv_state
+        .as_ref()
         .map(|s| ia_from_array(s))
-        .unwrap_or_else(|| InlineArray::zeros(&[b, ck - 1, cd], 10)); // dtype 10 = float32
+        .unwrap_or_else(|| InlineArray::zeros(&[b, ck - 1, cd], dtype));
 
     // Conv: concat state + qkv, extract new state, apply conv1d + silu
     let conv_in = conv_state.concatenate_2(&qkv, 1);
     let new_conv = conv_in.slice(
-        &[0, 1, 0],  // skip first row (keep last ck-1 rows)
+        &[0, 1, 0], // skip first row (keep last ck-1 rows)
         &[b, ck, cd],
     );
 
-    let conv_out = conv_in.conv1d(lw.gdn_conv_w.as_ref().unwrap(), 1, 0, 1, cd).fused_silu();
+    let conv_out = conv_in
+        .conv1d(lw.gdn_conv_w.as_ref().unwrap(), 1, 0, 1, cd)
+        .fused_silu();
 
     // Split conv output → q, k, v
-    let q = conv_out.slice(&[0, 0, 0], &[b, s, kd]).reshape(&[b, s, nk, dk]);
-    let k = conv_out.slice(&[0, 0, kd], &[b, s, kd * 2]).reshape(&[b, s, nk, dk]);
-    let v = conv_out.slice(&[0, 0, kd * 2], &[b, s, cd]).reshape(&[b, s, nv, dv]);
+    let q = conv_out
+        .slice(&[0, 0, 0], &[b, s, kd])
+        .reshape(&[b, s, nk, dk]);
+    let k = conv_out
+        .slice(&[0, 0, kd], &[b, s, kd * 2])
+        .reshape(&[b, s, nk, dk]);
+    let v = conv_out
+        .slice(&[0, 0, kd * 2], &[b, s, cd])
+        .reshape(&[b, s, nv, dv]);
 
     // Q/K normalization
     let q = q.rms_norm(lw.gdn_q_nw.as_ref(), 1e-6);
@@ -1321,14 +1583,14 @@ fn inline_gdn_forward(
     let g = InlineArray::fused_compute_g(a_log, &a, dt_bias);
     let beta = b_val.sigmoid();
 
-    let ssm_state = entry.ssm_state.as_ref()
+    let ssm_state = entry
+        .ssm_state
+        .as_ref()
         .map(|s| ia_from_array(s))
         .unwrap_or_else(|| InlineArray::zeros(&[b, nv, dv, dk], 10));
 
     // Direct Metal kernel dispatch with pre-computed g/beta
-    let (out, new_state) = InlineArray::gdn_metal_step(
-        &q, &k, &v, &g, &beta, &ssm_state, s,
-    );
+    let (out, new_state) = InlineArray::gdn_metal_step(&q, &k, &v, &g, &beta, &ssm_state, s);
 
     // Update cache
     entry.conv_state = Some(ia_to_array(&new_conv));
@@ -1339,7 +1601,9 @@ fn inline_gdn_forward(
     let gated = InlineArray::fused_precise_swiglu(&out_n, &z);
 
     // Output projection
-    Ok(gated.reshape(&[b, s, -1]).matmul(lw.gdn_out_w.as_ref().unwrap()))
+    Ok(gated
+        .reshape(&[b, s, -1])
+        .matmul(lw.gdn_out_w.as_ref().unwrap()))
 }
 
 // ============================================================================
@@ -1362,21 +1626,18 @@ fn inline_attn_forward(
     // Q (with gate), K, V projections
     let q_proj_out = normed.matmul(lw.attn_q_w.as_ref().unwrap());
     let q_gate = q_proj_out.reshape(&[b, s, n_heads, head_dim * 2]);
-    let queries = q_gate.slice(
-        &[0, 0, 0, 0],
-        &[b, s, n_heads, head_dim],
-    );
-    let gate = q_gate.slice(
-        &[0, 0, 0, head_dim],
-        &[b, s, n_heads, head_dim * 2],
-    ).reshape(&[b, s, n_heads * head_dim]);
+    let queries = q_gate.slice(&[0, 0, 0, 0], &[b, s, n_heads, head_dim]);
+    let gate = q_gate
+        .slice(&[0, 0, 0, head_dim], &[b, s, n_heads, head_dim * 2])
+        .reshape(&[b, s, n_heads * head_dim]);
 
     let new_keys = normed.matmul(lw.attn_k_w.as_ref().unwrap());
     let new_values = normed.matmul(lw.attn_v_w.as_ref().unwrap());
 
     // Q/K norms
     let queries = queries.rms_norm(lw.attn_q_norm_w.as_ref(), lw.attn_q_norm_eps);
-    let keys = new_keys.reshape(&[b, s, n_kv_heads, head_dim])
+    let keys = new_keys
+        .reshape(&[b, s, n_kv_heads, head_dim])
         .rms_norm(lw.attn_k_norm_w.as_ref(), lw.attn_k_norm_eps);
     let values = new_values.reshape(&[b, s, n_kv_heads, head_dim]);
 
@@ -1387,14 +1648,25 @@ fn inline_attn_forward(
 
     // RoPE — pure InlineArray, no Array conversion
     let offset = kv_cache.rope_offset();
-    let queries = queries.rope(lw.attn_rope_dims, false, lw.attn_rope_base, lw.attn_rope_scale, offset);
-    let keys = keys.rope(lw.attn_rope_dims, false, lw.attn_rope_base, lw.attn_rope_scale, offset);
+    let queries = queries.rope(
+        lw.attn_rope_dims,
+        false,
+        lw.attn_rope_base,
+        lw.attn_rope_scale,
+        offset,
+    );
+    let keys = keys.rope(
+        lw.attn_rope_dims,
+        false,
+        lw.attn_rope_base,
+        lw.attn_rope_scale,
+        offset,
+    );
 
     // KV cache update — use Array path for now (manages pre-allocated buffer)
     // TODO: port to InlineArray slice/concatenate for zero-copy
-    let (cached_keys, cached_values) = kv_cache.update_and_fetch(
-        layer_idx, &ia_to_array(&keys), &ia_to_array(&values),
-    )?;
+    let (cached_keys, cached_values) =
+        kv_cache.update_and_fetch(layer_idx, &ia_to_array(&keys), &ia_to_array(&values))?;
 
     // SDPA — pure InlineArray
     let k_cached = ia_from_array(&cached_keys);
@@ -1402,7 +1674,9 @@ fn inline_attn_forward(
     let output = queries.sdpa(&k_cached, &v_cached, scale, "causal");
 
     // Reshape + gate
-    let output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[b, s, n_heads * head_dim]);
+    let output = output
+        .transpose_axes(&[0, 2, 1, 3])
+        .reshape(&[b, s, n_heads * head_dim]);
     let gated = output.multiply(&gate.sigmoid());
 
     // O projection

@@ -26,7 +26,9 @@
 //! Reference: tiiuae/falcon-h1 on Hugging Face
 //! Reference: transformers.models.falcon_h1.modeling_falcon_h1
 
-use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops};
+use pmetal_bridge::compat::{
+    Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops,
+};
 use pmetal_bridge::impl_module_params;
 use std::collections::HashMap;
 
@@ -261,7 +263,6 @@ pub struct FalconH1Attention {
 }
 impl_module_params!(FalconH1Attention; q_proj, k_proj, v_proj, o_proj);
 
-
 impl FalconH1Attention {
     pub fn new(config: &FalconH1Config) -> Result<Self, Exception> {
         let head_dim = config.head_dim();
@@ -345,7 +346,8 @@ impl FalconH1Attention {
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
                 if let Some(output) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)? {
+                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
+                {
                     let output = output
                         .transpose_axes(&[0, 2, 1, 3])
                         .reshape(&[batch, seq_len, -1]);
@@ -413,7 +415,6 @@ pub struct FalconH1Mamba {
     pub time_step_max: f32,
 }
 impl_module_params!(FalconH1Mamba; in_proj, conv1d, out_proj);
-
 
 impl FalconH1Mamba {
     pub fn new(config: &FalconH1Config) -> Result<Self, Exception> {
@@ -511,7 +512,11 @@ impl FalconH1Mamba {
                     let padded = mc.update_conv_state(conv_input, conv_kernel)?;
                     let out = Module::forward(&mut self.conv1d, &padded)?;
                     let out_len = out.dim(1);
-                    let out = pmetal_bridge::compat::ops::slice_axis_from(&out, 1, (out_len - seq_len) as i32);
+                    let out = pmetal_bridge::compat::ops::slice_axis_from(
+                        &out,
+                        1,
+                        (out_len - seq_len) as i32,
+                    );
                     nn::silu(&out)
                 }
                 None => {
@@ -531,7 +536,8 @@ impl FalconH1Mamba {
         // Split conv output: hidden_states | B | C
         let bc_size = n_groups * ssm_state_size;
         let conv_split_at = &[intermediate_size, intermediate_size + bc_size];
-        let conv_parts = pmetal_bridge::compat::ops::split_sections(&conv_activated, conv_split_at, -1);
+        let conv_parts =
+            pmetal_bridge::compat::ops::split_sections(&conv_activated, conv_split_at, -1);
         let hidden_states = &conv_parts[0]; // [B, L, intermediate_size]
         let b_proj = &conv_parts[1]; // [B, L, n_groups * ssm_state_size]
         let c_proj = &conv_parts[2]; // [B, L, n_groups * ssm_state_size]
@@ -600,7 +606,6 @@ pub struct FalconH1MLP {
 }
 impl_module_params!(FalconH1MLP; gate_proj, up_proj, down_proj);
 
-
 impl FalconH1MLP {
     pub fn new(config: &FalconH1Config) -> Result<Self, Exception> {
         let gate_proj = nn::LinearBuilder::new(config.hidden_size, config.intermediate_size)
@@ -652,7 +657,6 @@ pub struct FalconH1DecoderLayer {
 }
 impl_module_params!(FalconH1DecoderLayer; input_layernorm, self_attn, mamba, pre_ff_layernorm, feed_forward);
 
-
 impl FalconH1DecoderLayer {
     pub fn new(config: &FalconH1Config, layer_idx: usize) -> Result<Self, Exception> {
         let norm_eps = config.rms_norm_eps as f32;
@@ -669,7 +673,6 @@ impl FalconH1DecoderLayer {
         let mamba = FalconH1Mamba::new(config)?;
 
         let feed_forward = FalconH1MLP::new(config)?;
-
 
         let attn_out_multiplier = config.attn_multiplier_for_layer(layer_idx);
         let ssm_out_multiplier = config.ssm_multiplier_for_layer(layer_idx);
@@ -739,7 +742,6 @@ pub struct FalconH1Model {
 }
 impl_module_params!(FalconH1Model; embed_tokens, layers, final_layernorm);
 
-
 impl FalconH1Model {
     pub fn new(config: FalconH1Config) -> Result<Self, Exception> {
         let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)?;
@@ -799,7 +801,6 @@ pub struct FalconH1ForCausalLM {
     pub lm_head: Option<nn::Linear>,
 }
 impl_module_params!(FalconH1ForCausalLM; model, lm_head);
-
 
 impl FalconH1ForCausalLM {
     pub fn new(config: FalconH1Config) -> Result<Self, Exception> {

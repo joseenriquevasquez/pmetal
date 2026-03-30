@@ -168,7 +168,6 @@ pub struct MistralAttention {
 }
 impl_module_params!(MistralAttention; q_proj, k_proj, v_proj, o_proj, rope);
 
-
 impl MistralAttention {
     /// Create a new attention layer.
     pub fn new(config: &MistralConfig) -> Result<Self, Exception> {
@@ -320,7 +319,6 @@ pub struct MistralMLP {
 }
 impl_module_params!(MistralMLP; gate_proj, up_proj, down_proj);
 
-
 impl MistralMLP {
     /// Create a new MLP layer.
     pub fn new(config: &MistralConfig) -> Result<Self, Exception> {
@@ -366,14 +364,12 @@ pub struct MistralDecoderLayer {
 }
 impl_module_params!(MistralDecoderLayer; self_attn, mlp, input_layernorm, post_attention_layernorm);
 
-
 impl MistralDecoderLayer {
     /// Create a new decoder layer.
     pub fn new(config: &MistralConfig) -> Result<Self, Exception> {
         let self_attn = MistralAttention::new(config)?;
 
         let mlp = MistralMLP::new(config)?;
-
 
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
@@ -427,7 +423,6 @@ pub struct MistralModel {
     pub norm: nn::RmsNorm,
 }
 impl_module_params!(MistralModel; embed_tokens, layers, norm);
-
 
 impl MistralModel {
     /// Create a new Mistral model.
@@ -495,7 +490,6 @@ pub struct MistralForCausalLM {
     pub lm_head: Option<nn::Linear>,
 }
 impl_module_params!(MistralForCausalLM; model, lm_head);
-
 
 impl MistralForCausalLM {
     /// Create a new Mistral model with LM head.
@@ -665,9 +659,10 @@ mod tests {
     #[test]
     #[serial]
     fn test_mistral_rms_norm() {
-        let mut norm = nn::RmsNorm::new(64)?.unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
-        let output = Module::forward(&mut norm, &x).unwrap()?;
+        let mut norm = nn::RmsNorm::new(64).unwrap();
+        let x =
+            pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let output = Module::forward(&mut norm, &x).unwrap();
         assert_eq!(output.shape(), &[1, 4, 64]);
     }
 
@@ -677,7 +672,7 @@ mod tests {
         let config = small_config();
         let mut attn = MistralAttention::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -691,7 +686,7 @@ mod tests {
 
         let mut attn = MistralAttention::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -703,7 +698,7 @@ mod tests {
         let config = small_config();
         let mut mlp = MistralMLP::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let output = mlp.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -715,7 +710,7 @@ mod tests {
         let config = small_config();
         let mut layer = MistralDecoderLayer::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let output = layer.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -727,7 +722,7 @@ mod tests {
         let config = small_config();
         let mut model = MistralModel::new(config).unwrap();
 
-        let input_ids = pmetal_bridge::compat::Array::from_i32_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_bridge::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let output = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -739,7 +734,7 @@ mod tests {
         let config = small_config();
         let mut model = MistralForCausalLM::new(config.clone()).unwrap();
 
-        let input_ids = pmetal_bridge::compat::Array::from_i32_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_bridge::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, config.vocab_size]); // [batch, seq, vocab]
@@ -755,7 +750,7 @@ mod tests {
         let mut cache = model.create_cache(32);
 
         // First forward (prompt)
-        let input_ids = pmetal_bridge::compat::Array::from_i32_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_bridge::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let logits = model
             .forward_with_cache(&input_ids, None, Some(&mut cache))
             .unwrap();
@@ -764,7 +759,7 @@ mod tests {
         assert_eq!(logits.shape(), &[1, 4, 1000]);
 
         // Second forward (incremental)
-        let next_token = pmetal_bridge::compat::Array::from_i32_slice(&[5_i32], &[1, 1]);
+        let next_token = pmetal_bridge::compat::Array::from_slice(&[5_i32], &[1, 1]);
         let logits = model
             .forward_with_cache(&next_token, None, Some(&mut cache))
             .unwrap();

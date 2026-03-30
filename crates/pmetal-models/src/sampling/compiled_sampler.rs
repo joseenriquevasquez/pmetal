@@ -53,10 +53,13 @@
 //! let token2 = sampler.sample(&logits);  // Different random key used
 //! ```
 
-use pmetal_bridge::compat::{Array, Exception, indexing, ops};
 use pmetal_bridge::compat::indexing::{IndexOp, put_along_axis, take_along_axis};
-use pmetal_bridge::compat::ops::{argmax_axis, argpartition_axis, argsort_axis, cumsum, exp, logsumexp_axis_keepdims, slice_axis, slice_last_from, which, zeros_like};
+use pmetal_bridge::compat::ops::{
+    argmax_axis, argpartition_axis, argsort_axis, cumsum, exp, logsumexp_axis_keepdims, slice_axis,
+    slice_last_from, which, zeros_like,
+};
 use pmetal_bridge::compat::random::categorical;
+use pmetal_bridge::compat::{Array, Exception, indexing, ops};
 
 // ============================================================================
 // SamplerState - Composite state for compiled sampling
@@ -80,9 +83,15 @@ impl RandomState {
         // In bridge, random key is implicit — just return a dummy array.
         Ok(Array::from_f32(self.seed as f32))
     }
-    pub fn updatable_states_len(&self) -> usize { 0 }
-    pub fn updatable_states(&self) -> std::iter::Empty<&Array> { std::iter::empty() }
-    pub fn updatable_states_mut(&mut self) -> std::iter::Empty<&mut Array> { std::iter::empty() }
+    pub fn updatable_states_len(&self) -> usize {
+        0
+    }
+    pub fn updatable_states(&self) -> std::iter::Empty<&Array> {
+        std::iter::empty()
+    }
+    pub fn updatable_states_mut(&mut self) -> std::iter::Empty<&mut Array> {
+        std::iter::empty()
+    }
 }
 
 /// Stub for `mlx_rs::transforms::compile::Updatable`.
@@ -476,7 +485,11 @@ impl CompiledSampler {
         }
 
         // Squeeze back once at end
-        if was_1d { Ok(result.squeeze_axes(&[0])) } else { Ok(result) }
+        if was_1d {
+            Ok(result.squeeze_axes(&[0]))
+        } else {
+            Ok(result)
+        }
     }
 
     /// Sample and immediately extract the token ID.
@@ -619,7 +632,7 @@ mod tests {
         let neg_inf = Array::from_f32(f32::NEG_INFINITY);
 
         let filtered = apply_top_k_2d(&log_probs, 2, 5, &neg_inf).unwrap();
-        let filtered = filtered.squeeze().unwrap();
+        let filtered = filtered.squeeze_axes(&[0]);
         let values: Vec<f32> = filtered.as_slice().to_vec();
 
         // Top 2 should be preserved, others should be -inf
@@ -636,7 +649,7 @@ mod tests {
 
         // With min_p = 0.1, only tokens with prob >= 0.1 * max_prob should survive
         let filtered = apply_min_p_2d(&log_probs, 0.1, 4, &neg_inf).unwrap();
-        let filtered = filtered.squeeze().unwrap();
+        let filtered = filtered.squeeze_axes(&[0]);
         let values: Vec<f32> = filtered.as_slice().to_vec();
 
         // First token (highest) should survive

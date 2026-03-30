@@ -7,16 +7,19 @@
 //! - ExpertsInt8 quantization support
 
 // ModuleParameters derive via impl_module_params!
-use pmetal_bridge::compat::{Array, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, ModuleParametersExt, NestedValue, indexing, nn, ops};
 use pmetal_bridge::compat::indexing::IndexOp;
+use pmetal_bridge::compat::{
+    Array, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters,
+    ModuleParametersExt, NestedValue, indexing, nn, ops,
+};
 use pmetal_bridge::impl_module_params;
 use pmetal_core::ModelConfig;
 use pmetal_mlx::Builder;
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use pmetal_mlx::moe::{MoEConfig, MoELayer};
 use serde::{Deserialize, Serialize};
-use std::rc::Rc;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 fn default_jamba_mamba_conv_kernel_size() -> i32 {
     4
@@ -72,7 +75,6 @@ pub struct JambaAttention {
     pub scale: f32,
 }
 impl_module_params!(JambaAttention; q_proj, k_proj, v_proj, o_proj);
-
 
 impl JambaAttention {
     pub fn new(config: &JambaConfig) -> Result<Self, Exception> {
@@ -142,7 +144,6 @@ pub struct JambaMambaMixer {
     pub conv_kernel_size: i32,
 }
 impl_module_params!(JambaMambaMixer; in_proj, conv1d, out_proj);
-
 
 impl JambaMambaMixer {
     pub fn new(config: &JambaConfig) -> Result<Self, Exception> {
@@ -336,7 +337,6 @@ pub struct JambaModel {
     pub config: JambaConfig,
 }
 impl_module_params!(JambaModel; embed, layers, norm, lm_head);
-
 
 impl JambaModel {
     pub fn new(config: JambaConfig) -> Result<Self, Exception> {

@@ -3,8 +3,8 @@
 //! Implementation of CLIP (Contrastive Language-Image Pre-training) text encoder.
 //! Based on the architecture from OpenAI and used in Flux.1.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ModuleParameters, Param, fast, nn, ops};
 use pmetal_bridge::compat::ops::{argmax_axis, slice_axis, take_along_axis, tri};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ModuleParameters, Param, fast, nn, ops};
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
@@ -50,7 +50,6 @@ pub struct CLIPAttention {
 }
 impl_module_params!(CLIPAttention; q_proj, k_proj, v_proj, out_proj);
 
-
 impl CLIPAttention {
     pub fn new(config: &CLIPConfig) -> Self {
         let dim = config.embed_dim as i32;
@@ -58,14 +57,10 @@ impl CLIPAttention {
         let head_dim = config.embed_dim / num_heads;
         let scale = (head_dim as f32).sqrt().recip();
 
-        let q_proj = nn::LinearBuilder::new(dim, dim)
-            .build().unwrap();
-        let k_proj = nn::LinearBuilder::new(dim, dim)
-            .build().unwrap();
-        let v_proj = nn::LinearBuilder::new(dim, dim)
-            .build().unwrap();
-        let out_proj = nn::LinearBuilder::new(dim, dim)
-            .build().unwrap();
+        let q_proj = nn::LinearBuilder::new(dim, dim).build().unwrap();
+        let k_proj = nn::LinearBuilder::new(dim, dim).build().unwrap();
+        let v_proj = nn::LinearBuilder::new(dim, dim).build().unwrap();
+        let out_proj = nn::LinearBuilder::new(dim, dim).build().unwrap();
 
         Self {
             q_proj,
@@ -97,11 +92,7 @@ impl CLIPAttention {
             .transpose_axes(&[0, 2, 1, 3]);
 
         let out = pmetal_bridge::compat::fast::scaled_dot_product_attention_masked(
-            &q,
-            &k,
-            &v,
-            self.scale,
-            mask,
+            &q, &k, &v, self.scale, mask,
         );
         let out = out.transpose_axes(&[0, 2, 1, 3]).reshape(&[b, l, -1]);
         Ok(self.out_proj.forward(&out))
@@ -117,13 +108,14 @@ pub struct CLIPMLP {
 }
 impl_module_params!(CLIPMLP; fc1, fc2);
 
-
 impl CLIPMLP {
     pub fn new(config: &CLIPConfig) -> Self {
         let fc1 = nn::LinearBuilder::new(config.embed_dim as i32, config.intermediate_size as i32)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let fc2 = nn::LinearBuilder::new(config.intermediate_size as i32, config.embed_dim as i32)
-            .build().unwrap();
+            .build()
+            .unwrap();
         Self {
             fc1,
             fc2,
@@ -158,17 +150,18 @@ pub struct CLIPEncoderLayer {
 }
 impl_module_params!(CLIPEncoderLayer; attn, mlp, norm1, norm2);
 
-
 impl CLIPEncoderLayer {
     pub fn new(config: &CLIPConfig) -> Self {
         let attn = CLIPAttention::new(config);
         let mlp = CLIPMLP::new(config);
         let norm1 = nn::LayerNormBuilder::new(config.embed_dim as i32)
             .eps(config.layer_norm_eps)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let norm2 = nn::LayerNormBuilder::new(config.embed_dim as i32)
             .eps(config.layer_norm_eps)
-            .build().unwrap();
+            .build()
+            .unwrap();
         Self {
             attn,
             mlp,
@@ -200,24 +193,25 @@ pub struct CLIPTextModel {
 }
 impl_module_params!(CLIPTextModel; token_embedding, position_embedding, layers, final_layer_norm);
 
-
 impl CLIPTextModel {
     pub fn new(config: CLIPConfig) -> Self {
-        let token_embedding = nn::Embedding::new(config.vocab_size as i32, config.embed_dim as i32)
-            .unwrap();
-        let position_embedding = Param::new(
-            pmetal_bridge::compat::ops::zeros(&[
+        let token_embedding =
+            nn::Embedding::new(config.vocab_size as i32, config.embed_dim as i32).unwrap();
+        let position_embedding = Param::new(pmetal_bridge::compat::ops::zeros(
+            &[
                 1,
                 config.max_position_embeddings as i32,
                 config.embed_dim as i32,
-            ], Dtype::Float32),
-        );
+            ],
+            Dtype::Float32,
+        ));
         let layers = (0..config.num_layers)
             .map(|_| CLIPEncoderLayer::new(&config))
             .collect();
         let final_layer_norm = nn::LayerNormBuilder::new(config.embed_dim as i32)
             .eps(config.layer_norm_eps)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         Self {
             token_embedding,
@@ -231,7 +225,11 @@ impl CLIPTextModel {
         let mask = tri(l, l, 0, Dtype::Float32);
         let neg_inf = Array::from_f32(f32::NEG_INFINITY);
         let zero = Array::from_f32(0.0);
-        Ok(pmetal_bridge::compat::ops::where_fn(&mask.equal(&zero), &neg_inf, &zero))
+        Ok(pmetal_bridge::compat::ops::where_fn(
+            &mask.equal(&zero),
+            &neg_inf,
+            &zero,
+        ))
     }
 
     pub fn forward(&mut self, input_ids: &Array) -> Result<(Array, Array), Exception> {

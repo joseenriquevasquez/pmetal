@@ -150,7 +150,6 @@ pub struct LlamaAttention {
 }
 impl_module_params!(LlamaAttention; q_proj, k_proj, v_proj, o_proj, rope);
 
-
 impl LlamaAttention {
     /// Create a new attention layer.
     ///
@@ -383,7 +382,6 @@ pub struct LlamaMLP {
 }
 impl_module_params!(LlamaMLP; gate_proj, up_proj, down_proj);
 
-
 impl LlamaMLP {
     /// Create a new MLP layer.
     pub fn new(config: &LlamaConfig) -> Result<Self, Exception> {
@@ -429,7 +427,6 @@ pub struct LlamaDecoderLayer {
 }
 impl_module_params!(LlamaDecoderLayer; self_attn, mlp, input_layernorm, post_attention_layernorm);
 
-
 impl LlamaDecoderLayer {
     /// Create a new decoder layer.
     ///
@@ -440,7 +437,6 @@ impl LlamaDecoderLayer {
         let self_attn = LlamaAttention::new(config, layer_id)?;
 
         let mlp = LlamaMLP::new(config)?;
-
 
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
@@ -494,7 +490,6 @@ pub struct LlamaModel {
     pub norm: nn::RmsNorm,
 }
 impl_module_params!(LlamaModel; embed_tokens, layers, norm);
-
 
 impl LlamaModel {
     /// Create a new Llama model.
@@ -562,11 +557,8 @@ impl LlamaModel {
         match cache {
             Some(cache) => {
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-                    hidden_states = layer.forward_with_cache(
-                        &hidden_states,
-                        mask,
-                        Some((cache, layer_idx)),
-                    )?;
+                    hidden_states =
+                        layer.forward_with_cache(&hidden_states, mask, Some((cache, layer_idx)))?;
                 }
             }
             None => {
@@ -590,7 +582,6 @@ pub struct LlamaForCausalLM {
     pub lm_head: Option<nn::Linear>,
 }
 impl_module_params!(LlamaForCausalLM; model, lm_head);
-
 
 impl LlamaForCausalLM {
     /// Create a new Llama model with LM head.
@@ -782,7 +773,7 @@ mod tests {
         let config = small_config();
         let mut attn = LlamaAttention::new(&config, 0).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -794,7 +785,7 @@ mod tests {
         let config = small_config();
         let mut mlp = LlamaMLP::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let output = mlp.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -806,7 +797,7 @@ mod tests {
         let config = small_config();
         let mut layer = LlamaDecoderLayer::new(&config, 0).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
         let output = layer.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -818,7 +809,7 @@ mod tests {
         let config = small_config();
         let mut model = LlamaModel::new(config).unwrap();
 
-        let input_ids = pmetal_bridge::compat::Array::from_i32_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_bridge::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let output = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -830,7 +821,7 @@ mod tests {
         let config = small_config();
         let mut model = LlamaForCausalLM::new(config).unwrap();
 
-        let input_ids = pmetal_bridge::compat::Array::from_i32_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let input_ids = pmetal_bridge::compat::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]); // [batch, seq, vocab]

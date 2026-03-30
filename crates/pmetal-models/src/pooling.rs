@@ -1,6 +1,5 @@
 //! Pooling strategies for converting sequence representations to fixed-size embeddings.
 
-
 use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 /// Pooling modes for sentence embeddings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -89,8 +88,10 @@ pub fn pool(
             // Reshape to [batch, 1, 1] then broadcast to [batch, 1, hidden_dim]
             // so take_along_axis can gather along the sequence dimension.
             let indices_expanded = last_indices.reshape(&[batch, 1, 1]);
-            let indices_broadcast =
-                pmetal_bridge::compat::ops::broadcast_to(&indices_expanded, &[batch, 1, hidden_dim]);
+            let indices_broadcast = pmetal_bridge::compat::ops::broadcast_to(
+                &indices_expanded,
+                &[batch, 1, hidden_dim],
+            );
 
             // take_along_axis(hidden_states, indices, axis=1) → [batch, 1, hidden_dim]
             let gathered = hidden_states.take_along_axis(&indices_broadcast, 1);
@@ -101,15 +102,16 @@ pub fn pool(
         PoolingMode::WeightedMean => {
             // Linearly increasing weights: position i gets weight (i+1)
             let weights: Vec<f32> = (1..=seq_len).map(|i| i as f32).collect();
-            let weights =
-                Array::from_slice(&weights, &[1, seq_len, 1]).as_dtype(hidden_states.dtype().as_i32());
+            let weights = Array::from_slice(&weights, &[1, seq_len, 1])
+                .as_dtype(hidden_states.dtype().as_i32());
             let mask_expanded = attention_mask
                 .reshape(&[batch, seq_len, 1])
                 .as_dtype(hidden_states.dtype().as_i32());
             let weighted = hidden_states.multiply(&weights).multiply(&mask_expanded);
             let sum = weighted.sum_axes(&[1], false);
             let weight_sum = weights.multiply(&mask_expanded).sum_axes(&[1], false);
-            let weight_sum = pmetal_bridge::compat::ops::maximum(&weight_sum, &Array::from_f32(1e-9));
+            let weight_sum =
+                pmetal_bridge::compat::ops::maximum(&weight_sum, &Array::from_f32(1e-9));
             Ok(sum.divide(&weight_sum))
         }
     }
@@ -147,7 +149,7 @@ mod tests {
         out.eval().unwrap();
         assert_eq!(out.shape(), &[2, 8]);
         // Mean of all-ones is 1.0 — check first element
-        let v: f32 = out.flatten(None, None).unwrap().index(0).item();
+        let v: f32 = out.flatten(0, -1).index(0).item();
         assert!((v - 1.0).abs() < 1e-5, "expected 1.0, got {}", v);
     }
 
@@ -167,7 +169,7 @@ mod tests {
         let out = pool(&hidden, &mask, PoolingMode::Cls).unwrap();
         out.eval().unwrap();
         assert_eq!(out.shape(), &[2, 8]);
-        let v: f32 = out.flatten(None, None).unwrap().index(0).item();
+        let v: f32 = out.flatten(0, -1).index(0).item();
         assert!((v - 2.0).abs() < 1e-5, "expected 2.0, got {}", v);
     }
 
@@ -177,7 +179,7 @@ mod tests {
         let normed = normalize_embeddings(&emb).unwrap();
         normed.eval().unwrap();
         // norm = 5.0, so [0.6, 0.8]
-        let flat = normed.flatten(None, None).unwrap();
+        let flat = normed.flatten(0, -1);
         let v0: f32 = flat.index(0).item();
         let v1: f32 = flat.index(1).item();
         assert!((v0 - 0.6).abs() < 1e-5);

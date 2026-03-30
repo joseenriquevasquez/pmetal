@@ -15,8 +15,10 @@
 //! - `phi-3-medium-4k-instruct` (14B, 4K context)
 //! - `phi-3.5-mini-instruct` (3.8B, 128K context)
 //! - `phi-4` (14B, 16K context)
-use pmetal_bridge::compat::{Array, Exception, ModuleParameters, ModuleParametersExt, Param, fast, nn, ops, random};
-use pmetal_bridge::compat::nn::{Linear, RmsNorm, Embedding, RopeBuilder};
+use pmetal_bridge::compat::nn::{Embedding, Linear, RmsNorm, RopeBuilder};
+use pmetal_bridge::compat::{
+    Array, Exception, ModuleParameters, ModuleParametersExt, Param, fast, nn, ops, random,
+};
 use pmetal_bridge::impl_module_params;
 
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
@@ -298,7 +300,6 @@ pub struct PhiRMSNorm {
 }
 impl_module_params!(PhiRMSNorm; weight);
 
-
 impl PhiRMSNorm {
     /// Create a new RMS LayerNorm.
     pub fn new(hidden_size: i32, eps: f32) -> Self {
@@ -339,7 +340,6 @@ pub struct PhiAttention {
     pub su_mscale: f32,
 }
 impl_module_params!(PhiAttention; q_proj, k_proj, v_proj, o_proj);
-
 
 impl PhiAttention {
     /// Create a new Phi attention layer.
@@ -568,7 +568,6 @@ pub struct PhiMLP {
 }
 impl_module_params!(PhiMLP; gate_up_proj, down_proj);
 
-
 impl PhiMLP {
     /// Create a new Phi MLP.
     pub fn new(config: &PhiConfig) -> Result<Self, Exception> {
@@ -602,8 +601,14 @@ impl PhiMLP {
         let activated = match self.activation {
             PhiActivation::SwiGLU => {
                 // Split into gate and up projections
-                let gate = pmetal_bridge::compat::ops::slice_last_to(&hidden, self.intermediate_size as i32);
-                let up = pmetal_bridge::compat::ops::slice_last_from(&hidden, self.intermediate_size as i32);
+                let gate = pmetal_bridge::compat::ops::slice_last_to(
+                    &hidden,
+                    self.intermediate_size as i32,
+                );
+                let up = pmetal_bridge::compat::ops::slice_last_from(
+                    &hidden,
+                    self.intermediate_size as i32,
+                );
                 // SwiGLU: silu(gate) * up
                 let gate_activated = pmetal_bridge::compat::ops::sigmoid(&gate).multiply(&gate);
                 gate_activated.multiply(&up)
@@ -625,7 +630,6 @@ pub struct PhiDecoderLayer {
     pub post_attention_layernorm: PhiRMSNorm,
 }
 impl_module_params!(PhiDecoderLayer; self_attn, mlp, input_layernorm, post_attention_layernorm);
-
 
 impl PhiDecoderLayer {
     /// Create a new decoder layer.
@@ -673,7 +677,6 @@ pub struct PhiModel {
     pub config: PhiConfig,
 }
 impl_module_params!(PhiModel; embed_tokens, layers, norm);
-
 
 impl PhiModel {
     /// Create a new Phi model.
@@ -732,7 +735,6 @@ pub struct PhiForCausalLM {
     pub lm_head: Linear,
 }
 impl_module_params!(PhiForCausalLM; model, lm_head);
-
 
 impl PhiForCausalLM {
     /// Create a new Phi causal LM.
@@ -872,7 +874,7 @@ mod tests {
     #[serial]
     fn test_phi_rms_norm() {
         let mut norm = PhiRMSNorm::new(64, 1e-5);
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
 
         let out = norm.forward(&x).unwrap();
         out.eval().unwrap();
@@ -893,8 +895,8 @@ mod tests {
             ..PhiConfig::phi3_mini()
         };
 
-        let mut attn = PhiAttention::new(&config);
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], None, None, None).unwrap();
+        let mut attn = PhiAttention::new(&config).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
 
         let out = attn.forward(&x, None).unwrap();
         out.eval().unwrap();
@@ -912,8 +914,8 @@ mod tests {
             ..PhiConfig::phi3_mini()
         };
 
-        let mut mlp = PhiMLP::new(&config);
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], None, None, None).unwrap();
+        let mut mlp = PhiMLP::new(&config).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
 
         let out = mlp.forward(&x).unwrap();
         out.eval().unwrap();
@@ -933,8 +935,8 @@ mod tests {
             ..PhiConfig::phi3_mini()
         };
 
-        let mut layer = PhiDecoderLayer::new(&config);
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], None, None, None).unwrap();
+        let mut layer = PhiDecoderLayer::new(&config).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
 
         let out = layer.forward(&x, None).unwrap();
         out.eval().unwrap();
@@ -956,7 +958,7 @@ mod tests {
             ..PhiConfig::phi3_mini()
         };
 
-        let mut model = PhiModel::new(config);
+        let mut model = PhiModel::new(config).unwrap();
         let input_ids = Array::from_slice(&[1i32, 2, 3, 4, 5, 6, 7, 8], &[2, 4]);
 
         let out = model.forward(&input_ids, None).unwrap();

@@ -41,26 +41,30 @@ pub struct ResnetBlock {
 }
 impl_module_params!(ResnetBlock; norm1, conv1, norm2, conv2, conv_shortcut);
 
-
 impl ResnetBlock {
     pub fn new(in_channels: usize, out_channels: usize, groups: usize, eps: f32) -> Self {
         let norm1 = nn::GroupNormBuilder::new(groups as i32, in_channels as i32)
             .eps(eps)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let conv1 = nn::Conv2dBuilder::new(in_channels as i32, out_channels as i32, 3)
             .padding(1)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let norm2 = nn::GroupNormBuilder::new(groups as i32, out_channels as i32)
             .eps(eps)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let conv2 = nn::Conv2dBuilder::new(out_channels as i32, out_channels as i32, 3)
             .padding(1)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let conv_shortcut = if in_channels != out_channels {
             Some(
                 nn::Conv2dBuilder::new(in_channels as i32, out_channels as i32, 1)
-                    .build().unwrap(),
+                    .build()
+                    .unwrap(),
             )
         } else {
             None
@@ -100,12 +104,12 @@ pub struct UpSampler {
 }
 impl_module_params!(UpSampler; conv);
 
-
 impl UpSampler {
     pub fn new(channels: usize) -> Self {
         let conv = nn::Conv2dBuilder::new(channels as i32, channels as i32, 3)
             .padding(1)
-            .build().unwrap();
+            .build()
+            .unwrap();
         Self { conv }
     }
 
@@ -132,13 +136,13 @@ pub struct DownSampler {
 }
 impl_module_params!(DownSampler; conv);
 
-
 impl DownSampler {
     pub fn new(channels: usize) -> Self {
         let conv = nn::Conv2dBuilder::new(channels as i32, channels as i32, 3)
             .stride(2)
             .padding(1)
-            .build().unwrap();
+            .build()
+            .unwrap();
         Self { conv }
     }
 
@@ -158,20 +162,24 @@ pub struct VAEAttentionBlock {
 }
 impl_module_params!(VAEAttentionBlock; norm, q, k, v, proj_out);
 
-
 impl VAEAttentionBlock {
     pub fn new(channels: usize, groups: usize, eps: f32) -> Self {
         let norm = nn::GroupNormBuilder::new(groups as i32, channels as i32)
             .eps(eps)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let q = nn::Conv2dBuilder::new(channels as i32, channels as i32, 1)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let k = nn::Conv2dBuilder::new(channels as i32, channels as i32, 1)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let v = nn::Conv2dBuilder::new(channels as i32, channels as i32, 1)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let proj_out = nn::Conv2dBuilder::new(channels as i32, channels as i32, 1)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         Self {
             norm,
@@ -201,13 +209,8 @@ impl VAEAttentionBlock {
         let v = v.reshape(&[b, h * w, c]).expand_dims_axes(&[1]);
 
         let scale = 1.0 / (c as f32).sqrt();
-        let attn_out = pmetal_bridge::compat::fast::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            scale,
-            "none",
-        );
+        let attn_out =
+            pmetal_bridge::compat::fast::scaled_dot_product_attention(&q, &k, &v, scale, "none");
 
         let attn_out = attn_out.squeeze_axes(&[1]).reshape(&[b, h, w, c]);
         let out = self.proj_out.forward(&attn_out);
@@ -245,7 +248,6 @@ pub struct FluxVAEEncoder {
 }
 impl_module_params!(FluxVAEEncoder; conv_in, down_1_0, down_1_1, down_2_0, down_2_1, down_2_sampler, down_3_0, down_3_1, down_3_sampler, down_4_0, down_4_1, down_4_sampler, mid_block_1, mid_attn, mid_block_2, norm_out, conv_out);
 
-
 impl Default for FluxVAEEncoder {
     fn default() -> Self {
         Self::new()
@@ -256,7 +258,8 @@ impl FluxVAEEncoder {
     pub fn new() -> Self {
         let conv_in = nn::Conv2dBuilder::new(3, 128, 3)
             .padding(1)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let down_1_0 = ResnetBlock::new(128, 128, 32, 1e-6);
         let down_1_1 = ResnetBlock::new(128, 128, 32, 1e-6);
@@ -279,10 +282,12 @@ impl FluxVAEEncoder {
 
         let norm_out = nn::GroupNormBuilder::new(32, 512)
             .eps(1e-6)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let conv_out = nn::Conv2dBuilder::new(512, 32, 3)
             .padding(1)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         Self {
             conv_in,
@@ -367,7 +372,6 @@ pub struct FluxVAEDecoder {
 }
 impl_module_params!(FluxVAEDecoder; conv_in, mid_block_1, mid_attn, mid_block_2, up_1_0, up_1_1, up_1_2, up_1_sampler, up_2_0, up_2_1, up_2_2, up_2_sampler, up_3_0, up_3_1, up_3_2, up_3_sampler, up_4_0, up_4_1, up_4_2, norm_out, conv_out);
 
-
 impl Default for FluxVAEDecoder {
     fn default() -> Self {
         Self::new()
@@ -378,7 +382,8 @@ impl FluxVAEDecoder {
     pub fn new() -> Self {
         let conv_in = nn::Conv2dBuilder::new(16, 512, 3)
             .padding(1)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         let mid_block_1 = ResnetBlock::new(512, 512, 32, 1e-6);
         let mid_attn = VAEAttentionBlock::new(512, 32, 1e-6);
@@ -405,10 +410,12 @@ impl FluxVAEDecoder {
 
         let norm_out = nn::GroupNormBuilder::new(32, 128)
             .eps(1e-6)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let conv_out = nn::Conv2dBuilder::new(128, 3, 3)
             .padding(1)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         Self {
             conv_in,
@@ -477,7 +484,6 @@ pub struct FluxVAE {
 }
 impl_module_params!(FluxVAE; encoder, decoder);
 
-
 impl FluxVAE {
     pub const SCALING_FACTOR: f32 = 0.3611;
     pub const SHIFT_FACTOR: f32 = 0.1159;
@@ -543,7 +549,7 @@ mod tests {
         let mut vae = FluxVAE::new(config);
 
         // Dummy input image: [1, 64, 64, 3]
-        let x = zeros::<f32>(&[1, 64, 64, 3]).unwrap();
+        let x = zeros(&[1, 64, 64, 3], pmetal_bridge::compat::Dtype::Float32);
 
         // Encode
         let z = vae.encode(&x, false).unwrap();

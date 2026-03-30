@@ -9,7 +9,9 @@
 //! - **Command R**: 35B parameters
 //! - **Command R+**: 104B parameters
 //! - **Command A**: 111B parameters (2025)
-use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, nn, ops, random};
+use pmetal_bridge::compat::{
+    Array, Exception, Module, ModuleParameters, ModuleParametersExt, nn, ops, random,
+};
 use pmetal_bridge::impl_module_params;
 
 use serde::{Deserialize, Serialize};
@@ -163,7 +165,6 @@ pub struct CohereMLP {
 }
 impl_module_params!(CohereMLP; gate_proj, up_proj, down_proj);
 
-
 impl CohereMLP {
     pub fn new(hidden_size: i32, intermediate_size: i32) -> Result<Self, Exception> {
         let gate_proj = nn::LinearBuilder::new(hidden_size, intermediate_size)
@@ -209,7 +210,6 @@ pub struct CohereAttention {
     pub o_proj: nn::Linear,
 }
 impl_module_params!(CohereAttention; q_proj, k_proj, v_proj, o_proj);
-
 
 impl CohereAttention {
     pub fn new(config: &CohereConfig, layer_idx: usize) -> Result<Self, Exception> {
@@ -326,7 +326,6 @@ pub struct CohereDecoderLayer {
 }
 impl_module_params!(CohereDecoderLayer; self_attn, mlp, input_layernorm);
 
-
 impl CohereDecoderLayer {
     pub fn new(config: &CohereConfig, layer_idx: usize) -> Result<Self, Exception> {
         let self_attn = CohereAttention::new(config, layer_idx)?;
@@ -371,7 +370,6 @@ pub struct CohereModel {
     pub norm: nn::LayerNorm,
 }
 impl_module_params!(CohereModel; embed_tokens, layers, norm);
-
 
 impl CohereModel {
     pub fn new(config: CohereConfig) -> Result<Self, Exception> {
@@ -418,7 +416,6 @@ pub struct CohereForCausalLM {
     pub lm_head: nn::Linear,
 }
 impl_module_params!(CohereForCausalLM; model, lm_head);
-
 
 impl CohereForCausalLM {
     pub fn new(config: CohereConfig) -> Result<Self, Exception> {
@@ -486,7 +483,7 @@ mod tests {
     #[serial]
     fn test_cohere_mlp() {
         let mlp = CohereMLP::new(64, 256).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[1, 10, 64], None, None, None).unwrap();
+        let x = pmetal_bridge::compat::random::normal(&[1, 10, 64], pmetal_bridge::compat::Dtype::Float32);
 
         let mut mlp = mlp;
         let out = mlp.forward(&x).unwrap();

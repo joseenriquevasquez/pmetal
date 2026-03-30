@@ -3,7 +3,9 @@
 //! Mllama is a multimodal model that combines a Llama 3.2 text model with a
 //! vision encoder. The text model includes cross-attention layers to attend
 //! to visual features.
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops, random};
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops, random,
+};
 use pmetal_bridge::impl_module_params;
 
 use std::collections::HashMap;
@@ -138,7 +140,6 @@ pub struct Gate {
 }
 impl_module_params!(Gate; weight);
 
-
 impl Gate {
     pub fn new(shape: &[i32]) -> Result<Self, Exception> {
         // Initialize with 0 usually for tanh gating to start as identity (x + 0*attn)
@@ -154,7 +155,7 @@ impl Gate {
 #[derive(Debug)]
 pub struct MllamaVisionEmbeddings {
     pub patch_embedding: nn::Conv2d,
-    pub class_embedding: nn::Embedding, // Learnable class token
+    pub class_embedding: nn::Embedding,    // Learnable class token
     pub position_embedding: nn::Embedding, // Learned positional embeddings
     pub pre_tile_position_embedding: nn::Embedding, // Gated positional embeddings for tiles
     pub post_tile_position_embedding: nn::Embedding,
@@ -165,7 +166,6 @@ pub struct MllamaVisionEmbeddings {
     pub num_patches: i32,
 }
 impl_module_params!(MllamaVisionEmbeddings; patch_embedding, class_embedding, position_embedding, pre_tile_position_embedding, post_tile_position_embedding);
-
 
 impl MllamaVisionEmbeddings {
     pub fn new(config: &MllamaVisionConfig) -> Result<Self, Exception> {
@@ -224,7 +224,6 @@ pub struct MllamaVisionMLP {
 }
 impl_module_params!(MllamaVisionMLP; fc1, fc2);
 
-
 impl MllamaVisionMLP {
     pub fn new(config: &MllamaVisionConfig) -> Result<Self, Exception> {
         let fc1 = nn::LinearBuilder::new(config.hidden_size, config.intermediate_size)
@@ -256,7 +255,6 @@ pub struct MllamaVisionAttention {
     pub o_proj: nn::Linear,
 }
 impl_module_params!(MllamaVisionAttention; q_proj, k_proj, v_proj, o_proj);
-
 
 impl MllamaVisionAttention {
     pub fn new(config: &MllamaVisionConfig) -> Result<Self, Exception> {
@@ -333,7 +331,6 @@ pub struct MllamaVisionEncoderLayer {
 }
 impl_module_params!(MllamaVisionEncoderLayer; self_attn, mlp, input_layernorm, post_attention_layernorm, gate_attn, gate_mlp);
 
-
 impl MllamaVisionEncoderLayer {
     pub fn new(config: &MllamaVisionConfig) -> Result<Self, Exception> {
         let self_attn = MllamaVisionAttention::new(config)?;
@@ -393,7 +390,6 @@ pub struct MllamaVisionModel {
 }
 impl_module_params!(MllamaVisionModel; embeddings, layers, layernorm);
 
-
 impl MllamaVisionModel {
     pub fn new(config: MllamaVisionConfig) -> Result<Self, Exception> {
         let embeddings = MllamaVisionEmbeddings::new(&config)?;
@@ -447,7 +443,6 @@ pub struct MllamaCrossAttention {
     pub gate: Vec<Gate>, // Optional gate
 }
 impl_module_params!(MllamaCrossAttention; q_proj, k_proj, v_proj, o_proj, gate);
-
 
 impl MllamaCrossAttention {
     pub fn new(config: &MllamaConfig) -> Result<Self, Exception> {
@@ -542,13 +537,11 @@ pub struct MllamaDecoderLayer {
 }
 impl_module_params!(MllamaDecoderLayer; self_attn, cross_attn, mlp, input_layernorm, post_attention_layernorm, cross_attention_layernorm);
 
-
 impl MllamaDecoderLayer {
     pub fn new(config: &MllamaConfig, layer_id: usize) -> Result<Self, Exception> {
         let self_attn = LlamaAttention::new(&config.text_config, layer_id)?;
 
         let mlp = LlamaMLP::new(&config.text_config)?;
-
 
         let input_layernorm = nn::RmsNormBuilder::new(config.text_config.hidden_size)
             .eps(config.text_config.rms_norm_eps)
@@ -619,7 +612,6 @@ pub struct MllamaMultiModalProjector {
 }
 impl_module_params!(MllamaMultiModalProjector; linear_1, linear_2);
 
-
 impl MllamaMultiModalProjector {
     pub fn new(config: &MllamaConfig) -> Result<Self, Exception> {
         let vision_dim = config.vision_config.hidden_size;
@@ -655,7 +647,6 @@ pub struct MllamaTextModel {
     pub norm: nn::RmsNorm,
 }
 impl_module_params!(MllamaTextModel; embed_tokens, layers, norm);
-
 
 impl MllamaTextModel {
     pub fn new(config: MllamaConfig) -> Result<Self, Exception> {
@@ -693,7 +684,11 @@ impl MllamaTextModel {
             let tri = pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, Dtype::Float32);
             let neg_inf = Array::from_f32(f32::NEG_INFINITY);
             let zero = Array::from_f32(0.0);
-            Some(pmetal_bridge::compat::ops::where_fn(&tri.equal(&zero), &neg_inf, &zero))
+            Some(pmetal_bridge::compat::ops::where_fn(
+                &tri.equal(&zero),
+                &neg_inf,
+                &zero,
+            ))
         } else {
             None
         };
@@ -722,7 +717,6 @@ pub struct MllamaForConditionalGeneration {
     pub lm_head: nn::Linear,
 }
 impl_module_params!(MllamaForConditionalGeneration; vision_model, multi_modal_projector, language_model, lm_head);
-
 
 impl MllamaForConditionalGeneration {
     pub fn new(config: MllamaConfig) -> Result<Self, Exception> {
@@ -823,7 +817,8 @@ mod tests {
         let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
 
         // Image: [batch=1, channels=3, h=28, w=28] (NCHW)
-        let pixels = pmetal_bridge::compat::random::normal(&[1, 3, 28, 28], None, None, None).unwrap();
+        let pixels =
+            pmetal_bridge::compat::random::normal(&[1, 3, 28, 28], pmetal_bridge::compat::Dtype::Float32);
 
         // Forward
         let logits = model.forward(&input_ids, Some(&pixels)).unwrap();

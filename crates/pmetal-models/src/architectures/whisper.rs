@@ -230,7 +230,6 @@ pub struct WhisperAttention {
 }
 impl_module_params!(WhisperAttention; q_proj, k_proj, v_proj, out_proj);
 
-
 impl WhisperAttention {
     /// Create a new attention layer.
     pub fn new(d_model: i32, n_heads: i32, with_bias: bool) -> Result<Self, Exception> {
@@ -340,7 +339,6 @@ pub struct WhisperEncoderBlock {
 }
 impl_module_params!(WhisperEncoderBlock; self_attn, self_attn_layer_norm, fc1, fc2, final_layer_norm);
 
-
 impl WhisperEncoderBlock {
     /// Create a new encoder block.
     pub fn new(config: &WhisperConfig) -> Result<Self, Exception> {
@@ -404,7 +402,6 @@ pub struct WhisperDecoderBlock {
     pub final_layer_norm: nn::LayerNorm,
 }
 impl_module_params!(WhisperDecoderBlock; self_attn, self_attn_layer_norm, encoder_attn, encoder_attn_layer_norm, fc1, fc2, final_layer_norm);
-
 
 impl WhisperDecoderBlock {
     /// Create a new decoder block.
@@ -485,7 +482,6 @@ pub struct WhisperEncoder {
 }
 impl_module_params!(WhisperEncoder; conv1, conv2, positional_embedding, layers, layer_norm);
 
-
 impl WhisperEncoder {
     /// Create a new encoder.
     pub fn new(config: &WhisperConfig) -> Result<Self, Exception> {
@@ -540,7 +536,8 @@ impl WhisperEncoder {
 
         // Add positional embedding
         let seq_len = x.shape()[1] as i32;
-        let pos_embed = pmetal_bridge::compat::ops::slice_axis(&self.positional_embedding.value, 0, 0, seq_len);
+        let pos_embed =
+            pmetal_bridge::compat::ops::slice_axis(&self.positional_embedding.value, 0, 0, seq_len);
         let mut x = pmetal_bridge::compat::ops::add(&x, &pos_embed);
 
         // Transformer blocks
@@ -565,7 +562,6 @@ pub struct WhisperDecoder {
     pub layer_norm: nn::LayerNorm,
 }
 impl_module_params!(WhisperDecoder; embed_tokens, embed_positions, layers, layer_norm);
-
 
 impl WhisperDecoder {
     /// Create a new decoder.
@@ -615,7 +611,8 @@ impl WhisperDecoder {
         let x = Module::forward(&mut self.embed_tokens, tokens)?;
 
         // Add positional embeddings
-        let pos_embed = pmetal_bridge::compat::ops::slice_axis(&self.embed_positions.value, 0, 0, seq_len);
+        let pos_embed =
+            pmetal_bridge::compat::ops::slice_axis(&self.embed_positions.value, 0, 0, seq_len);
         let mut x = pmetal_bridge::compat::ops::add(&x, &pos_embed);
 
         // Transformer blocks
@@ -644,14 +641,12 @@ pub struct Whisper {
 }
 impl_module_params!(Whisper; encoder, decoder);
 
-
 impl Whisper {
     /// Create a new Whisper model.
     pub fn new(config: WhisperConfig) -> Result<Self, Exception> {
         let encoder = WhisperEncoder::new(&config)?;
 
         let decoder = WhisperDecoder::new(&config)?;
-
 
         Ok(Self {
             config,

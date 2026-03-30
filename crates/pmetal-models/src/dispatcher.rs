@@ -3,67 +3,20 @@
 //! This module provides automatic architecture detection and model loading,
 //! eliminating the need for hardcoded model types in application code.
 
-use pmetal_bridge::compat::{Array, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, ModuleParametersExt, nn, transforms};
 use crate::architectures::*;
 use crate::loader::{
     Qwen3NextLoadOptions, load_bert_weights, load_falcon_h1_weights, load_generic_weights,
     load_nemotron_weights, load_qwen3_next_weights_with_options, load_weights,
 };
 use crate::traits::{CausalLMModel, ModelConfig};
+use pmetal_bridge::compat::{
+    Array, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters,
+    ModuleParametersExt, nn, transforms,
+};
 use pmetal_mlx::kv_cache::{
-    CacheMode, KVCache, KVCacheConfig, MambaCache, TurboQuantConfig, TurboQuantTensorConfig,
+    CacheMode, KVCache, KVCacheConfig, MambaCache, sanitize_cache_mode_for_config,
 };
 use std::path::Path;
-
-fn group_size_supported_for_dims(
-    key_head_dim: usize,
-    value_head_dim: usize,
-    group_size: usize,
-) -> bool {
-    group_size > 0
-        && (key_head_dim == 0 || key_head_dim % group_size == 0)
-        && (value_head_dim == 0 || value_head_dim % group_size == 0)
-}
-
-fn find_compatible_group_size_pair(
-    key_head_dim: usize,
-    value_head_dim: usize,
-    preferred: usize,
-) -> usize {
-    if group_size_supported_for_dims(key_head_dim, value_head_dim, preferred) {
-        return preferred;
-    }
-    for gs in [128, 64, 32, 16, 8, 4, 2, 1] {
-        if group_size_supported_for_dims(key_head_dim, value_head_dim, gs) {
-            return gs;
-        }
-    }
-    1
-}
-
-fn sanitize_turboquant_tensor(
-    head_dim: usize,
-    config: TurboQuantTensorConfig,
-) -> TurboQuantTensorConfig {
-    match config {
-        TurboQuantTensorConfig::Uniform { .. } => config,
-        TurboQuantTensorConfig::Mixed {
-            regular_bits,
-            outlier_bits,
-            outlier_count,
-        } => {
-            if head_dim <= 1 {
-                TurboQuantTensorConfig::uniform(outlier_bits.max(regular_bits))
-            } else {
-                TurboQuantTensorConfig::mixed(
-                    regular_bits,
-                    outlier_bits,
-                    outlier_count.clamp(1, head_dim - 1),
-                )
-            }
-        }
-    }
-}
 
 const PARAM_EVAL_BATCH_SIZE: usize = 128;
 
@@ -854,49 +807,16 @@ impl DynamicModel {
     pub fn create_cache_with_mode(&self, max_seq_len: usize, mode: CacheMode) -> KVCache {
         let base = self.create_cache(max_seq_len);
         let base_config = base.config();
-        let key_head_dim = base_config.head_dim;
-        let value_head_dim = base_config.value_head_dim;
-
-        // Ensure group_size is compatible with head_dim (MLX quantize requires divisibility).
-        // Models like Phi-3 mini (head_dim=96) or NemotronH (head_dim=32) need adjustment.
-        let safe_mode = match mode {
-            CacheMode::Quantized { bits, group_size }
-                if !group_size_supported_for_dims(key_head_dim, value_head_dim, group_size) =>
-            {
-                let safe_gs =
-                    find_compatible_group_size_pair(key_head_dim, value_head_dim, group_size);
-                tracing::info!(
-                    "KV cache: adjusted group_size {group_size} → {safe_gs} (key_head_dim={key_head_dim}, value_head_dim={value_head_dim})"
-                );
-                CacheMode::Quantized {
-                    bits,
-                    group_size: safe_gs,
-                }
-            }
-            CacheMode::AsymmetricQuantized {
-                key_bits,
-                value_bits,
-                group_size,
-            } if !group_size_supported_for_dims(key_head_dim, value_head_dim, group_size) => {
-                let safe_gs =
-                    find_compatible_group_size_pair(key_head_dim, value_head_dim, group_size);
-                tracing::info!(
-                    "KV cache: adjusted group_size {group_size} → {safe_gs} (key_head_dim={key_head_dim}, value_head_dim={value_head_dim})"
-                );
-                CacheMode::AsymmetricQuantized {
-                    key_bits,
-                    value_bits,
-                    group_size: safe_gs,
-                }
-            }
-            CacheMode::TurboQuant { config } => CacheMode::TurboQuant {
-                config: TurboQuantConfig {
-                    keys: sanitize_turboquant_tensor(key_head_dim, config.keys),
-                    values: sanitize_turboquant_tensor(value_head_dim, config.values),
-                },
-            },
-            other => other,
-        };
+        let safe_mode = sanitize_cache_mode_for_config(base_config, mode);
+        if safe_mode != mode {
+            tracing::info!(
+                requested = %mode.describe(),
+                normalized = %safe_mode.describe(),
+                key_head_dim = base_config.head_dim,
+                value_head_dim = base_config.value_head_dim,
+                "KV cache: normalized requested cache mode"
+            );
+        }
 
         let config = base_config.clone().with_mode(safe_mode);
         KVCache::new(config)
@@ -1253,7 +1173,7 @@ mod tests {
     #[test]
     #[serial]
     fn qwen3_moe_post_load_fast_paths_initialize_stacked_experts() {
-        let mut model = DynamicModel::Qwen3MoE(Qwen3MoE::new(tiny_qwen3_moe_config()).unwrap())?;
+        let mut model = DynamicModel::Qwen3MoE(Qwen3MoE::new(tiny_qwen3_moe_config()).unwrap());
         model.init_post_load_fast_paths().unwrap();
 
         let DynamicModel::Qwen3MoE(model) = &model else {
@@ -1268,7 +1188,7 @@ mod tests {
     #[test]
     #[serial]
     fn deepseek_post_load_fast_paths_initialize_stacked_experts() {
-        let mut model = DynamicModel::DeepSeek(DeepSeek::new(tiny_deepseek_config()).unwrap())?;
+        let mut model = DynamicModel::DeepSeek(DeepSeek::new(tiny_deepseek_config()).unwrap());
         model.init_post_load_fast_paths().unwrap();
 
         let DynamicModel::DeepSeek(model) = &model else {
