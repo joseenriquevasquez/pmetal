@@ -20,7 +20,7 @@ pub(crate) async fn run_serve(
     ane_real_time: bool,
 ) -> anyhow::Result<()> {
     use pmetal_mlx::CacheMode;
-    use pmetal_mlx::kv_cache::turboquant::TurboQuantConfig;
+    use pmetal_mlx::kv_cache::TurboQuantConfig;
     use pmetal_models::dispatcher::DynamicModel;
     use pmetal_serve::{InferenceEngine, ServeConfig};
 

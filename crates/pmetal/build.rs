@@ -1,7 +1,7 @@
 //! Build script for pmetal.
 //!
-//! Locates `mlx.metallib` produced by the mlx-sys build, compresses it with
-//! gzip, and writes it to OUT_DIR so it can be embedded into the binary via
+//! Locates `mlx.metallib` produced by the bridge build, compresses it with gzip,
+//! and writes it to OUT_DIR so it can be embedded into the binary via
 //! `include_bytes!`. At runtime the binary decompresses it on first use.
 //!
 //! Raw metallib is ~102MB; gzip-compressed is ~31MB — keeps the binary lean
@@ -11,9 +11,15 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=DEP_PMETAL_BRIDGE_MLX_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=DEP_PMETAL_BRIDGE_MLX_METALLIB");
+    println!("cargo:rerun-if-env-changed=HOME");
+
     if env::var("CARGO_CFG_TARGET_OS").unwrap() != "macos" {
         return;
     }
+
+    emit_runtime_rpath();
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let dest = out_dir.join("mlx.metallib.gz");
@@ -44,6 +50,18 @@ fn emit(path: &std::path::Path) {
     println!("cargo:rustc-env=MLX_METALLIB_EMBED_PATH={}", path.display());
 }
 
+fn emit_runtime_rpath() {
+    if let Some(mlx_lib_dir) = find_mlx_lib_dir() {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", mlx_lib_dir.display());
+        println!(
+            "cargo:warning=Embedding libmlx.dylib runtime search path into pmetal: {}",
+            mlx_lib_dir.display()
+        );
+    } else {
+        println!("cargo:warning=Could not determine libmlx.dylib runtime search path");
+    }
+}
+
 fn compress_metallib(src: &std::path::Path, dest: &std::path::Path) {
     use std::io::Write;
 
@@ -70,19 +88,31 @@ fn compress_metallib(src: &std::path::Path, dest: &std::path::Path) {
 }
 
 /// Search for mlx.metallib in order:
-/// 1. Sibling mlx-sys build output directories (same target/profile/build/)
-/// 2. ~/.cache/pmetal/lib/ (cached by mlx-sys build.rs)
+/// 1. `pmetal-bridge` build-script metadata
+/// 2. Sibling pmetal-bridge build output directories (same target/profile/build/)
+/// 3. ~/.cache/pmetal/lib/ (cached by the bridge build.rs)
 fn find_metallib() -> Option<PathBuf> {
+    if let Ok(path) = env::var("DEP_PMETAL_BRIDGE_MLX_METALLIB") {
+        let candidate = PathBuf::from(path);
+        if candidate.is_file() {
+            println!(
+                "cargo:warning=Found mlx.metallib from pmetal-bridge metadata: {}",
+                candidate.display()
+            );
+            return Some(candidate);
+        }
+    }
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").ok()?);
 
     // OUT_DIR is typically: target/<profile>/build/<crate>-<hash>/out
-    // We want:              target/<profile>/build/pmetal-mlx-sys-<hash>/out/build/lib/mlx.metallib
+    // We want:              target/<profile>/build/pmetal-bridge-<hash>/out/build/lib/mlx.metallib
     if let Some(build_dir) = out_dir.parent().and_then(|p| p.parent()) {
         if let Ok(entries) = std::fs::read_dir(build_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if name_str.starts_with("pmetal-mlx-sys-") && entry.path().is_dir() {
+                if name_str.starts_with("pmetal-bridge-") && entry.path().is_dir() {
                     let candidate = entry.path().join("out/build/lib/mlx.metallib");
                     if candidate.is_file() {
                         println!(
@@ -105,6 +135,43 @@ fn find_metallib() -> Option<PathBuf> {
                 cached.display()
             );
             return Some(cached);
+        }
+    }
+
+    None
+}
+
+fn find_mlx_lib_dir() -> Option<PathBuf> {
+    if let Ok(path) = env::var("DEP_PMETAL_BRIDGE_MLX_LIB_DIR") {
+        let candidate = PathBuf::from(path);
+        if candidate.join("libmlx.dylib").is_file() {
+            return Some(candidate);
+        }
+    }
+
+    if let Ok(path) = env::var("PMETAL_MLX_LIB_DIR") {
+        let candidate = PathBuf::from(path);
+        if candidate.join("libmlx.dylib").is_file() {
+            return Some(candidate);
+        }
+    }
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").ok()?);
+    let build_dir = out_dir.parent()?.parent()?;
+    let entries = std::fs::read_dir(build_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("pmetal-bridge-") {
+            continue;
+        }
+        let candidate = path.join("out/build/lib");
+        if candidate.join("libmlx.dylib").is_file() {
+            return Some(candidate);
         }
     }
 

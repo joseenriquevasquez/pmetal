@@ -44,8 +44,15 @@ pub(crate) async fn run_fuse(
 
     // Load LoRA adapter weights
     print!("Loading LoRA adapter weights... ");
-    let lora_weights =
-        mlx_rs::Array::load_safetensors(&lora_file).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let lora_file_str = lora_file
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 LoRA path: {}", lora_file.display()))?;
+    let lora_weights: HashMap<String, pmetal_bridge::compat::Array> =
+        pmetal_bridge::inline_array::load_safetensors_shard(lora_file_str)
+            .map(|pairs| pairs.into_iter().collect())
+            .ok_or_else(|| {
+                anyhow::anyhow!("failed to load safetensors: {}", lora_file.display())
+            })?;
     println!("OK ({} tensors)", lora_weights.len());
 
     // Read rank and alpha from adapter_config.json, with CLI overrides taking precedence
@@ -94,8 +101,8 @@ pub(crate) async fn run_fuse(
     let mut fused_count = 0usize;
 
     // Group LoRA weights by layer: find matching (lora_a, lora_b) pairs
-    let mut lora_a_map: HashMap<String, &mlx_rs::Array> = HashMap::new();
-    let mut lora_b_map: HashMap<String, &mlx_rs::Array> = HashMap::new();
+    let mut lora_a_map: HashMap<String, &pmetal_bridge::compat::Array> = HashMap::new();
+    let mut lora_b_map: HashMap<String, &pmetal_bridge::compat::Array> = HashMap::new();
 
     for (name, array) in &lora_weights {
         if let Some(base_name) = name.strip_suffix(".lora_a") {
@@ -105,8 +112,8 @@ pub(crate) async fn run_fuse(
         }
     }
 
-    for (layer_name, lora_a) in &lora_a_map {
-        let Some(lora_b) = lora_b_map.get(layer_name) else {
+    for (layer_name, &lora_a) in &lora_a_map {
+        let Some(&lora_b) = lora_b_map.get(layer_name) else {
             tracing::warn!("Missing lora_b for {layer_name}, skipping");
             continue;
         };
@@ -127,13 +134,14 @@ pub(crate) async fn run_fuse(
         // Compute delta = scale * (B @ A) and add to base weight
         // lora_a: [r, in_features], lora_b: [out_features, r]
         // delta: [out_features, in_features]
-        let base_dtype = base_weight.dtype();
-        let delta = mlx_rs::ops::matmul(lora_b, lora_a)?;
-        let scaled_delta = mlx_rs::ops::multiply(&delta, mlx_rs::array!(scale))?;
-        let fused = mlx_rs::ops::add(base_weight, &scaled_delta)?;
+        let base_dtype = base_weight.dtype_raw();
+        let delta = pmetal_bridge::compat::ops::matmul(lora_b, lora_a);
+        let scaled_delta =
+            pmetal_bridge::compat::ops::multiply(&delta, &pmetal_bridge::array!(scale));
+        let fused = pmetal_bridge::compat::ops::add(base_weight, &scaled_delta);
         // Cast back to base dtype (LoRA is f32, base is typically bf16/f16)
-        let fused = if fused.dtype() != base_dtype {
-            fused.as_dtype(base_dtype)?
+        let fused = if fused.dtype_raw() != base_dtype {
+            fused.as_dtype(base_dtype)
         } else {
             fused
         };
@@ -171,9 +179,14 @@ pub(crate) async fn run_fuse(
     // Save fused weights as a single safetensors file
     print!("Saving fused model... ");
     let output_file = output_dir.join("model.safetensors");
-    let metadata = std::collections::HashMap::from([("format".to_string(), "mlx".to_string())]);
-    mlx_rs::Array::save_safetensors(&base_weights, Some(&metadata), &output_file)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let output_file_str = output_file
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 output path: {}", output_file.display()))?;
+    let entries: Vec<(&str, &pmetal_bridge::compat::Array)> = base_weights
+        .iter()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect();
+    pmetal_bridge::compat::Array::save_safetensors(output_file_str, &entries);
 
     // Generate model.safetensors.index.json (required by LM Studio and other tools)
     let mut weight_map = serde_json::Map::new();

@@ -10,18 +10,23 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mlx_rs::Dtype;
-use mlx_rs::error::Exception;
-use mlx_rs::module::ModuleParameters as _;
+use pmetal_bridge::turboquant::{
+    TurboQuantConfig as BridgeTurboQuantConfig,
+    TurboQuantTensorConfig as BridgeTurboQuantTensorConfig,
+};
 use pmetal_data::Tokenizer;
 use pmetal_data::chat_templates::{ChatTemplateType, Message, ToolDefinition};
-use pmetal_lora::{DynamicLoraModel, TrainableModel as _};
 use pmetal_mlx::kv_cache::{
     CacheMode, KVCache, KVCacheConfig, MambaCache, TurboQuantConfig, TurboQuantTensorConfig,
+    sanitize_cache_mode_for_config,
 };
+use pmetal_mlx::{Array, Dtype, Exception, ModuleParameters as _};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::GenerationConfig;
 use pmetal_models::{GenerationOutput, generate_cached_async_streaming};
+
+#[cfg(feature = "lora")]
+use pmetal_lora::{DynamicLoraModel, TrainableModel as _};
 
 /// Configuration for preparing an inference run.
 ///
@@ -124,6 +129,7 @@ impl Default for InferenceRunnerConfig {
 #[allow(clippy::large_enum_variant)]
 enum LoadedModel {
     Standard(DynamicModel),
+    #[cfg(feature = "lora")]
     Lora(DynamicLoraModel),
     /// Native InlineArray path — no mlx-rs model needed.
     /// All weights loaded through pmetal-bridge's MLX.
@@ -159,6 +165,7 @@ pub struct InferenceGenState {
     input_ids: Vec<u32>,
     cache: KVCache,
     mamba_cache: Option<MambaCache>,
+    native_turboquant: Option<BridgeTurboQuantConfig>,
     /// Model directory path — used for native InlineArray weight loading
     /// (bypasses mlx-rs to avoid dual-MLX-instance 6x slowdown).
     model_path: PathBuf,
@@ -211,24 +218,21 @@ impl InferenceRunner {
             .frequency_penalty
             .unwrap_or(defaults.frequency_penalty);
         let presence_penalty = config.presence_penalty.unwrap_or(defaults.presence_penalty);
+        let native_qwen_candidate = config.lora_path.is_none()
+            && !config.fp8
+            && matches!(
+                crate::native_inference::detect_arch(model_path),
+                Some(crate::native_inference::NativeArch::Qwen3)
+                    | Some(crate::native_inference::NativeArch::Qwen3_5)
+            );
 
         // 4. Prime the Metal runtime before MLX model construction. The stable
         // benchmark path always initializes Metal first, and doing the same here
-        // Prewarm Metal context — but SKIP for native Qwen3.5 path to avoid
+        // Prewarm Metal context — but SKIP for native Qwen bridge paths to avoid
         // loading competing Metal pipeline state that degrades MLX performance.
         #[cfg(feature = "metal")]
         {
-            let skip_prewarm = config.lora_path.is_none() && !config.fp8 && {
-                let cp = model_path.join("config.json");
-                std::fs::read_to_string(&cp).ok()
-                    .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
-                    .map(|v| {
-                        let mt = v.get("text_config").and_then(|tc| tc.get("model_type"))
-                            .or_else(|| v.get("model_type")).and_then(|v| v.as_str()).unwrap_or("");
-                        mt == "qwen3_5" || mt == "qwen3_5_text"
-                    }).unwrap_or(false)
-            };
-            if !skip_prewarm {
+            if !native_qwen_candidate {
                 if let Err(err) = pmetal_metal::context::MetalContext::global() {
                     tracing::warn!("Metal context prewarm failed: {err}");
                 }
@@ -239,54 +243,12 @@ impl InferenceRunner {
         // the interactive inference path follows the same load ordering as the
         // stable benchmark flow. LoRA still tokenizes first because its loader
         // needs the final max_seq_len up front.
-        // Detect Qwen3.5 dense models to skip mlx-rs loading entirely.
-        // This avoids initializing a second MLX instance which causes 6x slowdown.
-        let is_native_qwen35 = config.lora_path.is_none() && !config.fp8 && {
-            let config_path = model_path.join("config.json");
-            if let Ok(data) = std::fs::read_to_string(&config_path) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                    let mt = v.get("text_config")
-                        .and_then(|tc| tc.get("model_type"))
-                        .or_else(|| v.get("model_type"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let has_moe = v.get("text_config")
-                        .and_then(|tc| tc.get("num_experts"))
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0) > 0;
-                    (mt == "qwen3_5" || mt == "qwen3_5_text") && !has_moe
-                } else { false }
-            } else { false }
-        };
-
-        let mut preloaded_model = if is_native_qwen35 {
-            // Skip mlx-rs model loading for Qwen3.5 — native path handles everything
-            tracing::info!("Qwen3.5 detected — skipping mlx-rs model load (native path)");
+        let mut preloaded_model = if native_qwen_candidate {
+            // Skip dynamic model loading for Qwen bridge-native inference.
+            tracing::info!("Qwen bridge-native path detected — skipping shared model load");
             None
         } else if config.lora_path.is_none() {
-            tracing::info!("Loading dynamic model");
-            let mut model = DynamicModel::load_with_options(
-                model_path,
-                pmetal_models::dispatcher::DynamicModelLoadOptions {
-                    prefer_expert_offload: config.experts_dir.is_some(),
-                },
-            )?;
-            tracing::info!(arch = %model.architecture(), "Model loaded");
-
-            if config.fp8 {
-                tracing::info!("Quantizing weights to FP8 E4M3");
-                model.quantize_fp8()?;
-            }
-
-            if let Some(ref experts_dir) = config.experts_dir {
-                model.enable_expert_offloading(Path::new(experts_dir))?;
-            } else if model.requires_expert_offloading() {
-                return Err(Exception::custom(
-                    "this model requires expert offloading; repack routed experts with `pmetal pack-experts` and pass --experts-dir <packed_dir>",
-                ));
-            }
-
-            Some(model)
+            Some(load_standard_model_for_inference(model_path, &config)?)
         } else {
             None
         };
@@ -350,36 +312,67 @@ impl InferenceRunner {
         // 9. Load model (standard or LoRA-merged)
         let max_seq_len = input_ids.len() + config.max_tokens + 64;
 
-        let (model, cache, mamba_cache) = if is_native_qwen35 {
-            // Native Qwen3.5: parse config directly (no model loading, no mlx-rs Metal init)
-            let config_path = model_path.join("config.json");
-            let config_json: serde_json::Value = serde_json::from_str(
-                &std::fs::read_to_string(&config_path)
-                    .map_err(|e| Exception::custom(format!("config.json: {e}")))?
-            ).map_err(|e| Exception::custom(format!("config.json parse: {e}")))?;
-            let text_config_str = if config_json.get("text_config").is_some() {
-                serde_json::to_string(&config_json["text_config"])
-                    .map_err(|e| Exception::custom(format!("text_config: {e}")))?
-            } else {
-                serde_json::to_string(&config_json)
-                    .map_err(|e| Exception::custom(format!("config: {e}")))?
-            };
-            let qwen_config: pmetal_models::architectures::qwen3_next::Qwen3NextConfig =
-                serde_json::from_str(&text_config_str)
-                    .map_err(|e| Exception::custom(format!("Qwen3NextConfig parse: {e}")))?;
-            // NO model creation, NO mlx-rs Metal init.
-            // Native path in generate_streaming is fully self-contained.
+        let cache_request = cache_mode_request_from_config(&config);
+        let (model, cache, mamba_cache, native_turboquant) = if native_qwen_candidate {
+            // Native Qwen path: parse the shared bridge config directly.
+            let qwen_config = pmetal_bridge::qwen3_native::load_config(model_path)
+                .map_err(|e| Exception::custom(format!("Qwen config parse: {e}")))?;
             let n_layers = qwen_config.num_hidden_layers as usize;
-            let n_kv = qwen_config.num_key_value_heads.unwrap_or(qwen_config.num_attention_heads) as usize;
-            let hd = qwen_config.head_dim.unwrap_or(qwen_config.hidden_size / qwen_config.num_attention_heads) as usize;
-            let cache = KVCache::new(pmetal_mlx::kv_cache::KVCacheConfig::new(n_layers, max_seq_len, n_kv, hd));
-            let mamba_cache = Some(MambaCache::new(n_layers));
-            (LoadedModel::NativeOnly, cache, mamba_cache)
+            let n_kv = qwen_config.get_num_kv_heads() as usize;
+            let hd = qwen_config.get_head_dim() as usize;
+            let base_cache_config = KVCacheConfig::new(n_layers, max_seq_len, n_kv, hd);
+            let cache_selection =
+                select_cache_mode_for_model(&base_cache_config, model_path, 0, cache_request);
+
+            if native_cache_mode_supported(cache_selection.mode) {
+                log_cache_selection(&cache_selection, max_seq_len);
+                let cache = build_cache_from_base_config(&base_cache_config, cache_selection.mode);
+                let mamba_cache = Some(MambaCache::new(n_layers));
+                (
+                    LoadedModel::NativeOnly,
+                    cache,
+                    mamba_cache,
+                    turboquant_config_from_mode(cache_selection.mode),
+                )
+            } else {
+                tracing::info!(
+                    mode = %cache_selection.mode.describe(),
+                    "Native Qwen3.5 path does not support the selected cache mode; using shared model path"
+                );
+                let m = match preloaded_model.take() {
+                    Some(model) => model,
+                    None => load_standard_model_for_inference(model_path, &config)?,
+                };
+
+                let base_cache_config = m.create_cache(max_seq_len).config().clone();
+                tracing::info!(tokens = max_seq_len, "Base KV cache created");
+                let cache_selection = select_cache_mode_for_model(
+                    &base_cache_config,
+                    model_path,
+                    m.num_parameters(),
+                    cache_request,
+                );
+                log_cache_selection(&cache_selection, max_seq_len);
+
+                let cache = build_cache_from_base_config(&base_cache_config, cache_selection.mode);
+                let mamba_cache = m.create_mamba_cache();
+                (LoadedModel::Standard(m), cache, mamba_cache, None)
+            }
         } else if let Some(ref lora_path) = config.lora_path {
-            let (lora_model, cache, mamba_cache, cache_selection) =
-                load_model_with_lora(model_path, lora_path, max_seq_len, &config)?;
-            log_cache_selection(&cache_selection, max_seq_len);
-            (LoadedModel::Lora(lora_model), cache, mamba_cache)
+            #[cfg(feature = "lora")]
+            {
+                let (lora_model, cache, mamba_cache, cache_selection) =
+                    load_model_with_lora(model_path, lora_path, max_seq_len, &config)?;
+                log_cache_selection(&cache_selection, max_seq_len);
+                (LoadedModel::Lora(lora_model), cache, mamba_cache, None)
+            }
+            #[cfg(not(feature = "lora"))]
+            {
+                let _ = lora_path;
+                return Err(Exception::custom(
+                    "LoRA adapters require the `lora` feature in this build",
+                ));
+            }
         } else {
             let m = preloaded_model
                 .take()
@@ -391,22 +384,13 @@ impl InferenceRunner {
                 &base_cache_config,
                 model_path,
                 m.num_parameters(),
-                CacheModeRequest {
-                    kv_quant: config.kv_quant,
-                    kv_k_bits: config.kv_k_bits,
-                    kv_v_bits: config.kv_v_bits,
-                    kv_group_size: config.kv_group_size,
-                    kv_turboquant: config.kv_turboquant,
-                    kv_turboquant_preset: config.kv_turboquant_preset,
-                    no_kv_quant: config.no_kv_quant,
-                    fp8: config.fp8,
-                },
+                cache_request,
             );
             log_cache_selection(&cache_selection, max_seq_len);
 
             let cache = build_cache_from_base_config(&base_cache_config, cache_selection.mode);
             let mamba_cache = m.create_mamba_cache();
-            (LoadedModel::Standard(m), cache, mamba_cache)
+            (LoadedModel::Standard(m), cache, mamba_cache, None)
         };
 
         Ok(Self {
@@ -417,6 +401,7 @@ impl InferenceRunner {
                 input_ids,
                 cache,
                 mamba_cache,
+                native_turboquant,
                 model_path: config.model_path.clone(),
             },
             chat_template_type: template_type,
@@ -433,6 +418,37 @@ impl InferenceRunner {
     pub fn chat_template_type(&self) -> Option<ChatTemplateType> {
         self.chat_template_type
     }
+
+    /// Benchmark the active model using the same workload shape as
+    /// `mlx_lm.benchmark`: fixed random prompt ids, one warmup, EOS disabled,
+    /// and repeated full prompt+decode runs.
+    pub fn benchmark_mlx_lm(
+        &mut self,
+        prompt_tokens: usize,
+        generation_tokens: usize,
+        num_trials: usize,
+        seed: u64,
+    ) -> Result<Vec<crate::native_inference::MlxLmBenchmarkTrial>, Exception> {
+        let vocab_size = self.tokenizer.vocab_size();
+        if vocab_size == 0 {
+            return Err(Exception::custom("tokenizer vocabulary is empty"));
+        }
+
+        let prompt_ids = build_mlx_lm_benchmark_prompt(prompt_tokens, vocab_size, seed);
+        match &mut self.state.model {
+            LoadedModel::NativeOnly => crate::native_inference::benchmark_native_mlx_lm(
+                &self.state.model_path,
+                &prompt_ids,
+                generation_tokens,
+                self.state.native_turboquant,
+                num_trials,
+            )
+            .map_err(Exception::custom),
+            _ => Err(Exception::custom(
+                "MLX-LM parity benchmark is currently only implemented for the native bridge path",
+            )),
+        }
+    }
 }
 
 impl InferenceGenState {
@@ -447,174 +463,23 @@ impl InferenceGenState {
     where
         F: FnMut(u32) -> bool,
     {
-        // ── Full-native InlineArray path: ZERO mlx-rs on the hot path ──
-        // Loads weights + runs prefill + decode all through pmetal-bridge's MLX.
-        // Parses config directly from disk — never touches mlx-rs model struct.
-        // Falls through to mlx-rs path on failure or for MoE models.
-        {
-            use pmetal_models::architectures::qwen3_next_inline as native;
+        if matches!(self.model, LoadedModel::NativeOnly) {
+            let output = crate::native_inference::run_native_inference(
+                &self.model_path,
+                &self.input_ids,
+                self.gen_config.max_new_tokens,
+                self.gen_config.temperature,
+                self.native_turboquant,
+                on_token,
+            )
+            .map_err(Exception::custom)?;
 
-            let native_result: Result<GenerationOutput, String> = (|| {
-                // Parse config from disk (pure serde, no MLX init)
-                let config_path = self.model_path.join("config.json");
-                let config_json: serde_json::Value = serde_json::from_str(
-                    &std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?
-                ).map_err(|e| e.to_string())?;
-
-                let text_config_str = if config_json.get("text_config").is_some() {
-                    serde_json::to_string(&config_json["text_config"]).map_err(|e| e.to_string())?
-                } else {
-                    serde_json::to_string(&config_json).map_err(|e| e.to_string())?
-                };
-
-                let mt = config_json.get("text_config")
-                    .and_then(|tc| tc.get("model_type"))
-                    .or_else(|| config_json.get("model_type"))
-                    .and_then(|v| v.as_str()).unwrap_or("");
-                if mt != "qwen3_5" && mt != "qwen3_5_text" {
-                    return Err("not qwen3_5".into());
-                }
-
-                let config: pmetal_models::architectures::qwen3_next::Qwen3NextConfig =
-                    serde_json::from_str(&text_config_str).map_err(|e| e.to_string())?;
-                if config.num_experts > 0 {
-                    return Err("MoE not supported on native path".into());
-                }
-
-                // 1. Load weights natively (single MLX instance)
-                let weights = native::InlineModelWeights::from_safetensors(
-                    &self.model_path,
-                    &config,
-                )?;
-                        eprintln!("[NATIVE] Loaded {} layers", weights.layers.len());
-
-                        // 2. Create empty cache (no mlx-rs bootstrap needed)
-                        let mut cache = native::InlineCache::new_empty(&weights.layers);
-
-                        // 3. Run prefill through InlineArray (zero mlx-rs!)
-                        let token_ids: Vec<i32> = self.input_ids.iter().map(|&t| t as i32).collect();
-                        let input = pmetal_bridge::InlineArray::from_i32_slice(&token_ids)
-                            .reshape(&[1, token_ids.len() as i32]);
-                        let logits = native::inline_decode_step_pure(&weights, &input, &mut cache);
-
-                        // 4. Extract last-token logits and sample first decode token
-                        let seq_len = token_ids.len() as i32;
-                        let vocab = weights.embed_w.dim(0);
-                        // logits is [1, seq_len, vocab] — take last token
-                        let last_logits = logits.reshape(&[seq_len, vocab])
-                            .slice(&[seq_len - 1, 0], &[seq_len, vocab]);
-                        let temperature = self.gen_config.temperature;
-                        let mut first_tok_arr = if temperature <= 0.0 {
-                            last_logits.argmax(-1)
-                        } else {
-                            let inv_temp = pmetal_bridge::InlineArray::from_f32(1.0 / temperature);
-                            let lse = last_logits.logsumexp(-1, true);
-                            let scaled = last_logits.subtract(&lse).multiply(&inv_temp);
-                            scaled.categorical()
-                        };
-                        first_tok_arr.eval();
-                        let first_tok = first_tok_arr.item_u32();
-                        eprintln!("[NATIVE] Prefill done ({} tokens), first_tok={}", seq_len, first_tok);
-
-                        // 5. Run decode loop (also zero mlx-rs)
-                        let max_tokens = self.gen_config.max_new_tokens;
-                        let prompt_len = self.input_ids.len();
-                        let mut all_tokens = self.input_ids.clone();
-                        all_tokens.push(first_tok);
-                        on_token(first_tok);
-
-                        let tokens = native::inline_generate(
-                            &weights,
-                            &mut cache,
-                            first_tok,
-                            max_tokens.saturating_sub(1),
-                            temperature,
-                            &mut on_token,
-                        );
-
-                        all_tokens.extend(&tokens);
-                        let num_generated = all_tokens.len() - prompt_len;
-                        Ok(GenerationOutput {
-                            token_ids: all_tokens,
-                            num_generated,
-                            stopped_by_token: num_generated < max_tokens,
-                            stopped_by_length: num_generated >= max_tokens,
-                        })
-                    })();
-
-            match native_result {
-                Ok(output) => return Ok(output),
-                Err(e) => eprintln!("[NATIVE] Failed: {e}, falling back to mlx-rs"),
-            }
-        }
-
-        // ── Fallback: mlx-rs prefill + InlineArray decode (dual MLX instance) ──
-        if let LoadedModel::Standard(ref mut model) = self.model {
-            if let Some(qwen3_next) = model.as_qwen3_next_mut() {
-                // Run prefill using the standard mlx-rs path
-                let mamba = &mut self.mamba_cache;
-                let prompt_array = mlx_rs::Array::from_slice(
-                    &self.input_ids.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-                    &[1, self.input_ids.len() as i32],
-                );
-                let logits = qwen3_next.forward_with_cache(
-                    &prompt_array, None, Some(&mut self.cache), mamba.as_mut(),
-                );
-
-                if let Ok(logits) = logits {
-                    use mlx_rs::ops::indexing::IndexOp;
-                    logits.eval()?;
-                    mlx_rs::transforms::eval([&logits].into_iter())?;
-                    pmetal_bridge::inline_array::synchronize();
-                    pmetal_bridge::inline_array::clear_cache();
-
-                    if qwen3_next.inline_weights.is_none() {
-                        if let Ok(w) = pmetal_models::architectures::qwen3_next_inline::InlineModelWeights::from_model(qwen3_next) {
-                            qwen3_next.inline_weights = Some(w);
-                        }
-                    }
-                    if qwen3_next.inline_weights.is_some() && qwen3_next.inline_cache.is_none() {
-                        let weights = qwen3_next.inline_weights.as_ref().unwrap();
-                        qwen3_next.inline_cache = Some(
-                            pmetal_models::architectures::qwen3_next_inline::InlineCache::from_caches(
-                                &self.cache, self.mamba_cache.as_ref().unwrap(), &weights.layers,
-                            )
-                        );
-                    }
-
-                    if qwen3_next.inline_weights.is_some() && qwen3_next.inline_cache.is_some() {
-                        let weights = qwen3_next.inline_weights.as_ref().unwrap();
-                        let inline_cache = qwen3_next.inline_cache.as_mut().unwrap();
-
-                        let last_logits = logits.index((.., -1, ..));
-                        let sampler = pmetal_models::Sampler::new(self.gen_config.clone());
-                        let (first_token, _) = sampler.sample_array(&last_logits)?;
-                        first_token.eval()?;
-                        let first_tok = first_token.item::<u32>();
-
-                        let temperature = self.gen_config.temperature;
-                        let max_tokens = self.gen_config.max_new_tokens;
-                        let prompt_len = self.input_ids.len();
-                        let mut all_tokens = self.input_ids.clone();
-                        all_tokens.push(first_tok);
-                        on_token(first_tok);
-
-                        let tokens = pmetal_models::architectures::qwen3_next_inline::inline_generate(
-                            weights, inline_cache, first_tok,
-                            max_tokens.saturating_sub(1), temperature, &mut on_token,
-                        );
-
-                        all_tokens.extend(&tokens);
-                        let num_generated = all_tokens.len() - prompt_len;
-                        return Ok(GenerationOutput {
-                            token_ids: all_tokens,
-                            num_generated,
-                            stopped_by_token: num_generated < max_tokens,
-                            stopped_by_length: num_generated >= max_tokens,
-                        });
-                    }
-                }
-            }
+            return Ok(GenerationOutput {
+                token_ids: output.token_ids,
+                num_generated: output.num_generated,
+                stopped_by_token: output.stopped_by_token,
+                stopped_by_length: output.stopped_by_length,
+            });
         }
 
         match self.model {
@@ -630,13 +495,14 @@ impl InferenceGenState {
                     on_token,
                 )
             }
+            #[cfg(feature = "lora")]
             LoadedModel::Lora(ref mut model) => {
                 let mamba = &mut self.mamba_cache;
                 generate_cached_async_streaming(
                     |input, cache| {
                         model
                             .forward_with_hybrid_cache(input, None, Some(cache), mamba.as_mut())
-                            .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
+                            .map_err(|e| Exception::custom(e.to_string()))
                     },
                     &self.input_ids,
                     self.gen_config.clone(),
@@ -659,7 +525,7 @@ impl InferenceGenState {
     pub fn run_with<F, R>(&mut self, f: F) -> R
     where
         F: FnOnce(
-            &mut dyn FnMut(&mlx_rs::Array, &mut KVCache) -> Result<mlx_rs::Array, Exception>,
+            &mut dyn FnMut(&Array, &mut KVCache) -> Result<Array, Exception>,
             &mut KVCache,
         ) -> R,
     {
@@ -670,20 +536,20 @@ impl InferenceGenState {
             ..
         } = *self;
 
-        let mut fwd =
-            |input: &mlx_rs::Array, kv: &mut KVCache| -> Result<mlx_rs::Array, Exception> {
-                match model {
-                    LoadedModel::Standard(m) => {
-                        m.forward_with_hybrid_cache(input, None, Some(kv), mamba_cache.as_mut())
-                    }
-                    LoadedModel::Lora(m) => m
-                        .forward_with_hybrid_cache(input, None, Some(kv), mamba_cache.as_mut())
-                        .map_err(|e| Exception::custom(e.to_string())),
-                    LoadedModel::NativeOnly => {
-                        Err(Exception::custom("run_with is not available in native mode"))
-                    }
+        let mut fwd = |input: &Array, kv: &mut KVCache| -> Result<Array, Exception> {
+            match model {
+                LoadedModel::Standard(m) => {
+                    m.forward_with_hybrid_cache(input, None, Some(kv), mamba_cache.as_mut())
                 }
-            };
+                #[cfg(feature = "lora")]
+                LoadedModel::Lora(m) => m
+                    .forward_with_hybrid_cache(input, None, Some(kv), mamba_cache.as_mut())
+                    .map_err(|e| Exception::custom(e.to_string())),
+                LoadedModel::NativeOnly => Err(Exception::custom(
+                    "run_with is not available in native mode",
+                )),
+            }
+        };
 
         f(&mut fwd, cache)
     }
@@ -707,6 +573,7 @@ impl InferenceGenState {
 
         match model {
             LoadedModel::Standard(dynamic_model) => f(dynamic_model, cache, mamba_cache.as_mut()),
+            #[cfg(feature = "lora")]
             LoadedModel::Lora(_) => Err(Exception::custom(
                 "this inference mode is only available for standard models",
             )),
@@ -720,15 +587,12 @@ impl InferenceGenState {
     ///
     /// Dispatches to the correct model type (standard or LoRA-merged) with
     /// hybrid cache support.
-    pub fn forward(
-        &mut self,
-        input: &mlx_rs::Array,
-        cache: &mut KVCache,
-    ) -> Result<mlx_rs::Array, Exception> {
+    pub fn forward(&mut self, input: &Array, cache: &mut KVCache) -> Result<Array, Exception> {
         match &mut self.model {
             LoadedModel::Standard(model) => {
                 model.forward_with_hybrid_cache(input, None, Some(cache), self.mamba_cache.as_mut())
             }
+            #[cfg(feature = "lora")]
             LoadedModel::Lora(model) => model
                 .forward_with_hybrid_cache(input, None, Some(cache), self.mamba_cache.as_mut())
                 .map_err(|e| Exception::custom(e.to_string())),
@@ -742,6 +606,7 @@ impl InferenceGenState {
     pub fn dynamic_model(&self) -> Option<&DynamicModel> {
         match &self.model {
             LoadedModel::Standard(m) => Some(m),
+            #[cfg(feature = "lora")]
             LoadedModel::Lora(_) => None,
             LoadedModel::NativeOnly => None,
         }
@@ -751,6 +616,7 @@ impl InferenceGenState {
     pub fn dynamic_model_mut(&mut self) -> Option<&mut DynamicModel> {
         match &mut self.model {
             LoadedModel::Standard(m) => Some(m),
+            #[cfg(feature = "lora")]
             LoadedModel::Lora(_) => None,
             LoadedModel::NativeOnly => None,
         }
@@ -779,7 +645,89 @@ impl InferenceGenState {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+fn cache_mode_request_from_config(config: &InferenceRunnerConfig) -> CacheModeRequest {
+    CacheModeRequest {
+        kv_quant: config.kv_quant,
+        kv_k_bits: config.kv_k_bits,
+        kv_v_bits: config.kv_v_bits,
+        kv_group_size: config.kv_group_size,
+        kv_turboquant: config.kv_turboquant,
+        kv_turboquant_preset: config.kv_turboquant_preset,
+        no_kv_quant: config.no_kv_quant,
+        fp8: config.fp8,
+    }
+}
+
+fn build_mlx_lm_benchmark_prompt(prompt_tokens: usize, vocab_size: usize, seed: u64) -> Vec<u32> {
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let upper = vocab_size.max(1) as u64;
+    let mut out = Vec::with_capacity(prompt_tokens);
+    for _ in 0..prompt_tokens {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let sample = state.wrapping_mul(0x2545_F491_4F6C_DD1D) % upper;
+        out.push(sample as u32);
+    }
+    out
+}
+
+fn load_standard_model_for_inference(
+    model_path: &Path,
+    config: &InferenceRunnerConfig,
+) -> Result<DynamicModel, Exception> {
+    tracing::info!("Loading dynamic model");
+    let mut model = DynamicModel::load_with_options(
+        model_path,
+        pmetal_models::dispatcher::DynamicModelLoadOptions {
+            prefer_expert_offload: config.experts_dir.is_some(),
+        },
+    )?;
+    tracing::info!(arch = %model.architecture(), "Model loaded");
+
+    if config.fp8 {
+        tracing::info!("Quantizing weights to FP8 E4M3");
+        model.quantize_fp8()?;
+    }
+
+    if let Some(ref experts_dir) = config.experts_dir {
+        model.enable_expert_offloading(Path::new(experts_dir))?;
+    } else if model.requires_expert_offloading() {
+        return Err(Exception::custom(
+            "this model requires expert offloading; repack routed experts with `pmetal pack-experts` and pass --experts-dir <packed_dir>",
+        ));
+    }
+
+    Ok(model)
+}
+
+fn native_cache_mode_supported(mode: CacheMode) -> bool {
+    matches!(mode, CacheMode::Standard | CacheMode::TurboQuant { .. })
+}
+
+fn turboquant_config_from_mode(mode: CacheMode) -> Option<BridgeTurboQuantConfig> {
+    match mode {
+        CacheMode::TurboQuant { config } => Some(BridgeTurboQuantConfig {
+            keys: bridge_turboquant_tensor_config(config.keys),
+            values: bridge_turboquant_tensor_config(config.values),
+        }),
+        _ => None,
+    }
+}
+
+fn bridge_turboquant_tensor_config(config: TurboQuantTensorConfig) -> BridgeTurboQuantTensorConfig {
+    match config {
+        TurboQuantTensorConfig::Uniform { bits } => BridgeTurboQuantTensorConfig::uniform(bits),
+        TurboQuantTensorConfig::Mixed {
+            regular_bits,
+            outlier_bits,
+            outlier_count,
+        } => BridgeTurboQuantTensorConfig::mixed(regular_bits, outlier_bits, outlier_count),
+    }
+}
+
 /// Load a model with LoRA weights merged in.
+#[cfg(feature = "lora")]
 fn load_model_with_lora(
     model_path: &Path,
     lora_path: &str,
@@ -860,16 +808,7 @@ fn load_model_with_lora(
         base_cache.config(),
         model_path,
         model.num_parameters(),
-        CacheModeRequest {
-            kv_quant: config.kv_quant,
-            kv_k_bits: config.kv_k_bits,
-            kv_v_bits: config.kv_v_bits,
-            kv_group_size: config.kv_group_size,
-            kv_turboquant: config.kv_turboquant,
-            kv_turboquant_preset: config.kv_turboquant_preset,
-            no_kv_quant: config.no_kv_quant,
-            fp8: config.fp8,
-        },
+        cache_mode_request_from_config(config),
     );
     let cache = build_cache_from_base_config(base_cache.config(), cache_selection.mode);
     let mamba_cache = model.create_mamba_cache();
@@ -1222,107 +1161,8 @@ fn log_cache_selection(selection: &CacheModeSelection, max_seq_len: usize) {
 }
 
 fn build_cache_from_base_config(base_cache_config: &KVCacheConfig, mode: CacheMode) -> KVCache {
-    let safe_mode = sanitize_cache_mode(base_cache_config, mode);
+    let safe_mode = sanitize_cache_mode_for_config(base_cache_config, mode);
     KVCache::new(base_cache_config.clone().with_mode(safe_mode))
-}
-
-fn sanitize_cache_mode(base_cache_config: &KVCacheConfig, mode: CacheMode) -> CacheMode {
-    let key_head_dim = base_cache_config.head_dim;
-    let value_head_dim = base_cache_config.value_head_dim;
-    match mode {
-        CacheMode::Quantized { bits, group_size }
-            if !group_size_supported_for_dims(key_head_dim, value_head_dim, group_size) =>
-        {
-            CacheMode::Quantized {
-                bits,
-                group_size: find_compatible_group_size_pair(
-                    key_head_dim,
-                    value_head_dim,
-                    group_size,
-                ),
-            }
-        }
-        CacheMode::AsymmetricQuantized {
-            key_bits,
-            value_bits,
-            group_size,
-        } if !group_size_supported_for_dims(key_head_dim, value_head_dim, group_size) => {
-            CacheMode::AsymmetricQuantized {
-                key_bits,
-                value_bits,
-                group_size: find_compatible_group_size_pair(
-                    key_head_dim,
-                    value_head_dim,
-                    group_size,
-                ),
-            }
-        }
-        CacheMode::TurboQuant { config } => CacheMode::TurboQuant {
-            config: sanitize_turboquant_config(key_head_dim, value_head_dim, config),
-        },
-        other => other,
-    }
-}
-
-fn find_compatible_group_size_pair(
-    key_head_dim: usize,
-    value_head_dim: usize,
-    preferred: usize,
-) -> usize {
-    if group_size_supported_for_dims(key_head_dim, value_head_dim, preferred) {
-        return preferred;
-    }
-    for candidate in [128, 64, 32, 16, 8, 4, 2, 1] {
-        if group_size_supported_for_dims(key_head_dim, value_head_dim, candidate) {
-            return candidate;
-        }
-    }
-    1
-}
-
-fn group_size_supported_for_dims(
-    key_head_dim: usize,
-    value_head_dim: usize,
-    group_size: usize,
-) -> bool {
-    group_size > 0
-        && (key_head_dim == 0 || key_head_dim % group_size == 0)
-        && (value_head_dim == 0 || value_head_dim % group_size == 0)
-}
-
-fn sanitize_turboquant_config(
-    key_head_dim: usize,
-    value_head_dim: usize,
-    config: TurboQuantConfig,
-) -> TurboQuantConfig {
-    TurboQuantConfig {
-        keys: sanitize_turboquant_tensor(key_head_dim, config.keys),
-        values: sanitize_turboquant_tensor(value_head_dim, config.values),
-    }
-}
-
-fn sanitize_turboquant_tensor(
-    head_dim: usize,
-    config: TurboQuantTensorConfig,
-) -> TurboQuantTensorConfig {
-    match config {
-        TurboQuantTensorConfig::Uniform { .. } => config,
-        TurboQuantTensorConfig::Mixed {
-            regular_bits,
-            outlier_bits,
-            outlier_count,
-        } => {
-            if head_dim <= 1 {
-                TurboQuantTensorConfig::uniform(outlier_bits.max(regular_bits))
-            } else {
-                TurboQuantTensorConfig::mixed(
-                    regular_bits,
-                    outlier_bits,
-                    outlier_count.clamp(1, head_dim - 1),
-                )
-            }
-        }
-    }
 }
 /// Check if a model directory looks instruction-tuned and should default to chat.
 ///
@@ -1623,6 +1463,17 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "write fizzbuzz");
+    }
+
+    #[test]
+    fn mlx_lm_benchmark_prompt_is_deterministic() {
+        let a = build_mlx_lm_benchmark_prompt(8, 1024, 0);
+        let b = build_mlx_lm_benchmark_prompt(8, 1024, 0);
+        let c = build_mlx_lm_benchmark_prompt(8, 1024, 1);
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.iter().all(|&tok| tok < 1024));
     }
 
     #[test]

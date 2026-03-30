@@ -12,7 +12,7 @@ pub(crate) async fn run_eval(
     num_samples: usize,
     json_output: bool,
 ) -> anyhow::Result<()> {
-    use mlx_rs::ops::indexing::take_along_axis;
+    use pmetal_bridge::compat::indexing::take_along_axis;
 
     // Resolve model
     let model_path = if model_id.contains('/') && !std::path::Path::new(model_id).exists() {
@@ -97,32 +97,26 @@ pub(crate) async fn run_eval(
             continue;
         }
         let n = tokens.len();
-        let input_array = mlx_rs::Array::from_slice(&tokens[..n - 1], &[1, (n - 1) as i32]);
+        let input_array =
+            pmetal_bridge::compat::Array::from_slice(&tokens[..n - 1], &[1, (n - 1) as i32]);
 
         let logits = model
             .forward(&input_array, None)
             .map_err(|e| anyhow::anyhow!("Forward pass failed: {}", e))?;
 
         // logits: [1, seq-1, vocab]  → [seq-1, vocab]
-        let logits = logits
-            .squeeze_axes(&[0i32])
-            .map_err(|e| anyhow::anyhow!("Squeeze failed: {}", e))?;
-        let log_probs = mlx_rs::nn::log_softmax(&logits, -1)
-            .map_err(|e| anyhow::anyhow!("log_softmax failed: {}", e))?;
+        let logits = logits.squeeze_axes(&[0i32]);
+        let log_probs = pmetal_bridge::compat::nn::log_softmax(&logits, -1);
 
         // Gather log-probs for the true tokens using take_along_axis
         // log_probs: [seq-1, vocab], indices: [seq-1, 1] → gathered: [seq-1, 1]
         let target_ids: Vec<i32> = sample.input_ids[1..].iter().map(|&t| t as i32).collect();
-        let target_arr = mlx_rs::Array::from_slice(&target_ids, &[(n - 1) as i32, 1]);
-        let gathered = take_along_axis(&log_probs, &target_arr, 1)
-            .map_err(|e| anyhow::anyhow!("take_along_axis failed: {}", e))?;
+        let target_arr =
+            pmetal_bridge::compat::Array::from_slice(&target_ids, &[(n - 1) as i32, 1]);
+        let gathered = take_along_axis(&log_probs, &target_arr, 1);
 
-        let gathered = gathered
-            .as_dtype(mlx_rs::Dtype::Float32)
-            .map_err(|e| anyhow::anyhow!("dtype cast failed: {}", e))?;
-        gathered
-            .eval()
-            .map_err(|e| anyhow::anyhow!("eval failed: {}", e))?;
+        let mut gathered = gathered.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+        gathered.eval();
         let nll: f32 = gathered.as_slice::<f32>().iter().map(|&v| -v).sum();
 
         total_nll += nll as f64;

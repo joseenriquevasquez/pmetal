@@ -7,7 +7,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! pmetal = "0.3"           # default features: core, gguf, metal, hub, mlx, models, lora, trainer, ane
+//! pmetal = "0.3"           # default features: core, gguf, metal, hub, mlx, models, data, ane
 //! pmetal = { version = "0.3", features = ["full"] }  # everything
 //! ```
 //!
@@ -21,8 +21,8 @@
 //! | `hub` | [`pmetal-hub`] | yes | HuggingFace Hub integration + model resolution |
 //! | `mlx` | [`pmetal-mlx`] | yes | MLX backend |
 //! | `models` | [`pmetal-models`] | yes | LLM architectures |
-//! | `lora` | [`pmetal-lora`] | yes | LoRA/QLoRA training |
-//! | `trainer` | [`pmetal-trainer`] | yes | Training loops (enables `data` + `distill`) |
+//! | `lora` | [`pmetal-lora`] | no | LoRA/QLoRA training |
+//! | `trainer` | [`pmetal-trainer`] | no | Training loops (enables `data` + `distill`) |
 //! | `ane` | [`pmetal-metal`] | yes | Apple Neural Engine integration |
 //! | `data` | [`pmetal-data`] | yes | Dataset loading |
 //! | `distill` | [`pmetal-distill`] | yes* | Knowledge distillation (*enabled transitively via `trainer`) |
@@ -65,14 +65,13 @@ pub mod version;
 
 /// Unified inference pipeline shared by CLI, GUI, and serve.
 ///
-/// Requires features: `hub`, `data`, `models`, `lora`.
-#[cfg(all(
-    feature = "hub",
-    feature = "data",
-    feature = "models",
-    feature = "lora"
-))]
+/// Requires features: `hub`, `data`, `models`.
+#[cfg(all(feature = "hub", feature = "data", feature = "models"))]
 pub mod inference_runner;
+
+/// Bridge-native inference implementations shared by CLI and library callers.
+#[cfg(any(feature = "models", feature = "native-only"))]
+pub mod native_inference;
 
 // NOTE: `core` below shadows the Rust built-in `core` crate within this file.
 // Any code added here that needs `core::fmt`, `core::mem`, etc. must use `::core::`.
@@ -140,7 +139,9 @@ pub mod prelude {
 
     // MLX prelude minus Dtype (use mlx::Dtype explicitly to avoid ambiguity with core::Dtype)
     #[cfg(feature = "mlx")]
-    pub use pmetal_mlx::prelude::{Array, Builder, Module, ModuleParameters, Param};
+    pub use pmetal_mlx::Builder;
+    #[cfg(feature = "mlx")]
+    pub use pmetal_mlx::prelude::{Array, Module, ModuleParameters, Param};
 
     #[cfg(feature = "distributed")]
     pub use pmetal_distributed::prelude::*;

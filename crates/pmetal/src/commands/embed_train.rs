@@ -17,8 +17,7 @@ pub(crate) async fn run_embed_train(
     log_every: usize,
     seed: u64,
 ) -> anyhow::Result<()> {
-    use mlx_rs::builder::Builder;
-    use mlx_rs::optimizers::{AdamWBuilder, Optimizer};
+    use pmetal_bridge::compat::optimizers::{AdamWBuilder, Optimizer};
     use pmetal_data::EmbeddingDataset;
     use pmetal_models::architectures::bert::BertForEmbedding;
     use pmetal_models::pooling::PoolingMode;
@@ -136,7 +135,7 @@ pub(crate) async fn run_embed_train(
 
     // Manual training loop using the encode_and_loss helpers exposed by the trainer
     // until BertForEmbedding implements TrainableModel.
-    use mlx_rs::{module::ModuleParameters, nn, transforms::eval_params};
+    use pmetal_bridge::compat::{eval_params, module::ModuleParameters, nn};
     use pmetal_models::pooling::{normalize_embeddings, pool};
     use pmetal_trainer::contrastive_loss;
 
@@ -207,39 +206,71 @@ pub(crate) async fn run_embed_train(
                             mask_b[i * actual_max_b + j] = 1;
                         }
                     }
-                    let ids_a =
-                        mlx_rs::Array::from_slice(&flat_a, &[bs as i32, actual_max_a as i32]);
-                    let m_a = mlx_rs::Array::from_slice(&mask_a, &[bs as i32, actual_max_a as i32]);
-                    let ids_b =
-                        mlx_rs::Array::from_slice(&flat_b, &[bs as i32, actual_max_b as i32]);
-                    let m_b = mlx_rs::Array::from_slice(&mask_b, &[bs as i32, actual_max_b as i32]);
+                    let ids_a = pmetal_bridge::compat::Array::from_slice(
+                        &flat_a,
+                        &[bs as i32, actual_max_a as i32],
+                    );
+                    let m_a = pmetal_bridge::compat::Array::from_slice(
+                        &mask_a,
+                        &[bs as i32, actual_max_a as i32],
+                    );
+                    let ids_b = pmetal_bridge::compat::Array::from_slice(
+                        &flat_b,
+                        &[bs as i32, actual_max_b as i32],
+                    );
+                    let m_b = pmetal_bridge::compat::Array::from_slice(
+                        &mask_b,
+                        &[bs as i32, actual_max_b as i32],
+                    );
                     let labels_data: Vec<f32> =
                         batch.iter().map(|p| p.label.unwrap_or(1.0)).collect();
-                    let labels = mlx_rs::Array::from_slice(&labels_data, &[bs as i32]);
+                    let labels =
+                        pmetal_bridge::compat::Array::from_slice(&labels_data, &[bs as i32]);
 
                     let loss_fn = |m: &mut BertForEmbedding,
-                                   (ia, ma, ib, mb, lbl): (&mlx_rs::Array, &mlx_rs::Array, &mlx_rs::Array, &mlx_rs::Array, &mlx_rs::Array)|
-                     -> Result<mlx_rs::Array, mlx_rs::error::Exception> {
+                                   (ia, ma, ib, mb, lbl): (
+                        &pmetal_bridge::compat::Array,
+                        &pmetal_bridge::compat::Array,
+                        &pmetal_bridge::compat::Array,
+                        &pmetal_bridge::compat::Array,
+                        &pmetal_bridge::compat::Array,
+                    )|
+                     -> Result<
+                        pmetal_bridge::compat::Array,
+                        pmetal_bridge::compat::Exception,
+                    > {
                         let ha = m.forward(ia, Some(ma))?;
                         let hb = m.forward(ib, Some(mb))?;
                         let ea = pool(&ha, ma, pooling_copy)?;
                         let eb = pool(&hb, mb, pooling_copy)?;
-                        let ea = if normalize_copy { normalize_embeddings(&ea)? } else { ea };
-                        let eb = if normalize_copy { normalize_embeddings(&eb)? } else { eb };
+                        let ea = if normalize_copy {
+                            normalize_embeddings(&ea)?
+                        } else {
+                            ea
+                        };
+                        let eb = if normalize_copy {
+                            normalize_embeddings(&eb)?
+                        } else {
+                            eb
+                        };
                         match loss_type_copy {
-                            EmbeddingLossType::InfoNce | EmbeddingLossType::Mnrl =>
-                                contrastive_loss::info_nce_loss(&ea, &eb, temperature_copy),
-                            EmbeddingLossType::CoSent =>
-                                contrastive_loss::cosent_loss(&ea, &eb, lbl, temperature_copy),
-                            EmbeddingLossType::CosineSimilarity =>
-                                contrastive_loss::cosine_similarity_loss(&ea, &eb, lbl),
-                            EmbeddingLossType::Triplet =>
-                                contrastive_loss::info_nce_loss(&ea, &eb, temperature_copy),
+                            EmbeddingLossType::InfoNce | EmbeddingLossType::Mnrl => {
+                                contrastive_loss::info_nce_loss(&ea, &eb, temperature_copy)
+                            }
+                            EmbeddingLossType::CoSent => {
+                                contrastive_loss::cosent_loss(&ea, &eb, lbl, temperature_copy)
+                            }
+                            EmbeddingLossType::CosineSimilarity => {
+                                contrastive_loss::cosine_similarity_loss(&ea, &eb, lbl)
+                            }
+                            EmbeddingLossType::Triplet => {
+                                contrastive_loss::info_nce_loss(&ea, &eb, temperature_copy)
+                            }
                         }
                     };
 
                     let mut lag = nn::value_and_grad(loss_fn);
-                    let (loss, grads) = lag(&mut model, (&ids_a, &m_a, &ids_b, &m_b, &labels))
+                    let (mut loss, grads) = lag(&mut model, (&ids_a, &m_a, &ids_b, &m_b, &labels))
                         .map_err(|e| anyhow::anyhow!("Forward/backward error: {}", e))?;
                     optimizer
                         .update(&mut model, grads)
@@ -302,10 +333,14 @@ pub(crate) async fn run_embed_train(
                                     msk[i * mlen + j] = 1;
                                 }
                             }
-                            let ids_arr =
-                                mlx_rs::Array::from_slice(&flat, &[bs2 as i32, mlen as i32]);
-                            let msk_arr =
-                                mlx_rs::Array::from_slice(&msk, &[bs2 as i32, mlen as i32]);
+                            let ids_arr = pmetal_bridge::compat::Array::from_slice(
+                                &flat,
+                                &[bs2 as i32, mlen as i32],
+                            );
+                            let msk_arr = pmetal_bridge::compat::Array::from_slice(
+                                &msk,
+                                &[bs2 as i32, mlen as i32],
+                            );
                             (ids_arr, msk_arr)
                         }};
                     }
@@ -318,23 +353,46 @@ pub(crate) async fn run_embed_train(
                     let (ids_n, m_n) = tok_batch!(negatives);
 
                     let loss_fn = |m: &mut BertForEmbedding,
-                                   (ia, ma, ip, mp, i_n, mn): (&mlx_rs::Array, &mlx_rs::Array, &mlx_rs::Array, &mlx_rs::Array, &mlx_rs::Array, &mlx_rs::Array)|
-                     -> Result<mlx_rs::Array, mlx_rs::error::Exception> {
+                                   (ia, ma, ip, mp, i_n, mn): (
+                        &pmetal_bridge::compat::Array,
+                        &pmetal_bridge::compat::Array,
+                        &pmetal_bridge::compat::Array,
+                        &pmetal_bridge::compat::Array,
+                        &pmetal_bridge::compat::Array,
+                        &pmetal_bridge::compat::Array,
+                    )|
+                     -> Result<
+                        pmetal_bridge::compat::Array,
+                        pmetal_bridge::compat::Exception,
+                    > {
                         let ha = m.forward(ia, Some(ma))?;
                         let hp = m.forward(ip, Some(mp))?;
                         let hn = m.forward(i_n, Some(mn))?;
                         let ea = pool(&ha, ma, pooling_copy)?;
                         let ep = pool(&hp, mp, pooling_copy)?;
                         let en = pool(&hn, mn, pooling_copy)?;
-                        let ea = if normalize_copy { normalize_embeddings(&ea)? } else { ea };
-                        let ep = if normalize_copy { normalize_embeddings(&ep)? } else { ep };
-                        let en = if normalize_copy { normalize_embeddings(&en)? } else { en };
+                        let ea = if normalize_copy {
+                            normalize_embeddings(&ea)?
+                        } else {
+                            ea
+                        };
+                        let ep = if normalize_copy {
+                            normalize_embeddings(&ep)?
+                        } else {
+                            ep
+                        };
+                        let en = if normalize_copy {
+                            normalize_embeddings(&en)?
+                        } else {
+                            en
+                        };
                         contrastive_loss::triplet_loss(&ea, &ep, &en, margin_copy)
                     };
 
                     let mut lag = nn::value_and_grad(loss_fn);
-                    let (loss, grads) = lag(&mut model, (&ids_a, &m_a, &ids_p, &m_p, &ids_n, &m_n))
-                        .map_err(|e| anyhow::anyhow!("Forward/backward error: {}", e))?;
+                    let (mut loss, grads) =
+                        lag(&mut model, (&ids_a, &m_a, &ids_p, &m_p, &ids_n, &m_n))
+                            .map_err(|e| anyhow::anyhow!("Forward/backward error: {}", e))?;
                     optimizer
                         .update(&mut model, grads)
                         .map_err(|e| anyhow::anyhow!("Optimizer error: {}", e))?;
@@ -363,10 +421,16 @@ pub(crate) async fn run_embed_train(
     std::fs::create_dir_all(output_dir)
         .map_err(|e| anyhow::anyhow!("Failed to create output dir: {}", e))?;
     let output_path = std::path::Path::new(output_dir).join("model.safetensors");
-    use mlx_rs::module::ModuleParametersExt;
-    model
-        .save_safetensors(&output_path)
-        .map_err(|e| anyhow::anyhow!("Failed to save weights: {}", e))?;
+    use pmetal_bridge::compat::module::ModuleParametersExt;
+    let output_path_str = output_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Non-UTF-8 output path: {}", output_path.display()))?;
+    let flattened = model.flatten_params();
+    let entries: Vec<(&str, &pmetal_bridge::compat::Array)> = flattened
+        .iter()
+        .map(|(name, value)| (name.as_ref(), value))
+        .collect();
+    pmetal_bridge::compat::Array::save_safetensors(output_path_str, &entries);
 
     // Copy config.json and tokenizer files so the output is a complete model directory
     for file in &[

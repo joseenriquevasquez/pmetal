@@ -18,6 +18,7 @@ mod tui;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(feature = "trainer")]
 use pmetal_core::{LoraConfig, TrainingConfig};
 
 /// Quantization method for QLoRA.
@@ -187,6 +188,7 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Fine-tune a model using LoRA/QLoRA
+    #[cfg(feature = "trainer")]
     Train {
         /// Path to training configuration file (YAML)
         #[arg(short, long)]
@@ -512,14 +514,18 @@ enum Commands {
         #[arg(long)]
         ane_real_time: bool,
 
-        /// Run benchmark mode: measure prefill + decode performance.
-        /// Outputs per-token timing, tok/s, and memory metrics.
+        /// Run an MLX-LM-compatible benchmark with random prompt ids, one warmup,
+        /// EOS disabled, and fixed generation length.
         #[arg(long)]
         benchmark: bool,
 
-        /// Number of decode iterations for benchmarking (default: 5)
+        /// Number of measured trials for benchmarking (default: 5)
         #[arg(long, default_value = "5")]
         benchmark_iters: usize,
+
+        /// Synthetic prompt length for --benchmark.
+        #[arg(long)]
+        benchmark_prompt_tokens: Option<usize>,
 
         /// Run an opt-in per-layer forward profile for supported hybrid models.
         /// Currently implemented for Qwen 3.5 / qwen3_next standard inference.
@@ -601,9 +607,11 @@ enum Commands {
     },
 
     /// Benchmark FFI overhead (for performance analysis)
+    #[cfg(feature = "trainer")]
     BenchFfi,
 
     /// Benchmark generation loop timing (detailed profiling)
+    #[cfg(feature = "trainer")]
     BenchGen {
         /// Model to benchmark
         #[arg(short, long, default_value = "Qwen/Qwen3-0.6B")]
@@ -611,6 +619,7 @@ enum Commands {
     },
 
     /// Benchmark training performance
+    #[cfg(feature = "trainer")]
     Bench {
         /// Model to benchmark
         #[arg(short, long, default_value = "meta-llama/Llama-3.2-1B")]
@@ -626,6 +635,7 @@ enum Commands {
     },
 
     /// Run a structured kernel benchmark corpus for this device tier
+    #[cfg(feature = "trainer")]
     BenchCorpus {
         /// Use a shorter run with fewer iterations and smaller tier-scaled shapes
         #[arg(long)]
@@ -641,6 +651,7 @@ enum Commands {
     },
 
     /// Benchmark a real cached workload for inference and short LoRA training
+    #[cfg(feature = "trainer")]
     BenchWorkload {
         /// Named preset that overrides the model/dataset/shape knobs below
         #[arg(long, value_enum)]
@@ -715,6 +726,7 @@ enum Commands {
     },
 
     /// Benchmark Qwen3.5 GDN backends on the actual model layer shapes
+    #[cfg(feature = "trainer")]
     BenchGdn {
         /// Qwen3.5/Qwen3Next model ID or local path
         #[arg(long, default_value = "unsloth/Qwen3.5-0.8B")]
@@ -754,6 +766,7 @@ enum Commands {
     },
 
     /// Generate a sample configuration file
+    #[cfg(feature = "trainer")]
     Init {
         /// Output path for the config file
         #[arg(short, long, default_value = "config.yaml")]
@@ -782,6 +795,7 @@ enum Commands {
     },
 
     /// Fuse LoRA adapter weights into a base model and save as a complete model
+    #[cfg(feature = "lora")]
     Fuse {
         /// Base model ID or path
         #[arg(short, long)]
@@ -857,6 +871,7 @@ enum Commands {
     },
 
     /// Knowledge Distillation from teacher to student
+    #[cfg(feature = "trainer")]
     Distill {
         /// Teacher model ID or path
         #[arg(short, long)]
@@ -952,6 +967,7 @@ enum Commands {
     },
 
     /// Group Relative Policy Optimization (GRPO) for reasoning models
+    #[cfg(feature = "trainer")]
     Grpo {
         /// Model ID or path
         #[arg(short, long)]
@@ -1123,6 +1139,7 @@ enum Commands {
     /// from a teacher model in a single training loop.
     ///
     /// Loss formula: L = (1 - alpha) * L_grpo + alpha * L_distill
+    #[cfg(feature = "trainer")]
     Rlkd {
         /// Policy (student) model ID or local path.
         #[arg(short, long)]
@@ -1339,6 +1356,7 @@ enum Commands {
     },
 
     /// Merge two or more models using various merge methods (SLERP, TIES, DARE, linear, etc.)
+    #[cfg(feature = "merge")]
     Merge {
         /// First model path or HuggingFace ID
         #[arg(short = 'a', long)]
@@ -1382,6 +1400,7 @@ enum Commands {
     },
 
     /// Evaluate a model's perplexity on a dataset
+    #[cfg(feature = "lora")]
     Eval {
         /// Model ID or path
         #[arg(short, long)]
@@ -1421,6 +1440,7 @@ enum Commands {
     /// Triplet JSONL:
     ///   {"anchor": "...", "positive": "...", "negative": "..."}
     #[command(name = "embed-train")]
+    #[cfg(feature = "trainer")]
     EmbedTrain {
         /// Path to the BERT / encoder model directory.
         #[arg(short, long)]
@@ -2291,10 +2311,14 @@ async fn tokio_main() -> anyhow::Result<()> {
 
     // Initialize logging — suppress stderr output when running the TUI
     // to avoid corrupting the raw terminal display.
+    #[cfg(feature = "dashboard")]
     let is_tui = matches!(cli.command, Commands::Tui { .. });
+    #[cfg(not(feature = "dashboard"))]
+    let is_tui = false;
     init_logging(if is_tui { "tui" } else { "cli" }, is_tui);
 
     match cli.command {
+        #[cfg(feature = "trainer")]
         Commands::Train {
             config,
             model,
@@ -2555,6 +2579,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             ane_real_time,
             benchmark,
             benchmark_iters,
+            benchmark_prompt_tokens,
             profile_layers,
             profile_output,
             kv_quant,
@@ -2621,6 +2646,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 false,
                 benchmark,
                 benchmark_iters,
+                benchmark_prompt_tokens,
                 profile_layers,
                 validated_profile_output.as_deref(),
                 kv_quant,
@@ -2691,6 +2717,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             }
         }
 
+        #[cfg(feature = "trainer")]
         Commands::Bench {
             model,
             batch_size,
@@ -2699,6 +2726,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             commands::bench::run_benchmark(&model, batch_size, seq_len).await?;
         }
 
+        #[cfg(feature = "trainer")]
         Commands::BenchCorpus {
             quick,
             json,
@@ -2711,6 +2739,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             commands::bench::run_kernel_benchmark_corpus(quick, validated_output.as_deref(), json)?;
         }
 
+        #[cfg(feature = "trainer")]
         Commands::BenchWorkload {
             preset,
             model,
@@ -2767,6 +2796,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             }
         }
 
+        #[cfg(feature = "trainer")]
         Commands::BenchGdn {
             model,
             stage,
@@ -2796,16 +2826,19 @@ async fn tokio_main() -> anyhow::Result<()> {
             .await?;
         }
 
+        #[cfg(feature = "trainer")]
         Commands::Init { output } => {
             // Validate output path to prevent path traversal attacks
             let validated_output = validate_output_path(&output, "config output")?;
             commands::bench::generate_sample_config(&validated_output.to_string_lossy())?;
         }
 
+        #[cfg(feature = "trainer")]
         Commands::BenchFfi => {
             commands::bench::run_ffi_benchmark()?;
         }
 
+        #[cfg(feature = "trainer")]
         Commands::BenchGen { model } => {
             commands::bench::run_gen_benchmark(&model).await?;
         }
@@ -2814,6 +2847,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             commands::ollama::run_ollama_command(action).await?;
         }
 
+        #[cfg(feature = "lora")]
         Commands::Fuse {
             model,
             lora,
@@ -2840,6 +2874,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             target_bpw,
             kl_threshold,
         } => {
+            #[cfg(feature = "lora")]
             if let Some(lora_path) = &lora {
                 // Fuse LoRA first, then quantize the fused model
                 let fused_dir = format!("{output}.fused_tmp");
@@ -2868,8 +2903,26 @@ async fn tokio_main() -> anyhow::Result<()> {
                 )
                 .await?;
             }
+
+            #[cfg(not(feature = "lora"))]
+            {
+                if lora.is_some() {
+                    anyhow::bail!("LoRA fusion during quantization requires the `lora` feature");
+                }
+                commands::quantize::run_quantization(
+                    &model,
+                    &output,
+                    imatrix.as_deref(),
+                    method,
+                    kl_calibrate,
+                    target_bpw,
+                    kl_threshold,
+                )
+                .await?;
+            }
         }
 
+        #[cfg(feature = "trainer")]
         Commands::Distill {
             teacher,
             student,
@@ -2925,6 +2978,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             .await?;
         }
 
+        #[cfg(feature = "trainer")]
         Commands::Grpo {
             model,
             dataset,
@@ -2994,6 +3048,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             .await?;
         }
 
+        #[cfg(feature = "trainer")]
         Commands::Rlkd {
             model,
             teacher_model,
@@ -3072,6 +3127,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             commands::info::run_info(json).await?;
         }
 
+        #[cfg(feature = "merge")]
         Commands::Merge {
             model_a,
             model_b,
@@ -3099,6 +3155,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             .await?;
         }
 
+        #[cfg(feature = "lora")]
         Commands::Eval {
             model,
             dataset,
@@ -3118,6 +3175,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             .await?;
         }
 
+        #[cfg(feature = "trainer")]
         Commands::EmbedTrain {
             model,
             dataset,
@@ -3168,17 +3226,89 @@ fn save_adapter_config(
     use_rslora: bool,
     base_model: Option<&str>,
 ) -> anyhow::Result<()> {
-    pmetal_trainer::orchestrator::save_adapter_config_with_base(
-        lora_weights_path,
-        r,
-        alpha,
-        target_modules,
-        use_rslora,
-        base_model,
-    )
+    let mut adapter_config = serde_json::json!({
+        "r": r,
+        "alpha": alpha,
+        "target_modules": target_modules,
+        "use_rslora": use_rslora,
+    });
+    if let Some(bm) = base_model {
+        adapter_config["base_model"] = serde_json::Value::String(bm.to_string());
+    }
+    let config_path = lora_weights_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("adapter_config.json");
+    std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
+    tracing::info!("Saved adapter config to {:?}", config_path);
+    Ok(())
 }
 
-/// Delegate to orchestrator's validate_output_path.
 fn validate_output_path(path: &str, context: &str) -> anyhow::Result<PathBuf> {
-    pmetal_trainer::orchestrator::validate_output_path(path, context)
+    use std::path::{Component, PathBuf};
+
+    let path = PathBuf::from(path);
+
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            anyhow::bail!(
+                "Path traversal detected in {}: '{}' contains '..' component. Please use a safe path.",
+                context,
+                path.display()
+            );
+        }
+    }
+
+    let cwd = std::env::current_dir()?;
+    let resolved = if path.is_absolute() {
+        path.clone()
+    } else {
+        cwd.join(&path)
+    };
+
+    if let Some(parent) = resolved.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let canonical = if resolved.exists() {
+        resolved.canonicalize()?
+    } else if let Some(parent) = resolved.parent() {
+        let canonical_parent = parent.canonicalize()?;
+        if let Some(filename) = resolved.file_name() {
+            canonical_parent.join(filename)
+        } else {
+            canonical_parent
+        }
+    } else {
+        resolved
+    };
+
+    let cwd_canonical = cwd.canonicalize()?;
+    let home_dir = dirs::home_dir();
+    let temp_dir = std::env::temp_dir().canonicalize().ok();
+
+    let is_safe = canonical.starts_with(&cwd_canonical)
+        || home_dir
+            .as_ref()
+            .map(|h| canonical.starts_with(h))
+            .unwrap_or(false)
+        || temp_dir
+            .as_ref()
+            .map(|t| canonical.starts_with(t))
+            .unwrap_or(false)
+        || canonical.starts_with("/tmp")
+        || canonical.starts_with("/private/tmp");
+
+    if !is_safe {
+        anyhow::bail!(
+            "Unsafe output path for {}: '{}' resolves to '{}'",
+            context,
+            path.display(),
+            canonical.display()
+        );
+    }
+
+    Ok(canonical)
 }

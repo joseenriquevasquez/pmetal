@@ -15,7 +15,7 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli", "dashboard", "ane"]
+default = ["cli", "ane"]
 
 # Foundation crates (no mlx-rs dependency)
 core = ["dep:pmetal-core"]
@@ -26,7 +26,7 @@ distributed = ["dep:pmetal-distributed", "pmetal-trainer?/distributed"]
 mhc = ["dep:pmetal-mhc", "core", "metal"]
 
 # MLX-dependent crates
-mlx = ["dep:pmetal-mlx", "dep:mlx-rs", "core", "metal"]
+mlx = ["dep:pmetal-mlx", "core", "metal"]
 models = ["dep:pmetal-models", "dep:pmetal-bridge", "core", "gguf", "metal", "mlx"]
 # Native-only: uses pmetal-bridge exclusively, NO mlx-rs/mlx-sys (single libmlx.a)
 native-only = ["dep:pmetal-bridge", "core", "metal"]
@@ -51,7 +51,7 @@ full = [
 
 # CLI: adds the pmetal binary + all CLI-specific dependencies
 cli = [
-    "full",
+    "core", "gguf", "metal", "hub", "mlx", "models", "data",
     "dep:clap", "dep:tokio", "dep:tracing-subscriber",
     "dep:serde", "dep:serde_yaml", "dep:indicatif", "dep:anyhow",
     "dep:safetensors", "dep:dirs", "dep:chrono",
@@ -88,7 +88,6 @@ pmetal-merge = { workspace = true, optional = true }
 pmetal-vocoder = { workspace = true, optional = true }
 pmetal-serve = { workspace = true, optional = true }
 pmetal-mcp = { workspace = true, optional = true }
-mlx-rs = { workspace = true, optional = true }
 
 # Always-on (SDK facade needs these)
 serde_json = { workspace = true }
@@ -149,6 +148,11 @@ required-features = ["hub", "data", "models", "ane"]
 name = "finetune_manual"
 path = "examples/finetune_manual.rs"
 required-features = ["data", "lora", "trainer"]
+
+[[example]]
+name = "finetune_ane"
+path = "examples/finetune_ane.rs"
+required-features = ["trainer", "ane"]
 
 [lints]
 workspace = true

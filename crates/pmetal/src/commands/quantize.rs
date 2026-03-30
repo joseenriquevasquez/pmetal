@@ -1,5 +1,25 @@
 use std::path::{Path, PathBuf};
 
+use pmetal_mlx::{Array, Dtype};
+
+fn tensor_to_f32_vec(name: &str, tensor: &Array) -> anyhow::Result<Option<Vec<f32>>> {
+    let mut materialized = tensor.clone();
+    materialized.eval();
+
+    match materialized.dtype() {
+        Dtype::Float32 => Ok(Some(materialized.as_slice::<f32>().to_vec())),
+        Dtype::Float16 | Dtype::Bfloat16 => {
+            let mut float32 = materialized.as_dtype(Dtype::Float32.as_i32());
+            float32.eval();
+            Ok(Some(float32.as_slice::<f32>().to_vec()))
+        }
+        other => {
+            tracing::debug!("Skipping non-float tensor {name} with dtype {:?}", other);
+            Ok(None)
+        }
+    }
+}
+
 /// Run model quantization.
 pub(crate) async fn run_quantization(
     model_path: &str,
@@ -129,22 +149,9 @@ pub(crate) async fn run_quantization(
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("Tensor {} missing after key listing", name))?;
 
-            tensor
-                .eval()
-                .map_err(|e| anyhow::anyhow!("MLX eval error for {}: {}", name, e))?;
-
-            let data_f32: Vec<f32> = match tensor.dtype() {
-                pmetal_mlx::Dtype::Float32 => tensor.as_slice::<f32>().to_vec(),
-                pmetal_mlx::Dtype::Float16 | pmetal_mlx::Dtype::Bfloat16 => {
-                    let t_f32 = tensor.as_dtype(pmetal_mlx::Dtype::Float32).map_err(|e| {
-                        anyhow::anyhow!("Dtype conversion error for {}: {}", name, e)
-                    })?;
-                    t_f32
-                        .eval()
-                        .map_err(|e| anyhow::anyhow!("MLX eval error for {}: {}", name, e))?;
-                    t_f32.as_slice::<f32>().to_vec()
-                }
-                _ => continue,
+            let data_f32 = match tensor_to_f32_vec(name, tensor)? {
+                Some(data) => data,
+                None => continue,
             };
 
             let shape_i32: Vec<i32> = tensor.shape().iter().map(|&d| d as i32).collect();
@@ -207,25 +214,9 @@ pub(crate) async fn run_quantization(
             let shape = tensor.shape();
             shape_u64 = shape.iter().map(|&d| d as u64).collect();
 
-            tensor
-                .eval()
-                .map_err(|e| anyhow::anyhow!("MLX eval error: {}", e))?;
-
-            data_f32 = match tensor.dtype() {
-                pmetal_mlx::Dtype::Float32 => tensor.as_slice::<f32>().to_vec(),
-                pmetal_mlx::Dtype::Float16 | pmetal_mlx::Dtype::Bfloat16 => {
-                    let t_f32 = tensor
-                        .as_dtype(pmetal_mlx::Dtype::Float32)
-                        .map_err(|e| anyhow::anyhow!("Dtype conversion error: {}", e))?;
-                    t_f32
-                        .eval()
-                        .map_err(|e| anyhow::anyhow!("MLX eval error: {}", e))?;
-                    t_f32.as_slice::<f32>().to_vec()
-                }
-                _ => {
-                    tracing::warn!("Skipping non-float tensor: {}", name);
-                    continue;
-                }
+            data_f32 = match tensor_to_f32_vec(name, tensor)? {
+                Some(data) => data,
+                None => continue,
             };
         }
 

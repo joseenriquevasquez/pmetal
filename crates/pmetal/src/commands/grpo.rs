@@ -1,4 +1,3 @@
-use mlx_rs::builder::Builder;
 use pmetal_core::TrainingConfig;
 use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
 use pmetal_trainer::{GrpoConfig, GrpoTrainer, TrainingLoopConfig};
@@ -179,7 +178,7 @@ pub(crate) async fn run_grpo_cli(
                 &self,
                 _prompts: &[String],
                 completions: &[String],
-                _images: Option<&[Vec<mlx_rs::Array>]>,
+                _images: Option<&[Vec<pmetal_bridge::compat::Array>]>,
             ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
                 Ok(completions
                     .iter()
@@ -206,7 +205,7 @@ pub(crate) async fn run_grpo_cli(
                 &self,
                 _prompts: &[String],
                 completions: &[String],
-                _images: Option<&[Vec<mlx_rs::Array>]>,
+                _images: Option<&[Vec<pmetal_bridge::compat::Array>]>,
             ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
                 Ok(completions
                     .iter()
@@ -238,7 +237,7 @@ pub(crate) async fn run_grpo_cli(
                 &self,
                 _p: &[String],
                 completions: &[String],
-                _i: Option<&[Vec<mlx_rs::Array>]>,
+                _i: Option<&[Vec<pmetal_bridge::compat::Array>]>,
             ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
                 Ok(vec![0.1; completions.len()])
             }
@@ -356,7 +355,7 @@ pub(crate) async fn run_grpo_cli(
     }
 
     // 7b. Setup Optimizer
-    let mut optimizer = mlx_rs::optimizers::AdamWBuilder::new(learning_rate as f32)
+    let mut optimizer = pmetal_bridge::compat::optimizers::AdamWBuilder::new(learning_rate as f32)
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build optimizer: {}", e))?;
 
@@ -387,7 +386,7 @@ pub(crate) async fn run_grpo_cli(
                 Box::new(rewards),
                 &mut optimizer,
                 |opt, lr| {
-                    opt.lr = mlx_rs::array!(lr);
+                    opt.lr = pmetal_bridge::array!(lr);
                 },
             )
             .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;
@@ -401,7 +400,7 @@ pub(crate) async fn run_grpo_cli(
                 &rewards,
                 &mut optimizer,
                 |opt, lr| {
-                    opt.lr = mlx_rs::array!(lr);
+                    opt.lr = pmetal_bridge::array!(lr);
                 },
             )
             .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;

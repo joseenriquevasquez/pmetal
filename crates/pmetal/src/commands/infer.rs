@@ -1,10 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use mlx_rs::{
-    Array,
-    ops::indexing::{IndexOp, argmax},
-};
+use pmetal_mlx::{Array, Exception};
 use pmetal_models::{
     DynamicModel,
     architectures::{Qwen3NextForwardProfile, Qwen3NextLayerProfile},
@@ -183,7 +180,7 @@ fn run_qwen3_next_layer_profile(
             let mut mamba_cache = mamba_cache;
             let architecture = model.architecture();
             let DynamicModel::Qwen3Next(qwen) = model else {
-                return Err(mlx_rs::error::Exception::custom(format!(
+                return Err(Exception::custom(format!(
                     "--profile-layers currently supports Qwen 3.5 / qwen3_next only, got {architecture}"
                 )));
             };
@@ -197,10 +194,10 @@ fn run_qwen3_next_layer_profile(
                 "prefill",
             )?;
 
-            let last_logits = prefill_logits.index((.., -1, ..));
-            last_logits.eval()?;
-            let next_token = argmax(&last_logits, None)?;
-            next_token.eval()?;
+            let last_logits = pmetal_bridge::compat::ops::select_axis(&prefill_logits, -1, 1);
+            let next_token = pmetal_bridge::compat::ops::argmax(&last_logits, -1);
+            let mut next_token = next_token;
+            next_token.eval();
             let decode_token_id = next_token.item::<u32>();
             let decode_input = Array::from_slice(&[decode_token_id as i32], &[1, 1]);
 
@@ -295,6 +292,7 @@ pub(crate) async fn run_inference(
     ane_real_time: bool,
     benchmark: bool,
     benchmark_iters: usize,
+    benchmark_prompt_tokens: Option<usize>,
     profile_layers: bool,
     profile_output: Option<&Path>,
     kv_quant: Option<u8>,
@@ -325,91 +323,6 @@ pub(crate) async fn run_inference(
     } else {
         PathBuf::from(model_id)
     };
-
-    // ── Native fast-path: skip mlx-rs entirely for supported architectures ──
-    #[cfg(any(feature = "models", feature = "native-only"))]
-    if lora_path.is_none() && !fp8 && !profile_layers && !ane && experts_dir.is_none() {
-        if let Some(arch) = crate::native_inference::detect_arch(&model_path) {
-            let tokenizer = pmetal_data::Tokenizer::from_model_dir(&model_path)
-                .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-
-            // Tokenize (with chat template if applicable)
-            let use_chat_mode = chat || tools.is_some();
-            let input_ids = if use_chat_mode {
-                let detected = pmetal_data::chat_templates::detect_chat_template(
-                    &model_path, &model_path.to_string_lossy());
-                let mut messages = Vec::new();
-                if let Some(sys) = system {
-                    messages.push(pmetal_data::chat_templates::Message {
-                        role: "system".into(), content: sys.to_string(),
-                        tool_calls: None, tool_call_id: None,
-                    });
-                }
-                messages.push(pmetal_data::chat_templates::Message {
-                    role: "user".into(), content: prompt.to_string(),
-                    tool_calls: None, tool_call_id: None,
-                });
-                let formatted = detected.apply_inference(&messages, no_thinking, tools).text;
-                tokenizer.encode_with_special_tokens(&formatted)
-                    .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?
-            } else {
-                tokenizer.encode(prompt)
-                    .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?
-            };
-
-            let defaults = pmetal_data::inference_config::load_sampling_defaults(
-                &model_path, use_chat_mode && !no_thinking);
-            let temp = temperature.unwrap_or(defaults.temperature);
-            let tq_bits = if kv_turboquant { Some(4u8) } else { None };
-
-            let stop_tokens: std::collections::HashSet<u32> =
-                pmetal_data::inference_config::collect_all_stop_tokens(
-                    &model_path, &tokenizer, None,
-                ).into_iter().collect();
-
-            println!("\n========================================");
-            println!("  PMetal Native Inference ({:?})", arch);
-            println!("========================================");
-            println!("Model:       {}", model_id);
-            println!("Temperature: {:.2}", temp);
-            println!("Max tokens:  {}", max_tokens);
-            println!("========================================\n");
-            println!("Prompt: {}\n", prompt);
-            println!("Generating...\n");
-
-            let start = std::time::Instant::now();
-            let prompt_len = input_ids.len();
-
-            let result = crate::native_inference::run_native_inference(
-                &model_path, &input_ids, max_tokens, temp, tq_bits,
-                |tok| !stop_tokens.contains(&tok),
-            );
-
-            match result {
-                Ok(output) => {
-                    let generated_ids = &output.token_ids[prompt_len..];
-                    if let Ok(text) = tokenizer.decode(generated_ids) {
-                        print!("{text}");
-                    }
-                    println!();
-
-                    let elapsed = start.elapsed();
-                    let tok_s = output.num_generated as f64 / elapsed.as_secs_f64().max(1e-9);
-
-                    eprintln!("\n========================================");
-                    eprintln!("Prompt tokens:     {}", prompt_len);
-                    eprintln!("Generated tokens:  {}", output.num_generated);
-                    eprintln!("Total time:        {:.2}s", elapsed.as_secs_f64());
-                    eprintln!("Tokens/sec:        {:.1}", tok_s);
-                    eprintln!("========================================");
-                    return Ok(());
-                }
-                Err(e) => {
-                    tracing::warn!("Native inference failed: {e}, falling back to mlx-rs path");
-                }
-            }
-        }
-    }
 
     // ── Prepare inference via shared runner ──────────────────────────────
     use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig};
@@ -457,6 +370,46 @@ pub(crate) async fn run_inference(
             anyhow::bail!("--profile-layers is only supported for standard models right now");
         }
         return run_qwen3_next_layer_profile(&mut runner, model_id, profile_output);
+    }
+
+    if benchmark {
+        let prompt_tokens = benchmark_prompt_tokens
+            .ok_or_else(|| anyhow::anyhow!("--benchmark requires --benchmark-prompt-tokens"))?;
+        println!("Running warmup..");
+        println!(
+            "Timing with prompt_tokens={prompt_tokens}, generation_tokens={max_tokens}, batch_size=1."
+        );
+        let trials = runner.benchmark_mlx_lm(
+            prompt_tokens,
+            max_tokens,
+            benchmark_iters,
+            seed.unwrap_or(0),
+        )?;
+
+        for (i, trial) in trials.iter().enumerate() {
+            println!(
+                "Trial {}:  prompt_tps={:.3}, generation_tps={:.3}, peak_memory={:.3}",
+                i + 1,
+                trial.prompt_tps,
+                trial.generation_tps,
+                trial.peak_memory_gb
+            );
+        }
+
+        if !trials.is_empty() {
+            let avg =
+                |f: fn(&pmetal::native_inference::MlxLmBenchmarkTrial) -> f64| -> f64 {
+                    trials.iter().map(|trial| f(trial)).sum::<f64>() / trials.len() as f64
+                };
+            println!(
+                "Averages: prompt_tps={:.3}, generation_tps={:.3}, peak_memory={:.3}",
+                avg(|t| t.prompt_tps),
+                avg(|t| t.generation_tps),
+                avg(|t| t.peak_memory_gb),
+            );
+        }
+
+        return Ok(());
     }
 
     // Print configuration
@@ -534,7 +487,7 @@ pub(crate) async fn run_inference(
                     Ok(config_text) => {
                         match serde_json::from_str::<serde_json::Value>(&config_text) {
                             Ok(config_json) => {
-                                use pmetal_trainer::DynamicAneTrainerConfig;
+                                use pmetal_metal::ane::dynamic_trainer::DynamicAneTrainerConfig;
                                 match DynamicAneTrainerConfig::is_ane_compatible(&config_json) {
                                     Ok(()) => true,
                                     Err(reason) => {
@@ -733,62 +686,6 @@ pub(crate) async fn run_inference(
                 stats.total,
             );
         }
-    }
-
-    // ── Benchmark mode ────────────────────────────────────────────────────────
-    if benchmark {
-        use std::time::Instant;
-
-        println!(
-            "\n=== Benchmark Mode ({} decode iterations) ===",
-            benchmark_iters
-        );
-
-        let last_token_id = output.token_ids.last().copied().unwrap_or(1);
-        let mut decode_times_ms: Vec<f64> = Vec::with_capacity(benchmark_iters);
-
-        // Warm-up + timed decode via run_with to avoid borrow conflicts
-        runner.state.run_with(|fwd, cache| {
-            // Warm-up
-            {
-                let input = mlx_rs::Array::from_slice(&[last_token_id as i32], &[1, 1]);
-                if let Ok(ref logits_w) = fwd(&input, cache) {
-                    let _ = logits_w.eval();
-                }
-            }
-
-            for i in 0..benchmark_iters {
-                let input = mlx_rs::Array::from_slice(&[last_token_id as i32], &[1, 1]);
-                let t0 = Instant::now();
-                let logits = fwd(&input, cache);
-                if let Ok(ref l) = logits {
-                    let _ = l.eval();
-                }
-                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                let tps = 1000.0 / ms;
-                decode_times_ms.push(ms);
-                let status = if logits.is_ok() { "ok" } else { "err" };
-                println!("  [{i}] {ms:.1} ms ({tps:.2} tok/s)  [{status}]");
-            }
-        });
-
-        if !decode_times_ms.is_empty() {
-            let mut sorted = decode_times_ms.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let n = sorted.len();
-            let mean = sorted.iter().sum::<f64>() / n as f64;
-            let min = sorted[0];
-            let p50 = sorted[n / 2];
-            let p99 = sorted[(n * 99 / 100).min(n - 1)];
-            println!("[mean]    {mean:.1} ms ({:.2} tok/s)", 1000.0 / mean);
-            println!("[min]     {min:.1} ms ({:.2} tok/s)", 1000.0 / min);
-            println!("[p50]     {p50:.1} ms ({:.2} tok/s)", 1000.0 / p50);
-            println!("[p99]     {p99:.1} ms ({:.2} tok/s)", 1000.0 / p99);
-        }
-
-        let mem_stats = pmetal_mlx::memory::get_memory_stats();
-        println!("[memory]  {:.1} GB resident", mem_stats.used_gb());
-        println!("[peak]    {:.1} GB peak", mem_stats.peak_gb());
     }
 
     Ok(())

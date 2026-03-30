@@ -1,9 +1,5 @@
 #![cfg(target_os = "macos")]
 
-use mlx_rs::{
-    Array,
-    ops::indexing::{IndexOp, argmax},
-};
 use pmetal::{
     data::{
         Tokenizer,
@@ -11,6 +7,7 @@ use pmetal::{
     },
     models::DynamicModel,
 };
+use pmetal_bridge::compat::{Array, ops};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -88,9 +85,10 @@ fn qwen35_cached_first_token_matches_plain_and_cached_paths() {
 
     let mut plain_model = DynamicModel::load(&model_path).expect("load plain model");
     let plain_logits = plain_model.forward(&input, None).expect("plain forward");
-    let plain_next = argmax(plain_logits.index((.., -1, ..)), None)
-        .expect("plain argmax")
-        .item::<u32>();
+    let plain_last = ops::select_axis(&plain_logits, -1, 1);
+    let mut plain_next = ops::argmax_axis(&plain_last, -1);
+    plain_next.eval();
+    let plain_next = plain_next.item::<u32>();
 
     let mut cached_model = DynamicModel::load(&model_path).expect("load cached model");
     let mut cache = cached_model.create_cache(token_ids.len() + 1);
@@ -98,9 +96,10 @@ fn qwen35_cached_first_token_matches_plain_and_cached_paths() {
     let cached_logits = cached_model
         .forward_with_hybrid_cache(&input, None, Some(&mut cache), mamba_cache.as_mut())
         .expect("cached forward");
-    let cached_next = argmax(cached_logits.index((.., -1, ..)), None)
-        .expect("cached argmax")
-        .item::<u32>();
+    let cached_last = ops::select_axis(&cached_logits, -1, 1);
+    let mut cached_next = ops::argmax_axis(&cached_last, -1);
+    cached_next.eval();
+    let cached_next = cached_next.item::<u32>();
     let decoded = tokenizer
         .decode(&[plain_next])
         .unwrap_or_else(|_| "<decode failed>".to_string());

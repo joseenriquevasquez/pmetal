@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use pmetal_bridge::InlineArray;
+use pmetal_bridge::{InlineArray, turboquant::TurboQuantConfig};
 
 // ============================================================================
 // Architecture enum
@@ -73,6 +73,13 @@ pub struct NativeGenerationOutput {
     pub stopped_by_length: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct MlxLmBenchmarkTrial {
+    pub prompt_tps: f64,
+    pub generation_tps: f64,
+    pub peak_memory_gb: f64,
+}
+
 // ============================================================================
 // Top-level dispatch
 // ============================================================================
@@ -88,24 +95,62 @@ pub fn run_native_inference(
     input_ids: &[u32],
     max_tokens: usize,
     temperature: f32,
-    tq_bits: Option<u8>,
+    turboquant: Option<TurboQuantConfig>,
     mut on_token: impl FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
     let arch = detect_arch(model_path)
         .ok_or_else(|| "unsupported architecture for native inference".to_string())?;
 
     match arch {
-        NativeArch::Qwen3 | NativeArch::Qwen3_5 => {
-            run_qwen3(model_path, input_ids, max_tokens, temperature, tq_bits, &mut on_token)
-        }
+        NativeArch::Qwen3 | NativeArch::Qwen3_5 => run_qwen3(
+            model_path,
+            input_ids,
+            max_tokens,
+            temperature,
+            turboquant,
+            &mut on_token,
+        ),
         NativeArch::Llama4 => {
-            run_llama4(model_path, input_ids, max_tokens, temperature, &mut on_token)
+            if turboquant.is_some() {
+                return Err(
+                    "TurboQuant native cache is only supported for Qwen3/Qwen3.5".to_string(),
+                );
+            }
+            run_llama4(
+                model_path,
+                input_ids,
+                max_tokens,
+                temperature,
+                &mut on_token,
+            )
         }
         NativeArch::DeepSeek => {
-            run_deepseek(model_path, input_ids, max_tokens, temperature, &mut on_token)
+            if turboquant.is_some() {
+                return Err(
+                    "TurboQuant native cache is only supported for Qwen3/Qwen3.5".to_string(),
+                );
+            }
+            run_deepseek(
+                model_path,
+                input_ids,
+                max_tokens,
+                temperature,
+                &mut on_token,
+            )
         }
         NativeArch::GptOss => {
-            run_gpt_oss(model_path, input_ids, max_tokens, temperature, &mut on_token)
+            if turboquant.is_some() {
+                return Err(
+                    "TurboQuant native cache is only supported for Qwen3/Qwen3.5".to_string(),
+                );
+            }
+            run_gpt_oss(
+                model_path,
+                input_ids,
+                max_tokens,
+                temperature,
+                &mut on_token,
+            )
         }
     }
 }
@@ -136,6 +181,50 @@ fn last_token_logits(logits: &InlineArray) -> InlineArray {
         .reshape(&[b, vocab])
 }
 
+fn sample_first_token(
+    last_logits: &InlineArray,
+    temperature: f32,
+    sample_token: impl Fn(&InlineArray, f32) -> InlineArray,
+) -> u32 {
+    let mut tok_arr = sample_token(last_logits, temperature);
+    tok_arr.eval();
+    tok_arr.item_u32()
+}
+
+fn finish_with_bridge_generate(
+    prompt: &[u32],
+    first_tok: u32,
+    max_tokens: usize,
+    on_token: &mut dyn FnMut(u32) -> bool,
+    generate_tail: impl FnOnce(&mut dyn FnMut(u32) -> bool) -> Vec<u32>,
+) -> NativeGenerationOutput {
+    let prompt_len = prompt.len();
+    let mut all_tokens = prompt.to_vec();
+    all_tokens.push(first_tok);
+
+    if !on_token(first_tok) {
+        return NativeGenerationOutput {
+            token_ids: all_tokens,
+            num_generated: 1,
+            stopped_by_token: true,
+            stopped_by_length: false,
+        };
+    }
+
+    let remaining = max_tokens.saturating_sub(1);
+    let generated_tail = generate_tail(on_token);
+    let stopped_by_token = generated_tail.len() < remaining;
+    all_tokens.extend(generated_tail);
+    let num_generated = all_tokens.len() - prompt_len;
+
+    NativeGenerationOutput {
+        token_ids: all_tokens,
+        num_generated,
+        stopped_by_token,
+        stopped_by_length: !stopped_by_token && num_generated >= max_tokens,
+    }
+}
+
 // ============================================================================
 // Qwen3 / Qwen3.5
 // ============================================================================
@@ -145,7 +234,7 @@ fn run_qwen3(
     input_ids: &[u32],
     max_tokens: usize,
     temperature: f32,
-    tq_bits: Option<u8>,
+    turboquant: Option<TurboQuantConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
     use pmetal_bridge::qwen3_native;
@@ -156,7 +245,11 @@ fn run_qwen3(
         if config.is_moe() { " MoE" } else { "" },
         config.num_hidden_layers,
         config.hidden_size,
-        if config.is_qwen3_dense() { " (Qwen3 dense)" } else { "" },
+        if config.is_qwen3_dense() {
+            " (Qwen3 dense)"
+        } else {
+            ""
+        },
     );
 
     let t0 = std::time::Instant::now();
@@ -167,37 +260,123 @@ fn run_qwen3(
         pmetal_bridge::inline_array::get_active_memory() as f64 / 1e6,
     );
 
-    let mut cache = if let Some(bits) = tq_bits {
-        let tq_config = pmetal_bridge::turboquant::TurboQuantConfig::uniform(bits, bits);
-        qwen3_native::NativeCache::new_with_turboquant(&weights, Some(tq_config))
-    } else {
-        qwen3_native::NativeCache::new_empty(&weights)
-    };
+    let mut cache = build_qwen3_cache(&weights, turboquant);
 
     // Prefill
     let input = prompt_to_input(input_ids);
     let logits = qwen3_native::forward_step(&weights, &input, &mut cache);
     let last_logits = last_token_logits(&logits); // [1, vocab]
+    let first_tok = sample_first_token(&last_logits, temperature, qwen3_native::sample_token);
 
-    let mut tok_arr = qwen3_native::sample_token(&last_logits, temperature);
-    tok_arr.eval();
-    let first_tok = tok_arr.item_u32();
-
-    finish_generation(
+    Ok(finish_with_bridge_generate(
         input_ids,
         first_tok,
         max_tokens,
         on_token,
-        |cur_tok, cache| {
-            let input = prompt_to_input(&[cur_tok]);
-            let logits = qwen3_native::forward_step(&weights, &input, cache);
-            let last_logits = last_token_logits(&logits);
-            let mut tok_arr = qwen3_native::sample_token(&last_logits, temperature);
-            tok_arr.eval();
-            tok_arr.item_u32()
+        |on_token| {
+            // Keep the Rust/bridge decode loop canonical until the monolithic
+            // C++ path demonstrably outperforms it on real models.
+            qwen3_native::generate(
+                &weights,
+                &mut cache,
+                first_tok,
+                max_tokens.saturating_sub(1),
+                temperature,
+                |tok| on_token(tok),
+            )
         },
-        &mut cache,
-    )
+    ))
+}
+
+fn build_qwen3_cache(
+    weights: &pmetal_bridge::qwen3_native::NativeWeights,
+    turboquant: Option<TurboQuantConfig>,
+) -> pmetal_bridge::qwen3_native::NativeCache {
+    match turboquant {
+        Some(config) => {
+            pmetal_bridge::qwen3_native::NativeCache::new_with_turboquant(weights, Some(config))
+        }
+        None => pmetal_bridge::qwen3_native::NativeCache::new_empty(weights),
+    }
+}
+
+/// Benchmark full prompt + generation throughput using the same workload shape
+/// as `mlx_lm.benchmark`: fixed prompt token ids, one warmup, EOS disabled, and
+/// repeated generations from a fresh cache.
+pub fn benchmark_native_mlx_lm(
+    model_path: &Path,
+    prompt_ids: &[u32],
+    generation_tokens: usize,
+    turboquant: Option<TurboQuantConfig>,
+    num_trials: usize,
+) -> Result<Vec<MlxLmBenchmarkTrial>, String> {
+    use pmetal_bridge::qwen3_native;
+
+    if prompt_ids.is_empty() {
+        return Err("MLX-LM parity benchmark requires prompt_tokens > 0".to_string());
+    }
+    if generation_tokens == 0 {
+        return Err("MLX-LM parity benchmark requires generation_tokens > 0".to_string());
+    }
+
+    let arch = detect_arch(model_path)
+        .ok_or_else(|| "unsupported architecture for native inference".to_string())?;
+    if !matches!(arch, NativeArch::Qwen3 | NativeArch::Qwen3_5) {
+        return Err(
+            "native MLX-LM parity benchmark is currently only implemented for Qwen3/Qwen3.5"
+                .to_string(),
+        );
+    }
+
+    let config = qwen3_native::load_config(model_path)?;
+    let weights = qwen3_native::load_model(model_path, &config)?;
+    if num_trials == 0 {
+        return Ok(Vec::new());
+    }
+
+    let prompt = prompt_to_input(prompt_ids);
+    let run_once = || {
+        pmetal_bridge::inline_array::reset_peak_memory();
+        let mut cache = build_qwen3_cache(&weights, turboquant);
+        let prompt_tic = std::time::Instant::now();
+        let logits = qwen3_native::forward_step(&weights, &prompt, &mut cache);
+        let last_logits = last_token_logits(&logits);
+        let first_tok = sample_first_token(&last_logits, 0.0, qwen3_native::sample_token);
+        let prompt_time = prompt_tic.elapsed().as_secs_f64();
+
+        let generation_tic = std::time::Instant::now();
+        if generation_tokens > 1 {
+            let current_y =
+                qwen3_native::prime_generation_preserve_peak(&weights, &mut cache, first_tok, 0.0);
+            let generated_tail = qwen3_native::generate_from_primed_sample(
+                &weights,
+                &mut cache,
+                current_y,
+                generation_tokens - 1,
+                0.0,
+                |_| true,
+            );
+            debug_assert_eq!(generated_tail.len(), generation_tokens - 1);
+        } else {
+            pmetal_bridge::inline_array::synchronize();
+        }
+        let generation_time = generation_tic.elapsed().as_secs_f64();
+
+        MlxLmBenchmarkTrial {
+            prompt_tps: prompt_ids.len() as f64 / prompt_time.max(f64::MIN_POSITIVE),
+            generation_tps: generation_tokens as f64 / generation_time.max(f64::MIN_POSITIVE),
+            peak_memory_gb: pmetal_bridge::inline_array::get_peak_memory() as f64 / 1e9,
+        }
+    };
+
+    let _warmup = run_once();
+
+    let mut trials = Vec::with_capacity(num_trials);
+    for _ in 0..num_trials {
+        trials.push(run_once());
+    }
+
+    Ok(trials)
 }
 
 // ============================================================================
@@ -217,10 +396,7 @@ fn run_llama4(
     let tc = config.text();
     eprintln!(
         "[NATIVE] Llama4 MoE: {} layers, hidden={}, experts={}/tok={}",
-        tc.num_hidden_layers,
-        tc.hidden_size,
-        tc.num_local_experts,
-        tc.num_experts_per_tok,
+        tc.num_hidden_layers, tc.hidden_size, tc.num_local_experts, tc.num_experts_per_tok,
     );
 
     let t0 = std::time::Instant::now();
@@ -237,26 +413,24 @@ fn run_llama4(
     let input = prompt_to_input(input_ids);
     let logits = llama4_native::forward_step(&weights, &input, &mut cache);
     let last_logits = last_token_logits(&logits); // [1, vocab]
+    let first_tok = sample_first_token(&last_logits, temperature, llama4_native::sample_token);
 
-    let mut tok_arr = llama4_native::sample_token(&last_logits, temperature);
-    tok_arr.eval();
-    let first_tok = tok_arr.item_u32();
-
-    finish_generation(
+    Ok(finish_with_bridge_generate(
         input_ids,
         first_tok,
         max_tokens,
         on_token,
-        |cur_tok, cache| {
-            let input = prompt_to_input(&[cur_tok]);
-            let logits = llama4_native::forward_step(&weights, &input, cache);
-            let last_logits = last_token_logits(&logits);
-            let mut tok_arr = llama4_native::sample_token(&last_logits, temperature);
-            tok_arr.eval();
-            tok_arr.item_u32()
+        |on_token| {
+            llama4_native::generate(
+                &weights,
+                &mut cache,
+                first_tok,
+                max_tokens.saturating_sub(1),
+                temperature,
+                |tok| on_token(tok),
+            )
         },
-        &mut cache,
-    )
+    ))
 }
 
 // ============================================================================
@@ -296,26 +470,24 @@ fn run_deepseek(
     let input = prompt_to_input(input_ids);
     let logits = deepseek_native::forward_step(&weights, &input, &mut cache);
     let last_logits = last_token_logits(&logits); // [1, vocab]
+    let first_tok = sample_first_token(&last_logits, temperature, deepseek_native::sample_token);
 
-    let mut tok_arr = deepseek_native::sample_token(&last_logits, temperature);
-    tok_arr.eval();
-    let first_tok = tok_arr.item_u32();
-
-    finish_generation(
+    Ok(finish_with_bridge_generate(
         input_ids,
         first_tok,
         max_tokens,
         on_token,
-        |cur_tok, cache| {
-            let input = prompt_to_input(&[cur_tok]);
-            let logits = deepseek_native::forward_step(&weights, &input, cache);
-            let last_logits = last_token_logits(&logits);
-            let mut tok_arr = deepseek_native::sample_token(&last_logits, temperature);
-            tok_arr.eval();
-            tok_arr.item_u32()
+        |on_token| {
+            deepseek_native::generate(
+                &weights,
+                &mut cache,
+                first_tok,
+                max_tokens.saturating_sub(1),
+                temperature,
+                |tok| on_token(tok),
+            )
         },
-        &mut cache,
-    )
+    ))
 }
 
 // ============================================================================
@@ -354,92 +526,22 @@ fn run_gpt_oss(
     let input = prompt_to_input(input_ids);
     let logits = gpt_oss_native::forward_step(&weights, &input, &mut cache);
     let last_logits = last_token_logits(&logits); // [1, vocab]
+    let first_tok = sample_first_token(&last_logits, temperature, gpt_oss_native::sample_token);
 
-    let mut tok_arr = gpt_oss_native::sample_token(&last_logits, temperature);
-    tok_arr.eval();
-    let first_tok = tok_arr.item_u32();
-
-    finish_generation(
+    Ok(finish_with_bridge_generate(
         input_ids,
         first_tok,
         max_tokens,
         on_token,
-        |cur_tok, cache| {
-            let input = prompt_to_input(&[cur_tok]);
-            let logits = gpt_oss_native::forward_step(&weights, &input, cache);
-            let last_logits = last_token_logits(&logits);
-            let mut tok_arr = gpt_oss_native::sample_token(&last_logits, temperature);
-            tok_arr.eval();
-            tok_arr.item_u32()
+        |on_token| {
+            gpt_oss_native::generate(
+                &weights,
+                &mut cache,
+                first_tok,
+                max_tokens.saturating_sub(1),
+                temperature,
+                |tok| on_token(tok),
+            )
         },
-        &mut cache,
-    )
-}
-
-// ============================================================================
-// Shared decode-loop driver
-// ============================================================================
-
-/// Drive the post-prefill decode loop for any architecture.
-///
-/// This eliminates the repetition of the "emit first token → decode loop →
-/// build output" bookkeeping across the four `run_*` functions.
-///
-/// # Parameters
-/// - `prompt`: original prompt token IDs (used only to compute `num_generated`)
-/// - `first_tok`: the token sampled from the prefill logits
-/// - `max_tokens`: total budget (including `first_tok`)
-/// - `on_token`: streaming callback; `false` return stops generation early
-/// - `step`: closure that takes `(current_token_id, &mut Cache)` and returns
-///   the next sampled token
-/// - `cache`: the architecture-specific cache (passed through to `step`)
-///
-/// The internal decode loop delegates to the architecture's own `generate()`
-/// function, which handles GPU stream management, wired memory, and pipelining.
-/// We only call `generate()` through the step closure so that the hot path
-/// stays inside the native module with its optimised async schedule.
-fn finish_generation<Cache>(
-    prompt: &[u32],
-    first_tok: u32,
-    max_tokens: usize,
-    on_token: &mut dyn FnMut(u32) -> bool,
-    mut step: impl FnMut(u32, &mut Cache) -> u32,
-    cache: &mut Cache,
-) -> Result<NativeGenerationOutput, String> {
-    let prompt_len = prompt.len();
-    let mut all_tokens: Vec<u32> = prompt.to_vec();
-    all_tokens.push(first_tok);
-
-    // Notify the caller about the first generated token; stop if requested.
-    if !on_token(first_tok) {
-        let num_generated = all_tokens.len() - prompt_len;
-        return Ok(NativeGenerationOutput {
-            token_ids: all_tokens,
-            num_generated,
-            stopped_by_token: true,
-            stopped_by_length: false,
-        });
-    }
-
-    // Remaining decode budget (first_tok already consumed one slot).
-    let remaining = max_tokens.saturating_sub(1);
-    let mut cur_tok = first_tok;
-    let mut stopped_by_token = false;
-
-    for _ in 0..remaining {
-        cur_tok = step(cur_tok, cache);
-        all_tokens.push(cur_tok);
-        if !on_token(cur_tok) {
-            stopped_by_token = true;
-            break;
-        }
-    }
-
-    let num_generated = all_tokens.len() - prompt_len;
-    Ok(NativeGenerationOutput {
-        token_ids: all_tokens,
-        num_generated,
-        stopped_by_token,
-        stopped_by_length: !stopped_by_token && num_generated >= max_tokens,
-    })
+    ))
 }

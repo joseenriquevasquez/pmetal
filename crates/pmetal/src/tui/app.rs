@@ -1721,17 +1721,11 @@ impl App {
             }
             125 => {
                 // TQ2.5 preset
-                args.extend([
-                    "--kv-turboquant-preset".to_string(),
-                    "q2_5".to_string(),
-                ]);
+                args.extend(["--kv-turboquant-preset".to_string(), "q2_5".to_string()]);
             }
             135 => {
                 // TQ3.5 preset
-                args.extend([
-                    "--kv-turboquant-preset".to_string(),
-                    "q3_5".to_string(),
-                ]);
+                args.extend(["--kv-turboquant-preset".to_string(), "q3_5".to_string()]);
             }
             _ => {} // 0 = auto (omit flag)
         }

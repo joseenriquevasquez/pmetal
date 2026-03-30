@@ -14,7 +14,7 @@ pub(crate) async fn run_merge_command(
 ) -> anyhow::Result<()> {
     use pmetal_merge::{
         MergeConfig, MergeMethodConfig, MergeParameters, ModelConfig as MergeModelConfig,
-        TokenizerConfig,
+        ParameterSetting, TokenizerConfig,
     };
 
     println!("PMetal Model Merge");
@@ -82,18 +82,18 @@ pub(crate) async fn run_merge_command(
             MergeModelConfig {
                 model: path_a.to_string_lossy().to_string(),
                 parameters: MergeParameters {
-                    weight: Some(pmetal_merge::ParameterSetting::Scalar(weight_a)),
-                    density: Some(pmetal_merge::ParameterSetting::Scalar(density)),
-                    t: Some(pmetal_merge::ParameterSetting::Scalar(t)),
+                    weight: Some(ParameterSetting::Scalar(weight_a)),
+                    density: Some(ParameterSetting::Scalar(density)),
+                    t: Some(ParameterSetting::Scalar(t)),
                     ..Default::default()
                 },
             },
             MergeModelConfig {
                 model: path_b.to_string_lossy().to_string(),
                 parameters: MergeParameters {
-                    weight: Some(pmetal_merge::ParameterSetting::Scalar(weight_b)),
-                    density: Some(pmetal_merge::ParameterSetting::Scalar(density)),
-                    t: Some(pmetal_merge::ParameterSetting::Scalar(1.0 - t)),
+                    weight: Some(ParameterSetting::Scalar(weight_b)),
+                    density: Some(ParameterSetting::Scalar(density)),
+                    t: Some(ParameterSetting::Scalar(1.0 - t)),
                     ..Default::default()
                 },
             },
