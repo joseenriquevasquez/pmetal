@@ -42,6 +42,15 @@ fn find_clang_rt_path() -> Option<String> {
     None
 }
 
+#[cfg(target_os = "macos")]
+fn emit_mlx_rpath(path: &str) {
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{path}");
+}
+
+fn emit_bridge_metadata(key: &str, value: impl AsRef<str>) {
+    println!("cargo:metadata={key}={}", value.as_ref());
+}
+
 // ── Patches (embedded as string constants) ────────────────────────────────
 
 /// The metallib search-path patch: adds PMETAL_METALLIB_PATH env-var override
@@ -157,10 +166,7 @@ fn build_and_link() {
 
     // ── Link libmlx.a ──
     // cmake installs libmlx.a into <dst>/build/lib (cmake crate convention)
-    println!(
-        "cargo:rustc-link-search=native={}/build/lib",
-        dst.display()
-    );
+    println!("cargo:rustc-link-search=native={}/build/lib", dst.display());
     // The fetched MLX target also produces libmlx.a; cmake may put it in _deps
     // or build/lib depending on build system; add both search paths.
     println!(
@@ -168,14 +174,21 @@ fn build_and_link() {
         dst.display()
     );
     // Link MLX — use PMETAL_MLX_LIB_DIR to override with Python's libmlx.dylib
-    if let Ok(mlx_dir) = env::var("PMETAL_MLX_LIB_DIR") {
+    let mlx_lib_dir = if let Ok(mlx_dir) = env::var("PMETAL_MLX_LIB_DIR") {
         println!("cargo:rustc-link-search=native={mlx_dir}");
         println!("cargo:rustc-link-lib=dylib=mlx");
+        #[cfg(target_os = "macos")]
+        emit_mlx_rpath(&mlx_dir);
         println!("cargo:warning=Using external libmlx.dylib from {mlx_dir}");
+        PathBuf::from(mlx_dir)
     } else {
         println!("cargo:rustc-link-lib=dylib=mlx");
         println!("cargo:rustc-link-search={}/build/lib", dst.display());
-    }
+        #[cfg(target_os = "macos")]
+        emit_mlx_rpath(&format!("{}/build/lib", dst.display()));
+        dst.join("build/lib")
+    };
+    emit_bridge_metadata("mlx_lib_dir", mlx_lib_dir.display().to_string());
 
     // ── Compile bridge.cpp via cc::Build ──
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -231,7 +244,9 @@ fn build_and_link() {
             println!("cargo:rustc-link-lib=static=clang_rt.osx");
             println!("cargo:warning=clang_rt fallback: {}", fallback);
         } else {
-            println!("cargo:warning=clang_rt NOT FOUND — ___isPlatformVersionAtLeast may be missing");
+            println!(
+                "cargo:warning=clang_rt NOT FOUND — ___isPlatformVersionAtLeast may be missing"
+            );
         }
     }
 
@@ -240,6 +255,9 @@ fn build_and_link() {
     {
         // CMake installs it to build/lib/mlx.metallib
         let metallib = dst.join("build/lib/mlx.metallib");
+        if metallib.exists() {
+            emit_bridge_metadata("mlx_metallib", metallib.display().to_string());
+        }
         if metallib.exists() {
             if let Ok(home) = env::var("HOME") {
                 let cache_dir = PathBuf::from(home).join(".cache/pmetal/lib");
@@ -261,10 +279,9 @@ fn build_and_link() {
                 if should_copy {
                     let _ = std::fs::create_dir_all(&cache_dir);
                     match std::fs::copy(&metallib, &dest) {
-                        Ok(_) => println!(
-                            "cargo:warning=Cached mlx.metallib to {}",
-                            dest.display()
-                        ),
+                        Ok(_) => {
+                            println!("cargo:warning=Cached mlx.metallib to {}", dest.display())
+                        }
                         Err(e) => println!("cargo:warning=Failed to cache mlx.metallib: {}", e),
                     }
                 }

@@ -8,6 +8,7 @@ description = "Zero-allocation MLX bridge — standalone C++ layer that replaces
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+links = "pmetal_bridge"
 
 [features]
 default = ["accelerate", "metal"]

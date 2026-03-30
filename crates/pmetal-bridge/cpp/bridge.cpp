@@ -1133,7 +1133,11 @@ int mlx_inline_load_safetensors_key(mlx_inline_array* dst, const char* path, con
         if (it == arrays.end()) return 1;
         new (dst->buf) array(it->second);
         return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[C++ EXCEPTION] load_safetensors_key(%s, %s): %s\n", path, key, e.what());
+        return 1;
     } catch (...) {
+        fprintf(stderr, "[C++ EXCEPTION] load_safetensors_key(%s, %s): unknown exception\n", path, key);
         return 1;
     }
 }
@@ -1156,7 +1160,11 @@ int mlx_inline_load_safetensors_all(
             count++;
         }
         return count;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[C++ EXCEPTION] load_safetensors_all(%s): %s\n", path, e.what());
+        return -1;
     } catch (...) {
+        fprintf(stderr, "[C++ EXCEPTION] load_safetensors_all(%s): unknown exception\n", path);
         return -1;
     }
 }
@@ -1451,15 +1459,182 @@ void mlx_inline_compiled_gdn_layer_fixed(
     new (dst_ssm_state->buf) array(result[2]);
 }
 
+void mlx_inline_compiled_attn_layer_fixed(
+    mlx_inline_array* dst_out,
+    mlx_inline_array* dst_cache_keys,
+    mlx_inline_array* dst_cache_vals,
+    const mlx_inline_array* normed,
+    const mlx_inline_array* q_w,
+    const mlx_inline_array* k_w,
+    const mlx_inline_array* v_w,
+    const mlx_inline_array* o_w,
+    const mlx_inline_array* q_nw,
+    const mlx_inline_array* k_nw,
+    const mlx_inline_array* cache_keys_in,
+    const mlx_inline_array* cache_vals_in,
+    int kv_offset,
+    int rope_offset,
+    int n_heads,
+    int n_kv,
+    int head_dim,
+    float scale,
+    int rope_dims,
+    float rope_base,
+    float rope_scale,
+    float q_norm_eps,
+    float k_norm_eps,
+    bool gated
+) {
+    struct Entry {
+        int batch;
+        int cache_len;
+        int n_heads;
+        int n_kv;
+        int head_dim;
+        int rope_dims;
+        int gated;
+        CompiledFn compiled;
+    };
+    static auto* entries = new std::vector<Entry>();
+
+    int batch = as_arr(normed).shape(0);
+    int cache_len = as_arr(cache_keys_in).shape(2);
+
+    CompiledFn* compiled = nullptr;
+    for (auto& entry : *entries) {
+        if (entry.batch == batch
+            && entry.cache_len == cache_len
+            && entry.n_heads == n_heads
+            && entry.n_kv == n_kv
+            && entry.head_dim == head_dim
+            && entry.rope_dims == rope_dims
+            && entry.gated == static_cast<int>(gated)) {
+            compiled = &entry.compiled;
+            break;
+        }
+    }
+
+    if (compiled == nullptr) {
+        int NH = n_heads;
+        int NKV = n_kv;
+        int HD = head_dim;
+        int RD = rope_dims;
+        int L = cache_len;
+        bool GATED = gated;
+        float SCALE = scale;
+        float RBASE = rope_base;
+        float RSCALE = rope_scale;
+        float QEPS = q_norm_eps;
+        float KEPS = k_norm_eps;
+
+        entries->push_back(Entry{
+            batch,
+            cache_len,
+            n_heads,
+            n_kv,
+            head_dim,
+            rope_dims,
+            static_cast<int>(gated),
+            make_compiled_fixed(
+                [NH, NKV, HD, RD, L, GATED, SCALE, RBASE, RSCALE, QEPS, KEPS]
+                (const std::vector<array>& ins) -> std::vector<array> {
+                    using namespace mlx::core;
+
+                    auto& normed = ins[0];
+                    auto& q_w = ins[1];
+                    auto& k_w = ins[2];
+                    auto& v_w = ins[3];
+                    auto& o_w = ins[4];
+                    auto& q_nw = ins[5];
+                    auto& k_nw = ins[6];
+                    auto& cache_keys = ins[7];
+                    auto& cache_vals = ins[8];
+                    auto& kv_offset_arr = ins[9];
+                    auto& rope_offset_arr = ins[10];
+
+                    int B = normed.shape(0);
+                    int S = normed.shape(1);
+
+                    auto q_proj = matmul(normed, q_w);
+                    array queries(0.0f);
+                    array gate(0.0f);
+                    if (GATED) {
+                        auto qg = reshape(q_proj, {B, S, NH, HD * 2});
+                        auto qg_parts = split(qg, Shape{HD}, -1);
+                        queries = qg_parts[0];
+                        gate = reshape(qg_parts[1], {B, S, NH * HD});
+                    } else {
+                        queries = reshape(q_proj, {B, S, NH, HD});
+                    }
+
+                    auto new_k = matmul(normed, k_w);
+                    auto new_v = matmul(normed, v_w);
+
+                    queries = fast::rms_norm(queries, q_nw, QEPS);
+                    auto keys = fast::rms_norm(reshape(new_k, {B, S, NKV, HD}), k_nw, KEPS);
+                    auto values = reshape(new_v, {B, S, NKV, HD});
+
+                    queries = transpose(queries, {0, 2, 1, 3});
+                    keys = transpose(keys, {0, 2, 1, 3});
+                    values = transpose(values, {0, 2, 1, 3});
+
+                    queries = fast::rope(queries, RD, false, RBASE, RSCALE, rope_offset_arr);
+                    keys = fast::rope(keys, RD, false, RBASE, RSCALE, rope_offset_arr);
+
+                    auto kv_indices = broadcast_to(
+                        reshape(kv_offset_arr, {1, 1, 1, 1}),
+                        {B, NKV, S, HD});
+                    auto updated_keys = put_along_axis(cache_keys, kv_indices, keys, 2);
+                    auto updated_vals = put_along_axis(cache_vals, kv_indices, values, 2);
+
+                    auto next_offset = add(kv_offset_arr, array(S));
+                    auto positions = reshape(arange(L, int32), {1, 1, 1, L});
+                    auto valid_mask = less(positions, reshape(next_offset, {1, 1, 1, 1}));
+
+                    auto output = fast::scaled_dot_product_attention(
+                        queries, updated_keys, updated_vals, SCALE, "", valid_mask);
+                    output = transpose(output, {0, 2, 1, 3});
+                    output = reshape(output, {B, S, NH * HD});
+                    if (GATED) {
+                        output = multiply(output, sigmoid(gate));
+                    }
+                    auto result = matmul(output, o_w);
+                    return {result, updated_keys, updated_vals};
+                })
+        });
+        compiled = &entries->back().compiled;
+    }
+
+    auto result = (*compiled)({
+        as_arr(normed),
+        as_arr(q_w),
+        as_arr(k_w),
+        as_arr(v_w),
+        as_arr(o_w),
+        as_arr(q_nw),
+        as_arr(k_nw),
+        as_arr(cache_keys_in),
+        as_arr(cache_vals_in),
+        array(kv_offset),
+        array(rope_offset),
+    });
+    new (dst_out->buf) array(result[0]);
+    new (dst_cache_keys->buf) array(result[1]);
+    new (dst_cache_vals->buf) array(result[2]);
+}
+
 } // extern "C"
 
 // ============================================================================
-// Full Qwen3.5 forward pass — single C++ function, zero per-op FFI overhead.
+// Full Qwen3.5 forward pass — single C++ function, low FFI overhead.
 //
 // The entire forward pass (embedding, all N layers, final norm, lm_head) runs
 // here as pure C++ MLX ops.  No Rust stack frame is entered between ops;
 // intermediate arrays are C++ locals, never placement-new'd through the FFI
-// bridge.  This eliminates ~1800 FFI round trips per decode step.
+// bridge.  This eliminates ~1800 Rust<->C++ FFI round trips per decode step.
+//
+// Important: this path still rebuilds the MLX graph on every token. It is not
+// a traced or tape-replayed whole-model decode session.
 // ============================================================================
 
 extern "C" {
@@ -1669,6 +1844,66 @@ static array run_attn_layer(
                 new (cache_vals->buf) array(std::move(grown_v));
             }
         }
+    }
+
+    if (S == 1) {
+        mlx_inline_array w_normed, w_q, w_k, w_v, w_o, w_qn, w_kn, w_ck, w_cv;
+        new (w_normed.buf) array(normed);
+        new (w_q.buf) array(q_w);
+        new (w_k.buf) array(k_w);
+        new (w_v.buf) array(v_w);
+        new (w_o.buf) array(o_w);
+        new (w_qn.buf) array(q_nw);
+        new (w_kn.buf) array(k_nw);
+        new (w_ck.buf) array(C_arr(cache_keys));
+        new (w_cv.buf) array(C_arr(cache_vals));
+
+        mlx_inline_array dst_out, dst_k, dst_v;
+        mlx_inline_compiled_attn_layer_fixed(
+            &dst_out,
+            &dst_k,
+            &dst_v,
+            &w_normed,
+            &w_q,
+            &w_k,
+            &w_v,
+            &w_o,
+            &w_qn,
+            &w_kn,
+            &w_ck,
+            &w_cv,
+            prev,
+            rope_offset,
+            n_heads,
+            n_kv,
+            head_dim,
+            scale,
+            rope_dims,
+            rope_base,
+            rope_scale,
+            q_norm_eps,
+            k_norm_eps,
+            /*gated=*/true);
+
+        as_arr(&w_normed).~array();
+        as_arr(&w_q).~array();
+        as_arr(&w_k).~array();
+        as_arr(&w_v).~array();
+        as_arr(&w_o).~array();
+        as_arr(&w_qn).~array();
+        as_arr(&w_kn).~array();
+        as_arr(&w_ck).~array();
+        as_arr(&w_cv).~array();
+
+        C_arr(cache_keys).~array();
+        new (cache_keys->buf) array(std::move(as_arr(&dst_k)));
+        C_arr(cache_vals).~array();
+        new (cache_vals->buf) array(std::move(as_arr(&dst_v)));
+        kv_offset = next;
+
+        array out = as_arr(&dst_out);
+        as_arr(&dst_out).~array();
+        return out;
     }
 
     // In-place slice_set: cache[..., prev:next, :] = new_kv

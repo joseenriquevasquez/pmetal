@@ -3,7 +3,10 @@ use std::time::Instant;
 
 fn bench_eval(label: &str, mut setup: impl FnMut() -> InlineArray, iters: usize) {
     // Warm up
-    for _ in 0..3 { let mut r = setup(); r.eval(); }
+    for _ in 0..3 {
+        let mut r = setup();
+        r.eval();
+    }
     // Measure
     let mut times = Vec::new();
     for _ in 0..iters {
@@ -36,7 +39,11 @@ fn profile_real_ops() {
         let q = InlineArray::ones(&[1, nh, 1, hd], 10);
         let k = InlineArray::ones(&[1, nkv, sl, hd], 10);
         let v = InlineArray::ones(&[1, nkv, sl, hd], 10);
-        bench_eval(&format!("SDPA seq={sl}"), || q.sdpa(&k, &v, 0.0625, "causal"), 20);
+        bench_eval(
+            &format!("SDPA seq={sl}"),
+            || q.sdpa(&k, &v, 0.0625, "causal"),
+            20,
+        );
     }
 
     // KV append
@@ -54,14 +61,18 @@ fn profile_real_ops() {
     let uw = InlineArray::ones(&[3584, h], 10);
     let dw = InlineArray::ones(&[h, 3584], 10);
     let nw = InlineArray::ones(&[h], 10);
-    bench_eval("24-layer MLP (real dims)", || {
-        let mut x = InlineArray::ones(&[1, 1, h], 10);
-        for _ in 0..24 {
-            let n = x.rms_norm(Some(&nw), 1e-6);
-            let g = InlineArray::fused_silu(&n.matmul(&gw));
-            let u = n.matmul(&uw);
-            x = x.add(&g.multiply(&u).matmul(&dw));
-        }
-        x
-    }, 20);
+    bench_eval(
+        "24-layer MLP (real dims)",
+        || {
+            let mut x = InlineArray::ones(&[1, 1, h], 10);
+            for _ in 0..24 {
+                let n = x.rms_norm(Some(&nw), 1e-6);
+                let g = InlineArray::fused_silu(&n.matmul(&gw));
+                let u = n.matmul(&uw);
+                x = x.add(&g.multiply(&u).matmul(&dw));
+            }
+            x
+        },
+        20,
+    );
 }

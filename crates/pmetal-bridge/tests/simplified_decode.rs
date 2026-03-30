@@ -52,8 +52,13 @@ fn simplified_decode_benchmark() {
             up_wt: rand_w(&[h, inter], dtype),
             down_wt: rand_w(&[inter, h], dtype),
             is_gdn,
-            qkvz_wt: None, ba_wt: None, out_wt: None,
-            q_wt: None, k_wt: None, v_wt: None, o_wt: None,
+            qkvz_wt: None,
+            ba_wt: None,
+            out_wt: None,
+            q_wt: None,
+            k_wt: None,
+            v_wt: None,
+            o_wt: None,
         };
         if is_gdn {
             lw.qkvz_wt = Some(rand_w(&[h, 8192], dtype));
@@ -85,9 +90,15 @@ fn simplified_decode_benchmark() {
         d.eval();
         dummy_buffers.push(d);
     }
-    eprintln!("Allocated {} dummy buffers ({:.0} MB)", n_chunks,
-        n_chunks as f64 * chunk as f64 * 2.0 / 1e6);
-    eprintln!("Active memory: {:.0} MB", pmetal_bridge::inline_array::get_active_memory() as f64 / 1e6);
+    eprintln!(
+        "Allocated {} dummy buffers ({:.0} MB)",
+        n_chunks,
+        n_chunks as f64 * chunk as f64 * 2.0 / 1e6
+    );
+    eprintln!(
+        "Active memory: {:.0} MB",
+        pmetal_bridge::inline_array::get_active_memory() as f64 / 1e6
+    );
 
     let decode_step = |token_id: i32| -> InlineArray {
         let tok = InlineArray::from_i32(token_id).reshape(&[1, 1]);
@@ -135,5 +146,8 @@ fn simplified_decode_benchmark() {
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let avg = times[5..].iter().sum::<f64>() / (times.len() - 5) as f64;
     let p50 = times[times.len() / 2];
-    eprintln!("InlineArray simplified decode: avg={avg:.2}ms p50={p50:.2}ms = {:.0} tok/s", 1000.0 / avg);
+    eprintln!(
+        "InlineArray simplified decode: avg={avg:.2}ms p50={p50:.2}ms = {:.0} tok/s",
+        1000.0 / avg
+    );
 }

@@ -246,7 +246,10 @@ impl AdamW {
             state.m = state.m.multiply(&b1).add(&grad.multiply(&one_minus_b1));
 
             // v = β₂·v + (1−β₂)·g²
-            state.v = state.v.multiply(&b2).add(&grad.square().multiply(&one_minus_b2));
+            state.v = state
+                .v
+                .multiply(&b2)
+                .add(&grad.square().multiply(&one_minus_b2));
 
             // Bias-corrected estimates: m̂ = m/(1−β₁ᵗ), v̂ = v/(1−β₂ᵗ)
             let m_hat = state.m.divide(&bc1);
@@ -293,7 +296,10 @@ impl AdamW {
         let one_minus_b2 = InlineArray::from_f32(1.0 - self.beta2);
 
         state.m = state.m.multiply(&b1).add(&gradient.multiply(&one_minus_b1));
-        state.v = state.v.multiply(&b2).add(&gradient.square().multiply(&one_minus_b2));
+        state.v = state
+            .v
+            .multiply(&b2)
+            .add(&gradient.square().multiply(&one_minus_b2));
 
         let bc1 = InlineArray::from_f32(1.0 - self.beta1.powf(t));
         let bc2 = InlineArray::from_f32(1.0 - self.beta2.powf(t));
@@ -337,18 +343,38 @@ mod tests {
 
     #[test]
     fn test_default_classifier() {
-        assert_eq!(default_classifier("layers.0.norm.weight"), ParamClass::NoDecay);
-        assert_eq!(default_classifier("layers.0.self_attn.q_proj.bias"), ParamClass::NoDecay);
-        assert_eq!(default_classifier("embed_tokens.weight"), ParamClass::Embedding);
+        assert_eq!(
+            default_classifier("layers.0.norm.weight"),
+            ParamClass::NoDecay
+        );
+        assert_eq!(
+            default_classifier("layers.0.self_attn.q_proj.bias"),
+            ParamClass::NoDecay
+        );
+        assert_eq!(
+            default_classifier("embed_tokens.weight"),
+            ParamClass::Embedding
+        );
         assert_eq!(default_classifier("lm_head.weight"), ParamClass::Embedding);
-        assert_eq!(default_classifier("layers.0.q_proj.lora_b"), ParamClass::LoraB);
-        assert_eq!(default_classifier("layers.0.q_proj.lora_a"), ParamClass::Regular);
-        assert_eq!(default_classifier("layers.0.mlp.gate_proj.weight"), ParamClass::Regular);
+        assert_eq!(
+            default_classifier("layers.0.q_proj.lora_b"),
+            ParamClass::LoraB
+        );
+        assert_eq!(
+            default_classifier("layers.0.q_proj.lora_a"),
+            ParamClass::Regular
+        );
+        assert_eq!(
+            default_classifier("layers.0.mlp.gate_proj.weight"),
+            ParamClass::Regular
+        );
     }
 
     #[test]
     fn test_adamw_lr_for() {
-        let opt = AdamW::new(1e-4, 0.01).with_loraplus_ratio(16.0).with_embedding_lr(5e-5);
+        let opt = AdamW::new(1e-4, 0.01)
+            .with_loraplus_ratio(16.0)
+            .with_embedding_lr(5e-5);
         assert!((opt.lr_for(ParamClass::Regular) - 1e-4).abs() < 1e-9);
         assert!((opt.lr_for(ParamClass::NoDecay) - 1e-4).abs() < 1e-9);
         assert!((opt.lr_for(ParamClass::Embedding) - 5e-5).abs() < 1e-9);

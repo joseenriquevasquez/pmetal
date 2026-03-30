@@ -29,18 +29,18 @@ pub use crate::InlineArray as Array;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
 pub enum Dtype {
-    Bool      = 0,
-    Uint8     = 1,
-    Uint16    = 2,
-    Uint32    = 3,
-    Uint64    = 4,
-    Int8      = 5,
-    Int16     = 6,
-    Int32     = 7,
-    Int64     = 8,
-    Float16   = 9,
-    Float32   = 10,
-    Bfloat16  = 11,
+    Bool = 0,
+    Uint8 = 1,
+    Uint16 = 2,
+    Uint32 = 3,
+    Uint64 = 4,
+    Int8 = 5,
+    Int16 = 6,
+    Int32 = 7,
+    Int64 = 8,
+    Float16 = 9,
+    Float32 = 10,
+    Bfloat16 = 11,
     Complex64 = 12,
 }
 
@@ -56,20 +56,20 @@ impl Dtype {
     /// Compatible with mlx-rs `Dtype::from(raw_i32)`.
     pub fn from_raw(raw: i32) -> Self {
         match raw {
-            0  => Dtype::Bool,
-            1  => Dtype::Uint8,
-            2  => Dtype::Uint16,
-            3  => Dtype::Uint32,
-            4  => Dtype::Uint64,
-            5  => Dtype::Int8,
-            6  => Dtype::Int16,
-            7  => Dtype::Int32,
-            8  => Dtype::Int64,
-            9  => Dtype::Float16,
+            0 => Dtype::Bool,
+            1 => Dtype::Uint8,
+            2 => Dtype::Uint16,
+            3 => Dtype::Uint32,
+            4 => Dtype::Uint64,
+            5 => Dtype::Int8,
+            6 => Dtype::Int16,
+            7 => Dtype::Int32,
+            8 => Dtype::Int64,
+            9 => Dtype::Float16,
             10 => Dtype::Float32,
             11 => Dtype::Bfloat16,
             12 => Dtype::Complex64,
-            _  => Dtype::Float32, // fallback
+            _ => Dtype::Float32, // fallback
         }
     }
 
@@ -82,7 +82,10 @@ impl Dtype {
     /// Returns `true` for float or complex types.
     #[inline]
     pub fn is_inexact(self) -> bool {
-        matches!(self, Dtype::Float16 | Dtype::Float32 | Dtype::Bfloat16 | Dtype::Complex64)
+        matches!(
+            self,
+            Dtype::Float16 | Dtype::Float32 | Dtype::Bfloat16 | Dtype::Complex64
+        )
     }
 
     /// Type promotion following MLX's rules (subset — covers float/int cases).
@@ -123,7 +126,9 @@ impl Exception {
     /// Create an exception with the given message.
     #[track_caller]
     pub fn custom(msg: impl Into<String>) -> Self {
-        Self { message: msg.into() }
+        Self {
+            message: msg.into(),
+        }
     }
 
     /// The error message string.
@@ -141,11 +146,15 @@ impl std::fmt::Display for Exception {
 impl std::error::Error for Exception {}
 
 impl From<String> for Exception {
-    fn from(s: String) -> Self { Self::custom(s) }
+    fn from(s: String) -> Self {
+        Self::custom(s)
+    }
 }
 
 impl From<&str> for Exception {
-    fn from(s: &str) -> Self { Self::custom(s) }
+    fn from(s: &str) -> Self {
+        Self::custom(s)
+    }
 }
 
 // ── Param ────────────────────────────────────────────────────────────────────
@@ -163,7 +172,10 @@ pub struct Param<T> {
 impl<T> Param<T> {
     /// Wrap a value as a (non-frozen) trainable parameter.
     pub fn new(value: T) -> Self {
-        Self { value, is_frozen: false }
+        Self {
+            value,
+            is_frozen: false,
+        }
     }
 
     /// Whether this parameter is currently frozen.
@@ -188,20 +200,28 @@ impl<T> Param<T> {
 }
 
 impl<T> From<T> for Param<T> {
-    fn from(value: T) -> Self { Self::new(value) }
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
 }
 
 impl<T> std::ops::Deref for Param<T> {
     type Target = T;
-    fn deref(&self) -> &T { &self.value }
+    fn deref(&self) -> &T {
+        &self.value
+    }
 }
 
 impl<T> std::ops::DerefMut for Param<T> {
-    fn deref_mut(&mut self) -> &mut T { &mut self.value }
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
 }
 
 impl<T: AsRef<U>, U> AsRef<U> for Param<T> {
-    fn as_ref(&self) -> &U { self.value.as_ref() }
+    fn as_ref(&self) -> &U {
+        self.value.as_ref()
+    }
 }
 
 // ── Module parameter tree types ───────────────────────────────────────────────
@@ -220,7 +240,9 @@ impl<V> NestedValue<V> {
     /// Flatten the tree into a `HashMap<String, V>`.
     pub fn flatten_into(self, prefix: &str, out: &mut std::collections::HashMap<String, V>) {
         match self {
-            NestedValue::Value(v) => { out.insert(prefix.to_owned(), v); }
+            NestedValue::Value(v) => {
+                out.insert(prefix.to_owned(), v);
+            }
             NestedValue::Map(m) => {
                 for (k, child) in m {
                     let full = if prefix.is_empty() {
@@ -239,7 +261,8 @@ impl<V> NestedValue<V> {
 pub type ModuleParamRef<'a> = std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a Array>>;
 
 /// Mutably borrowed parameter tree (returned by `parameters_mut()`).
-pub type ModuleParamMut<'a> = std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a mut Array>>;
+pub type ModuleParamMut<'a> =
+    std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a mut Array>>;
 
 /// Owned, flattened parameter map (used by optimizers and `value_and_grad`).
 pub type FlattenedModuleParam = std::collections::HashMap<std::rc::Rc<str>, Array>;
@@ -255,9 +278,15 @@ pub type FlattenedModuleParam = std::collections::HashMap<std::rc::Rc<str>, Arra
 pub struct Stream;
 
 impl Stream {
-    pub fn cpu() -> Self { Self }
-    pub fn gpu() -> Self { Self }
-    pub fn default() -> Self { Self }
+    pub fn cpu() -> Self {
+        Self
+    }
+    pub fn gpu() -> Self {
+        Self
+    }
+    pub fn default() -> Self {
+        Self
+    }
 }
 
 /// Stub for `mlx_rs::fast::ScaledDotProductAttentionMask`.
@@ -282,8 +311,12 @@ pub use std::collections::hash_map::RandomState;
 pub struct Device;
 
 impl Device {
-    pub fn gpu() -> Self { Self }
-    pub fn cpu() -> Self { Self }
+    pub fn gpu() -> Self {
+        Self
+    }
+    pub fn cpu() -> Self {
+        Self
+    }
 }
 
 // ── Module traits ─────────────────────────────────────────────────────────────
@@ -331,10 +364,14 @@ pub trait ModuleParameters {
 
     /// Returns `Some(true)` if all parameters are frozen, `Some(false)` if at
     /// least one is not, `None` if there are no parameters.
-    fn all_frozen(&self) -> Option<bool> { None }
+    fn all_frozen(&self) -> Option<bool> {
+        None
+    }
 
     /// Returns `Some(true)` if any parameter is frozen.
-    fn any_frozen(&self) -> Option<bool> { None }
+    fn any_frozen(&self) -> Option<bool> {
+        None
+    }
 }
 
 // ── Top-level transform functions ─────────────────────────────────────────────
@@ -360,11 +397,15 @@ pub fn eval_params(params: ModuleParamRef<'_>) -> Result<(), Exception> {
                 c.eval();
             }
             NestedValue::Map(m) => {
-                for v in m.values() { walk(v); }
+                for v in m.values() {
+                    walk(v);
+                }
             }
         }
     }
-    for v in params.values() { walk(v); }
+    for v in params.values() {
+        walk(v);
+    }
     Ok(())
 }
 
@@ -376,16 +417,26 @@ pub mod ops {
     use crate::inline_array::RawBuf;
     use std::mem::MaybeUninit;
 
-    pub fn maximum(a: &Array, b: &Array) -> Array { a.maximum(b) }
-    pub fn minimum(a: &Array, b: &Array) -> Array { a.minimum(b) }
-    pub fn matmul(a: &Array, b: &Array) -> Array { a.matmul(b) }
-    pub fn softmax_axis(a: &Array, axis: i32) -> Array { a.softmax(axis) }
+    pub fn maximum(a: &Array, b: &Array) -> Array {
+        a.maximum(b)
+    }
+    pub fn minimum(a: &Array, b: &Array) -> Array {
+        a.minimum(b)
+    }
+    pub fn matmul(a: &Array, b: &Array) -> Array {
+        a.matmul(b)
+    }
+    pub fn softmax_axis(a: &Array, axis: i32) -> Array {
+        a.softmax(axis)
+    }
     /// log(1 + x) — numerically stable log1p.
     pub fn log1p(a: &Array) -> Array {
         let one = Array::from_f32(1.0);
         a.add(&one).log()
     }
-    pub fn broadcast_to(a: &Array, shape: &[i32]) -> Array { a.broadcast_to(shape) }
+    pub fn broadcast_to(a: &Array, shape: &[i32]) -> Array {
+        a.broadcast_to(shape)
+    }
 
     /// Concatenate a slice of arrays along `axis`.
     ///
@@ -410,7 +461,10 @@ pub mod ops {
     /// Concatenate owned arrays along `axis`.  The arrays must all remain live
     /// for the duration of the call (they are dropped after the FFI returns).
     pub fn concatenate_owned_axis(arrays: &[Array], axis: i32) -> Array {
-        assert!(!arrays.is_empty(), "concatenate_owned_axis: empty array slice");
+        assert!(
+            !arrays.is_empty(),
+            "concatenate_owned_axis: empty array slice"
+        );
         if arrays.len() == 1 {
             return arrays[0].clone();
         }
@@ -421,17 +475,20 @@ pub mod ops {
         // SAFETY: RawBuf is Copy, and InlineArray exposes its raw field via
         // the internal `as_raw_ptr` method.  We must not let `arrays` drop
         // while we hold the pointer.
-        let raw_copies: Vec<RawBuf> = arrays.iter().map(|a| {
-            // Copy the raw buffer — this is a C++ copy-construct (ref-count bump).
-            let mut dst = MaybeUninit::<RawBuf>::uninit();
-            unsafe {
-                // mlx_inline_init_copy is the copy-constructor trampoline.
-                // It is `pub(crate)` in inline_array but we are inside the
-                // same crate so this is fine.
-                crate::inline_array::raw_copy_buf(dst.as_mut_ptr(), a.as_raw_ptr());
-                dst.assume_init()
-            }
-        }).collect();
+        let raw_copies: Vec<RawBuf> = arrays
+            .iter()
+            .map(|a| {
+                // Copy the raw buffer — this is a C++ copy-construct (ref-count bump).
+                let mut dst = MaybeUninit::<RawBuf>::uninit();
+                unsafe {
+                    // mlx_inline_init_copy is the copy-constructor trampoline.
+                    // It is `pub(crate)` in inline_array but we are inside the
+                    // same crate so this is fine.
+                    crate::inline_array::raw_copy_buf(dst.as_mut_ptr(), a.as_raw_ptr());
+                    dst.assume_init()
+                }
+            })
+            .collect();
 
         let mut dst_raw = MaybeUninit::<RawBuf>::uninit();
         unsafe {
@@ -444,7 +501,9 @@ pub mod ops {
         }
         // Destroy the temporary copies we made.
         for mut rb in raw_copies {
-            unsafe { crate::inline_array::raw_destroy(&mut rb); }
+            unsafe {
+                crate::inline_array::raw_destroy(&mut rb);
+            }
         }
         unsafe { crate::inline_array::from_raw_buf(dst_raw.assume_init()) }
     }
@@ -452,13 +511,16 @@ pub mod ops {
     /// Stack arrays along a new axis.
     pub fn stack_axis(arrays: &[Array], axis: i32) -> Array {
         assert!(!arrays.is_empty(), "stack_axis: empty array slice");
-        let raw_copies: Vec<RawBuf> = arrays.iter().map(|a| {
-            let mut dst = MaybeUninit::<RawBuf>::uninit();
-            unsafe {
-                crate::inline_array::raw_copy_buf(dst.as_mut_ptr(), a.as_raw_ptr());
-                dst.assume_init()
-            }
-        }).collect();
+        let raw_copies: Vec<RawBuf> = arrays
+            .iter()
+            .map(|a| {
+                let mut dst = MaybeUninit::<RawBuf>::uninit();
+                unsafe {
+                    crate::inline_array::raw_copy_buf(dst.as_mut_ptr(), a.as_raw_ptr());
+                    dst.assume_init()
+                }
+            })
+            .collect();
 
         let mut dst_raw = MaybeUninit::<RawBuf>::uninit();
         unsafe {
@@ -470,40 +532,70 @@ pub mod ops {
             );
         }
         for mut rb in raw_copies {
-            unsafe { crate::inline_array::raw_destroy(&mut rb); }
+            unsafe {
+                crate::inline_array::raw_destroy(&mut rb);
+            }
         }
         unsafe { crate::inline_array::from_raw_buf(dst_raw.assume_init()) }
     }
 
-    pub fn expand_dims(a: &Array, axis: i32) -> Array { a.expand_dims(axis) }
-    pub fn repeat_axis(a: Array, repeats: i32, axis: i32) -> Array { a.repeat(repeats, axis) }
+    pub fn expand_dims(a: &Array, axis: i32) -> Array {
+        a.expand_dims(axis)
+    }
+    pub fn repeat_axis(a: Array, repeats: i32, axis: i32) -> Array {
+        a.repeat(repeats, axis)
+    }
     /// Stack arrays along a new axis 0 — equivalent to `mlx_rs::ops::stack`.
-    pub fn stack(arrays: &[Array]) -> Array { stack_axis(arrays, 0) }
+    pub fn stack(arrays: &[Array]) -> Array {
+        stack_axis(arrays, 0)
+    }
 
     pub fn tri(n: i32, m: i32, k: i32, dtype: Dtype) -> Array {
         Array::tri(n, m, k, dtype.as_i32())
     }
 
-    pub fn sigmoid(a: &Array) -> Array { a.sigmoid() }
+    pub fn sigmoid(a: &Array) -> Array {
+        a.sigmoid()
+    }
 
     pub fn clip(a: &Array, lo: Option<&Array>, hi: Option<&Array>) -> Array {
         a.clip(lo, hi)
     }
 
-    pub fn argsort_axis(a: &Array, axis: i32) -> Array { a.argsort(axis) }
-    pub fn argpartition_axis(a: &Array, kth: i32, axis: i32) -> Array { a.argpartition(kth, axis) }
-    pub fn cumsum(a: &Array, axis: i32) -> Array { a.cumsum(axis) }
-    pub fn tril(a: &Array, k: i32) -> Array { a.tril(k) }
-    pub fn argmax(a: &Array, axis: i32) -> Array { a.argmax(axis) }
-    pub fn argmin(a: &Array, axis: i32) -> Array { a.argmin(axis) }
-    pub fn zeros(shape: &[i32], dtype: Dtype) -> Array { Array::zeros(shape, dtype.as_i32()) }
-    pub fn ones(shape: &[i32], dtype: Dtype) -> Array { Array::ones(shape, dtype.as_i32()) }
+    pub fn argsort_axis(a: &Array, axis: i32) -> Array {
+        a.argsort(axis)
+    }
+    pub fn argpartition_axis(a: &Array, kth: i32, axis: i32) -> Array {
+        a.argpartition(kth, axis)
+    }
+    pub fn cumsum(a: &Array, axis: i32) -> Array {
+        a.cumsum(axis)
+    }
+    pub fn tril(a: &Array, k: i32) -> Array {
+        a.tril(k)
+    }
+    pub fn argmax(a: &Array, axis: i32) -> Array {
+        a.argmax(axis)
+    }
+    pub fn argmin(a: &Array, axis: i32) -> Array {
+        a.argmin(axis)
+    }
+    pub fn zeros(shape: &[i32], dtype: Dtype) -> Array {
+        Array::zeros(shape, dtype.as_i32())
+    }
+    pub fn ones(shape: &[i32], dtype: Dtype) -> Array {
+        Array::ones(shape, dtype.as_i32())
+    }
     pub fn full(shape: &[i32], val: f32, dtype: Dtype) -> Array {
         Array::full(shape, val, dtype.as_i32())
     }
-    pub fn arange(n: i32, dtype: Dtype) -> Array { Array::arange(n, dtype.as_i32()) }
+    pub fn arange(n: i32, dtype: Dtype) -> Array {
+        Array::arange(n, dtype.as_i32())
+    }
     /// `arange(0, n, 1)` — integer range as int32.
-    pub fn arange_n(n: i32) -> Array { Array::arange(n, Dtype::Int32.as_i32()) }
+    pub fn arange_n(n: i32) -> Array {
+        Array::arange(n, Dtype::Int32.as_i32())
+    }
     /// `arange(start, stop, 1)` — integer range; equivalent to `mlx_rs::ops::arange::<i32,i32>(start, stop, 1)`.
     pub fn arange_from(start: i32, stop: i32) -> Array {
         let n = (stop - start).max(0);
@@ -515,44 +607,111 @@ pub mod ops {
             base.add(&offset)
         }
     }
-    pub fn zeros_like(a: &Array) -> Array { a.zeros_like() }
-    pub fn eye(n: i32, dtype: Dtype) -> Array { Array::eye(n, dtype.as_i32()) }
-    pub fn flatten(a: &Array, start: i32, end: i32) -> Array { a.flatten(start, end) }
-    pub fn transpose(a: &Array) -> Array { a.t() }
-    pub fn transpose_axes(a: &Array, axes: &[i32]) -> Array { a.transpose_axes(axes) }
-    pub fn reshape(a: &Array, shape: &[i32]) -> Array { a.reshape(shape) }
-    pub fn squeeze(a: &Array, axis: i32) -> Array { a.squeeze(axis) }
-    pub fn sum_axis(a: &Array, axis: i32, keepdims: bool) -> Array { a.sum_axis(axis, keepdims) }
-    pub fn sum_axes(a: &Array, axes: &[i32], keepdims: bool) -> Array { a.sum_axes(axes, keepdims) }
-    pub fn sum_all(a: &Array) -> Array { a.sum_all() }
-    pub fn mean_axis(a: &Array, axis: i32, keepdims: bool) -> Array { a.mean_axis(axis, keepdims) }
-    pub fn mean_all(a: &Array) -> Array { a.mean_all() }
-    pub fn max_axis(a: &Array, axis: i32, keepdims: bool) -> Array { a.max_axis(axis, keepdims) }
-    pub fn min_axis(a: &Array, axis: i32, keepdims: bool) -> Array { a.min_axis(axis, keepdims) }
-    pub fn logsumexp(a: &Array, axis: i32, keepdims: bool) -> Array { a.logsumexp(axis, keepdims) }
-    pub fn exp(a: &Array) -> Array { a.exp() }
-    pub fn log(a: &Array) -> Array { a.log() }
-    pub fn sqrt(a: &Array) -> Array { a.sqrt() }
-    pub fn abs(a: &Array) -> Array { a.abs_val() }
-    pub fn square(a: &Array) -> Array { a.square() }
-    pub fn pow(a: &Array, b: &Array) -> Array { a.pow(b) }
-    pub fn where_fn(cond: &Array, a: &Array, b: &Array) -> Array { cond.where_cond(a, b) }
+    pub fn zeros_like(a: &Array) -> Array {
+        a.zeros_like()
+    }
+    pub fn eye(n: i32, dtype: Dtype) -> Array {
+        Array::eye(n, dtype.as_i32())
+    }
+    pub fn flatten(a: &Array, start: i32, end: i32) -> Array {
+        a.flatten(start, end)
+    }
+    pub fn transpose(a: &Array) -> Array {
+        a.t()
+    }
+    pub fn transpose_axes(a: &Array, axes: &[i32]) -> Array {
+        a.transpose_axes(axes)
+    }
+    pub fn reshape(a: &Array, shape: &[i32]) -> Array {
+        a.reshape(shape)
+    }
+    pub fn squeeze(a: &Array, axis: i32) -> Array {
+        a.squeeze(axis)
+    }
+    pub fn sum_axis(a: &Array, axis: i32, keepdims: bool) -> Array {
+        a.sum_axis(axis, keepdims)
+    }
+    pub fn sum_axes(a: &Array, axes: &[i32], keepdims: bool) -> Array {
+        a.sum_axes(axes, keepdims)
+    }
+    pub fn sum_all(a: &Array) -> Array {
+        a.sum_all()
+    }
+    pub fn mean_axis(a: &Array, axis: i32, keepdims: bool) -> Array {
+        a.mean_axis(axis, keepdims)
+    }
+    pub fn mean_all(a: &Array) -> Array {
+        a.mean_all()
+    }
+    pub fn max_axis(a: &Array, axis: i32, keepdims: bool) -> Array {
+        a.max_axis(axis, keepdims)
+    }
+    pub fn min_axis(a: &Array, axis: i32, keepdims: bool) -> Array {
+        a.min_axis(axis, keepdims)
+    }
+    pub fn logsumexp(a: &Array, axis: i32, keepdims: bool) -> Array {
+        a.logsumexp(axis, keepdims)
+    }
+    pub fn exp(a: &Array) -> Array {
+        a.exp()
+    }
+    pub fn log(a: &Array) -> Array {
+        a.log()
+    }
+    pub fn sqrt(a: &Array) -> Array {
+        a.sqrt()
+    }
+    pub fn abs(a: &Array) -> Array {
+        a.abs_val()
+    }
+    pub fn square(a: &Array) -> Array {
+        a.square()
+    }
+    pub fn pow(a: &Array, b: &Array) -> Array {
+        a.pow(b)
+    }
+    pub fn where_fn(cond: &Array, a: &Array, b: &Array) -> Array {
+        cond.where_cond(a, b)
+    }
     /// `r#where` — alias for `where_fn` matching the mlx-rs `ops::r#where` name.
     #[allow(non_snake_case)]
-    pub fn r#where(cond: &Array, a: &Array, b: &Array) -> Array { cond.where_cond(a, b) }
-    pub fn equal(a: &Array, b: &Array) -> Array { a.equal(b) }
-    pub fn not_equal(a: &Array, b: &Array) -> Array { a.not_equal(b) }
-    pub fn greater(a: &Array, b: &Array) -> Array { a.greater(b) }
-    pub fn less(a: &Array, b: &Array) -> Array { a.less(b) }
-    pub fn greater_equal(a: &Array, b: &Array) -> Array { a.greater_equal(b) }
-    pub fn less_equal(a: &Array, b: &Array) -> Array { a.less_equal(b) }
-    pub fn stop_gradient(a: &Array) -> Array { a.stop_gradient() }
-    pub fn take_axis(a: &Array, indices: &Array, axis: i32) -> Array { a.take_axis(indices, axis) }
+    pub fn r#where(cond: &Array, a: &Array, b: &Array) -> Array {
+        cond.where_cond(a, b)
+    }
+    pub fn equal(a: &Array, b: &Array) -> Array {
+        a.equal(b)
+    }
+    pub fn not_equal(a: &Array, b: &Array) -> Array {
+        a.not_equal(b)
+    }
+    pub fn greater(a: &Array, b: &Array) -> Array {
+        a.greater(b)
+    }
+    pub fn less(a: &Array, b: &Array) -> Array {
+        a.less(b)
+    }
+    pub fn greater_equal(a: &Array, b: &Array) -> Array {
+        a.greater_equal(b)
+    }
+    pub fn less_equal(a: &Array, b: &Array) -> Array {
+        a.less_equal(b)
+    }
+    pub fn stop_gradient(a: &Array) -> Array {
+        a.stop_gradient()
+    }
+    pub fn take_axis(a: &Array, indices: &Array, axis: i32) -> Array {
+        a.take_axis(indices, axis)
+    }
     pub fn take_along_axis(a: &Array, indices: &Array, axis: i32) -> Array {
         a.take_along_axis(indices, axis)
     }
     /// Pad array. `pad_widths`: `&[(before, after)]` per axis.
-    pub fn pad(a: &Array, pad_widths: &[(i32, i32)], _mode: Option<&str>, fill_value: Option<f32>) -> Array {
+    pub fn pad(
+        a: &Array,
+        pad_widths: &[(i32, i32)],
+        _mode: Option<&str>,
+        fill_value: Option<f32>,
+    ) -> Array {
         let fill = fill_value.unwrap_or(0.0);
         let flat: Vec<i32> = pad_widths.iter().flat_map(|(b, e)| [*b, *e]).collect();
         a.pad_constant(&flat, fill)
@@ -570,7 +729,14 @@ pub mod ops {
             a.add(&offset)
         }
     }
-    pub fn conv1d(input: &Array, weight: &Array, stride: i32, padding: i32, dilation: i32, groups: i32) -> Array {
+    pub fn conv1d(
+        input: &Array,
+        weight: &Array,
+        stride: i32,
+        padding: i32,
+        dilation: i32,
+        groups: i32,
+    ) -> Array {
         input.conv1d(weight, stride, padding, dilation, groups)
     }
     pub fn tanh(a: &Array) -> Array {
@@ -586,13 +752,21 @@ pub mod ops {
     // ── arithmetic helpers ────────────────────────────────────────────────────
 
     /// Element-wise addition — alias for `a.add(b)`.
-    pub fn add(a: &Array, b: &Array) -> Array { a.add(b) }
+    pub fn add(a: &Array, b: &Array) -> Array {
+        a.add(b)
+    }
     /// Element-wise subtraction.
-    pub fn subtract(a: &Array, b: &Array) -> Array { a.subtract(b) }
+    pub fn subtract(a: &Array, b: &Array) -> Array {
+        a.subtract(b)
+    }
     /// Element-wise multiplication.
-    pub fn multiply(a: &Array, b: &Array) -> Array { a.multiply(b) }
+    pub fn multiply(a: &Array, b: &Array) -> Array {
+        a.multiply(b)
+    }
     /// Element-wise division.
-    pub fn divide(a: &Array, b: &Array) -> Array { a.divide(b) }
+    pub fn divide(a: &Array, b: &Array) -> Array {
+        a.divide(b)
+    }
     /// Negate: `-a`.
     pub fn negative(a: &Array) -> Array {
         let neg_one = Array::from_f32(-1.0);
@@ -601,19 +775,31 @@ pub mod ops {
 
     // ── trigonometry ─────────────────────────────────────────────────────────
 
-    pub fn sin(a: &Array) -> Array { a.sin() }
-    pub fn cos(a: &Array) -> Array { a.cos() }
+    pub fn sin(a: &Array) -> Array {
+        a.sin()
+    }
+    pub fn cos(a: &Array) -> Array {
+        a.cos()
+    }
 
     // ── aliases and missing variants ──────────────────────────────────────────
 
     /// Alias for `zeros` — `zeros_dtype(shape, dtype)` matches mlx-rs naming.
-    pub fn zeros_dtype(shape: &[i32], dtype: Dtype) -> Array { Array::zeros(shape, dtype.as_i32()) }
+    pub fn zeros_dtype(shape: &[i32], dtype: Dtype) -> Array {
+        Array::zeros(shape, dtype.as_i32())
+    }
     /// Alias: `argmax` with keepdims=false.
-    pub fn argmax_axis(a: &Array, axis: i32) -> Array { a.argmax(axis) }
+    pub fn argmax_axis(a: &Array, axis: i32) -> Array {
+        a.argmax(axis)
+    }
     /// Alias: `argmin` with keepdims=false.
-    pub fn argmin_axis(a: &Array, axis: i32) -> Array { a.argmin(axis) }
+    pub fn argmin_axis(a: &Array, axis: i32) -> Array {
+        a.argmin(axis)
+    }
     /// `which(cond, x, y)` — alias for `where_fn`.
-    pub fn which(cond: &Array, x: &Array, y: &Array) -> Array { cond.where_cond(x, y) }
+    pub fn which(cond: &Array, x: &Array, y: &Array) -> Array {
+        cond.where_cond(x, y)
+    }
 
     /// Tile array `reps` times along each dimension.
     ///
@@ -629,8 +815,15 @@ pub mod ops {
             }
         }
         let effective_ndim = arr.ndim() as usize;
-        let pad = if nrep < effective_ndim { effective_ndim - nrep } else { 0 };
-        let full_reps: Vec<i32> = std::iter::repeat(1).take(pad).chain(reps.iter().copied()).collect();
+        let pad = if nrep < effective_ndim {
+            effective_ndim - nrep
+        } else {
+            0
+        };
+        let full_reps: Vec<i32> = std::iter::repeat(1)
+            .take(pad)
+            .chain(reps.iter().copied())
+            .collect();
         for (axis, &rep) in full_reps.iter().enumerate() {
             if rep > 1 {
                 arr = arr.repeat(rep, axis as i32);
@@ -673,13 +866,19 @@ pub mod ops {
     }
 
     /// `logsumexp_axis` — alias for `logsumexp(a, axis, false)`.
-    pub fn logsumexp_axis(a: &Array, axis: i32) -> Array { a.logsumexp(axis, false) }
+    pub fn logsumexp_axis(a: &Array, axis: i32) -> Array {
+        a.logsumexp(axis, false)
+    }
 
     /// `logsumexp_axis_keepdims` — `logsumexp(a, axis, keepdims)`.
-    pub fn logsumexp_axis_keepdims(a: &Array, axis: i32, keepdims: bool) -> Array { a.logsumexp(axis, keepdims) }
+    pub fn logsumexp_axis_keepdims(a: &Array, axis: i32, keepdims: bool) -> Array {
+        a.logsumexp(axis, keepdims)
+    }
 
     /// Reciprocal square root: `1/sqrt(x)`.
-    pub fn rsqrt(a: &Array) -> Array { a.rsqrt() }
+    pub fn rsqrt(a: &Array) -> Array {
+        a.rsqrt()
+    }
 
     /// Quantize to FP8 (E4M3 format, stored as uint8).
     ///
@@ -790,11 +989,7 @@ pub mod ops {
             }
         };
         let out = s.as_dtype(Dtype::Bool.as_i32());
-        if keep_dims {
-            out
-        } else {
-            out
-        }
+        if keep_dims { out } else { out }
     }
 
     /// Returns `true` (scalar bool) if any element is NaN.
@@ -811,7 +1006,7 @@ pub mod ops {
     pub fn select_axis(a: &Array, idx: i32, axis: i32) -> Array {
         let ndim = a.ndim() as i32;
         let ax = if axis < 0 { ndim + axis } else { axis };
-        let i = Array::from_i32(idx);
+        let i = Array::from_i32_slice_shaped(&[idx], &[1]);
         let out = a.take_axis(&i, ax);
         out.squeeze(ax)
     }
@@ -842,7 +1037,11 @@ pub mod ops {
     /// Equivalent to `a[..., start:end, ...]` at the given axis.
     pub fn slice_axis(a: &Array, axis: i32, start: i32, end: i32) -> Array {
         let ndim = a.ndim() as i32;
-        let ax = if axis < 0 { (ndim + axis) as usize } else { axis as usize };
+        let ax = if axis < 0 {
+            (ndim + axis) as usize
+        } else {
+            axis as usize
+        };
         let shape = a.shape();
         let mut s: Vec<i32> = vec![0; ndim as usize];
         let mut e: Vec<i32> = shape.iter().map(|&x| x as i32).collect();
@@ -854,7 +1053,11 @@ pub mod ops {
     /// Slice a specific axis from `start` to the end, all other axes full.
     pub fn slice_axis_from(a: &Array, axis: i32, start: i32) -> Array {
         let ndim = a.ndim() as i32;
-        let ax = if axis < 0 { (ndim + axis) as usize } else { axis as usize };
+        let ax = if axis < 0 {
+            (ndim + axis) as usize
+        } else {
+            axis as usize
+        };
         let shape = a.shape();
         let mut s: Vec<i32> = vec![0; ndim as usize];
         let e: Vec<i32> = shape.iter().map(|&x| x as i32).collect();
@@ -921,31 +1124,45 @@ pub mod nn {
     // Re-export layer types so `use pmetal_bridge::compat::nn` works
     // as a drop-in for `use mlx_rs::nn`.
     pub use super::layers::{
-        Linear, LinearBuilder,
-        RmsNorm, RmsNormBuilder,
-        LayerNorm, LayerNormBuilder,
-        GroupNorm, GroupNormBuilder,
-        Embedding,
-        Conv1d, Conv1dBuilder,
-        Conv2d, Conv2dBuilder,
-        Rope, RopeBuilder,
-        Sequential,
+        Conv1d, Conv1dBuilder, Conv2d, Conv2dBuilder, Embedding, GroupNorm, GroupNormBuilder,
+        LayerNorm, LayerNormBuilder, Linear, LinearBuilder, RmsNorm, RmsNormBuilder, Rope,
+        RopeBuilder, Sequential,
     };
 
     use super::{Array, Exception};
 
-    pub fn softplus(a: &Array) -> Array { a.softplus() }
-    pub fn sigmoid(a: &Array) -> Array { a.sigmoid() }
-    pub fn relu(a: &Array) -> Array { a.relu() }
-    pub fn gelu(a: &Array) -> Array { a.gelu() }
+    pub fn softplus(a: &Array) -> Array {
+        a.softplus()
+    }
+    pub fn sigmoid(a: &Array) -> Array {
+        a.sigmoid()
+    }
+    pub fn relu(a: &Array) -> Array {
+        a.relu()
+    }
+    pub fn gelu(a: &Array) -> Array {
+        a.gelu()
+    }
     /// GeLU with tanh approximation — matches `mlx_rs::nn::gelu_approximate`.
-    pub fn gelu_approximate(a: &Array) -> Array { a.gelu() }
-    pub fn silu(a: &Array) -> Array { a.silu() }
+    pub fn gelu_approximate(a: &Array) -> Array {
+        a.gelu()
+    }
+    pub fn silu(a: &Array) -> Array {
+        a.silu()
+    }
     /// Log-sigmoid: `log(sigmoid(x)) = -softplus(-x)`.
-    pub fn log_sigmoid(a: &Array) -> Array { a.negative().softplus().negative() }
-    pub fn log_softmax(a: &Array, axis: i32) -> Array { a.log_softmax(axis) }
-    pub fn softmax(a: &Array, axis: i32) -> Array { a.softmax(axis) }
-    pub fn leaky_relu(a: &Array, neg_slope: f32) -> Array { a.leaky_relu(neg_slope) }
+    pub fn log_sigmoid(a: &Array) -> Array {
+        a.negative().softplus().negative()
+    }
+    pub fn log_softmax(a: &Array, axis: i32) -> Array {
+        a.log_softmax(axis)
+    }
+    pub fn softmax(a: &Array, axis: i32) -> Array {
+        a.softmax(axis)
+    }
+    pub fn leaky_relu(a: &Array, neg_slope: f32) -> Array {
+        a.leaky_relu(neg_slope)
+    }
     pub fn cross_entropy(logits: &Array, targets: &Array, axis: i32) -> Array {
         logits.cross_entropy(targets, axis)
     }
@@ -1030,7 +1247,9 @@ pub mod nn {
                 }
 
                 // Consume inputs from the slot (called exactly once by bridge).
-                let inp = inputs_slot.take().expect("value_and_grad callback called more than once");
+                let inp = inputs_slot
+                    .take()
+                    .expect("value_and_grad callback called more than once");
                 match loss_fn_mut(model_mut, inp) {
                     Ok(loss) => loss,
                     Err(_) => Array::from_f32(f32::NAN),
@@ -1042,10 +1261,8 @@ pub mod nn {
                 crate::inline_array::value_and_grad(flat_loss, &param_arrays, &[]);
 
             // 4. Re-key gradients into FlattenedModuleParam.
-            let grads: FlattenedModuleParam = keys
-                .into_iter()
-                .zip(grad_arrays.into_iter())
-                .collect();
+            let grads: FlattenedModuleParam =
+                keys.into_iter().zip(grad_arrays.into_iter()).collect();
 
             Ok((loss, grads))
         }
@@ -1067,22 +1284,19 @@ pub mod nn {
     ) -> impl FnMut(
         super::FlattenedModuleParam,
         T,
-    ) -> Result<(Vec<super::Array>, super::FlattenedModuleParam), super::Exception>
+    )
+        -> Result<(Vec<super::Array>, super::FlattenedModuleParam), super::Exception>
     where
         T: 'static,
-        F: FnMut(
-            super::FlattenedModuleParam,
-            T,
-        ) -> Result<Vec<super::Array>, super::Exception>,
+        F: FnMut(super::FlattenedModuleParam, T) -> Result<Vec<super::Array>, super::Exception>,
     {
         move |params: super::FlattenedModuleParam, inputs: T| {
-            use std::rc::Rc;
             use super::FlattenedModuleParam;
+            use std::rc::Rc;
 
             // Stable key order.
             let keys: Vec<Rc<str>> = params.keys().cloned().collect();
-            let param_arrays: Vec<super::Array> =
-                keys.iter().map(|k| params[k].clone()).collect();
+            let param_arrays: Vec<super::Array> = keys.iter().map(|k| params[k].clone()).collect();
             let n_params = param_arrays.len();
 
             let mut inputs_slot: Option<T> = Some(inputs);
@@ -1109,7 +1323,9 @@ pub mod nn {
                 match loss_fn_mut(param_map, inp) {
                     Ok(mut vals) => {
                         // If there are multiple values, reduce to first (loss).
-                        vals.drain(..).next().unwrap_or_else(|| super::Array::from_f32(0.0))
+                        vals.drain(..)
+                            .next()
+                            .unwrap_or_else(|| super::Array::from_f32(0.0))
                     }
                     Err(_) => super::Array::from_f32(f32::NAN),
                 }
@@ -1120,10 +1336,8 @@ pub mod nn {
                 crate::inline_array::value_and_grad(flat_loss, &param_arrays, &[]);
 
             // Re-key gradients.
-            let grads: FlattenedModuleParam = keys
-                .into_iter()
-                .zip(grad_arrays.into_iter())
-                .collect();
+            let grads: FlattenedModuleParam =
+                keys.into_iter().zip(grad_arrays.into_iter()).collect();
 
             Ok((vec![loss_val], grads))
         }
@@ -1238,7 +1452,9 @@ pub struct IoError {
 
 impl IoError {
     pub fn new(msg: impl Into<String>) -> Self {
-        Self { message: msg.into() }
+        Self {
+            message: msg.into(),
+        }
     }
 }
 
@@ -1251,15 +1467,21 @@ impl std::fmt::Display for IoError {
 impl std::error::Error for IoError {}
 
 impl From<String> for IoError {
-    fn from(s: String) -> Self { Self::new(s) }
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
 }
 
 impl From<&str> for IoError {
-    fn from(s: &str) -> Self { Self::new(s) }
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
 }
 
 impl From<std::io::Error> for IoError {
-    fn from(e: std::io::Error) -> Self { Self::new(e.to_string()) }
+    fn from(e: std::io::Error) -> Self {
+        Self::new(e.to_string())
+    }
 }
 
 // ── ModuleParametersExt ───────────────────────────────────────────────────────
@@ -1284,7 +1506,8 @@ pub trait ModuleParametersExt: ModuleParameters {
     /// Used by weight loaders that need to assign tensors by name.
     fn flatten_params_mut(&mut self) -> std::collections::HashMap<String, &mut Array> {
         let tree = self.parameters_mut();
-        let mut out: std::collections::HashMap<String, &mut Array> = std::collections::HashMap::new();
+        let mut out: std::collections::HashMap<String, &mut Array> =
+            std::collections::HashMap::new();
         flatten_nested_mut_owned(tree, "", &mut out);
         out
     }
@@ -1312,26 +1535,12 @@ fn flatten_nested_ref_owned(
             format!("{prefix}.{k}").into()
         };
         match v {
-            NestedValue::Value(arr) => { out.insert(full, (*arr).clone()); }
-            NestedValue::Map(child) => { flatten_nested_ref_owned(child, &full, out); }
-        }
-    }
-}
-
-fn flatten_nested_mut<'a>(
-    map: std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a mut Array>>,
-    prefix: &str,
-    out: &mut std::collections::HashMap<std::rc::Rc<str>, &'a mut Array>,
-) {
-    for (k, v) in map {
-        let full: std::rc::Rc<str> = if prefix.is_empty() {
-            k.clone()
-        } else {
-            format!("{prefix}.{k}").into()
-        };
-        match v {
-            NestedValue::Value(arr) => { out.insert(full, arr); }
-            NestedValue::Map(child) => { flatten_nested_mut(child, &full, out); }
+            NestedValue::Value(arr) => {
+                out.insert(full, (*arr).clone());
+            }
+            NestedValue::Map(child) => {
+                flatten_nested_ref_owned(child, &full, out);
+            }
         }
     }
 }
@@ -1348,8 +1557,12 @@ fn flatten_nested_mut_owned<'a>(
             format!("{prefix}.{k}")
         };
         match v {
-            NestedValue::Value(arr) => { out.insert(full, arr); }
-            NestedValue::Map(child) => { flatten_nested_mut_owned(child, &full, out); }
+            NestedValue::Value(arr) => {
+                out.insert(full, arr);
+            }
+            NestedValue::Map(child) => {
+                flatten_nested_mut_owned(child, &full, out);
+            }
         }
     }
 }
@@ -1388,23 +1601,29 @@ pub enum NestedValue2<K, V> {
 }
 
 impl<K, V> Default for NestedHashMap<K, V> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<K, V> NestedHashMap<K, V> {
     pub fn new() -> Self {
-        Self { entries: std::collections::HashMap::new() }
+        Self {
+            entries: std::collections::HashMap::new(),
+        }
     }
 
     pub fn insert(&mut self, key: K, value: NestedValue2<K, V>)
-    where K: Eq + std::hash::Hash
+    where
+        K: Eq + std::hash::Hash,
     {
         self.entries.insert(key, value);
     }
 
     /// Flatten the nested map into a `HashMap<Rc<str>, V>`.
     pub fn flatten(self) -> std::collections::HashMap<std::rc::Rc<str>, V>
-    where K: AsRef<str> + std::fmt::Display
+    where
+        K: AsRef<str> + std::fmt::Display,
     {
         fn go<K: AsRef<str> + std::fmt::Display, V>(
             prefix: &str,
@@ -1412,7 +1631,9 @@ impl<K, V> NestedHashMap<K, V> {
             out: &mut std::collections::HashMap<std::rc::Rc<str>, V>,
         ) {
             match v {
-                NestedValue2::Value(val) => { out.insert(prefix.into(), val); }
+                NestedValue2::Value(val) => {
+                    out.insert(prefix.into(), val);
+                }
                 NestedValue2::Map(m) => {
                     for (k, child) in m {
                         let key = if prefix.is_empty() {
@@ -1438,12 +1659,24 @@ impl<K, V> NestedHashMap<K, V> {
 pub mod ops_ext {
     use super::Array;
 
-    pub fn sin(a: &Array) -> Array { a.sin() }
-    pub fn cos(a: &Array) -> Array { a.cos() }
-    pub fn rsqrt(a: &Array) -> Array { a.rsqrt() }
-    pub fn zeros_like(a: &Array) -> Array { a.zeros_like() }
-    pub fn ones_like(a: &Array) -> Array { a.ones_like() }
-    pub fn tile(a: &Array, reps: &[i32]) -> Array { a.tile(reps) }
+    pub fn sin(a: &Array) -> Array {
+        a.sin()
+    }
+    pub fn cos(a: &Array) -> Array {
+        a.cos()
+    }
+    pub fn rsqrt(a: &Array) -> Array {
+        a.rsqrt()
+    }
+    pub fn zeros_like(a: &Array) -> Array {
+        a.zeros_like()
+    }
+    pub fn ones_like(a: &Array) -> Array {
+        a.ones_like()
+    }
+    pub fn tile(a: &Array, reps: &[i32]) -> Array {
+        a.tile(reps)
+    }
     pub fn linspace(start: f32, stop: f32, n: i32, dtype: super::Dtype) -> Array {
         Array::linspace(start, stop, n, dtype.as_i32())
     }
@@ -1453,7 +1686,9 @@ pub mod ops_ext {
     pub fn scatter_add_single(a: &Array, indices: &Array, updates: &Array, axis: i32) -> Array {
         a.scatter_add_axis(indices, updates, axis)
     }
-    pub fn topk_axis(a: &Array, k: i32, axis: i32) -> Array { a.topk(k, axis) }
+    pub fn topk_axis(a: &Array, k: i32, axis: i32) -> Array {
+        a.topk(k, axis)
+    }
     pub fn put_along_axis(a: &Array, indices: &Array, values: &Array, axis: Option<i32>) -> Array {
         a.put_along_axis_op(indices, values, axis.unwrap_or(-1))
     }
@@ -1465,21 +1700,78 @@ pub mod ops_ext {
         let out = a.argmax(axis);
         if keepdims { out.expand_dims(axis) } else { out }
     }
-    pub fn argmax(a: &Array) -> Array { a.argmax(-1) }
+    pub fn argmax(a: &Array) -> Array {
+        a.argmax(-1)
+    }
 }
 
 // Re-export ops extras into ops for convenience
 pub mod indexing {
-    pub use super::ops_ext::{argmax_axis, argmax, scatter_add_single, topk_axis, put_along_axis};
     use super::Array;
+    pub use super::ops_ext::{argmax, argmax_axis, put_along_axis, scatter_add_single, topk_axis};
+    use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
     pub fn take_along_axis(a: &Array, indices: &Array, axis: i32) -> Array {
         a.take_along_axis(indices, axis)
     }
 
+    fn normalize_axis(axis: i32, ndim: usize) -> usize {
+        if axis < 0 {
+            (ndim as i32 + axis) as usize
+        } else {
+            axis as usize
+        }
+    }
+
+    fn normalize_bound(bound: i32, dim: i32) -> i32 {
+        if bound < 0 {
+            (dim + bound).clamp(0, dim)
+        } else {
+            bound.clamp(0, dim)
+        }
+    }
+
+    fn slice_axis_range(a: &Array, axis: usize, start: i32, end: i32) -> Array {
+        let shape = a.shape();
+        let dim = shape[axis] as i32;
+        let ndim = shape.len();
+        let mut starts = vec![0; ndim];
+        let mut stops: Vec<i32> = shape.iter().map(|&x| x as i32).collect();
+        starts[axis] = normalize_bound(start, dim);
+        stops[axis] = normalize_bound(end, dim);
+        a.slice(&starts, &stops)
+    }
+
+    fn slice_axis_from(a: &Array, axis: usize, start: i32) -> Array {
+        let end = a.shape()[axis] as i32;
+        slice_axis_range(a, axis, start, end)
+    }
+
+    fn select_axis_idx(a: &Array, axis: usize, idx: i32) -> Array {
+        let ndim = a.ndim();
+        let axis_i32 = axis as i32;
+        let dim = a.dim(axis_i32);
+        let normalized = if idx < 0 { dim + idx } else { idx };
+        let indices = Array::from_i32_slice_shaped(&[normalized], &[1]);
+        let out = a.take_axis(&indices, axis_i32);
+        out.squeeze(axis_i32)
+    }
+
     /// Thin shim: `IndexOp` replacement for simple array-backed indexing.
     pub trait IndexOp<Idx> {
         fn index(&self, idx: Idx) -> Self;
+    }
+
+    impl IndexOp<&Array> for Array {
+        fn index(&self, idx: &Array) -> Self {
+            self.index_array(idx)
+        }
+    }
+
+    impl IndexOp<Array> for Array {
+        fn index(&self, idx: Array) -> Self {
+            IndexOp::<&Array>::index(self, &idx)
+        }
     }
 
     // Integer index (e.g. `arr.index(5)`) — squeeze that axis.
@@ -1488,7 +1780,7 @@ pub mod indexing {
             let n = self.ndim();
             assert!(n >= 1, "index(i32): array must have at least 1 dim");
             // Take at position `idx` along axis 0, then remove that axis.
-            let i = Array::from_i32(idx);
+            let i = Array::from_i32_slice_shaped(&[idx], &[1]);
             let out = self.take_axis(&i, 0);
             out.squeeze(0)
         }
@@ -1498,6 +1790,187 @@ pub mod indexing {
     impl IndexOp<usize> for Array {
         fn index(&self, idx: usize) -> Self {
             IndexOp::<i32>::index(self, idx as i32)
+        }
+    }
+
+    impl IndexOp<(RangeTo<i32>, RangeFull)> for Array {
+        fn index(&self, idx: (RangeTo<i32>, RangeFull)) -> Self {
+            let axis = normalize_axis(0, self.ndim() as usize);
+            slice_axis_range(self, axis, 0, idx.0.end)
+        }
+    }
+
+    impl IndexOp<(RangeTo<usize>, RangeFull)> for Array {
+        fn index(&self, idx: (RangeTo<usize>, RangeFull)) -> Self {
+            IndexOp::<(RangeTo<i32>, RangeFull)>::index(self, (..(idx.0.end as i32), ..))
+        }
+    }
+
+    impl IndexOp<(Range<i32>, RangeFull)> for Array {
+        fn index(&self, idx: (Range<i32>, RangeFull)) -> Self {
+            let axis = normalize_axis(0, self.ndim() as usize);
+            slice_axis_range(self, axis, idx.0.start, idx.0.end)
+        }
+    }
+
+    impl IndexOp<(Range<usize>, RangeFull)> for Array {
+        fn index(&self, idx: (Range<usize>, RangeFull)) -> Self {
+            IndexOp::<(Range<i32>, RangeFull)>::index(
+                self,
+                ((idx.0.start as i32)..(idx.0.end as i32), ..),
+            )
+        }
+    }
+
+    impl IndexOp<(RangeFull, RangeTo<i32>)> for Array {
+        fn index(&self, idx: (RangeFull, RangeTo<i32>)) -> Self {
+            let axis = normalize_axis(1, self.ndim() as usize);
+            slice_axis_range(self, axis, 0, idx.1.end)
+        }
+    }
+
+    impl IndexOp<(RangeFull, RangeTo<usize>)> for Array {
+        fn index(&self, idx: (RangeFull, RangeTo<usize>)) -> Self {
+            IndexOp::<(RangeFull, RangeTo<i32>)>::index(self, (.., ..(idx.1.end as i32)))
+        }
+    }
+
+    impl IndexOp<(RangeFull, Range<i32>)> for Array {
+        fn index(&self, idx: (RangeFull, Range<i32>)) -> Self {
+            let axis = normalize_axis(1, self.ndim() as usize);
+            slice_axis_range(self, axis, idx.1.start, idx.1.end)
+        }
+    }
+
+    impl IndexOp<(RangeFull, Range<usize>)> for Array {
+        fn index(&self, idx: (RangeFull, Range<usize>)) -> Self {
+            IndexOp::<(RangeFull, Range<i32>)>::index(
+                self,
+                (.., (idx.1.start as i32)..(idx.1.end as i32)),
+            )
+        }
+    }
+
+    impl IndexOp<(RangeFull, RangeFrom<i32>)> for Array {
+        fn index(&self, idx: (RangeFull, RangeFrom<i32>)) -> Self {
+            let axis = normalize_axis(1, self.ndim() as usize);
+            slice_axis_from(self, axis, idx.1.start)
+        }
+    }
+
+    impl IndexOp<(RangeFull, RangeFrom<usize>)> for Array {
+        fn index(&self, idx: (RangeFull, RangeFrom<usize>)) -> Self {
+            IndexOp::<(RangeFull, RangeFrom<i32>)>::index(self, (.., (idx.1.start as i32)..))
+        }
+    }
+
+    impl IndexOp<(RangeFull, i32)> for Array {
+        fn index(&self, idx: (RangeFull, i32)) -> Self {
+            let axis = normalize_axis(1, self.ndim() as usize);
+            select_axis_idx(self, axis, idx.1)
+        }
+    }
+
+    impl IndexOp<(RangeFull, RangeTo<i32>, RangeFull)> for Array {
+        fn index(&self, idx: (RangeFull, RangeTo<i32>, RangeFull)) -> Self {
+            let axis = normalize_axis(1, self.ndim() as usize);
+            slice_axis_range(self, axis, 0, idx.1.end)
+        }
+    }
+
+    impl IndexOp<(RangeFull, RangeTo<usize>, RangeFull)> for Array {
+        fn index(&self, idx: (RangeFull, RangeTo<usize>, RangeFull)) -> Self {
+            IndexOp::<(RangeFull, RangeTo<i32>, RangeFull)>::index(
+                self,
+                (.., ..(idx.1.end as i32), ..),
+            )
+        }
+    }
+
+    impl IndexOp<(RangeFull, Range<i32>, RangeFull)> for Array {
+        fn index(&self, idx: (RangeFull, Range<i32>, RangeFull)) -> Self {
+            let axis = normalize_axis(1, self.ndim() as usize);
+            slice_axis_range(self, axis, idx.1.start, idx.1.end)
+        }
+    }
+
+    impl IndexOp<(RangeFull, Range<usize>, RangeFull)> for Array {
+        fn index(&self, idx: (RangeFull, Range<usize>, RangeFull)) -> Self {
+            IndexOp::<(RangeFull, Range<i32>, RangeFull)>::index(
+                self,
+                (.., (idx.1.start as i32)..(idx.1.end as i32), ..),
+            )
+        }
+    }
+
+    impl IndexOp<(RangeFull, RangeFrom<i32>, RangeFull)> for Array {
+        fn index(&self, idx: (RangeFull, RangeFrom<i32>, RangeFull)) -> Self {
+            let axis = normalize_axis(1, self.ndim() as usize);
+            slice_axis_from(self, axis, idx.1.start)
+        }
+    }
+
+    impl IndexOp<(RangeFull, RangeFrom<usize>, RangeFull)> for Array {
+        fn index(&self, idx: (RangeFull, RangeFrom<usize>, RangeFull)) -> Self {
+            IndexOp::<(RangeFull, RangeFrom<i32>, RangeFull)>::index(
+                self,
+                (.., (idx.1.start as i32).., ..),
+            )
+        }
+    }
+
+    impl IndexOp<(RangeFull, i32, RangeFull)> for Array {
+        fn index(&self, idx: (RangeFull, i32, RangeFull)) -> Self {
+            let axis = normalize_axis(1, self.ndim() as usize);
+            select_axis_idx(self, axis, idx.1)
+        }
+    }
+
+    impl IndexOp<(RangeFull, RangeFull, RangeFull, RangeTo<i32>)> for Array {
+        fn index(&self, idx: (RangeFull, RangeFull, RangeFull, RangeTo<i32>)) -> Self {
+            let axis = normalize_axis(3, self.ndim() as usize);
+            slice_axis_range(self, axis, 0, idx.3.end)
+        }
+    }
+
+    impl IndexOp<(RangeFull, RangeFull, RangeFull, RangeTo<usize>)> for Array {
+        fn index(&self, idx: (RangeFull, RangeFull, RangeFull, RangeTo<usize>)) -> Self {
+            IndexOp::<(RangeFull, RangeFull, RangeFull, RangeTo<i32>)>::index(
+                self,
+                (.., .., .., ..(idx.3.end as i32)),
+            )
+        }
+    }
+
+    impl IndexOp<(RangeFull, RangeFull, RangeFull, RangeFrom<i32>)> for Array {
+        fn index(&self, idx: (RangeFull, RangeFull, RangeFull, RangeFrom<i32>)) -> Self {
+            let axis = normalize_axis(3, self.ndim() as usize);
+            slice_axis_from(self, axis, idx.3.start)
+        }
+    }
+
+    impl IndexOp<(RangeFull, RangeFull, RangeFull, RangeFrom<usize>)> for Array {
+        fn index(&self, idx: (RangeFull, RangeFull, RangeFull, RangeFrom<usize>)) -> Self {
+            IndexOp::<(RangeFull, RangeFull, RangeFull, RangeFrom<i32>)>::index(
+                self,
+                (.., .., .., (idx.3.start as i32)..),
+            )
+        }
+    }
+
+    impl IndexOp<(RangeFull, RangeFull, RangeFull, Range<i32>)> for Array {
+        fn index(&self, idx: (RangeFull, RangeFull, RangeFull, Range<i32>)) -> Self {
+            let axis = normalize_axis(3, self.ndim() as usize);
+            slice_axis_range(self, axis, idx.3.start, idx.3.end)
+        }
+    }
+
+    impl IndexOp<(RangeFull, RangeFull, RangeFull, Range<usize>)> for Array {
+        fn index(&self, idx: (RangeFull, RangeFull, RangeFull, Range<usize>)) -> Self {
+            IndexOp::<(RangeFull, RangeFull, RangeFull, Range<i32>)>::index(
+                self,
+                (.., .., .., (idx.3.start as i32)..(idx.3.end as i32)),
+            )
         }
     }
 }
@@ -1534,7 +2007,9 @@ pub mod compile {
         pub fn new(f: impl Fn(&[Array]) -> Vec<Array> + 'static) -> Self {
             Self { f: Box::new(f) }
         }
-        pub fn call(&self, args: &[Array]) -> Vec<Array> { (self.f)(args) }
+        pub fn call(&self, args: &[Array]) -> Vec<Array> {
+            (self.f)(args)
+        }
         /// `apply` — alias for `call`, matches the mlx-rs Closure API.
         pub fn apply(&self, args: &[Array]) -> Result<Vec<Array>, super::Exception> {
             Ok((self.f)(args))
@@ -1552,7 +2027,11 @@ pub mod losses {
     use super::{Array, Exception};
 
     #[derive(Debug, Clone, Copy)]
-    pub enum LossReduction { None, Sum, Mean }
+    pub enum LossReduction {
+        None,
+        Sum,
+        Mean,
+    }
 
     /// Categorical cross-entropy loss — drop-in for `mlx_rs::losses::CrossEntropy`.
     ///
@@ -1563,7 +2042,9 @@ pub mod losses {
 
     impl CrossEntropy {
         /// Construct a CrossEntropy loss (infallible — Result is for API parity).
-        pub fn new() -> Result<Self, Exception> { Ok(Self) }
+        pub fn new() -> Result<Self, Exception> {
+            Ok(Self)
+        }
 
         /// Compute per-token cross-entropy loss.
         ///
@@ -1581,18 +2062,30 @@ pub mod losses {
 
     impl BinaryCrossEntropyBuilder {
         pub fn new() -> Self {
-            Self { reduction: LossReduction::Mean, with_logits: true }
+            Self {
+                reduction: LossReduction::Mean,
+                with_logits: true,
+            }
         }
-        pub fn reduction(mut self, r: LossReduction) -> Self { self.reduction = r; self }
-        pub fn with_logits(mut self, v: bool) -> Self { self.with_logits = v; self }
+        pub fn reduction(mut self, r: LossReduction) -> Self {
+            self.reduction = r;
+            self
+        }
+        pub fn with_logits(mut self, v: bool) -> Self {
+            self.with_logits = v;
+            self
+        }
         pub fn build(self) -> BinaryCrossEntropy {
-            BinaryCrossEntropy { reduction: self.reduction, with_logits: self.with_logits }
+            BinaryCrossEntropy {
+                reduction: self.reduction,
+                _with_logits: self.with_logits,
+            }
         }
     }
 
     pub struct BinaryCrossEntropy {
         reduction: LossReduction,
-        with_logits: bool,
+        _with_logits: bool,
     }
 
     impl BinaryCrossEntropy {
@@ -1600,9 +2093,12 @@ pub mod losses {
             // BCE with logits: -( targets * log_sigmoid(logits) + (1-targets) * log_sigmoid(-logits) )
             let ones = Array::ones(logits.shape(), 10);
             let neg_logits = logits.negative();
-            let pos = logits.log_softmax(0);  // placeholder - proper impl would use log_sigmoid
+            let pos = logits.log_softmax(0); // placeholder - proper impl would use log_sigmoid
             let neg = neg_logits.log_softmax(0);
-            let loss = targets.negative().multiply(&pos).subtract(&ones.subtract(targets).multiply(&neg));
+            let loss = targets
+                .negative()
+                .multiply(&pos)
+                .subtract(&ones.subtract(targets).multiply(&neg));
             match self.reduction {
                 LossReduction::Mean => loss.mean_all(),
                 LossReduction::Sum => loss.sum_all(),
@@ -1612,15 +2108,14 @@ pub mod losses {
     }
 }
 
-
 // ── optimizers compat ────────────────────────────────────────────────────────
 //
 // Drop-in shims for `mlx_rs::optimizers::*` used by the training infrastructure.
 
 pub mod optimizers {
     use super::{Array, Exception, FlattenedModuleParam, ModuleParameters, NestedValue};
-    use std::rc::Rc;
     use std::collections::HashMap;
+    use std::rc::Rc;
 
     /// Optimizer state: stores (momentum, velocity) tensors per parameter.
     pub type State<V> = HashMap<Rc<str>, V>;
@@ -1695,8 +2190,12 @@ pub mod optimizers {
 
     impl Optimizer for AdamW {
         type State = State<(Array, Array)>;
-        fn state(&self) -> &Self::State { &self.state }
-        fn state_mut(&mut self) -> &mut Self::State { &mut self.state }
+        fn state(&self) -> &Self::State {
+            &self.state
+        }
+        fn state_mut(&mut self) -> &mut Self::State {
+            &mut self.state
+        }
         fn update_single(
             &mut self,
             key: &Rc<str>,
@@ -1709,7 +2208,9 @@ pub mod optimizers {
     }
 
     impl Updatable for AdamW {
-        fn updatable_states_len(&self) -> usize { self.state.len() * 2 }
+        fn updatable_states_len(&self) -> usize {
+            self.state.len() * 2
+        }
         fn updatable_states(&self) -> Vec<&Array> {
             self.state.values().flat_map(|(m, v)| [m, v]).collect()
         }
@@ -1729,11 +2230,25 @@ pub mod optimizers {
 
     impl AdamWBuilder {
         pub fn new(lr: f32) -> Self {
-            Self { lr, weight_decay: 0.01, betas: (0.9, 0.999), eps: 1e-8 }
+            Self {
+                lr,
+                weight_decay: 0.01,
+                betas: (0.9, 0.999),
+                eps: 1e-8,
+            }
         }
-        pub fn weight_decay(mut self, wd: f32) -> Self { self.weight_decay = wd; self }
-        pub fn betas(mut self, b: (f32, f32)) -> Self { self.betas = b; self }
-        pub fn eps(mut self, e: f32) -> Self { self.eps = e; self }
+        pub fn weight_decay(mut self, wd: f32) -> Self {
+            self.weight_decay = wd;
+            self
+        }
+        pub fn betas(mut self, b: (f32, f32)) -> Self {
+            self.betas = b;
+            self
+        }
+        pub fn eps(mut self, e: f32) -> Self {
+            self.eps = e;
+            self
+        }
         pub fn build(self) -> Result<AdamW, Exception> {
             Ok(AdamW::new(self.lr, self.weight_decay))
         }
@@ -1753,14 +2268,21 @@ pub mod optimizers {
 
     impl Sgd {
         pub fn new(lr: f32) -> Self {
-            Self { lr: Array::from_f32(lr), state: HashMap::new() }
+            Self {
+                lr: Array::from_f32(lr),
+                state: HashMap::new(),
+            }
         }
     }
 
     impl Optimizer for Sgd {
         type State = State<()>;
-        fn state(&self) -> &Self::State { &self.state }
-        fn state_mut(&mut self) -> &mut Self::State { &mut self.state }
+        fn state(&self) -> &Self::State {
+            &self.state
+        }
+        fn state_mut(&mut self) -> &mut Self::State {
+            &mut self.state
+        }
         fn update_single(
             &mut self,
             _key: &Rc<str>,
@@ -1775,9 +2297,27 @@ pub mod optimizers {
     }
 
     impl Updatable for Sgd {
-        fn updatable_states_len(&self) -> usize { 0 }
-        fn updatable_states(&self) -> Vec<&Array> { vec![] }
-        fn updatable_states_mut(&mut self) -> Vec<&mut Array> { vec![] }
+        fn updatable_states_len(&self) -> usize {
+            0
+        }
+        fn updatable_states(&self) -> Vec<&Array> {
+            vec![]
+        }
+        fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
+            vec![]
+        }
+    }
+
+    impl<M, O: Updatable> Updatable for (M, O) {
+        fn updatable_states_len(&self) -> usize {
+            self.1.updatable_states_len()
+        }
+        fn updatable_states(&self) -> Vec<&Array> {
+            self.1.updatable_states()
+        }
+        fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
+            self.1.updatable_states_mut()
+        }
     }
 }
 
@@ -1794,7 +2334,9 @@ pub mod transforms {
         /// Placeholder: the bridge pre-compiles all ops in C++.
         /// Returns the function unchanged.
         pub fn compile_with_state<S, F>(f: F) -> F
-        where F: FnMut(&mut S) -> Vec<super::super::Array> {
+        where
+            F: FnMut(&mut S) -> Vec<super::super::Array>,
+        {
             f
         }
 
@@ -1835,8 +2377,8 @@ pub mod builder {
 
 pub mod module {
     pub use super::{
-        FlattenedModuleParam, Module, ModuleParameters, ModuleParamRef, ModuleParamMut,
-        Param, NestedValue, ModuleParametersExt,
+        FlattenedModuleParam, Module, ModuleParamMut, ModuleParamRef, ModuleParameters,
+        ModuleParametersExt, NestedValue, Param,
     };
 
     pub fn update_parameters<M: ModuleParameters>(
@@ -1884,7 +2426,9 @@ impl Parameter for Param<Array> {
     fn collect_params_mut<'a>(&'a mut self, key: &str, out: &mut ModuleParamMut<'a>) {
         out.insert(std::rc::Rc::from(key), NestedValue::Value(&mut self.value));
     }
-    fn count_params(&self) -> usize { 1 }
+    fn count_params(&self) -> usize {
+        1
+    }
 }
 
 // Param<Option<Array>> — contributes one leaf only when Some
@@ -1899,7 +2443,9 @@ impl Parameter for Param<Option<Array>> {
             out.insert(std::rc::Rc::from(key), NestedValue::Value(arr));
         }
     }
-    fn count_params(&self) -> usize { if self.value.is_some() { 1 } else { 0 } }
+    fn count_params(&self) -> usize {
+        if self.value.is_some() { 1 } else { 0 }
+    }
 }
 
 // A plain Array field (no Param wrapper) — contributes one leaf
@@ -1910,7 +2456,9 @@ impl Parameter for Array {
     fn collect_params_mut<'a>(&'a mut self, key: &str, out: &mut ModuleParamMut<'a>) {
         out.insert(std::rc::Rc::from(key), NestedValue::Value(self));
     }
-    fn count_params(&self) -> usize { 1 }
+    fn count_params(&self) -> usize {
+        1
+    }
 }
 
 // Option<Array> — contributes a leaf only when Some
@@ -1925,7 +2473,9 @@ impl Parameter for Option<Array> {
             out.insert(std::rc::Rc::from(key), NestedValue::Value(arr));
         }
     }
-    fn count_params(&self) -> usize { if self.is_some() { 1 } else { 0 } }
+    fn count_params(&self) -> usize {
+        if self.is_some() { 1 } else { 0 }
+    }
 }
 
 // Vec<Array>
@@ -1942,7 +2492,9 @@ impl Parameter for Vec<Array> {
             out.insert(std::rc::Rc::from(k.as_str()), NestedValue::Value(arr));
         }
     }
-    fn count_params(&self) -> usize { self.len() }
+    fn count_params(&self) -> usize {
+        self.len()
+    }
 }
 
 // Sub-modules implementing ModuleParameters are promoted into nested maps.
@@ -1961,7 +2513,9 @@ where
 {
     fn collect_params<'a>(&'a self, key: &str, out: &mut ModuleParamRef<'a>) {
         let sub = self.parameters();
-        if sub.is_empty() { return; }
+        if sub.is_empty() {
+            return;
+        }
         // Promote sub-tree as a NestedValue::Map
         let mut sub_map: std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a Array>> =
             std::collections::HashMap::new();
@@ -1976,7 +2530,9 @@ where
 
     fn collect_params_mut<'a>(&'a mut self, key: &str, out: &mut ModuleParamMut<'a>) {
         let sub = self.parameters_mut();
-        if sub.is_empty() { return; }
+        if sub.is_empty() {
+            return;
+        }
         let mut sub_map: std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a mut Array>> =
             std::collections::HashMap::new();
         for (k, v) in sub {
@@ -1993,9 +2549,7 @@ where
 // Lifetime re-borrow helpers — these are safe because the sub-map lifetime
 // is bounded by `self: 'a` and we never alias mutable references.
 #[allow(clippy::needless_lifetimes)]
-unsafe fn clone_nested_ref_lifetime<'a>(
-    v: NestedValue<&Array>
-) -> NestedValue<&'a Array> {
+unsafe fn clone_nested_ref_lifetime<'a>(v: NestedValue<&Array>) -> NestedValue<&'a Array> {
     match v {
         NestedValue::Value(r) => NestedValue::Value(unsafe { &*(r as *const Array) }),
         NestedValue::Map(m) => {
@@ -2009,9 +2563,7 @@ unsafe fn clone_nested_ref_lifetime<'a>(
 }
 
 #[allow(clippy::needless_lifetimes)]
-unsafe fn clone_nested_mut_lifetime<'a>(
-    v: NestedValue<&mut Array>
-) -> NestedValue<&'a mut Array> {
+unsafe fn clone_nested_mut_lifetime<'a>(v: NestedValue<&mut Array>) -> NestedValue<&'a mut Array> {
     match v {
         NestedValue::Value(r) => NestedValue::Value(unsafe { &mut *(r as *mut Array) }),
         NestedValue::Map(m) => {
@@ -2088,10 +2640,12 @@ macro_rules! impl_module_params {
 /// These are bridge-native equivalents of `mlx_rs::nn::Linear`, `RmsNorm`, etc.
 /// They implement `pmetal_bridge::compat::ModuleParameters` directly.
 pub mod layers {
-    use super::{Array, Exception, ModuleParameters, ModuleParamRef, ModuleParamMut,
-                NestedValue, Param, Parameter, ops, random};
-    use std::rc::Rc;
+    use super::{
+        Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param,
+        Parameter, ops, random,
+    };
     use std::collections::HashMap;
+    use std::rc::Rc;
 
     // ── Linear ────────────────────────────────────────────────────────────────
 
@@ -2107,13 +2661,22 @@ pub mod layers {
 
         pub fn new(in_dims: i32, out_dims: i32, with_bias: bool) -> Result<Self, super::Exception> {
             let scale = f32::sqrt(1.0 / in_dims as f32);
-            let weight = random::uniform_range(-scale, scale, &[out_dims, in_dims], super::Dtype::Float32);
+            let weight =
+                random::uniform_range(-scale, scale, &[out_dims, in_dims], super::Dtype::Float32);
             let bias = if with_bias {
-                Some(random::uniform_range(-scale, scale, &[out_dims], super::Dtype::Float32))
+                Some(random::uniform_range(
+                    -scale,
+                    scale,
+                    &[out_dims],
+                    super::Dtype::Float32,
+                ))
             } else {
                 None
             };
-            Ok(Self { weight: Param::new(weight), bias: Param::new(bias) })
+            Ok(Self {
+                weight: Param::new(weight),
+                bias: Param::new(bias),
+            })
         }
 
         /// Infallible constructor variant for internal use.
@@ -2136,6 +2699,16 @@ pub mod layers {
             let s = self.weight.value.shape();
             (s[0], s[1])
         }
+
+        #[inline]
+        pub fn unwrap(self) -> Self {
+            self
+        }
+
+        #[inline]
+        pub fn expect(self, _msg: &str) -> Self {
+            self
+        }
     }
 
     crate::impl_module_params!(Linear; weight, bias);
@@ -2149,9 +2722,16 @@ pub mod layers {
 
     impl LinearBuilder {
         pub fn new(in_dims: i32, out_dims: i32) -> Self {
-            Self { in_dims, out_dims, bias: Linear::DEFAULT_BIAS }
+            Self {
+                in_dims,
+                out_dims,
+                bias: Linear::DEFAULT_BIAS,
+            }
         }
-        pub fn bias(mut self, b: bool) -> Self { self.bias = b; self }
+        pub fn bias(mut self, b: bool) -> Self {
+            self.bias = b;
+            self
+        }
         pub fn build(self) -> Result<Linear, Exception> {
             Linear::new(self.in_dims, self.out_dims, self.bias)
         }
@@ -2175,7 +2755,10 @@ pub mod layers {
 
         pub fn with_eps(dims: i32, eps: f32) -> Self {
             let weight = ops::ones(&[dims], super::Dtype::Float32);
-            Self { weight: Param::new(weight), eps }
+            Self {
+                weight: Param::new(weight),
+                eps,
+            }
         }
 
         pub fn forward(&self, x: &Array) -> Array {
@@ -2193,9 +2776,15 @@ pub mod layers {
 
     impl RmsNormBuilder {
         pub fn new(dims: i32) -> Self {
-            Self { dims, eps: RmsNorm::DEFAULT_EPS }
+            Self {
+                dims,
+                eps: RmsNorm::DEFAULT_EPS,
+            }
         }
-        pub fn eps(mut self, eps: f32) -> Self { self.eps = eps; self }
+        pub fn eps(mut self, eps: f32) -> Self {
+            self.eps = eps;
+            self
+        }
         pub fn build(self) -> Result<RmsNorm, Exception> {
             Ok(RmsNorm::with_eps(self.dims, self.eps))
         }
@@ -2218,12 +2807,19 @@ pub mod layers {
 
         pub fn with_affine(dims: i32, eps: f32, affine: bool) -> Self {
             let (w, b) = if affine {
-                (Some(ops::ones(&[dims], super::Dtype::Float32)),
-                 Some(ops::zeros(&[dims], super::Dtype::Float32)))
+                (
+                    Some(ops::ones(&[dims], super::Dtype::Float32)),
+                    Some(ops::zeros(&[dims], super::Dtype::Float32)),
+                )
             } else {
                 (None, None)
             };
-            Self { dimensions: dims, eps, weight: Param::new(w), bias: Param::new(b) }
+            Self {
+                dimensions: dims,
+                eps,
+                weight: Param::new(w),
+                bias: Param::new(b),
+            }
         }
 
         pub fn forward(&self, x: &Array) -> Array {
@@ -2244,10 +2840,20 @@ pub mod layers {
 
     impl LayerNormBuilder {
         pub fn new(dims: i32) -> Self {
-            Self { dims, eps: LayerNorm::DEFAULT_EPS, affine: LayerNorm::DEFAULT_AFFINE }
+            Self {
+                dims,
+                eps: LayerNorm::DEFAULT_EPS,
+                affine: LayerNorm::DEFAULT_AFFINE,
+            }
         }
-        pub fn eps(mut self, eps: f32) -> Self { self.eps = eps; self }
-        pub fn affine(mut self, a: bool) -> Self { self.affine = a; self }
+        pub fn eps(mut self, eps: f32) -> Self {
+            self.eps = eps;
+            self
+        }
+        pub fn affine(mut self, a: bool) -> Self {
+            self.affine = a;
+            self
+        }
         pub fn build(self) -> Result<LayerNorm, Exception> {
             Ok(LayerNorm::with_affine(self.dims, self.eps, self.affine))
         }
@@ -2271,10 +2877,18 @@ pub mod layers {
         pub const DEFAULT_AFFINE: bool = true;
         pub const DEFAULT_PYTORCH_COMPATIBLE: bool = false;
 
-        pub fn new(group_count: i32, dims: i32, eps: f32, affine: bool, pytorch_compatible: bool) -> Self {
+        pub fn new(
+            group_count: i32,
+            dims: i32,
+            eps: f32,
+            affine: bool,
+            pytorch_compatible: bool,
+        ) -> Self {
             let (w, b) = if affine {
-                (Some(ops::ones(&[dims], super::Dtype::Float32)),
-                 Some(ops::zeros(&[dims], super::Dtype::Float32)))
+                (
+                    Some(ops::ones(&[dims], super::Dtype::Float32)),
+                    Some(ops::zeros(&[dims], super::Dtype::Float32)),
+                )
             } else {
                 (None, None)
             };
@@ -2297,7 +2911,9 @@ pub mod layers {
             if self.pytorch_compatible {
                 // PyTorch layout: [B, H, W, C] → reshape to [B, H*W, groups, group_size]
                 let x2 = x.reshape(&[batch, -1, self.group_count, group_size]);
-                let x2 = x2.transpose_axes(&[0, 2, 1, 3]).reshape(&[batch, self.group_count, -1]);
+                let x2 = x2
+                    .transpose_axes(&[0, 2, 1, 3])
+                    .reshape(&[batch, self.group_count, -1]);
                 let x2 = x2.layer_norm(None, None, eps_f);
                 let ndim = x.ndim() as i32;
                 let new_shape: Vec<i32> = std::iter::once(batch)
@@ -2348,17 +2964,33 @@ pub mod layers {
     impl GroupNormBuilder {
         pub fn new(group_count: i32, dims: i32) -> Self {
             Self {
-                group_count, dims,
+                group_count,
+                dims,
                 eps: GroupNorm::DEFAULT_EPS,
                 affine: GroupNorm::DEFAULT_AFFINE,
                 pytorch_compatible: GroupNorm::DEFAULT_PYTORCH_COMPATIBLE,
             }
         }
-        pub fn eps(mut self, eps: f32) -> Self { self.eps = eps; self }
-        pub fn affine(mut self, a: bool) -> Self { self.affine = a; self }
-        pub fn pytorch_compatible(mut self, p: bool) -> Self { self.pytorch_compatible = p; self }
+        pub fn eps(mut self, eps: f32) -> Self {
+            self.eps = eps;
+            self
+        }
+        pub fn affine(mut self, a: bool) -> Self {
+            self.affine = a;
+            self
+        }
+        pub fn pytorch_compatible(mut self, p: bool) -> Self {
+            self.pytorch_compatible = p;
+            self
+        }
         pub fn build(self) -> Result<GroupNorm, Exception> {
-            Ok(GroupNorm::new(self.group_count, self.dims, self.eps, self.affine, self.pytorch_compatible))
+            Ok(GroupNorm::new(
+                self.group_count,
+                self.dims,
+                self.eps,
+                self.affine,
+                self.pytorch_compatible,
+            ))
         }
     }
 
@@ -2373,8 +3005,15 @@ pub mod layers {
     impl Embedding {
         pub fn new(num_embeddings: i32, dims: i32) -> Result<Self, Exception> {
             let scale = f32::sqrt(1.0 / dims as f32);
-            let weight = random::uniform_range(-scale, scale, &[num_embeddings, dims], super::Dtype::Float32);
-            Ok(Self { weight: Param::new(weight) })
+            let weight = random::uniform_range(
+                -scale,
+                scale,
+                &[num_embeddings, dims],
+                super::Dtype::Float32,
+            );
+            Ok(Self {
+                weight: Param::new(weight),
+            })
         }
 
         pub fn forward(&self, x: &Array) -> Array {
@@ -2408,22 +3047,48 @@ pub mod layers {
         pub const DEFAULT_DILATION: i32 = 1;
         pub const DEFAULT_GROUPS: i32 = 1;
 
-        pub fn new(in_channels: i32, out_channels: i32, kernel_size: i32,
-                   stride: i32, padding: i32, dilation: i32, groups: i32, with_bias: bool) -> Self {
+        pub fn new(
+            in_channels: i32,
+            out_channels: i32,
+            kernel_size: i32,
+            stride: i32,
+            padding: i32,
+            dilation: i32,
+            groups: i32,
+            with_bias: bool,
+        ) -> Self {
             let scale = f32::sqrt(1.0 / (in_channels * kernel_size) as f32);
             // weight shape: [out_channels, kernel_size, in_channels/groups]
-            let weight = random::uniform_range(-scale, scale,
+            let weight = random::uniform_range(
+                -scale,
+                scale,
                 &[out_channels, kernel_size, in_channels / groups],
-                super::Dtype::Float32);
+                super::Dtype::Float32,
+            );
             let bias = if with_bias {
                 Some(ops::zeros(&[out_channels], super::Dtype::Float32))
-            } else { None };
-            Self { weight: Param::new(weight), bias: Param::new(bias),
-                   stride, padding, dilation, groups }
+            } else {
+                None
+            };
+            Self {
+                weight: Param::new(weight),
+                bias: Param::new(bias),
+                stride,
+                padding,
+                dilation,
+                groups,
+            }
         }
 
         pub fn forward(&self, x: &Array) -> Array {
-            let y = ops::conv1d(x, &self.weight.value, self.stride, self.padding, self.dilation, self.groups);
+            let y = ops::conv1d(
+                x,
+                &self.weight.value,
+                self.stride,
+                self.padding,
+                self.dilation,
+                self.groups,
+            );
             match &self.bias.value {
                 Some(b) => y.add(b),
                 None => y,
@@ -2448,7 +3113,9 @@ pub mod layers {
     impl Conv1dBuilder {
         pub fn new(in_ch: i32, out_ch: i32, kernel: i32) -> Self {
             Self {
-                in_ch, out_ch, kernel,
+                in_ch,
+                out_ch,
+                kernel,
                 bias: Conv1d::DEFAULT_BIAS,
                 stride: Conv1d::DEFAULT_STRIDE,
                 padding: Conv1d::DEFAULT_PADDING,
@@ -2456,14 +3123,37 @@ pub mod layers {
                 groups: Conv1d::DEFAULT_GROUPS,
             }
         }
-        pub fn bias(mut self, b: bool) -> Self { self.bias = b; self }
-        pub fn stride(mut self, s: i32) -> Self { self.stride = s; self }
-        pub fn padding(mut self, p: i32) -> Self { self.padding = p; self }
-        pub fn dilation(mut self, d: i32) -> Self { self.dilation = d; self }
-        pub fn groups(mut self, g: i32) -> Self { self.groups = g; self }
+        pub fn bias(mut self, b: bool) -> Self {
+            self.bias = b;
+            self
+        }
+        pub fn stride(mut self, s: i32) -> Self {
+            self.stride = s;
+            self
+        }
+        pub fn padding(mut self, p: i32) -> Self {
+            self.padding = p;
+            self
+        }
+        pub fn dilation(mut self, d: i32) -> Self {
+            self.dilation = d;
+            self
+        }
+        pub fn groups(mut self, g: i32) -> Self {
+            self.groups = g;
+            self
+        }
         pub fn build(self) -> Result<Conv1d, Exception> {
-            Ok(Conv1d::new(self.in_ch, self.out_ch, self.kernel,
-                           self.stride, self.padding, self.dilation, self.groups, self.bias))
+            Ok(Conv1d::new(
+                self.in_ch,
+                self.out_ch,
+                self.kernel,
+                self.stride,
+                self.padding,
+                self.dilation,
+                self.groups,
+                self.bias,
+            ))
         }
     }
 
@@ -2487,18 +3177,35 @@ pub mod layers {
         pub const DEFAULT_SCALE: f32 = 1.0;
 
         pub fn new(dims: i32, traditional: bool, base: f32, scale: f32) -> Self {
-            Self { dimensions: dims, traditional, base, scale }
+            Self {
+                dimensions: dims,
+                traditional,
+                base,
+                scale,
+            }
         }
 
         pub fn forward(&self, x: &Array, offset: i32) -> Array {
-            x.rope(self.dimensions, self.traditional, self.base, self.scale, offset)
+            x.rope(
+                self.dimensions,
+                self.traditional,
+                self.base,
+                self.scale,
+                offset,
+            )
         }
     }
 
     impl ModuleParameters for Rope {
-        fn num_parameters(&self) -> usize { 0 }
-        fn parameters(&self) -> ModuleParamRef<'_> { HashMap::new() }
-        fn parameters_mut(&mut self) -> ModuleParamMut<'_> { HashMap::new() }
+        fn num_parameters(&self) -> usize {
+            0
+        }
+        fn parameters(&self) -> ModuleParamRef<'_> {
+            HashMap::new()
+        }
+        fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
+            HashMap::new()
+        }
     }
 
     /// Builder for [`Rope`].
@@ -2518,11 +3225,25 @@ pub mod layers {
                 scale: Rope::DEFAULT_SCALE,
             }
         }
-        pub fn traditional(mut self, t: bool) -> Self { self.traditional = t; self }
-        pub fn base(mut self, b: f32) -> Self { self.base = b; self }
-        pub fn scale(mut self, s: f32) -> Self { self.scale = s; self }
+        pub fn traditional(mut self, t: bool) -> Self {
+            self.traditional = t;
+            self
+        }
+        pub fn base(mut self, b: f32) -> Self {
+            self.base = b;
+            self
+        }
+        pub fn scale(mut self, s: f32) -> Self {
+            self.scale = s;
+            self
+        }
         pub fn build(self) -> Result<Rope, Exception> {
-            Ok(Rope::new(self.dims, self.traditional, self.base, self.scale))
+            Ok(Rope::new(
+                self.dims,
+                self.traditional,
+                self.base,
+                self.scale,
+            ))
         }
     }
 
@@ -2668,12 +3389,18 @@ pub mod layers {
         ) -> Self {
             let scale = f32::sqrt(1.0 / (in_channels * kernel_size * kernel_size) as f32);
             let weight = random::uniform_range(
-                -scale, scale,
+                -scale,
+                scale,
                 &[out_channels, kernel_size, kernel_size, in_channels],
                 super::Dtype::Float32,
             );
             let bias = if with_bias {
-                Some(random::uniform_range(-scale, scale, &[out_channels], super::Dtype::Float32))
+                Some(random::uniform_range(
+                    -scale,
+                    scale,
+                    &[out_channels],
+                    super::Dtype::Float32,
+                ))
             } else {
                 None
             };
@@ -2690,9 +3417,12 @@ pub mod layers {
         pub fn forward(&self, x: &Array) -> Array {
             let out = x.conv2d(
                 &self.weight.value,
-                self.stride[0], self.stride[1],
-                self.padding[0], self.padding[1],
-                self.dilation[0], self.dilation[1],
+                self.stride[0],
+                self.stride[1],
+                self.padding[0],
+                self.padding[1],
+                self.dilation[0],
+                self.dilation[1],
                 self.groups,
             );
             match &self.bias.value {
@@ -2725,13 +3455,36 @@ pub mod layers {
 
     impl Conv2dBuilder {
         pub fn new(in_channels: i32, out_channels: i32, kernel_size: i32) -> Self {
-            Self { in_channels, out_channels, kernel_size, stride: 1, padding: 0, with_bias: true }
+            Self {
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride: 1,
+                padding: 0,
+                with_bias: true,
+            }
         }
-        pub fn stride(mut self, s: i32) -> Self { self.stride = s; self }
-        pub fn padding(mut self, p: i32) -> Self { self.padding = p; self }
-        pub fn bias(mut self, b: bool) -> Self { self.with_bias = b; self }
+        pub fn stride(mut self, s: i32) -> Self {
+            self.stride = s;
+            self
+        }
+        pub fn padding(mut self, p: i32) -> Self {
+            self.padding = p;
+            self
+        }
+        pub fn bias(mut self, b: bool) -> Self {
+            self.with_bias = b;
+            self
+        }
         pub fn build(self) -> Result<Conv2d, super::Exception> {
-            Ok(Conv2d::new(self.in_channels, self.out_channels, self.kernel_size, self.stride, self.padding, self.with_bias))
+            Ok(Conv2d::new(
+                self.in_channels,
+                self.out_channels,
+                self.kernel_size,
+                self.stride,
+                self.padding,
+                self.with_bias,
+            ))
         }
     }
 
@@ -2748,7 +3501,8 @@ pub mod layers {
     ///
     /// Equivalent to `mlx_rs::nn::Sequential` but works with any `Module<&Array>`.
     pub struct Sequential {
-        layers: Vec<Box<dyn super::Module<&'static Array, Output = Array, Error = super::Exception>>>,
+        layers:
+            Vec<Box<dyn super::Module<&'static Array, Output = Array, Error = super::Exception>>>,
     }
 
     // Note: Sequential is intentionally left minimal. Full implementation would
@@ -2761,14 +3515,24 @@ pub mod layers {
     }
 
     impl Sequential {
-        pub fn new() -> Self { Self { layers: Vec::new() } }
+        pub fn new() -> Self {
+            Self { layers: Vec::new() }
+        }
     }
 
     impl ModuleParameters for Sequential {
-        fn num_parameters(&self) -> usize { 0 }
-        fn parameters(&self) -> super::ModuleParamRef<'_> { HashMap::new() }
-        fn parameters_mut(&mut self) -> super::ModuleParamMut<'_> { HashMap::new() }
-        fn trainable_parameters(&self) -> super::ModuleParamRef<'_> { HashMap::new() }
+        fn num_parameters(&self) -> usize {
+            0
+        }
+        fn parameters(&self) -> super::ModuleParamRef<'_> {
+            HashMap::new()
+        }
+        fn parameters_mut(&mut self) -> super::ModuleParamMut<'_> {
+            HashMap::new()
+        }
+        fn trainable_parameters(&self) -> super::ModuleParamRef<'_> {
+            HashMap::new()
+        }
     }
 }
 

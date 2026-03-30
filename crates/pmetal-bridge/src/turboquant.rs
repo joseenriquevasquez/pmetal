@@ -125,7 +125,10 @@ impl TurboQuantTensorConfig {
     fn assert_valid(self, total_dim: usize, label: &str) {
         match self {
             Self::Uniform { bits } => {
-                assert!((1..=8).contains(&bits), "TurboQuant {label} bits must be in 1..=8");
+                assert!(
+                    (1..=8).contains(&bits),
+                    "TurboQuant {label} bits must be in 1..=8"
+                );
             }
             Self::Mixed {
                 regular_bits,
@@ -336,9 +339,9 @@ impl TurboQuantCore {
         };
         let input_2d = flat.as_ref().unwrap_or(rotated);
 
-        if let Some(indices_2d) = InlineArray::turboquant_encode(
-            input_2d, cb_arr, dim, n_centroids, n_rows as u32,
-        ) {
+        if let Some(indices_2d) =
+            InlineArray::turboquant_encode(input_2d, cb_arr, dim, n_centroids, n_rows as u32)
+        {
             // Reshape back to original leading dims + D.
             if ndim == 2 {
                 return Some(indices_2d);
@@ -377,9 +380,9 @@ impl TurboQuantCore {
         };
         let indices_2d = flat.as_ref().unwrap_or(indices);
 
-        if let Some(recon_2d) = InlineArray::turboquant_decode(
-            indices_2d, cb_arr, dim, n_centroids, n_rows as u32,
-        ) {
+        if let Some(recon_2d) =
+            InlineArray::turboquant_decode(indices_2d, cb_arr, dim, n_centroids, n_rows as u32)
+        {
             if ndim == 2 {
                 return Some(recon_2d);
             }
@@ -484,8 +487,6 @@ enum TensorRuntime {
 /// across all layers and heads that share the same (dim, config) pair.
 #[derive(Debug, Clone)]
 pub struct TurboQuantState {
-    key_dim: usize,
-    value_dim: usize,
     keys: TensorRuntime,
     values: TensorRuntime,
 }
@@ -498,8 +499,7 @@ impl TurboQuantState {
 
         // Cache cores so (dim, bits) pairs that appear for both keys and values
         // share the same Arc.
-        let mut core_cache =
-            std::collections::HashMap::<(usize, u8), Arc<TurboQuantCore>>::new();
+        let mut core_cache = std::collections::HashMap::<(usize, u8), Arc<TurboQuantCore>>::new();
         let mut get_core = |subdim: usize, max_mse_bits: u8| {
             core_cache
                 .entry((subdim, max_mse_bits))
@@ -510,12 +510,7 @@ impl TurboQuantState {
         let keys = build_tensor_runtime(key_dim, config.keys, true, &mut get_core);
         let values = build_tensor_runtime(value_dim, config.values, false, &mut get_core);
 
-        Self {
-            key_dim,
-            value_dim,
-            keys,
-            values,
-        }
+        Self { keys, values }
     }
 }
 
@@ -530,7 +525,11 @@ where
 {
     match config {
         TurboQuantTensorConfig::Uniform { bits } => {
-            let max_mse_bits = if is_keys { bits.saturating_sub(1) } else { bits };
+            let max_mse_bits = if is_keys {
+                bits.saturating_sub(1)
+            } else {
+                bits
+            };
             TensorRuntime::Uniform {
                 config,
                 core: get_core(total_dim, max_mse_bits),
@@ -685,9 +684,9 @@ struct GpuKeyStore {
 impl GpuKeyStore {
     /// Concatenate a new step's GPU arrays along the T (axis 2) dimension.
     fn append(&mut self, new: GpuKeyStore) {
-        self.indices        = self.indices.kv_cache_append(&new.indices, 2);
-        self.norms          = self.norms.kv_cache_append(&new.norms, 2);
-        self.qjl_signs      = self.qjl_signs.kv_cache_append(&new.qjl_signs, 2);
+        self.indices = self.indices.kv_cache_append(&new.indices, 2);
+        self.norms = self.norms.kv_cache_append(&new.norms, 2);
+        self.qjl_signs = self.qjl_signs.kv_cache_append(&new.qjl_signs, 2);
         self.residual_norms = self.residual_norms.kv_cache_append(&new.residual_norms, 2);
     }
 }
@@ -705,7 +704,7 @@ struct GpuValueStore {
 impl GpuValueStore {
     fn append(&mut self, new: GpuValueStore) {
         self.indices = self.indices.kv_cache_append(&new.indices, 2);
-        self.norms   = self.norms.kv_cache_append(&new.norms, 2);
+        self.norms = self.norms.kv_cache_append(&new.norms, 2);
     }
 }
 
@@ -756,11 +755,17 @@ impl QuantizedKeyStore {
         }
     }
 
-    fn extend(&mut self, encoded: &EncodedKeyRows, outlier_encoded: Option<&EncodedKeyRows>, outlier_mask: Option<&Vec<u16>>) {
+    fn extend(
+        &mut self,
+        encoded: &EncodedKeyRows,
+        outlier_encoded: Option<&EncodedKeyRows>,
+        outlier_mask: Option<&Vec<u16>>,
+    ) {
         self.regular_indices.extend_from_slice(&encoded.mse_indices);
         self.regular_qjl_signs.extend_from_slice(&encoded.qjl_signs);
         self.regular_norms.extend_from_slice(&encoded.norms);
-        self.regular_residual_norms.extend_from_slice(&encoded.residual_norms);
+        self.regular_residual_norms
+            .extend_from_slice(&encoded.residual_norms);
 
         if let Some(mask) = outlier_mask {
             self.outlier_mask
@@ -788,31 +793,6 @@ impl QuantizedKeyStore {
         }
     }
 
-    fn truncate(&mut self, keep_rows: usize, total_dim: usize, config: TurboQuantTensorConfig) {
-        self.regular_indices
-            .truncate(keep_rows * config.regular_dim(total_dim));
-        self.regular_qjl_signs
-            .truncate(keep_rows * config.regular_dim(total_dim));
-        self.regular_norms.truncate(keep_rows);
-        self.regular_residual_norms.truncate(keep_rows);
-
-        if let Some(mask) = &mut self.outlier_mask {
-            mask.truncate(keep_rows * total_dim);
-        }
-        if let Some(idx) = &mut self.outlier_indices {
-            idx.truncate(keep_rows * config.outlier_count());
-        }
-        if let Some(signs) = &mut self.outlier_qjl_signs {
-            signs.truncate(keep_rows * config.outlier_count());
-        }
-        if let Some(norms) = &mut self.outlier_norms {
-            norms.truncate(keep_rows);
-        }
-        if let Some(res) = &mut self.outlier_residual_norms {
-            res.truncate(keep_rows);
-        }
-    }
-
     /// Approximate memory usage in bytes.
     pub fn memory_usage(&self) -> usize {
         self.regular_indices.byte_len()
@@ -823,7 +803,10 @@ impl QuantizedKeyStore {
             + self.outlier_indices.as_ref().map_or(0, |p| p.byte_len())
             + self.outlier_qjl_signs.as_ref().map_or(0, |p| p.byte_len())
             + self.outlier_norms.as_ref().map_or(0, |v| v.len() * 4)
-            + self.outlier_residual_norms.as_ref().map_or(0, |v| v.len() * 4)
+            + self
+                .outlier_residual_norms
+                .as_ref()
+                .map_or(0, |v| v.len() * 4)
     }
 }
 
@@ -862,7 +845,12 @@ impl QuantizedValueStore {
         }
     }
 
-    fn extend(&mut self, encoded: &EncodedValueRows, outlier_encoded: Option<&EncodedValueRows>, outlier_mask: Option<&Vec<u16>>) {
+    fn extend(
+        &mut self,
+        encoded: &EncodedValueRows,
+        outlier_encoded: Option<&EncodedValueRows>,
+        outlier_mask: Option<&Vec<u16>>,
+    ) {
         self.regular_indices.extend_from_slice(&encoded.indices);
         self.regular_norms.extend_from_slice(&encoded.norms);
 
@@ -881,22 +869,6 @@ impl QuantizedValueStore {
                 .as_mut()
                 .expect("TurboQuant value outlier norms missing")
                 .extend_from_slice(&outlier.norms);
-        }
-    }
-
-    fn truncate(&mut self, keep_rows: usize, total_dim: usize, config: TurboQuantTensorConfig) {
-        self.regular_indices
-            .truncate(keep_rows * config.regular_dim(total_dim));
-        self.regular_norms.truncate(keep_rows);
-
-        if let Some(mask) = &mut self.outlier_mask {
-            mask.truncate(keep_rows * total_dim);
-        }
-        if let Some(idx) = &mut self.outlier_indices {
-            idx.truncate(keep_rows * config.outlier_count());
-        }
-        if let Some(norms) = &mut self.outlier_norms {
-            norms.truncate(keep_rows);
         }
     }
 
@@ -994,17 +966,17 @@ impl QuantizedKvCache {
     /// selection requires a per-row top-k sort that is not trivially vectorisable).
     ///
     /// Returns an error string on shape mismatch.
-    pub fn append(
-        &mut self,
-        keys: &InlineArray,
-        values: &InlineArray,
-    ) -> Result<(), String> {
+    pub fn append(&mut self, keys: &InlineArray, values: &InlineArray) -> Result<(), String> {
         let layout = self.ensure_layout(keys, values)?;
         let seq_len = keys.dim(2) as usize;
 
         let config = self.config;
         let state = self.state.get_or_insert_with(|| {
-            Arc::new(TurboQuantState::new(layout.key_dim, layout.value_dim, config))
+            Arc::new(TurboQuantState::new(
+                layout.key_dim,
+                layout.value_dim,
+                config,
+            ))
         });
         let state = Arc::clone(state);
 
@@ -1012,8 +984,12 @@ impl QuantizedKvCache {
         let keys_f32 = keys.as_dtype(10 /* float32 */);
         let values_f32 = values.as_dtype(10 /* float32 */);
 
-        let ks = self.keys.get_or_insert_with(|| QuantizedKeyStore::new(config.keys));
-        let vs = self.values.get_or_insert_with(|| QuantizedValueStore::new(config.values));
+        let ks = self
+            .keys
+            .get_or_insert_with(|| QuantizedKeyStore::new(config.keys));
+        let vs = self
+            .values
+            .get_or_insert_with(|| QuantizedValueStore::new(config.values));
 
         // ── GPU path (Uniform only) ───────────────────────────────────────
         let gpu_keys_ok = matches!(config.keys, TurboQuantTensorConfig::Uniform { .. });
@@ -1138,7 +1114,11 @@ impl QuantizedKvCache {
         let vd = values.dim(3) as usize;
 
         if let Some(existing) = self.layout {
-            if existing.batch != b || existing.heads != h || existing.key_dim != kd || existing.value_dim != vd {
+            if existing.batch != b
+                || existing.heads != h
+                || existing.key_dim != kd
+                || existing.value_dim != vd
+            {
                 return Err(format!(
                     "TurboQuant: layout mismatch — expected [{b},{h},*,{kd}] / [{b},{h},*,{vd}]"
                 ));
@@ -1146,7 +1126,12 @@ impl QuantizedKvCache {
             return Ok(existing);
         }
 
-        let layout = CacheLayout { batch: b, heads: h, key_dim: kd, value_dim: vd };
+        let layout = CacheLayout {
+            batch: b,
+            heads: h,
+            key_dim: kd,
+            value_dim: vd,
+        };
         self.layout = Some(layout);
         Ok(layout)
     }
@@ -1160,7 +1145,11 @@ impl QuantizedKvCache {
 ///
 /// This is the expensive step (~100 ms per unique dim).  Call once at model
 /// load time and share the `Arc` across all layers.
-pub fn build_state(key_dim: usize, value_dim: usize, config: TurboQuantConfig) -> Arc<TurboQuantState> {
+pub fn build_state(
+    key_dim: usize,
+    value_dim: usize,
+    config: TurboQuantConfig,
+) -> Arc<TurboQuantState> {
     Arc::new(TurboQuantState::new(key_dim, value_dim, config))
 }
 
@@ -1370,11 +1359,7 @@ struct BatchedValueRows {
     outlier: Option<EncodedValueRows>,
 }
 
-fn encode_key_rows(
-    runtime: &TensorRuntime,
-    total_dim: usize,
-    rows: &[f32],
-) -> BatchedKeyRows {
+fn encode_key_rows(runtime: &TensorRuntime, total_dim: usize, rows: &[f32]) -> BatchedKeyRows {
     match runtime {
         TensorRuntime::Uniform { config, core } => {
             let TurboQuantTensorConfig::Uniform { bits } = config else {
@@ -1414,11 +1399,7 @@ fn encode_key_rows(
     }
 }
 
-fn encode_value_rows(
-    runtime: &TensorRuntime,
-    total_dim: usize,
-    rows: &[f32],
-) -> BatchedValueRows {
+fn encode_value_rows(runtime: &TensorRuntime, total_dim: usize, rows: &[f32]) -> BatchedValueRows {
     match runtime {
         TensorRuntime::Uniform { config, core } => {
             let TurboQuantTensorConfig::Uniform { bits } = config else {
@@ -2298,7 +2279,9 @@ mod tests {
         let total = (b * h * s * d) as usize;
 
         // Build deterministic input vectors.
-        let data: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.1 - total as f32 * 0.05).sin()).collect();
+        let data: Vec<f32> = (0..total)
+            .map(|i| ((i as f32) * 0.1 - total as f32 * 0.05).sin())
+            .collect();
         // Upload as [B, H, S, D] f32.
         let keys_arr = InlineArray::from_f32_slice(&data, &[b, h, s, d]);
         let vals_arr = InlineArray::from_f32_slice(&data, &[b, h, s, d]);
@@ -2319,7 +2302,10 @@ mod tests {
         let mut cpu_cache = QuantizedKvCache::new(cpu_config);
         cpu_cache.append(&keys_arr, &vals_arr).expect("CPU append");
         // Verify CPU path taken (no GPU store).
-        assert!(cpu_cache.keys.as_ref().unwrap().gpu.is_none(), "Expected CPU path for Mixed config");
+        assert!(
+            cpu_cache.keys.as_ref().unwrap().gpu.is_none(),
+            "Expected CPU path for Mixed config"
+        );
 
         // ── GPU path ──────────────────────────────────────────────────────
         let mut gpu_cache = QuantizedKvCache::new(config);
@@ -2337,23 +2323,44 @@ mod tests {
 
         // Dequantise — should succeed.
         let dk = gpu_cache.dequantize_keys().expect("GPU dequantize_keys");
-        let dv = gpu_cache.dequantize_values().expect("GPU dequantize_values");
+        let dv = gpu_cache
+            .dequantize_values()
+            .expect("GPU dequantize_values");
 
         // Verify output shapes: [B, H, T, D].
         assert_eq!(dk.shape(), &[b, h, s, d], "dequantized keys shape mismatch");
-        assert_eq!(dv.shape(), &[b, h, s, d], "dequantized values shape mismatch");
+        assert_eq!(
+            dv.shape(),
+            &[b, h, s, d],
+            "dequantized values shape mismatch"
+        );
 
         // Output should be finite (not NaN/Inf).
-        let dk_vals = dk.reshape(&[(b * h * s * d)]).to_f32_vec(total).expect("dk to_f32");
-        let dv_vals = dv.reshape(&[(b * h * s * d)]).to_f32_vec(total).expect("dv to_f32");
-        assert!(dk_vals.iter().all(|v| v.is_finite()), "dequantized keys contain non-finite");
-        assert!(dv_vals.iter().all(|v| v.is_finite()), "dequantized values contain non-finite");
+        let dk_vals = dk
+            .reshape(&[(b * h * s * d)])
+            .to_f32_vec(total)
+            .expect("dk to_f32");
+        let dv_vals = dv
+            .reshape(&[(b * h * s * d)])
+            .to_f32_vec(total)
+            .expect("dv to_f32");
+        assert!(
+            dk_vals.iter().all(|v| v.is_finite()),
+            "dequantized keys contain non-finite"
+        );
+        assert!(
+            dv_vals.iter().all(|v| v.is_finite()),
+            "dequantized values contain non-finite"
+        );
 
         // Verify output is within reasonable range (quantisation introduces error but
         // should not explode — reconstructed vectors should be roughly same magnitude as input).
         let input_max = data.iter().cloned().fold(0.0f32, f32::max).abs();
         let dk_max = dk_vals.iter().cloned().fold(0.0f32, f32::max).abs();
-        assert!(dk_max < input_max * 3.0, "dequantized keys magnitude unreasonably large");
+        assert!(
+            dk_max < input_max * 3.0,
+            "dequantized keys magnitude unreasonably large"
+        );
     }
 
     /// Verify that multiple appends accumulate correctly in the GPU store.
@@ -2366,7 +2373,9 @@ mod tests {
         let d = dim as i32;
 
         let make_data = |seed: f32| -> Vec<f32> {
-            (0..b * h * 1 * d).map(|i| (i as f32 * 0.15 + seed).sin()).collect()
+            (0..b * h * 1 * d)
+                .map(|i| (i as f32 * 0.15 + seed).sin())
+                .collect()
         };
 
         let mut cache = QuantizedKvCache::new(config);

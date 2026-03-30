@@ -23,21 +23,33 @@ fn native_weight_forward() {
     let down_w = load_w("model.language_model.layers.0.mlp.down_proj.weight");
 
     // Transpose projection weights (matching the model's pattern)
-    let mut gate_wt = gate_w.t(); gate_wt.eval();
-    let mut up_wt = up_w.t(); up_wt.eval();
-    let mut down_wt = down_w.t(); down_wt.eval();
+    let mut gate_wt = gate_w.t();
+    gate_wt.eval();
+    let mut up_wt = up_w.t();
+    up_wt.eval();
+    let mut down_wt = down_w.t();
+    down_wt.eval();
 
     // Eval all
-    let mut e = embed_w.clone(); e.eval();
-    let mut l = ln_w.clone(); l.eval();
+    let mut e = embed_w.clone();
+    e.eval();
+    let mut l = ln_w.clone();
+    l.eval();
 
-    eprintln!("Loaded weights natively. gate_wt: ({},{}) dtype={}",
-        gate_wt.dim(0), gate_wt.dim(1), gate_wt.dtype_raw());
+    eprintln!(
+        "Loaded weights natively. gate_wt: ({},{}) dtype={}",
+        gate_wt.dim(0),
+        gate_wt.dim(1),
+        gate_wt.dtype_raw()
+    );
 
     // Load ALL 24 layers of UNIQUE weights (matching real model exactly)
     struct LayerW {
-        ln_w: InlineArray, ln2_w: InlineArray,
-        gate_wt: InlineArray, up_wt: InlineArray, down_wt: InlineArray,
+        ln_w: InlineArray,
+        ln2_w: InlineArray,
+        gate_wt: InlineArray,
+        up_wt: InlineArray,
+        down_wt: InlineArray,
     }
     let mut all_layers: Vec<LayerW> = Vec::new();
     for i in 0..24 {
@@ -52,13 +64,18 @@ fn native_weight_forward() {
     }
     // Eval all
     for lw in &mut all_layers {
-        lw.ln_w.eval(); lw.ln2_w.eval();
-        lw.gate_wt.eval(); lw.up_wt.eval(); lw.down_wt.eval();
+        lw.ln_w.eval();
+        lw.ln2_w.eval();
+        lw.gate_wt.eval();
+        lw.up_wt.eval();
+        lw.down_wt.eval();
     }
     let final_ln = load_w("model.language_model.norm.weight");
 
-    eprintln!("Loaded ALL 24 layers of unique weights. Active: {:.0} MB",
-        pmetal_bridge::inline_array::get_active_memory() as f64 / 1e6);
+    eprintln!(
+        "Loaded ALL 24 layers of unique weights. Active: {:.0} MB",
+        pmetal_bridge::inline_array::get_active_memory() as f64 / 1e6
+    );
 
     let run_step = |tok: i32| -> InlineArray {
         let t = InlineArray::from_i32(tok).reshape(&[1, 1]);
@@ -77,7 +94,10 @@ fn native_weight_forward() {
     };
 
     // Warmup
-    for i in 0..5 { let mut r = run_step(42 + i); r.eval(); }
+    for i in 0..5 {
+        let mut r = run_step(42 + i);
+        r.eval();
+    }
 
     let mut times = Vec::new();
     for i in 0..30 {
@@ -88,5 +108,8 @@ fn native_weight_forward() {
     }
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let avg = times[5..].iter().sum::<f64>() / (times.len() - 5) as f64;
-    eprintln!("Native weights forward: avg={avg:.2}ms = {:.0} tok/s", 1000.0 / avg);
+    eprintln!(
+        "Native weights forward: avg={avg:.2}ms = {:.0} tok/s",
+        1000.0 / avg
+    );
 }

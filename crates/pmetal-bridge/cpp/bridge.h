@@ -255,6 +255,34 @@ void mlx_inline_compiled_gdn_layer_fixed(
     const mlx_inline_array* conv_state_in, const mlx_inline_array* ssm_state_in,
     int nv, int nk, int dk, int dv, int cd, int ck, int kd, float norm_eps);
 
+// Fixed-shape compiled attention decode layer (shapeless=false).
+// Traces per cache-shape bucket on first T=1 call, then replays.
+void mlx_inline_compiled_attn_layer_fixed(
+    mlx_inline_array* dst_out,
+    mlx_inline_array* dst_cache_keys,
+    mlx_inline_array* dst_cache_vals,
+    const mlx_inline_array* normed,
+    const mlx_inline_array* q_w,
+    const mlx_inline_array* k_w,
+    const mlx_inline_array* v_w,
+    const mlx_inline_array* o_w,
+    const mlx_inline_array* q_nw,
+    const mlx_inline_array* k_nw,
+    const mlx_inline_array* cache_keys_in,
+    const mlx_inline_array* cache_vals_in,
+    int kv_offset,
+    int rope_offset,
+    int n_heads,
+    int n_kv,
+    int head_dim,
+    float scale,
+    int rope_dims,
+    float rope_base,
+    float rope_scale,
+    float q_norm_eps,
+    float k_norm_eps,
+    bool gated);
+
 // fused_compute_g: exp(-exp(A_log.f32()) * softplus(a + dt_bias)) → 1 dispatch instead of 6
 void mlx_inline_fused_compute_g(mlx_inline_array* dst,
     const mlx_inline_array* a_log, const mlx_inline_array* a, const mlx_inline_array* dt_bias);

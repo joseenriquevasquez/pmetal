@@ -60,14 +60,8 @@ pub fn causal_lm_loss(
     let vocab_size = logits.dim(2);
 
     // logits[:, :-1, :] predicts labels[:, 1:]
-    let shift_logits = logits.slice(
-        &[0, 0, 0],
-        &[batch, seq_len - 1, vocab_size],
-    );
-    let shift_labels = labels.slice(
-        &[0, 1],
-        &[batch, seq_len],
-    );
+    let shift_logits = logits.slice(&[0, 0, 0], &[batch, seq_len - 1, vocab_size]);
+    let shift_labels = labels.slice(&[0, 1], &[batch, seq_len]);
 
     // Flatten to [batch*(seq_len-1), vocab_size] / [batch*(seq_len-1)]
     let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
@@ -122,7 +116,9 @@ pub fn accumulate_gradients(acc: &mut ParamSet, grads: &ParamSet, scale: f32) {
         let scaled = grad.multiply(&scale_arr);
         match acc.get_mut(key) {
             Some(existing) => *existing = existing.add(&scaled),
-            None => { acc.insert(key.clone(), scaled); }
+            None => {
+                acc.insert(key.clone(), scaled);
+            }
         }
     }
 }
@@ -199,7 +195,14 @@ pub fn lora_forward_quantized(
     scale: f32,
 ) -> InlineArray {
     // Base: fused dequant + matmul (transpose=true: W is [out, in/pack])
-    let y_base = x.quantized_matmul(base_weight, base_scales, base_biases, true, group_size, bits);
+    let y_base = x.quantized_matmul(
+        base_weight,
+        base_scales,
+        base_biases,
+        true,
+        group_size,
+        bits,
+    );
 
     // Low-rank adapter: scale * (x @ A.T) @ B.T
     let xa = x.matmul(&lora_a.t());

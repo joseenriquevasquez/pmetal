@@ -4,6 +4,7 @@
 //! C++ binding performance. Each op is a single `extern "C"` call with placement-new
 //! into a caller-provided buffer.
 
+use std::io::Read;
 use std::mem::MaybeUninit;
 
 /// Size of `mlx::core::array` in bytes. Must match MLX_ARRAY_SIZE in bridge.h.
@@ -49,12 +50,7 @@ unsafe extern "C" {
         rhs: *const RawBuf,
         sorted: bool,
     );
-    fn mlx_inline_rms_norm(
-        dst: *mut RawBuf,
-        x: *const RawBuf,
-        w: *const RawBuf,
-        eps: f32,
-    );
+    fn mlx_inline_rms_norm(dst: *mut RawBuf, x: *const RawBuf, w: *const RawBuf, eps: f32);
     fn mlx_inline_rope(
         dst: *mut RawBuf,
         x: *const RawBuf,
@@ -102,7 +98,14 @@ unsafe extern "C" {
     fn mlx_inline_item_u32(a: *mut RawBuf) -> u32;
 
     fn mlx_inline_sign(dst: *mut RawBuf, a: *const RawBuf);
-    fn mlx_inline_dequantize(dst: *mut RawBuf, w: *const RawBuf, scales: *const RawBuf, biases: *const RawBuf, group_size: i32, bits: i32);
+    fn mlx_inline_dequantize(
+        dst: *mut RawBuf,
+        w: *const RawBuf,
+        scales: *const RawBuf,
+        biases: *const RawBuf,
+        group_size: i32,
+        bits: i32,
+    );
     fn mlx_inline_from_f32_slice(dst: *mut RawBuf, data: *const f32, shape: *const i32, ndim: i32);
     fn mlx_inline_to_f32_slice(a: *mut RawBuf, out: *mut f32, n: usize) -> i32;
     fn mlx_inline_stack(dst: *mut RawBuf, arrays: *const RawBuf, num: i32, axis: i32);
@@ -152,35 +155,96 @@ unsafe extern "C" {
 
     // Compiled GDN layer — entire layer as single compiled function
     fn mlx_inline_compiled_gdn_layer(
-        dst_out: *mut RawBuf, dst_conv: *mut RawBuf, dst_ssm: *mut RawBuf,
+        dst_out: *mut RawBuf,
+        dst_conv: *mut RawBuf,
+        dst_ssm: *mut RawBuf,
         normed: *const RawBuf,
-        qkv_w: *const RawBuf, z_w: *const RawBuf,
-        b_w: *const RawBuf, a_w: *const RawBuf,
+        qkv_w: *const RawBuf,
+        z_w: *const RawBuf,
+        b_w: *const RawBuf,
+        a_w: *const RawBuf,
         conv_w: *const RawBuf,
-        q_nw: *const RawBuf, k_nw: *const RawBuf,
-        a_log: *const RawBuf, dt_bias: *const RawBuf,
-        norm_w: *const RawBuf, out_w: *const RawBuf,
-        conv_state: *const RawBuf, ssm_state: *const RawBuf,
-        nv: i32, nk: i32, dk: i32, dv: i32, cd: i32, ck: i32, kd: i32, norm_eps: f32,
+        q_nw: *const RawBuf,
+        k_nw: *const RawBuf,
+        a_log: *const RawBuf,
+        dt_bias: *const RawBuf,
+        norm_w: *const RawBuf,
+        out_w: *const RawBuf,
+        conv_state: *const RawBuf,
+        ssm_state: *const RawBuf,
+        nv: i32,
+        nk: i32,
+        dk: i32,
+        dv: i32,
+        cd: i32,
+        ck: i32,
+        kd: i32,
+        norm_eps: f32,
     );
 
     // Fixed-shape compiled GDN layer (shapeless=false, works with ALL primitives)
     fn mlx_inline_compiled_gdn_layer_fixed(
-        dst_out: *mut RawBuf, dst_conv: *mut RawBuf, dst_ssm: *mut RawBuf,
+        dst_out: *mut RawBuf,
+        dst_conv: *mut RawBuf,
+        dst_ssm: *mut RawBuf,
         normed: *const RawBuf,
-        qkv_w: *const RawBuf, z_w: *const RawBuf,
-        b_w: *const RawBuf, a_w: *const RawBuf,
+        qkv_w: *const RawBuf,
+        z_w: *const RawBuf,
+        b_w: *const RawBuf,
+        a_w: *const RawBuf,
         conv_w: *const RawBuf,
-        q_nw: *const RawBuf, k_nw: *const RawBuf,
-        a_log: *const RawBuf, dt_bias: *const RawBuf,
-        norm_w: *const RawBuf, out_w: *const RawBuf,
-        conv_state: *const RawBuf, ssm_state: *const RawBuf,
-        nv: i32, nk: i32, dk: i32, dv: i32, cd: i32, ck: i32, kd: i32, norm_eps: f32,
+        q_nw: *const RawBuf,
+        k_nw: *const RawBuf,
+        a_log: *const RawBuf,
+        dt_bias: *const RawBuf,
+        norm_w: *const RawBuf,
+        out_w: *const RawBuf,
+        conv_state: *const RawBuf,
+        ssm_state: *const RawBuf,
+        nv: i32,
+        nk: i32,
+        dk: i32,
+        dv: i32,
+        cd: i32,
+        ck: i32,
+        kd: i32,
+        norm_eps: f32,
+    );
+
+    fn mlx_inline_compiled_attn_layer_fixed(
+        dst_out: *mut RawBuf,
+        dst_cache_keys: *mut RawBuf,
+        dst_cache_vals: *mut RawBuf,
+        normed: *const RawBuf,
+        q_w: *const RawBuf,
+        k_w: *const RawBuf,
+        v_w: *const RawBuf,
+        o_w: *const RawBuf,
+        q_nw: *const RawBuf,
+        k_nw: *const RawBuf,
+        cache_keys_in: *const RawBuf,
+        cache_vals_in: *const RawBuf,
+        kv_offset: i32,
+        rope_offset: i32,
+        n_heads: i32,
+        n_kv: i32,
+        head_dim: i32,
+        scale: f32,
+        rope_dims: i32,
+        rope_base: f32,
+        rope_scale: f32,
+        q_norm_eps: f32,
+        k_norm_eps: f32,
+        gated: bool,
     );
 
     // Arange — non-broadcast tensor creation
     fn mlx_inline_arange(dst: *mut RawBuf, n: i32, dtype: i32);
-    fn mlx_inline_load_safetensors_key(dst: *mut RawBuf, path: *const std::ffi::c_char, key: *const std::ffi::c_char) -> i32;
+    fn mlx_inline_load_safetensors_key(
+        dst: *mut RawBuf,
+        path: *const std::ffi::c_char,
+        key: *const std::ffi::c_char,
+    ) -> i32;
 
     // Graph detach — severs computation graph references
     fn mlx_inline_detach(a: *mut RawBuf);
@@ -206,22 +270,18 @@ unsafe extern "C" {
     fn mlx_inline_squeeze_all(dst: *mut RawBuf, a: *const RawBuf);
 
     // ── pad ──
-    fn mlx_inline_pad(dst: *mut RawBuf, a: *const RawBuf, pad_widths: *const i32, ndim: i32, fill_value: f32);
+    fn mlx_inline_pad(
+        dst: *mut RawBuf,
+        a: *const RawBuf,
+        pad_widths: *const i32,
+        ndim: i32,
+        fill_value: f32,
+    );
 
     // ── Additional ops for complete model inference ──
-    fn mlx_inline_concatenate_2(
-        dst: *mut RawBuf,
-        a: *const RawBuf,
-        b: *const RawBuf,
-        axis: i32,
-    );
+    fn mlx_inline_concatenate_2(dst: *mut RawBuf, a: *const RawBuf, b: *const RawBuf, axis: i32);
     fn mlx_inline_softplus(dst: *mut RawBuf, a: *const RawBuf);
-    fn mlx_inline_where(
-        dst: *mut RawBuf,
-        cond: *const RawBuf,
-        a: *const RawBuf,
-        b: *const RawBuf,
-    );
+    fn mlx_inline_where(dst: *mut RawBuf, cond: *const RawBuf, a: *const RawBuf, b: *const RawBuf);
     fn mlx_inline_maximum(dst: *mut RawBuf, a: *const RawBuf, b: *const RawBuf);
     fn mlx_inline_zeros(dst: *mut RawBuf, shape: *const i32, ndim: i32, dtype: i32);
     fn mlx_inline_ones(dst: *mut RawBuf, shape: *const i32, ndim: i32, dtype: i32);
@@ -243,12 +303,7 @@ unsafe extern "C" {
     fn mlx_inline_repeat(dst: *mut RawBuf, a: *const RawBuf, repeats: i32, axis: i32);
     fn mlx_inline_squeeze(dst: *mut RawBuf, a: *const RawBuf, axis: i32);
     fn mlx_inline_expand_dims(dst: *mut RawBuf, a: *const RawBuf, axis: i32);
-    fn mlx_inline_transpose_axes(
-        dst: *mut RawBuf,
-        a: *const RawBuf,
-        axes: *const i32,
-        ndim: i32,
-    );
+    fn mlx_inline_transpose_axes(dst: *mut RawBuf, a: *const RawBuf, axes: *const i32, ndim: i32);
     fn mlx_inline_cumsum(dst: *mut RawBuf, a: *const RawBuf, axis: i32);
     fn mlx_inline_log(dst: *mut RawBuf, a: *const RawBuf);
     fn mlx_inline_tril(dst: *mut RawBuf, a: *const RawBuf, k: i32);
@@ -298,15 +353,25 @@ unsafe extern "C" {
 
     // ── Embedding / KV cache ──
     fn mlx_inline_take_axis(dst: *mut RawBuf, a: *const RawBuf, indices: *const RawBuf, axis: i32);
-    fn mlx_inline_kv_cache_append(dst: *mut RawBuf, cached: *const RawBuf, new_kv: *const RawBuf, axis: i32);
+    fn mlx_inline_kv_cache_append(
+        dst: *mut RawBuf,
+        cached: *const RawBuf,
+        new_kv: *const RawBuf,
+        axis: i32,
+    );
     fn mlx_inline_async_eval_arr(a: *const RawBuf);
 
     // ── GDN Metal kernel step with pre-computed g/beta ──
     fn mlx_inline_gdn_metal_step(
-        dst_y: *mut RawBuf, dst_state: *mut RawBuf,
-        q: *const RawBuf, k: *const RawBuf, v: *const RawBuf,
-        g: *const RawBuf, beta: *const RawBuf,
-        state_in: *const RawBuf, t: i32,
+        dst_y: *mut RawBuf,
+        dst_state: *mut RawBuf,
+        q: *const RawBuf,
+        k: *const RawBuf,
+        v: *const RawBuf,
+        g: *const RawBuf,
+        beta: *const RawBuf,
+        state_in: *const RawBuf,
+        t: i32,
     );
 
     // ── TurboQuant fused Metal kernels ──
@@ -317,33 +382,45 @@ unsafe extern "C" {
     // Returns 0 on success, 1 if Metal unavailable.
     fn mlx_inline_turboquant_encode(
         out_indices: *mut RawBuf,
-        out_norms:   *mut RawBuf,   // reserved — pass std::ptr::null_mut()
-        input:       *const RawBuf,
-        codebook:    *const RawBuf,
-        dim:         u32,
+        out_norms: *mut RawBuf, // reserved — pass std::ptr::null_mut()
+        input: *const RawBuf,
+        codebook: *const RawBuf,
+        dim: u32,
         n_centroids: u32,
-        n_rows:      u32,
+        n_rows: u32,
     ) -> i32;
 
     // Decode: codebook lookup → [N,D] f32 centroid values (un-scaled).
     // indices: [N,D] uint32.  norms: reserved (pass null ptr).  codebook: [C] f32.
     // Returns 0 on success, 1 if Metal unavailable.
     fn mlx_inline_turboquant_decode(
-        out:         *mut RawBuf,
-        indices:     *const RawBuf,
-        norms:       *const RawBuf,  // reserved — pass std::ptr::null_mut()
-        codebook:    *const RawBuf,
-        dim:         u32,
+        out: *mut RawBuf,
+        indices: *const RawBuf,
+        norms: *const RawBuf, // reserved — pass std::ptr::null_mut()
+        codebook: *const RawBuf,
+        dim: u32,
         n_centroids: u32,
-        n_rows:      u32,
+        n_rows: u32,
     ) -> i32;
 
     // ── Training ops: random ──
     fn mlx_inline_random_normal(dst: *mut RawBuf, shape: *const i32, ndim: i32, dtype: i32);
     fn mlx_inline_random_uniform(dst: *mut RawBuf, shape: *const i32, ndim: i32, dtype: i32);
-    fn mlx_inline_random_bernoulli(dst: *mut RawBuf, p: *const RawBuf, shape: *const i32, ndim: i32);
+    fn mlx_inline_random_bernoulli(
+        dst: *mut RawBuf,
+        p: *const RawBuf,
+        shape: *const i32,
+        ndim: i32,
+    );
     fn mlx_inline_random_seed(seed: u64);
-    fn mlx_inline_random_randint(dst: *mut RawBuf, low: i32, high: i32, shape: *const i32, ndim: i32, dtype: i32);
+    fn mlx_inline_random_randint(
+        dst: *mut RawBuf,
+        low: i32,
+        high: i32,
+        shape: *const i32,
+        ndim: i32,
+        dtype: i32,
+    );
 
     // ── Training ops: math ──
     fn mlx_inline_mean_axis(dst: *mut RawBuf, a: *const RawBuf, axis: i32, keepdims: bool);
@@ -355,7 +432,12 @@ unsafe extern "C" {
     fn mlx_inline_cos(dst: *mut RawBuf, a: *const RawBuf);
     fn mlx_inline_clip(dst: *mut RawBuf, a: *const RawBuf, lo: *const RawBuf, hi: *const RawBuf);
     fn mlx_inline_log_softmax(dst: *mut RawBuf, a: *const RawBuf, axis: i32);
-    fn mlx_inline_cross_entropy(dst: *mut RawBuf, logits: *const RawBuf, targets: *const RawBuf, axis: i32);
+    fn mlx_inline_cross_entropy(
+        dst: *mut RawBuf,
+        logits: *const RawBuf,
+        targets: *const RawBuf,
+        axis: i32,
+    );
     fn mlx_inline_square(dst: *mut RawBuf, a: *const RawBuf);
 
     // ── Training ops: creation ──
@@ -387,14 +469,38 @@ unsafe extern "C" {
     fn mlx_inline_less_equal(dst: *mut RawBuf, a: *const RawBuf, b: *const RawBuf);
 
     // ── Training ops: serialization ──
-    fn mlx_inline_save_safetensors(path: *const std::ffi::c_char, keys: *const *const std::ffi::c_char, arrays: *const RawBuf, count: i32);
+    fn mlx_inline_save_safetensors(
+        path: *const std::ffi::c_char,
+        keys: *const *const std::ffi::c_char,
+        arrays: *const RawBuf,
+        count: i32,
+    );
 
     // ── Training ops: quantize ──
-    fn mlx_inline_quantize(dst_w: *mut RawBuf, dst_scales: *mut RawBuf, dst_biases: *mut RawBuf, a: *const RawBuf, group_size: i32, bits: i32);
+    fn mlx_inline_quantize(
+        dst_w: *mut RawBuf,
+        dst_scales: *mut RawBuf,
+        dst_biases: *mut RawBuf,
+        a: *const RawBuf,
+        group_size: i32,
+        bits: i32,
+    );
 
     // ── Training ops: multi-axis ──
-    fn mlx_inline_sum_axes(dst: *mut RawBuf, a: *const RawBuf, axes: *const i32, num_axes: i32, keepdims: bool);
-    fn mlx_inline_mean_axes(dst: *mut RawBuf, a: *const RawBuf, axes: *const i32, num_axes: i32, keepdims: bool);
+    fn mlx_inline_sum_axes(
+        dst: *mut RawBuf,
+        a: *const RawBuf,
+        axes: *const i32,
+        num_axes: i32,
+        keepdims: bool,
+    );
+    fn mlx_inline_mean_axes(
+        dst: *mut RawBuf,
+        a: *const RawBuf,
+        axes: *const i32,
+        num_axes: i32,
+        keepdims: bool,
+    );
 
     // ── Training ops: misc ──
     fn mlx_inline_size(a: *const RawBuf) -> usize;
@@ -405,7 +511,12 @@ unsafe extern "C" {
 
     // ── Autograd: value_and_grad ──
     fn mlx_inline_value_and_grad(
-        forward_fn: unsafe extern "C" fn(*const *const RawBuf, i32, *mut RawBuf, *mut std::ffi::c_void),
+        forward_fn: unsafe extern "C" fn(
+            *const *const RawBuf,
+            i32,
+            *mut RawBuf,
+            *mut std::ffi::c_void,
+        ),
         ctx: *mut std::ffi::c_void,
         all_arrays: *const *const RawBuf,
         n_params: i32,
@@ -417,7 +528,12 @@ unsafe extern "C" {
     // ── Fused compiled ops (match Python's @mx.compile) ──
     fn mlx_inline_fused_swiglu(dst: *mut RawBuf, gate: *const RawBuf, up: *const RawBuf);
     fn mlx_inline_fused_silu(dst: *mut RawBuf, x: *const RawBuf);
-    fn mlx_inline_fused_compute_g(dst: *mut RawBuf, a_log: *const RawBuf, a: *const RawBuf, dt_bias: *const RawBuf);
+    fn mlx_inline_fused_compute_g(
+        dst: *mut RawBuf,
+        a_log: *const RawBuf,
+        a: *const RawBuf,
+        dt_bias: *const RawBuf,
+    );
     fn mlx_inline_fused_precise_swiglu(dst: *mut RawBuf, x: *const RawBuf, gate: *const RawBuf);
 
     // Batch safetensors load — parses the file once and fills caller-provided buffers.
@@ -436,7 +552,12 @@ unsafe extern "C" {
     fn mlx_inline_from_i32_slice(dst: *mut RawBuf, data: *const i32, len: i32);
 
     // ── Linalg: SVD ──
-    fn mlx_inline_svd(dst_u: *mut RawBuf, dst_s: *mut RawBuf, dst_vt: *mut RawBuf, a: *const RawBuf);
+    fn mlx_inline_svd(
+        dst_u: *mut RawBuf,
+        dst_s: *mut RawBuf,
+        dst_vt: *mut RawBuf,
+        a: *const RawBuf,
+    );
 
     // ── Missing ops for pmetal-models migration ──
     fn mlx_inline_rsqrt(dst: *mut RawBuf, a: *const RawBuf);
@@ -444,28 +565,63 @@ unsafe extern "C" {
     fn mlx_inline_ones_like(dst: *mut RawBuf, a: *const RawBuf);
     fn mlx_inline_tile(dst: *mut RawBuf, a: *const RawBuf, reps: *const i32, ndim: i32);
     fn mlx_inline_linspace(dst: *mut RawBuf, start: f32, stop: f32, n: i32, dtype: i32);
-    fn mlx_inline_split_sections(dst_arr: *mut RawBuf, a: *const RawBuf, sections: i32, axis: i32, out_count: *mut i32);
-    fn mlx_inline_scatter_add(dst: *mut RawBuf, a: *const RawBuf, indices: *const RawBuf, updates: *const RawBuf, axis: i32);
+    fn mlx_inline_split_sections(
+        dst_arr: *mut RawBuf,
+        a: *const RawBuf,
+        sections: i32,
+        axis: i32,
+        out_count: *mut i32,
+    );
+    fn mlx_inline_scatter_add(
+        dst: *mut RawBuf,
+        a: *const RawBuf,
+        indices: *const RawBuf,
+        updates: *const RawBuf,
+        axis: i32,
+    );
     fn mlx_inline_topk(dst: *mut RawBuf, a: *const RawBuf, k: i32, axis: i32);
-    fn mlx_inline_put_along_axis(dst: *mut RawBuf, a: *const RawBuf, indices: *const RawBuf, values: *const RawBuf, axis: i32);
-    fn mlx_inline_layer_norm(dst: *mut RawBuf, x: *const RawBuf, weight: *const RawBuf, bias: *const RawBuf, eps: f32);
+    fn mlx_inline_put_along_axis(
+        dst: *mut RawBuf,
+        a: *const RawBuf,
+        indices: *const RawBuf,
+        values: *const RawBuf,
+        axis: i32,
+    );
+    fn mlx_inline_layer_norm(
+        dst: *mut RawBuf,
+        x: *const RawBuf,
+        weight: *const RawBuf,
+        bias: *const RawBuf,
+        eps: f32,
+    );
     fn mlx_inline_addmm(dst: *mut RawBuf, c: *const RawBuf, a: *const RawBuf, b: *const RawBuf);
-    fn mlx_inline_conv2d(dst: *mut RawBuf, input: *const RawBuf, weight: *const RawBuf, stride_h: i32, stride_w: i32, pad_h: i32, pad_w: i32, dil_h: i32, dil_w: i32, groups: i32);
+    fn mlx_inline_conv2d(
+        dst: *mut RawBuf,
+        input: *const RawBuf,
+        weight: *const RawBuf,
+        stride_h: i32,
+        stride_w: i32,
+        pad_h: i32,
+        pad_w: i32,
+        dil_h: i32,
+        dil_w: i32,
+        groups: i32,
+    );
 
     // ── Full Qwen3.5 forward pass — single C++ function, zero FFI overhead ──
     // See bridge.h for the complete weight/cache/config layout documentation.
     fn mlx_inline_qwen35_decode_step(
-        dst_logits:       *mut RawBuf,
-        token_ids:        *const RawBuf,
-        weight_ptrs:      *const *const RawBuf,
-        num_weights:      i32,
-        cache_ptrs:       *mut *mut RawBuf,
-        num_cache:        i32,
-        attn_kv_offsets:  *mut i32,
-        rope_offset:      *mut i32,
-        config_ints:      *const i32,
-        num_config_ints:  i32,
-        config_floats:    *const f32,
+        dst_logits: *mut RawBuf,
+        token_ids: *const RawBuf,
+        weight_ptrs: *const *const RawBuf,
+        num_weights: i32,
+        cache_ptrs: *mut *mut RawBuf,
+        num_cache: i32,
+        attn_kv_offsets: *mut i32,
+        rope_offset: *mut i32,
+        config_ints: *const i32,
+        num_config_ints: i32,
+        config_floats: *const f32,
         num_config_floats: i32,
     );
 }
@@ -526,17 +682,23 @@ pub fn get_max_recommended_size() -> usize {
 /// Create a new GPU stream and set it as default for all subsequent ops.
 /// Matches Python's `generation_stream = mx.new_stream(mx.default_device())`.
 pub fn new_generation_stream() {
-    unsafe { mlx_inline_new_stream(); }
+    unsafe {
+        mlx_inline_new_stream();
+    }
 }
 
 /// Set the generation stream as the default stream for all ops.
 pub fn set_generation_stream() {
-    unsafe { mlx_inline_set_default_stream(0); }
+    unsafe {
+        mlx_inline_set_default_stream(0);
+    }
 }
 
 /// Synchronize the generation stream (wait for all pending GPU work).
 pub fn synchronize() {
-    unsafe { mlx_inline_synchronize(); }
+    unsafe {
+        mlx_inline_synchronize();
+    }
 }
 
 /// Clear the Metal buffer cache — frees unused GPU memory.
@@ -565,11 +727,20 @@ pub fn disable_compile() {
 /// This is critical for cache arrays: eval+detach severs the computation
 /// graph chain across decode steps without per-array sync barriers.
 pub fn eval_and_detach_many(arrays: &mut [&mut InlineArray]) {
-    if arrays.is_empty() { return; }
-    let mut ptrs: Vec<*mut RawBuf> = arrays.iter_mut().map(|a| &mut a.raw as *mut RawBuf).collect();
-    unsafe { mlx_inline_eval_many(ptrs.as_mut_ptr(), ptrs.len() as i32); }
+    if arrays.is_empty() {
+        return;
+    }
+    let mut ptrs: Vec<*mut RawBuf> = arrays
+        .iter_mut()
+        .map(|a| &mut a.raw as *mut RawBuf)
+        .collect();
+    unsafe {
+        mlx_inline_eval_many(ptrs.as_mut_ptr(), ptrs.len() as i32);
+    }
     for a in arrays.iter_mut() {
-        unsafe { mlx_inline_detach(&mut a.raw); }
+        unsafe {
+            mlx_inline_detach(&mut a.raw);
+        }
     }
 }
 
@@ -670,8 +841,10 @@ pub fn load_safetensors_shard(path: &str) -> Option<Vec<(String, InlineArray)>> 
     };
 
     if count < 0 {
-        // Error: no arrays were placement-new'd, nothing to destroy.
-        return None;
+        // Fallback: recover tensor names from the safetensors header, then load
+        // each tensor through the single-key bridge path. This preserves a
+        // correct native load path even when the batched C++ loader fails.
+        return load_safetensors_shard_fallback(path);
     }
 
     let count = count as usize;
@@ -681,7 +854,9 @@ pub fn load_safetensors_shard(path: &str) -> Option<Vec<(String, InlineArray)>> 
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
         // SAFETY: C++ placement-new'd into slots [0, count).
-        let array = InlineArray { raw: unsafe { arr_slots[i].assume_init() } };
+        let array = InlineArray {
+            raw: unsafe { arr_slots[i].assume_init() },
+        };
 
         // key_ptrs[i] is a strdup'd C string.  Convert to Rust String and
         // free the C allocation immediately — the String owns the data.
@@ -698,6 +873,45 @@ pub fn load_safetensors_shard(path: &str) -> Option<Vec<(String, InlineArray)>> 
     }
 
     Some(result)
+}
+
+fn load_safetensors_shard_fallback(path: &str) -> Option<Vec<(String, InlineArray)>> {
+    let keys = load_safetensors_tensor_names(path)?;
+    let mut result = Vec::with_capacity(keys.len());
+    for key in keys {
+        let array = InlineArray::load_safetensors(path, &key)?;
+        result.push((key, array));
+    }
+    Some(result)
+}
+
+fn load_safetensors_tensor_names(path: &str) -> Option<Vec<String>> {
+    let mut file = std::fs::File::open(path).ok()?;
+
+    let mut len_buf = [0u8; 8];
+    file.read_exact(&mut len_buf).ok()?;
+    let header_len = u64::from_le_bytes(len_buf);
+    let max_header_len = 128 * 1024 * 1024u64;
+    if header_len == 0 || header_len > max_header_len {
+        return None;
+    }
+
+    let mut header = vec![0u8; header_len as usize];
+    file.read_exact(&mut header).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&header).ok()?;
+    let obj = json.as_object()?;
+
+    let mut keys = Vec::with_capacity(obj.len());
+    for (key, value) in obj {
+        if key == "__metadata__" {
+            continue;
+        }
+        if value.get("data_offsets").is_some() {
+            keys.push(key.clone());
+        }
+    }
+
+    if keys.is_empty() { None } else { Some(keys) }
 }
 
 /// Thin wrapper around libc free so we can call it without a libc dependency.
@@ -721,6 +935,17 @@ pub fn random_seed(seed: u64) {
 /// Stack-allocated MLX array. Zero heap allocation per op.
 pub struct InlineArray {
     raw: RawBuf,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EvalToken;
+
+impl EvalToken {
+    #[inline]
+    pub fn unwrap(self) {}
+
+    #[inline]
+    pub fn expect(self, _msg: &str) {}
 }
 
 impl Drop for InlineArray {
@@ -747,7 +972,12 @@ unsafe impl Sync for InlineArray {}
 
 impl std::fmt::Debug for InlineArray {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "InlineArray(ndim={}, shape={:?})", self.ndim(), self.shape())
+        write!(
+            f,
+            "InlineArray(ndim={}, shape={:?})",
+            self.ndim(),
+            self.shape()
+        )
     }
 }
 
@@ -943,8 +1173,17 @@ impl InlineArray {
     pub fn dequantize(&self, scales: &Self, biases: &Self, group_size: i32, bits: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_dequantize(dst.as_mut_ptr(), &self.raw, &scales.raw, &biases.raw, group_size, bits);
-            Self { raw: dst.assume_init() }
+            mlx_inline_dequantize(
+                dst.as_mut_ptr(),
+                &self.raw,
+                &scales.raw,
+                &biases.raw,
+                group_size,
+                bits,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -953,7 +1192,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_norm_l2(dst.as_mut_ptr(), &self.raw, axis, keepdims);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -1082,14 +1323,7 @@ impl InlineArray {
         }
     }
 
-    pub fn rope(
-        &self,
-        dims: i32,
-        traditional: bool,
-        base: f32,
-        scale: f32,
-        offset: i32,
-    ) -> Self {
+    pub fn rope(&self, dims: i32, traditional: bool, base: f32, scale: f32, offset: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_rope(
@@ -1133,14 +1367,7 @@ impl InlineArray {
             .map(|m| &m.raw as *const RawBuf)
             .unwrap_or(std::ptr::null());
         unsafe {
-            mlx_inline_sdpa_with_mask(
-                dst.as_mut_ptr(),
-                &self.raw,
-                &k.raw,
-                &v.raw,
-                scale,
-                mask_ptr,
-            );
+            mlx_inline_sdpa_with_mask(dst.as_mut_ptr(), &self.raw, &k.raw, &v.raw, scale, mask_ptr);
             Self {
                 raw: dst.assume_init(),
             }
@@ -1149,8 +1376,7 @@ impl InlineArray {
 
     pub fn split(&self, indices: &[i32], axis: i32) -> Vec<Self> {
         let n = indices.len() + 1;
-        let mut bufs: Vec<MaybeUninit<RawBuf>> =
-            (0..n).map(|_| MaybeUninit::uninit()).collect();
+        let mut bufs: Vec<MaybeUninit<RawBuf>> = (0..n).map(|_| MaybeUninit::uninit()).collect();
         unsafe {
             mlx_inline_split(
                 &self.raw,
@@ -1217,11 +1443,15 @@ impl InlineArray {
 
     // ── Eval ─────────────────────────────────────────────────────────────
 
-    pub fn eval(&mut self) {
-        unsafe { mlx_inline_eval(&mut self.raw) }
+    pub fn eval(&self) -> EvalToken {
+        // MLX array handles are internally mutable; eval materializes the backing
+        // graph state but does not change the logical Rust ownership model.
+        unsafe { mlx_inline_eval(std::ptr::from_ref(&self.raw).cast_mut()) }
+        EvalToken
     }
-    pub fn async_eval(&mut self) {
-        unsafe { mlx_inline_async_eval(&mut self.raw) }
+    pub fn async_eval(&self) -> EvalToken {
+        unsafe { mlx_inline_async_eval(std::ptr::from_ref(&self.raw).cast_mut()) }
+        EvalToken
     }
 
     /// Eval two arrays in one call (avoids two FFI round-trips).
@@ -1236,26 +1466,70 @@ impl InlineArray {
     #[allow(clippy::too_many_arguments)]
     pub fn compiled_gdn_layer(
         normed: &Self,
-        qkv_w: &Self, z_w: &Self, b_w: &Self, a_w: &Self,
+        qkv_w: &Self,
+        z_w: &Self,
+        b_w: &Self,
+        a_w: &Self,
         conv_w: &Self,
-        q_nw: &Self, k_nw: &Self, a_log: &Self, dt_bias: &Self,
-        norm_w: &Self, out_w: &Self, conv_state: &Self, ssm_state: &Self,
-        nv: i32, nk: i32, dk: i32, dv: i32, cd: i32, ck: i32, kd: i32, norm_eps: f32,
+        q_nw: &Self,
+        k_nw: &Self,
+        a_log: &Self,
+        dt_bias: &Self,
+        norm_w: &Self,
+        out_w: &Self,
+        conv_state: &Self,
+        ssm_state: &Self,
+        nv: i32,
+        nk: i32,
+        dk: i32,
+        dv: i32,
+        cd: i32,
+        ck: i32,
+        kd: i32,
+        norm_eps: f32,
     ) -> (Self, Self, Self) {
         let mut out = std::mem::MaybeUninit::<RawBuf>::uninit();
         let mut conv = std::mem::MaybeUninit::<RawBuf>::uninit();
         let mut ssm = std::mem::MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_compiled_gdn_layer(
-                out.as_mut_ptr(), conv.as_mut_ptr(), ssm.as_mut_ptr(),
+                out.as_mut_ptr(),
+                conv.as_mut_ptr(),
+                ssm.as_mut_ptr(),
                 &normed.raw,
-                &qkv_w.raw, &z_w.raw, &b_w.raw, &a_w.raw,
+                &qkv_w.raw,
+                &z_w.raw,
+                &b_w.raw,
+                &a_w.raw,
                 &conv_w.raw,
-                &q_nw.raw, &k_nw.raw, &a_log.raw, &dt_bias.raw,
-                &norm_w.raw, &out_w.raw, &conv_state.raw, &ssm_state.raw,
-                nv, nk, dk, dv, cd, ck, kd, norm_eps,
+                &q_nw.raw,
+                &k_nw.raw,
+                &a_log.raw,
+                &dt_bias.raw,
+                &norm_w.raw,
+                &out_w.raw,
+                &conv_state.raw,
+                &ssm_state.raw,
+                nv,
+                nk,
+                dk,
+                dv,
+                cd,
+                ck,
+                kd,
+                norm_eps,
             );
-            (Self { raw: out.assume_init() }, Self { raw: conv.assume_init() }, Self { raw: ssm.assume_init() })
+            (
+                Self {
+                    raw: out.assume_init(),
+                },
+                Self {
+                    raw: conv.assume_init(),
+                },
+                Self {
+                    raw: ssm.assume_init(),
+                },
+            )
         }
     }
 
@@ -1265,26 +1539,140 @@ impl InlineArray {
     #[allow(clippy::too_many_arguments)]
     pub fn compiled_gdn_layer_fixed(
         normed: &Self,
-        qkv_w: &Self, z_w: &Self, b_w: &Self, a_w: &Self,
+        qkv_w: &Self,
+        z_w: &Self,
+        b_w: &Self,
+        a_w: &Self,
         conv_w: &Self,
-        q_nw: &Self, k_nw: &Self, a_log: &Self, dt_bias: &Self,
-        norm_w: &Self, out_w: &Self, conv_state: &Self, ssm_state: &Self,
-        nv: i32, nk: i32, dk: i32, dv: i32, cd: i32, ck: i32, kd: i32, norm_eps: f32,
+        q_nw: &Self,
+        k_nw: &Self,
+        a_log: &Self,
+        dt_bias: &Self,
+        norm_w: &Self,
+        out_w: &Self,
+        conv_state: &Self,
+        ssm_state: &Self,
+        nv: i32,
+        nk: i32,
+        dk: i32,
+        dv: i32,
+        cd: i32,
+        ck: i32,
+        kd: i32,
+        norm_eps: f32,
     ) -> (Self, Self, Self) {
         let mut out = std::mem::MaybeUninit::<RawBuf>::uninit();
         let mut conv = std::mem::MaybeUninit::<RawBuf>::uninit();
         let mut ssm = std::mem::MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_compiled_gdn_layer_fixed(
-                out.as_mut_ptr(), conv.as_mut_ptr(), ssm.as_mut_ptr(),
+                out.as_mut_ptr(),
+                conv.as_mut_ptr(),
+                ssm.as_mut_ptr(),
                 &normed.raw,
-                &qkv_w.raw, &z_w.raw, &b_w.raw, &a_w.raw,
+                &qkv_w.raw,
+                &z_w.raw,
+                &b_w.raw,
+                &a_w.raw,
                 &conv_w.raw,
-                &q_nw.raw, &k_nw.raw, &a_log.raw, &dt_bias.raw,
-                &norm_w.raw, &out_w.raw, &conv_state.raw, &ssm_state.raw,
-                nv, nk, dk, dv, cd, ck, kd, norm_eps,
+                &q_nw.raw,
+                &k_nw.raw,
+                &a_log.raw,
+                &dt_bias.raw,
+                &norm_w.raw,
+                &out_w.raw,
+                &conv_state.raw,
+                &ssm_state.raw,
+                nv,
+                nk,
+                dk,
+                dv,
+                cd,
+                ck,
+                kd,
+                norm_eps,
             );
-            (Self { raw: out.assume_init() }, Self { raw: conv.assume_init() }, Self { raw: ssm.assume_init() })
+            (
+                Self {
+                    raw: out.assume_init(),
+                },
+                Self {
+                    raw: conv.assume_init(),
+                },
+                Self {
+                    raw: ssm.assume_init(),
+                },
+            )
+        }
+    }
+
+    /// Fixed-shape compiled attention decode layer (shapeless=false).
+    /// Traces per cache-capacity bucket on first T=1 call, then replays.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compiled_attn_layer_fixed(
+        normed: &Self,
+        q_w: &Self,
+        k_w: &Self,
+        v_w: &Self,
+        o_w: &Self,
+        q_nw: &Self,
+        k_nw: &Self,
+        cache_keys_in: &Self,
+        cache_vals_in: &Self,
+        kv_offset: i32,
+        rope_offset: i32,
+        n_heads: i32,
+        n_kv: i32,
+        head_dim: i32,
+        scale: f32,
+        rope_dims: i32,
+        rope_base: f32,
+        rope_scale: f32,
+        q_norm_eps: f32,
+        k_norm_eps: f32,
+        gated: bool,
+    ) -> (Self, Self, Self) {
+        let mut out = std::mem::MaybeUninit::<RawBuf>::uninit();
+        let mut cache_keys = std::mem::MaybeUninit::<RawBuf>::uninit();
+        let mut cache_vals = std::mem::MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_compiled_attn_layer_fixed(
+                out.as_mut_ptr(),
+                cache_keys.as_mut_ptr(),
+                cache_vals.as_mut_ptr(),
+                &normed.raw,
+                &q_w.raw,
+                &k_w.raw,
+                &v_w.raw,
+                &o_w.raw,
+                &q_nw.raw,
+                &k_nw.raw,
+                &cache_keys_in.raw,
+                &cache_vals_in.raw,
+                kv_offset,
+                rope_offset,
+                n_heads,
+                n_kv,
+                head_dim,
+                scale,
+                rope_dims,
+                rope_base,
+                rope_scale,
+                q_norm_eps,
+                k_norm_eps,
+                gated,
+            );
+            (
+                Self {
+                    raw: out.assume_init(),
+                },
+                Self {
+                    raw: cache_keys.assume_init(),
+                },
+                Self {
+                    raw: cache_vals.assume_init(),
+                },
+            )
         }
     }
 
@@ -1296,8 +1684,12 @@ impl InlineArray {
         let c_key = std::ffi::CString::new(key).ok()?;
         let mut dst = std::mem::MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            if mlx_inline_load_safetensors_key(dst.as_mut_ptr(), c_path.as_ptr(), c_key.as_ptr()) == 0 {
-                Some(Self { raw: dst.assume_init() })
+            if mlx_inline_load_safetensors_key(dst.as_mut_ptr(), c_path.as_ptr(), c_key.as_ptr())
+                == 0
+            {
+                Some(Self {
+                    raw: dst.assume_init(),
+                })
             } else {
                 None
             }
@@ -1318,7 +1710,9 @@ impl InlineArray {
                 shape.as_ptr(),
                 shape.len() as i32,
             );
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -1339,7 +1733,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_from_i32_slice(dst.as_mut_ptr(), data.as_ptr(), data.len() as i32);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -1368,7 +1764,9 @@ impl InlineArray {
         let mut dst = std::mem::MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_arange(dst.as_mut_ptr(), n, dtype);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -1386,36 +1784,63 @@ impl InlineArray {
     #[inline]
     pub fn argmax(&self, axis: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_argmax(dst.as_mut_ptr(), &self.raw, axis); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_argmax(dst.as_mut_ptr(), &self.raw, axis);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     #[inline]
     pub fn argmin(&self, axis: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_argmin(dst.as_mut_ptr(), &self.raw, axis); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_argmin(dst.as_mut_ptr(), &self.raw, axis);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     /// Element-wise absolute value.
     #[inline]
-    pub fn abs(&self) -> Self { self.abs_val() }
+    pub fn abs(&self) -> Self {
+        self.abs_val()
+    }
 
     /// Element-wise absolute value (alias to avoid f32::abs conflict in some contexts).
     #[inline]
     pub fn abs_val(&self) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_abs(dst.as_mut_ptr(), &self.raw); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_abs(dst.as_mut_ptr(), &self.raw);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     #[inline]
     pub fn logsumexp(&self, axis: i32, keepdims: bool) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_logsumexp(dst.as_mut_ptr(), &self.raw, axis, keepdims); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_logsumexp(dst.as_mut_ptr(), &self.raw, axis, keepdims);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     #[inline]
     pub fn categorical(&self) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_categorical(dst.as_mut_ptr(), &self.raw); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_categorical(dst.as_mut_ptr(), &self.raw);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     // ── Embedding / KV cache ────────────────────────────────────────────
@@ -1424,14 +1849,24 @@ impl InlineArray {
     #[inline]
     pub fn take_axis(&self, indices: &Self, axis: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_take_axis(dst.as_mut_ptr(), &self.raw, &indices.raw, axis); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_take_axis(dst.as_mut_ptr(), &self.raw, &indices.raw, axis);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     /// Concatenate cached and new K/V along the sequence axis.
     #[inline]
     pub fn kv_cache_append(&self, new_kv: &Self, axis: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_kv_cache_append(dst.as_mut_ptr(), &self.raw, &new_kv.raw, axis); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_kv_cache_append(dst.as_mut_ptr(), &self.raw, &new_kv.raw, axis);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     /// Async eval (non-blocking).
@@ -1446,20 +1881,36 @@ impl InlineArray {
     /// when dk%32==0 && dk<=256, otherwise falls back to ops.
     #[inline]
     pub fn gdn_metal_step(
-        q: &Self, k: &Self, v: &Self,
-        g: &Self, beta: &Self,
-        state: &Self, t: i32,
+        q: &Self,
+        k: &Self,
+        v: &Self,
+        g: &Self,
+        beta: &Self,
+        state: &Self,
+        t: i32,
     ) -> (Self, Self) {
         let mut dst_y = MaybeUninit::<RawBuf>::uninit();
         let mut dst_state = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_gdn_metal_step(
-                dst_y.as_mut_ptr(), dst_state.as_mut_ptr(),
-                &q.raw, &k.raw, &v.raw,
-                &g.raw, &beta.raw,
-                &state.raw, t,
+                dst_y.as_mut_ptr(),
+                dst_state.as_mut_ptr(),
+                &q.raw,
+                &k.raw,
+                &v.raw,
+                &g.raw,
+                &beta.raw,
+                &state.raw,
+                t,
             );
-            (Self { raw: dst_y.assume_init() }, Self { raw: dst_state.assume_init() })
+            (
+                Self {
+                    raw: dst_y.assume_init(),
+                },
+                Self {
+                    raw: dst_state.assume_init(),
+                },
+            )
         }
     }
 
@@ -1490,7 +1941,7 @@ impl InlineArray {
         let rc = unsafe {
             mlx_inline_turboquant_encode(
                 out_indices.as_mut_ptr(),
-                std::ptr::null_mut(),   // norms: reserved
+                std::ptr::null_mut(), // norms: reserved
                 &input.raw,
                 &codebook.raw,
                 dim,
@@ -1499,7 +1950,9 @@ impl InlineArray {
             )
         };
         if rc == 0 {
-            Some(Self { raw: unsafe { out_indices.assume_init() } })
+            Some(Self {
+                raw: unsafe { out_indices.assume_init() },
+            })
         } else {
             None
         }
@@ -1528,7 +1981,7 @@ impl InlineArray {
             mlx_inline_turboquant_decode(
                 out.as_mut_ptr(),
                 &indices.raw,
-                std::ptr::null_mut(),   // norms: reserved
+                std::ptr::null_mut(), // norms: reserved
                 &codebook.raw,
                 dim,
                 n_centroids,
@@ -1536,7 +1989,9 @@ impl InlineArray {
             )
         };
         if rc == 0 {
-            Some(Self { raw: unsafe { out.assume_init() } })
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
         } else {
             None
         }
@@ -1548,28 +2003,48 @@ impl InlineArray {
     #[inline]
     pub fn fused_swiglu(gate: &Self, up: &Self) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_fused_swiglu(dst.as_mut_ptr(), &gate.raw, &up.raw); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_fused_swiglu(dst.as_mut_ptr(), &gate.raw, &up.raw);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     /// Fused SiLU: `x * sigmoid(x)` → 1 compiled dispatch instead of 2.
     #[inline]
     pub fn fused_silu(&self) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_fused_silu(dst.as_mut_ptr(), &self.raw); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_fused_silu(dst.as_mut_ptr(), &self.raw);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     /// Fused compute_g: `exp(-exp(A_log.f32()) * softplus(a + dt_bias))` → 1 compiled dispatch instead of 6.
     #[inline]
     pub fn fused_compute_g(a_log: &Self, a: &Self, dt_bias: &Self) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_fused_compute_g(dst.as_mut_ptr(), &a_log.raw, &a.raw, &dt_bias.raw); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_fused_compute_g(dst.as_mut_ptr(), &a_log.raw, &a.raw, &dt_bias.raw);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     /// Fused precise SwiGLU: `(silu(gate.f32()) * x.f32()).as(x.dtype)` → 1 compiled dispatch instead of 5.
     #[inline]
     pub fn fused_precise_swiglu(x: &Self, gate: &Self) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_fused_precise_swiglu(dst.as_mut_ptr(), &x.raw, &gate.raw); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_fused_precise_swiglu(dst.as_mut_ptr(), &x.raw, &gate.raw);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     // ── Slice access (requires prior eval) ───────────────────────────────
@@ -1581,7 +2056,10 @@ impl InlineArray {
     /// dtype is not Float32, or if the data pointer is null.
     pub fn as_slice<T: crate::inline_array::BridgeScalar>(&self) -> &[T] {
         let ptr = self.data_ptr() as *const T;
-        assert!(!ptr.is_null(), "as_slice: array not evaluated (null data ptr)");
+        assert!(
+            !ptr.is_null(),
+            "as_slice: array not evaluated (null data ptr)"
+        );
         let n = self.size();
         // SAFETY: `data_ptr` returns a valid pointer into MLX's heap allocation
         // for the lifetime of `self`. The array must have been `eval()`d first
@@ -1591,11 +2069,15 @@ impl InlineArray {
 
     // ── Item extraction ───────────────────────────────────────────────────
 
-    pub fn item_f32(&mut self) -> f32 {
-        unsafe { mlx_inline_item_f32(&mut self.raw) }
+    pub fn item_f32(&self) -> f32 {
+        let mut owned = self.clone();
+        owned.eval();
+        unsafe { mlx_inline_item_f32(&mut owned.raw) }
     }
-    pub fn item_u32(&mut self) -> u32 {
-        unsafe { mlx_inline_item_u32(&mut self.raw) }
+    pub fn item_u32(&self) -> u32 {
+        let mut owned = self.clone();
+        owned.eval();
+        unsafe { mlx_inline_item_u32(&mut owned.raw) }
     }
 
     // ── Indexing / slicing ────────────────────────────────────────────────
@@ -1759,9 +2241,8 @@ impl InlineArray {
         }
     }
 
-    /// Embedding/gather lookup: `self[indices]`
     #[inline]
-    pub fn index(&self, indices: &Self) -> Self {
+    pub(crate) fn index_array(&self, indices: &Self) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_index(dst.as_mut_ptr(), &self.raw, &indices.raw);
@@ -1769,6 +2250,18 @@ impl InlineArray {
                 raw: dst.assume_init(),
             }
         }
+    }
+
+    /// Index or slice this array using the compatibility bridge.
+    ///
+    /// Supports gather indexing with an index array as well as mlx-rs style
+    /// integer and tuple/range slicing via `compat::indexing::IndexOp`.
+    #[inline]
+    pub fn index<Idx>(&self, idx: Idx) -> Self
+    where
+        Self: crate::compat::indexing::IndexOp<Idx>,
+    {
+        <Self as crate::compat::indexing::IndexOp<Idx>>::index(self, idx)
     }
 
     // ── GDN recurrence ────────────────────────────────────────────────────
@@ -1902,7 +2395,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_random_normal(dst.as_mut_ptr(), shape.as_ptr(), shape.len() as i32, dtype);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -1911,7 +2406,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_random_uniform(dst.as_mut_ptr(), shape.as_ptr(), shape.len() as i32, dtype);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -1919,8 +2416,15 @@ impl InlineArray {
     pub fn random_bernoulli(p: &Self, shape: &[i32]) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_random_bernoulli(dst.as_mut_ptr(), &p.raw, shape.as_ptr(), shape.len() as i32);
-            Self { raw: dst.assume_init() }
+            mlx_inline_random_bernoulli(
+                dst.as_mut_ptr(),
+                &p.raw,
+                shape.as_ptr(),
+                shape.len() as i32,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -1928,8 +2432,17 @@ impl InlineArray {
     pub fn random_randint(low: i32, high: i32, shape: &[i32], dtype: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_random_randint(dst.as_mut_ptr(), low, high, shape.as_ptr(), shape.len() as i32, dtype);
-            Self { raw: dst.assume_init() }
+            mlx_inline_random_randint(
+                dst.as_mut_ptr(),
+                low,
+                high,
+                shape.as_ptr(),
+                shape.len() as i32,
+                dtype,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -1939,7 +2452,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_mean_axis(dst.as_mut_ptr(), &self.raw, axis, keepdims);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -1947,7 +2462,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_mean_all(dst.as_mut_ptr(), &self.raw);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -1955,7 +2472,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_var_axis(dst.as_mut_ptr(), &self.raw, axis, keepdims);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -1981,7 +2500,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_tri_inv(dst.as_mut_ptr(), &self.raw, upper, use_cpu);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -1990,15 +2511,21 @@ impl InlineArray {
     /// Economy/thin SVD: `U` is `[m, k]`, `S` is `[k]`, `Vt` is `[k, n]`
     /// where `k = min(m, n)`.  Always runs on the CPU stream.
     pub fn svd(&self) -> (Self, Self, Self) {
-        let mut u   = MaybeUninit::<RawBuf>::uninit();
-        let mut s   = MaybeUninit::<RawBuf>::uninit();
-        let mut vt  = MaybeUninit::<RawBuf>::uninit();
+        let mut u = MaybeUninit::<RawBuf>::uninit();
+        let mut s = MaybeUninit::<RawBuf>::uninit();
+        let mut vt = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_svd(u.as_mut_ptr(), s.as_mut_ptr(), vt.as_mut_ptr(), &self.raw);
             (
-                Self { raw: u.assume_init()  },
-                Self { raw: s.assume_init()  },
-                Self { raw: vt.assume_init() },
+                Self {
+                    raw: u.assume_init(),
+                },
+                Self {
+                    raw: s.assume_init(),
+                },
+                Self {
+                    raw: vt.assume_init(),
+                },
             )
         }
     }
@@ -2006,11 +2533,17 @@ impl InlineArray {
     /// Clip values to [lo, hi]. Either bound can be None.
     pub fn clip(&self, lo: Option<&Self>, hi: Option<&Self>) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        let lo_ptr = lo.map(|x| &x.raw as *const RawBuf).unwrap_or(std::ptr::null());
-        let hi_ptr = hi.map(|x| &x.raw as *const RawBuf).unwrap_or(std::ptr::null());
+        let lo_ptr = lo
+            .map(|x| &x.raw as *const RawBuf)
+            .unwrap_or(std::ptr::null());
+        let hi_ptr = hi
+            .map(|x| &x.raw as *const RawBuf)
+            .unwrap_or(std::ptr::null());
         unsafe {
             mlx_inline_clip(dst.as_mut_ptr(), &self.raw, lo_ptr, hi_ptr);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2018,7 +2551,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_log_softmax(dst.as_mut_ptr(), &self.raw, axis);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2027,7 +2562,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_cross_entropy(dst.as_mut_ptr(), &self.raw, &targets.raw, axis);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2037,8 +2574,16 @@ impl InlineArray {
     pub fn full(shape: &[i32], val: f32, dtype: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_full(dst.as_mut_ptr(), shape.as_ptr(), shape.len() as i32, val, dtype);
-            Self { raw: dst.assume_init() }
+            mlx_inline_full(
+                dst.as_mut_ptr(),
+                shape.as_ptr(),
+                shape.len() as i32,
+                val,
+                dtype,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2047,7 +2592,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_eye(dst.as_mut_ptr(), n, dtype);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2056,7 +2603,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_tri(dst.as_mut_ptr(), n, m, k, dtype);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2065,8 +2614,15 @@ impl InlineArray {
     pub fn broadcast_to(&self, shape: &[i32]) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_broadcast_to(dst.as_mut_ptr(), &self.raw, shape.as_ptr(), shape.len() as i32);
-            Self { raw: dst.assume_init() }
+            mlx_inline_broadcast_to(
+                dst.as_mut_ptr(),
+                &self.raw,
+                shape.as_ptr(),
+                shape.len() as i32,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2074,7 +2630,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_flatten(dst.as_mut_ptr(), &self.raw, start_axis, end_axis);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2084,7 +2642,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_argsort(dst.as_mut_ptr(), &self.raw, axis);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2093,7 +2653,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_sum_all(dst.as_mut_ptr(), &self.raw);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2101,7 +2663,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_max_axis(dst.as_mut_ptr(), &self.raw, axis, keepdims);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2109,7 +2673,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_min_axis(dst.as_mut_ptr(), &self.raw, axis, keepdims);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2119,8 +2685,16 @@ impl InlineArray {
     pub fn sum_axes(&self, axes: &[i32], keepdims: bool) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_sum_axes(dst.as_mut_ptr(), &self.raw, axes.as_ptr(), axes.len() as i32, keepdims);
-            Self { raw: dst.assume_init() }
+            mlx_inline_sum_axes(
+                dst.as_mut_ptr(),
+                &self.raw,
+                axes.as_ptr(),
+                axes.len() as i32,
+                keepdims,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2128,8 +2702,16 @@ impl InlineArray {
     pub fn mean_axes(&self, axes: &[i32], keepdims: bool) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_mean_axes(dst.as_mut_ptr(), &self.raw, axes.as_ptr(), axes.len() as i32, keepdims);
-            Self { raw: dst.assume_init() }
+            mlx_inline_mean_axes(
+                dst.as_mut_ptr(),
+                &self.raw,
+                axes.as_ptr(),
+                axes.len() as i32,
+                keepdims,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2172,11 +2754,24 @@ impl InlineArray {
         let mut s = MaybeUninit::<RawBuf>::uninit();
         let mut b = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_quantize(w.as_mut_ptr(), s.as_mut_ptr(), b.as_mut_ptr(), &self.raw, group_size, bits);
+            mlx_inline_quantize(
+                w.as_mut_ptr(),
+                s.as_mut_ptr(),
+                b.as_mut_ptr(),
+                &self.raw,
+                group_size,
+                bits,
+            );
             (
-                Self { raw: w.assume_init() },
-                Self { raw: s.assume_init() },
-                Self { raw: b.assume_init() },
+                Self {
+                    raw: w.assume_init(),
+                },
+                Self {
+                    raw: s.assume_init(),
+                },
+                Self {
+                    raw: b.assume_init(),
+                },
             )
         }
     }
@@ -2184,13 +2779,29 @@ impl InlineArray {
     // ── Training ops: misc ────────────────────────────────────────────────
 
     /// Alias for pow (mlx-rs compat).
-    pub fn power(&self, other: &Self) -> Self { self.pow(other) }
+    pub fn power(&self, other: &Self) -> Self {
+        self.pow(other)
+    }
 
     /// gt/lt/ge/le aliases for compat with mlx-rs naming.
-    pub fn gt(&self, other: &Self) -> Self { self.greater(other) }
-    pub fn lt(&self, other: &Self) -> Self { self.less(other) }
-    pub fn ge(&self, other: &Self) -> Self { self.greater_equal(other) }
-    pub fn le(&self, other: &Self) -> Self { self.less_equal(other) }
+    pub fn eq(&self, other: &Self) -> Self {
+        self.equal(other)
+    }
+    pub fn ne(&self, other: &Self) -> Self {
+        self.not_equal(other)
+    }
+    pub fn gt(&self, other: &Self) -> Self {
+        self.greater(other)
+    }
+    pub fn lt(&self, other: &Self) -> Self {
+        self.less(other)
+    }
+    pub fn ge(&self, other: &Self) -> Self {
+        self.greater_equal(other)
+    }
+    pub fn le(&self, other: &Self) -> Self {
+        self.less_equal(other)
+    }
 
     /// Swap two axes.
     pub fn swap_axes(&self, a: i32, b: i32) -> Self {
@@ -2226,14 +2837,24 @@ impl InlineArray {
     #[inline]
     pub fn rfft(&self, n_fft: i32, axis: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_rfft(dst.as_mut_ptr(), &self.raw, n_fft, axis); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_rfft(dst.as_mut_ptr(), &self.raw, n_fft, axis);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     /// Inverse real-valued FFT along `axis`. Pass `n_fft = -1` to infer from input.
     #[inline]
     pub fn irfft(&self, n_fft: i32, axis: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_irfft(dst.as_mut_ptr(), &self.raw, n_fft, axis); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_irfft(dst.as_mut_ptr(), &self.raw, n_fft, axis);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     // ── leaky_relu ────────────────────────────────────────────────────────
@@ -2242,7 +2863,12 @@ impl InlineArray {
     #[inline]
     pub fn leaky_relu(&self, neg_slope: f32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_leaky_relu(dst.as_mut_ptr(), &self.raw, neg_slope); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_leaky_relu(dst.as_mut_ptr(), &self.raw, neg_slope);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     // ── squeeze all ───────────────────────────────────────────────────────
@@ -2251,7 +2877,12 @@ impl InlineArray {
     #[inline]
     pub fn squeeze_all(&self) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        unsafe { mlx_inline_squeeze_all(dst.as_mut_ptr(), &self.raw); Self { raw: dst.assume_init() } }
+        unsafe {
+            mlx_inline_squeeze_all(dst.as_mut_ptr(), &self.raw);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     // ── pad ───────────────────────────────────────────────────────────────
@@ -2264,8 +2895,15 @@ impl InlineArray {
     pub fn tile(&self, reps: &[i32]) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_tile(dst.as_mut_ptr(), &self.raw, reps.as_ptr(), reps.len() as i32);
-            Self { raw: dst.assume_init() }
+            mlx_inline_tile(
+                dst.as_mut_ptr(),
+                &self.raw,
+                reps.as_ptr(),
+                reps.len() as i32,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2274,7 +2912,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_linspace(dst.as_mut_ptr(), start, stop, n, dtype);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2293,17 +2933,29 @@ impl InlineArray {
                 &mut out_count,
             );
         }
-        (0..out_count as usize).map(|i| unsafe {
-            Self { raw: buf[i].assume_init() }
-        }).collect()
+        (0..out_count as usize)
+            .map(|i| unsafe {
+                Self {
+                    raw: buf[i].assume_init(),
+                }
+            })
+            .collect()
     }
 
     /// Scatter-add: `self[indices] += updates` along `axis`.
     pub fn scatter_add_axis(&self, indices: &Self, updates: &Self, axis: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_scatter_add(dst.as_mut_ptr(), &self.raw, &indices.raw, &updates.raw, axis);
-            Self { raw: dst.assume_init() }
+            mlx_inline_scatter_add(
+                dst.as_mut_ptr(),
+                &self.raw,
+                &indices.raw,
+                &updates.raw,
+                axis,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2312,7 +2964,9 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_topk(dst.as_mut_ptr(), &self.raw, k, axis);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2321,18 +2975,26 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_put_along_axis(dst.as_mut_ptr(), &self.raw, &indices.raw, &values.raw, axis);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
     /// Layer normalisation. `weight` and `bias` may be null (use `std::ptr::null()`).
     pub fn layer_norm(&self, weight: Option<&Self>, bias: Option<&Self>, eps: f32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
-        let w_ptr = weight.map(|w| &w.raw as *const RawBuf).unwrap_or(std::ptr::null());
-        let b_ptr = bias.map(|b| &b.raw as *const RawBuf).unwrap_or(std::ptr::null());
+        let w_ptr = weight
+            .map(|w| &w.raw as *const RawBuf)
+            .unwrap_or(std::ptr::null());
+        let b_ptr = bias
+            .map(|b| &b.raw as *const RawBuf)
+            .unwrap_or(std::ptr::null());
         unsafe {
             mlx_inline_layer_norm(dst.as_mut_ptr(), &self.raw, w_ptr, b_ptr, eps);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2341,18 +3003,41 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_addmm(dst.as_mut_ptr(), &c.raw, &a.raw, &b.raw);
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
     /// 2-D convolution (NHWC format, MLX standard).
-    pub fn conv2d(&self, weight: &Self, stride_h: i32, stride_w: i32,
-                  pad_h: i32, pad_w: i32, dil_h: i32, dil_w: i32, groups: i32) -> Self {
+    pub fn conv2d(
+        &self,
+        weight: &Self,
+        stride_h: i32,
+        stride_w: i32,
+        pad_h: i32,
+        pad_w: i32,
+        dil_h: i32,
+        dil_w: i32,
+        groups: i32,
+    ) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_conv2d(dst.as_mut_ptr(), &self.raw, &weight.raw,
-                              stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups);
-            Self { raw: dst.assume_init() }
+            mlx_inline_conv2d(
+                dst.as_mut_ptr(),
+                &self.raw,
+                &weight.raw,
+                stride_h,
+                stride_w,
+                pad_h,
+                pad_w,
+                dil_h,
+                dil_w,
+                groups,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2367,7 +3052,9 @@ impl InlineArray {
                 (pad_widths_flat.len() / 2) as i32,
                 fill_value,
             );
-            Self { raw: dst.assume_init() }
+            Self {
+                raw: dst.assume_init(),
+            }
         }
     }
 
@@ -2375,8 +3062,10 @@ impl InlineArray {
 
     /// Extract the scalar value from a 0-d array. Evaluates lazily if needed.
     /// `T` must be `f32` or `u32` (the only types exported by the bridge).
-    pub fn item<T: BridgeScalar>(&mut self) -> T {
-        T::extract(self)
+    pub fn item<T: BridgeScalar>(&self) -> T {
+        let mut owned = self.clone();
+        owned.eval();
+        T::extract(&mut owned)
     }
 
     // ── max / min scalar reductions ───────────────────────────────────────
@@ -2403,6 +3092,11 @@ impl InlineArray {
     /// Reduce to the global mean (returns scalar array).
     pub fn mean(&self, _axis: Option<i32>) -> Self {
         self.mean_all()
+    }
+
+    /// mlx-rs compat alias.
+    pub fn logsumexp_axis(&self, axis: i32, keepdims: bool) -> Self {
+        self.logsumexp(axis, keepdims)
     }
 
     // ── mlx-rs compat constructors ────────────────────────────────────────
@@ -2441,13 +3135,25 @@ impl InlineArray {
     pub fn cast_like(&self, other: &Self) -> Self {
         self.as_dtype(other.dtype_raw())
     }
+
+    #[inline]
+    pub fn unwrap(self) -> Self {
+        self
+    }
+
+    #[inline]
+    pub fn expect(self, _msg: &str) -> Self {
+        self
+    }
 }
 
 // ── Trait impls ────────────────────────────────────────────────────────────
 
 impl AsRef<InlineArray> for InlineArray {
     #[inline]
-    fn as_ref(&self) -> &InlineArray { self }
+    fn as_ref(&self) -> &InlineArray {
+        self
+    }
 }
 
 // ── Autograd ──────────────────────────────────────────────────────────────
@@ -2480,7 +3186,9 @@ where
                 let ptr = unsafe { *all_arrays.add(i) };
                 let mut dst = MaybeUninit::<RawBuf>::uninit();
                 unsafe { mlx_inline_init_copy(dst.as_mut_ptr(), ptr) };
-                InlineArray { raw: unsafe { dst.assume_init() } }
+                InlineArray {
+                    raw: unsafe { dst.assume_init() },
+                }
             })
             .collect();
         let loss = f(&arrays);
@@ -2501,7 +3209,10 @@ where
 
     let mut loss = InlineArray::from_f32(0.0);
     let mut grads: Vec<InlineArray> = (0..n_params).map(|_| InlineArray::from_f32(0.0)).collect();
-    let mut grad_ptrs: Vec<*mut RawBuf> = grads.iter_mut().map(|g| &mut g.raw as *mut RawBuf).collect();
+    let mut grad_ptrs: Vec<*mut RawBuf> = grads
+        .iter_mut()
+        .map(|g| &mut g.raw as *mut RawBuf)
+        .collect();
 
     unsafe {
         mlx_inline_value_and_grad(
@@ -2582,17 +3293,39 @@ pub trait AsDtype {
     const DTYPE_ID: i32;
 }
 
-impl AsDtype for f32    { const DTYPE_ID: i32 = 10; }  // Float32
-impl AsDtype for f16    { const DTYPE_ID: i32 = 9;  }  // Float16 (using half::f16 or similar)
-impl AsDtype for u8     { const DTYPE_ID: i32 = 1;  }  // Uint8
-impl AsDtype for u16    { const DTYPE_ID: i32 = 2;  }  // Uint16
-impl AsDtype for u32    { const DTYPE_ID: i32 = 3;  }  // Uint32
-impl AsDtype for u64    { const DTYPE_ID: i32 = 4;  }  // Uint64
-impl AsDtype for i8     { const DTYPE_ID: i32 = 5;  }  // Int8
-impl AsDtype for i16    { const DTYPE_ID: i32 = 6;  }  // Int16
-impl AsDtype for i32    { const DTYPE_ID: i32 = 7;  }  // Int32
-impl AsDtype for i64    { const DTYPE_ID: i32 = 8;  }  // Int64
-impl AsDtype for bool   { const DTYPE_ID: i32 = 0;  }  // Bool
+impl AsDtype for f32 {
+    const DTYPE_ID: i32 = 10;
+} // Float32
+impl AsDtype for f16 {
+    const DTYPE_ID: i32 = 9;
+} // Float16 (using half::f16 or similar)
+impl AsDtype for u8 {
+    const DTYPE_ID: i32 = 1;
+} // Uint8
+impl AsDtype for u16 {
+    const DTYPE_ID: i32 = 2;
+} // Uint16
+impl AsDtype for u32 {
+    const DTYPE_ID: i32 = 3;
+} // Uint32
+impl AsDtype for u64 {
+    const DTYPE_ID: i32 = 4;
+} // Uint64
+impl AsDtype for i8 {
+    const DTYPE_ID: i32 = 5;
+} // Int8
+impl AsDtype for i16 {
+    const DTYPE_ID: i32 = 6;
+} // Int16
+impl AsDtype for i32 {
+    const DTYPE_ID: i32 = 7;
+} // Int32
+impl AsDtype for i64 {
+    const DTYPE_ID: i32 = 8;
+} // Int64
+impl AsDtype for bool {
+    const DTYPE_ID: i32 = 0;
+} // Bool
 
 /// Half-precision float marker type for `as_type::<f16>()`.
 /// Use `half::f16` from the `half` crate, or this zero-sized stub.
@@ -2603,7 +3336,9 @@ pub struct f16;
 #[allow(non_camel_case_types)]
 pub struct bf16;
 
-impl AsDtype for bf16   { const DTYPE_ID: i32 = 11; }  // Bfloat16
+impl AsDtype for bf16 {
+    const DTYPE_ID: i32 = 11;
+} // Bfloat16
 
 // ── ArrayElement: trait for from_slice<T>() ──────────────────────────────
 
@@ -2611,7 +3346,9 @@ impl AsDtype for bf16   { const DTYPE_ID: i32 = 11; }  // Bfloat16
 ///
 /// Implemented for `f32`, `i32`, `u32`, and `i64`.
 pub trait ArrayElement {
-    fn into_array(data: &[Self], shape: &[i32]) -> InlineArray where Self: Sized;
+    fn into_array(data: &[Self], shape: &[i32]) -> InlineArray
+    where
+        Self: Sized;
 }
 
 impl ArrayElement for f32 {
@@ -2662,14 +3399,25 @@ mod private {
     pub trait Sealed {}
     impl Sealed for f32 {}
     impl Sealed for u32 {}
+    impl Sealed for i32 {}
 }
 
 impl BridgeScalar for f32 {
-    fn extract(arr: &mut InlineArray) -> f32 { arr.item_f32() }
+    fn extract(arr: &mut InlineArray) -> f32 {
+        arr.item_f32()
+    }
 }
 
 impl BridgeScalar for u32 {
-    fn extract(arr: &mut InlineArray) -> u32 { arr.item_u32() }
+    fn extract(arr: &mut InlineArray) -> u32 {
+        arr.item_u32()
+    }
+}
+
+impl BridgeScalar for i32 {
+    fn extract(arr: &mut InlineArray) -> i32 {
+        arr.item_u32() as i32
+    }
 }
 
 #[cfg(test)]

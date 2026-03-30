@@ -18,9 +18,9 @@ use std::path::Path;
 
 use crate::inline_array;
 use crate::optimizer::ParamSet;
-use crate::{AdamW, InlineArray};
 use crate::qwen3_native::{NativeCache, NativeWeights, Qwen3Config};
 use crate::training;
+use crate::{AdamW, InlineArray};
 
 // ============================================================================
 // LoRA configuration
@@ -102,7 +102,11 @@ impl LoraAdapter {
         // B = zeros
         let b = InlineArray::zeros(&[out_features, rank], dtype_f32);
 
-        Self { lora_a: a, lora_b: b, scale }
+        Self {
+            lora_a: a,
+            lora_b: b,
+            scale,
+        }
     }
 }
 
@@ -132,12 +136,8 @@ impl Qwen3LoraWeights {
         let hidden = model_config.hidden_size;
         let intermediate = model_config.intermediate_size;
         let n_heads = model_config.num_attention_heads;
-        let head_dim = model_config
-            .head_dim
-            .unwrap_or(hidden / n_heads);
-        let n_kv = model_config
-            .num_key_value_heads
-            .unwrap_or(n_heads);
+        let head_dim = model_config.head_dim.unwrap_or(hidden / n_heads);
+        let n_kv = model_config.num_key_value_heads.unwrap_or(n_heads);
 
         for i in 0..n_layers {
             for target in &lora_config.target_modules {
@@ -174,7 +174,10 @@ impl Qwen3LoraWeights {
             }
         }
 
-        Self { adapters, config: lora_config }
+        Self {
+            adapters,
+            config: lora_config,
+        }
     }
 
     /// Return a [`ParamSet`] containing all trainable adapter arrays.
@@ -221,10 +224,8 @@ impl Qwen3LoraWeights {
             })
             .collect();
 
-        let entries: Vec<(&str, &InlineArray)> = owned_keys
-            .iter()
-            .map(|(k, v)| (k.as_str(), *v))
-            .collect();
+        let entries: Vec<(&str, &InlineArray)> =
+            owned_keys.iter().map(|(k, v)| (k.as_str(), *v)).collect();
 
         InlineArray::save_safetensors(path, &entries);
     }
@@ -370,10 +371,8 @@ pub fn train_step(
 
     // ── Build input arrays ──────────────────────────────────────────────────
     // Reshape flat slices to [batch, seq_len] int32 tensors.
-    let input = InlineArray::from_i32_slice(input_ids)
-        .reshape(&[batch_size, seq_len]);
-    let label_arr = InlineArray::from_i32_slice(labels)
-        .reshape(&[batch_size, seq_len]);
+    let input = InlineArray::from_i32_slice(input_ids).reshape(&[batch_size, seq_len]);
+    let label_arr = InlineArray::from_i32_slice(labels).reshape(&[batch_size, seq_len]);
 
     // ── Collect trainable params ────────────────────────────────────────────
     // We need a stable, ordered list of names so we can correlate the
@@ -386,10 +385,7 @@ pub fn train_step(
         names
     };
 
-    let param_arrays: Vec<InlineArray> = param_names
-        .iter()
-        .map(|k| params[k].clone())
-        .collect();
+    let param_arrays: Vec<InlineArray> = param_names.iter().map(|k| params[k].clone()).collect();
 
     // Non-differentiated context: [input_ids, labels]
     let input_arrays = vec![input, label_arr];
@@ -521,8 +517,7 @@ pub fn train_loop(
 
     for _epoch in 0..train_config.num_epochs {
         // Batch samples.
-        let batches: Vec<&[(Vec<i32>, Vec<i32>)]> =
-            samples.chunks(batch_size).collect();
+        let batches: Vec<&[(Vec<i32>, Vec<i32>)]> = samples.chunks(batch_size).collect();
 
         let mut acc_grads: ParamSet = ParamSet::new();
         let mut acc_loss = 0.0_f32;
@@ -531,10 +526,8 @@ pub fn train_loop(
         for (batch_idx, batch) in batches.iter().enumerate() {
             // Flatten batch into [batch * seq_len] slices.
             let actual_batch = batch.len() as i32;
-            let mut flat_input: Vec<i32> =
-                Vec::with_capacity(actual_batch as usize * seq_len);
-            let mut flat_labels: Vec<i32> =
-                Vec::with_capacity(actual_batch as usize * seq_len);
+            let mut flat_input: Vec<i32> = Vec::with_capacity(actual_batch as usize * seq_len);
+            let mut flat_labels: Vec<i32> = Vec::with_capacity(actual_batch as usize * seq_len);
             for (inp, lbl) in *batch {
                 flat_input.extend_from_slice(inp);
                 flat_labels.extend_from_slice(lbl);
@@ -612,7 +605,8 @@ mod tests {
 
     fn dummy_config() -> Qwen3Config {
         // Minimal config: 2 layers, hidden=64, 2 heads, intermediate=128.
-        serde_json::from_str(r#"{
+        serde_json::from_str(
+            r#"{
             "model_type": "qwen3",
             "hidden_size": 64,
             "num_hidden_layers": 2,
@@ -623,7 +617,9 @@ mod tests {
             "vocab_size": 512,
             "rms_norm_eps": 1e-6,
             "rope_theta": 1000000.0
-        }"#).expect("invalid dummy config")
+        }"#,
+        )
+        .expect("invalid dummy config")
     }
 
     #[test]
