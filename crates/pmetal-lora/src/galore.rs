@@ -40,8 +40,8 @@
 
 use crate::LoraError;
 use pmetal_bridge::compat::Array;
+use pmetal_bridge::compat::indexing::IndexOp;
 use pmetal_bridge::compat::linalg;
-use pmetal_bridge::compat::ops::IndexOp;
 
 /// Projection type for GaLore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -454,7 +454,7 @@ impl GaloreParamState {
 
         // Compute update in projected space
         let eps_arr = Array::from_f32(eps);
-        let v_sqrt = v_hat.sqrt()?;
+        let v_sqrt = v_hat.sqrt();
         let denom = v_sqrt.add(&eps_arr);
         let low_rank_update = m_hat.divide(&denom);
 

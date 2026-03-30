@@ -56,7 +56,12 @@ pub fn sdpa_causal_like_mlx(
 /// `mlx::core::enable_compile()` was benchmarked and shown to regress decode
 /// throughput on the active native paths, so the canonical bridge path keeps
 /// it disabled here.
-fn begin_generation_session_impl(tag: &str, model_dtype: i32, reset_peak_memory: bool) {
+fn begin_generation_session_impl(
+    tag: &str,
+    model_dtype: i32,
+    reset_peak_memory: bool,
+    log_session: bool,
+) {
     crate::inline_array::clear_cache();
     if reset_peak_memory {
         crate::inline_array::reset_peak_memory();
@@ -66,18 +71,24 @@ fn begin_generation_session_impl(tag: &str, model_dtype: i32, reset_peak_memory:
     crate::inline_array::set_generation_stream();
     crate::inline_array::set_wired_limit_max();
 
-    eprintln!(
-        "[{tag}] generate: dtype={model_dtype} active={:.0}MB",
-        crate::inline_array::get_active_memory() as f64 / 1e6,
-    );
+    if log_session {
+        eprintln!(
+            "[{tag}] generate: dtype={model_dtype} active={:.0}MB",
+            crate::inline_array::get_active_memory() as f64 / 1e6,
+        );
+    }
 }
 
 pub fn begin_generation_session(tag: &str, model_dtype: i32) {
-    begin_generation_session_impl(tag, model_dtype, true);
+    begin_generation_session_impl(tag, model_dtype, true, true);
 }
 
 pub fn begin_generation_session_preserve_peak(tag: &str, model_dtype: i32) {
-    begin_generation_session_impl(tag, model_dtype, false);
+    begin_generation_session_impl(tag, model_dtype, false, true);
+}
+
+pub fn begin_generation_session_preserve_peak_silent(tag: &str, model_dtype: i32) {
+    begin_generation_session_impl(tag, model_dtype, false, false);
 }
 
 #[cfg(test)]

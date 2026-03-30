@@ -245,7 +245,7 @@ impl QBLoraLinear {
 
         // Cast weight to Float32 if needed
         let weight_f32 = if weight.dtype() != pmetal_bridge::compat::Dtype::Float32 {
-            weight.as_type::<f32>()?
+            weight.as_type::<f32>()
         } else {
             weight.clone()
         };
@@ -278,7 +278,7 @@ impl QBLoraLinear {
                 // Random orthogonal-ish projection (fixed)
                 let proj = pmetal_bridge::compat::random::normal(&[in_features, proj_dim as i32], pmetal_bridge::compat::Dtype::Float32);
                 // Normalize columns for stability
-                let norm = proj.square().sum_axis(0, true).sqrt()?;
+                let norm = proj.square().sum_axis(0, true).sqrt();
                 proj.divide(&norm)
             };
             (Some(proj), proj_dim as i32)
@@ -293,7 +293,7 @@ impl QBLoraLinear {
                 pmetal_bridge::compat::random::uniform_range(-bound, bound, &[proj_dim as i32, out_features], pmetal_bridge::compat::Dtype::Float32)
             } else {
                 let proj = pmetal_bridge::compat::random::normal(&[proj_dim as i32, out_features], pmetal_bridge::compat::Dtype::Float32);
-                let norm = proj.square().sum_axis(1, true).sqrt()?;
+                let norm = proj.square().sum_axis(1, true).sqrt();
                 proj.divide(&norm)
             };
             (Some(proj), proj_dim as i32)

@@ -346,9 +346,13 @@ pub fn benchmark_native_mlx_lm(
 
         let generation_tic = std::time::Instant::now();
         if generation_tokens > 1 {
-            let current_y =
-                qwen3_native::prime_generation_preserve_peak(&weights, &mut cache, first_tok, 0.0);
-            let generated_tail = qwen3_native::generate_from_primed_sample(
+            let current_y = qwen3_native::prime_generation_preserve_peak_silent(
+                &weights,
+                &mut cache,
+                first_tok,
+                0.0,
+            );
+            let generated_tail = qwen3_native::generate_from_primed_sample_silent(
                 &weights,
                 &mut cache,
                 current_y,

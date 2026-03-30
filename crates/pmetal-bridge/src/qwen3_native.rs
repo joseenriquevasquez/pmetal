@@ -2381,11 +2381,14 @@ fn begin_generation_session(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     reset_peak_memory: bool,
+    log_session: bool,
 ) {
     if reset_peak_memory {
         crate::decode::begin_generation_session("NATIVE", weights.model_dtype);
-    } else {
+    } else if log_session {
         crate::decode::begin_generation_session_preserve_peak("NATIVE", weights.model_dtype);
+    } else {
+        crate::decode::begin_generation_session_preserve_peak_silent("NATIVE", weights.model_dtype);
     }
 
     // Evaluate and detach all prefill cache states before decode.
@@ -2399,8 +2402,9 @@ fn prime_generation_impl(
     first_token: u32,
     temperature: f32,
     reset_peak_memory: bool,
+    log_session: bool,
 ) -> InlineArray {
-    begin_generation_session(weights, cache, reset_peak_memory);
+    begin_generation_session(weights, cache, reset_peak_memory, log_session);
 
     // First decode step
     let input_token = InlineArray::from_i32(first_token as i32).reshape(&[1, 1]);
@@ -2420,6 +2424,7 @@ fn generate_from_primed_sample_impl(
     mut current_y: InlineArray,
     max_tokens: usize,
     temperature: f32,
+    log_stats: bool,
     mut on_token: impl FnMut(u32) -> bool,
 ) -> Vec<u32> {
     let mut tokens = Vec::with_capacity(max_tokens);
@@ -2460,7 +2465,7 @@ fn generate_from_primed_sample_impl(
         }
     }
 
-    if step_times.len() > 20 {
+    if log_stats && step_times.len() > 20 {
         step_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let skip = 10;
         let avg = step_times[skip..].iter().sum::<f64>() / (step_times.len() - skip) as f64;
@@ -2486,7 +2491,16 @@ pub fn prime_generation_preserve_peak(
     first_token: u32,
     temperature: f32,
 ) -> InlineArray {
-    prime_generation_impl(weights, cache, first_token, temperature, false)
+    prime_generation_impl(weights, cache, first_token, temperature, false, true)
+}
+
+pub fn prime_generation_preserve_peak_silent(
+    weights: &NativeWeights,
+    cache: &mut NativeCache,
+    first_token: u32,
+    temperature: f32,
+) -> InlineArray {
+    prime_generation_impl(weights, cache, first_token, temperature, false, false)
 }
 
 /// Continue generation from an already-primed async sample.
@@ -2501,7 +2515,34 @@ pub fn generate_from_primed_sample(
     temperature: f32,
     on_token: impl FnMut(u32) -> bool,
 ) -> Vec<u32> {
-    generate_from_primed_sample_impl(weights, cache, current_y, max_tokens, temperature, on_token)
+    generate_from_primed_sample_impl(
+        weights,
+        cache,
+        current_y,
+        max_tokens,
+        temperature,
+        true,
+        on_token,
+    )
+}
+
+pub fn generate_from_primed_sample_silent(
+    weights: &NativeWeights,
+    cache: &mut NativeCache,
+    current_y: InlineArray,
+    max_tokens: usize,
+    temperature: f32,
+    on_token: impl FnMut(u32) -> bool,
+) -> Vec<u32> {
+    generate_from_primed_sample_impl(
+        weights,
+        cache,
+        current_y,
+        max_tokens,
+        temperature,
+        false,
+        on_token,
+    )
 }
 
 pub fn generate(
@@ -2512,8 +2553,16 @@ pub fn generate(
     temperature: f32,
     on_token: impl FnMut(u32) -> bool,
 ) -> Vec<u32> {
-    let current_y = prime_generation_impl(weights, cache, first_token, temperature, true);
-    generate_from_primed_sample_impl(weights, cache, current_y, max_tokens, temperature, on_token)
+    let current_y = prime_generation_impl(weights, cache, first_token, temperature, true, true);
+    generate_from_primed_sample_impl(
+        weights,
+        cache,
+        current_y,
+        max_tokens,
+        temperature,
+        true,
+        on_token,
+    )
 }
 
 pub fn generate_preserve_peak(
@@ -2524,8 +2573,16 @@ pub fn generate_preserve_peak(
     temperature: f32,
     on_token: impl FnMut(u32) -> bool,
 ) -> Vec<u32> {
-    let current_y = prime_generation_impl(weights, cache, first_token, temperature, false);
-    generate_from_primed_sample_impl(weights, cache, current_y, max_tokens, temperature, on_token)
+    let current_y = prime_generation_impl(weights, cache, first_token, temperature, false, true);
+    generate_from_primed_sample_impl(
+        weights,
+        cache,
+        current_y,
+        max_tokens,
+        temperature,
+        true,
+        on_token,
+    )
 }
 
 // ============================================================================
