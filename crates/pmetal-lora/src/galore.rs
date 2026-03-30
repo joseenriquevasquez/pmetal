@@ -263,7 +263,7 @@ impl GaloreProjector {
 
         let full_grad = if self.use_right_projection {
             // Right: full = low_rank @ P^T, shape [m, n]
-            low_rank_grad.matmul(&ortho.t())?
+            low_rank_grad.matmul(&ortho.t())
         } else {
             // Left: full = P @ low_rank, shape [m, n]
             ortho.matmul(low_rank_grad)
@@ -344,7 +344,7 @@ impl GaloreProjectionState {
     /// Unproject the low-rank gradient back to full space.
     pub fn unproject(&self) -> Result<Array, LoraError> {
         let full_grad = if self.use_right_projection {
-            self.low_rank_grad.matmul(&self.projector.t())?
+            self.low_rank_grad.matmul(&self.projector.t())
         } else {
             self.projector.matmul(&self.low_rank_grad)
         };
@@ -433,15 +433,15 @@ impl GaloreParamState {
         let one_minus_beta1 = Array::from_f32(1.0 - beta1);
         let new_m = m
             .multiply(&beta1_arr)
-            .add(&low_rank_grad.multiply(&one_minus_beta1))?;
+            .add(&low_rank_grad.multiply(&one_minus_beta1));
 
         // v = beta2 * v + (1 - beta2) * g^2
         let beta2_arr = Array::from_f32(beta2);
         let one_minus_beta2 = Array::from_f32(1.0 - beta2);
-        let grad_sq = low_rank_grad.multiply(&low_rank_grad)?;
+        let grad_sq = low_rank_grad.multiply(&low_rank_grad);
         let new_v = v
             .multiply(&beta2_arr)
-            .add(&grad_sq.multiply(&one_minus_beta2))?;
+            .add(&grad_sq.multiply(&one_minus_beta2));
 
         // Bias correction
         let bias_correction1 = 1.0 - beta1.powf(step);
@@ -449,21 +449,21 @@ impl GaloreParamState {
         let bc1_arr = Array::from_f32(bias_correction1);
         let bc2_arr = Array::from_f32(bias_correction2);
 
-        let m_hat = new_m.divide(&bc1_arr)?;
-        let v_hat = new_v.divide(&bc2_arr)?;
+        let m_hat = new_m.divide(&bc1_arr);
+        let v_hat = new_v.divide(&bc2_arr);
 
         // Compute update in projected space
         let eps_arr = Array::from_f32(eps);
         let v_sqrt = v_hat.sqrt()?;
-        let denom = v_sqrt.add(&eps_arr)?;
-        let low_rank_update = m_hat.divide(&denom)?;
+        let denom = v_sqrt.add(&eps_arr);
+        let low_rank_update = m_hat.divide(&denom);
 
         // Unproject to full space
         let full_update = self.projector.unproject(&low_rank_update)?;
 
         // Apply learning rate
         let lr_arr = Array::from_f32(lr);
-        let scaled_update = full_update.multiply(&lr_arr)?;
+        let scaled_update = full_update.multiply(&lr_arr);
 
         // Apply weight decay (decoupled)
         let new_param = if weight_decay > 0.0 {

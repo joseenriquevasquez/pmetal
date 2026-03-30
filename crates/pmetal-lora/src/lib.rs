@@ -5,7 +5,7 @@
 //! - QLoRA (Quantized LoRA with 4-bit base weights)
 //! - Q-BLoRA (Quantized Balanced LoRA - addresses underfitting in QLoRA)
 //! - DoRA (Weight-Decomposed Low-Rank Adaptation)
-//! - Fused training with Metal acceleration (~2x speedup)
+//! - GaLore (Gradient Low-Rank Projection, ICML 2024)
 //! - Adapter management utilities
 //! - LoRA-enabled model architectures
 //! - Dynamic model dispatch for architecture-agnostic training
@@ -44,6 +44,7 @@ pub mod autograd;
 mod dora;
 mod dynamic;
 mod dynamic_qlora;
+pub mod galore;
 pub mod gemma_lora;
 pub mod gemma_qlora;
 pub mod llama_lora;
@@ -54,6 +55,7 @@ pub mod mistral_lora;
 pub mod mistral_qlora;
 mod patcher;
 pub mod phi_lora;
+mod qblora;
 mod qlora;
 pub mod qwen3_lora;
 pub mod qwen3_next_lora;
@@ -68,6 +70,9 @@ pub use autograd::{
 };
 pub use dora::*;
 pub use dynamic::*;
+pub use galore::{
+    GaloreConfig, GaloreParamState, GaloreProjectionState, GaloreProjectionType, GaloreProjector,
+};
 pub use dynamic_qlora::DynamicQloraModel;
 pub use gemma_lora::*;
 pub use gemma_qlora::*;
@@ -82,6 +87,7 @@ pub use mistral_lora::*;
 pub use mistral_qlora::*;
 pub use patcher::*;
 pub use phi_lora::*;
+pub use qblora::*;
 pub use qlora::*;
 pub use qwen3_lora::*;
 pub use qwen3_next_lora::*;

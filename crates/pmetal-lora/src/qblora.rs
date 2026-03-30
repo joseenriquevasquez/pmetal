@@ -251,7 +251,7 @@ impl QBLoraLinear {
         };
 
         // Quantize weights
-        weight_f32.eval()?;
+        weight_f32.eval();
         let weight_data: Vec<f32> = weight_f32.as_slice().to_vec();
         let shape = vec![out_features as usize, in_features as usize];
         let quantized_weight = quantizer
@@ -392,7 +392,7 @@ impl QBLoraLinear {
         let weight = self.dequantize_weight()?;
 
         // Base forward: y_base = x @ W.T
-        let y_base = x.matmul(&weight.t())?;
+        let y_base = x.matmul(&weight.t());
 
         // Q-BLoRA forward with optional projections
         let x_proj = if let Some(ref p_in) = self.input_proj {
@@ -402,8 +402,8 @@ impl QBLoraLinear {
         };
 
         // LoRA: (x_proj @ A.T) @ B.T
-        let xa = x_proj.matmul(&self.lora_a.t())?;
-        let xab = xa.matmul(&self.lora_b.t())?;
+        let xa = x_proj.matmul(&self.lora_a.t());
+        let xab = xa.matmul(&self.lora_b.t());
 
         // Output projection if specified
         // p_out: [proj_dim, out_features], xab: [batch, proj_dim]
@@ -416,10 +416,10 @@ impl QBLoraLinear {
 
         // Scale
         let scale_arr = Array::from_f32(self.scale * self.gradient_scale);
-        let y_lora = y_lora_unscaled.multiply(&scale_arr)?;
+        let y_lora = y_lora_unscaled.multiply(&scale_arr);
 
         // Combined output
-        let y = y_base.add(&y_lora)?;
+        let y = y_base.add(&y_lora);
 
         // Add bias if present
         if let Some(ref bias) = self.bias {
