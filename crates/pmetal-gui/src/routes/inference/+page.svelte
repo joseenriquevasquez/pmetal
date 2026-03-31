@@ -7,6 +7,8 @@
   import { renderMarkdown } from '$lib/utils';
   import type { UnlistenFn } from '@tauri-apps/api/event';
 
+  const DEFAULT_MAX_TOKENS = 1024;
+
   interface ChatMessage {
     role: 'user' | 'assistant';
     content: string;
@@ -37,7 +39,7 @@
   let temperature = $state(0.7);
   let topK = $state(50);
   let topP = $state(0.9);
-  let maxTokens = $state(1024);
+  let maxTokens = $state(DEFAULT_MAX_TOKENS);
   let repetitionPenalty = $state(1.1);
   let minP = $state<number | null>(null);
   let frequencyPenalty = $state<number | null>(null);
@@ -59,7 +61,7 @@
       if (d.temperature != null) temperature = d.temperature;
       if (d.top_k != null) topK = d.top_k;
       if (d.top_p != null) topP = d.top_p;
-      if (d.max_new_tokens != null) maxTokens = d.max_new_tokens;
+      if (d.max_new_tokens != null) maxTokens = normalizeMaxTokensValue(d.max_new_tokens);
       if (d.repetition_penalty != null) repetitionPenalty = d.repetition_penalty;
     }).catch(() => {});
   });
@@ -70,6 +72,8 @@
   let isGenerating = $state(false);
   let error = $state<string | null>(null);
   let showThinking = $state(true);
+  const truncatedThinkingReply =
+    '[Response truncated - model was still thinking. Disable thinking or increase Max Tokens.]';
 
   // Scroll ref
   let messagesEl = $state<HTMLElement | null>(null);
@@ -111,6 +115,16 @@
     return { thinking: null, reply: text };
   }
 
+  function normalizeMaxTokensValue(value: number | null | undefined): number {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return DEFAULT_MAX_TOKENS;
+    return Math.max(1, Math.floor(parsed));
+  }
+
+  function normalizeMaxTokensInput() {
+    maxTokens = normalizeMaxTokensValue(maxTokens);
+  }
+
   async function handleSend() {
     if (!userInput.trim() || isGenerating) return;
     if (!selectedModel) { error = 'Please select a model first'; return; }
@@ -150,10 +164,21 @@
       });
 
       unlistenDone = await onInferenceDone((metrics) => {
-        const { thinking, reply } = parseThinking(currentContent);
+        const parsed = metrics?.response_text != null
+          ? {
+              thinking: metrics.thinking ?? null,
+              reply: metrics.truncated_thinking ? truncatedThinkingReply : metrics.response_text,
+            }
+          : parseThinking(currentContent);
         messages = messages.map((m, i) => {
           if (i === messages.length - 1) {
-            return { ...m, content: reply, thinking: thinking ?? undefined, isStreaming: false, metrics: metrics ?? undefined };
+            return {
+              ...m,
+              content: parsed.reply,
+              thinking: parsed.thinking ?? undefined,
+              isStreaming: false,
+              metrics: metrics ?? undefined,
+            };
           }
           return m;
         });
@@ -179,7 +204,7 @@
         top_k: topK,
         top_p: topP,
         min_p: minP,
-        max_tokens: maxTokens,
+        max_tokens: normalizeMaxTokensValue(maxTokens),
         repetition_penalty: repetitionPenalty,
         frequency_penalty: frequencyPenalty,
         presence_penalty: presencePenalty,
@@ -322,6 +347,19 @@
         {/if}
       </div>
 
+      <div class="w-28">
+        <label class="label text-xs" for="inf-maxtok">Max Tokens</label>
+        <input
+          id="inf-maxtok"
+          type="number"
+          class="input text-sm"
+          min="1"
+          step="1"
+          bind:value={maxTokens}
+          onblur={normalizeMaxTokensInput}
+        />
+      </div>
+
       <!-- Parameters toggle -->
       <button
         class="btn-secondary btn-sm"
@@ -355,7 +393,7 @@
     {#if showParams}
       <div class="mt-3 pt-3 border-t border-surface-200 dark:border-surface-700 space-y-3">
         <!-- Row 1: core sampling -->
-        <div class="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
           <div>
             <label class="label" for="inf-temp">Temperature</label>
             <input id="inf-temp" type="number" class="input text-sm" step="0.05" min="0" max="2" bind:value={temperature} />
@@ -371,10 +409,6 @@
           <div>
             <label class="label" for="inf-minp">Min-P</label>
             <input id="inf-minp" type="number" class="input text-sm" step="0.01" min="0" max="1" bind:value={minP} />
-          </div>
-          <div>
-            <label class="label" for="inf-maxtok">Max Tokens</label>
-            <input id="inf-maxtok" type="number" class="input text-sm" min="1" bind:value={maxTokens} />
           </div>
         </div>
         <!-- Row 2: penalties, seed, KV cache -->

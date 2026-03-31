@@ -642,6 +642,9 @@ export interface InferenceMetrics {
   total_ms: number;
   ttft_ms: number | null;
   tok_per_sec: number | null;
+  response_text?: string | null;
+  thinking?: string | null;
+  truncated_thinking?: boolean | null;
 }
 
 export function onInferenceDone(callback: (metrics: InferenceMetrics | null) => void): Promise<UnlistenFn> {

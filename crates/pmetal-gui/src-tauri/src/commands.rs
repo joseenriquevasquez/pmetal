@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use futures::FutureExt;
-use pmetal_bridge::compat::ops;
 use pmetal::prelude::TrainingCallback;
+use pmetal_bridge::compat::ops;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
@@ -371,6 +371,25 @@ pub struct InferenceMessage {
     pub content: String,
 }
 
+fn chat_message_from_inference_message(
+    message: &InferenceMessage,
+) -> std::result::Result<pmetal::data::chat_templates::Message, String> {
+    match message.role.as_str() {
+        "user" => Ok(pmetal::data::chat_templates::Message::user(
+            message.content.clone(),
+        )),
+        "assistant" => Ok(pmetal::data::chat_templates::Message::assistant(
+            message.content.clone(),
+        )),
+        "system" => Ok(pmetal::data::chat_templates::Message::system(
+            message.content.clone(),
+        )),
+        other => Err(format!(
+            "unsupported chat role '{other}' in GUI inference history"
+        )),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct InferenceConfig {
     pub model: String,
@@ -509,14 +528,26 @@ pub async fn get_dashboard_stats(state: State<'_, AppState>) -> Result<Dashboard
 
     let total_size: u64 = models.iter().map(|m| m.size).sum();
 
-    let active_training = training.iter().filter(|r| r.status == TrainingStatus::Running).count();
-    let completed_training = training.iter().filter(|r| r.status == TrainingStatus::Completed).count();
-    let active_grpo = grpo.iter().filter(|r| r.status == GrpoStatus::Running).count();
-    let active_distillation = distillation.iter().filter(|r| {
-        r.status == DistillationStatus::Training
-            || r.status == DistillationStatus::LoadingModels
-            || r.status == DistillationStatus::GeneratingSignals
-    }).count();
+    let active_training = training
+        .iter()
+        .filter(|r| r.status == TrainingStatus::Running)
+        .count();
+    let completed_training = training
+        .iter()
+        .filter(|r| r.status == TrainingStatus::Completed)
+        .count();
+    let active_grpo = grpo
+        .iter()
+        .filter(|r| r.status == GrpoStatus::Running)
+        .count();
+    let active_distillation = distillation
+        .iter()
+        .filter(|r| {
+            r.status == DistillationStatus::Training
+                || r.status == DistillationStatus::LoadingModels
+                || r.status == DistillationStatus::GeneratingSignals
+        })
+        .count();
 
     Ok(DashboardStats {
         models_count: models.len(),
@@ -549,7 +580,9 @@ pub async fn get_model_info(
         models.iter().find(|m| m.id == model_id).cloned()
     };
 
-    let Some(cached) = cached else { return Ok(None) };
+    let Some(cached) = cached else {
+        return Ok(None);
+    };
 
     // Attempt to read config.json from the snapshots directory
     let config_json = read_model_config_json(&cached.path).await;
@@ -647,13 +680,13 @@ pub async fn get_model_defaults(
 }
 
 #[tauri::command]
-pub async fn delete_model(
-    state: State<'_, AppState>,
-    model_id: String,
-) -> Result<()> {
+pub async fn delete_model(state: State<'_, AppState>, model_id: String) -> Result<()> {
     let path = {
         let models = state.cached_models.read().await;
-        models.iter().find(|m| m.id == model_id).map(|m| m.path.clone())
+        models
+            .iter()
+            .find(|m| m.id == model_id)
+            .map(|m| m.path.clone())
     };
 
     if let Some(path) = path {
@@ -661,7 +694,11 @@ pub async fn delete_model(
             .await
             .map_err(|e| AppError(format!("Failed to delete model directory: {}", e)))?;
 
-        state.cached_models.write().await.retain(|m| m.id != model_id);
+        state
+            .cached_models
+            .write()
+            .await
+            .retain(|m| m.id != model_id);
         let _ = state.event_tx.send(AppEvent::ModelRemoved { model_id });
     }
 
@@ -715,9 +752,7 @@ pub async fn remove_model_directory(
 
 /// List configured custom model directories.
 #[tauri::command]
-pub async fn list_model_directories(
-    state: State<'_, AppState>,
-) -> Result<Vec<String>> {
+pub async fn list_model_directories(state: State<'_, AppState>) -> Result<Vec<String>> {
     Ok(state.config.read().await.custom_model_dirs.clone())
 }
 
@@ -747,7 +782,9 @@ pub async fn download_model(
             }),
         );
 
-        let token = hf_token.as_ref().map(|s| pmetal::core::SecretString::from(s.clone()));
+        let token = hf_token
+            .as_ref()
+            .map(|s| pmetal::core::SecretString::from(s.clone()));
         match pmetal::hub::download_model(&model_id_task, revision.as_deref(), token.as_ref()).await
         {
             Ok(path) => {
@@ -797,11 +834,9 @@ pub async fn get_trending_models(
 }
 
 #[tauri::command]
-pub async fn get_model_fit(
-    state: State<'_, AppState>,
-    model_id: String,
-) -> Result<ModelFitInfo> {
-    let available_memory = get_available_memory_bytes().await
+pub async fn get_model_fit(state: State<'_, AppState>, model_id: String) -> Result<ModelFitInfo> {
+    let available_memory = get_available_memory_bytes()
+        .await
         .unwrap_or_else(|| get_total_memory_bytes_sync() / 2);
     let available_memory_gb = available_memory as f64 / (1024.0_f64.powi(3));
 
@@ -890,9 +925,7 @@ pub async fn get_trending_datasets(
 }
 
 #[tauri::command]
-pub async fn list_cached_datasets(
-    state: State<'_, AppState>,
-) -> Result<Vec<CachedDatasetInfo>> {
+pub async fn list_cached_datasets(state: State<'_, AppState>) -> Result<Vec<CachedDatasetInfo>> {
     let cache_dir = state.config.read().await.cache_dir.clone();
     let hub_dir = PathBuf::from(&cache_dir).join("hub");
     let mut datasets = Vec::new();
@@ -956,11 +989,9 @@ pub async fn peek_dataset_columns(path: String, limit: Option<usize>) -> Result<
     let sample_limit = limit.unwrap_or(100);
 
     let p = std::path::PathBuf::from(&path);
-    let resolved = pmetal::data::TrainingDataset::resolve_dataset_path_pub(&p)
-        .unwrap_or(p);
+    let resolved = pmetal::data::TrainingDataset::resolve_dataset_path_pub(&p).unwrap_or(p);
 
-    let columns = pmetal::data::peek_columns(&resolved)
-        .map_err(|e| AppError(e.to_string()))?;
+    let columns = pmetal::data::peek_columns(&resolved).map_err(|e| AppError(e.to_string()))?;
 
     // Sample first 100 rows for length estimates
     let mut char_lengths: Vec<usize> = Vec::new();
@@ -974,10 +1005,15 @@ pub async fn peek_dataset_columns(path: String, limit: Option<usize>) -> Result<
         for line in iter {
             if let Ok(line) = line {
                 let trimmed = line.trim();
-                if trimmed.is_empty() { continue; }
+                if trimmed.is_empty() {
+                    continue;
+                }
                 // Sum all string-valued fields as a rough content length
-                if let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(trimmed) {
-                    let total_chars: usize = obj.values()
+                if let Ok(obj) =
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(trimmed)
+                {
+                    let total_chars: usize = obj
+                        .values()
                         .filter_map(|v| v.as_str())
                         .map(|s| s.len())
                         .sum();
@@ -990,7 +1026,9 @@ pub async fn peek_dataset_columns(path: String, limit: Option<usize>) -> Result<
     let rows_sampled = char_lengths.len();
     // Rough estimate: 1 token ≈ 4 characters for English text
     let token_estimates: Vec<usize> = char_lengths.iter().map(|&c| c / 4).collect();
-    let avg = if token_estimates.is_empty() { 0 } else {
+    let avg = if token_estimates.is_empty() {
+        0
+    } else {
         token_estimates.iter().sum::<usize>() / token_estimates.len()
     };
     let max = token_estimates.iter().copied().max().unwrap_or(0);
@@ -998,7 +1036,10 @@ pub async fn peek_dataset_columns(path: String, limit: Option<usize>) -> Result<
     // p95 estimate for suggested seq len
     let mut sorted = token_estimates;
     sorted.sort();
-    let p95 = sorted.get((sorted.len() as f64 * 0.95) as usize).copied().unwrap_or(avg);
+    let p95 = sorted
+        .get((sorted.len() as f64 * 0.95) as usize)
+        .copied()
+        .unwrap_or(avg);
     // Round up to next multiple of 64 (practical for GPU alignment)
     let suggested = if p95 > 0 { (p95 + 63) / 64 * 64 } else { 2048 };
 
@@ -1032,7 +1073,8 @@ pub async fn start_training(
     if config.resume_from.is_some() {
         return Err(AppError(
             "Resume from checkpoint is not yet supported in GUI mode. \
-             Use the CLI instead: pmetal train --resume".to_string(),
+             Use the CLI instead: pmetal train --resume"
+                .to_string(),
         ));
     }
 
@@ -1115,7 +1157,11 @@ pub async fn start_training(
 
     // Register cancellation flag before creating the run so the flag is always
     // present when the run record is visible to the frontend.
-    state.cancel_flags.write().await.insert(run_id.clone(), cancel_flag.clone());
+    state
+        .cancel_flags
+        .write()
+        .await
+        .insert(run_id.clone(), cancel_flag.clone());
 
     state.create_training_run(run).await;
 
@@ -1178,7 +1224,11 @@ pub async fn start_training(
                     text_column = Some(tc.clone());
                 }
             }
-            if text_column.is_some() || text_columns.is_some() || prompt_column.is_some() || response_column.is_some() {
+            if text_column.is_some()
+                || text_columns.is_some()
+                || prompt_column.is_some()
+                || response_column.is_some()
+            {
                 Some(pmetal::data::DatasetColumnConfig {
                     text_column,
                     text_columns,
@@ -1210,7 +1260,8 @@ pub async fn start_training(
                 batch_size: config.batch_size.unwrap_or(1) as usize,
                 num_epochs: config.epochs.unwrap_or(3) as usize,
                 max_seq_len: config.max_seq_len.unwrap_or(2048) as usize,
-                gradient_accumulation_steps: config.gradient_accumulation_steps.unwrap_or(4) as usize,
+                gradient_accumulation_steps: config.gradient_accumulation_steps.unwrap_or(4)
+                    as usize,
                 weight_decay: config.weight_decay.unwrap_or(0.01),
                 max_grad_norm: config.max_grad_norm.unwrap_or(1.0),
                 warmup_steps: config.warmup_steps.unwrap_or(100) as usize,
@@ -1219,7 +1270,9 @@ pub async fn start_training(
                 lr_scheduler: match config.lr_scheduler.as_deref() {
                     Some("constant") => pmetal::core::LrSchedulerType::Constant,
                     Some("linear") => pmetal::core::LrSchedulerType::Linear,
-                    Some("cosine_with_restarts") => pmetal::core::LrSchedulerType::CosineWithRestarts,
+                    Some("cosine_with_restarts") => {
+                        pmetal::core::LrSchedulerType::CosineWithRestarts
+                    }
                     Some("polynomial") => pmetal::core::LrSchedulerType::Polynomial,
                     Some("wsd") => pmetal::core::LrSchedulerType::Wsd,
                     _ => pmetal::core::LrSchedulerType::Cosine,
@@ -1236,7 +1289,8 @@ pub async fn start_training(
                 fused: true,
                 metal_fused_optimizer: config.fused_optimizer.unwrap_or(true),
                 gradient_checkpointing: config.gradient_checkpointing.unwrap_or(true),
-                gradient_checkpointing_layers: config.gradient_checkpointing_layers.unwrap_or(4) as usize,
+                gradient_checkpointing_layers: config.gradient_checkpointing_layers.unwrap_or(4)
+                    as usize,
                 cut_cross_entropy: false,
                 ane: config.method == "ane",
                 no_adaptive_lr: false,
@@ -1274,14 +1328,11 @@ pub async fn start_training(
             }),
         ];
 
-        let result = pmetal::trainer::orchestrator::run_training(
-            job_config,
-            Some(&phase_cb),
-            callbacks,
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| AppError(e.to_string()));
+        let result =
+            pmetal::trainer::orchestrator::run_training(job_config, Some(&phase_cb), callbacks)
+                .await
+                .map(|_| ())
+                .map_err(|e| AppError(e.to_string()));
 
         // Clear the status message on success so the UI can show step progress.
         if result.is_ok() {
@@ -1347,7 +1398,11 @@ pub async fn start_distillation(
     let temperature = config.temperature.unwrap_or(2.0) as f64;
     let loss_type = config.loss_type.clone().unwrap_or_else(|| "kl".to_string());
     let total_epochs = config.epochs.unwrap_or(3) as u64;
-    let output_dir = config.output_dir.as_deref().unwrap_or("./output").to_string();
+    let output_dir = config
+        .output_dir
+        .as_deref()
+        .unwrap_or("./output")
+        .to_string();
     let metrics_path = PathBuf::from(&output_dir).join("metrics.jsonl");
 
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1364,7 +1419,11 @@ pub async fn start_distillation(
     run.status = DistillationStatus::Training;
     let run_id = run.id.clone();
 
-    state.cancel_flags.write().await.insert(run_id.clone(), cancel_flag.clone());
+    state
+        .cancel_flags
+        .write()
+        .await
+        .insert(run_id.clone(), cancel_flag.clone());
     state.create_distillation_run(run).await;
 
     let run_id_task = run_id.clone();
@@ -1439,9 +1498,7 @@ pub async fn get_distillation_status(
 }
 
 #[tauri::command]
-pub async fn list_distillation_runs(
-    state: State<'_, AppState>,
-) -> Result<Vec<DistillationRun>> {
+pub async fn list_distillation_runs(state: State<'_, AppState>) -> Result<Vec<DistillationRun>> {
     Ok(state.list_distillation_runs().await)
 }
 
@@ -1463,7 +1520,11 @@ pub async fn start_grpo(
 ) -> Result<String> {
     let group_size = config.group_size.unwrap_or(8);
     let beta = config.beta.unwrap_or(0.04);
-    let output_dir = config.output_dir.as_deref().unwrap_or("./output").to_string();
+    let output_dir = config
+        .output_dir
+        .as_deref()
+        .unwrap_or("./output")
+        .to_string();
     let metrics_path = PathBuf::from(&output_dir).join("metrics.jsonl");
 
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1478,7 +1539,11 @@ pub async fn start_grpo(
     run.status = GrpoStatus::Running;
     let run_id = run.id.clone();
 
-    state.cancel_flags.write().await.insert(run_id.clone(), cancel_flag.clone());
+    state
+        .cancel_flags
+        .write()
+        .await
+        .insert(run_id.clone(), cancel_flag.clone());
     state.create_grpo_run(run).await;
 
     let run_id_task = run_id.clone();
@@ -1595,25 +1660,26 @@ async fn run_inference_streaming(
         .await
         .map_err(|e| e.to_string())?;
 
+    let chat_messages = config
+        .messages
+        .as_ref()
+        .map(|messages| {
+            messages
+                .iter()
+                .map(chat_message_from_inference_message)
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+
     let runner_config = InferenceRunnerConfig {
         model_path,
         lora_path: config.lora_path.clone(),
         experts_dir: config.experts_dir.clone(),
         fp8: config.fp8.unwrap_or(false),
         prompt: config.prompt.clone(),
-        chat_messages: config.messages.as_ref().map(|messages| {
-            messages
-                .iter()
-                .map(|message| match message.role.as_str() {
-                    "assistant" => pmetal::data::chat_templates::Message::assistant(
-                        message.content.clone(),
-                    ),
-                    _ => pmetal::data::chat_templates::Message::user(message.content.clone()),
-                })
-                .collect()
-        }),
+        chat_messages,
         system_message: config.system_message.clone(),
-        chat: true, // GUI always uses chat mode
+        chat: false, // let the shared runner auto-detect chat-capable models
         no_thinking: config.no_thinking.unwrap_or(false),
         tools: None,
         temperature: config.temperature,
@@ -1645,7 +1711,8 @@ async fn run_inference_streaming(
 
     // Split borrow: &runner.tokenizer captured by closure, runner.gen borrows the rest.
     let tokenizer = &runner.tokenizer;
-    runner.state
+    runner
+        .state
         .generate_streaming(|token_id| {
             generated_tokens += 1;
             if first_token_time.is_none() {
@@ -1669,8 +1736,7 @@ async fn run_inference_streaming(
         .map_err(|e| e.to_string())?;
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let ttft_ms = first_token_time
-        .map(|t| t.duration_since(start).as_secs_f64() * 1000.0);
+    let ttft_ms = first_token_time.map(|t| t.duration_since(start).as_secs_f64() * 1000.0);
     let decode_ms = ttft_ms.map(|ttft| total_ms - ttft);
     let decode_tokens = generated_tokens.saturating_sub(1);
     let tok_per_sec = if let Some(dm) = decode_ms {
@@ -1683,12 +1749,17 @@ async fn run_inference_streaming(
         None
     };
 
+    let parsed_response = pmetal::response_parser::parse_assistant_response(&streamed_text);
+
     Ok(serde_json::json!({
         "prompt_tokens": prompt_tokens,
         "generated_tokens": generated_tokens,
         "total_ms": total_ms,
         "ttft_ms": ttft_ms,
         "tok_per_sec": tok_per_sec,
+        "response_text": parsed_response.response,
+        "thinking": parsed_response.thinking,
+        "truncated_thinking": parsed_response.truncated_thinking,
     }))
 }
 
@@ -1713,12 +1784,7 @@ pub async fn start_inference(
         .insert(session_id.clone(), cancel_flag.clone());
 
     tokio::spawn(async move {
-        let result = run_inference_streaming(
-            &config,
-            &cancel_flag,
-            &app_handle,
-        )
-        .await;
+        let result = run_inference_streaming(&config, &cancel_flag, &app_handle).await;
 
         match result {
             Ok(metrics) => {
@@ -1739,10 +1805,7 @@ pub async fn start_inference(
 }
 
 #[tauri::command]
-pub async fn stop_inference(
-    state: State<'_, AppState>,
-    session_id: Option<String>,
-) -> Result<()> {
+pub async fn stop_inference(state: State<'_, AppState>, session_id: Option<String>) -> Result<()> {
     if let Some(id) = session_id {
         let flags = state.inference_cancel_flags.read().await;
         if let Some(flag) = flags.get(&id) {
@@ -1793,10 +1856,7 @@ pub async fn get_merge_strategies() -> Result<Vec<MergeStrategy>> {
 }
 
 #[tauri::command]
-pub async fn merge_models(
-    _app_handle: AppHandle,
-    config: MergeConfig,
-) -> Result<String> {
+pub async fn merge_models(_app_handle: AppHandle, config: MergeConfig) -> Result<String> {
     let merge_method = match config.strategy.as_str() {
         "linear" => pmetal::merge::MergeMethodConfig::Linear,
         "slerp" => pmetal::merge::MergeMethodConfig::Slerp,
@@ -2031,7 +2091,6 @@ pub async fn quantize_model(
     Ok(output_dir)
 }
 
-
 async fn finalize_training_run(
     state_arc: &Arc<tokio::sync::RwLock<Vec<TrainingRun>>>,
     event_tx: &tokio::sync::broadcast::Sender<AppEvent>,
@@ -2162,7 +2221,10 @@ fn apply_metrics_to_distillation(
             run.best_loss = Some(v);
         }
     }
-    if let Some(v) = metrics["lr"].as_f64().or_else(|| metrics["learning_rate"].as_f64()) {
+    if let Some(v) = metrics["lr"]
+        .as_f64()
+        .or_else(|| metrics["learning_rate"].as_f64())
+    {
         run.learning_rate = Some(v);
     }
     if let Some(v) = metrics["tok_sec"]
@@ -2313,7 +2375,10 @@ fn apply_metrics_to_grpo(
     if let Some(v) = metrics["kl_div"].as_f64() {
         run.kl_div = Some(v);
     }
-    if let Some(v) = metrics["lr"].as_f64().or_else(|| metrics["learning_rate"].as_f64()) {
+    if let Some(v) = metrics["lr"]
+        .as_f64()
+        .or_else(|| metrics["learning_rate"].as_f64())
+    {
         run.learning_rate = Some(v);
     }
     if let Some(v) = metrics["tok_sec"]
@@ -2363,7 +2428,9 @@ async fn finalize_grpo_run(
 /// Scan a directory (up to 3 levels deep) for .parquet files.
 fn find_parquet_in_dir(dir: &Path) -> Option<PathBuf> {
     fn scan(dir: &Path, depth: usize) -> Option<PathBuf> {
-        if depth > 3 { return None; }
+        if depth > 3 {
+            return None;
+        }
         let entries = std::fs::read_dir(dir).ok()?;
         let mut dirs = Vec::new();
         for entry in entries.flatten() {
@@ -2371,10 +2438,14 @@ fn find_parquet_in_dir(dir: &Path) -> Option<PathBuf> {
             if p.is_file() && p.extension().is_some_and(|e| e == "parquet") {
                 return Some(p);
             }
-            if p.is_dir() { dirs.push(p); }
+            if p.is_dir() {
+                dirs.push(p);
+            }
         }
         for d in dirs {
-            if let Some(p) = scan(&d, depth + 1) { return Some(p); }
+            if let Some(p) = scan(&d, depth + 1) {
+                return Some(p);
+            }
         }
         None
     }
@@ -2421,7 +2492,6 @@ async fn resolve_dataset_path(dataset_id: &str) -> Result<PathBuf> {
     }
 }
 
-
 async fn run_distillation_in_process(
     config: &DistillationConfig,
     metrics_path: &PathBuf,
@@ -2459,10 +2529,7 @@ async fn run_distillation_in_process(
         }
     });
 
-    let train_dataset = if dataset_path
-        .extension()
-        .is_some_and(|ext| ext == "parquet")
-    {
+    let train_dataset = if dataset_path.extension().is_some_and(|ext| ext == "parquet") {
         pmetal::data::TrainingDataset::from_parquet_tokenized(
             &dataset_path,
             &tokenizer,
@@ -2496,22 +2563,18 @@ async fn run_distillation_in_process(
         r: 0,
         ..Default::default()
     };
-    let mut teacher_model = pmetal::lora::DynamicLoraModel::from_pretrained(
-        &teacher_path,
-        teacher_lora_config,
-    )
-    .map_err(|e| AppError(e.to_string()))?;
+    let mut teacher_model =
+        pmetal::lora::DynamicLoraModel::from_pretrained(&teacher_path, teacher_lora_config)
+            .map_err(|e| AppError(e.to_string()))?;
 
     let student_lora_config = pmetal::core::LoraConfig {
         r: config.lora_rank.unwrap_or(16) as usize,
         alpha: config.lora_alpha.unwrap_or(32) as f32,
         ..Default::default()
     };
-    let mut student_model = pmetal::lora::DynamicLoraModel::from_pretrained(
-        &student_path,
-        student_lora_config.clone(),
-    )
-    .map_err(|e| AppError(e.to_string()))?;
+    let mut student_model =
+        pmetal::lora::DynamicLoraModel::from_pretrained(&student_path, student_lora_config.clone())
+            .map_err(|e| AppError(e.to_string()))?;
 
     let loss_type = match config
         .loss_type
@@ -2524,7 +2587,11 @@ async fn run_distillation_in_process(
         "js" | "jensen_shannon" => pmetal::distill::LossType::JensenShannon,
         "soft_cross_entropy" => pmetal::distill::LossType::SoftCrossEntropy,
         "mse" | "mse_loss" => pmetal::distill::LossType::MseLoss,
-        other => return Err(AppError(format!("Unsupported distillation loss type: {other}"))),
+        other => {
+            return Err(AppError(format!(
+                "Unsupported distillation loss type: {other}"
+            )));
+        }
     };
 
     let distill_config = pmetal::distill::DistillConfig {
@@ -2548,8 +2615,8 @@ async fn run_distillation_in_process(
         },
     };
 
-    let distiller = pmetal::distill::Distiller::new(distill_config)
-        .map_err(|e| AppError(e.to_string()))?;
+    let distiller =
+        pmetal::distill::Distiller::new(distill_config).map_err(|e| AppError(e.to_string()))?;
 
     let training_loop_config = pmetal::trainer::TrainingLoopConfig {
         training: pmetal::core::TrainingConfig {
@@ -2601,14 +2668,23 @@ async fn run_distillation_in_process(
 
     let callback = pmetal::trainer::MetricsJsonCallback::new(metrics_path)
         .map_err(|e| AppError(e.to_string()))?
-        .with_run_name(format!("distill-{}", config.student_model.replace('/', "-")));
+        .with_run_name(format!(
+            "distill-{}",
+            config.student_model.replace('/', "-")
+        ));
     trainer.add_callback(Box::new(callback));
     trainer.add_callback(Box::new(CancelOnFlag {
         cancelled: cancel_flag,
     }));
 
     trainer
-        .run(&mut student_model, &mut teacher_model, train_dataset, None, None)
+        .run(
+            &mut student_model,
+            &mut teacher_model,
+            train_dataset,
+            None,
+            None,
+        )
         .map_err(|e| AppError(e.to_string()))?;
 
     let output_dir = PathBuf::from(
@@ -2673,10 +2749,7 @@ async fn run_grpo_in_process(
         }
     });
 
-    let dataset = if dataset_path
-        .extension()
-        .is_some_and(|ext| ext == "parquet")
-    {
+    let dataset = if dataset_path.extension().is_some_and(|ext| ext == "parquet") {
         pmetal::data::TrainingDataset::from_parquet_tokenized(
             &dataset_path,
             &tokenizer,
@@ -2715,9 +2788,8 @@ async fn run_grpo_in_process(
         pmetal::lora::DynamicLoraModel::from_pretrained(&model_path, lora_config.clone())
             .map_err(|e| AppError(e.to_string()))?;
 
-    let mut grpo_config =
-        pmetal::trainer::GrpoConfig::new(config.group_size.unwrap_or(8) as usize)
-            .with_beta(config.beta.unwrap_or(0.04));
+    let mut grpo_config = pmetal::trainer::GrpoConfig::new(config.group_size.unwrap_or(8) as usize)
+        .with_beta(config.beta.unwrap_or(0.04));
     grpo_config.max_prompt_length = max_seq_len;
     grpo_config.max_completion_length = 512;
 
@@ -2730,7 +2802,8 @@ async fn run_grpo_in_process(
     } else {
         return Err(AppError(
             "GRPO requires a reward function. Enable 'Use Reasoning Rewards' or use the CLI \
-             with a custom reward configuration.".to_string(),
+             with a custom reward configuration."
+                .to_string(),
         ));
     }
 
@@ -2837,7 +2910,12 @@ fn run_fuse_in_process(
     let lora_weights: HashMap<String, pmetal::mlx::Array> =
         pmetal_bridge::inline_array::load_safetensors_shard(lora_file_str)
             .map(|pairs| pairs.into_iter().collect())
-            .ok_or_else(|| AppError(format!("failed to load safetensors: {}", lora_file.display())))?;
+            .ok_or_else(|| {
+                AppError(format!(
+                    "failed to load safetensors: {}",
+                    lora_file.display()
+                ))
+            })?;
 
     let lora_dir = if Path::new(lora_path).is_dir() {
         PathBuf::from(lora_path)
@@ -2909,7 +2987,10 @@ fn run_fuse_in_process(
 
     let output_dir = Path::new(output_path);
     std::fs::create_dir_all(output_dir)?;
-    for entry in std::fs::read_dir(&model_dir).map_err(|e| AppError(e.to_string()))?.flatten() {
+    for entry in std::fs::read_dir(&model_dir)
+        .map_err(|e| AppError(e.to_string()))?
+        .flatten()
+    {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if name_str.ends_with(".safetensors")
@@ -2938,7 +3019,10 @@ fn run_fuse_in_process(
     let mut weight_map = serde_json::Map::new();
     let mut total_size: u64 = 0;
     for (key, arr) in &base_weights {
-        weight_map.insert(key.clone(), serde_json::Value::String("model.safetensors".to_string()));
+        weight_map.insert(
+            key.clone(),
+            serde_json::Value::String("model.safetensors".to_string()),
+        );
         total_size += arr.nbytes() as u64;
     }
     let index = serde_json::json!({
@@ -2958,8 +3042,7 @@ fn run_quantize_in_process(
     output_path: &str,
 ) -> std::result::Result<(), AppError> {
     use pmetal::gguf::{
-        GgmlType,
-        GgufBuilder,
+        GgmlType, GgufBuilder,
         dynamic::{DynamicQuantizationConfig, DynamicQuantizer},
         quantize::quantize,
     };
@@ -2972,7 +3055,11 @@ fn run_quantize_in_process(
         let base_type = match method {
             "q8_0" => GgmlType::Q8_0,
             "q4_k_m" => GgmlType::Q4K,
-            other => return Err(AppError(format!("Unsupported quantization method: {other}"))),
+            other => {
+                return Err(AppError(format!(
+                    "Unsupported quantization method: {other}"
+                )));
+            }
         };
         DynamicQuantizer::new(
             DynamicQuantizationConfig {
@@ -3022,7 +3109,9 @@ fn run_quantize_in_process(
     }
 
     let mut file = std::fs::File::create(output_path).map_err(|e| AppError(e.to_string()))?;
-    builder.write(&mut file).map_err(|e| AppError(e.to_string()))?;
+    builder
+        .write(&mut file)
+        .map_err(|e| AppError(e.to_string()))?;
     Ok(())
 }
 
@@ -3066,22 +3155,19 @@ pub fn start_event_forwarder(app_handle: AppHandle, state: &AppState) {
                             "grpo-started",
                             serde_json::to_value(run).unwrap_or_default(),
                         ),
-                        AppEvent::GrpoStopped { run_id } => (
-                            "grpo-stopped",
-                            serde_json::Value::String(run_id.clone()),
-                        ),
-                        AppEvent::GrpoUpdate { run } => (
-                            "grpo-update",
-                            serde_json::to_value(run).unwrap_or_default(),
-                        ),
+                        AppEvent::GrpoStopped { run_id } => {
+                            ("grpo-stopped", serde_json::Value::String(run_id.clone()))
+                        }
+                        AppEvent::GrpoUpdate { run } => {
+                            ("grpo-update", serde_json::to_value(run).unwrap_or_default())
+                        }
                         AppEvent::ModelCached { model } => (
                             "model-cached",
                             serde_json::to_value(model).unwrap_or_default(),
                         ),
-                        AppEvent::ModelRemoved { model_id } => (
-                            "model-removed",
-                            serde_json::json!({ "model_id": model_id }),
-                        ),
+                        AppEvent::ModelRemoved { model_id } => {
+                            ("model-removed", serde_json::json!({ "model_id": model_id }))
+                        }
                         AppEvent::ProcessLog { run_id, line } => (
                             "process-log",
                             serde_json::json!({ "run_id": run_id, "line": line }),
@@ -3112,7 +3198,11 @@ async fn search_hf_models_inner(
     let client = reqwest::Client::new();
 
     // When query is empty (trending), sort by trending score; otherwise sort by downloads for search
-    let sort = if query.is_empty() { "trending" } else { "downloads" };
+    let sort = if query.is_empty() {
+        "trending"
+    } else {
+        "downloads"
+    };
     let mut url = format!(
         "https://huggingface.co/api/models?filter=text-generation&sort={sort}&limit={}",
         limit
@@ -3121,9 +3211,10 @@ async fn search_hf_models_inner(
         url.push_str(&format!("&search={}", url_encode(&query)));
     }
 
-    let mut req = client
-        .get(&url)
-        .header("User-Agent", concat!("pmetal-gui/", env!("CARGO_PKG_VERSION")));
+    let mut req = client.get(&url).header(
+        "User-Agent",
+        concat!("pmetal-gui/", env!("CARGO_PKG_VERSION")),
+    );
 
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {}", t));
@@ -3140,10 +3231,14 @@ async fn search_hf_models_inner(
             let downloads = v["downloads"].as_u64().unwrap_or(0);
             let tags: Vec<String> = v["tags"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| t.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
-            let is_gated = v["gated"].as_bool().unwrap_or(false)
-                || tags.iter().any(|t| t == "gated");
+            let is_gated =
+                v["gated"].as_bool().unwrap_or(false) || tags.iter().any(|t| t == "gated");
             HubSearchResult {
                 author,
                 downloads_formatted: format_downloads(downloads),
@@ -3168,7 +3263,11 @@ async fn search_hf_datasets_inner(
 ) -> Result<Vec<DatasetSearchResult>> {
     let client = reqwest::Client::new();
 
-    let sort = if query.is_empty() { "trending" } else { "downloads" };
+    let sort = if query.is_empty() {
+        "trending"
+    } else {
+        "downloads"
+    };
     let mut url = format!(
         "https://huggingface.co/api/datasets?sort={sort}&limit={}",
         limit
@@ -3177,9 +3276,10 @@ async fn search_hf_datasets_inner(
         url.push_str(&format!("&search={}", url_encode(&query)));
     }
 
-    let mut req = client
-        .get(&url)
-        .header("User-Agent", concat!("pmetal-gui/", env!("CARGO_PKG_VERSION")));
+    let mut req = client.get(&url).header(
+        "User-Agent",
+        concat!("pmetal-gui/", env!("CARGO_PKG_VERSION")),
+    );
 
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {}", t));
@@ -3202,7 +3302,11 @@ async fn search_hf_datasets_inner(
                 likes: v["likes"].as_u64().unwrap_or(0),
                 tags: v["tags"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|t| t.as_str().map(str::to_string))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 description: v["description"].as_str().map(str::to_string),
             }
@@ -3232,7 +3336,6 @@ async fn get_bandwidth_gbps() -> Option<f64> {
         .map(|ctx| ctx.properties().memory_bandwidth_gbps)
 }
 
-
 /// Percent-encode a string for use in a URL query parameter value.
 fn url_encode(s: &str) -> String {
     s.chars()
@@ -3254,12 +3357,29 @@ fn url_encode(s: &str) -> String {
 fn estimate_params_b(model_id: &str) -> f64 {
     let lower = model_id.to_lowercase();
     let patterns: &[(&str, f64)] = &[
-        ("0.5b", 0.5), ("1b", 1.0), ("1.5b", 1.5), ("1.8b", 1.8),
-        ("2b", 2.0), ("3b", 3.0), ("3.8b", 3.8), ("4b", 4.0),
-        ("7b", 7.0), ("8b", 8.0), ("9b", 9.0), ("11b", 11.0),
-        ("13b", 13.0), ("14b", 14.0), ("20b", 20.0), ("27b", 27.0),
-        ("32b", 32.0), ("34b", 34.0), ("40b", 40.0), ("70b", 70.0),
-        ("72b", 72.0), ("110b", 110.0), ("235b", 235.0),
+        ("0.5b", 0.5),
+        ("1b", 1.0),
+        ("1.5b", 1.5),
+        ("1.8b", 1.8),
+        ("2b", 2.0),
+        ("3b", 3.0),
+        ("3.8b", 3.8),
+        ("4b", 4.0),
+        ("7b", 7.0),
+        ("8b", 8.0),
+        ("9b", 9.0),
+        ("11b", 11.0),
+        ("13b", 13.0),
+        ("14b", 14.0),
+        ("20b", 20.0),
+        ("27b", 27.0),
+        ("32b", 32.0),
+        ("34b", 34.0),
+        ("40b", 40.0),
+        ("70b", 70.0),
+        ("72b", 72.0),
+        ("110b", 110.0),
+        ("235b", 235.0),
     ];
     patterns
         .iter()
@@ -3327,4 +3447,47 @@ async fn read_model_config_json(repo_path: &str) -> Option<serde_json::Value> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InferenceMessage, chat_message_from_inference_message};
+
+    #[test]
+    fn inference_message_mapping_preserves_supported_roles() {
+        let user = chat_message_from_inference_message(&InferenceMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        })
+        .unwrap();
+        assert_eq!(user.role, "user");
+        assert_eq!(user.content, "hello");
+
+        let assistant = chat_message_from_inference_message(&InferenceMessage {
+            role: "assistant".into(),
+            content: "hi".into(),
+        })
+        .unwrap();
+        assert_eq!(assistant.role, "assistant");
+        assert_eq!(assistant.content, "hi");
+
+        let system = chat_message_from_inference_message(&InferenceMessage {
+            role: "system".into(),
+            content: "stay concise".into(),
+        })
+        .unwrap();
+        assert_eq!(system.role, "system");
+        assert_eq!(system.content, "stay concise");
+    }
+
+    #[test]
+    fn inference_message_mapping_rejects_unknown_roles() {
+        let err = chat_message_from_inference_message(&InferenceMessage {
+            role: "tool".into(),
+            content: "{}".into(),
+        })
+        .unwrap_err();
+
+        assert!(err.contains("unsupported chat role 'tool'"));
+    }
 }
