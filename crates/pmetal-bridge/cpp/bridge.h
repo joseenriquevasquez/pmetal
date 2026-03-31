@@ -547,8 +547,8 @@ int mlx_inline_turboquant_decode(
 
 // Fused TurboQuant key scoring.
 // query_rot/query_proj: [N, D] f32
-// indices:              [N, S_cap, D]
-// qjl_signs:            [N, S_cap, ceil(D/32)] packed uint32 sign words
+// indices:              [N, D, S_cap] uint8 transposed for score-friendly seq access
+// qjl_signs:            [N, ceil(D/32), S_cap] packed uint32 sign words
 // norms/residual_norms: [N, S_cap] f32
 // codebook:             [C] f32
 // out_scores:           [N, S] f32
@@ -628,7 +628,7 @@ int mlx_inline_turboquant_unpack_sign_bits(
 
 // Fused TurboQuant value aggregation in the rotated domain.
 // weights:  [N, S] f32
-// indices:  [N, S_cap, D] uint32
+// indices:  [N, D, S_cap] uint8
 // norms:    [N, S_cap] f32
 // codebook: [C] f32
 // out:      [N, D] f32 aggregated rotated vectors

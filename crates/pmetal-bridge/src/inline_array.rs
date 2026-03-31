@@ -2249,8 +2249,8 @@ impl InlineArray {
     ///
     /// Inputs:
     /// - `query_rot` / `query_proj`: `[N, D]` f32
-    /// - `indices`: `[N, S, D]`
-    /// - `qjl_signs`: `[N, S, ceil(D/32)]` packed uint32 sign words
+    /// - `indices`: `[N, D, S]` transposed uint8 key indices
+    /// - `qjl_signs`: `[N, ceil(D/32), S]` packed uint32 sign words
     /// - `norms` / `residual_norms`: `[N, S]` f32
     /// - `codebook`: `[C]` f32
     ///
@@ -2437,7 +2437,7 @@ impl InlineArray {
     ///
     /// Inputs:
     /// - `weights`: `[N, S]` f32
-    /// - `indices`: `[N, S, D]` uint32
+    /// - `indices`: `[N, D, S_cap]` uint8
     /// - `norms`: `[N, S]` f32
     /// - `codebook`: `[C]` f32
     ///

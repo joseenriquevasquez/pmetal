@@ -832,6 +832,11 @@ static const char* TURBOQUANT_DECODE_SOURCE = R"(
 // SCORE: for each (row, seq) pair, compute the TurboQuant key score directly
 // from compressed centroids + QJL signs without materializing a [row, seq, dim]
 // decoded tensor.
+//
+// The key cache is stored in score-friendly transposed views:
+//   indices:   [KvRows, D, S_cap]
+//   qjl_signs: [KvRows, ceil(D/32), S_cap]
+// so threads that walk `seq` read contiguous memory instead of striding by D.
 static const char* TURBOQUANT_SCORE_SOURCE = R"(
     constexpr uint kTileSeq = 64u;
     constexpr uint kMaxDim = 512u;
@@ -857,8 +862,6 @@ static const char* TURBOQUANT_SCORE_SOURCE = R"(
     uint q_head = row % q_heads;
     uint kv_row = batch * kv_heads + (q_head / groups);
 
-    uint cache_base = (kv_row * cache_seq_capacity + seq) * dim;
-    uint qjl_base = (kv_row * cache_seq_capacity + seq) * qjl_words;
     uint scalar_idx = row * n_seq + seq;
     uint kv_scalar_idx = kv_row * cache_seq_capacity + seq;
 
@@ -867,8 +870,8 @@ static const char* TURBOQUANT_SCORE_SOURCE = R"(
     for (uint d = 0u; d < dim; ++d) {
         float q_rot = shared_query_rot[d];
         float q_proj_val = shared_query_proj[d];
-        uint idx = (uint)indices[cache_base + d];
-        uint sign_word = qjl_signs[qjl_base + (d >> 5)];
+        uint idx = (uint)indices[(kv_row * dim + d) * cache_seq_capacity + seq];
+        uint sign_word = qjl_signs[(kv_row * qjl_words + (d >> 5)) * cache_seq_capacity + seq];
         float q_sign = ((sign_word >> (d & 31u)) & 1u) == 0 ? -1.0f : 1.0f;
         mse += q_rot * codebook[idx];
         qjl += q_proj_val * q_sign;
@@ -973,6 +976,10 @@ static const char* TURBOQUANT_UNPACK_SIGN_BITS_SOURCE = R"(
 // WEIGHTED_DECODE: aggregate value centroids directly in the rotated domain.
 // This avoids materializing a [row, seq, dim] decoded value tensor before the
 // attention reduction.
+//
+// The value cache is stored in a decode-friendly transposed view:
+//   indices: [KvRows, D, S_cap]
+// so threads that walk `seq` read contiguous memory instead of striding by D.
 static const char* TURBOQUANT_WEIGHTED_DECODE_SOURCE = R"(
     constexpr uint kTileDims = 8u;
     constexpr uint kMaxCentroids = 512u;
@@ -1010,30 +1017,30 @@ static const char* TURBOQUANT_WEIGHTED_DECODE_SOURCE = R"(
         uint scalar_idx = scalar_base + seq;
         uint kv_scalar_idx = kv_scalar_base + seq;
         float scalar = weights[scalar_idx] * norms[kv_scalar_idx];
-        uint cache_base = (kv_row * cache_seq_capacity + seq) * dim + d0;
+        uint cache_base = (kv_row * dim + d0) * cache_seq_capacity + seq;
         if (d0 + 0u < dim) {
-            acc0 += scalar * shared_codebook[(uint)indices[cache_base + 0u]];
+            acc0 += scalar * shared_codebook[(uint)indices[cache_base + 0u * cache_seq_capacity]];
         }
         if (d0 + 1u < dim) {
-            acc1 += scalar * shared_codebook[(uint)indices[cache_base + 1u]];
+            acc1 += scalar * shared_codebook[(uint)indices[cache_base + 1u * cache_seq_capacity]];
         }
         if (d0 + 2u < dim) {
-            acc2 += scalar * shared_codebook[(uint)indices[cache_base + 2u]];
+            acc2 += scalar * shared_codebook[(uint)indices[cache_base + 2u * cache_seq_capacity]];
         }
         if (d0 + 3u < dim) {
-            acc3 += scalar * shared_codebook[(uint)indices[cache_base + 3u]];
+            acc3 += scalar * shared_codebook[(uint)indices[cache_base + 3u * cache_seq_capacity]];
         }
         if (d0 + 4u < dim) {
-            acc4 += scalar * shared_codebook[(uint)indices[cache_base + 4u]];
+            acc4 += scalar * shared_codebook[(uint)indices[cache_base + 4u * cache_seq_capacity]];
         }
         if (d0 + 5u < dim) {
-            acc5 += scalar * shared_codebook[(uint)indices[cache_base + 5u]];
+            acc5 += scalar * shared_codebook[(uint)indices[cache_base + 5u * cache_seq_capacity]];
         }
         if (d0 + 6u < dim) {
-            acc6 += scalar * shared_codebook[(uint)indices[cache_base + 6u]];
+            acc6 += scalar * shared_codebook[(uint)indices[cache_base + 6u * cache_seq_capacity]];
         }
         if (d0 + 7u < dim) {
-            acc7 += scalar * shared_codebook[(uint)indices[cache_base + 7u]];
+            acc7 += scalar * shared_codebook[(uint)indices[cache_base + 7u * cache_seq_capacity]];
         }
     }
     acc0 = simd_sum(acc0);

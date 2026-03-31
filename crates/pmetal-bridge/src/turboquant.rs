@@ -692,14 +692,18 @@ fn packed_qjl_words(dim: usize) -> usize {
 /// All tensors live entirely on the GPU — no CPU round-trips during normal
 /// operation.  Shape convention (accumulated over T steps):
 ///   indices:         [B, H, T, D]  uint8   — codebook index per coordinate
+///   indices_t:       [B, H, D, T]  uint8   — score-friendly transposed view
 ///   norms:           [B, H, T, 1]  f32     — L2 norm before unit-sphere normalise
 ///   qjl_signs:       [B, H, T, ceil(D/32)]  uint32 packed sign words
+///   qjl_signs_t:     [B, H, ceil(D/32), T]  uint32 transposed sign-word view
 ///   residual_norms:  [B, H, T, 1]  f32     — unscaled residual L2 norm
 #[derive(Debug, Clone)]
 struct GpuKeyStore {
     indices: InlineArray,
+    indices_t: InlineArray,
     norms: InlineArray,
     qjl_signs: InlineArray,
+    qjl_signs_t: InlineArray,
     residual_norms: InlineArray,
 }
 
@@ -707,15 +711,19 @@ impl GpuKeyStore {
     /// Concatenate a new step's GPU arrays along the T (axis 2) dimension.
     fn append(&mut self, new: GpuKeyStore) {
         self.indices = self.indices.kv_cache_append(&new.indices, 2);
+        self.indices_t = self.indices_t.kv_cache_append(&new.indices_t, 3);
         self.norms = self.norms.kv_cache_append(&new.norms, 2);
         self.qjl_signs = self.qjl_signs.kv_cache_append(&new.qjl_signs, 2);
+        self.qjl_signs_t = self.qjl_signs_t.kv_cache_append(&new.qjl_signs_t, 3);
         self.residual_norms = self.residual_norms.kv_cache_append(&new.residual_norms, 2);
     }
 
     fn collect_for_detach<'a>(&'a mut self, out: &mut Vec<&'a mut InlineArray>) {
         out.push(&mut self.indices);
+        out.push(&mut self.indices_t);
         out.push(&mut self.norms);
         out.push(&mut self.qjl_signs);
+        out.push(&mut self.qjl_signs_t);
         out.push(&mut self.residual_norms);
     }
 }
@@ -723,21 +731,25 @@ impl GpuKeyStore {
 /// GPU-resident quantised value data for the Uniform path.
 ///
 ///   indices:  [B, H, T, D]  uint8
+///   indices_t:[B, H, D, T]  uint8
 ///   norms:    [B, H, T, 1]  f32
 #[derive(Debug, Clone)]
 struct GpuValueStore {
     indices: InlineArray,
+    indices_t: InlineArray,
     norms: InlineArray,
 }
 
 impl GpuValueStore {
     fn append(&mut self, new: GpuValueStore) {
         self.indices = self.indices.kv_cache_append(&new.indices, 2);
+        self.indices_t = self.indices_t.kv_cache_append(&new.indices_t, 3);
         self.norms = self.norms.kv_cache_append(&new.norms, 2);
     }
 
     fn collect_for_detach<'a>(&'a mut self, out: &mut Vec<&'a mut InlineArray>) {
         out.push(&mut self.indices);
+        out.push(&mut self.indices_t);
         out.push(&mut self.norms);
     }
 }
@@ -1259,7 +1271,6 @@ impl QuantizedKvCache {
         };
 
         let key_codebook = key_core.codebook_arr(key_bits.saturating_sub(1))?;
-        let value_codebook = value_core.codebook_arr(value_bits)?;
         let key_rot = key_core.inverse_rotation_arr.as_ref()?;
         let key_proj = key_core.inverse_qjl_arr.as_ref()?;
 
@@ -1269,7 +1280,7 @@ impl QuantizedKvCache {
         let value_dim = layout.value_dim as i32;
         let q_rows = batch * q_heads;
         let n_seq = self.offset as i32;
-        let cache_seq_capacity = ks.indices.dim(2);
+        let cache_seq_capacity = ks.indices_t.dim(3);
         if q_rows <= 0 || n_seq <= 0 || cache_seq_capacity < n_seq {
             return None;
         }
@@ -1297,13 +1308,13 @@ impl QuantizedKvCache {
         let kv_rows = (layout.batch * layout.heads) as i32;
         let key_norms = ks.norms.reshape(&[kv_rows, cache_seq_capacity]);
         let key_residual_norms = ks.residual_norms.reshape(&[kv_rows, cache_seq_capacity]);
-        let qjl_words = ks.qjl_signs.dim(3);
+        let qjl_words = ks.qjl_signs_t.dim(2);
 
         let scores = InlineArray::turboquant_score(
             &query_rot,
             &query_proj,
-            &ks.indices,
-            &ks.qjl_signs,
+            &ks.indices_t,
+            &ks.qjl_signs_t,
             &key_norms,
             &key_residual_norms,
             key_codebook,
@@ -1322,23 +1333,23 @@ impl QuantizedKvCache {
         } else {
             0
         };
-        let value_norms = vs.norms.reshape(&[kv_rows, cache_seq_capacity]);
         let weights = scores.softmax(-1);
         let softmax_us = if trace_timing {
             eval_stage_micros(&weights)
         } else {
             0
         };
+        let value_norms = vs.norms.reshape(&[kv_rows, cache_seq_capacity]);
         let decoded_rot = InlineArray::turboquant_weighted_decode(
             &weights,
-            &vs.indices,
+            &vs.indices_t,
             &value_norms,
-            value_codebook,
+            value_core.codebook_arr(value_bits)?,
             value_dim as u32,
-            value_codebook.dim(0) as u32,
+            (1u32 << value_bits) as u32,
             q_rows as u32,
             n_seq as u32,
-            vs.indices.dim(2) as u32,
+            vs.indices_t.dim(3) as u32,
             q_heads as u32,
             layout.heads as u32,
         )?;
@@ -1539,6 +1550,8 @@ fn gpu_quantize_kv(
         packed_shape.push(packed_dim);
         k_qjl_signs.reshape(&packed_shape)
     };
+    let k_indices_t = k_indices.transpose_axes(&[0, 1, 3, 2]);
+    let k_qjl_signs_t = k_qjl_signs.transpose_axes(&[0, 1, 3, 2]);
 
     // ── Values ────────────────────────────────────────────────────────────
     let val_norms = values.norm_l2(-1, true);
@@ -1551,16 +1564,20 @@ fn gpu_quantize_kv(
         None => return None,
     };
     let v_indices = v_core.gpu_quantize_mse(&v_rot, val_bits)?;
+    let v_indices_t = v_indices.transpose_axes(&[0, 1, 3, 2]);
 
     Some((
         GpuKeyStore {
             indices: k_indices,
+            indices_t: k_indices_t,
             norms: key_norms,
             qjl_signs: k_qjl_signs,
+            qjl_signs_t: k_qjl_signs_t,
             residual_norms: k_residual_norms,
         },
         GpuValueStore {
             indices: v_indices,
+            indices_t: v_indices_t,
             norms: val_norms,
         },
     ))
