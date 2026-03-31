@@ -32,6 +32,7 @@
 
 use std::f32::consts::PI;
 use std::sync::Arc;
+use std::time::Instant;
 
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
@@ -49,6 +50,23 @@ const LLOYD_MAX_ITERS: usize = 64;
 const LLOYD_MAX_TOLERANCE: f64 = 1e-7;
 /// Number of grid points for the Beta-distribution quadrature.
 const LLOYD_GRID_POINTS: usize = 8192;
+
+fn turboquant_trace_enabled() -> bool {
+    std::env::var_os("PMETAL_TRACE_TURBOQUANT").is_some()
+}
+
+fn trace_turboquant_bridge(message: &str) {
+    if turboquant_trace_enabled() {
+        eprintln!("[TURBOQUANT TRACE][BRIDGE] {message}");
+    }
+}
+
+fn eval_stage_micros(array: &InlineArray) -> u128 {
+    let start = Instant::now();
+    array.eval();
+    crate::inline_array::synchronize();
+    start.elapsed().as_micros()
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Configuration types
@@ -1070,7 +1088,10 @@ impl QuantizedKvCache {
             let TurboQuantTensorConfig::Uniform { bits } = self.config.keys else {
                 unreachable!("GPU store only exists for Uniform config")
             };
-            return gpu_dequantize_keys(g, &state.keys, bits);
+            let mut dense = gpu_dequantize_keys(g, &state.keys, bits)?;
+            let mut to_eval = vec![&mut dense];
+            crate::inline_array::eval_and_detach_many(&mut to_eval);
+            return Some(dense);
         }
 
         // CPU fallback.
@@ -1096,7 +1117,10 @@ impl QuantizedKvCache {
             let TurboQuantTensorConfig::Uniform { bits } = self.config.values else {
                 unreachable!("GPU store only exists for Uniform config")
             };
-            return gpu_dequantize_values(g, &state.values, bits);
+            let mut dense = gpu_dequantize_values(g, &state.values, bits)?;
+            let mut to_eval = vec![&mut dense];
+            crate::inline_array::eval_and_detach_many(&mut to_eval);
+            return Some(dense);
         }
 
         // CPU fallback.
@@ -1238,7 +1262,6 @@ impl QuantizedKvCache {
         let value_codebook = value_core.codebook_arr(value_bits)?;
         let key_rot = key_core.inverse_rotation_arr.as_ref()?;
         let key_proj = key_core.inverse_qjl_arr.as_ref()?;
-        let value_inv_rot = value_core.rotation_arr.as_ref()?;
 
         let batch = queries_f32.dim(0);
         let q_heads = queries_f32.dim(1);
@@ -1251,9 +1274,25 @@ impl QuantizedKvCache {
             return None;
         }
 
+        let trace_timing = turboquant_trace_enabled();
+        let query_ready_us = if trace_timing {
+            eval_stage_micros(queries_f32)
+        } else {
+            0
+        };
         let query_rows = queries_f32.reshape(&[q_rows, key_dim]);
         let query_rot = query_rows.matmul(key_rot);
+        let rotate_us = if trace_timing {
+            eval_stage_micros(&query_rot)
+        } else {
+            0
+        };
         let query_proj = query_rows.matmul(key_proj);
+        let project_us = if trace_timing {
+            eval_stage_micros(&query_proj)
+        } else {
+            0
+        };
 
         let kv_rows = (layout.batch * layout.heads) as i32;
         let key_norms = ks.norms.reshape(&[kv_rows, cache_seq_capacity]);
@@ -1278,9 +1317,18 @@ impl QuantizedKvCache {
             layout.heads as u32,
             scale,
         )?;
-        let weights = scores.softmax(-1);
-
+        let score_us = if trace_timing {
+            eval_stage_micros(&scores)
+        } else {
+            0
+        };
         let value_norms = vs.norms.reshape(&[kv_rows, cache_seq_capacity]);
+        let weights = scores.softmax(-1);
+        let softmax_us = if trace_timing {
+            eval_stage_micros(&weights)
+        } else {
+            0
+        };
         let decoded_rot = InlineArray::turboquant_weighted_decode(
             &weights,
             &vs.indices,
@@ -1294,7 +1342,32 @@ impl QuantizedKvCache {
             q_heads as u32,
             layout.heads as u32,
         )?;
+        let decode_us = if trace_timing {
+            eval_stage_micros(&decoded_rot)
+        } else {
+            0
+        };
+        let value_inv_rot = value_core.rotation_arr.as_ref()?;
         let output_rows = decoded_rot.matmul(value_inv_rot);
+        let inverse_rotate_us = if trace_timing {
+            eval_stage_micros(&output_rows)
+        } else {
+            0
+        };
+        if trace_timing {
+            trace_turboquant_bridge(&format!(
+                "gpu_uniform_stage_us seq={} q_rows={} query_ready={} rotate={} project={} score={} softmax={} decode={} inverse_rotate={}",
+                n_seq,
+                q_rows,
+                query_ready_us,
+                rotate_us,
+                project_us,
+                score_us,
+                softmax_us,
+                decode_us,
+                inverse_rotate_us
+            ));
+        }
         Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]))
     }
 
@@ -2405,6 +2478,121 @@ fn f32_rows_to_bhsd_array(
 mod tests {
     use super::*;
 
+    fn make_uniform_direct_attention_case() -> (
+        QuantizedKvCache,
+        InlineArray,
+        InlineArray,
+        InlineArray,
+        f32,
+        i32,
+        i32,
+        i32,
+    ) {
+        let dim = 16usize;
+        let config = TurboQuantConfig::uniform(8, 8);
+        let b = 1i32;
+        let h = 2i32;
+        let prefill = 3i32;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let step_len = (b * h * d) as usize;
+        let prefill_keys =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.2), &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
+        let queries = InlineArray::from_f32_slice(&make_data(step_len, 1.3), &[b, h, 1, d]);
+        let step_keys = InlineArray::from_f32_slice(&make_data(step_len, 1.9), &[b, h, 1, d]);
+        let step_values = InlineArray::from_f32_slice(&make_data(step_len, 2.4), &[b, h, 1, d]);
+
+        let mut seed_cache = QuantizedKvCache::new(config);
+        seed_cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+        assert!(seed_cache.keys.as_ref().and_then(|k| k.gpu.as_ref()).is_some());
+        assert!(
+            seed_cache
+                .values
+                .as_ref()
+                .and_then(|v| v.gpu.as_ref())
+                .is_some()
+        );
+
+        (seed_cache, queries, step_keys, step_values, scale, b, h, d)
+    }
+
+    fn manual_single_token_attention(
+        queries: &mut InlineArray,
+        keys: &mut InlineArray,
+        values: &mut InlineArray,
+        batch: i32,
+        heads: i32,
+        seq: i32,
+        dim: i32,
+        scale: f32,
+    ) -> Vec<f32> {
+        let q = queries
+            .to_f32_vec((batch * heads * dim) as usize)
+            .expect("queries to_f32");
+        let k = keys
+            .to_f32_vec((batch * heads * seq * dim) as usize)
+            .expect("keys to_f32");
+        let v = values
+            .to_f32_vec((batch * heads * seq * dim) as usize)
+            .expect("values to_f32");
+
+        let rows = (batch * heads) as usize;
+        let seq_usize = seq as usize;
+        let dim_usize = dim as usize;
+        let mut out = vec![0.0f32; rows * dim_usize];
+
+        for row in 0..rows {
+            let q_base = row * dim_usize;
+            let q_row = &q[q_base..q_base + dim_usize];
+
+            let mut scores = vec![0.0f32; seq_usize];
+            for t in 0..seq_usize {
+                let k_base = (row * seq_usize + t) * dim_usize;
+                let k_row = &k[k_base..k_base + dim_usize];
+                let dot = q_row
+                    .iter()
+                    .zip(k_row.iter())
+                    .map(|(lhs, rhs)| lhs * rhs)
+                    .sum::<f32>();
+                scores[t] = dot * scale;
+            }
+
+            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum_exp = 0.0f32;
+            for score in &mut scores {
+                *score = (*score - max_score).exp();
+                sum_exp += *score;
+            }
+            for score in &mut scores {
+                *score /= sum_exp.max(f32::MIN_POSITIVE);
+            }
+
+            let out_row = &mut out[q_base..q_base + dim_usize];
+            for t in 0..seq_usize {
+                let v_base = (row * seq_usize + t) * dim_usize;
+                let v_row = &v[v_base..v_base + dim_usize];
+                let weight = scores[t];
+                for (dst, val) in out_row.iter_mut().zip(v_row.iter()) {
+                    *dst += weight * *val;
+                }
+            }
+        }
+
+        out
+    }
+
     #[test]
     fn packed_bits_round_trip() {
         let values = [1u16, 6, 3, 0, 7, 2, 4];
@@ -2624,37 +2812,8 @@ mod tests {
 
     #[test]
     fn turboquant_direct_attention_matches_dequantized_sdpa_uniform() {
-        let dim = 16usize;
-        let config = TurboQuantConfig::uniform(8, 8);
-        let b = 1i32;
-        let h = 2i32;
-        let prefill = 3i32;
-        let d = dim as i32;
-        let scale = 1.0f32 / (dim as f32).sqrt();
-
-        let make_data = |len: usize, seed: f32| -> Vec<f32> {
-            (0..len)
-                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
-                .collect()
-        };
-
-        let prefill_len = (b * h * prefill * d) as usize;
-        let step_len = (b * h * d) as usize;
-        let prefill_keys =
-            InlineArray::from_f32_slice(&make_data(prefill_len, 0.2), &[b, h, prefill, d]);
-        let prefill_values =
-            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
-        let queries = InlineArray::from_f32_slice(&make_data(step_len, 1.3), &[b, h, 1, d]);
-        let step_keys = InlineArray::from_f32_slice(&make_data(step_len, 1.9), &[b, h, 1, d]);
-        let step_values = InlineArray::from_f32_slice(&make_data(step_len, 2.4), &[b, h, 1, d]);
-
-        let mut seed_cache = QuantizedKvCache::new(config);
-        seed_cache
-            .append(&prefill_keys, &prefill_values)
-            .expect("prefill append");
-        assert!(seed_cache.keys.as_ref().and_then(|k| k.gpu.as_ref()).is_some());
-        assert!(seed_cache.values.as_ref().and_then(|v| v.gpu.as_ref()).is_some());
-
+        let (seed_cache, queries, step_keys, step_values, scale, b, h, d) =
+            make_uniform_direct_attention_case();
         let mut direct_cache = seed_cache.clone();
         let mut ref_cache = seed_cache;
 
@@ -2663,15 +2822,12 @@ mod tests {
             .expect("direct attention");
 
         ref_cache.append(&step_keys, &step_values).expect("reference append");
-        let full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
-        let full_values = ref_cache.dequantize_values().expect("dequantize values");
-        let mut reference =
-            crate::decode::sdpa_causal_like_mlx(&queries, &full_keys, &full_values, scale, 1);
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let reference_vals =
+            manual_single_token_attention(&mut queries.clone(), &mut full_keys, &mut full_values, b, h, 4, d, scale);
 
         let direct_vals = direct.to_f32_vec((b * h * d) as usize).expect("direct to_f32");
-        let reference_vals = reference
-            .to_f32_vec((b * h * d) as usize)
-            .expect("reference to_f32");
         let max_abs_diff = direct_vals
             .iter()
             .zip(reference_vals.iter())
@@ -2681,6 +2837,69 @@ mod tests {
             max_abs_diff < 1e-4,
             "direct attention diverged from dequantized sdpa: max_abs_diff={max_abs_diff}"
         );
+    }
+
+    #[test]
+    fn turboquant_direct_attention_uniform_smoke() {
+        let (seed_cache, queries, step_keys, step_values, scale, b, h, d) =
+            make_uniform_direct_attention_case();
+        let mut direct_cache = seed_cache;
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+        let vals = direct
+            .to_f32_vec((b * h * d) as usize)
+            .expect("direct to_f32");
+        assert!(vals.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn turboquant_reference_attention_uniform_smoke() {
+        let (seed_cache, queries, step_keys, step_values, scale, b, h, d) =
+            make_uniform_direct_attention_case();
+        let mut ref_cache = seed_cache;
+        ref_cache.append(&step_keys, &step_values).expect("reference append");
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut full_keys,
+            &mut full_values,
+            b,
+            h,
+            4,
+            d,
+            scale,
+        );
+        assert!(vals.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn turboquant_dequantize_keys_after_append_uniform_smoke() {
+        let (seed_cache, _, step_keys, step_values, _, b, h, d) =
+            make_uniform_direct_attention_case();
+        let mut ref_cache = seed_cache;
+        ref_cache.append(&step_keys, &step_values).expect("reference append");
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        assert_eq!(full_keys.shape(), &[b, h, 4, d]);
+        let vals = full_keys
+            .to_f32_vec((b * h * 4 * d) as usize)
+            .expect("keys to_f32");
+        assert!(vals.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn turboquant_dequantize_values_after_append_uniform_smoke() {
+        let (seed_cache, _, step_keys, step_values, _, b, h, d) =
+            make_uniform_direct_attention_case();
+        let mut ref_cache = seed_cache;
+        ref_cache.append(&step_keys, &step_values).expect("reference append");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        assert_eq!(full_values.shape(), &[b, h, 4, d]);
+        let vals = full_values
+            .to_f32_vec((b * h * 4 * d) as usize)
+            .expect("values to_f32");
+        assert!(vals.iter().all(|v| v.is_finite()));
     }
 
     /// Verify that multiple appends accumulate correctly in the GPU store.

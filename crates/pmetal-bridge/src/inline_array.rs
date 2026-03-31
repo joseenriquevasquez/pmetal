@@ -3968,6 +3968,28 @@ impl BridgeScalar for i32 {
 mod tests {
     use super::*;
 
+    fn assert_slice_set_round_trip(mut base: InlineArray, value: InlineArray, expected: &[f32]) {
+        let start = [0, 1];
+        let stop = [2, 3];
+        base = base.slice_set(&value, &start, &stop);
+        let got = base.to_f32_vec(expected.len()).expect("to_f32_vec");
+        assert_eq!(got, expected);
+    }
+
+    fn assert_tail_write_after_kv_cache_append(
+        mut base: InlineArray,
+        zeros: InlineArray,
+        value: InlineArray,
+        expected: &[f32],
+    ) {
+        base = base.kv_cache_append(&zeros, 2);
+        let start = [0, 0, 3, 0];
+        let stop = [1, 1, 4, 2];
+        base = base.slice_set(&value, &start, &stop);
+        let got = base.to_f32_vec(expected.len()).expect("to_f32_vec");
+        assert_eq!(got, expected);
+    }
+
     #[test]
     fn test_buffer_layout() {
         verify_buffer_layout();
@@ -3989,5 +4011,65 @@ mod tests {
         c.eval();
         let v = c.item_f32();
         assert!((v - 5.0).abs() < 1e-6, "expected 5.0, got {v}");
+    }
+
+    #[test]
+    fn test_slice_set_f32() {
+        let base = InlineArray::zeros(&[2, 4], crate::compat::Dtype::Float32.as_i32());
+        let value = InlineArray::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        assert_slice_set_round_trip(base, value, &[0.0, 1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0]);
+    }
+
+    #[test]
+    fn test_slice_set_u8() {
+        let base = InlineArray::zeros(&[2, 4], crate::compat::Dtype::Uint8.as_i32());
+        let value = InlineArray::from_u8_slice(&[1, 2, 3, 4], &[2, 2]);
+        assert_slice_set_round_trip(base, value, &[0.0, 1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0]);
+    }
+
+    #[test]
+    fn test_slice_set_u32() {
+        let base = InlineArray::zeros(&[2, 4], crate::compat::Dtype::Uint32.as_i32());
+        let value = InlineArray::from_u32_slice(&[1, 2, 3, 4], &[2, 2]);
+        assert_slice_set_round_trip(base, value, &[0.0, 1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0]);
+    }
+
+    #[test]
+    fn test_tail_slice_set_after_kv_cache_append_f32() {
+        let base = InlineArray::from_f32_slice(&[10.0, 11.0, 12.0, 13.0, 14.0, 15.0], &[1, 1, 3, 2]);
+        let zeros = InlineArray::zeros(&[1, 1, 1, 2], crate::compat::Dtype::Float32.as_i32());
+        let value = InlineArray::from_f32_slice(&[20.0, 21.0], &[1, 1, 1, 2]);
+        assert_tail_write_after_kv_cache_append(
+            base,
+            zeros,
+            value,
+            &[10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 20.0, 21.0],
+        );
+    }
+
+    #[test]
+    fn test_tail_slice_set_after_kv_cache_append_u8() {
+        let base = InlineArray::from_u8_slice(&[10, 11, 12, 13, 14, 15], &[1, 1, 3, 2]);
+        let zeros = InlineArray::zeros(&[1, 1, 1, 2], crate::compat::Dtype::Uint8.as_i32());
+        let value = InlineArray::from_u8_slice(&[20, 21], &[1, 1, 1, 2]);
+        assert_tail_write_after_kv_cache_append(
+            base,
+            zeros,
+            value,
+            &[10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 20.0, 21.0],
+        );
+    }
+
+    #[test]
+    fn test_tail_slice_set_after_kv_cache_append_u32() {
+        let base = InlineArray::from_u32_slice(&[10, 11, 12, 13, 14, 15], &[1, 1, 3, 2]);
+        let zeros = InlineArray::zeros(&[1, 1, 1, 2], crate::compat::Dtype::Uint32.as_i32());
+        let value = InlineArray::from_u32_slice(&[20, 21], &[1, 1, 1, 2]);
+        assert_tail_write_after_kv_cache_append(
+            base,
+            zeros,
+            value,
+            &[10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 20.0, 21.0],
+        );
     }
 }

@@ -974,30 +974,86 @@ static const char* TURBOQUANT_UNPACK_SIGN_BITS_SOURCE = R"(
 // This avoids materializing a [row, seq, dim] decoded value tensor before the
 // attention reduction.
 static const char* TURBOQUANT_WEIGHTED_DECODE_SOURCE = R"(
-    uint out_linear = thread_position_in_grid.y;
-    uint row = out_linear / dim;
-    uint d   = out_linear % dim;
+    constexpr uint kTileDims = 8u;
+    constexpr uint kMaxCentroids = 512u;
+    threadgroup float shared_codebook[kMaxCentroids];
+
+    if (n_centroids > kMaxCentroids) return;
+    uint lane = thread_index_in_simdgroup;
+    for (uint c = lane; c < n_centroids; c += 32u) {
+        shared_codebook[c] = codebook[c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint tile = thread_position_in_grid.y;
+    uint row = tile / ((dim + kTileDims - 1u) / kTileDims);
     if (row >= n_rows) return;
+    uint tile_idx = tile % ((dim + kTileDims - 1u) / kTileDims);
+    uint d0 = tile_idx * kTileDims;
 
     uint groups = q_heads / kv_heads;
     uint batch = row / q_heads;
     uint q_head = row % q_heads;
     uint kv_row = batch * kv_heads + (q_head / groups);
 
-    float acc = 0.0f;
-    uint lane = thread_index_in_simdgroup;
     uint scalar_base = row * n_seq;
     uint kv_scalar_base = kv_row * cache_seq_capacity;
-    uint cache_base = kv_row * cache_seq_capacity * dim + d;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    float acc4 = 0.0f;
+    float acc5 = 0.0f;
+    float acc6 = 0.0f;
+    float acc7 = 0.0f;
     for (uint seq = lane; seq < n_seq; seq += 32u) {
         uint scalar_idx = scalar_base + seq;
         uint kv_scalar_idx = kv_scalar_base + seq;
-        uint idx = (uint)indices[cache_base + seq * dim];
-        acc += weights[scalar_idx] * norms[kv_scalar_idx] * codebook[idx];
+        float scalar = weights[scalar_idx] * norms[kv_scalar_idx];
+        uint cache_base = (kv_row * cache_seq_capacity + seq) * dim + d0;
+        if (d0 + 0u < dim) {
+            acc0 += scalar * shared_codebook[(uint)indices[cache_base + 0u]];
+        }
+        if (d0 + 1u < dim) {
+            acc1 += scalar * shared_codebook[(uint)indices[cache_base + 1u]];
+        }
+        if (d0 + 2u < dim) {
+            acc2 += scalar * shared_codebook[(uint)indices[cache_base + 2u]];
+        }
+        if (d0 + 3u < dim) {
+            acc3 += scalar * shared_codebook[(uint)indices[cache_base + 3u]];
+        }
+        if (d0 + 4u < dim) {
+            acc4 += scalar * shared_codebook[(uint)indices[cache_base + 4u]];
+        }
+        if (d0 + 5u < dim) {
+            acc5 += scalar * shared_codebook[(uint)indices[cache_base + 5u]];
+        }
+        if (d0 + 6u < dim) {
+            acc6 += scalar * shared_codebook[(uint)indices[cache_base + 6u]];
+        }
+        if (d0 + 7u < dim) {
+            acc7 += scalar * shared_codebook[(uint)indices[cache_base + 7u]];
+        }
     }
-    acc = simd_sum(acc);
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2);
+    acc3 = simd_sum(acc3);
+    acc4 = simd_sum(acc4);
+    acc5 = simd_sum(acc5);
+    acc6 = simd_sum(acc6);
+    acc7 = simd_sum(acc7);
     if (thread_index_in_simdgroup == 0) {
-        output[row * dim + d] = acc;
+        uint out_base = row * dim + d0;
+        if (d0 + 0u < dim) output[out_base + 0u] = acc0;
+        if (d0 + 1u < dim) output[out_base + 1u] = acc1;
+        if (d0 + 2u < dim) output[out_base + 2u] = acc2;
+        if (d0 + 3u < dim) output[out_base + 3u] = acc3;
+        if (d0 + 4u < dim) output[out_base + 4u] = acc4;
+        if (d0 + 5u < dim) output[out_base + 5u] = acc5;
+        if (d0 + 6u < dim) output[out_base + 6u] = acc6;
+        if (d0 + 7u < dim) output[out_base + 7u] = acc7;
     }
 )";
 
@@ -1486,11 +1542,13 @@ int mlx_inline_turboquant_weighted_decode(
     try {
         auto& kernel = get_turboquant_weighted_decode_kernel();
         constexpr uint32_t tg_threads = 32u;
+        constexpr uint32_t tile_dims = 8u;
+        uint32_t dim_tiles = (dim + tile_dims - 1u) / tile_dims;
         auto outputs = kernel(
             {as_arr(weights), as_arr(indices), as_arr(norms), as_arr(codebook)},
             {{(int)n_rows, (int)dim}},
             {float32},
-            {(int)tg_threads, (int)(n_rows * dim), 1},
+            {(int)tg_threads, (int)(n_rows * dim_tiles), 1},
             {(int)tg_threads, 1, 1},
             {{"dim",         (int)dim},
              {"n_centroids", (int)n_centroids},
