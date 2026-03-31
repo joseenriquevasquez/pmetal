@@ -52,10 +52,6 @@ pmetal-distributed = { path = "crates/pmetal-distributed", version = "0.4.0" }
 pmetal-serve = { path = "crates/pmetal-serve", version = "0.4.0" }
 pmetal-mcp = { path = "crates/pmetal-mcp", version = "0.4.0" }
 
-# MLX bindings - pmetal-maintained fork (unblocks crates.io publishing)
-mlx-rs = { path = "../reference/mlx-rs/mlx-rs", package = "pmetal-mlx-rs", features = ["safetensors"] }
-mlx-sys = { path = "../reference/mlx-rs/mlx-sys", package = "pmetal-mlx-sys" }
-
 # Async runtime
 tokio = { version = "1.50", features = ["full"] }
 
