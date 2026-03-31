@@ -32,6 +32,7 @@ use std::thread::{self, JoinHandle};
 
 use pmetal_bridge::compat::indexing::IndexOp;
 use pmetal_bridge::compat::{Array, Dtype, Exception, Module, indexing, nn};
+use pmetal_metal::expert_buffer::{AlignedBuffer, ExpertBufferPool};
 
 use crate::expert_io::ExpertOffloadContext;
 
@@ -58,6 +59,8 @@ pub struct ExpertPrefetcher {
     generation: Arc<AtomicU64>,
     /// Persistent background worker pool for prefetch I/O.
     worker_pool: PrefetchIoWorkerPool,
+    /// Shared aligned buffer pool for zero-copy prefetched expert hits.
+    aligned_pool: Option<Arc<ExpertBufferPool>>,
     /// Hit/miss statistics.
     stats: Mutex<PrefetchStats>,
 }
@@ -66,6 +69,7 @@ struct PrefetchRequest {
     layer_idx: usize,
     predicted_indices: Vec<usize>,
     offload_ctx: Arc<ExpertOffloadContext>,
+    aligned_pool: Option<Arc<ExpertBufferPool>>,
     generation: u64,
 }
 
@@ -82,7 +86,76 @@ struct PrefetchResult {
     predicted_indices: Vec<usize>,
     /// Raw byte buffers, one per predicted expert.
     /// Ownership is transferred out on hit (Vec::swap_remove), not cloned.
-    buffers: Vec<Option<Vec<u8>>>,
+    buffers: Vec<Option<PrefetchedExpert>>,
+}
+
+/// Prefetched expert payload ready for a future sparse-layer lookup.
+pub enum PrefetchedExpert {
+    /// Raw byte payload. Used when the aligned pool is unavailable.
+    Raw(Vec<u8>),
+    /// Already resident in a pooled aligned Metal-shared buffer.
+    Aligned(PrefetchedAlignedBuffer),
+}
+
+impl std::fmt::Debug for PrefetchedExpert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Raw(bytes) => f
+                .debug_struct("PrefetchedExpert::Raw")
+                .field("len", &bytes.len())
+                .finish(),
+            Self::Aligned(buf) => f
+                .debug_tuple("PrefetchedExpert::Aligned")
+                .field(buf)
+                .finish(),
+        }
+    }
+}
+
+/// A prefetched aligned expert buffer that returns itself to the pool on drop.
+pub struct PrefetchedAlignedBuffer {
+    pool: Arc<ExpertBufferPool>,
+    buffer: Option<AlignedBuffer>,
+}
+
+impl PrefetchedAlignedBuffer {
+    fn new(pool: Arc<ExpertBufferPool>, buffer: AlignedBuffer) -> Self {
+        Self {
+            pool,
+            buffer: Some(buffer),
+        }
+    }
+
+    pub fn into_inner(mut self) -> AlignedBuffer {
+        self.buffer.take().unwrap()
+    }
+
+    pub fn to_vec(&self, len: usize) -> Vec<u8> {
+        self.buffer.as_ref().unwrap().as_bytes()[..len].to_vec()
+    }
+}
+
+impl Drop for PrefetchedAlignedBuffer {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.pool.release(buffer);
+        }
+    }
+}
+
+impl std::fmt::Debug for PrefetchedAlignedBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrefetchedAlignedBuffer")
+            .field(
+                "size",
+                &self
+                    .buffer
+                    .as_ref()
+                    .map(|buffer| buffer.size())
+                    .unwrap_or(0),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// Prefetch hit/miss statistics.
@@ -112,7 +185,7 @@ fn complete_prefetch(
     generation: &Arc<AtomicU64>,
     layer_idx: usize,
     predicted_indices: Vec<usize>,
-    buffers: Vec<Vec<u8>>,
+    buffers: Vec<PrefetchedExpert>,
     request_generation: u64,
 ) {
     if generation.load(AtomicOrdering::Relaxed) != request_generation {
@@ -126,6 +199,44 @@ fn complete_prefetch(
             buffers: buffers.into_iter().map(Some).collect(),
         },
     );
+}
+
+fn try_prefetch_aligned(
+    layer_idx: usize,
+    predicted_indices: &[usize],
+    offload_ctx: &Arc<ExpertOffloadContext>,
+    pool: &Arc<ExpertBufferPool>,
+) -> Option<Vec<PrefetchedExpert>> {
+    let mut aligned = Vec::with_capacity(predicted_indices.len());
+    for _ in 0..predicted_indices.len() {
+        let buf = match pool.try_acquire() {
+            Some(buf) => buf,
+            None => {
+                for buf in aligned.drain(..) {
+                    pool.release(buf);
+                }
+                return None;
+            }
+        };
+        aligned.push(buf);
+    }
+
+    if offload_ctx
+        .read_experts_aligned(layer_idx, predicted_indices, &mut aligned)
+        .is_err()
+    {
+        for buf in aligned.drain(..) {
+            pool.release(buf);
+        }
+        return None;
+    }
+
+    Some(
+        aligned
+            .into_iter()
+            .map(|buf| PrefetchedExpert::Aligned(PrefetchedAlignedBuffer::new(pool.clone(), buf)))
+            .collect(),
+    )
 }
 
 fn try_mark_inflight(
@@ -176,18 +287,46 @@ impl PrefetchIoWorkerPool {
                             break;
                         };
 
-                        let buffers = match request
-                            .offload_ctx
-                            .read_experts(request.layer_idx, &request.predicted_indices)
-                        {
-                            Ok(bufs) => bufs,
-                            Err(_) => {
-                                clear_inflight(
-                                    &inflight_layers,
-                                    request.layer_idx,
-                                    request.generation,
-                                );
-                                continue;
+                        let buffers = if let Some(pool) = request.aligned_pool.as_ref() {
+                            if let Some(buffers) = try_prefetch_aligned(
+                                request.layer_idx,
+                                &request.predicted_indices,
+                                &request.offload_ctx,
+                                pool,
+                            ) {
+                                buffers
+                            } else {
+                                match request
+                                    .offload_ctx
+                                    .read_experts(request.layer_idx, &request.predicted_indices)
+                                {
+                                    Ok(bufs) => {
+                                        bufs.into_iter().map(PrefetchedExpert::Raw).collect()
+                                    }
+                                    Err(_) => {
+                                        clear_inflight(
+                                            &inflight_layers,
+                                            request.layer_idx,
+                                            request.generation,
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        } else {
+                            match request
+                                .offload_ctx
+                                .read_experts(request.layer_idx, &request.predicted_indices)
+                            {
+                                Ok(bufs) => bufs.into_iter().map(PrefetchedExpert::Raw).collect(),
+                                Err(_) => {
+                                    clear_inflight(
+                                        &inflight_layers,
+                                        request.layer_idx,
+                                        request.generation,
+                                    );
+                                    continue;
+                                }
                             }
                         };
                         complete_prefetch(
@@ -246,6 +385,7 @@ impl std::fmt::Debug for ExpertPrefetcher {
             .field("num_experts", &self.num_experts)
             .field("hidden_dim", &self.hidden_dim)
             .field("top_k", &self.top_k)
+            .field("aligned_pool", &self.aligned_pool.is_some())
             .field(
                 "inflight_layers",
                 &self.inflight_layers.lock().unwrap().len(),
@@ -265,6 +405,7 @@ impl ExpertPrefetcher {
         num_experts: usize,
         hidden_dim: usize,
         top_k: usize,
+        aligned_pool: Option<Arc<ExpertBufferPool>>,
     ) -> Self {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let inflight_layers = Arc::new(Mutex::new(HashMap::new()));
@@ -280,6 +421,7 @@ impl ExpertPrefetcher {
                 Arc::clone(&generation),
                 prefetch_worker_count(),
             ),
+            aligned_pool,
             pending,
             inflight_layers,
             generation,
@@ -308,6 +450,7 @@ impl ExpertPrefetcher {
             layer_idx,
             predicted_indices,
             offload_ctx: offload_ctx.clone(),
+            aligned_pool: self.aligned_pool.clone(),
             generation,
         };
         if !self.worker_pool.enqueue(request) {
@@ -346,7 +489,11 @@ impl ExpertPrefetcher {
     /// transferred, not cloned), and `None` for experts needing sync fallback.
     ///
     /// The returned Vec has the same length and order as `expert_indices`.
-    pub fn try_get(&self, layer_idx: usize, expert_indices: &[usize]) -> Vec<Option<Vec<u8>>> {
+    pub fn try_get(
+        &self,
+        layer_idx: usize,
+        expert_indices: &[usize],
+    ) -> Vec<Option<PrefetchedExpert>> {
         let mut pending = self.pending.lock().unwrap();
         let prefetch = pending.remove(&layer_idx);
 
@@ -420,7 +567,7 @@ impl ExpertPrefetcher {
         let hidden_1d =
             pmetal_bridge::compat::ops::slice_axis(&hidden_rows, 0, last_row_idx, last_row_idx + 1)
                 .squeeze_axes(&[0]);
-        let mut hidden_1d = if hidden_1d.dtype() != Dtype::Float32 {
+        let hidden_1d = if hidden_1d.dtype() != Dtype::Float32 {
             hidden_1d.as_type::<f32>()
         } else {
             hidden_1d
@@ -466,6 +613,17 @@ mod tests {
 
     use crate::architectures::qwen3_next::Qwen3NextConfig;
 
+    fn raw_prefetched(bytes: &[u8]) -> Option<PrefetchedExpert> {
+        Some(PrefetchedExpert::Raw(bytes.to_vec()))
+    }
+
+    fn first_byte(prefetched: &PrefetchedExpert) -> u8 {
+        match prefetched {
+            PrefetchedExpert::Raw(bytes) => bytes[0],
+            PrefetchedExpert::Aligned(bytes) => bytes.to_vec(1)[0],
+        }
+    }
+
     #[test]
     #[serial]
     fn test_predict_topk_basic() {
@@ -480,7 +638,7 @@ mod tests {
         let mut gate_weights = HashMap::new();
         gate_weights.insert(0, gate_w);
 
-        let prefetcher = ExpertPrefetcher::new(gate_weights, num_experts, hidden_dim, top_k);
+        let prefetcher = ExpertPrefetcher::new(gate_weights, num_experts, hidden_dim, top_k, None);
 
         let hidden = Array::from_slice(&vec![1.0f32; hidden_dim], &[hidden_dim as i32]);
 
@@ -539,13 +697,15 @@ mod tests {
             config.num_experts as usize,
             config.hidden_size as usize,
             config.num_experts_per_tok as usize,
+            None,
         );
 
         let predicted = prefetcher
             .predict_topk(&hidden, prefetcher.gate_weights.get(&0).unwrap())
             .unwrap();
         let gate_logits = gate.forward(&hidden).unwrap();
-        let last_row = pmetal_bridge::compat::ops::select_axis(&gate_logits, gate_logits.dim(0) - 1, 0);
+        let last_row =
+            pmetal_bridge::compat::ops::select_axis(&gate_logits, gate_logits.dim(0) - 1, 0);
         let last_row = last_row.as_type::<f32>().unwrap();
         let mut actual_scores: Vec<(f32, usize)> = (0..config.num_experts as usize)
             .map(|expert_idx| (last_row.index(expert_idx as i32).item::<f32>(), expert_idx))
@@ -564,7 +724,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_try_get_hit_miss() {
-        let prefetcher = ExpertPrefetcher::new(HashMap::new(), 4, 16, 2);
+        let prefetcher = ExpertPrefetcher::new(HashMap::new(), 4, 16, 2, None);
 
         // Manually insert a prefetch result
         {
@@ -573,7 +733,7 @@ mod tests {
                 5,
                 PrefetchResult {
                     predicted_indices: vec![2, 7],
-                    buffers: vec![Some(vec![0xAA; 100]), Some(vec![0xBB; 100])],
+                    buffers: vec![raw_prefetched(&[0xAA; 100]), raw_prefetched(&[0xBB; 100])],
                 },
             );
         }
@@ -583,10 +743,10 @@ mod tests {
 
         assert_eq!(results.len(), 3);
         assert!(results[0].is_some()); // expert 2 was prefetched
-        assert_eq!(results[0].as_ref().unwrap()[0], 0xAA);
+        assert_eq!(first_byte(results[0].as_ref().unwrap()), 0xAA);
         assert!(results[1].is_none()); // expert 3 was NOT prefetched
         assert!(results[2].is_some()); // expert 7 was prefetched
-        assert_eq!(results[2].as_ref().unwrap()[0], 0xBB);
+        assert_eq!(first_byte(results[2].as_ref().unwrap()), 0xBB);
 
         let stats = prefetcher.stats();
         assert_eq!(stats.hits, 2);
@@ -597,7 +757,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_try_get_no_prefetch() {
-        let prefetcher = ExpertPrefetcher::new(HashMap::new(), 4, 16, 2);
+        let prefetcher = ExpertPrefetcher::new(HashMap::new(), 4, 16, 2, None);
 
         let results = prefetcher.try_get(3, &[0, 1]);
         assert_eq!(results.len(), 2);
@@ -611,7 +771,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_try_get_ownership_transfer() {
-        let prefetcher = ExpertPrefetcher::new(HashMap::new(), 4, 16, 2);
+        let prefetcher = ExpertPrefetcher::new(HashMap::new(), 4, 16, 2, None);
 
         {
             let mut pending = prefetcher.pending.lock().unwrap();
@@ -619,7 +779,7 @@ mod tests {
                 1,
                 PrefetchResult {
                     predicted_indices: vec![0],
-                    buffers: vec![Some(vec![0xFF; 50])],
+                    buffers: vec![raw_prefetched(&[0xFF; 50])],
                 },
             );
         }
@@ -639,14 +799,28 @@ mod tests {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let generation = Arc::new(AtomicU64::new(0));
 
-        complete_prefetch(&pending, &generation, 7, vec![1], vec![vec![0x11; 4]], 0);
-        complete_prefetch(&pending, &generation, 7, vec![3], vec![vec![0x33; 4]], 0);
+        complete_prefetch(
+            &pending,
+            &generation,
+            7,
+            vec![1],
+            vec![PrefetchedExpert::Raw(vec![0x11; 4])],
+            0,
+        );
+        complete_prefetch(
+            &pending,
+            &generation,
+            7,
+            vec![3],
+            vec![PrefetchedExpert::Raw(vec![0x33; 4])],
+            0,
+        );
 
         let mut guard = pending.lock().unwrap();
         let result = guard.remove(&7).unwrap();
         assert_eq!(result.predicted_indices, vec![3]);
         assert_eq!(result.buffers.len(), 1);
-        assert_eq!(result.buffers[0].as_ref().unwrap()[0], 0x33);
+        assert_eq!(first_byte(result.buffers[0].as_ref().unwrap()), 0x33);
     }
 
     #[test]
@@ -655,7 +829,14 @@ mod tests {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let generation = Arc::new(AtomicU64::new(1));
 
-        complete_prefetch(&pending, &generation, 7, vec![1], vec![vec![0x11; 4]], 0);
+        complete_prefetch(
+            &pending,
+            &generation,
+            7,
+            vec![1],
+            vec![PrefetchedExpert::Raw(vec![0x11; 4])],
+            0,
+        );
 
         assert!(pending.lock().unwrap().is_empty());
     }
@@ -663,7 +844,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_reset_stats_clears_counters() {
-        let prefetcher = ExpertPrefetcher::new(HashMap::new(), 4, 16, 2);
+        let prefetcher = ExpertPrefetcher::new(HashMap::new(), 4, 16, 2, None);
 
         {
             let mut pending = prefetcher.pending.lock().unwrap();
@@ -671,7 +852,7 @@ mod tests {
                 2,
                 PrefetchResult {
                     predicted_indices: vec![0],
-                    buffers: vec![Some(vec![0xAB; 8])],
+                    buffers: vec![raw_prefetched(&[0xAB; 8])],
                 },
             );
         }
@@ -691,7 +872,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_prefetcher_debug_includes_shape_metadata() {
-        let prefetcher = ExpertPrefetcher::new(HashMap::new(), 8, 64, 2);
+        let prefetcher = ExpertPrefetcher::new(HashMap::new(), 8, 64, 2, None);
         let debug = format!("{prefetcher:?}");
         assert!(debug.contains("num_experts"));
         assert!(debug.contains("hidden_dim"));
@@ -717,14 +898,14 @@ mod tests {
     #[test]
     #[serial]
     fn test_reset_pending_clears_pending_and_advances_generation() {
-        let prefetcher = ExpertPrefetcher::new(HashMap::new(), 4, 16, 2);
+        let prefetcher = ExpertPrefetcher::new(HashMap::new(), 4, 16, 2, None);
         {
             let mut pending = prefetcher.pending.lock().unwrap();
             pending.insert(
                 2,
                 PrefetchResult {
                     predicted_indices: vec![0],
-                    buffers: vec![Some(vec![0xAB; 8])],
+                    buffers: vec![raw_prefetched(&[0xAB; 8])],
                 },
             );
         }

@@ -346,6 +346,24 @@ impl AlignedBuffer {
         Ok(())
     }
 
+    /// Return a mutable view into the first `len` bytes of the buffer.
+    ///
+    /// This is the safe counterpart to [`Self::as_bytes_mut`] for callers that
+    /// only need to fill a bounded prefix before handing the buffer to Metal.
+    pub fn prefix_mut(&mut self, len: usize) -> Result<&mut [u8]> {
+        if len > self.size {
+            return Err(MetalError::InvalidConfig(format!(
+                "prefix_mut: requested prefix {} exceeds buffer size {}",
+                len, self.size
+            )));
+        }
+
+        // SAFETY: `self` is exclusively borrowed and the returned slice is
+        // bounded to `len <= self.size`.
+        let bytes = unsafe { self.as_bytes_mut() };
+        Ok(&mut bytes[..len])
+    }
+
     // ── I/O ───────────────────────────────────────────────────────────────────
 
     /// Fill the buffer from a file using `pread(2)` at the given byte offset.

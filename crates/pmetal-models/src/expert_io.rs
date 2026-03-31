@@ -16,11 +16,10 @@
 //!   └── ExpertIoPool       — persistent N-thread pread pool (channel-based)
 //! ```
 
+use std::collections::HashSet;
 use std::fs::File;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -53,8 +52,8 @@ struct IoWork {
 struct IoResult {
     /// Index into the results vec.
     result_idx: usize,
-    /// The data read, or an error.
-    data: std::io::Result<Vec<u8>>,
+    /// The completed task payload, or an error.
+    data: std::io::Result<IoPayload>,
 }
 
 struct BytesIoTask {
@@ -64,8 +63,22 @@ struct BytesIoTask {
 }
 
 #[cfg(unix)]
+struct FillIoTask {
+    work: IoWork,
+    file: Arc<File>,
+    dst_addr: usize,
+    result_tx: mpsc::Sender<IoResult>,
+}
+
+enum IoPayload {
+    Bytes(Vec<u8>),
+    Filled,
+}
+
+#[cfg(unix)]
 enum IoTask {
     Bytes(BytesIoTask),
+    Fill(FillIoTask),
 }
 
 /// Persistent thread pool for parallel pread() operations.
@@ -111,8 +124,25 @@ impl ExpertIoPool {
 
                         match task {
                             Ok(IoTask::Bytes(task)) => {
-                                let data =
-                                    Self::do_pread(&task.file, task.work.offset, task.work.size);
+                                let data = Self::do_pread_bytes(
+                                    &task.file,
+                                    task.work.offset,
+                                    task.work.size,
+                                )
+                                .map(IoPayload::Bytes);
+                                let _ = task.result_tx.send(IoResult {
+                                    result_idx: task.work.result_idx,
+                                    data,
+                                });
+                            }
+                            Ok(IoTask::Fill(task)) => {
+                                let data = Self::do_pread_into(
+                                    &task.file,
+                                    task.work.offset,
+                                    task.work.size,
+                                    task.dst_addr,
+                                )
+                                .map(|()| IoPayload::Filled);
                                 let _ = task.result_tx.send(IoResult {
                                     result_idx: task.work.result_idx,
                                     data,
@@ -136,14 +166,31 @@ impl ExpertIoPool {
 
     /// Read bytes at a given offset using pread (no seek, no lock).
     #[cfg(unix)]
-    fn do_pread(file: &File, offset: u64, size: usize) -> std::io::Result<Vec<u8>> {
+    fn do_pread_bytes(file: &File, offset: u64, size: usize) -> std::io::Result<Vec<u8>> {
         let mut buf = vec![0u8; size];
-        file.read_exact_at(&mut buf, offset);
+        file.read_exact_at(&mut buf, offset)?;
         Ok(buf)
     }
 
+    /// Read bytes directly into a caller-provided mutable region.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn do_pread_into(
+        file: &File,
+        offset: u64,
+        size: usize,
+        dst_addr: usize,
+    ) -> std::io::Result<()> {
+        // SAFETY: `parallel_read_into_slices` only submits pointers derived from
+        // unique `&mut [u8]` slices that remain alive until all worker results
+        // have been collected.
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_addr as *mut u8, size) };
+        file.read_exact_at(dst, offset)?;
+        Ok(())
+    }
+
     #[cfg(not(unix))]
-    fn do_pread(_file: &File, _offset: u64, _size: usize) -> std::io::Result<Vec<u8>> {
+    fn do_pread_bytes(_file: &File, _offset: u64, _size: usize) -> std::io::Result<Vec<u8>> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "pread is not available on this platform",
@@ -169,7 +216,7 @@ impl ExpertIoPool {
 
         // For a single task, skip the channel overhead
         if n == 1 {
-            let data = Self::do_pread(file, offsets[0], size);
+            let data = Self::do_pread_bytes(file, offsets[0], size);
             return Ok(vec![data?]);
         }
 
@@ -203,8 +250,14 @@ impl ExpertIoPool {
                 )
             })?;
             match result.data {
-                Ok(data) => {
+                Ok(IoPayload::Bytes(data)) => {
                     results[result.result_idx] = Some(data);
+                }
+                Ok(IoPayload::Filled) => {
+                    return Err(std::io::Error::other(format!(
+                        "unexpected fill completion for byte task {}",
+                        result.result_idx
+                    )));
                 }
                 Err(e) => {
                     return Err(std::io::Error::new(
@@ -217,6 +270,124 @@ impl ExpertIoPool {
 
         // Unwrap all results (all should be Some at this point)
         Ok(results.into_iter().map(|r| r.unwrap()).collect())
+    }
+
+    /// Read multiple expert chunks directly into caller-owned mutable slices.
+    ///
+    /// The slices remain owned by the caller; the pool only uses raw pointers
+    /// for the lifetime of this call and waits for all completions before
+    /// returning.
+    #[cfg(unix)]
+    pub fn parallel_read_into_slices(
+        &self,
+        file: &Arc<File>,
+        offsets: &[u64],
+        targets: &mut [&mut [u8]],
+        size: usize,
+    ) -> std::io::Result<()> {
+        let n = offsets.len();
+        if n != targets.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("offsets.len()={} != targets.len()={}", n, targets.len()),
+            ));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        for (i, target) in targets.iter().enumerate() {
+            if target.len() < size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "target {} too small for read: len={} < size={}",
+                        i,
+                        target.len(),
+                        size
+                    ),
+                ));
+            }
+        }
+
+        let dst_addrs: Vec<usize> = targets
+            .iter_mut()
+            .map(|target| target.as_mut_ptr() as usize)
+            .collect();
+        self.parallel_read_into_addrs(file, offsets, &dst_addrs, size)
+    }
+
+    /// Read multiple expert chunks directly into caller-owned mutable regions.
+    ///
+    /// Each address must point to a unique writable region of at least `size`
+    /// bytes that stays alive until this call returns.
+    #[cfg(unix)]
+    pub fn parallel_read_into_addrs(
+        &self,
+        file: &Arc<File>,
+        offsets: &[u64],
+        dst_addrs: &[usize],
+        size: usize,
+    ) -> std::io::Result<()> {
+        let n = offsets.len();
+        if n != dst_addrs.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("offsets.len()={} != dst_addrs.len()={}", n, dst_addrs.len()),
+            ));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+
+        if n == 1 {
+            return Self::do_pread_into(file, offsets[0], size, dst_addrs[0]);
+        }
+
+        let (result_tx, result_rx) = mpsc::channel::<IoResult>();
+        for (i, (&offset, &dst_addr)) in offsets.iter().zip(dst_addrs.iter()).enumerate() {
+            let work = IoWork {
+                offset,
+                size,
+                result_idx: i,
+            };
+            self.task_tx
+                .send(IoTask::Fill(FillIoTask {
+                    work,
+                    file: file.clone(),
+                    dst_addr,
+                    result_tx: result_tx.clone(),
+                }))
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "IO pool shut down")
+                })?;
+        }
+        drop(result_tx);
+
+        for _ in 0..n {
+            let result = result_rx.recv().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "IO pool result channel closed",
+                )
+            })?;
+            match result.data {
+                Ok(IoPayload::Filled) => {}
+                Ok(IoPayload::Bytes(_)) => {
+                    return Err(std::io::Error::other(format!(
+                        "unexpected byte payload for fill task {}",
+                        result.result_idx
+                    )));
+                }
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("pread failed for task {}: {}", result.result_idx, e),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -371,13 +542,6 @@ impl ExpertOffloadContext {
         expert_indices: &[usize],
         buffers: &mut [pmetal_metal::expert_buffer::AlignedBuffer],
     ) -> std::io::Result<()> {
-        let file = self.file_manager.file_for_layer(layer_idx).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Layer {} has no MoE expert file", layer_idx),
-            )
-        })?;
-
         if expert_indices.len() != buffers.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -389,47 +553,79 @@ impl ExpertOffloadContext {
             ));
         }
 
-        let expert_size = self.file_manager.expert_size();
-        let offsets: Vec<u64> = expert_indices
+        let plan: Vec<(usize, usize)> = expert_indices
             .iter()
-            .map(|&idx| self.file_manager.expert_offset(idx))
+            .enumerate()
+            .map(|(slot_idx, &expert_idx)| (slot_idx, expert_idx))
             .collect();
-        let fd = file.as_raw_fd();
-        let errors: Mutex<Vec<(usize, std::io::Error)>> = Mutex::new(Vec::new());
+        self.read_experts_aligned_with_plan(layer_idx, &plan, buffers)
+    }
 
-        std::thread::scope(|s| {
-            let chunk_size = buffers.len().div_ceil(4);
-            for (chunk_idx, (buf_chunk, idx_chunk)) in buffers
-                .chunks_mut(chunk_size)
-                .zip(offsets.chunks(chunk_size))
-                .enumerate()
-            {
-                let errors = &errors;
-                s.spawn(move || {
-                    for (i, (buf, &offset)) in
-                        buf_chunk.iter_mut().zip(idx_chunk.iter()).enumerate()
-                    {
-                        if let Err(e) = buf
-                            .pread_range(fd, offset, 0, expert_size)
-                            .map_err(|e| std::io::Error::other(e.to_string()))
-                        {
-                            let global_idx = chunk_idx * chunk_size + i;
-                            errors.lock().unwrap().push((global_idx, e));
-                        }
-                    }
-                });
-            }
-        });
-
-        let errors = errors.into_inner().unwrap();
-        if let Some((idx, err)) = errors.into_iter().next() {
-            return Err(std::io::Error::new(
-                err.kind(),
-                format!("pread failed for expert task {}: {}", idx, err),
-            ));
+    /// Read experts directly into selected aligned-buffer slots.
+    ///
+    /// `plan` entries are `(slot_idx, expert_idx)` pairs. This is used by the
+    /// mixed prefetched-hit / synchronous-miss path so it can fill only the
+    /// missing buffer slots while still reusing the same persistent I/O pool as
+    /// the full aligned load path.
+    #[cfg(unix)]
+    pub fn read_experts_aligned_with_plan(
+        &self,
+        layer_idx: usize,
+        plan: &[(usize, usize)],
+        buffers: &mut [pmetal_metal::expert_buffer::AlignedBuffer],
+    ) -> std::io::Result<()> {
+        if plan.is_empty() {
+            return Ok(());
         }
 
-        Ok(())
+        let file = self.file_manager.file_for_layer(layer_idx).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Layer {} has no MoE expert file", layer_idx),
+            )
+        })?;
+
+        let expert_size = self.file_manager.expert_size();
+        let buffer_count = buffers.len();
+        let mut offsets = Vec::with_capacity(plan.len());
+        let mut dst_addrs = Vec::with_capacity(plan.len());
+        let mut used_slots = HashSet::with_capacity(plan.len());
+        for &(slot_idx, expert_idx) in plan {
+            if !used_slots.insert(slot_idx) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("duplicate aligned buffer slot {} in read plan", slot_idx),
+                ));
+            }
+            let buf = buffers.get_mut(slot_idx).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "plan slot {} out of bounds for {} aligned buffers",
+                        slot_idx, buffer_count
+                    ),
+                )
+            })?;
+            if buf.size() < expert_size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "aligned buffer {} too small: size={} < expert_size={}",
+                        slot_idx,
+                        buf.size(),
+                        expert_size
+                    ),
+                ));
+            }
+            let slice = buf
+                .prefix_mut(expert_size)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            offsets.push(self.file_manager.expert_offset(expert_idx));
+            dst_addrs.push(slice.as_mut_ptr() as usize);
+        }
+
+        self.io_pool
+            .parallel_read_into_addrs(file, &offsets, &dst_addrs, expert_size)
     }
 }
 
@@ -516,5 +712,42 @@ mod tests {
         assert_eq!(r1[1][0], 2);
         assert_eq!(r2[0][0], 2);
         assert_eq!(r2[1][0], 1);
+    }
+
+    #[test]
+    fn test_io_pool_parallel_read_into_slices() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.bin");
+
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&[7u8; 128]).unwrap();
+        file.write_all(&[9u8; 128]).unwrap();
+        drop(file);
+
+        let file = Arc::new(File::open(&path).unwrap());
+        let pool = ExpertIoPool::with_threads(2);
+
+        let mut a = vec![0u8; 128];
+        let mut b = vec![0u8; 128];
+        let mut targets: Vec<&mut [u8]> = vec![a.as_mut_slice(), b.as_mut_slice()];
+        pool.parallel_read_into_slices(&file, &[0, 128], &mut targets, 128)
+            .unwrap();
+
+        assert_eq!(a, vec![7u8; 128]);
+        assert_eq!(b, vec![9u8; 128]);
+    }
+
+    #[test]
+    fn test_io_pool_parallel_read_into_slices_rejects_short_target() {
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let pool = ExpertIoPool::with_threads(1);
+
+        let mut short = vec![0u8; 8];
+        let mut targets: Vec<&mut [u8]> = vec![short.as_mut_slice()];
+        let err = pool
+            .parallel_read_into_slices(&file, &[0], &mut targets, 16)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

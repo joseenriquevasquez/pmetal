@@ -29,6 +29,7 @@ use crate::tuna::Tuner;
 
 /// Global Metal context singleton using OnceLock for thread-safe lazy initialization.
 static GLOBAL_CONTEXT: OnceLock<Result<Arc<MetalContext>>> = OnceLock::new();
+static DEVICE_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 /// Embedded Metal 3 library binary (compiled at build time).
 const METAL_LIBRARY_BYTES: &[u8] =
@@ -674,6 +675,12 @@ fn detect_die_count() -> u32 {
 }
 
 impl MetalContext {
+    /// Probe whether a Metal device is visible to this process without
+    /// constructing the full context or loading kernel libraries.
+    pub fn device_available() -> bool {
+        *DEVICE_AVAILABLE.get_or_init(|| MTLCreateSystemDefaultDevice().is_some())
+    }
+
     /// Get the global Metal context, initializing it if necessary.
     ///
     /// This is the recommended way to obtain a Metal context, as it ensures
