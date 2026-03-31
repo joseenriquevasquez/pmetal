@@ -2,14 +2,13 @@
 //! Proves the performance achievable without dual-MLX-instance interference.
 //!
 //! Usage: cargo run -p pmetal-bridge --release --example native_qwen35 -- \
-//!          --model /path/to/Qwen3.5-0.8B --max-tokens 200 [--cpp]
+//!          --model /path/to/Qwen3.5-0.8B --max-tokens 200
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut model_path = String::new();
     let mut max_tokens: usize = 200;
     let mut temperature: f32 = 0.0;
-    let mut use_cpp = false;
     let mut tq_bits: Option<u8> = None;
     let mut dump_decode_graph = false;
 
@@ -28,9 +27,6 @@ fn main() {
                 i += 1;
                 temperature = args[i].parse().unwrap();
             }
-            "--cpp" => {
-                use_cpp = true;
-            }
             "--turboquant" => {
                 i += 1;
                 tq_bits = Some(args[i].parse().unwrap());
@@ -45,7 +41,7 @@ fn main() {
 
     if model_path.is_empty() {
         eprintln!(
-            "Usage: native_qwen35 --model <path> [--max-tokens N] [--temperature T] [--cpp] [--turboquant BITS] [--dump-decode-graph]"
+            "Usage: native_qwen35 --model <path> [--max-tokens N] [--temperature T] [--turboquant BITS] [--dump-decode-graph]"
         );
         std::process::exit(1);
     }
@@ -92,7 +88,7 @@ fn main() {
     let last_logits = logits
         .reshape(&[seq_len, vocab])
         .slice(&[seq_len - 1, 0], &[seq_len, vocab]);
-    let mut first_tok = last_logits.argmax(-1);
+    let first_tok = last_logits.argmax(-1);
     first_tok.eval();
     let first_tok_id = first_tok.item_u32();
     eprintln!("First token: {first_tok_id}");
@@ -102,14 +98,10 @@ fn main() {
         cache.eval_and_detach_states();
         pmetal_bridge::inline_array::clear_cache();
 
-        let decode_input = pmetal_bridge::InlineArray::from_i32(first_tok_id as i32).reshape(&[1, 1]);
-        let decode_logits = if use_cpp && pmetal_bridge::qwen3_native::supports_cpp_decode(&config) {
-            let mut session =
-                pmetal_bridge::qwen3_native::start_cpp_decode_session(&weights, &mut cache, &config);
-            session.step(first_tok_id)
-        } else {
-            pmetal_bridge::qwen3_native::forward_step(&weights, &decode_input, &mut cache)
-        };
+        let decode_input =
+            pmetal_bridge::InlineArray::from_i32(first_tok_id as i32).reshape(&[1, 1]);
+        let decode_logits =
+            pmetal_bridge::qwen3_native::forward_step(&weights, &decode_input, &mut cache);
 
         let node_count = pmetal_bridge::inline_array::graph_node_count(&decode_logits);
         let desc_count = pmetal_bridge::inline_array::graph_desc_count(&decode_logits);
@@ -119,40 +111,22 @@ fn main() {
     }
 
     let t0 = std::time::Instant::now();
-    if use_cpp {
-        eprintln!("Using C++ forward path (generate_cpp)");
-        let tokens = pmetal_bridge::qwen3_native::generate_cpp(
-            &weights,
-            &mut cache,
-            &config,
-            first_tok_id,
-            max_tokens,
-            temperature,
-            |_tok| true,
-        );
-        let elapsed = t0.elapsed().as_secs_f64();
-        eprintln!(
-            "Generated {} tokens in {:.2}s ({:.1} tok/s)",
-            tokens.len(),
-            elapsed,
-            tokens.len() as f64 / elapsed
-        );
-    } else {
-        eprintln!("Using Rust forward path (generate)");
-        let tokens = pmetal_bridge::qwen3_native::generate(
-            &weights,
-            &mut cache,
-            first_tok_id,
-            max_tokens,
-            temperature,
-            |_tok| true,
-        );
-        let elapsed = t0.elapsed().as_secs_f64();
-        eprintln!(
-            "Generated {} tokens in {:.2}s ({:.1} tok/s)",
-            tokens.len(),
-            elapsed,
-            tokens.len() as f64 / elapsed
-        );
-    }
+    eprintln!("Using canonical bridge decode path");
+    let tokens = pmetal_bridge::qwen3_native::generate_canonical(
+        &weights,
+        &mut cache,
+        &config,
+        first_tok_id,
+        max_tokens,
+        temperature,
+        tq_bits.map(|bits| pmetal_bridge::turboquant::TurboQuantConfig::uniform(bits, bits)),
+        |_tok| true,
+    );
+    let elapsed = t0.elapsed().as_secs_f64();
+    eprintln!(
+        "Generated {} tokens in {:.2}s ({:.1} tok/s)",
+        tokens.len(),
+        elapsed,
+        tokens.len() as f64 / elapsed
+    );
 }

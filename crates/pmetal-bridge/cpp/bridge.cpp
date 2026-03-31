@@ -14,6 +14,8 @@
 
 using mlx::core::array;
 
+static inline mlx::core::Dtype dtype_from_int(int dtype);
+
 static_assert(sizeof(array) <= MLX_ARRAY_SIZE, "MLX_ARRAY_SIZE too small");
 static_assert(alignof(array) <= MLX_ARRAY_ALIGN, "MLX_ARRAY_ALIGN too small");
 
@@ -256,9 +258,48 @@ void mlx_inline_dequantize(mlx_inline_array* dst, const mlx_inline_array* w,
 
 void mlx_inline_from_f32_slice(mlx_inline_array* dst, const float* data, const int* shape, int ndim) {
     mlx::core::Shape s(shape, shape + ndim);
-    size_t n = 1;
-    for (int i = 0; i < ndim; ++i) n *= shape[i];
     new (dst->buf) array(data, s, mlx::core::float32);
+}
+
+void mlx_inline_from_u32_slice(
+    mlx_inline_array* dst,
+    const uint32_t* data,
+    const int* shape,
+    int ndim) {
+    mlx::core::Shape s(shape, shape + ndim);
+    new (dst->buf) array(data, s, mlx::core::uint32);
+}
+
+void mlx_inline_from_u8_slice(
+    mlx_inline_array* dst,
+    const uint8_t* data,
+    const int* shape,
+    int ndim) {
+    mlx::core::Shape s(shape, shape + ndim);
+    new (dst->buf) array(data, s, mlx::core::uint8);
+}
+
+void mlx_inline_from_u16_bits_slice(
+    mlx_inline_array* dst,
+    const uint16_t* data,
+    const int* shape,
+    int ndim,
+    int dtype) {
+    mlx::core::Shape s(shape, shape + ndim);
+    auto dt = dtype_from_int(dtype);
+    switch (dt) {
+      case mlx::core::bfloat16:
+        new (dst->buf) array(reinterpret_cast<const mlx::core::bfloat16_t*>(data), s, dt);
+        break;
+      case mlx::core::float16:
+        new (dst->buf) array(reinterpret_cast<const mlx::core::float16_t*>(data), s, dt);
+        break;
+      case mlx::core::uint16:
+        new (dst->buf) array(data, s, dt);
+        break;
+      default:
+        throw std::invalid_argument("mlx_inline_from_u16_bits_slice requires float16, bfloat16, or uint16 dtype");
+    }
 }
 
 // Copy the evaluated f32 data of an array into a caller-provided buffer.
@@ -744,9 +785,9 @@ static const char* GDN_METAL_SOURCE = R"(
 // Grid: (D, N)  — x = dim index, y = row index.
 // Threadgroup: (min(D,256), 1).
 //
-// n_centroids is a kernel constant (≤16), so the inner comparison loop is
-// fully unrolled by the Metal compiler.  For 4-bit (C=16) that is 15 fma ops
-// per thread — fits in registers with zero threadgroup memory.
+// n_centroids is a runtime constant, so the same kernel handles both low-bit
+// and q8 codebooks. Smaller codebooks still unroll well, while larger ones
+// avoid falling back to an ops graph.
 //
 // This replaces the ops chain:
 //   expand_dims(rotated, -1) → subtract(codebook) → square → argmin
@@ -758,8 +799,9 @@ static const char* TURBOQUANT_ENCODE_SOURCE = R"(
 
     float x = input[row * dim + d];
 
-    // Nearest-centroid search over the tiny codebook (n_centroids <= 16).
-    // Fully register-resident — no shared memory needed.
+    // Nearest-centroid search over the codebook.  This stays on-GPU even for
+    // larger q8 codebooks, which is still preferable to materializing the
+    // expand_dims/subtract/square/argmin fallback graph.
     float best_dist = (x - codebook[0]) * (x - codebook[0]);
     uint  best_idx  = 0u;
     for (uint c = 1u; c < n_centroids; ++c) {
@@ -785,6 +827,214 @@ static const char* TURBOQUANT_DECODE_SOURCE = R"(
     if (d >= dim || row >= n_rows) return;
 
     output[row * dim + d] = codebook[indices[row * dim + d]];
+)";
+
+// SCORE: for each (row, seq) pair, compute the TurboQuant key score directly
+// from compressed centroids + QJL signs without materializing a [row, seq, dim]
+// decoded tensor.
+static const char* TURBOQUANT_SCORE_SOURCE = R"(
+    constexpr uint kTileSeq = 64u;
+    constexpr uint kMaxDim = 512u;
+    threadgroup float shared_query_rot[kMaxDim];
+    threadgroup float shared_query_proj[kMaxDim];
+
+    uint row = thread_position_in_grid.y;
+    if (row >= n_rows || dim > kMaxDim) return;
+
+    uint lane = thread_position_in_threadgroup.x;
+    uint query_base = row * dim;
+    for (uint d = lane; d < dim; d += kTileSeq) {
+        shared_query_rot[d] = query_rot[query_base + d];
+        shared_query_proj[d] = query_proj[query_base + d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint seq = thread_position_in_grid.x;
+    if (seq >= n_seq) return;
+
+    uint groups = q_heads / kv_heads;
+    uint batch = row / q_heads;
+    uint q_head = row % q_heads;
+    uint kv_row = batch * kv_heads + (q_head / groups);
+
+    uint cache_base = (kv_row * cache_seq_capacity + seq) * dim;
+    uint qjl_base = (kv_row * cache_seq_capacity + seq) * qjl_words;
+    uint scalar_idx = row * n_seq + seq;
+    uint kv_scalar_idx = kv_row * cache_seq_capacity + seq;
+
+    float mse = 0.0f;
+    float qjl = 0.0f;
+    for (uint d = 0u; d < dim; ++d) {
+        float q_rot = shared_query_rot[d];
+        float q_proj_val = shared_query_proj[d];
+        uint idx = (uint)indices[cache_base + d];
+        uint sign_word = qjl_signs[qjl_base + (d >> 5)];
+        float q_sign = ((sign_word >> (d & 31u)) & 1u) == 0 ? -1.0f : 1.0f;
+        mse += q_rot * codebook[idx];
+        qjl += q_proj_val * q_sign;
+    }
+    float residual = residual_norms[kv_scalar_idx];
+    float score = mse;
+    if (residual > 0.0f) {
+        score += qjl * residual;
+    }
+    output[scalar_idx] = norms[kv_scalar_idx] * score;
+)";
+
+// MIXED_SCORE: combine regular and outlier TurboQuant key contributions in one
+// launch instead of scoring the two subspaces independently and adding later.
+static const char* TURBOQUANT_MIXED_SCORE_SOURCE = R"(
+    uint row = thread_position_in_grid.y;
+    uint seq = thread_position_in_grid.x;
+    if (seq >= n_seq || row >= n_rows) return;
+
+    uint groups = q_heads / kv_heads;
+    uint batch = row / q_heads;
+    uint q_head = row % q_heads;
+    uint kv_row = batch * kv_heads + (q_head / groups);
+    uint scalar_idx = row * n_seq + seq;
+    uint kv_scalar_idx = kv_row * cache_seq_capacity + seq;
+
+    float regular_mse = 0.0f;
+    float regular_qjl = 0.0f;
+    uint regular_query_base = row * regular_dim;
+    uint regular_cache_base = (kv_row * cache_seq_capacity + seq) * regular_dim;
+    uint regular_qjl_base = (kv_row * cache_seq_capacity + seq) * regular_qjl_words;
+    for (uint d = 0u; d < regular_dim; ++d) {
+        float q_rot = regular_query_rot[regular_query_base + d];
+        float q_proj_val = regular_query_proj[regular_query_base + d];
+        uint idx = (uint)regular_indices[regular_cache_base + d];
+        uint sign_word = regular_qjl_signs[regular_qjl_base + (d >> 5)];
+        float q_sign = ((sign_word >> (d & 31u)) & 1u) == 0 ? -1.0f : 1.0f;
+        regular_mse += q_rot * regular_codebook[idx];
+        regular_qjl += q_proj_val * q_sign;
+    }
+
+    float outlier_mse = 0.0f;
+    float outlier_qjl = 0.0f;
+    uint outlier_query_base = row * outlier_dim;
+    uint outlier_cache_base = (kv_row * cache_seq_capacity + seq) * outlier_dim;
+    uint outlier_qjl_base = (kv_row * cache_seq_capacity + seq) * outlier_qjl_words;
+    for (uint d = 0u; d < outlier_dim; ++d) {
+        float q_rot = outlier_query_rot[outlier_query_base + d];
+        float q_proj_val = outlier_query_proj[outlier_query_base + d];
+        uint idx = (uint)outlier_indices[outlier_cache_base + d];
+        uint sign_word = outlier_qjl_signs[outlier_qjl_base + (d >> 5)];
+        float q_sign = ((sign_word >> (d & 31u)) & 1u) == 0 ? -1.0f : 1.0f;
+        outlier_mse += q_rot * outlier_codebook[idx];
+        outlier_qjl += q_proj_val * q_sign;
+    }
+
+    float regular_score = regular_mse;
+    float regular_residual = regular_residual_norms[kv_scalar_idx];
+    if (regular_residual > 0.0f) {
+        regular_score += regular_qjl * regular_residual;
+    }
+    regular_score *= regular_norms[kv_scalar_idx];
+
+    float outlier_score = outlier_mse;
+    float outlier_residual = outlier_residual_norms[kv_scalar_idx];
+    if (outlier_residual > 0.0f) {
+        outlier_score += outlier_qjl * outlier_residual;
+    }
+    outlier_score *= outlier_norms[kv_scalar_idx];
+
+    output[scalar_idx] = regular_score + outlier_score;
+)";
+
+static const char* TURBOQUANT_PACK_SIGN_BITS_SOURCE = R"(
+    uint row = thread_position_in_grid.y;
+    uint packed_idx = thread_position_in_grid.x;
+    if (row >= n_rows || packed_idx >= packed_dim) return;
+
+    uint base = row * dim;
+    uint start = packed_idx * 32u;
+    uint word = 0u;
+    for (uint bit = 0u; bit < 32u; ++bit) {
+        uint d = start + bit;
+        if (d < dim && projected[base + d] >= 0.0f) {
+            word |= (1u << bit);
+        }
+    }
+    output[row * packed_dim + packed_idx] = word;
+)";
+
+static const char* TURBOQUANT_UNPACK_SIGN_BITS_SOURCE = R"(
+    uint row = thread_position_in_grid.y;
+    uint d = thread_position_in_grid.x;
+    if (row >= n_rows || d >= dim) return;
+
+    uint word = packed[row * packed_dim + (d >> 5)];
+    output[row * dim + d] = ((word >> (d & 31u)) & 1u) == 0 ? -1.0f : 1.0f;
+)";
+
+// WEIGHTED_DECODE: aggregate value centroids directly in the rotated domain.
+// This avoids materializing a [row, seq, dim] decoded value tensor before the
+// attention reduction.
+static const char* TURBOQUANT_WEIGHTED_DECODE_SOURCE = R"(
+    uint out_linear = thread_position_in_grid.y;
+    uint row = out_linear / dim;
+    uint d   = out_linear % dim;
+    if (row >= n_rows) return;
+
+    uint groups = q_heads / kv_heads;
+    uint batch = row / q_heads;
+    uint q_head = row % q_heads;
+    uint kv_row = batch * kv_heads + (q_head / groups);
+
+    float acc = 0.0f;
+    uint lane = thread_index_in_simdgroup;
+    uint scalar_base = row * n_seq;
+    uint kv_scalar_base = kv_row * cache_seq_capacity;
+    uint cache_base = kv_row * cache_seq_capacity * dim + d;
+    for (uint seq = lane; seq < n_seq; seq += 32u) {
+        uint scalar_idx = scalar_base + seq;
+        uint kv_scalar_idx = kv_scalar_base + seq;
+        uint idx = (uint)indices[cache_base + seq * dim];
+        acc += weights[scalar_idx] * norms[kv_scalar_idx] * codebook[idx];
+    }
+    acc = simd_sum(acc);
+    if (thread_index_in_simdgroup == 0) {
+        output[row * dim + d] = acc;
+    }
+)";
+
+// GATHER_LAST_DIM: gather selected coordinates from a flattened [row, dim]
+// tensor using a fixed position list.
+static const char* TURBOQUANT_GATHER_LAST_DIM_SOURCE = R"(
+    uint row = thread_position_in_grid.y;
+    uint out_d = thread_position_in_grid.x;
+    if (out_d >= out_dim || row >= n_rows) return;
+
+    int src_d = positions[out_d];
+    output[row * out_dim + out_d] = input[row * full_dim + (uint)src_d];
+)";
+
+// SCATTER_LAST_DIM: reassemble mixed regular/outlier sub-vectors into the
+// original full-dimensional row layout.
+static const char* TURBOQUANT_SCATTER_LAST_DIM_SOURCE = R"(
+    uint row = thread_position_in_grid.y;
+    uint d = thread_position_in_grid.x;
+    if (d >= full_dim || row >= n_rows) return;
+
+    float value = 0.0f;
+    bool found = false;
+    for (uint i = 0u; i < regular_dim; ++i) {
+        if ((uint)regular_positions[i] == d) {
+            value = regular[row * regular_dim + i];
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        for (uint i = 0u; i < outlier_dim; ++i) {
+            if ((uint)outlier_positions[i] == d) {
+                value = outlier[row * outlier_dim + i];
+                break;
+            }
+        }
+    }
+    output[row * full_dim + d] = value;
 )";
 
 // Cached Metal kernel functions (created once per process)
@@ -829,6 +1079,112 @@ static mlx::core::fast::CustomKernelFunction& get_turboquant_decode_kernel() {
     return kernel;
 }
 
+static mlx::core::fast::CustomKernelFunction& get_turboquant_score_kernel() {
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "turboquant_score",
+        {"query_rot", "query_proj", "indices", "qjl_signs", "norms", "residual_norms", "codebook"},
+        {"output"},
+        TURBOQUANT_SCORE_SOURCE,
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
+static mlx::core::fast::CustomKernelFunction& get_turboquant_mixed_score_kernel() {
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "turboquant_mixed_score",
+        {
+            "regular_query_rot",
+            "regular_query_proj",
+            "regular_indices",
+            "regular_qjl_signs",
+            "regular_norms",
+            "regular_residual_norms",
+            "regular_codebook",
+            "outlier_query_rot",
+            "outlier_query_proj",
+            "outlier_indices",
+            "outlier_qjl_signs",
+            "outlier_norms",
+            "outlier_residual_norms",
+            "outlier_codebook",
+        },
+        {"output"},
+        TURBOQUANT_MIXED_SCORE_SOURCE,
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
+static mlx::core::fast::CustomKernelFunction& get_turboquant_weighted_decode_kernel() {
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "turboquant_weighted_decode",
+        {"weights", "indices", "norms", "codebook"},
+        {"output"},
+        TURBOQUANT_WEIGHTED_DECODE_SOURCE,
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
+static mlx::core::fast::CustomKernelFunction& get_turboquant_pack_sign_bits_kernel() {
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "turboquant_pack_sign_bits",
+        {"projected"},
+        {"output"},
+        TURBOQUANT_PACK_SIGN_BITS_SOURCE,
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
+static mlx::core::fast::CustomKernelFunction& get_turboquant_unpack_sign_bits_kernel() {
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "turboquant_unpack_sign_bits",
+        {"packed"},
+        {"output"},
+        TURBOQUANT_UNPACK_SIGN_BITS_SOURCE,
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
+static mlx::core::fast::CustomKernelFunction& get_turboquant_gather_last_dim_kernel() {
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "turboquant_gather_last_dim",
+        {"input", "positions"},
+        {"output"},
+        TURBOQUANT_GATHER_LAST_DIM_SOURCE,
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
+static mlx::core::fast::CustomKernelFunction& get_turboquant_scatter_last_dim_kernel() {
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "turboquant_scatter_last_dim",
+        {"regular", "outlier", "regular_positions", "outlier_positions"},
+        {"output"},
+        TURBOQUANT_SCATTER_LAST_DIM_SOURCE,
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
 // ── TurboQuant C bridge functions ───────────────────────────────────────────
 //
 // encode: input is already normalised+rotated f32 [N, D].
@@ -850,7 +1206,7 @@ int mlx_inline_turboquant_encode(
 {
     using namespace mlx::core;
 
-    if (n_centroids > 16 || dim == 0 || n_rows == 0) return 1;
+    if (n_centroids == 0 || dim == 0 || n_rows == 0) return 1;
 
     const array& inp = as_arr(input);
     const array& cb  = as_arr(codebook);
@@ -862,7 +1218,7 @@ int mlx_inline_turboquant_encode(
         auto outputs = kernel(
             {inp, cb},
             {{(int)n_rows, (int)dim}},   // output shape: [N, D]
-            {uint32},                     // output dtype: uint32
+            {uint8},                      // output dtype: uint8
             {(int)dim, (int)n_rows, 1},  // grid (x=D, y=N, z=1)
             {(int)std::min(dim, 256u), 1, 1},
             {{"dim",         (int)dim},
@@ -888,7 +1244,7 @@ int mlx_inline_turboquant_decode(
 {
     using namespace mlx::core;
 
-    if (n_centroids > 16 || dim == 0 || n_rows == 0) return 1;
+    if (n_centroids == 0 || dim == 0 || n_rows == 0) return 1;
 
     const array& idx = as_arr(indices);
     const array& cb  = as_arr(codebook);
@@ -903,6 +1259,312 @@ int mlx_inline_turboquant_decode(
             {(int)std::min(dim, 256u), 1, 1},
             {{"dim",         (int)dim},
              {"n_centroids", (int)n_centroids},
+             {"n_rows",      (int)n_rows}},
+            std::nullopt, false, {}
+        );
+        new (out->buf) array(outputs[0]);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+int mlx_inline_turboquant_score(
+    mlx_inline_array*       out_scores,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* query_proj,
+    const mlx_inline_array* indices,
+    const mlx_inline_array* qjl_signs,
+    const mlx_inline_array* norms,
+    const mlx_inline_array* residual_norms,
+    const mlx_inline_array* codebook,
+    uint32_t                dim,
+    uint32_t                qjl_words,
+    uint32_t                n_centroids,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads)
+{
+    using namespace mlx::core;
+
+    if (n_centroids == 0 || dim == 0 || n_rows == 0 || n_seq == 0 || kv_heads == 0 || q_heads == 0) return 1;
+    if (cache_seq_capacity < n_seq) return 1;
+    if (q_heads % kv_heads != 0) return 1;
+
+    try {
+        auto& kernel = get_turboquant_score_kernel();
+        constexpr uint32_t tg_threads = 64u;
+        auto outputs = kernel(
+            {as_arr(query_rot), as_arr(query_proj), as_arr(indices), as_arr(qjl_signs), as_arr(norms), as_arr(residual_norms), as_arr(codebook)},
+            {{(int)n_rows, (int)n_seq}},
+            {float32},
+            {(int)(((n_seq + tg_threads - 1) / tg_threads) * tg_threads), (int)n_rows, 1},
+            {(int)tg_threads, 1, 1},
+            {{"dim",         (int)dim},
+             {"qjl_words",   (int)qjl_words},
+             {"n_centroids", (int)n_centroids},
+             {"n_rows",      (int)n_rows},
+             {"n_seq",       (int)n_seq},
+             {"cache_seq_capacity", (int)cache_seq_capacity},
+             {"q_heads",     (int)q_heads},
+             {"kv_heads",    (int)kv_heads}},
+            std::nullopt, false, {}
+        );
+        new (out_scores->buf) array(outputs[0]);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+int mlx_inline_turboquant_mixed_score(
+    mlx_inline_array*       out_scores,
+    const mlx_inline_array* regular_query_rot,
+    const mlx_inline_array* regular_query_proj,
+    const mlx_inline_array* regular_indices,
+    const mlx_inline_array* regular_qjl_signs,
+    const mlx_inline_array* regular_norms,
+    const mlx_inline_array* regular_residual_norms,
+    const mlx_inline_array* regular_codebook,
+    const mlx_inline_array* outlier_query_rot,
+    const mlx_inline_array* outlier_query_proj,
+    const mlx_inline_array* outlier_indices,
+    const mlx_inline_array* outlier_qjl_signs,
+    const mlx_inline_array* outlier_norms,
+    const mlx_inline_array* outlier_residual_norms,
+    const mlx_inline_array* outlier_codebook,
+    uint32_t                regular_dim,
+    uint32_t                regular_qjl_words,
+    uint32_t                regular_n_centroids,
+    uint32_t                outlier_dim,
+    uint32_t                outlier_qjl_words,
+    uint32_t                outlier_n_centroids,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads)
+{
+    using namespace mlx::core;
+
+    if (regular_n_centroids == 0 || outlier_n_centroids == 0) return 1;
+    if (regular_dim == 0 || outlier_dim == 0 || n_rows == 0 || n_seq == 0) return 1;
+    if (cache_seq_capacity < n_seq) return 1;
+    if (kv_heads == 0 || q_heads == 0 || (q_heads % kv_heads) != 0) return 1;
+
+    try {
+        auto& kernel = get_turboquant_mixed_score_kernel();
+        auto outputs = kernel(
+            {
+                as_arr(regular_query_rot),
+                as_arr(regular_query_proj),
+                as_arr(regular_indices),
+                as_arr(regular_qjl_signs),
+                as_arr(regular_norms),
+                as_arr(regular_residual_norms),
+                as_arr(regular_codebook),
+                as_arr(outlier_query_rot),
+                as_arr(outlier_query_proj),
+                as_arr(outlier_indices),
+                as_arr(outlier_qjl_signs),
+                as_arr(outlier_norms),
+                as_arr(outlier_residual_norms),
+                as_arr(outlier_codebook),
+            },
+            {{(int)n_rows, (int)n_seq}},
+            {float32},
+            {(int)n_seq, (int)n_rows, 1},
+            {(int)std::min(n_seq, 256u), 1, 1},
+            {{"regular_dim", (int)regular_dim},
+             {"regular_qjl_words", (int)regular_qjl_words},
+             {"outlier_dim", (int)outlier_dim},
+             {"outlier_qjl_words", (int)outlier_qjl_words},
+             {"n_rows",      (int)n_rows},
+             {"n_seq",       (int)n_seq},
+             {"cache_seq_capacity", (int)cache_seq_capacity},
+             {"q_heads",     (int)q_heads},
+             {"kv_heads",    (int)kv_heads}},
+            std::nullopt, false, {}
+        );
+        new (out_scores->buf) array(outputs[0]);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+int mlx_inline_turboquant_pack_sign_bits(
+    mlx_inline_array*       out,
+    const mlx_inline_array* projected,
+    uint32_t                dim,
+    uint32_t                packed_dim,
+    uint32_t                n_rows)
+{
+    using namespace mlx::core;
+
+    if (dim == 0 || packed_dim == 0 || n_rows == 0) return 1;
+
+    try {
+        auto& kernel = get_turboquant_pack_sign_bits_kernel();
+        auto outputs = kernel(
+            {as_arr(projected)},
+            {{(int)n_rows, (int)packed_dim}},
+            {uint32},
+            {(int)packed_dim, (int)n_rows, 1},
+            {(int)std::min(packed_dim, 256u), 1, 1},
+            {{"dim", (int)dim},
+             {"packed_dim", (int)packed_dim},
+             {"n_rows", (int)n_rows}},
+            std::nullopt, false, {}
+        );
+        new (out->buf) array(outputs[0]);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+int mlx_inline_turboquant_unpack_sign_bits(
+    mlx_inline_array*       out,
+    const mlx_inline_array* packed,
+    uint32_t                dim,
+    uint32_t                packed_dim,
+    uint32_t                n_rows)
+{
+    using namespace mlx::core;
+
+    if (dim == 0 || packed_dim == 0 || n_rows == 0) return 1;
+
+    try {
+        auto& kernel = get_turboquant_unpack_sign_bits_kernel();
+        auto outputs = kernel(
+            {as_arr(packed)},
+            {{(int)n_rows, (int)dim}},
+            {float32},
+            {(int)dim, (int)n_rows, 1},
+            {(int)std::min(dim, 256u), 1, 1},
+            {{"dim", (int)dim},
+             {"packed_dim", (int)packed_dim},
+             {"n_rows", (int)n_rows}},
+            std::nullopt, false, {}
+        );
+        new (out->buf) array(outputs[0]);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+int mlx_inline_turboquant_weighted_decode(
+    mlx_inline_array*       out,
+    const mlx_inline_array* weights,
+    const mlx_inline_array* indices,
+    const mlx_inline_array* norms,
+    const mlx_inline_array* codebook,
+    uint32_t                dim,
+    uint32_t                n_centroids,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads)
+{
+    using namespace mlx::core;
+
+    if (n_centroids == 0 || dim == 0 || n_rows == 0 || n_seq == 0 || kv_heads == 0 || q_heads == 0) return 1;
+    if (cache_seq_capacity < n_seq) return 1;
+    if (q_heads % kv_heads != 0) return 1;
+
+    try {
+        auto& kernel = get_turboquant_weighted_decode_kernel();
+        constexpr uint32_t tg_threads = 32u;
+        auto outputs = kernel(
+            {as_arr(weights), as_arr(indices), as_arr(norms), as_arr(codebook)},
+            {{(int)n_rows, (int)dim}},
+            {float32},
+            {(int)tg_threads, (int)(n_rows * dim), 1},
+            {(int)tg_threads, 1, 1},
+            {{"dim",         (int)dim},
+             {"n_centroids", (int)n_centroids},
+             {"n_rows",      (int)n_rows},
+             {"n_seq",       (int)n_seq},
+             {"cache_seq_capacity", (int)cache_seq_capacity},
+             {"q_heads",     (int)q_heads},
+             {"kv_heads",    (int)kv_heads}},
+            std::nullopt, false, {}
+        );
+        new (out->buf) array(outputs[0]);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+int mlx_inline_turboquant_gather_last_dim(
+    mlx_inline_array*       out,
+    const mlx_inline_array* input,
+    const mlx_inline_array* positions,
+    uint32_t                full_dim,
+    uint32_t                out_dim,
+    uint32_t                n_rows)
+{
+    using namespace mlx::core;
+
+    if (full_dim == 0 || out_dim == 0 || n_rows == 0) return 1;
+
+    try {
+        auto& kernel = get_turboquant_gather_last_dim_kernel();
+        auto outputs = kernel(
+            {as_arr(input), as_arr(positions)},
+            {{(int)n_rows, (int)out_dim}},
+            {float32},
+            {(int)out_dim, (int)n_rows, 1},
+            {(int)std::min(out_dim, 256u), 1, 1},
+            {{"full_dim", (int)full_dim},
+             {"out_dim",  (int)out_dim},
+             {"n_rows",   (int)n_rows}},
+            std::nullopt, false, {}
+        );
+        new (out->buf) array(outputs[0]);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+int mlx_inline_turboquant_scatter_last_dim(
+    mlx_inline_array*       out,
+    const mlx_inline_array* regular,
+    const mlx_inline_array* outlier,
+    const mlx_inline_array* regular_positions,
+    const mlx_inline_array* outlier_positions,
+    uint32_t                full_dim,
+    uint32_t                regular_dim,
+    uint32_t                outlier_dim,
+    uint32_t                n_rows)
+{
+    using namespace mlx::core;
+
+    if (full_dim == 0 || n_rows == 0) return 1;
+
+    try {
+        auto& kernel = get_turboquant_scatter_last_dim_kernel();
+        auto outputs = kernel(
+            {
+                as_arr(regular),
+                as_arr(outlier),
+                as_arr(regular_positions),
+                as_arr(outlier_positions),
+            },
+            {{(int)n_rows, (int)full_dim}},
+            {float32},
+            {(int)full_dim, (int)n_rows, 1},
+            {(int)std::min(full_dim, 256u), 1, 1},
+            {{"full_dim",    (int)full_dim},
+             {"regular_dim", (int)regular_dim},
+             {"outlier_dim", (int)outlier_dim},
              {"n_rows",      (int)n_rows}},
             std::nullopt, false, {}
         );
@@ -1623,6 +2285,134 @@ void mlx_inline_compiled_attn_layer_fixed(
     new (dst_cache_vals->buf) array(result[2]);
 }
 
+void mlx_inline_compiled_moe_layer_fixed(
+    mlx_inline_array* dst_out,
+    const mlx_inline_array* x,
+    const mlx_inline_array* router_w,
+    const mlx_inline_array* moe_gate_w,
+    const mlx_inline_array* moe_up_w,
+    const mlx_inline_array* moe_down_w,
+    const mlx_inline_array* shared_gate_w,
+    const mlx_inline_array* shared_up_w,
+    const mlx_inline_array* shared_down_w,
+    const mlx_inline_array* shared_expert_gate_w,
+    int top_k,
+    bool norm_topk_prob
+) {
+    struct Entry {
+        int batch;
+        int hidden;
+        int num_experts;
+        int routed_hidden;
+        int shared_hidden;
+        int top_k;
+        int dtype;
+        int norm_topk_prob;
+        CompiledFn compiled;
+    };
+    static auto* entries = new std::vector<Entry>();
+
+    int batch = as_arr(x).shape(0);
+    int hidden = as_arr(x).shape(2);
+    int num_experts = as_arr(router_w).shape(1);
+    int routed_hidden = as_arr(moe_down_w).shape(1);
+    int shared_hidden = as_arr(shared_down_w).shape(0);
+    int dtype = static_cast<int>(as_arr(x).dtype().val());
+
+    CompiledFn* compiled = nullptr;
+    for (auto& entry : *entries) {
+        if (entry.batch == batch
+            && entry.hidden == hidden
+            && entry.num_experts == num_experts
+            && entry.routed_hidden == routed_hidden
+            && entry.shared_hidden == shared_hidden
+            && entry.top_k == top_k
+            && entry.dtype == dtype
+            && entry.norm_topk_prob == static_cast<int>(norm_topk_prob)) {
+            compiled = &entry.compiled;
+            break;
+        }
+    }
+
+    if (compiled == nullptr) {
+        int TOPK = top_k;
+        bool NORM_TOPK = norm_topk_prob;
+        entries->push_back(Entry{
+            batch,
+            hidden,
+            num_experts,
+            routed_hidden,
+            shared_hidden,
+            top_k,
+            dtype,
+            static_cast<int>(norm_topk_prob),
+            make_compiled_fixed(
+                [TOPK, NORM_TOPK](const std::vector<array>& ins) -> std::vector<array> {
+                    using namespace mlx::core;
+
+                    auto& x = ins[0];
+                    auto& router_w = ins[1];
+                    auto& moe_gate_w = ins[2];
+                    auto& moe_up_w = ins[3];
+                    auto& moe_down_w = ins[4];
+                    auto& shared_gate_w = ins[5];
+                    auto& shared_up_w = ins[6];
+                    auto& shared_down_w = ins[7];
+                    auto& shared_expert_gate_w = ins[8];
+
+                    int B = x.shape(0);
+                    int S = x.shape(1);
+                    int H = x.shape(2);
+                    int expert_count = router_w.shape(1);
+
+                    auto x_flat = reshape(x, {B * S, H});
+                    auto gates = softmax(matmul(x_flat, router_w), -1, /*precise=*/true);
+                    auto all_inds = argpartition(gates, -TOPK, -1);
+                    auto inds = slice(all_inds, {0, expert_count - TOPK}, {B * S, expert_count});
+                    auto scores = take_along_axis(gates, inds, -1);
+                    if (NORM_TOPK) {
+                        scores = divide(scores, sum(scores, {-1}, true));
+                    }
+
+                    auto switch_in = expand_dims(expand_dims(x_flat, 1), 2);
+                    auto rhs_indices = std::optional<array>(inds);
+                    auto x_gate_exp =
+                        gather_mm(switch_in, moe_gate_w, std::nullopt, rhs_indices, false);
+                    auto x_up_exp =
+                        gather_mm(switch_in, moe_up_w, std::nullopt, rhs_indices, false);
+                    auto x_act = multiply(multiply(x_gate_exp, sigmoid(x_gate_exp)), x_up_exp);
+                    auto y_exp =
+                        squeeze(gather_mm(x_act, moe_down_w, std::nullopt, rhs_indices, false), 2);
+                    auto scores_exp = reshape(scores, {B * S, TOPK, 1});
+                    auto y_routed = sum(multiply(y_exp, scores_exp), {-2}, false);
+
+                    auto sh_gate = matmul(x_flat, shared_gate_w);
+                    auto sh_up = matmul(x_flat, shared_up_w);
+                    auto sh_act = multiply(multiply(sh_gate, sigmoid(sh_gate)), sh_up);
+                    auto sh_out = matmul(sh_act, shared_down_w);
+                    auto sh_scale = sigmoid(matmul(x_flat, shared_expert_gate_w));
+                    auto y_shared = multiply(sh_out, sh_scale);
+
+                    return {reshape(add(y_routed, y_shared), {B, S, H})};
+                })
+        });
+        compiled = &entries->back().compiled;
+    }
+
+    auto result = (*compiled)({
+        as_arr(x),
+        as_arr(router_w),
+        as_arr(moe_gate_w),
+        as_arr(moe_up_w),
+        as_arr(moe_down_w),
+        as_arr(shared_gate_w),
+        as_arr(shared_up_w),
+        as_arr(shared_down_w),
+        as_arr(shared_expert_gate_w),
+    });
+    new (dst_out->buf) array(result[0]);
+}
+
 } // extern "C"
 
 // ============================================================================
@@ -1929,6 +2719,99 @@ static array run_attn_layer(
     return matmul(gated_out, o_w);
 }
 
+// ── MoE block forward ─────────────────────────────────────────────────────
+// Returns the post-attention MoE output for either decode (S=1) or prefill.
+static array run_moe_layer(
+    const array& mlp_in,
+    const array& router_w,
+    const array& moe_gate_w,
+    const array& moe_up_w,
+    const array& moe_down_w,
+    const array& shared_gate_w,
+    const array& shared_up_w,
+    const array& shared_down_w,
+    const array& shared_expert_gate_w,
+    int top_k,
+    bool norm_topk_prob
+) {
+    using namespace mlx::core;
+
+    int B = mlp_in.shape(0);
+    int S = mlp_in.shape(1);
+    int H = mlp_in.shape(2);
+
+    if (S == 1) {
+        mlx_inline_array w_x, w_router, w_moe_gate, w_moe_up, w_moe_down;
+        mlx_inline_array w_shared_gate, w_shared_up, w_shared_down, w_shared_expert_gate;
+        new (w_x.buf) array(mlp_in);
+        new (w_router.buf) array(router_w);
+        new (w_moe_gate.buf) array(moe_gate_w);
+        new (w_moe_up.buf) array(moe_up_w);
+        new (w_moe_down.buf) array(moe_down_w);
+        new (w_shared_gate.buf) array(shared_gate_w);
+        new (w_shared_up.buf) array(shared_up_w);
+        new (w_shared_down.buf) array(shared_down_w);
+        new (w_shared_expert_gate.buf) array(shared_expert_gate_w);
+
+        mlx_inline_array dst_out;
+        mlx_inline_compiled_moe_layer_fixed(
+            &dst_out,
+            &w_x,
+            &w_router,
+            &w_moe_gate,
+            &w_moe_up,
+            &w_moe_down,
+            &w_shared_gate,
+            &w_shared_up,
+            &w_shared_down,
+            &w_shared_expert_gate,
+            top_k,
+            norm_topk_prob);
+
+        as_arr(&w_x).~array();
+        as_arr(&w_router).~array();
+        as_arr(&w_moe_gate).~array();
+        as_arr(&w_moe_up).~array();
+        as_arr(&w_moe_down).~array();
+        as_arr(&w_shared_gate).~array();
+        as_arr(&w_shared_up).~array();
+        as_arr(&w_shared_down).~array();
+        as_arr(&w_shared_expert_gate).~array();
+
+        array out = as_arr(&dst_out);
+        as_arr(&dst_out).~array();
+        return out;
+    }
+
+    auto x_flat = reshape(mlp_in, {B * S, H});
+    auto gates = softmax(matmul(x_flat, router_w), -1, /*precise=*/true);
+    int expert_count = router_w.shape(1);
+    auto all_inds = argpartition(gates, -top_k, -1);
+    auto inds = slice(all_inds, {0, expert_count - top_k}, {B * S, expert_count});
+    auto scores = take_along_axis(gates, inds, -1);
+    if (norm_topk_prob) {
+        scores = divide(scores, sum(scores, {-1}, true));
+    }
+
+    auto switch_in = expand_dims(expand_dims(x_flat, 1), 2);
+    auto rhs_indices = std::optional<array>(inds);
+    auto x_gate_exp = gather_mm(switch_in, moe_gate_w, std::nullopt, rhs_indices, false);
+    auto x_up_exp = gather_mm(switch_in, moe_up_w, std::nullopt, rhs_indices, false);
+    auto x_act = multiply(multiply(x_gate_exp, sigmoid(x_gate_exp)), x_up_exp);
+    auto y_exp = squeeze(gather_mm(x_act, moe_down_w, std::nullopt, rhs_indices, false), 2);
+    auto scores_exp = reshape(scores, {B * S, top_k, 1});
+    auto y_routed = sum(multiply(y_exp, scores_exp), {-2}, false);
+
+    auto sh_gate = matmul(x_flat, shared_gate_w);
+    auto sh_up = matmul(x_flat, shared_up_w);
+    auto sh_act = multiply(multiply(sh_gate, sigmoid(sh_gate)), sh_up);
+    auto sh_out = matmul(sh_act, shared_down_w);
+    auto sh_scale = sigmoid(matmul(x_flat, shared_expert_gate_w));
+    auto y_shared = multiply(sh_out, sh_scale);
+
+    return reshape(add(y_routed, y_shared), {B, S, H});
+}
+
 // ── Main entry point ──────────────────────────────────────────────────────
 void mlx_inline_qwen35_decode_step(
     mlx_inline_array*              dst_logits,
@@ -1965,6 +2848,9 @@ void mlx_inline_qwen35_decode_step(
     const int  attn_rope_dims     = config_ints[15];
     const int  full_attn_interval = config_ints[16];
     const bool tie_embeddings     = (config_ints[17] != 0);
+    const int  moe_top_k          = config_ints[18];
+    const bool moe_norm_topk_prob = (config_ints[19] != 0);
+    const int* layer_is_moe       = config_ints + 20;
 
     // ── Unpack config floats ───────────────────────────────────────────────
     const float final_norm_eps   = config_floats[0];
@@ -2049,13 +2935,29 @@ void mlx_inline_qwen35_decode_step(
         // Residual: h = hidden + layer_out
         auto h = add(hidden, layer_out);
 
-        // Post-attention LayerNorm + SwiGLU MLP (fused inline, no FFI)
+        // Post-attention LayerNorm + dense / MoE MLP.
         auto mlp_in  = fast::rms_norm(h, W(weight_ptrs, base + 1), post_eps);
-        auto gate_v  = matmul(mlp_in, W(weight_ptrs, base + 2));  // gate_w
-        auto up_v    = matmul(mlp_in, W(weight_ptrs, base + 3));  // up_w
-        // silu(gate) * up — inlined (matches fused_swiglu exactly)
-        auto swiglu  = multiply(multiply(gate_v, sigmoid(gate_v)), up_v);
-        auto mlp_out = matmul(swiglu, W(weight_ptrs, base + 4));  // down_w
+        array mlp_out(0.0f);
+        if (layer_is_moe[li] != 0) {
+            mlp_out = run_moe_layer(
+                mlp_in,
+                W(weight_ptrs, base + 2),   // moe_router_w
+                W(weight_ptrs, base + 3),   // moe_gate_w
+                W(weight_ptrs, base + 4),   // moe_up_w
+                W(weight_ptrs, base + 16),  // moe_down_w
+                W(weight_ptrs, base + 17),  // shared_gate_w
+                W(weight_ptrs, base + 18),  // shared_up_w
+                W(weight_ptrs, base + 19),  // shared_down_w
+                W(weight_ptrs, base + 20),  // shared_expert_gate_w
+                moe_top_k,
+                moe_norm_topk_prob
+            );
+        } else {
+            auto gate_v = matmul(mlp_in, W(weight_ptrs, base + 2));  // gate_w
+            auto up_v = matmul(mlp_in, W(weight_ptrs, base + 3));    // up_w
+            auto swiglu = multiply(multiply(gate_v, sigmoid(gate_v)), up_v);
+            mlp_out = matmul(swiglu, W(weight_ptrs, base + 4));      // down_w
+        }
 
         // Residual: hidden = h + mlp_out
         hidden = add(h, mlp_out);

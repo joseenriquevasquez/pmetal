@@ -21,6 +21,16 @@ use crate::InlineArray;
 use crate::inline_array as bridge;
 use crate::inline_array::RawBuf;
 
+fn turboquant_trace_enabled() -> bool {
+    std::env::var_os("PMETAL_TRACE_TURBOQUANT").is_some()
+}
+
+fn trace_turboquant_qwen(message: &str) {
+    if turboquant_trace_enabled() {
+        eprintln!("[TURBOQUANT TRACE][QWEN] {message}");
+    }
+}
+
 // ============================================================================
 // Config
 // ============================================================================
@@ -34,14 +44,20 @@ fn default_quantization_bits() -> i32 {
 fn default_quantization_group_size() -> i32 {
     64
 }
+fn default_intermediate_size() -> i32 {
+    14_336
+}
 fn default_rope_theta() -> f64 {
-    1_000_000.0
+    100_000.0
 }
 fn default_true() -> bool {
     true
 }
 fn default_full_attn_interval() -> i32 {
     4
+}
+fn default_decoder_sparse_step() -> i32 {
+    1
 }
 fn default_conv_kernel() -> i32 {
     4
@@ -72,6 +88,7 @@ pub struct Qwen3Config {
     pub head_dim: Option<i32>,
 
     /// Dense MLP intermediate size.
+    #[serde(default = "default_intermediate_size")]
     pub intermediate_size: i32,
 
     #[serde(default = "default_rms_norm_eps")]
@@ -114,13 +131,13 @@ pub struct Qwen3Config {
     pub num_experts: i32,
     #[serde(default)]
     pub num_experts_per_tok: i32,
-    #[serde(default)]
+    #[serde(default = "default_decoder_sparse_step")]
     pub decoder_sparse_step: i32,
     #[serde(default)]
     pub shared_expert_intermediate_size: i32,
     #[serde(default)]
     pub moe_intermediate_size: i32,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub norm_topk_prob: bool,
     /// Layer indices that use dense MLP even when MoE is active.
     #[serde(default)]
@@ -147,16 +164,23 @@ pub struct QuantizationConfig {
 struct RopeParameters {
     #[serde(default)]
     partial_rotary_factor: Option<f64>,
+    #[serde(default)]
+    rope_theta: Option<f64>,
 }
 
 impl Qwen3Config {
     /// Promote nested `rope_parameters.partial_rotary_factor` when the
     /// top-level field is absent. Call once after deserializing.
     pub fn finalize(&mut self) {
-        if self.partial_rotary_factor.is_none() {
-            if let Some(ref rp) = self.rope_parameters.clone() {
+        if let Some(ref rp) = self.rope_parameters.clone() {
+            if self.partial_rotary_factor.is_none() {
                 if let Some(prf) = rp.partial_rotary_factor {
                     self.partial_rotary_factor = Some(prf);
+                }
+            }
+            if self.rope_theta == default_rope_theta() {
+                if let Some(theta) = rp.rope_theta {
+                    self.rope_theta = theta;
                 }
             }
         }
@@ -251,6 +275,10 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<Qwen3Config, String> {
     let path = model_dir.join("config.json");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    parse_config_text(&text)
+}
+
+fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
 
@@ -275,13 +303,138 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<Qwen3Config, String> {
         }
         serde_json::to_string(&tc).map_err(|e| e.to_string())?
     } else {
-        text
+        text.to_owned()
     };
 
     let mut cfg: Qwen3Config =
         serde_json::from_str(&config_str).map_err(|e| format!("failed to parse config: {e}"))?;
     cfg.finalize();
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        QwenDecodeBackend, canonical_decode_backend, moe_switch_glu_input, parse_config_text,
+    };
+    use crate::{compat::Dtype, inline_array::InlineArray};
+
+    #[test]
+    fn parse_nested_qwen35_promotes_rope_parameters() {
+        let config = parse_config_text(
+            r#"{
+                "model_type": "qwen3_5",
+                "text_config": {
+                    "model_type": "qwen3_5_text",
+                    "hidden_size": 1536,
+                    "num_hidden_layers": 28,
+                    "num_attention_heads": 12,
+                    "num_key_value_heads": 2,
+                    "head_dim": 128,
+                    "intermediate_size": 3584,
+                    "rope_parameters": {
+                        "rope_theta": 10000000.0,
+                        "partial_rotary_factor": 0.25,
+                        "rope_type": "default"
+                    }
+                }
+            }"#,
+        )
+        .expect("config parses");
+
+        assert_eq!(config.model_type, "qwen3_5_text");
+        assert_eq!(config.rope_theta, 10_000_000.0);
+        assert_eq!(config.partial_rotary_factor, Some(0.25));
+    }
+
+    #[test]
+    fn parse_qwen35_moe_uses_mlx_reference_defaults_for_missing_fields() {
+        let config = parse_config_text(
+            r#"{
+                "model_type": "qwen3_5_moe",
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text",
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 40,
+                    "num_attention_heads": 16,
+                    "num_key_value_heads": 2,
+                    "head_dim": 256,
+                    "num_experts": 256,
+                    "num_experts_per_tok": 8,
+                    "moe_intermediate_size": 512,
+                    "shared_expert_intermediate_size": 512,
+                    "rope_parameters": {
+                        "rope_theta": 10000000.0,
+                        "partial_rotary_factor": 0.25,
+                        "rope_type": "default"
+                    }
+                }
+            }"#,
+        )
+        .expect("moe config parses");
+
+        assert!(config.is_moe());
+        assert_eq!(config.intermediate_size, 14_336);
+        assert_eq!(config.decoder_sparse_step, 1);
+        assert!(config.norm_topk_prob);
+        assert_eq!(config.rope_theta, 10_000_000.0);
+    }
+
+    #[test]
+    fn moe_switch_glu_input_matches_mlx_rank_contract() {
+        let dt = Dtype::Bfloat16.as_i32();
+        let x_flat = InlineArray::ones(&[3, 4], dt);
+        let switch_in = moe_switch_glu_input(&x_flat);
+        assert_eq!(switch_in.shape(), &[3, 1, 1, 4]);
+    }
+
+    #[test]
+    fn canonical_decode_backend_prefers_rust_bridge_for_qwen35_moe() {
+        let config = parse_config_text(
+            r#"{
+                "model_type": "qwen3_5_moe",
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text",
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 40,
+                    "num_attention_heads": 16,
+                    "num_key_value_heads": 2,
+                    "head_dim": 256,
+                    "num_experts": 256,
+                    "num_experts_per_tok": 8,
+                    "moe_intermediate_size": 512,
+                    "shared_expert_intermediate_size": 512
+                }
+            }"#,
+        )
+        .expect("moe config parses");
+
+        assert_eq!(
+            canonical_decode_backend(&config, None),
+            QwenDecodeBackend::RustBridge
+        );
+    }
+
+    #[test]
+    fn reserve_decode_inputs_grows_dense_kv_to_exact_target() {
+        let dt = Dtype::Bfloat16.as_i32();
+        let mut cache = super::NativeCache {
+            gdn_caches: Vec::new(),
+            kv_caches: vec![super::KvLayerCache {
+                keys: Some(InlineArray::zeros(&[1, 2, 16, 8], dt)),
+                values: Some(InlineArray::zeros(&[1, 2, 16, 8], dt)),
+                offset: 12,
+                turboquant: None,
+            }],
+            rope_offset: 0,
+            turboquant_state: None,
+        };
+
+        cache.reserve_decode_inputs(5, dt);
+
+        assert_eq!(cache.kv_caches[0].keys.as_ref().unwrap().dim(2), 17);
+        assert_eq!(cache.kv_caches[0].values.as_ref().unwrap().dim(2), 17);
+    }
 }
 
 // ============================================================================
@@ -624,6 +777,9 @@ impl NativeCache {
             if let Some(ref mut v) = c.values {
                 to_eval.push(v);
             }
+            if let Some(ref mut tq) = c.turboquant {
+                tq.eval_and_detach_gpu_state();
+            }
         }
         // Batch eval then detach each.
         bridge::eval_and_detach_many(&mut to_eval);
@@ -679,6 +835,67 @@ impl NativeCache {
             rope_offset: 0,
             turboquant_state: tq_state,
         }
+    }
+
+    fn reserve_decode_inputs(&mut self, additional_tokens: i32, dtype: i32) {
+        if additional_tokens <= 0 {
+            return;
+        }
+
+        let mut changed_indices = Vec::new();
+        for (idx, cache) in self.kv_caches.iter_mut().enumerate() {
+            if cache.turboquant.is_some() {
+                continue;
+            }
+
+            let Some(keys) = cache.keys.take() else {
+                continue;
+            };
+            let Some(values) = cache.values.take() else {
+                cache.keys = Some(keys);
+                continue;
+            };
+
+            let current_capacity = keys.dim(2);
+            let target_capacity = cache.offset + additional_tokens;
+            if target_capacity <= current_capacity {
+                cache.keys = Some(keys);
+                cache.values = Some(values);
+                continue;
+            }
+
+            let extend = target_capacity - current_capacity;
+            let ext_keys =
+                InlineArray::zeros(&[keys.dim(0), keys.dim(1), extend, keys.dim(3)], dtype);
+            let ext_values = InlineArray::zeros(
+                &[values.dim(0), values.dim(1), extend, values.dim(3)],
+                dtype,
+            );
+            cache.keys = Some(keys.kv_cache_append(&ext_keys, 2));
+            cache.values = Some(values.kv_cache_append(&ext_values, 2));
+            changed_indices.push(idx);
+        }
+
+        if changed_indices.is_empty() {
+            return;
+        }
+
+        let mut changed_ptrs: Vec<*mut InlineArray> = Vec::new();
+        for idx in changed_indices {
+            let cache = &mut self.kv_caches[idx];
+            if let Some(ref mut keys) = cache.keys {
+                changed_ptrs.push(keys as *mut InlineArray);
+            }
+            if let Some(ref mut values) = cache.values {
+                changed_ptrs.push(values as *mut InlineArray);
+            }
+        }
+
+        let mut to_eval: Vec<&mut InlineArray> = changed_ptrs
+            .into_iter()
+            .map(|ptr| unsafe { &mut *ptr })
+            .collect();
+        bridge::eval_and_detach_many(&mut to_eval);
     }
 }
 
@@ -934,11 +1151,17 @@ pub fn load_model(
         }
     }
 
-    // 3e. MoE expert weight stacking.
+    // 3e. MoE expert weight stacking / normalization.
     //
     // Python's sanitize() stacks per-expert weights into [E, out, in]:
     //   to_join = [weights[f"{prefix}.experts.{e}.{n}.weight"] for e in range(E)]
     //   weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(to_join)
+    //
+    // Newer Qwen3.5 MoE checkpoints already ship experts in a packed form:
+    //   - `{prefix}.experts.gate_up_proj` : [E, 2H, in]
+    //   - `{prefix}.experts.down_proj`    : [E, out, H]
+    // We normalize both layouts into the same `switch_mlp.*` keys so the hot
+    // path stays identical.
     //
     // For dense weights:
     //   `gather_mm` in SwitchLinear calls `weight.swapaxes(-1,-2)` at forward
@@ -961,6 +1184,40 @@ pub fn load_model(
                 continue;
             }
             let prefix = format!("model.layers.{li}.mlp");
+            let packed_gate_up_key = format!("{prefix}.experts.gate_up_proj");
+            let packed_down_key = format!("{prefix}.experts.down_proj");
+            if raw.contains_key(&packed_gate_up_key) && raw.contains_key(&packed_down_key) {
+                let gate_up = raw.remove(&packed_gate_up_key).ok_or_else(|| {
+                    format!("MoE: missing packed expert tensor {packed_gate_up_key}")
+                })?;
+                let down = raw.remove(&packed_down_key).ok_or_else(|| {
+                    format!("MoE: missing packed expert tensor {packed_down_key}")
+                })?;
+                let hidden = config.moe_intermediate_size;
+                if hidden <= 0 {
+                    return Err(format!(
+                        "MoE: invalid moe_intermediate_size={} for packed expert weights at layer {li}",
+                        hidden
+                    ));
+                }
+
+                // gate_up: [E, 2H, in] -> split into gate/up [E, H, in], then
+                // transpose to [E, in, H] for gather_mm.
+                let gate = gate_up
+                    .index((.., 0..hidden, ..))
+                    .transpose_axes(&[0, 2, 1]);
+                let up = gate_up
+                    .index((.., hidden..(hidden * 2), ..))
+                    .transpose_axes(&[0, 2, 1]);
+                // down: [E, out, H] -> [E, H, out] for gather_mm.
+                let down = down.transpose_axes(&[0, 2, 1]);
+
+                raw.insert(format!("{prefix}.switch_mlp.gate_proj.weight"), gate);
+                raw.insert(format!("{prefix}.switch_mlp.up_proj.weight"), up);
+                raw.insert(format!("{prefix}.switch_mlp.down_proj.weight"), down);
+                continue;
+            }
+
             for proj in &["gate_proj", "up_proj", "down_proj"] {
                 // Detect whether first expert is quantized.
                 let is_quantized = raw.contains_key(&format!("{prefix}.experts.0.{proj}.scales"));
@@ -1341,6 +1598,12 @@ pub fn load_model(
     //
     // For LayerWeight: `LayerWeight::copy_fresh` handles each tensor (weight,
     // scales, biases) independently using a same-dtype zero.
+    //
+    // Drop the raw safetensors handle map first. Large checkpoints like
+    // Qwen3.5-35B-A3B otherwise keep both the raw handle set and the copied
+    // weights live through the entire pass, needlessly spiking load-time peak
+    // memory and causing benchmark/process kills under pressure.
+    drop(raw);
     let zero = InlineArray::from_f32(0.0).as_dtype(model_dtype);
     let cf_arr = |w: &InlineArray| -> InlineArray { copy_fresh_arr(w, &zero) };
     let cf_lw = |w: &LayerWeight| -> LayerWeight { w.copy_fresh(&zero) };
@@ -1506,11 +1769,18 @@ pub fn forward_step(
         } else {
             weights.embed_w.take_axis(token_ids, 0)
         };
+    let trace_qwen35 = std::env::var_os("PMETAL_TRACE_QWEN35").is_some();
 
     let mut gdn_slot = 0usize;
     let mut attn_slot = 0usize;
 
-    for lw in weights.layers.iter() {
+    for (layer_idx, lw) in weights.layers.iter().enumerate() {
+        if trace_qwen35 {
+            eprintln!(
+                "[QWEN35 TRACE] layer={layer_idx} start linear={} moe={} rope_offset={} seq={s}",
+                lw.is_linear, lw.is_moe_layer, cache.rope_offset
+            );
+        }
         // Input LayerNorm
         let normed = hidden.rms_norm(Some(&lw.input_ln_w), lw.input_ln_eps);
 
@@ -1531,6 +1801,9 @@ pub fn forward_step(
             attn_slot += 1;
             result
         };
+        if trace_qwen35 {
+            eprintln!("[QWEN35 TRACE] layer={layer_idx} after_attention");
+        }
 
         // Residual
         let h = hidden.add(&r);
@@ -1542,6 +1815,9 @@ pub fn forward_step(
         } else {
             dense_mlp_forward(lw, &mlp_in)
         };
+        if trace_qwen35 {
+            eprintln!("[QWEN35 TRACE] layer={layer_idx} after_mlp");
+        }
 
         // Residual
         hidden = h.add(&mlp_out);
@@ -1720,15 +1996,19 @@ fn dense_mlp_forward_lora(
 // Input x: [B, T, hidden].  For decode T=1, B=1 → x is [1, 1, hidden].
 // We work in [B*T, hidden] = [S, hidden] throughout, then reshape back.
 
-fn moe_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
-    let b = x.dim(0);
-    let t = x.dim(1);
-    let h = x.dim(2);
-    let s = b * t; // flattened sequence length
-    let top_k = lw.moe_top_k;
+#[inline]
+fn moe_switch_glu_input(x_flat: &InlineArray) -> InlineArray {
+    debug_assert_eq!(x_flat.ndim(), 2);
+    // MLX SwitchGLU does `mx.expand_dims(x, (-2, -3))` before gather_mm. Use
+    // positive axes here so insertion order is unambiguous and yields the same
+    // `[S, 1, 1, hidden]` layout for flattened `[S, hidden]` inputs.
+    x_flat.expand_dims(1).expand_dims(2)
+}
 
-    // Flatten to [S, hidden].
-    let x_flat = x.reshape(&[s, h]);
+#[inline]
+fn moe_routed_forward(lw: &LayerWeights, x_flat: &InlineArray) -> InlineArray {
+    let s = x_flat.dim(0);
+    let top_k = lw.moe_top_k;
 
     // ── Router ──────────────────────────────────────────────────────────────
     // gates: [S, num_experts]
@@ -1749,46 +2029,92 @@ fn moe_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
         scores = scores.divide(&score_sum);
     }
 
-    // ── Expert dispatch via gather_mm / gather_qmm ───────────────────────────
+    // ── Expert dispatch via gather_mm / gather_qmm ─────────────────────────
     //
-    // SwitchGLU: x_up = gather_mm(x, up_w, rhs_indices=inds)
-    //            x_gate = gather_mm(x, gate_w, rhs_indices=inds)
-    //            x_act = silu(x_gate) * x_up
-    //            y = gather_mm(x_act, down_w, rhs_indices=inds)
+    // Mirror MLX SwitchGLU rank semantics exactly:
+    //   x: [S, hidden] -> [S, 1, 1, hidden]
+    //   up/gate gather_mm -> [S, top_k, 1, moe_intermediate]
+    //   down gather_mm -> [S, top_k, 1, hidden]
+    //   squeeze(-2) -> [S, top_k, hidden]
     //
-    // gather_mm(a [S, in], b [E, in, out], rhs_indices [S, k]) → [S, k, out]
-    //
-    // For dense expert weights: [E, in, out] pre-transposed.
-    // For quantized: gather_qmm dispatches to mx.gather_qmm with transpose=true.
-    //
-    // The `sorted` flag is omitted (false) for simplicity — matches Python's
-    // do_sort=True only when indices.size >= 64. For the common decode case
-    // (S=1, top_k=8, indices.size=8) do_sort is false in Python too.
+    // Without these singleton axes, the down projection can reinterpret the
+    // sequence axis as an additional batch dimension and produce
+    // `[S, top_k, S, hidden]`, which then breaks score broadcasting.
+    let switch_in = moe_switch_glu_input(x_flat);
     let x_gate_exp =
         lw.moe_gate_w
             .as_ref()
             .unwrap()
-            .gather_mm_from(&x_flat, None, Some(&inds), false);
-    let x_up_exp = lw
-        .moe_up_w
-        .as_ref()
-        .unwrap()
-        .gather_mm_from(&x_flat, None, Some(&inds), false);
+            .gather_mm_from(&switch_in, None, Some(&inds), false);
+    let x_up_exp =
+        lw.moe_up_w
+            .as_ref()
+            .unwrap()
+            .gather_mm_from(&switch_in, None, Some(&inds), false);
 
     // Fused swiglu: silu(gate) * up
     let x_act = InlineArray::fused_swiglu(&x_gate_exp, &x_up_exp);
 
-    // gather_mm for down projection: [S, k, moe_intermediate] × [E, moe_intermediate, hidden]
-    // → [S, k, hidden]
+    // gather_mm for down projection: [S, top_k, 1, moe_intermediate] ×
+    // [E, moe_intermediate, hidden] → [S, top_k, 1, hidden]
     let y_exp = lw
         .moe_down_w
         .as_ref()
         .unwrap()
-        .gather_mm_from(&x_act, None, Some(&inds), false);
+        .gather_mm_from(&x_act, None, Some(&inds), false)
+        .squeeze(-2);
 
-    // Weighted sum over top_k: [S, k, hidden] * [S, k, 1] → sum(-2) → [S, hidden]
+    // Weighted sum over top_k: [S, top_k, hidden] * [S, top_k, 1] →
+    // sum(-2) → [S, hidden]
     let scores_exp = scores.reshape(&[s, top_k, 1]);
-    let y_routed = y_exp.multiply(&scores_exp).sum_axis(-2, false);
+    y_exp.multiply(&scores_exp).sum_axis(-2, false)
+}
+
+fn moe_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
+    let b = x.dim(0);
+    let t = x.dim(1);
+    let h = x.dim(2);
+    let s = b * t; // flattened sequence length
+
+    if s == 1 {
+        if let (
+            Some(ref router_w),
+            Some(LayerWeight::Dense(moe_gate_w)),
+            Some(LayerWeight::Dense(moe_up_w)),
+            Some(LayerWeight::Dense(moe_down_w)),
+            Some(LayerWeight::Dense(shared_gate_w)),
+            Some(LayerWeight::Dense(shared_up_w)),
+            Some(LayerWeight::Dense(shared_down_w)),
+            Some(ref shared_expert_gate_w),
+        ) = (
+            lw.moe_router_w.as_ref(),
+            lw.moe_gate_w.as_ref(),
+            lw.moe_up_w.as_ref(),
+            lw.moe_down_w.as_ref(),
+            lw.shared_gate_w.as_ref(),
+            lw.shared_up_w.as_ref(),
+            lw.shared_down_w.as_ref(),
+            lw.shared_expert_gate_w.as_ref(),
+        ) {
+            return InlineArray::compiled_moe_layer_fixed(
+                x,
+                router_w,
+                moe_gate_w,
+                moe_up_w,
+                moe_down_w,
+                shared_gate_w,
+                shared_up_w,
+                shared_down_w,
+                shared_expert_gate_w,
+                lw.moe_top_k,
+                lw.moe_norm_topk_prob,
+            );
+        }
+    }
+
+    // Flatten to [S, hidden].
+    let x_flat = x.reshape(&[s, h]);
+    let y_routed = moe_routed_forward(lw, &x_flat);
 
     // ── Shared expert ────────────────────────────────────────────────────────
     //
@@ -1972,7 +2298,6 @@ fn attn_forward(
     let scale = lw.attn_scale;
     let prev = cache.offset;
     let next = prev + s;
-
     if cache.keys.is_none() {
         let alloc = ((next + 255) / 256) * 256;
         cache.keys = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
@@ -1997,12 +2322,8 @@ fn attn_forward(
             Some(LayerWeight::Dense(k_w)),
             Some(LayerWeight::Dense(v_w)),
             Some(LayerWeight::Dense(o_w)),
-        ) = (
-            &lw.attn_q_w,
-            &lw.attn_k_w,
-            &lw.attn_v_w,
-            &lw.attn_o_w,
-        ) {
+        ) = (&lw.attn_q_w, &lw.attn_k_w, &lw.attn_v_w, &lw.attn_o_w)
+        {
             let cache_keys = cache.keys.take().unwrap();
             let cache_vals = cache.values.take().unwrap();
             let (output, new_cache_keys, new_cache_vals) = InlineArray::compiled_attn_layer_fixed(
@@ -2092,15 +2413,51 @@ fn attn_forward(
 
     // KV cache update + SDPA
     let output = if let Some(ref mut tq_cache) = cache.turboquant {
-        // TurboQuant path: quantize new K,V and store compressed
-        tq_cache.append(&keys, &values).ok();
-        // Dequantize full cache for SDPA
-        let full_keys = tq_cache.dequantize_keys().unwrap_or_else(|| keys.clone());
-        let full_values = tq_cache
-            .dequantize_values()
-            .unwrap_or_else(|| values.clone());
-        cache.offset = next;
-        crate::decode::sdpa_causal_like_mlx(&queries, &full_keys, &full_values, scale, s)
+        if s == 1 {
+            match tq_cache.append_and_compute_attention(&queries, &keys, &values, scale) {
+                Ok(output) => {
+                    cache.offset = next;
+                    output
+                }
+                Err(err) => {
+                    trace_turboquant_qwen(&format!(
+                        "decode_fallback=append_and_compute_attention_err seq={} prev={} err={}",
+                        next, prev, err
+                    ));
+                    tq_cache.append(&keys, &values).ok();
+                    let full_keys = tq_cache.dequantize_keys().unwrap_or_else(|| keys.clone());
+                    let full_values = tq_cache
+                        .dequantize_values()
+                        .unwrap_or_else(|| values.clone());
+                    cache.offset = next;
+                    crate::decode::sdpa_causal_like_mlx(
+                        &queries,
+                        &full_keys,
+                        &full_values,
+                        scale,
+                        s,
+                    )
+                }
+            }
+        } else {
+            tq_cache.append(&keys, &values).ok();
+            cache.offset = next;
+            if prev == 0 {
+                trace_turboquant_qwen(&format!("prefill_path=dense_prompt_only seq={}", next));
+                crate::decode::sdpa_causal_like_mlx(&queries, &keys, &values, scale, s)
+            } else {
+                trace_turboquant_qwen(&format!(
+                    "prefill_fallback=full_dequantized seq={} prev={}",
+                    next, prev
+                ));
+                let full_keys = tq_cache.dequantize_keys().unwrap_or_else(|| keys.clone());
+                let full_values = tq_cache
+                    .dequantize_values()
+                    .unwrap_or_else(|| values.clone());
+                cache.offset = next;
+                crate::decode::sdpa_causal_like_mlx(&queries, &full_keys, &full_values, scale, s)
+            }
+        }
     } else {
         // Standard bf16 path
         let start = [0, 0, prev, 0];
@@ -2222,7 +2579,6 @@ fn attn_forward_lora(
     let prev = cache.offset;
     let num_new = keys.dim(2);
     let next = prev + num_new;
-
     if cache.keys.is_none() {
         let alloc = 256i32;
         cache.keys = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
@@ -2240,13 +2596,50 @@ fn attn_forward_lora(
     }
 
     let output = if let Some(ref mut tq_cache) = cache.turboquant {
-        tq_cache.append(&keys, &values).ok();
-        let full_keys = tq_cache.dequantize_keys().unwrap_or_else(|| keys.clone());
-        let full_values = tq_cache
-            .dequantize_values()
-            .unwrap_or_else(|| values.clone());
-        cache.offset = next;
-        crate::decode::sdpa_causal_like_mlx(&queries, &full_keys, &full_values, scale, s)
+        if s == 1 {
+            match tq_cache.append_and_compute_attention(&queries, &keys, &values, scale) {
+                Ok(output) => {
+                    cache.offset = next;
+                    output
+                }
+                Err(err) => {
+                    trace_turboquant_qwen(&format!(
+                        "decode_fallback=append_and_compute_attention_err seq={} prev={} err={}",
+                        next, prev, err
+                    ));
+                    tq_cache.append(&keys, &values).ok();
+                    let full_keys = tq_cache.dequantize_keys().unwrap_or_else(|| keys.clone());
+                    let full_values = tq_cache
+                        .dequantize_values()
+                        .unwrap_or_else(|| values.clone());
+                    cache.offset = next;
+                    crate::decode::sdpa_causal_like_mlx(
+                        &queries,
+                        &full_keys,
+                        &full_values,
+                        scale,
+                        s,
+                    )
+                }
+            }
+        } else {
+            tq_cache.append(&keys, &values).ok();
+            cache.offset = next;
+            if prev == 0 {
+                trace_turboquant_qwen(&format!("prefill_path=dense_prompt_only seq={}", next));
+                crate::decode::sdpa_causal_like_mlx(&queries, &keys, &values, scale, s)
+            } else {
+                trace_turboquant_qwen(&format!(
+                    "prefill_fallback=full_dequantized seq={} prev={}",
+                    next, prev
+                ));
+                let full_keys = tq_cache.dequantize_keys().unwrap_or_else(|| keys.clone());
+                let full_values = tq_cache
+                    .dequantize_values()
+                    .unwrap_or_else(|| values.clone());
+                crate::decode::sdpa_causal_like_mlx(&queries, &full_keys, &full_values, scale, s)
+            }
+        }
     } else {
         let start = [0, 0, prev, 0];
         let stop = [b, n_kv_heads, next, head_dim];
@@ -2298,39 +2691,9 @@ fn moe_forward_lora(
     let t = x.dim(1);
     let h = x.dim(2);
     let s = b * t;
-    let top_k = lw.moe_top_k;
 
     let x_flat = x.reshape(&[s, h]);
-    let gates = x_flat
-        .matmul(lw.moe_router_w.as_ref().unwrap())
-        .softmax_precise(-1);
-    let all_inds = gates.argpartition(-top_k, -1);
-    let ne = gates.dim(1);
-    let inds = all_inds.slice(&[0, ne - top_k], &[s, ne]);
-    let mut scores = gates.take_along_axis(&inds, -1);
-    if lw.moe_norm_topk_prob {
-        let score_sum = scores.sum_axis(-1, true);
-        scores = scores.divide(&score_sum);
-    }
-
-    let x_gate_exp =
-        lw.moe_gate_w
-            .as_ref()
-            .unwrap()
-            .gather_mm_from(&x_flat, None, Some(&inds), false);
-    let x_up_exp = lw
-        .moe_up_w
-        .as_ref()
-        .unwrap()
-        .gather_mm_from(&x_flat, None, Some(&inds), false);
-    let x_act = InlineArray::fused_swiglu(&x_gate_exp, &x_up_exp);
-    let y_exp = lw
-        .moe_down_w
-        .as_ref()
-        .unwrap()
-        .gather_mm_from(&x_act, None, Some(&inds), false);
-    let scores_exp = scores.reshape(&[s, top_k, 1]);
-    let y_routed = y_exp.multiply(&scores_exp).sum_axis(-2, false);
+    let y_routed = moe_routed_forward(lw, &x_flat);
 
     // Shared expert: LoRA-adapted
     let sh_gate = lw.shared_gate_w.as_ref().unwrap().matmul_from_lora(
@@ -2366,6 +2729,16 @@ pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
     crate::decode::sample_token(logits_2d, temperature)
 }
 
+/// Run prompt prefill and return the first sampled token.
+pub fn prefill_first_token(
+    weights: &NativeWeights,
+    cache: &mut NativeCache,
+    input_ids: &[u32],
+    temperature: f32,
+) -> u32 {
+    crate::decode::prefill_first_token(weights, cache, input_ids, temperature, forward_step)
+}
+
 // ============================================================================
 // Generation loop
 // ============================================================================
@@ -2377,108 +2750,75 @@ pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
 /// `false` to stop early (e.g. on EOS).
 ///
 /// Returns all generated token IDs (not including `first_token`).
-fn begin_generation_session(
-    weights: &NativeWeights,
-    cache: &mut NativeCache,
-    reset_peak_memory: bool,
-    log_session: bool,
-) {
-    if reset_peak_memory {
-        crate::decode::begin_generation_session("NATIVE", weights.model_dtype);
-    } else if log_session {
-        crate::decode::begin_generation_session_preserve_peak("NATIVE", weights.model_dtype);
-    } else {
-        crate::decode::begin_generation_session_preserve_peak_silent("NATIVE", weights.model_dtype);
+fn prepare_generation_cache(cache: &mut NativeCache, reserve_decode_inputs: i32, model_dtype: i32) {
+    let trace_qwen35 = std::env::var_os("PMETAL_TRACE_QWEN35").is_some();
+    if trace_qwen35 {
+        eprintln!("[QWEN35 TRACE] begin_generation_session before_eval_and_detach");
     }
-
-    // Evaluate and detach all prefill cache states before decode.
     cache.eval_and_detach_states();
-    bridge::clear_cache();
+    if trace_qwen35 {
+        eprintln!("[QWEN35 TRACE] begin_generation_session after_eval_and_detach");
+    }
+    cache.reserve_decode_inputs(reserve_decode_inputs, model_dtype);
+    if trace_qwen35 {
+        eprintln!(
+            "[QWEN35 TRACE] begin_generation_session after_reserve decode_inputs={reserve_decode_inputs}"
+        );
+    }
+    if std::env::var_os("PMETAL_SKIP_CLEAR_CACHE").is_none() {
+        bridge::clear_cache();
+        if trace_qwen35 {
+            eprintln!("[QWEN35 TRACE] begin_generation_session after_clear_cache");
+        }
+    } else if trace_qwen35 {
+        eprintln!("[QWEN35 TRACE] begin_generation_session skipped_clear_cache");
+    }
 }
 
 fn prime_generation_impl(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     first_token: u32,
+    reserve_decode_inputs: usize,
     temperature: f32,
     reset_peak_memory: bool,
     log_session: bool,
 ) -> InlineArray {
-    begin_generation_session(weights, cache, reset_peak_memory, log_session);
-
-    // First decode step
-    let input_token = InlineArray::from_i32(first_token as i32).reshape(&[1, 1]);
-    let logits = forward_step(weights, &input_token, cache);
-    // Squeeze the sequence dimension: [B, 1, vocab] → [B, vocab]
-    let logits_2d = logits.squeeze(1);
-    let current_y = sample_token(&logits_2d, temperature);
-    // Start async GPU eval of the sampled token concurrently with the CPU.
-    current_y.async_eval_ref();
-
-    current_y
+    let reserve_decode_inputs = reserve_decode_inputs.min(i32::MAX as usize) as i32;
+    crate::decode::prime_generation(
+        "NATIVE",
+        weights.model_dtype,
+        weights,
+        cache,
+        first_token,
+        temperature,
+        reset_peak_memory,
+        log_session,
+        |cache| prepare_generation_cache(cache, reserve_decode_inputs, weights.model_dtype),
+        forward_step,
+    )
 }
 
 fn generate_from_primed_sample_impl(
     weights: &NativeWeights,
     cache: &mut NativeCache,
-    mut current_y: InlineArray,
+    current_y: InlineArray,
     max_tokens: usize,
     temperature: f32,
     log_stats: bool,
     mut on_token: impl FnMut(u32) -> bool,
 ) -> Vec<u32> {
-    let mut tokens = Vec::with_capacity(max_tokens);
-    let mut step_times: Vec<f64> = Vec::new();
-
-    for step in 0..max_tokens {
-        let next_y = if step + 1 < max_tokens {
-            let t_step = std::time::Instant::now();
-            let next_input = current_y.reshape(&[1, 1]);
-            let next_logits = forward_step(weights, &next_input, cache);
-            let next_logits_2d = next_logits.squeeze(1);
-            let next_y = sample_token(&next_logits_2d, temperature);
-            next_y.async_eval_ref();
-            step_times.push(t_step.elapsed().as_secs_f64() * 1000.0);
-            Some(next_y)
-        } else {
-            None
-        };
-
-        // On step 0 we need to wait for the first async eval.
-        if step == 0 {
-            current_y.eval();
-        }
-        let token_val = current_y.item_u32();
-
-        tokens.push(token_val);
-        if !on_token(token_val) {
-            break;
-        }
-        let Some(next_y) = next_y else {
-            break;
-        };
-        current_y = next_y;
-
-        // Periodically flush the buffer cache to prevent memory accumulation.
-        if step % 256 == 255 {
-            bridge::clear_cache();
-        }
-    }
-
-    if log_stats && step_times.len() > 20 {
-        step_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let skip = 10;
-        let avg = step_times[skip..].iter().sum::<f64>() / (step_times.len() - skip) as f64;
-        let p50 = step_times[step_times.len() / 2];
-        eprintln!(
-            "[NATIVE] per-step: avg={avg:.2}ms p50={p50:.2}ms = {:.0} tok/s",
-            1000.0 / avg
-        );
-    }
-
-    bridge::synchronize();
-
-    tokens
+    crate::decode::generate_from_primed_sample(
+        "NATIVE",
+        weights,
+        cache,
+        current_y,
+        max_tokens,
+        temperature,
+        log_stats,
+        |token| on_token(token),
+        forward_step,
+    )
 }
 
 /// Prime the canonical decode loop without resetting peak memory.
@@ -2489,18 +2829,36 @@ pub fn prime_generation_preserve_peak(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     first_token: u32,
+    reserve_decode_inputs: usize,
     temperature: f32,
 ) -> InlineArray {
-    prime_generation_impl(weights, cache, first_token, temperature, false, true)
+    prime_generation_impl(
+        weights,
+        cache,
+        first_token,
+        reserve_decode_inputs,
+        temperature,
+        false,
+        true,
+    )
 }
 
 pub fn prime_generation_preserve_peak_silent(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     first_token: u32,
+    reserve_decode_inputs: usize,
     temperature: f32,
 ) -> InlineArray {
-    prime_generation_impl(weights, cache, first_token, temperature, false, false)
+    prime_generation_impl(
+        weights,
+        cache,
+        first_token,
+        reserve_decode_inputs,
+        temperature,
+        false,
+        false,
+    )
 }
 
 /// Continue generation from an already-primed async sample.
@@ -2524,6 +2882,59 @@ pub fn generate_from_primed_sample(
         true,
         on_token,
     )
+}
+
+/// Run one MLX-LM-style benchmark trial on the canonical Qwen native path.
+///
+/// The timing split matches `mlx_lm.benchmark`: prompt timing includes prefill,
+/// first-token sampling, and priming the next decode step; generation timing
+/// covers only the remaining decode loop.
+pub fn benchmark_mlx_lm_trial(
+    weights: &NativeWeights,
+    prompt_ids: &[u32],
+    generation_tokens: usize,
+    turboquant: Option<crate::turboquant::TurboQuantConfig>,
+) -> crate::decode::BenchmarkTrial {
+    crate::inline_array::reset_peak_memory();
+    let mut cache = NativeCache::new_with_turboquant(weights, turboquant);
+
+    let prompt_tic = std::time::Instant::now();
+    let first_tok = prefill_first_token(weights, &mut cache, prompt_ids, 0.0);
+    let current_y = prime_generation_preserve_peak_silent(
+        weights,
+        &mut cache,
+        first_tok,
+        generation_tokens.saturating_sub(1),
+        0.0,
+    );
+    let prompt_secs = prompt_tic.elapsed().as_secs_f64();
+
+    let generation_secs = if generation_tokens > 1 {
+        let generation_tic = std::time::Instant::now();
+        let generated_tail = generate_from_primed_sample_silent(
+            weights,
+            &mut cache,
+            current_y,
+            generation_tokens - 1,
+            0.0,
+            |_| true,
+        );
+        debug_assert_eq!(generated_tail.len(), generation_tokens - 1);
+        generation_tic.elapsed().as_secs_f64()
+    } else {
+        crate::inline_array::synchronize();
+        f64::MIN_POSITIVE
+    };
+
+    let trial = crate::decode::BenchmarkTrial {
+        prompt_secs,
+        generation_secs,
+        peak_memory_bytes: crate::inline_array::get_peak_memory(),
+    };
+
+    crate::inline_array::synchronize();
+    crate::inline_array::clear_cache();
+    trial
 }
 
 pub fn generate_from_primed_sample_silent(
@@ -2553,7 +2964,15 @@ pub fn generate(
     temperature: f32,
     on_token: impl FnMut(u32) -> bool,
 ) -> Vec<u32> {
-    let current_y = prime_generation_impl(weights, cache, first_token, temperature, true, true);
+    let current_y = prime_generation_impl(
+        weights,
+        cache,
+        first_token,
+        max_tokens,
+        temperature,
+        true,
+        true,
+    );
     generate_from_primed_sample_impl(
         weights,
         cache,
@@ -2565,6 +2984,54 @@ pub fn generate(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QwenDecodeBackend {
+    RustBridge,
+}
+
+pub fn canonical_decode_backend(
+    _config: &Qwen3Config,
+    _turboquant: Option<crate::turboquant::TurboQuantConfig>,
+) -> QwenDecodeBackend {
+    QwenDecodeBackend::RustBridge
+}
+
+pub fn generate_canonical(
+    weights: &NativeWeights,
+    cache: &mut NativeCache,
+    config: &Qwen3Config,
+    first_token: u32,
+    max_tokens: usize,
+    temperature: f32,
+    turboquant: Option<crate::turboquant::TurboQuantConfig>,
+    on_token: impl FnMut(u32) -> bool,
+) -> Vec<u32> {
+    match canonical_decode_backend(config, turboquant) {
+        QwenDecodeBackend::RustBridge => generate(
+            weights,
+            cache,
+            first_token,
+            max_tokens,
+            temperature,
+            on_token,
+        ),
+    }
+}
+
+pub fn benchmark_mlx_lm_trial_canonical(
+    weights: &NativeWeights,
+    config: &Qwen3Config,
+    prompt_ids: &[u32],
+    generation_tokens: usize,
+    turboquant: Option<crate::turboquant::TurboQuantConfig>,
+) -> crate::decode::BenchmarkTrial {
+    match canonical_decode_backend(config, turboquant) {
+        QwenDecodeBackend::RustBridge => {
+            benchmark_mlx_lm_trial(weights, prompt_ids, generation_tokens, turboquant)
+        }
+    }
+}
+
 pub fn generate_preserve_peak(
     weights: &NativeWeights,
     cache: &mut NativeCache,
@@ -2573,7 +3040,15 @@ pub fn generate_preserve_peak(
     temperature: f32,
     on_token: impl FnMut(u32) -> bool,
 ) -> Vec<u32> {
-    let current_y = prime_generation_impl(weights, cache, first_token, temperature, false, true);
+    let current_y = prime_generation_impl(
+        weights,
+        cache,
+        first_token,
+        max_tokens,
+        temperature,
+        false,
+        true,
+    );
     generate_from_primed_sample_impl(
         weights,
         cache,
@@ -2589,44 +3064,25 @@ pub fn generate_preserve_peak(
 // C++ monolithic per-token generation loop
 // ============================================================================
 
-/// Generation loop using the C++ monolithic per-token forward path.
-///
-/// Equivalent to [`generate`] but each decode step executes all per-layer ops
-/// inside a single C++ function call (`mlx_inline_qwen35_decode_step`), which
-/// removes per-op FFI overhead.
-///
-/// Important: this is not a traced or tape-replayed whole-model decode. The
-/// MLX graph is still rebuilt inside that C++ function on every token.
-///
-/// Only supports Qwen3.5 dense (the C++ side does not implement MoE). Falls
-/// back to the Rust path silently for unsupported model variants.
-///
-/// # Safety
-/// Internally uses raw pointers into `weights` and `cache`; both must remain
-/// live and un-moved for the duration of this call.
-pub fn generate_cpp(
-    weights: &NativeWeights,
-    cache: &mut NativeCache,
+fn begin_cpp_generation_session<'a>(
+    weights: &'a NativeWeights,
+    cache: &'a mut NativeCache,
     config: &Qwen3Config,
     first_token: u32,
-    max_tokens: usize,
     temperature: f32,
-    mut on_token: impl FnMut(u32) -> bool,
-) -> Vec<u32> {
-    if !supports_cpp_decode(config) {
-        return generate(
-            weights,
-            cache,
-            first_token,
-            max_tokens,
-            temperature,
-            on_token,
+    reset_peak_memory: bool,
+    log_session: bool,
+) -> (CppDecodeSession<'a>, InlineArray) {
+    if reset_peak_memory {
+        crate::decode::begin_generation_session("NATIVE-CPP", weights.model_dtype);
+    } else if log_session {
+        crate::decode::begin_generation_session_preserve_peak("NATIVE-CPP", weights.model_dtype);
+    } else {
+        crate::decode::begin_generation_session_preserve_peak_silent(
+            "NATIVE-CPP",
+            weights.model_dtype,
         );
     }
-
-    let mut tokens = Vec::with_capacity(max_tokens);
-
-    crate::decode::begin_generation_session("NATIVE-CPP", weights.model_dtype);
 
     cache.eval_and_detach_states();
     bridge::clear_cache();
@@ -2634,9 +3090,20 @@ pub fn generate_cpp(
     let mut session = start_cpp_decode_session(weights, cache, config);
     let logits = session.step(first_token);
     let logits_2d = logits.squeeze(1);
-    let mut current_y = sample_token(&logits_2d, temperature);
+    let current_y = sample_token(&logits_2d, temperature);
     current_y.async_eval_ref();
+    (session, current_y)
+}
 
+fn generate_from_primed_cpp_session(
+    mut session: CppDecodeSession<'_>,
+    mut current_y: InlineArray,
+    max_tokens: usize,
+    temperature: f32,
+    log_stats: bool,
+    mut on_token: impl FnMut(u32) -> bool,
+) -> Vec<u32> {
+    let mut tokens = Vec::with_capacity(max_tokens);
     let mut step_times: Vec<f64> = Vec::new();
 
     for step in 0..max_tokens {
@@ -2654,7 +3121,6 @@ pub fn generate_cpp(
         }
 
         let t_step = std::time::Instant::now();
-
         let next_logits = session.step(token_val);
         let next_logits_2d = next_logits.squeeze(1);
         current_y = sample_token(&next_logits_2d, temperature);
@@ -2667,7 +3133,7 @@ pub fn generate_cpp(
         }
     }
 
-    if step_times.len() > 20 {
+    if log_stats && step_times.len() > 20 {
         step_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let skip = 10;
         let avg = step_times[skip..].iter().sum::<f64>() / (step_times.len() - skip) as f64;
@@ -2678,14 +3144,91 @@ pub fn generate_cpp(
         );
     }
 
+    drop(session);
     bridge::synchronize();
-
     tokens
 }
 
-pub fn supports_cpp_decode(config: &Qwen3Config) -> bool {
+/// Generation loop using the C++ monolithic per-token forward path.
+///
+/// Equivalent to [`generate`] but each decode step executes all per-layer ops
+/// inside a single C++ function call (`mlx_inline_qwen35_decode_step`), which
+/// removes per-op FFI overhead while still using the same bridge-native MLX
+/// tensors and cache ownership as the Rust path.
+#[allow(dead_code)]
+fn generate_cpp(
+    weights: &NativeWeights,
+    cache: &mut NativeCache,
+    config: &Qwen3Config,
+    first_token: u32,
+    max_tokens: usize,
+    temperature: f32,
+    on_token: impl FnMut(u32) -> bool,
+) -> Vec<u32> {
+    if !supports_cpp_decode(config) {
+        return generate(
+            weights,
+            cache,
+            first_token,
+            max_tokens,
+            temperature,
+            on_token,
+        );
+    }
+
+    let (session, current_y) =
+        begin_cpp_generation_session(weights, cache, config, first_token, temperature, true, true);
+    generate_from_primed_cpp_session(session, current_y, max_tokens, temperature, true, on_token)
+}
+
+#[allow(dead_code)]
+fn benchmark_mlx_lm_trial_cpp(
+    weights: &NativeWeights,
+    config: &Qwen3Config,
+    prompt_ids: &[u32],
+    generation_tokens: usize,
+) -> crate::decode::BenchmarkTrial {
+    crate::inline_array::reset_peak_memory();
+    let mut cache = NativeCache::new_empty(weights);
+
+    let prompt_tic = std::time::Instant::now();
+    let first_tok = prefill_first_token(weights, &mut cache, prompt_ids, 0.0);
+    let (session, current_y) =
+        begin_cpp_generation_session(weights, &mut cache, config, first_tok, 0.0, false, false);
+    let prompt_secs = prompt_tic.elapsed().as_secs_f64();
+
+    let generation_secs = if generation_tokens > 1 {
+        let generation_tic = std::time::Instant::now();
+        let generated_tail = generate_from_primed_cpp_session(
+            session,
+            current_y,
+            generation_tokens - 1,
+            0.0,
+            false,
+            |_| true,
+        );
+        debug_assert_eq!(generated_tail.len(), generation_tokens - 1);
+        generation_tic.elapsed().as_secs_f64()
+    } else {
+        crate::inline_array::synchronize();
+        f64::MIN_POSITIVE
+    };
+
+    let trial = crate::decode::BenchmarkTrial {
+        prompt_secs,
+        generation_secs,
+        peak_memory_bytes: crate::inline_array::get_peak_memory(),
+    };
+
+    crate::inline_array::synchronize();
+    crate::inline_array::clear_cache();
+    trial
+}
+
+#[allow(dead_code)]
+fn supports_cpp_decode(config: &Qwen3Config) -> bool {
     let is_quantized = config.quantization_config.is_some();
-    !config.is_moe() && !config.is_qwen3_dense() && !is_quantized
+    !config.is_qwen3_dense() && !is_quantized
 }
 
 fn sync_cpp_state_back(cache: &mut NativeCache, state: &CppForwardState) {
@@ -2708,7 +3251,7 @@ fn sync_cpp_state_back(cache: &mut NativeCache, state: &CppForwardState) {
 // Layout matches the documentation in `bridge.h`:
 //
 //   weight_ptrs:  [embed_w, final_norm_w, lm_head_w, layer_0_block, ..., layer_N-1_block]
-//                 where each layer block is QWEN35_WEIGHTS_PER_LAYER (16) pointers.
+//                 where each layer block is QWEN35_WEIGHTS_PER_LAYER pointers.
 //
 //   cache_ptrs:   [gdn_0_conv, gdn_0_ssm, ..., gdn_{n_gdn-1}_ssm,
 //                  attn_0_keys, attn_0_vals, ..., attn_{n_attn-1}_vals]
@@ -2720,8 +3263,7 @@ fn sync_cpp_state_back(cache: &mut NativeCache, state: &CppForwardState) {
 // IMPORTANT: `CppForwardState` stores RAW POINTERS into `NativeWeights` and
 // `NativeCache` arrays.  The caller MUST ensure both outlive the state.
 
-const WEIGHTS_PER_LAYER: usize = 16;
-
+const WEIGHTS_PER_LAYER: usize = 21;
 #[allow(dead_code)]
 pub struct CppForwardState {
     // Flat weight pointer array (const *const RawBuf).
@@ -2776,7 +3318,8 @@ impl Drop for CppDecodeSession<'_> {
     }
 }
 
-pub fn start_cpp_decode_session<'a>(
+#[allow(dead_code)]
+fn start_cpp_decode_session<'a>(
     weights: &'a NativeWeights,
     cache: &'a mut NativeCache,
     config: &Qwen3Config,
@@ -2817,6 +3360,7 @@ pub unsafe fn build_cpp_forward_state(
 
     // Compute counts for the config arrays.
     let n_config_floats = 4 + num_layers * 2 + n_gdn + n_attn * 2;
+    let n_config_ints = 20 + num_layers;
 
     // ── Build config_ints ──────────────────────────────────────────────────
     let gdn_nv = config.gdn_nv();
@@ -2831,7 +3375,8 @@ pub unsafe fn build_cpp_forward_state(
     let head_dim = config.get_head_dim();
     let rope_dims = config.rope_dims();
 
-    let config_ints = vec![
+    let mut config_ints = Vec::with_capacity(n_config_ints);
+    config_ints.extend_from_slice(&[
         num_layers as i32,                               // [0]
         config.hidden_size,                              // [1]
         weights.model_dtype,                             // [2]
@@ -2850,7 +3395,12 @@ pub unsafe fn build_cpp_forward_state(
         rope_dims,                                       // [15]
         config.full_attention_interval,                  // [16]
         if weights.tie_word_embeddings { 1 } else { 0 }, // [17]
-    ];
+        config.num_experts_per_tok,                      // [18]
+        if config.norm_topk_prob { 1 } else { 0 },       // [19]
+    ]);
+    for lw in &weights.layers {
+        config_ints.push(if lw.is_moe_layer { 1 } else { 0 });
+    }
 
     // ── Build config_floats ────────────────────────────────────────────────
     let attn_scale = 1.0_f32 / (head_dim as f32).sqrt();
@@ -2901,37 +3451,55 @@ pub unsafe fn build_cpp_forward_state(
         push_sent(&mut weight_ptrs, &mut weight_storage);
     }
 
-    // Per-layer weight blocks [3 + li*16 .. 3 + (li+1)*16)
-    // Slot layout (16 per layer):
+    // Per-layer weight blocks [3 + li*WEIGHTS_PER_LAYER .. 3 + (li+1)*WEIGHTS_PER_LAYER)
+    // Slot layout (21 per layer):
     //   0: input_ln_w
     //   1: post_ln_w
-    //   2: mlp_gate_w / sentinel (MoE layers)
-    //   3: mlp_up_w   / sentinel
-    //   4: mlp_down_w / sentinel
+    //   2: dense mlp_gate_w / moe_router_w
+    //   3: dense mlp_up_w   / moe_gate_w
+    //   4: dense mlp_down_w / moe_up_w
     //   5: attn_q_w   / gdn_qkv_w
     //   6: attn_k_w   / gdn_z_w
     //   7: attn_v_w   / gdn_b_w
     //   8: attn_o_w   / gdn_a_w
     //   9: attn_q_norm_w / gdn_conv_w
     //  10: attn_k_norm_w / gdn_q_nw
-    //  11: sentinel    / gdn_k_nw
-    //  12: sentinel    / gdn_a_log
-    //  13: sentinel    / gdn_dt_bias
-    //  14: sentinel    / gdn_norm_w
-    //  15: sentinel    / gdn_out_w
+    //  11: gdn_k_nw
+    //  12: gdn_a_log
+    //  13: gdn_dt_bias
+    //  14: gdn_norm_w
+    //  15: gdn_out_w
+    //  16: moe_down_w
+    //  17: shared_gate_w
+    //  18: shared_up_w
+    //  19: shared_down_w
+    //  20: shared_expert_gate_w
     for lw in &weights.layers {
         push_real(&mut weight_ptrs, &lw.input_ln_w);
         push_real(&mut weight_ptrs, &lw.post_ln_w);
 
-        // MLP slots (dense only; MoE layers leave these as sentinel).
-        // For quantized models we still expose the weight tensor (scales/biases
-        // are not used by the C++ path — quantized models fall back to Rust path
-        // before reaching here, but we handle it defensively).
-        for opt in [&lw.mlp_gate_w, &lw.mlp_up_w, &lw.mlp_down_w] {
-            if let Some(w) = opt {
-                push_real(&mut weight_ptrs, w.weight_arr());
+        // MLP prefix slots. Dense layers expose gate/up/down; MoE layers expose
+        // router/gate/up so the C++ path can execute either post-attention block.
+        if lw.is_moe_layer {
+            if let Some(w) = &lw.moe_router_w {
+                push_real(&mut weight_ptrs, w);
             } else {
                 push_sent(&mut weight_ptrs, &mut weight_storage);
+            }
+            for opt in [&lw.moe_gate_w, &lw.moe_up_w] {
+                if let Some(w) = opt {
+                    push_real(&mut weight_ptrs, w.weight_arr());
+                } else {
+                    push_sent(&mut weight_ptrs, &mut weight_storage);
+                }
+            }
+        } else {
+            for opt in [&lw.mlp_gate_w, &lw.mlp_up_w, &lw.mlp_down_w] {
+                if let Some(w) = opt {
+                    push_real(&mut weight_ptrs, w.weight_arr());
+                } else {
+                    push_sent(&mut weight_ptrs, &mut weight_storage);
+                }
             }
         }
 
@@ -2983,7 +3551,31 @@ pub unsafe fn build_cpp_forward_state(
                     push_sent(&mut weight_ptrs, &mut weight_storage);
                 }
             }
-            // 5 sentinel padding slots to reach 16 total
+            // Attention layers do not use the GDN-only slots.
+            for _ in 0..5 {
+                push_sent(&mut weight_ptrs, &mut weight_storage);
+            }
+        }
+
+        if lw.is_moe_layer {
+            if let Some(w) = &lw.moe_down_w {
+                push_real(&mut weight_ptrs, w.weight_arr());
+            } else {
+                push_sent(&mut weight_ptrs, &mut weight_storage);
+            }
+            for opt in [&lw.shared_gate_w, &lw.shared_up_w, &lw.shared_down_w] {
+                if let Some(w) = opt {
+                    push_real(&mut weight_ptrs, w.weight_arr());
+                } else {
+                    push_sent(&mut weight_ptrs, &mut weight_storage);
+                }
+            }
+            if let Some(w) = &lw.shared_expert_gate_w {
+                push_real(&mut weight_ptrs, w);
+            } else {
+                push_sent(&mut weight_ptrs, &mut weight_storage);
+            }
+        } else {
             for _ in 0..5 {
                 push_sent(&mut weight_ptrs, &mut weight_storage);
             }

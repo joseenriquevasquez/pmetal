@@ -4,8 +4,10 @@
 //! C++ binding performance. Each op is a single `extern "C"` call with placement-new
 //! into a caller-provided buffer.
 
-use std::io::Read;
 use std::mem::MaybeUninit;
+
+use memmap2::Mmap;
+use safetensors::{Dtype as SafeDtype, SafeTensors};
 
 /// Size of `mlx::core::array` in bytes. Must match MLX_ARRAY_SIZE in bridge.h.
 const ARRAY_BUF_SIZE: usize = 128;
@@ -107,6 +109,15 @@ unsafe extern "C" {
         bits: i32,
     );
     fn mlx_inline_from_f32_slice(dst: *mut RawBuf, data: *const f32, shape: *const i32, ndim: i32);
+    fn mlx_inline_from_u32_slice(dst: *mut RawBuf, data: *const u32, shape: *const i32, ndim: i32);
+    fn mlx_inline_from_u8_slice(dst: *mut RawBuf, data: *const u8, shape: *const i32, ndim: i32);
+    fn mlx_inline_from_u16_bits_slice(
+        dst: *mut RawBuf,
+        data: *const u16,
+        shape: *const i32,
+        ndim: i32,
+        dtype: i32,
+    );
     fn mlx_inline_to_f32_slice(a: *mut RawBuf, out: *mut f32, n: usize) -> i32;
     fn mlx_inline_stack(dst: *mut RawBuf, arrays: *const RawBuf, num: i32, axis: i32);
     fn mlx_inline_norm_l2(dst: *mut RawBuf, a: *const RawBuf, axis: i32, keepdims: bool);
@@ -236,6 +247,21 @@ unsafe extern "C" {
         q_norm_eps: f32,
         k_norm_eps: f32,
         gated: bool,
+    );
+
+    fn mlx_inline_compiled_moe_layer_fixed(
+        dst_out: *mut RawBuf,
+        x: *const RawBuf,
+        router_w: *const RawBuf,
+        moe_gate_w: *const RawBuf,
+        moe_up_w: *const RawBuf,
+        moe_down_w: *const RawBuf,
+        shared_gate_w: *const RawBuf,
+        shared_up_w: *const RawBuf,
+        shared_down_w: *const RawBuf,
+        shared_expert_gate_w: *const RawBuf,
+        top_k: i32,
+        norm_topk_prob: bool,
     );
 
     // Arange — non-broadcast tensor creation
@@ -400,6 +426,106 @@ unsafe extern "C" {
         codebook: *const RawBuf,
         dim: u32,
         n_centroids: u32,
+        n_rows: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_score(
+        out_scores: *mut RawBuf,
+        query_rot: *const RawBuf,
+        query_proj: *const RawBuf,
+        indices: *const RawBuf,
+        qjl_signs: *const RawBuf,
+        norms: *const RawBuf,
+        residual_norms: *const RawBuf,
+        codebook: *const RawBuf,
+        dim: u32,
+        qjl_words: u32,
+        n_centroids: u32,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_mixed_score(
+        out_scores: *mut RawBuf,
+        regular_query_rot: *const RawBuf,
+        regular_query_proj: *const RawBuf,
+        regular_indices: *const RawBuf,
+        regular_qjl_signs: *const RawBuf,
+        regular_norms: *const RawBuf,
+        regular_residual_norms: *const RawBuf,
+        regular_codebook: *const RawBuf,
+        outlier_query_rot: *const RawBuf,
+        outlier_query_proj: *const RawBuf,
+        outlier_indices: *const RawBuf,
+        outlier_qjl_signs: *const RawBuf,
+        outlier_norms: *const RawBuf,
+        outlier_residual_norms: *const RawBuf,
+        outlier_codebook: *const RawBuf,
+        regular_dim: u32,
+        regular_qjl_words: u32,
+        regular_n_centroids: u32,
+        outlier_dim: u32,
+        outlier_qjl_words: u32,
+        outlier_n_centroids: u32,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_pack_sign_bits(
+        out: *mut RawBuf,
+        projected: *const RawBuf,
+        dim: u32,
+        packed_dim: u32,
+        n_rows: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_unpack_sign_bits(
+        out: *mut RawBuf,
+        packed: *const RawBuf,
+        dim: u32,
+        packed_dim: u32,
+        n_rows: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_weighted_decode(
+        out: *mut RawBuf,
+        weights: *const RawBuf,
+        indices: *const RawBuf,
+        norms: *const RawBuf,
+        codebook: *const RawBuf,
+        dim: u32,
+        n_centroids: u32,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_gather_last_dim(
+        out: *mut RawBuf,
+        input: *const RawBuf,
+        positions: *const RawBuf,
+        full_dim: u32,
+        out_dim: u32,
+        n_rows: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_scatter_last_dim(
+        out: *mut RawBuf,
+        regular: *const RawBuf,
+        outlier: *const RawBuf,
+        regular_positions: *const RawBuf,
+        outlier_positions: *const RawBuf,
+        full_dim: u32,
+        regular_dim: u32,
+        outlier_dim: u32,
         n_rows: u32,
     ) -> i32;
 
@@ -876,42 +1002,75 @@ pub fn load_safetensors_shard(path: &str) -> Option<Vec<(String, InlineArray)>> 
 }
 
 fn load_safetensors_shard_fallback(path: &str) -> Option<Vec<(String, InlineArray)>> {
-    let keys = load_safetensors_tensor_names(path)?;
-    let mut result = Vec::with_capacity(keys.len());
-    for key in keys {
-        let array = InlineArray::load_safetensors(path, &key)?;
-        result.push((key, array));
+    let mapped = map_safetensors_file(path)?;
+    let tensors = SafeTensors::deserialize(&mapped).ok()?;
+    let names = tensors.names();
+    let mut result = Vec::with_capacity(names.len());
+    for key in names {
+        let tensor = tensors.tensor(key).ok()?;
+        let array = inline_array_from_tensor_view(&tensor)?;
+        result.push((key.to_string(), array));
     }
     Some(result)
 }
 
-fn load_safetensors_tensor_names(path: &str) -> Option<Vec<String>> {
-    let mut file = std::fs::File::open(path).ok()?;
+fn map_safetensors_file(path: &str) -> Option<Mmap> {
+    let file = std::fs::File::open(path).ok()?;
+    unsafe { Mmap::map(&file).ok() }
+}
 
-    let mut len_buf = [0u8; 8];
-    file.read_exact(&mut len_buf).ok()?;
-    let header_len = u64::from_le_bytes(len_buf);
-    let max_header_len = 128 * 1024 * 1024u64;
-    if header_len == 0 || header_len > max_header_len {
-        return None;
+fn as_typed_slice<T>(data: &[u8]) -> Option<&[T]> {
+    // SAFETY: We only accept fully aligned, remainder-free views.
+    let (prefix, values, suffix) = unsafe { data.align_to::<T>() };
+    if prefix.is_empty() && suffix.is_empty() {
+        Some(values)
+    } else {
+        None
     }
+}
 
-    let mut header = vec![0u8; header_len as usize];
-    file.read_exact(&mut header).ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&header).ok()?;
-    let obj = json.as_object()?;
+fn shape_to_i32(shape: &[usize]) -> Option<Vec<i32>> {
+    shape.iter().map(|&dim| i32::try_from(dim).ok()).collect()
+}
 
-    let mut keys = Vec::with_capacity(obj.len());
-    for (key, value) in obj {
-        if key == "__metadata__" {
-            continue;
+fn inline_array_from_tensor_view(
+    tensor: &safetensors::tensor::TensorView<'_>,
+) -> Option<InlineArray> {
+    let shape = shape_to_i32(tensor.shape())?;
+    match tensor.dtype() {
+        SafeDtype::F32 => Some(InlineArray::from_f32_slice(
+            as_typed_slice::<f32>(tensor.data())?,
+            &shape,
+        )),
+        SafeDtype::I32 => Some(InlineArray::from_i32_slice_shaped(
+            as_typed_slice::<i32>(tensor.data())?,
+            &shape,
+        )),
+        SafeDtype::U32 => Some(InlineArray::from_u32_slice(
+            as_typed_slice::<u32>(tensor.data())?,
+            &shape,
+        )),
+        SafeDtype::U8 => Some(InlineArray::from_u8_slice(
+            as_typed_slice::<u8>(tensor.data())?,
+            &shape,
+        )),
+        SafeDtype::F16 => Some(InlineArray::from_u16_bits_slice(
+            as_typed_slice::<u16>(tensor.data())?,
+            &shape,
+            1,
+        )),
+        SafeDtype::BF16 => Some(InlineArray::from_u16_bits_slice(
+            as_typed_slice::<u16>(tensor.data())?,
+            &shape,
+            11,
+        )),
+        SafeDtype::I64 => {
+            let values = as_typed_slice::<i64>(tensor.data())?;
+            let cast: Vec<i32> = values.iter().map(|&value| value as i32).collect();
+            Some(InlineArray::from_i32_slice_shaped(&cast, &shape))
         }
-        if value.get("data_offsets").is_some() {
-            keys.push(key.clone());
-        }
+        _ => None,
     }
-
-    if keys.is_empty() { None } else { Some(keys) }
 }
 
 /// Thin wrapper around libc free so we can call it without a libc dependency.
@@ -1676,6 +1835,44 @@ impl InlineArray {
         }
     }
 
+    /// Fixed-shape compiled dense MoE decode block (shapeless=false).
+    /// Replays the routed-expert + shared-expert graph for T=1 decode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compiled_moe_layer_fixed(
+        x: &Self,
+        router_w: &Self,
+        moe_gate_w: &Self,
+        moe_up_w: &Self,
+        moe_down_w: &Self,
+        shared_gate_w: &Self,
+        shared_up_w: &Self,
+        shared_down_w: &Self,
+        shared_expert_gate_w: &Self,
+        top_k: i32,
+        norm_topk_prob: bool,
+    ) -> Self {
+        let mut out = std::mem::MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_compiled_moe_layer_fixed(
+                out.as_mut_ptr(),
+                &x.raw,
+                &router_w.raw,
+                &moe_gate_w.raw,
+                &moe_up_w.raw,
+                &moe_down_w.raw,
+                &shared_gate_w.raw,
+                &shared_up_w.raw,
+                &shared_down_w.raw,
+                &shared_expert_gate_w.raw,
+                top_k,
+                norm_topk_prob,
+            );
+            Self {
+                raw: out.assume_init(),
+            }
+        }
+    }
+
     /// Load a single array from a safetensors file by key name.
     /// Uses pmetal-bridge's MLX instance (not mlx-rs) — critical for avoiding
     /// dual-allocator interference.
@@ -1691,7 +1888,10 @@ impl InlineArray {
                     raw: dst.assume_init(),
                 })
             } else {
-                None
+                let mapped = map_safetensors_file(path)?;
+                let tensors = SafeTensors::deserialize(&mapped).ok()?;
+                let tensor = tensors.tensor(key).ok()?;
+                inline_array_from_tensor_view(&tensor)
             }
         }
     }
@@ -1709,6 +1909,52 @@ impl InlineArray {
                 data.as_ptr(),
                 shape.as_ptr(),
                 shape.len() as i32,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
+    pub fn from_u32_slice(data: &[u32], shape: &[i32]) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_from_u32_slice(
+                dst.as_mut_ptr(),
+                data.as_ptr(),
+                shape.as_ptr(),
+                shape.len() as i32,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
+    pub fn from_u8_slice(data: &[u8], shape: &[i32]) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_from_u8_slice(
+                dst.as_mut_ptr(),
+                data.as_ptr(),
+                shape.as_ptr(),
+                shape.len() as i32,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
+    pub fn from_u16_bits_slice(data: &[u16], shape: &[i32], dtype: i32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_from_u16_bits_slice(
+                dst.as_mut_ptr(),
+                data.as_ptr(),
+                shape.as_ptr(),
+                shape.len() as i32,
+                dtype,
             );
             Self {
                 raw: dst.assume_init(),
@@ -1985,6 +2231,300 @@ impl InlineArray {
                 &codebook.raw,
                 dim,
                 n_centroids,
+                n_rows,
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Fused TurboQuant key scoring directly from compressed indices/signs.
+    ///
+    /// Inputs:
+    /// - `query_rot` / `query_proj`: `[N, D]` f32
+    /// - `indices`: `[N, S, D]`
+    /// - `qjl_signs`: `[N, S, ceil(D/32)]` packed uint32 sign words
+    /// - `norms` / `residual_norms`: `[N, S]` f32
+    /// - `codebook`: `[C]` f32
+    ///
+    /// Returns `scores [N, S]` f32 on success.
+    pub fn turboquant_score(
+        query_rot: &Self,
+        query_proj: &Self,
+        indices: &Self,
+        qjl_signs: &Self,
+        norms: &Self,
+        residual_norms: &Self,
+        codebook: &Self,
+        dim: u32,
+        qjl_words: u32,
+        n_centroids: u32,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_score(
+                out.as_mut_ptr(),
+                &query_rot.raw,
+                &query_proj.raw,
+                &indices.raw,
+                &qjl_signs.raw,
+                &norms.raw,
+                &residual_norms.raw,
+                &codebook.raw,
+                dim,
+                qjl_words,
+                n_centroids,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Fused mixed TurboQuant key scoring directly from regular/outlier
+    /// compressed subspaces.
+    pub fn turboquant_mixed_score(
+        regular_query_rot: &Self,
+        regular_query_proj: &Self,
+        regular_indices: &Self,
+        regular_qjl_signs: &Self,
+        regular_norms: &Self,
+        regular_residual_norms: &Self,
+        regular_codebook: &Self,
+        outlier_query_rot: &Self,
+        outlier_query_proj: &Self,
+        outlier_indices: &Self,
+        outlier_qjl_signs: &Self,
+        outlier_norms: &Self,
+        outlier_residual_norms: &Self,
+        outlier_codebook: &Self,
+        regular_dim: u32,
+        regular_qjl_words: u32,
+        regular_n_centroids: u32,
+        outlier_dim: u32,
+        outlier_qjl_words: u32,
+        outlier_n_centroids: u32,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_mixed_score(
+                out.as_mut_ptr(),
+                &regular_query_rot.raw,
+                &regular_query_proj.raw,
+                &regular_indices.raw,
+                &regular_qjl_signs.raw,
+                &regular_norms.raw,
+                &regular_residual_norms.raw,
+                &regular_codebook.raw,
+                &outlier_query_rot.raw,
+                &outlier_query_proj.raw,
+                &outlier_indices.raw,
+                &outlier_qjl_signs.raw,
+                &outlier_norms.raw,
+                &outlier_residual_norms.raw,
+                &outlier_codebook.raw,
+                regular_dim,
+                regular_qjl_words,
+                regular_n_centroids,
+                outlier_dim,
+                outlier_qjl_words,
+                outlier_n_centroids,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Pack `sign(projected >= 0)` along the last dimension into uint32 words.
+    ///
+    /// - `projected`: `[N, D]` f32
+    /// - Returns packed `[N, ceil(D/32)]` uint32 on success.
+    pub fn turboquant_pack_sign_bits(
+        projected: &Self,
+        dim: u32,
+        packed_dim: u32,
+        n_rows: u32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_pack_sign_bits(
+                out.as_mut_ptr(),
+                &projected.raw,
+                dim,
+                packed_dim,
+                n_rows,
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Unpack uint32 sign words back into `{-1,+1}` float32 signs.
+    ///
+    /// - `packed`: `[N, ceil(D/32)]` uint32
+    /// - Returns unpacked `[N, D]` f32 on success.
+    pub fn turboquant_unpack_sign_bits(
+        packed: &Self,
+        dim: u32,
+        packed_dim: u32,
+        n_rows: u32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_unpack_sign_bits(
+                out.as_mut_ptr(),
+                &packed.raw,
+                dim,
+                packed_dim,
+                n_rows,
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Fused TurboQuant value aggregation in the rotated domain.
+    ///
+    /// Inputs:
+    /// - `weights`: `[N, S]` f32
+    /// - `indices`: `[N, S, D]` uint32
+    /// - `norms`: `[N, S]` f32
+    /// - `codebook`: `[C]` f32
+    ///
+    /// Returns `output [N, D]` f32 on success.
+    pub fn turboquant_weighted_decode(
+        weights: &Self,
+        indices: &Self,
+        norms: &Self,
+        codebook: &Self,
+        dim: u32,
+        n_centroids: u32,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_weighted_decode(
+                out.as_mut_ptr(),
+                &weights.raw,
+                &indices.raw,
+                &norms.raw,
+                &codebook.raw,
+                dim,
+                n_centroids,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Gather selected coordinates from a `[N, D]` f32 tensor.
+    pub fn turboquant_gather_last_dim(
+        input: &Self,
+        positions: &Self,
+        full_dim: u32,
+        out_dim: u32,
+        n_rows: u32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_gather_last_dim(
+                out.as_mut_ptr(),
+                &input.raw,
+                &positions.raw,
+                full_dim,
+                out_dim,
+                n_rows,
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Scatter regular/outlier component rows back into `[N, D]` f32 rows.
+    pub fn turboquant_scatter_last_dim(
+        regular: &Self,
+        outlier: &Self,
+        regular_positions: &Self,
+        outlier_positions: &Self,
+        full_dim: u32,
+        regular_dim: u32,
+        outlier_dim: u32,
+        n_rows: u32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_scatter_last_dim(
+                out.as_mut_ptr(),
+                &regular.raw,
+                &outlier.raw,
+                &regular_positions.raw,
+                &outlier_positions.raw,
+                full_dim,
+                regular_dim,
+                outlier_dim,
                 n_rows,
             )
         };
@@ -3365,9 +3905,7 @@ impl ArrayElement for i32 {
 
 impl ArrayElement for u32 {
     fn into_array(data: &[u32], shape: &[i32]) -> InlineArray {
-        // Convert to i32 then create array
-        let i32_data: Vec<i32> = data.iter().map(|&x| x as i32).collect();
-        InlineArray::from_i32_slice_shaped(&i32_data, shape)
+        InlineArray::from_u32_slice(data, shape)
     }
 }
 

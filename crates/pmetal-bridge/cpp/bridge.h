@@ -283,6 +283,22 @@ void mlx_inline_compiled_attn_layer_fixed(
     float k_norm_eps,
     bool gated);
 
+// Fixed-shape compiled dense MoE decode block (shapeless=false).
+// Replays the routed-expert + shared-expert graph for T=1 decode.
+void mlx_inline_compiled_moe_layer_fixed(
+    mlx_inline_array* dst_out,
+    const mlx_inline_array* x,
+    const mlx_inline_array* router_w,
+    const mlx_inline_array* moe_gate_w,
+    const mlx_inline_array* moe_up_w,
+    const mlx_inline_array* moe_down_w,
+    const mlx_inline_array* shared_gate_w,
+    const mlx_inline_array* shared_up_w,
+    const mlx_inline_array* shared_down_w,
+    const mlx_inline_array* shared_expert_gate_w,
+    int top_k,
+    bool norm_topk_prob);
+
 // fused_compute_g: exp(-exp(A_log.f32()) * softplus(a + dt_bias)) → 1 dispatch instead of 6
 void mlx_inline_fused_compute_g(mlx_inline_array* dst,
     const mlx_inline_array* a_log, const mlx_inline_array* a, const mlx_inline_array* dt_bias);
@@ -380,16 +396,16 @@ void mlx_inline_arange(mlx_inline_array* dst, int n, int dtype);
 // Implements the entire 24-layer decode step (or prefill for T>1) inside C++,
 // eliminating ~1800 per-op FFI round trips per decode step.
 //
-// Weight pointer layout (weight_ptrs, num_weights = 3 + num_layers * 16):
+// Weight pointer layout (weight_ptrs, num_weights = 3 + num_layers * WEIGHTS_PER_LAYER):
 //   [0]  embed_w          (global)
 //   [1]  final_norm_w     (global)
 //   [2]  lm_head_w        (global; NULL when tie_word_embeddings=true)
-//   Per-layer block at base index 3 + layer_idx * WEIGHTS_PER_LAYER (= 16):
+//   Per-layer block at base index 3 + layer_idx * WEIGHTS_PER_LAYER:
 //     [+0]  input_ln_w
 //     [+1]  post_ln_w
-//     [+2]  mlp_gate_w    (pre-transposed [in, out])
-//     [+3]  mlp_up_w
-//     [+4]  mlp_down_w
+//     [+2]  dense mlp_gate_w / moe_router_w
+//     [+3]  dense mlp_up_w   / moe_gate_w
+//     [+4]  dense mlp_down_w / moe_up_w
 //   GDN-only offsets (+5 .. +15), NULL for attention layers:
 //     [+5]  gdn_qkv_w
 //     [+6]  gdn_z_w
@@ -409,7 +425,12 @@ void mlx_inline_arange(mlx_inline_array* dst, int n, int dtype);
 //     [+8]  attn_o_w
 //     [+9]  attn_q_norm_w
 //     [+10] attn_k_norm_w
-//     (offsets +11..+15 are NULL for attention layers)
+//   MoE-only offsets (+16 .. +20), NULL for dense MLP layers:
+//     [+16] moe_down_w
+//     [+17] shared_gate_w
+//     [+18] shared_up_w
+//     [+19] shared_down_w
+//     [+20] shared_expert_gate_w
 //
 // Cache pointer layout (cache_ptrs, num_cache = n_gdn*2 + n_attn*4):
 //   For each GDN layer gi = 0..n_gdn-1:
@@ -423,7 +444,7 @@ void mlx_inline_arange(mlx_inline_array* dst, int n, int dtype);
 //   attn_kv_offsets[n_attn]  — per-attention-layer valid-token count (in/out)
 //   rope_offset[1]            — global position counter (in/out)
 //
-// Config integer layout (config_ints, num_config_ints = 18):
+// Config integer layout (config_ints, num_config_ints = 20 + num_layers):
 //   [0]  num_layers
 //   [1]  hidden_size
 //   [2]  model_dtype          (11 = bfloat16)
@@ -442,6 +463,9 @@ void mlx_inline_arange(mlx_inline_array* dst, int n, int dtype);
 //   [15] attn_rope_dims
 //   [16] full_attn_interval   (every Nth layer is attention, e.g. 4)
 //   [17] tie_word_embeddings  (1 = tied, 0 = separate lm_head)
+//   [18] moe_top_k
+//   [19] moe_norm_topk_prob
+//   [20 + i] (i = 0..num_layers-1) layer_i_is_moe
 //
 // Config float layout (config_floats):
 //   [0]                                     final_norm_eps
@@ -455,7 +479,7 @@ void mlx_inline_arange(mlx_inline_array* dst, int n, int dtype);
 //   [4 + num_layers*2 + n_gdn + ai*2+1]     attn_k_norm_eps
 //
 // Returns logits [B, T, vocab] via placement-new into dst_logits.
-#define QWEN35_WEIGHTS_PER_LAYER 16
+#define QWEN35_WEIGHTS_PER_LAYER 21
 void mlx_inline_qwen35_decode_step(
     mlx_inline_array*              dst_logits,
     const mlx_inline_array*        token_ids,          // [B, T] int32
@@ -465,7 +489,7 @@ void mlx_inline_qwen35_decode_step(
     int                            num_cache,
     int*                           attn_kv_offsets,     // [n_attn] in/out
     int*                           rope_offset,         // [1] in/out
-    const int*                     config_ints,         // [18]
+    const int*                     config_ints,         // [20 + num_layers]
     int                            num_config_ints,
     const float*                   config_floats,       // see layout above
     int                            num_config_floats
@@ -519,6 +543,127 @@ int mlx_inline_turboquant_decode(
     const mlx_inline_array* codebook,      // [C]    f32
     uint32_t                dim,
     uint32_t                n_centroids,
+    uint32_t                n_rows);
+
+// Fused TurboQuant key scoring.
+// query_rot/query_proj: [N, D] f32
+// indices:              [N, S_cap, D]
+// qjl_signs:            [N, S_cap, ceil(D/32)] packed uint32 sign words
+// norms/residual_norms: [N, S_cap] f32
+// codebook:             [C] f32
+// out_scores:           [N, S] f32
+int mlx_inline_turboquant_score(
+    mlx_inline_array*       out_scores,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* query_proj,
+    const mlx_inline_array* indices,
+    const mlx_inline_array* qjl_signs,
+    const mlx_inline_array* norms,
+    const mlx_inline_array* residual_norms,
+    const mlx_inline_array* codebook,
+    uint32_t                dim,
+    uint32_t                qjl_words,
+    uint32_t                n_centroids,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads);
+
+// Fused mixed TurboQuant key scoring.
+// regular/outlier query tensors: [N, D_reg]/[N, D_out] f32
+// regular/outlier indices: [KvRows, S_cap, D_*]
+// regular/outlier qjl_signs: [KvRows, S_cap, ceil(D_*/32)] packed uint32 words
+// regular/outlier norms/residual_norms: [KvRows, S_cap] f32
+// out_scores: [N, S] f32
+int mlx_inline_turboquant_mixed_score(
+    mlx_inline_array*       out_scores,
+    const mlx_inline_array* regular_query_rot,
+    const mlx_inline_array* regular_query_proj,
+    const mlx_inline_array* regular_indices,
+    const mlx_inline_array* regular_qjl_signs,
+    const mlx_inline_array* regular_norms,
+    const mlx_inline_array* regular_residual_norms,
+    const mlx_inline_array* regular_codebook,
+    const mlx_inline_array* outlier_query_rot,
+    const mlx_inline_array* outlier_query_proj,
+    const mlx_inline_array* outlier_indices,
+    const mlx_inline_array* outlier_qjl_signs,
+    const mlx_inline_array* outlier_norms,
+    const mlx_inline_array* outlier_residual_norms,
+    const mlx_inline_array* outlier_codebook,
+    uint32_t                regular_dim,
+    uint32_t                regular_qjl_words,
+    uint32_t                regular_n_centroids,
+    uint32_t                outlier_dim,
+    uint32_t                outlier_qjl_words,
+    uint32_t                outlier_n_centroids,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads);
+
+// Pack sign(projected >= 0) along the last dimension into uint32 words.
+// projected: [N, D] f32
+// out:       [N, ceil(D/32)] uint32
+int mlx_inline_turboquant_pack_sign_bits(
+    mlx_inline_array*       out,
+    const mlx_inline_array* projected,
+    uint32_t                dim,
+    uint32_t                packed_dim,
+    uint32_t                n_rows);
+
+// Unpack uint32 sign words back to {-1,+1} f32 signs.
+// packed: [N, ceil(D/32)] uint32
+// out:    [N, D] f32
+int mlx_inline_turboquant_unpack_sign_bits(
+    mlx_inline_array*       out,
+    const mlx_inline_array* packed,
+    uint32_t                dim,
+    uint32_t                packed_dim,
+    uint32_t                n_rows);
+
+// Fused TurboQuant value aggregation in the rotated domain.
+// weights:  [N, S] f32
+// indices:  [N, S_cap, D] uint32
+// norms:    [N, S_cap] f32
+// codebook: [C] f32
+// out:      [N, D] f32 aggregated rotated vectors
+int mlx_inline_turboquant_weighted_decode(
+    mlx_inline_array*       out,
+    const mlx_inline_array* weights,
+    const mlx_inline_array* indices,
+    const mlx_inline_array* norms,
+    const mlx_inline_array* codebook,
+    uint32_t                dim,
+    uint32_t                n_centroids,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads);
+
+// Gather/scatter helpers for mixed TurboQuant component layouts.
+// input: [N, D] f32, positions: [P] int32, out: [N, P] f32
+int mlx_inline_turboquant_gather_last_dim(
+    mlx_inline_array*       out,
+    const mlx_inline_array* input,
+    const mlx_inline_array* positions,
+    uint32_t                full_dim,
+    uint32_t                out_dim,
+    uint32_t                n_rows);
+
+// regular/outlier: [N, R]/[N, O] f32, positions: [R]/[O] int32, out: [N, D] f32
+int mlx_inline_turboquant_scatter_last_dim(
+    mlx_inline_array*       out,
+    const mlx_inline_array* regular,
+    const mlx_inline_array* outlier,
+    const mlx_inline_array* regular_positions,
+    const mlx_inline_array* outlier_positions,
+    uint32_t                full_dim,
+    uint32_t                regular_dim,
+    uint32_t                outlier_dim,
     uint32_t                n_rows);
 
 // Load a single array from a safetensors file by key name.
