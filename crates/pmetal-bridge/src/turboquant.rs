@@ -693,6 +693,7 @@ fn packed_qjl_words(dim: usize) -> usize {
 /// operation.  Shape convention (accumulated over T steps):
 ///   indices:         [B, H, T, D]  uint8   — codebook index per coordinate
 ///   indices_t:       [B, H, D, T]  uint8   — score-friendly transposed view
+///   q8_keybytes_t:   [B, H, D, T]  uint8   — q8-only packed index/sign view
 ///   norms:           [B, H, T, 1]  f32     — L2 norm before unit-sphere normalise
 ///   qjl_signs:       [B, H, T, ceil(D/32)]  uint32 packed sign words
 ///   qjl_signs_t:     [B, H, ceil(D/32), T]  uint32 transposed sign-word view
@@ -701,6 +702,7 @@ fn packed_qjl_words(dim: usize) -> usize {
 struct GpuKeyStore {
     indices: InlineArray,
     indices_t: InlineArray,
+    q8_keybytes_t: Option<InlineArray>,
     norms: InlineArray,
     qjl_signs: InlineArray,
     qjl_signs_t: InlineArray,
@@ -712,6 +714,10 @@ impl GpuKeyStore {
     fn append(&mut self, new: GpuKeyStore) {
         self.indices = self.indices.kv_cache_append(&new.indices, 2);
         self.indices_t = self.indices_t.kv_cache_append(&new.indices_t, 3);
+        self.q8_keybytes_t = match (self.q8_keybytes_t.take(), new.q8_keybytes_t) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
+            _ => None,
+        };
         self.norms = self.norms.kv_cache_append(&new.norms, 2);
         self.qjl_signs = self.qjl_signs.kv_cache_append(&new.qjl_signs, 2);
         self.qjl_signs_t = self.qjl_signs_t.kv_cache_append(&new.qjl_signs_t, 3);
@@ -721,6 +727,9 @@ impl GpuKeyStore {
     fn collect_for_detach<'a>(&'a mut self, out: &mut Vec<&'a mut InlineArray>) {
         out.push(&mut self.indices);
         out.push(&mut self.indices_t);
+        if let Some(q8_keybytes_t) = self.q8_keybytes_t.as_mut() {
+            out.push(q8_keybytes_t);
+        }
         out.push(&mut self.norms);
         out.push(&mut self.qjl_signs);
         out.push(&mut self.qjl_signs_t);
@@ -1313,60 +1322,107 @@ impl QuantizedKvCache {
             && value_bits == 8
             && key_dim == 128
             && value_dim == 128
-            && qjl_words == 4
-            // Current 2-pass bridge primitive is tuned for the smaller
-            // expanded-head shape seen on Qwen3.5-0.8B. Larger-head cases like
-            // 35B-A3B stay on the proven split path until pass 2/block
-            // scheduling is tuned for them as well.
-            && q_heads <= 8
             && n_seq >= 1024
         {
             let key_indices = ks.indices_t.reshape(&[kv_rows, key_dim, cache_seq_capacity]);
-            let key_qjl_signs = ks.qjl_signs_t.reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
             let value_indices = vs.indices_t.reshape(&[kv_rows, value_dim, cache_seq_capacity]);
-            if let Some(decoded_rot) = InlineArray::turboquant_attention_q8_d128_2pass(
-                &query_rot,
-                &query_proj,
-                &key_indices,
-                &key_qjl_signs,
-                &key_norms,
-                &key_residual_norms,
-                key_codebook,
-                &value_indices,
-                &vs.norms.reshape(&[kv_rows, cache_seq_capacity]),
-                value_core.codebook_arr(value_bits)?,
-                q_rows as u32,
-                n_seq as u32,
-                cache_seq_capacity as u32,
-                q_heads as u32,
-                layout.heads as u32,
-                scale,
-            ) {
-                let decode_us = if trace_timing {
-                    eval_stage_micros(&decoded_rot)
-                } else {
-                    0
-                };
-                let value_inv_rot = value_core.rotation_arr.as_ref()?;
-                let output_rows = decoded_rot.matmul(value_inv_rot);
-                let inverse_rotate_us = if trace_timing {
-                    eval_stage_micros(&output_rows)
-                } else {
-                    0
-                };
-                if trace_timing {
-                    trace_turboquant_bridge(&format!(
-                        "gpu_uniform_q8_d128_2pass_stage_us seq={} q_rows={} query_ready={} rotate={} project={} score=0 softmax=0 decode={} inverse_rotate={}",
-                        n_seq,
-                        q_rows,
-                        query_ready_us,
-                        rotate_us,
-                        project_us,
-                        decode_us,
-                        inverse_rotate_us,
-                    ));
+            let value_norms = vs.norms.reshape(&[kv_rows, cache_seq_capacity]);
+
+            if q_heads > 8 {
+                if let Some(key_bytes) = ks.q8_keybytes_t.as_ref() {
+                    let key_bytes = key_bytes.reshape(&[kv_rows, key_dim, cache_seq_capacity]);
+                    if let Some(decoded_rot) =
+                        InlineArray::turboquant_attention_q8_d128_packed_keys_2pass(
+                            &query_rot,
+                            &query_proj,
+                            &key_bytes,
+                            &key_norms,
+                            &key_residual_norms,
+                            key_codebook,
+                            &value_indices,
+                            &value_norms,
+                            value_core.codebook_arr(value_bits)?,
+                            q_rows as u32,
+                            n_seq as u32,
+                            cache_seq_capacity as u32,
+                            q_heads as u32,
+                            layout.heads as u32,
+                            scale,
+                        )
+                    {
+                        let decode_us = if trace_timing {
+                            eval_stage_micros(&decoded_rot)
+                        } else {
+                            0
+                        };
+                        let value_inv_rot = value_core.rotation_arr.as_ref()?;
+                        let output_rows = decoded_rot.matmul(value_inv_rot);
+                        let inverse_rotate_us = if trace_timing {
+                            eval_stage_micros(&output_rows)
+                        } else {
+                            0
+                        };
+                        if trace_timing {
+                            trace_turboquant_bridge(&format!(
+                                "gpu_uniform_q8_d128_packed_keys_2pass_stage_us seq={} q_rows={} query_ready={} rotate={} project={} score=0 softmax=0 decode={} inverse_rotate={}",
+                                n_seq,
+                                q_rows,
+                                query_ready_us,
+                                rotate_us,
+                                project_us,
+                                decode_us,
+                                inverse_rotate_us,
+                            ));
+                        }
+                        return Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]));
+                    }
                 }
-                return Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]));
+            } else if qjl_words == 4 {
+                let key_qjl_signs = ks.qjl_signs_t.reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
+                if let Some(decoded_rot) = InlineArray::turboquant_attention_q8_d128_2pass(
+                    &query_rot,
+                    &query_proj,
+                    &key_indices,
+                    &key_qjl_signs,
+                    &key_norms,
+                    &key_residual_norms,
+                    key_codebook,
+                    &value_indices,
+                    &value_norms,
+                    value_core.codebook_arr(value_bits)?,
+                    q_rows as u32,
+                    n_seq as u32,
+                    cache_seq_capacity as u32,
+                    q_heads as u32,
+                    layout.heads as u32,
+                    scale,
+                ) {
+                    let decode_us = if trace_timing {
+                        eval_stage_micros(&decoded_rot)
+                    } else {
+                        0
+                    };
+                    let value_inv_rot = value_core.rotation_arr.as_ref()?;
+                    let output_rows = decoded_rot.matmul(value_inv_rot);
+                    let inverse_rotate_us = if trace_timing {
+                        eval_stage_micros(&output_rows)
+                    } else {
+                        0
+                    };
+                    if trace_timing {
+                        trace_turboquant_bridge(&format!(
+                            "gpu_uniform_q8_d128_2pass_stage_us seq={} q_rows={} query_ready={} rotate={} project={} score=0 softmax=0 decode={} inverse_rotate={}",
+                            n_seq,
+                            q_rows,
+                            query_ready_us,
+                            rotate_us,
+                            project_us,
+                            decode_us,
+                            inverse_rotate_us,
+                        ));
+                    }
+                    return Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]));
+                }
             }
         }
 
@@ -1612,6 +1668,31 @@ fn gpu_quantize_kv(
     };
     let k_indices_t = k_indices.transpose_axes(&[0, 1, 3, 2]);
     let k_qjl_signs_t = k_qjl_signs.transpose_axes(&[0, 1, 3, 2]);
+    let q8_keybytes_t = if key_bits == 8 {
+        let kv_rows = (keys.dim(0) * keys.dim(1)) as u32;
+        let seq = keys.dim(2) as u32;
+        let indices_t_3d = k_indices_t.reshape(&[kv_rows as i32, k_core.dim as i32, seq as i32]);
+        let qjl_signs_t_3d =
+            k_qjl_signs_t.reshape(&[kv_rows as i32, packed_dim, seq as i32]);
+        InlineArray::turboquant_pack_q8_keybytes(
+            &indices_t_3d,
+            &qjl_signs_t_3d,
+            k_core.dim as u32,
+            packed_dim as u32,
+            kv_rows,
+            seq,
+        )
+        .map(|packed| {
+            packed.reshape(&[
+                keys.dim(0),
+                keys.dim(1),
+                k_core.dim as i32,
+                keys.dim(2),
+            ])
+        })
+    } else {
+        None
+    };
 
     // ── Values ────────────────────────────────────────────────────────────
     let val_norms = values.norm_l2(-1, true);
@@ -1630,6 +1711,7 @@ fn gpu_quantize_kv(
         GpuKeyStore {
             indices: k_indices,
             indices_t: k_indices_t,
+            q8_keybytes_t,
             norms: key_norms,
             qjl_signs: k_qjl_signs,
             qjl_signs_t: k_qjl_signs_t,

@@ -616,6 +616,19 @@ int mlx_inline_turboquant_pack_sign_bits(
     uint32_t                packed_dim,
     uint32_t                n_rows);
 
+// Pack q8 TurboQuant key bytes from seq-major centroid indices plus QJL signs.
+// indices:   [N, D, S_cap] uint8   (7-bit centroid indices)
+// qjl_signs: [N, ceil(D/32), S_cap] uint32 packed sign words
+// out:       [N, D, S_cap] uint8   (low 7 bits index, high bit sign)
+int mlx_inline_turboquant_pack_q8_keybytes(
+    mlx_inline_array*       out,
+    const mlx_inline_array* indices,
+    const mlx_inline_array* qjl_signs,
+    uint32_t                dim,
+    uint32_t                packed_dim,
+    uint32_t                n_rows,
+    uint32_t                cache_seq_capacity);
+
 // Unpack uint32 sign words back to {-1,+1} f32 signs.
 // packed: [N, ceil(D/32)] uint32
 // out:    [N, D] f32
@@ -656,6 +669,26 @@ int mlx_inline_turboquant_attention_q8_d128_2pass(
     const mlx_inline_array* query_proj,
     const mlx_inline_array* key_indices,
     const mlx_inline_array* key_qjl_signs,
+    const mlx_inline_array* key_norms,
+    const mlx_inline_array* key_residual_norms,
+    const mlx_inline_array* key_codebook,
+    const mlx_inline_array* value_indices,
+    const mlx_inline_array* value_norms,
+    const mlx_inline_array* value_codebook,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
+
+// Specialized long-context q8 decode primitive for D=128/V=128 over packed
+// seq-major key bytes (low 7 bits centroid index, high bit QJL sign).
+int mlx_inline_turboquant_attention_q8_d128_packed_keys_2pass(
+    mlx_inline_array*       out,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* query_proj,
+    const mlx_inline_array* key_bytes,
     const mlx_inline_array* key_norms,
     const mlx_inline_array* key_residual_norms,
     const mlx_inline_array* key_codebook,

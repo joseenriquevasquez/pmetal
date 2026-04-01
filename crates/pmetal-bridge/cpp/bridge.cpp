@@ -985,6 +985,20 @@ static const char* TURBOQUANT_UNPACK_SIGN_BITS_SOURCE = R"(
     output[row * dim + d] = ((word >> (d & 31u)) & 1u) == 0 ? -1.0f : 1.0f;
 )";
 
+static const char* TURBOQUANT_PACK_Q8_KEYBYTES_SOURCE = R"(
+    uint seq = thread_position_in_grid.x;
+    uint d = thread_position_in_grid.y;
+    uint row = thread_position_in_grid.z;
+    if (row >= n_rows || d >= dim || seq >= cache_seq_capacity) return;
+
+    uint index_base = ((row * dim) + d) * cache_seq_capacity + seq;
+    uint sign_word_idx = ((row * packed_dim) + (d >> 5)) * cache_seq_capacity + seq;
+    uchar index = indices[index_base] & 0x7fu;
+    uint sign_word = qjl_signs[sign_word_idx];
+    uchar sign_bit = ((sign_word >> (d & 31u)) & 1u) != 0u ? 0x80u : 0x00u;
+    output[index_base] = index | sign_bit;
+)";
+
 // WEIGHTED_DECODE: aggregate value centroids directly in the rotated domain.
 // This avoids materializing a [row, seq, dim] decoded value tensor before the
 // attention reduction.
@@ -1144,6 +1158,107 @@ static const char* TURBOQUANT_ATTENTION_Q8_D128_2PASS_1_SOURCE = R"(
         score_part += qrot1 * shared_k_codebook[(uint)key_indices[key_base + 1u * cache_seq_capacity]];
         score_part += qrot2 * shared_k_codebook[(uint)key_indices[key_base + 2u * cache_seq_capacity]];
         score_part += qrot3 * shared_k_codebook[(uint)key_indices[key_base + 3u * cache_seq_capacity]];
+        score_part += residual_scale * qproj0 * sign0;
+        score_part += residual_scale * qproj1 * sign1;
+        score_part += residual_scale * qproj2 * sign2;
+        score_part += residual_scale * qproj3 * sign3;
+        float score = key_norm * simd_sum(score_part);
+
+        float new_max = max(max_score, score);
+        float factor = fast::exp(max_score - new_max);
+        float exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        float value_scale = exp_score * value_norms[scalar_idx];
+        acc0 = acc0 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 0u * cache_seq_capacity]];
+        acc1 = acc1 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 1u * cache_seq_capacity]];
+        acc2 = acc2 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 2u * cache_seq_capacity]];
+        acc3 = acc3 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 3u * cache_seq_capacity]];
+    }
+
+    if (lane == 0u) {
+        sums[row * blocks + block] = sum_exp_score;
+        maxs[row * blocks + block] = max_score;
+    }
+    uint out_base = (row * blocks + block) * kDim + d0;
+    partials[out_base + 0u] = acc0;
+    partials[out_base + 1u] = acc1;
+    partials[out_base + 2u] = acc2;
+    partials[out_base + 3u] = acc3;
+)";
+
+// Variant of the q8 2-pass primitive that consumes a q8-specific seq-major key
+// byte view where low 7 bits are the centroid index and the high bit is the
+// QJL sign. This reduces key-side decode bandwidth for larger-head decode.
+static const char* TURBOQUANT_ATTENTION_Q8_D128_PACKED_KEYS_2PASS_1_SOURCE = R"(
+    constexpr uint kDim = 128u;
+    constexpr uint kVec = 4u;
+    constexpr float kQjlConst = 1.2533141373155003f / 128.0f;
+    threadgroup float shared_k_codebook[128];
+    threadgroup float shared_v_codebook[256];
+
+    uint kv_head = threadgroup_position_in_grid.x;
+    uint batch = threadgroup_position_in_grid.y;
+    uint block = threadgroup_position_in_grid.z;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint groups = q_heads / kv_heads;
+    uint row = batch * q_heads + kv_head * groups + simd_gid;
+    if (row >= n_rows || block >= blocks) return;
+
+    if (simd_gid == 0u) {
+        for (uint c = lane; c < 128u; c += 32u) {
+            shared_k_codebook[c] = key_codebook[c];
+        }
+        for (uint c = lane; c < 256u; c += 32u) {
+            shared_v_codebook[c] = value_codebook[c];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint kv_row = batch * kv_heads + kv_head;
+
+    uint d0 = lane * kVec;
+    uint query_base = row * kDim + d0;
+    float qrot0 = as_type<float>((uint)attn_scale_bits) * query_rot[query_base + 0u];
+    float qrot1 = as_type<float>((uint)attn_scale_bits) * query_rot[query_base + 1u];
+    float qrot2 = as_type<float>((uint)attn_scale_bits) * query_rot[query_base + 2u];
+    float qrot3 = as_type<float>((uint)attn_scale_bits) * query_rot[query_base + 3u];
+    float qproj0 = as_type<float>((uint)attn_scale_bits) * query_proj[query_base + 0u];
+    float qproj1 = as_type<float>((uint)attn_scale_bits) * query_proj[query_base + 1u];
+    float qproj2 = as_type<float>((uint)attn_scale_bits) * query_proj[query_base + 2u];
+    float qproj3 = as_type<float>((uint)attn_scale_bits) * query_proj[query_base + 3u];
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    float max_score = -INFINITY;
+    float sum_exp_score = 0.0f;
+
+    for (uint seq = block; seq < n_seq; seq += blocks) {
+        uint scalar_idx = kv_row * cache_seq_capacity + seq;
+        float key_norm = key_norms[scalar_idx];
+        float residual_scale = key_residual_norms[scalar_idx] * kQjlConst;
+        uint key_base = (kv_row * kDim + d0) * cache_seq_capacity + seq;
+        uint value_base = (kv_row * kDim + d0) * cache_seq_capacity + seq;
+
+        uchar key_byte0 = key_bytes[key_base + 0u * cache_seq_capacity];
+        uchar key_byte1 = key_bytes[key_base + 1u * cache_seq_capacity];
+        uchar key_byte2 = key_bytes[key_base + 2u * cache_seq_capacity];
+        uchar key_byte3 = key_bytes[key_base + 3u * cache_seq_capacity];
+
+        float sign0 = (key_byte0 & 0x80u) == 0u ? -1.0f : 1.0f;
+        float sign1 = (key_byte1 & 0x80u) == 0u ? -1.0f : 1.0f;
+        float sign2 = (key_byte2 & 0x80u) == 0u ? -1.0f : 1.0f;
+        float sign3 = (key_byte3 & 0x80u) == 0u ? -1.0f : 1.0f;
+
+        float score_part = 0.0f;
+        score_part += qrot0 * shared_k_codebook[(uint)(key_byte0 & 0x7fu)];
+        score_part += qrot1 * shared_k_codebook[(uint)(key_byte1 & 0x7fu)];
+        score_part += qrot2 * shared_k_codebook[(uint)(key_byte2 & 0x7fu)];
+        score_part += qrot3 * shared_k_codebook[(uint)(key_byte3 & 0x7fu)];
         score_part += residual_scale * qproj0 * sign0;
         score_part += residual_scale * qproj1 * sign1;
         score_part += residual_scale * qproj2 * sign2;
@@ -1431,12 +1546,48 @@ static mlx::core::fast::CustomKernelFunction& get_turboquant_pack_sign_bits_kern
     return kernel;
 }
 
+static mlx::core::fast::CustomKernelFunction& get_turboquant_pack_q8_keybytes_kernel() {
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "turboquant_pack_q8_keybytes",
+        {"indices", "qjl_signs"},
+        {"output"},
+        TURBOQUANT_PACK_Q8_KEYBYTES_SOURCE,
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
 static mlx::core::fast::CustomKernelFunction& get_turboquant_unpack_sign_bits_kernel() {
     static auto kernel = mlx::core::fast::metal_kernel(
         "turboquant_unpack_sign_bits",
         {"packed"},
         {"output"},
         TURBOQUANT_UNPACK_SIGN_BITS_SOURCE,
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
+static mlx::core::fast::CustomKernelFunction& get_turboquant_attention_q8_d128_packed_keys_2pass_1_kernel() {
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "turboquant_attention_q8_d128_packed_keys_2pass_1",
+        {
+            "query_rot",
+            "query_proj",
+            "key_bytes",
+            "key_norms",
+            "key_residual_norms",
+            "key_codebook",
+            "value_indices",
+            "value_norms",
+            "value_codebook",
+        },
+        {"partials", "sums", "maxs"},
+        TURBOQUANT_ATTENTION_Q8_D128_PACKED_KEYS_2PASS_1_SOURCE,
         "",
         true,
         false
@@ -1715,6 +1866,40 @@ int mlx_inline_turboquant_pack_sign_bits(
     }
 }
 
+int mlx_inline_turboquant_pack_q8_keybytes(
+    mlx_inline_array*       out,
+    const mlx_inline_array* indices,
+    const mlx_inline_array* qjl_signs,
+    uint32_t                dim,
+    uint32_t                packed_dim,
+    uint32_t                n_rows,
+    uint32_t                cache_seq_capacity)
+{
+    using namespace mlx::core;
+
+    if (dim == 0 || packed_dim == 0 || n_rows == 0 || cache_seq_capacity == 0) return 1;
+
+    try {
+        auto& kernel = get_turboquant_pack_q8_keybytes_kernel();
+        auto outputs = kernel(
+            {as_arr(indices), as_arr(qjl_signs)},
+            {{(int)n_rows, (int)dim, (int)cache_seq_capacity}},
+            {uint8},
+            {(int)cache_seq_capacity, (int)dim, (int)n_rows},
+            {(int)std::min(cache_seq_capacity, 256u), 1, 1},
+            {{"dim", (int)dim},
+             {"packed_dim", (int)packed_dim},
+             {"n_rows", (int)n_rows},
+             {"cache_seq_capacity", (int)cache_seq_capacity}},
+            std::nullopt, false, {}
+        );
+        new (out->buf) array(outputs[0]);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
 int mlx_inline_turboquant_unpack_sign_bits(
     mlx_inline_array*       out,
     const mlx_inline_array* packed,
@@ -1740,6 +1925,96 @@ int mlx_inline_turboquant_unpack_sign_bits(
             std::nullopt, false, {}
         );
         new (out->buf) array(outputs[0]);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+int mlx_inline_turboquant_attention_q8_d128_packed_keys_2pass(
+    mlx_inline_array*       out,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* query_proj,
+    const mlx_inline_array* key_bytes,
+    const mlx_inline_array* key_norms,
+    const mlx_inline_array* key_residual_norms,
+    const mlx_inline_array* key_codebook,
+    const mlx_inline_array* value_indices,
+    const mlx_inline_array* value_norms,
+    const mlx_inline_array* value_codebook,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits)
+{
+    using namespace mlx::core;
+
+    constexpr uint32_t dim = 128u;
+    const uint32_t blocks = turboquant_q8_2pass_blocks_override_or(32u);
+
+    if (n_rows == 0 || n_seq < 1024 || cache_seq_capacity < n_seq) return 1;
+    if (q_heads == 0 || kv_heads == 0 || (q_heads % kv_heads) != 0) return 1;
+
+    try {
+        const array& query_rot_arr = as_arr(query_rot);
+        const array& query_proj_arr = as_arr(query_proj);
+        const array& key_bytes_arr = as_arr(key_bytes);
+        const array& key_norms_arr = as_arr(key_norms);
+        const array& key_residual_norms_arr = as_arr(key_residual_norms);
+        const array& key_codebook_arr = as_arr(key_codebook);
+        const array& value_indices_arr = as_arr(value_indices);
+        const array& value_norms_arr = as_arr(value_norms);
+        const array& value_codebook_arr = as_arr(value_codebook);
+
+        if (query_rot_arr.shape(-1) != dim || query_proj_arr.shape(-1) != dim) return 1;
+        if (key_codebook_arr.shape(0) != 128 || value_codebook_arr.shape(0) != 256) return 1;
+
+        auto& pass1 = get_turboquant_attention_q8_d128_packed_keys_2pass_1_kernel();
+        auto pass1_outputs = pass1(
+            {
+                query_rot_arr,
+                query_proj_arr,
+                key_bytes_arr,
+                key_norms_arr,
+                key_residual_norms_arr,
+                key_codebook_arr,
+                value_indices_arr,
+                value_norms_arr,
+                value_codebook_arr,
+            },
+            {{(int)n_rows, (int)blocks, (int)dim}, {(int)n_rows, (int)blocks}, {(int)n_rows, (int)blocks}},
+            {float32, float32, float32},
+            {32 * (int)kv_heads, (int)((q_heads / kv_heads) * (n_rows / q_heads)), (int)blocks},
+            {32, (int)(q_heads / kv_heads), 1},
+            {
+                {"n_rows", (int)n_rows},
+                {"n_seq", (int)n_seq},
+                {"blocks", (int)blocks},
+                {"cache_seq_capacity", (int)cache_seq_capacity},
+                {"q_heads", (int)q_heads},
+                {"kv_heads", (int)kv_heads},
+                {"attn_scale_bits", (int)attn_scale_bits},
+            },
+            std::nullopt, false, {}
+        );
+
+        auto& pass2 = get_turboquant_attention_q8_d128_2pass_2_kernel();
+        auto pass2_outputs = pass2(
+            {pass1_outputs[0], pass1_outputs[1], pass1_outputs[2]},
+            {{(int)n_rows, (int)dim}},
+            {float32},
+            {1024, (int)n_rows, 1},
+            {1024, 1, 1},
+            {
+                {"n_rows", (int)n_rows},
+                {"blocks", (int)blocks},
+            },
+            std::nullopt, false, {}
+        );
+
+        new (out->buf) array(pass2_outputs[0]);
         return 0;
     } catch (...) {
         return 1;
