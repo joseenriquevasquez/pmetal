@@ -1338,34 +1338,24 @@ impl QuantizedKvCache {
                 )
             }
             UniformAttentionBenchMode::SpecializedQ8D256TwoPass => {
-                if key_bits != 8
-                    || value_bits != 8
-                    || key_dim != 256
-                    || value_dim != 256
-                    || qjl_words != 8
-                {
-                    return None;
-                }
-                let key_indices = ks.indices_t.reshape(&[kv_rows, key_dim, cache_seq_capacity]);
-                let key_qjl_signs = ks.qjl_signs_t.reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
-                let value_indices = vs.indices_t.reshape(&[kv_rows, value_dim, cache_seq_capacity]);
-                InlineArray::turboquant_attention_q8_d256_2pass(
-                    query_rot,
-                    query_proj,
-                    &key_indices,
-                    &key_qjl_signs,
-                    &key_norms,
-                    &key_residual_norms,
-                    key_core.codebook_arr(key_bits.saturating_sub(1))?,
-                    &value_indices,
+                // This branch only carries the exact-shape D256 score specialization.
+                // Keep the benchmark mode wired, but route it through the split path
+                // until a verified D256 2-pass primitive exists on this branch too.
+                let scores =
+                    self.bench_gpu_uniform_scores_precomputed(query_rot, query_proj, q_heads, scale)?;
+                let weights = scores.softmax(-1);
+                InlineArray::turboquant_weighted_decode(
+                    &weights,
+                    &vs.indices_t,
                     &vs.norms.reshape(&[kv_rows, cache_seq_capacity]),
                     value_core.codebook_arr(value_bits)?,
+                    value_dim as u32,
+                    (1u32 << value_bits) as u32,
                     q_rows as u32,
                     n_seq as u32,
-                    cache_seq_capacity as u32,
+                    vs.indices_t.dim(3) as u32,
                     q_heads as u32,
                     layout.heads as u32,
-                    scale,
                 )
             }
             UniformAttentionBenchMode::Split => {
