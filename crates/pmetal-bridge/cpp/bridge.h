@@ -646,6 +646,29 @@ int mlx_inline_turboquant_weighted_decode(
     uint32_t                q_heads,
     uint32_t                kv_heads);
 
+// Specialized long-context q8 decode primitive for D=128/V=128.
+// Computes TurboQuant attention directly from compressed K/V in two passes:
+// pass 1 emits per-block partial accumulators + log-sum-exp stats,
+// pass 2 merges those partials into the final rotated output.
+int mlx_inline_turboquant_attention_q8_d128_2pass(
+    mlx_inline_array*       out,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* query_proj,
+    const mlx_inline_array* key_indices,
+    const mlx_inline_array* key_qjl_signs,
+    const mlx_inline_array* key_norms,
+    const mlx_inline_array* key_residual_norms,
+    const mlx_inline_array* key_codebook,
+    const mlx_inline_array* value_indices,
+    const mlx_inline_array* value_norms,
+    const mlx_inline_array* value_codebook,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
+
 // Gather/scatter helpers for mixed TurboQuant component layouts.
 // input: [N, D] f32, positions: [P] int32, out: [N, P] f32
 int mlx_inline_turboquant_gather_last_dim(

@@ -1309,6 +1309,66 @@ impl QuantizedKvCache {
         let key_norms = ks.norms.reshape(&[kv_rows, cache_seq_capacity]);
         let key_residual_norms = ks.residual_norms.reshape(&[kv_rows, cache_seq_capacity]);
         let qjl_words = ks.qjl_signs_t.dim(2);
+        if key_bits == 8
+            && value_bits == 8
+            && key_dim == 128
+            && value_dim == 128
+            && qjl_words == 4
+            // Current 2-pass bridge primitive is tuned for the smaller
+            // expanded-head shape seen on Qwen3.5-0.8B. Larger-head cases like
+            // 35B-A3B stay on the proven split path until pass 2/block
+            // scheduling is tuned for them as well.
+            && q_heads <= 8
+            && n_seq >= 1024
+        {
+            let key_indices = ks.indices_t.reshape(&[kv_rows, key_dim, cache_seq_capacity]);
+            let key_qjl_signs = ks.qjl_signs_t.reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
+            let value_indices = vs.indices_t.reshape(&[kv_rows, value_dim, cache_seq_capacity]);
+            if let Some(decoded_rot) = InlineArray::turboquant_attention_q8_d128_2pass(
+                &query_rot,
+                &query_proj,
+                &key_indices,
+                &key_qjl_signs,
+                &key_norms,
+                &key_residual_norms,
+                key_codebook,
+                &value_indices,
+                &vs.norms.reshape(&[kv_rows, cache_seq_capacity]),
+                value_core.codebook_arr(value_bits)?,
+                q_rows as u32,
+                n_seq as u32,
+                cache_seq_capacity as u32,
+                q_heads as u32,
+                layout.heads as u32,
+                scale,
+            ) {
+                let decode_us = if trace_timing {
+                    eval_stage_micros(&decoded_rot)
+                } else {
+                    0
+                };
+                let value_inv_rot = value_core.rotation_arr.as_ref()?;
+                let output_rows = decoded_rot.matmul(value_inv_rot);
+                let inverse_rotate_us = if trace_timing {
+                    eval_stage_micros(&output_rows)
+                } else {
+                    0
+                };
+                if trace_timing {
+                    trace_turboquant_bridge(&format!(
+                        "gpu_uniform_q8_d128_2pass_stage_us seq={} q_rows={} query_ready={} rotate={} project={} score=0 softmax=0 decode={} inverse_rotate={}",
+                        n_seq,
+                        q_rows,
+                        query_ready_us,
+                        rotate_us,
+                        project_us,
+                        decode_us,
+                        inverse_rotate_us,
+                    ));
+                }
+                return Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]));
+            }
+        }
 
         let scores = InlineArray::turboquant_score(
             &query_rot,
@@ -2495,7 +2555,11 @@ fn f32_rows_to_bhsd_array(
 mod tests {
     use super::*;
 
-    fn make_uniform_direct_attention_case() -> (
+    fn make_uniform_direct_attention_case_with(
+        dim: usize,
+        heads: i32,
+        prefill: i32,
+    ) -> (
         QuantizedKvCache,
         InlineArray,
         InlineArray,
@@ -2505,11 +2569,9 @@ mod tests {
         i32,
         i32,
     ) {
-        let dim = 16usize;
         let config = TurboQuantConfig::uniform(8, 8);
         let b = 1i32;
-        let h = 2i32;
-        let prefill = 3i32;
+        let h = heads;
         let d = dim as i32;
         let scale = 1.0f32 / (dim as f32).sqrt();
 
@@ -2543,6 +2605,19 @@ mod tests {
         );
 
         (seed_cache, queries, step_keys, step_values, scale, b, h, d)
+    }
+
+    fn make_uniform_direct_attention_case() -> (
+        QuantizedKvCache,
+        InlineArray,
+        InlineArray,
+        InlineArray,
+        f32,
+        i32,
+        i32,
+        i32,
+    ) {
+        make_uniform_direct_attention_case_with(16, 2, 3)
     }
 
     fn manual_single_token_attention(
@@ -2853,6 +2928,43 @@ mod tests {
         assert!(
             max_abs_diff < 1e-4,
             "direct attention diverged from dequantized sdpa: max_abs_diff={max_abs_diff}"
+        );
+    }
+
+    #[test]
+    fn turboquant_direct_attention_matches_dequantized_sdpa_uniform_q8_d128_long_context() {
+        let (seed_cache, queries, step_keys, step_values, scale, b, h, d) =
+            make_uniform_direct_attention_case_with(128, 2, 1023);
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+
+        ref_cache.append(&step_keys, &step_values).expect("reference append");
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let reference_vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut full_keys,
+            &mut full_values,
+            b,
+            h,
+            1024,
+            d,
+            scale,
+        );
+
+        let direct_vals = direct.to_f32_vec((b * h * d) as usize).expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff < 1e-4,
+            "long-context direct attention diverged from dequantized sdpa: max_abs_diff={max_abs_diff}"
         );
     }
 

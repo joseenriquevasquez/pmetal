@@ -510,6 +510,26 @@ unsafe extern "C" {
         kv_heads: u32,
     ) -> i32;
 
+    fn mlx_inline_turboquant_attention_q8_d128_2pass(
+        out: *mut RawBuf,
+        query_rot: *const RawBuf,
+        query_proj: *const RawBuf,
+        key_indices: *const RawBuf,
+        key_qjl_signs: *const RawBuf,
+        key_norms: *const RawBuf,
+        key_residual_norms: *const RawBuf,
+        key_codebook: *const RawBuf,
+        value_indices: *const RawBuf,
+        value_norms: *const RawBuf,
+        value_codebook: *const RawBuf,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale_bits: u32,
+    ) -> i32;
+
     fn mlx_inline_turboquant_gather_last_dim(
         out: *mut RawBuf,
         input: *const RawBuf,
@@ -2470,6 +2490,58 @@ impl InlineArray {
                 cache_seq_capacity,
                 q_heads,
                 kv_heads,
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Specialized long-context q8 TurboQuant decode for D=128/V=128.
+    ///
+    /// Returns the rotated aggregated values `[N, 128]` on success.
+    pub fn turboquant_attention_q8_d128_2pass(
+        query_rot: &Self,
+        query_proj: &Self,
+        key_indices: &Self,
+        key_qjl_signs: &Self,
+        key_norms: &Self,
+        key_residual_norms: &Self,
+        key_codebook: &Self,
+        value_indices: &Self,
+        value_norms: &Self,
+        value_codebook: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale: f32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_attention_q8_d128_2pass(
+                out.as_mut_ptr(),
+                &query_rot.raw,
+                &query_proj.raw,
+                &key_indices.raw,
+                &key_qjl_signs.raw,
+                &key_norms.raw,
+                &key_residual_norms.raw,
+                &key_codebook.raw,
+                &value_indices.raw,
+                &value_norms.raw,
+                &value_codebook.raw,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+                attn_scale.to_bits(),
             )
         };
         if rc == 0 {
