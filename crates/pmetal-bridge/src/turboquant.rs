@@ -969,6 +969,13 @@ struct CacheLayout {
     value_dim: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum UniformAttentionBenchMode {
+    Split,
+    SpecializedQ8D128TwoPass,
+    SpecializedQ8D256TwoPass,
+}
+
 impl QuantizedKvCache {
     /// Create an empty cache.  `state` should be `None` on first use; call
     /// [`append`] to populate.
@@ -1254,6 +1261,260 @@ impl QuantizedKvCache {
         })
     }
 
+    #[doc(hidden)]
+    pub fn bench_gpu_uniform_attention_core_precomputed(
+        &self,
+        query_rot: &InlineArray,
+        query_proj: &InlineArray,
+        q_heads: i32,
+        scale: f32,
+        mode: UniformAttentionBenchMode,
+    ) -> Option<InlineArray> {
+        let layout = self.layout?;
+        let ks = self.keys.as_ref()?.gpu.as_ref()?;
+        let vs = self.values.as_ref()?.gpu.as_ref()?;
+        let state = self.state.as_ref()?;
+
+        let (key_core, key_bits) = match &state.keys {
+            TensorRuntime::Uniform {
+                config: TurboQuantTensorConfig::Uniform { bits },
+                core,
+            } => (core, *bits),
+            _ => return None,
+        };
+        let (value_core, value_bits) = match &state.values {
+            TensorRuntime::Uniform {
+                config: TurboQuantTensorConfig::Uniform { bits },
+                core,
+            } => (core, *bits),
+            _ => return None,
+        };
+
+        let key_dim = layout.key_dim as i32;
+        let value_dim = layout.value_dim as i32;
+        let kv_heads_i32 = layout.heads as i32;
+        let q_rows = query_rot.dim(0);
+        let n_seq = self.offset as i32;
+        let cache_seq_capacity = ks.indices_t.dim(3);
+        if q_rows <= 0 || n_seq <= 0 || cache_seq_capacity < n_seq || kv_heads_i32 <= 0 {
+            return None;
+        }
+
+        let kv_rows = (layout.batch * layout.heads) as i32;
+        let key_norms = ks.norms.reshape(&[kv_rows, cache_seq_capacity]);
+        let key_residual_norms = ks.residual_norms.reshape(&[kv_rows, cache_seq_capacity]);
+        let qjl_words = ks.qjl_signs_t.dim(2);
+
+        match mode {
+            UniformAttentionBenchMode::SpecializedQ8D128TwoPass => {
+                if key_bits != 8
+                    || value_bits != 8
+                    || key_dim != 128
+                    || value_dim != 128
+                    || qjl_words != 4
+                {
+                    return None;
+                }
+                let key_indices = ks.indices_t.reshape(&[kv_rows, key_dim, cache_seq_capacity]);
+                let key_qjl_signs = ks.qjl_signs_t.reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
+                let value_indices = vs.indices_t.reshape(&[kv_rows, value_dim, cache_seq_capacity]);
+                InlineArray::turboquant_attention_q8_d128_2pass(
+                    query_rot,
+                    query_proj,
+                    &key_indices,
+                    &key_qjl_signs,
+                    &key_norms,
+                    &key_residual_norms,
+                    key_core.codebook_arr(key_bits.saturating_sub(1))?,
+                    &value_indices,
+                    &vs.norms.reshape(&[kv_rows, cache_seq_capacity]),
+                    value_core.codebook_arr(value_bits)?,
+                    q_rows as u32,
+                    n_seq as u32,
+                    cache_seq_capacity as u32,
+                    q_heads as u32,
+                    layout.heads as u32,
+                    scale,
+                )
+            }
+            UniformAttentionBenchMode::SpecializedQ8D256TwoPass => {
+                if key_bits != 8
+                    || value_bits != 8
+                    || key_dim != 256
+                    || value_dim != 256
+                    || qjl_words != 8
+                {
+                    return None;
+                }
+                let key_indices = ks.indices_t.reshape(&[kv_rows, key_dim, cache_seq_capacity]);
+                let key_qjl_signs = ks.qjl_signs_t.reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
+                let value_indices = vs.indices_t.reshape(&[kv_rows, value_dim, cache_seq_capacity]);
+                InlineArray::turboquant_attention_q8_d256_2pass(
+                    query_rot,
+                    query_proj,
+                    &key_indices,
+                    &key_qjl_signs,
+                    &key_norms,
+                    &key_residual_norms,
+                    key_core.codebook_arr(key_bits.saturating_sub(1))?,
+                    &value_indices,
+                    &vs.norms.reshape(&[kv_rows, cache_seq_capacity]),
+                    value_core.codebook_arr(value_bits)?,
+                    q_rows as u32,
+                    n_seq as u32,
+                    cache_seq_capacity as u32,
+                    q_heads as u32,
+                    layout.heads as u32,
+                    scale,
+                )
+            }
+            UniformAttentionBenchMode::Split => {
+                let scores =
+                    self.bench_gpu_uniform_scores_precomputed(query_rot, query_proj, q_heads, scale)?;
+                let weights = scores.softmax(-1);
+                InlineArray::turboquant_weighted_decode(
+                    &weights,
+                    &vs.indices_t,
+                    &vs.norms.reshape(&[kv_rows, cache_seq_capacity]),
+                    value_core.codebook_arr(value_bits)?,
+                    value_dim as u32,
+                    (1u32 << value_bits) as u32,
+                    q_rows as u32,
+                    n_seq as u32,
+                    vs.indices_t.dim(3) as u32,
+                    q_heads as u32,
+                    layout.heads as u32,
+                )
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn bench_gpu_uniform_query_transforms(
+        &self,
+        queries_f32: &InlineArray,
+    ) -> Option<(InlineArray, InlineArray)> {
+        let state = self.state.as_ref()?;
+        let key_core = match &state.keys {
+            TensorRuntime::Uniform { core, .. } => core,
+            _ => return None,
+        };
+        let key_rot = key_core.inverse_rotation_arr.as_ref()?;
+        let key_proj = key_core.inverse_qjl_arr.as_ref()?;
+        let batch = queries_f32.dim(0);
+        let q_heads = queries_f32.dim(1);
+        let key_dim = queries_f32.dim(3);
+        let q_rows = batch * q_heads;
+        let query_rows = queries_f32.reshape(&[q_rows, key_dim]);
+        Some((query_rows.matmul(key_rot), query_rows.matmul(key_proj)))
+    }
+
+    #[doc(hidden)]
+    pub fn bench_gpu_uniform_scores_precomputed(
+        &self,
+        query_rot: &InlineArray,
+        query_proj: &InlineArray,
+        q_heads: i32,
+        scale: f32,
+    ) -> Option<InlineArray> {
+        let layout = self.layout?;
+        let ks = self.keys.as_ref()?.gpu.as_ref()?;
+        let state = self.state.as_ref()?;
+        let (key_core, key_bits) = match &state.keys {
+            TensorRuntime::Uniform {
+                config: TurboQuantTensorConfig::Uniform { bits },
+                core,
+            } => (core, *bits),
+            _ => return None,
+        };
+        let key_dim = layout.key_dim as i32;
+        let kv_rows = (layout.batch * layout.heads) as i32;
+        let q_rows = query_rot.dim(0);
+        let n_seq = self.offset as i32;
+        let cache_seq_capacity = ks.indices_t.dim(3);
+        let qjl_words = ks.qjl_signs_t.dim(2);
+        let key_norms = ks.norms.reshape(&[kv_rows, cache_seq_capacity]);
+        let key_residual_norms = ks.residual_norms.reshape(&[kv_rows, cache_seq_capacity]);
+        if key_bits == 8
+            && key_dim == 256
+            && qjl_words == 8
+            && q_heads > 0
+            && (q_heads % layout.heads as i32) == 0
+            && (q_heads / layout.heads as i32) <= 8
+        {
+            if let Some(scores) = InlineArray::turboquant_score_q8_d256(
+                query_rot,
+                query_proj,
+                &ks.indices_t,
+                &ks.qjl_signs_t,
+                &key_norms,
+                &key_residual_norms,
+                key_core.codebook_arr(key_bits.saturating_sub(1))?,
+                q_rows as u32,
+                n_seq as u32,
+                cache_seq_capacity as u32,
+                q_heads as u32,
+                layout.heads as u32,
+                scale,
+            ) {
+                return Some(scores);
+            }
+        }
+        InlineArray::turboquant_score(
+            query_rot,
+            query_proj,
+            &ks.indices_t,
+            &ks.qjl_signs_t,
+            &key_norms,
+            &key_residual_norms,
+            key_core.codebook_arr(key_bits.saturating_sub(1))?,
+            key_dim as u32,
+            qjl_words as u32,
+            key_core.codebook_arr(key_bits.saturating_sub(1))?.dim(0) as u32,
+            q_rows as u32,
+            n_seq as u32,
+            cache_seq_capacity as u32,
+            q_heads as u32,
+            layout.heads as u32,
+            scale,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn bench_gpu_uniform_weighted_decode(
+        &self,
+        weights: &InlineArray,
+        q_heads: i32,
+    ) -> Option<InlineArray> {
+        let layout = self.layout?;
+        let vs = self.values.as_ref()?.gpu.as_ref()?;
+        let state = self.state.as_ref()?;
+        let (value_core, value_bits) = match &state.values {
+            TensorRuntime::Uniform {
+                config: TurboQuantTensorConfig::Uniform { bits },
+                core,
+            } => (core, *bits),
+            _ => return None,
+        };
+        let value_dim = layout.value_dim as i32;
+        let kv_rows = (layout.batch * layout.heads) as i32;
+        let q_rows = weights.dim(0);
+        let n_seq = self.offset as i32;
+        InlineArray::turboquant_weighted_decode(
+            weights,
+            &vs.indices_t,
+            &vs.norms.reshape(&[kv_rows, vs.indices_t.dim(3)]),
+            value_core.codebook_arr(value_bits)?,
+            value_dim as u32,
+            (1u32 << value_bits) as u32,
+            q_rows as u32,
+            n_seq as u32,
+            vs.indices_t.dim(3) as u32,
+            q_heads as u32,
+            layout.heads as u32,
+        )
+    }
+
     fn try_gpu_uniform_attention(
         &self,
         queries_f32: &InlineArray,
@@ -1426,22 +1687,10 @@ impl QuantizedKvCache {
             }
         }
 
-        let scores = InlineArray::turboquant_score(
+        let scores = self.bench_gpu_uniform_scores_precomputed(
             &query_rot,
             &query_proj,
-            &ks.indices_t,
-            &ks.qjl_signs_t,
-            &key_norms,
-            &key_residual_norms,
-            key_codebook,
-            key_dim as u32,
-            qjl_words as u32,
-            key_codebook.dim(0) as u32,
-            q_rows as u32,
-            n_seq as u32,
-            cache_seq_capacity as u32,
-            q_heads as u32,
-            layout.heads as u32,
+            q_heads,
             scale,
         )?;
         let score_us = if trace_timing {

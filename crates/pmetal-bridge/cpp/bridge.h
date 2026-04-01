@@ -571,6 +571,23 @@ int mlx_inline_turboquant_score(
     uint32_t                kv_heads,
     uint32_t                attn_scale_bits);
 
+// Specialized q8 key scoring for D=256 on the seq-major transposed cache layout.
+int mlx_inline_turboquant_score_q8_d256(
+    mlx_inline_array*       out_scores,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* query_proj,
+    const mlx_inline_array* indices,
+    const mlx_inline_array* qjl_signs,
+    const mlx_inline_array* norms,
+    const mlx_inline_array* residual_norms,
+    const mlx_inline_array* codebook,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
+
 // Fused mixed TurboQuant key scoring.
 // regular/outlier query tensors: [N, D_reg]/[N, D_out] f32
 // regular/outlier indices: [KvRows, S_cap, D_*]

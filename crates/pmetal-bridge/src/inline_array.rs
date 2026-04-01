@@ -449,6 +449,23 @@ unsafe extern "C" {
         attn_scale_bits: u32,
     ) -> i32;
 
+    fn mlx_inline_turboquant_score_q8_d256(
+        out_scores: *mut RawBuf,
+        query_rot: *const RawBuf,
+        query_proj: *const RawBuf,
+        indices: *const RawBuf,
+        qjl_signs: *const RawBuf,
+        norms: *const RawBuf,
+        residual_norms: *const RawBuf,
+        codebook: *const RawBuf,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale_bits: u32,
+    ) -> i32;
+
     fn mlx_inline_turboquant_mixed_score(
         out_scores: *mut RawBuf,
         regular_query_rot: *const RawBuf,
@@ -2336,6 +2353,50 @@ impl InlineArray {
                 dim,
                 qjl_words,
                 n_centroids,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+                attn_scale.to_bits(),
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Specialized q8 key scoring for D=256 on the seq-major transposed cache layout.
+    pub fn turboquant_score_q8_d256(
+        query_rot: &Self,
+        query_proj: &Self,
+        indices: &Self,
+        qjl_signs: &Self,
+        norms: &Self,
+        residual_norms: &Self,
+        codebook: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale: f32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_score_q8_d256(
+                out.as_mut_ptr(),
+                &query_rot.raw,
+                &query_proj.raw,
+                &indices.raw,
+                &qjl_signs.raw,
+                &norms.raw,
+                &residual_norms.raw,
+                &codebook.raw,
                 n_rows,
                 n_seq,
                 cache_seq_capacity,
