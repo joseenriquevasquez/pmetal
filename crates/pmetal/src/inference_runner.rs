@@ -685,6 +685,35 @@ fn cache_mode_request_from_config(config: &InferenceRunnerConfig) -> CacheModeRe
     }
 }
 
+pub fn explicit_cache_mode_override(
+    base_cache_config: &KVCacheConfig,
+    request: CacheModeRequest,
+) -> Option<CacheMode> {
+    let explicit = request.no_kv_quant
+        || request.kv_quant == Some(0)
+        || request.kv_turboquant
+        || request.kv_turboquant_preset.is_some()
+        || request.kv_quant.is_some()
+        || request.kv_k_bits.is_some()
+        || request.kv_v_bits.is_some();
+
+    if !explicit {
+        return None;
+    }
+
+    let mode = if request.no_kv_quant || request.kv_quant == Some(0) {
+        CacheMode::Standard
+    } else {
+        resolve_cache_mode(
+            base_cache_config.head_dim,
+            base_cache_config.value_head_dim,
+            request,
+        )
+    };
+
+    Some(sanitize_cache_mode_for_config(base_cache_config, mode))
+}
+
 fn build_mlx_lm_benchmark_prompt(prompt_tokens: usize, vocab_size: usize, seed: u64) -> Vec<u32> {
     let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
     let upper = vocab_size.max(1) as u64;
@@ -1052,18 +1081,9 @@ fn select_cache_mode_with_working_set(
         };
     }
 
-    if request.kv_turboquant
-        || request.kv_turboquant_preset.is_some()
-        || request.kv_quant.is_some()
-        || request.kv_k_bits.is_some()
-        || request.kv_v_bits.is_some()
-    {
+    if let Some(mode) = explicit_cache_mode_override(base_cache_config, request) {
         return CacheModeSelection {
-            mode: resolve_cache_mode(
-                base_cache_config.head_dim,
-                base_cache_config.value_head_dim,
-                request,
-            ),
+            mode,
             source: CacheModeSource::Explicit,
             estimated_weight_bytes,
             estimated_fp16_kv_bytes,
@@ -1533,6 +1553,33 @@ mod tests {
             }
         );
         assert_eq!(selection.source, CacheModeSource::Explicit);
+    }
+
+    #[test]
+    fn explicit_cache_mode_override_uses_real_key_and_value_dims() {
+        let base = KVCacheConfig::new(40, 4096, 2, 256)
+            .with_value_head_dim(128)
+            .with_dtype(Dtype::Float16);
+        let mode = explicit_cache_mode_override(
+            &base,
+            CacheModeRequest {
+                kv_quant: None,
+                kv_k_bits: None,
+                kv_v_bits: None,
+                kv_group_size: 64,
+                kv_turboquant: false,
+                kv_turboquant_preset: Some(TurboQuantPreset::Q2_5),
+                no_kv_quant: false,
+                fp8: false,
+            },
+        )
+        .expect("explicit turboquant preset should produce a cache override");
+
+        let expected = TurboQuantConfig {
+            keys: TurboQuantConfig::preset_q2_5(256).keys,
+            values: TurboQuantConfig::preset_q2_5(128).values,
+        };
+        assert_eq!(mode, CacheMode::TurboQuant { config: expected });
     }
 
     #[test]

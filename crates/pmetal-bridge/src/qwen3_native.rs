@@ -66,6 +66,31 @@ fn default_model_type() -> String {
     "qwen3_5".to_string()
 }
 
+fn bundled_mlx_supports_quant_bits(bits: i32) -> bool {
+    matches!(bits, 2 | 3 | 4 | 5 | 6 | 8)
+}
+
+fn validate_quantization_runtime_support_for(
+    bits: i32,
+    mlx_kind: &str,
+    mlx_git_tag: &str,
+) -> Result<(), String> {
+    if mlx_kind == "bundled-upstream" && !bundled_mlx_supports_quant_bits(bits) {
+        return Err(format!(
+            "This pmetal build uses bundled upstream MLX {mlx_git_tag}, whose Metal affine quantized kernels only support bits in {{2, 3, 4, 5, 6, 8}}. The requested model uses {bits}-bit quantization. Rebuild pmetal against a compatible libmlx by setting PMETAL_MLX_LIB_DIR to the directory containing libmlx.dylib before running `cargo build --release -p pmetal`. 1-bit checkpoints such as PrismML Bonsai require a 1-bit-capable MLX fork."
+        ));
+    }
+    Ok(())
+}
+
+fn validate_quantization_runtime_support(bits: i32) -> Result<(), String> {
+    validate_quantization_runtime_support_for(
+        bits,
+        option_env!("PMETAL_BRIDGE_MLX_KIND").unwrap_or("bundled-upstream"),
+        option_env!("PMETAL_BRIDGE_MLX_GIT_TAG").unwrap_or("unknown"),
+    )
+}
+
 /// Minimal, serde-deserializable Qwen3/Qwen3.5 config.
 ///
 /// Only the fields required for inference are included; unknown keys are
@@ -143,8 +168,11 @@ pub struct Qwen3Config {
     #[serde(default)]
     pub mlp_only_layers: Vec<usize>,
 
-    /// Optional quantization config — present in 4-bit quantized checkpoints.
-    #[serde(default)]
+    /// Optional quantization config.
+    ///
+    /// MLX checkpoints commonly use `quantization_config`, but newer Bonsai /
+    /// MLX-LM exports may spell the same object as `quantization`.
+    #[serde(default, alias = "quantization")]
     pub quantization_config: Option<QuantizationConfig>,
 }
 
@@ -293,11 +321,15 @@ fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
                 tc["model_type"] = mt.clone();
             }
         }
-        // Promote `quantization_config` from the outer JSON into text_config when
-        // present at the top level but absent from the nested config.  MLX-LM
-        // places it at the outer level for Qwen3.5 VLM checkpoints.
-        if tc.get("quantization_config").is_none() {
-            if let Some(qc) = json.get("quantization_config") {
+        // Promote quantization metadata from the outer JSON into text_config when
+        // present at the top level but absent from the nested config. MLX-LM
+        // uses `quantization_config`, while newer Bonsai exports may use
+        // `quantization` for the same object.
+        if tc.get("quantization_config").is_none() && tc.get("quantization").is_none() {
+            if let Some(qc) = json
+                .get("quantization_config")
+                .or_else(|| json.get("quantization"))
+            {
                 tc["quantization_config"] = qc.clone();
             }
         }
@@ -316,6 +348,7 @@ fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
 mod tests {
     use super::{
         QwenDecodeBackend, canonical_decode_backend, moe_switch_glu_input, parse_config_text,
+        validate_quantization_runtime_support_for,
     };
     use crate::{compat::Dtype, inline_array::InlineArray};
 
@@ -378,6 +411,81 @@ mod tests {
         assert_eq!(config.decoder_sparse_step, 1);
         assert!(config.norm_topk_prob);
         assert_eq!(config.rope_theta, 10_000_000.0);
+    }
+
+    #[test]
+    fn parse_qwen3_accepts_mlx_quantization_alias() {
+        let config = parse_config_text(
+            r#"{
+                "model_type": "qwen3",
+                "hidden_size": 4096,
+                "num_hidden_layers": 36,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "quantization": {
+                    "group_size": 128,
+                    "bits": 1
+                }
+            }"#,
+        )
+        .expect("quantized qwen3 config parses");
+
+        let qc = config
+            .quantization_config
+            .as_ref()
+            .expect("quantization config present");
+        assert_eq!(qc.group_size, 128);
+        assert_eq!(qc.bits, 1);
+    }
+
+    #[test]
+    fn parse_nested_qwen35_promotes_outer_quantization_alias() {
+        let config = parse_config_text(
+            r#"{
+                "model_type": "qwen3_5",
+                "quantization": {
+                    "group_size": 64,
+                    "bits": 4
+                },
+                "text_config": {
+                    "model_type": "qwen3_5_text",
+                    "hidden_size": 1536,
+                    "num_hidden_layers": 28,
+                    "num_attention_heads": 12,
+                    "num_key_value_heads": 2,
+                    "head_dim": 128
+                }
+            }"#,
+        )
+        .expect("nested quantized qwen3.5 config parses");
+
+        let qc = config
+            .quantization_config
+            .as_ref()
+            .expect("quantization config promoted");
+        assert_eq!(qc.group_size, 64);
+        assert_eq!(qc.bits, 4);
+    }
+
+    #[test]
+    fn bundled_upstream_mlx_rejects_one_bit_quantization() {
+        let err = validate_quantization_runtime_support_for(1, "bundled-upstream", "v0.31.1")
+            .expect_err("1-bit should be rejected");
+        assert!(err.contains("PMETAL_MLX_LIB_DIR"));
+        assert!(err.contains("1-bit"));
+    }
+
+    #[test]
+    fn bundled_upstream_mlx_accepts_four_bit_quantization() {
+        validate_quantization_runtime_support_for(4, "bundled-upstream", "v0.31.1")
+            .expect("4-bit should be supported");
+    }
+
+    #[test]
+    fn external_mlx_build_can_attempt_one_bit_quantization() {
+        validate_quantization_runtime_support_for(1, "external", "v0.31.1")
+            .expect("external libmlx should not be pre-rejected");
     }
 
     #[test]
@@ -688,7 +796,10 @@ pub struct NativeWeights {
     pub final_norm_w: InlineArray,
     pub final_norm_eps: f32,
     /// None when `tie_word_embeddings = true`.
-    pub lm_head_w: Option<InlineArray>,
+    ///
+    /// Untied heads may be dense or quantized, just like the projection
+    /// matrices inside the decoder blocks.
+    pub lm_head_w: Option<LayerWeight>,
     pub tie_word_embeddings: bool,
     pub quantization_config: Option<QuantizationConfig>,
     /// Per-layer weights — opaque to callers; only accessed via [`forward_step`].
@@ -1287,6 +1398,7 @@ pub fn load_model(
         .as_ref()
         .map(|qc| (qc.bits, qc.group_size))
         .unwrap_or((4, 64));
+    validate_quantization_runtime_support(q_bits)?;
 
     let get = |key: &str| -> Result<InlineArray, String> {
         raw.get(key).cloned().ok_or_else(|| {
@@ -1334,9 +1446,7 @@ pub fn load_model(
     let lm_head_w = if config.tie_word_embeddings {
         None
     } else {
-        // lm_head.weight is stored as (vocab, hidden); pre-transpose to (hidden, vocab)
-        // so forward() can use hidden.matmul(lm_head_w) directly.
-        Some(get("lm_head.weight")?.t())
+        Some(get_layer_weight("lm_head")?)
     };
 
     let model_dtype = embed_w.dtype_raw();
@@ -1610,7 +1720,7 @@ pub fn load_model(
 
     let embed_w = cf_arr(&embed_w);
     let final_norm_w = cf_arr(&final_norm_w);
-    let lm_head_w = lm_head_w.map(|w| cf_arr(&w));
+    let lm_head_w = lm_head_w.map(|w| cf_lw(&w));
 
     for lw in &mut layers {
         lw.input_ln_w = cf_arr(&lw.input_ln_w);
@@ -1839,7 +1949,7 @@ pub fn forward_step(
             hidden.matmul(&weights.embed_w.t())
         }
     } else {
-        hidden.matmul(weights.lm_head_w.as_ref().unwrap())
+        weights.lm_head_w.as_ref().unwrap().matmul_from(&hidden)
     }
 }
 
@@ -1938,7 +2048,7 @@ pub fn forward_step_lora(
             hidden.matmul(&weights.embed_w.t())
         }
     } else {
-        hidden.matmul(weights.lm_head_w.as_ref().unwrap())
+        weights.lm_head_w.as_ref().unwrap().matmul_from(&hidden)
     }
 }
 
@@ -3446,7 +3556,7 @@ pub unsafe fn build_cpp_forward_state(
     push_real(&mut weight_ptrs, &weights.embed_w);
     push_real(&mut weight_ptrs, &weights.final_norm_w);
     if let Some(ref lm) = weights.lm_head_w {
-        push_real(&mut weight_ptrs, lm);
+        push_real(&mut weight_ptrs, lm.weight_arr());
     } else {
         push_sent(&mut weight_ptrs, &mut weight_storage);
     }

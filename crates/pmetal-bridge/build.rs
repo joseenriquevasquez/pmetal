@@ -1,6 +1,8 @@
 use cmake::Config;
 use std::{env, path::PathBuf, process::Command};
 
+const BUNDLED_MLX_GIT_TAG: &str = "v0.31.1";
+
 // ── Deployment target ──────────────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
@@ -180,14 +182,17 @@ fn build_and_link() {
         #[cfg(target_os = "macos")]
         emit_mlx_rpath(&mlx_dir);
         println!("cargo:warning=Using external libmlx.dylib from {mlx_dir}");
+        println!("cargo:rustc-env=PMETAL_BRIDGE_MLX_KIND=external");
         PathBuf::from(mlx_dir)
     } else {
         println!("cargo:rustc-link-lib=dylib=mlx");
         println!("cargo:rustc-link-search={}/build/lib", dst.display());
         #[cfg(target_os = "macos")]
         emit_mlx_rpath(&format!("{}/build/lib", dst.display()));
+        println!("cargo:rustc-env=PMETAL_BRIDGE_MLX_KIND=bundled-upstream");
         dst.join("build/lib")
     };
+    println!("cargo:rustc-env=PMETAL_BRIDGE_MLX_GIT_TAG={BUNDLED_MLX_GIT_TAG}");
     emit_bridge_metadata("mlx_lib_dir", mlx_lib_dir.display().to_string());
 
     // ── Compile bridge.cpp via cc::Build ──

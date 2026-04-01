@@ -19,8 +19,9 @@ pub(crate) async fn run_serve(
     ane_max_seq_len: usize,
     ane_real_time: bool,
 ) -> anyhow::Result<()> {
-    use pmetal_mlx::CacheMode;
-    use pmetal_mlx::kv_cache::TurboQuantConfig;
+    use pmetal::inference_runner::{
+        CacheModeRequest, TurboQuantPreset, explicit_cache_mode_override,
+    };
     use pmetal_models::dispatcher::DynamicModel;
     use pmetal_serve::{InferenceEngine, ServeConfig};
 
@@ -76,37 +77,34 @@ pub(crate) async fn run_serve(
 
     tracing::info!("Model loaded successfully");
 
-    // Resolve KV cache mode override
-    let cache_mode_override = if kv_turboquant || kv_turboquant_preset.is_some() {
-        let config = match kv_turboquant_preset.as_deref() {
-            Some("q2_5") => {
-                tracing::info!("TurboQuant KV cache: q2.5 preset (2.5 bits, ~6.4x compression)");
-                TurboQuantConfig::preset_q2_5(128)
-            }
-            Some("q3_5") => {
-                tracing::info!(
-                    "TurboQuant KV cache: q3.5 preset (3.5 bits, ~4.6x compression, near-lossless)"
-                );
-                TurboQuantConfig::preset_q3_5(128)
-            }
-            _ => {
-                tracing::info!("TurboQuant KV cache: uniform 4-bit keys, 4-bit values");
-                TurboQuantConfig::uniform(4, 4)
-            }
-        };
-        Some(CacheMode::TurboQuant { config })
-    } else if no_kv_quant {
-        tracing::info!("KV cache: FP16 (no quantization)");
-        Some(CacheMode::Standard)
-    } else if let Some(bits) = kv_quant {
-        tracing::info!("KV cache: Q{bits} quantization (group_size={kv_group_size})");
-        Some(CacheMode::Quantized {
-            bits,
-            group_size: kv_group_size,
-        })
-    } else {
-        None // auto-select
+    // Resolve KV cache mode override using the same model-derived base-cache
+    // configuration path as CLI/GUI inference. This keeps dense and MoE models
+    // on one canonical TurboQuant/KV selection policy.
+    let kv_turboquant_preset = match kv_turboquant_preset.as_deref() {
+        Some("q2_5") => Some(TurboQuantPreset::Q2_5),
+        Some("q3_5") => Some(TurboQuantPreset::Q3_5),
+        Some(other) => {
+            anyhow::bail!("unsupported TurboQuant preset `{other}`");
+        }
+        None => None,
     };
+    let base_cache = model.create_cache(max_seq_len);
+    let cache_mode_override = explicit_cache_mode_override(
+        base_cache.config(),
+        CacheModeRequest {
+            kv_quant,
+            kv_k_bits: None,
+            kv_v_bits: None,
+            kv_group_size,
+            kv_turboquant,
+            kv_turboquant_preset,
+            no_kv_quant,
+            fp8,
+        },
+    );
+    if let Some(ref mode) = cache_mode_override {
+        tracing::info!(mode = %mode.describe(), "KV cache override");
+    }
 
     // Create inference engine
     let engine = InferenceEngine::new_with_options(

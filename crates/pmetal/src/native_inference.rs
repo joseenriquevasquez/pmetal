@@ -207,6 +207,33 @@ mod tests {
     }
 
     #[test]
+    fn load_native_bridge_info_uses_attention_dims_not_linear_dims_for_qwen35_moe() {
+        let dir = write_temp_config(
+            r#"{
+                "model_type":"qwen3_5_moe",
+                "text_config":{
+                    "model_type":"qwen3_5_moe_text",
+                    "hidden_size":2048,
+                    "num_hidden_layers":40,
+                    "num_attention_heads":16,
+                    "num_key_value_heads":2,
+                    "head_dim":256,
+                    "linear_key_head_dim":128,
+                    "linear_value_head_dim":128
+                }
+            }"#,
+        );
+        let info = load_native_bridge_info(&dir).unwrap().unwrap();
+        assert_eq!(info.arch, NativeArch::Qwen3_5);
+        assert_eq!(info.num_layers, 40);
+        assert_eq!(info.num_kv_heads, 2);
+        assert_eq!(info.head_dim, 256);
+        assert_eq!(info.value_head_dim, 256);
+        assert!(info.supports_turboquant);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn load_native_bridge_info_tracks_deepseek_asymmetric_dims() {
         let dir = write_temp_config(
             r#"{
