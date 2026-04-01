@@ -514,6 +514,16 @@ unsafe extern "C" {
         cache_seq_capacity: u32,
     ) -> i32;
 
+    fn mlx_inline_turboquant_pack_q8_keybytes_seq(
+        out: *mut RawBuf,
+        indices: *const RawBuf,
+        qjl_signs: *const RawBuf,
+        dim: u32,
+        packed_dim: u32,
+        n_rows: u32,
+        cache_seq_capacity: u32,
+    ) -> i32;
+
     fn mlx_inline_turboquant_unpack_sign_bits(
         out: *mut RawBuf,
         packed: *const RawBuf,
@@ -535,6 +545,45 @@ unsafe extern "C" {
         cache_seq_capacity: u32,
         q_heads: u32,
         kv_heads: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_attention_q8_d256_2pass(
+        out: *mut RawBuf,
+        query_rot: *const RawBuf,
+        query_proj: *const RawBuf,
+        key_indices: *const RawBuf,
+        key_qjl_signs: *const RawBuf,
+        key_norms: *const RawBuf,
+        key_residual_norms: *const RawBuf,
+        key_codebook: *const RawBuf,
+        value_indices: *const RawBuf,
+        value_norms: *const RawBuf,
+        value_codebook: *const RawBuf,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale_bits: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_attention_q8_d256_packed_keys_2pass(
+        out: *mut RawBuf,
+        query_rot: *const RawBuf,
+        query_proj: *const RawBuf,
+        key_bytes: *const RawBuf,
+        key_norms: *const RawBuf,
+        key_residual_norms: *const RawBuf,
+        key_codebook: *const RawBuf,
+        value_indices: *const RawBuf,
+        value_norms: *const RawBuf,
+        value_codebook: *const RawBuf,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale_bits: u32,
     ) -> i32;
 
     fn mlx_inline_turboquant_attention_q8_d128_2pass(
@@ -2514,7 +2563,7 @@ impl InlineArray {
         }
     }
 
-    /// Pack q8 key bytes from seq-major centroid indices and packed QJL signs.
+    /// Pack q8 key bytes from centroid indices and packed QJL signs.
     ///
     /// - `indices`: `[N, D, S_cap]` uint8
     /// - `qjl_signs`: `[N, ceil(D/32), S_cap]` uint32
@@ -2531,6 +2580,41 @@ impl InlineArray {
         let mut out = MaybeUninit::<RawBuf>::uninit();
         let rc = unsafe {
             mlx_inline_turboquant_pack_q8_keybytes(
+                out.as_mut_ptr(),
+                &indices.raw,
+                &qjl_signs.raw,
+                dim,
+                packed_dim,
+                n_rows,
+                cache_seq_capacity,
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Pack q8 key bytes directly into a seq-major shadow layout.
+    ///
+    /// - `indices`: `[N, D, S_cap]` uint8
+    /// - `qjl_signs`: `[N, ceil(D/32), S_cap]` uint32
+    /// - Returns `[N, S_cap, D]` uint8 where low 7 bits are the centroid index
+    ///   and the high bit is the QJL sign.
+    pub fn turboquant_pack_q8_keybytes_seq(
+        indices: &Self,
+        qjl_signs: &Self,
+        dim: u32,
+        packed_dim: u32,
+        n_rows: u32,
+        cache_seq_capacity: u32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_pack_q8_keybytes_seq(
                 out.as_mut_ptr(),
                 &indices.raw,
                 &qjl_signs.raw,
@@ -2626,6 +2710,109 @@ impl InlineArray {
         }
     }
 
+    /// Specialized long-context q8 TurboQuant decode for D=256/V=256.
+    ///
+    /// Returns the rotated aggregated values `[N, 256]` on success.
+    pub fn turboquant_attention_q8_d256_2pass(
+        query_rot: &Self,
+        query_proj: &Self,
+        key_indices: &Self,
+        key_qjl_signs: &Self,
+        key_norms: &Self,
+        key_residual_norms: &Self,
+        key_codebook: &Self,
+        value_indices: &Self,
+        value_norms: &Self,
+        value_codebook: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale: f32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_attention_q8_d256_2pass(
+                out.as_mut_ptr(),
+                &query_rot.raw,
+                &query_proj.raw,
+                &key_indices.raw,
+                &key_qjl_signs.raw,
+                &key_norms.raw,
+                &key_residual_norms.raw,
+                &key_codebook.raw,
+                &value_indices.raw,
+                &value_norms.raw,
+                &value_codebook.raw,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+                attn_scale.to_bits(),
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Specialized long-context q8 TurboQuant decode for D=256/V=256 over
+    /// packed key bytes stored as `[N, S_cap, D]`.
+    ///
+    /// Returns the rotated aggregated values `[N, 256]` on success.
+    pub fn turboquant_attention_q8_d256_packed_keys_2pass(
+        query_rot: &Self,
+        query_proj: &Self,
+        key_bytes: &Self,
+        key_norms: &Self,
+        key_residual_norms: &Self,
+        key_codebook: &Self,
+        value_indices: &Self,
+        value_norms: &Self,
+        value_codebook: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale: f32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_attention_q8_d256_packed_keys_2pass(
+                out.as_mut_ptr(),
+                &query_rot.raw,
+                &query_proj.raw,
+                &key_bytes.raw,
+                &key_norms.raw,
+                &key_residual_norms.raw,
+                &key_codebook.raw,
+                &value_indices.raw,
+                &value_norms.raw,
+                &value_codebook.raw,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+                attn_scale.to_bits(),
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
     /// Specialized long-context q8 TurboQuant decode for D=128/V=128.
     ///
     /// Returns the rotated aggregated values `[N, 128]` on success.
@@ -2679,7 +2866,7 @@ impl InlineArray {
     }
 
     /// Specialized long-context q8 TurboQuant decode for D=128/V=128 over
-    /// packed seq-major key bytes.
+    /// packed key bytes stored as `[N, D, S_cap]`.
     ///
     /// Returns the rotated aggregated values `[N, 128]` on success.
     pub fn turboquant_attention_q8_d128_packed_keys_2pass(
