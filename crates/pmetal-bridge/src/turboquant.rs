@@ -703,7 +703,8 @@ fn packed_qjl_words(dim: usize) -> usize {
 ///   indices:         [B, H, T, D]  uint8   — codebook index per coordinate
 ///   indices_t:       [B, H, D, T]  uint8   — score-friendly transposed view
 ///   q8_keybytes_t:   [B, H, D, T]  uint8   — q8-only packed index/sign view
-///   q8_keybytes_seq: [B, H, T, D]  uint8   — D256 q8 seq-major key shadow
+///   q8_keybytes_seq: [B, H, T, D]  uint8   — q8 seq-major key shadow
+///   q8_kvbytes_seq:  [B, H, T, D]  uint16  — D256 q8 seq-major packed {key,value}
 ///   q8_slot_scales_seq: [B, H, T, 4]  f32  — [key_norm, residual_norm, value_norm, pad]
 ///   norms:           [B, H, T, 1]  f32     — L2 norm before unit-sphere normalise
 ///   qjl_signs:       [B, H, T, ceil(D/32)]  uint32 packed sign words
@@ -715,6 +716,7 @@ struct GpuKeyStore {
     indices_t: InlineArray,
     q8_keybytes_t: Option<InlineArray>,
     q8_keybytes_seq: Option<InlineArray>,
+    q8_kvbytes_seq: Option<InlineArray>,
     q8_slot_scales_seq: Option<InlineArray>,
     norms: InlineArray,
     qjl_signs: InlineArray,
@@ -732,6 +734,12 @@ impl GpuKeyStore {
             _ => None,
         };
         self.q8_keybytes_seq = match (self.q8_keybytes_seq.take(), new.q8_keybytes_seq) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
+            (None, Some(next)) => Some(next),
+            (Some(current), None) => Some(current),
+            (None, None) => None,
+        };
+        self.q8_kvbytes_seq = match (self.q8_kvbytes_seq.take(), new.q8_kvbytes_seq) {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
             (None, Some(next)) => Some(next),
             (Some(current), None) => Some(current),
@@ -758,6 +766,9 @@ impl GpuKeyStore {
         }
         if let Some(q8_keybytes_seq) = self.q8_keybytes_seq.as_mut() {
             out.push(q8_keybytes_seq);
+        }
+        if let Some(q8_kvbytes_seq) = self.q8_kvbytes_seq.as_mut() {
+            out.push(q8_kvbytes_seq);
         }
         if let Some(q8_slot_scales_seq) = self.q8_slot_scales_seq.as_mut() {
             out.push(q8_slot_scales_seq);
@@ -1468,7 +1479,24 @@ impl QuantizedKvCache {
         }
 
         let kv_rows = (layout.batch * layout.heads) as i32;
-        if let (Some(key_bytes), Some(slot_scales)) =
+        if let (Some(kv_bytes), Some(slot_scales)) =
+            (ks.q8_kvbytes_seq.as_ref(), ks.q8_slot_scales_seq.as_ref())
+        {
+            InlineArray::turboquant_attention_q8_d256_packed_kv_2pass(
+                query_rot,
+                query_proj,
+                &kv_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
+                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
+                key_core.codebook_arr(key_bits.saturating_sub(1))?,
+                value_core.codebook_arr(value_bits)?,
+                q_rows as u32,
+                n_seq as u32,
+                cache_seq_capacity as u32,
+                q_heads as u32,
+                layout.heads as u32,
+                scale,
+            )
+        } else if let (Some(key_bytes), Some(slot_scales)) =
             (ks.q8_keybytes_seq.as_ref(), ks.q8_slot_scales_seq.as_ref())
         {
             InlineArray::turboquant_attention_q8_d256_packed_keys_2pass(
@@ -2102,28 +2130,7 @@ fn gpu_quantize_kv(
     } else {
         None
     };
-    let q8_keybytes_seq = if use_q8_seq_shadow {
-        q8_pack_inputs.as_ref().and_then(|(kv_rows, seq, indices_t_3d, qjl_signs_t_3d)| {
-            InlineArray::turboquant_pack_q8_keybytes_seq(
-                indices_t_3d,
-                qjl_signs_t_3d,
-                k_core.dim as u32,
-                packed_dim as u32,
-                *kv_rows,
-                *seq,
-            )
-            .map(|packed| {
-                packed.reshape(&[
-                    keys.dim(0),
-                    keys.dim(1),
-                    keys.dim(2),
-                    k_core.dim as i32,
-                ])
-            })
-        })
-    } else {
-        None
-    };
+    let q8_keybytes_seq = None;
 
     // ── Values ────────────────────────────────────────────────────────────
     let val_norms = values.norm_l2(-1, true);
@@ -2137,6 +2144,36 @@ fn gpu_quantize_kv(
     };
     let v_indices = v_core.gpu_quantize_mse(&v_rot, val_bits)?;
     let v_indices_t = v_indices.transpose_axes(&[0, 1, 3, 2]);
+    let q8_kvbytes_seq = if use_q8_seq_shadow {
+        q8_pack_inputs
+            .as_ref()
+            .and_then(|(kv_rows, seq, indices_t_3d, qjl_signs_t_3d)| {
+                let value_indices_seq = v_indices.reshape(&[
+                    *kv_rows as i32,
+                    *seq as i32,
+                    v_core.dim as i32,
+                ]);
+                InlineArray::turboquant_pack_q8_kvbytes_seq(
+                    indices_t_3d,
+                    qjl_signs_t_3d,
+                    &value_indices_seq,
+                    k_core.dim as u32,
+                    packed_dim as u32,
+                    *kv_rows,
+                    *seq,
+                )
+                .map(|packed| {
+                    packed.reshape(&[
+                        keys.dim(0),
+                        keys.dim(1),
+                        keys.dim(2),
+                        k_core.dim as i32,
+                    ])
+                })
+            })
+    } else {
+        None
+    };
     let q8_slot_scales_seq = if use_q8_seq_shadow {
         let slot_pad = InlineArray::zeros(
             &[values.dim(0), values.dim(1), values.dim(2), 1],
@@ -2155,6 +2192,7 @@ fn gpu_quantize_kv(
             indices_t: k_indices_t,
             q8_keybytes_t,
             q8_keybytes_seq,
+            q8_kvbytes_seq,
             q8_slot_scales_seq,
             norms: key_norms,
             qjl_signs: k_qjl_signs,
@@ -3512,8 +3550,12 @@ mod tests {
             "d256 q8 path should not keep transposed q8 shadow"
         );
         assert!(
-            gpu.q8_keybytes_seq.is_some(),
-            "d256 q8 path should keep seq-major q8 shadow"
+            gpu.q8_keybytes_seq.is_none(),
+            "d256 q8 path should not keep legacy key-only seq shadow"
+        );
+        assert!(
+            gpu.q8_kvbytes_seq.is_some(),
+            "d256 q8 path should keep seq-major packed kv shadow"
         );
         assert!(
             gpu.q8_slot_scales_seq.is_some(),

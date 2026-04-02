@@ -659,6 +659,22 @@ int mlx_inline_turboquant_pack_q8_keybytes_seq(
     uint32_t                n_rows,
     uint32_t                cache_seq_capacity);
 
+// Pack q8 TurboQuant key bytes and value indices into a seq-major shadow.
+// indices:       [N, D, S_cap] uint8
+// qjl_signs:     [N, ceil(D/32), S_cap] uint32
+// value_indices: [N, S_cap, D] uint8
+// out:           [N, S_cap, D] uint16
+//                low byte = key byte, high byte = value centroid index
+int mlx_inline_turboquant_pack_q8_kvbytes_seq(
+    mlx_inline_array*       out,
+    const mlx_inline_array* indices,
+    const mlx_inline_array* qjl_signs,
+    const mlx_inline_array* value_indices,
+    uint32_t                dim,
+    uint32_t                packed_dim,
+    uint32_t                n_rows,
+    uint32_t                cache_seq_capacity);
+
 // Unpack uint32 sign words back to {-1,+1} f32 signs.
 // packed: [N, ceil(D/32)] uint32
 // out:    [N, D] f32
@@ -722,6 +738,25 @@ int mlx_inline_turboquant_attention_q8_d256_packed_keys_2pass(
     const mlx_inline_array* slot_scales,
     const mlx_inline_array* key_codebook,
     const mlx_inline_array* value_indices,
+    const mlx_inline_array* value_codebook,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
+
+// Specialized long-context q8 decode primitive for D=256/V=256 over a
+// seq-major packed `{key,value}` shadow:
+// - `kv_bytes`: [N, S_cap, D] uint16
+//   low byte = key byte, high byte = value centroid index
+int mlx_inline_turboquant_attention_q8_d256_packed_kv_2pass(
+    mlx_inline_array*       out,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* query_proj,
+    const mlx_inline_array* kv_bytes,
+    const mlx_inline_array* slot_scales,
+    const mlx_inline_array* key_codebook,
     const mlx_inline_array* value_codebook,
     uint32_t                n_rows,
     uint32_t                n_seq,

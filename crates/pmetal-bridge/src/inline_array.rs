@@ -524,6 +524,17 @@ unsafe extern "C" {
         cache_seq_capacity: u32,
     ) -> i32;
 
+    fn mlx_inline_turboquant_pack_q8_kvbytes_seq(
+        out: *mut RawBuf,
+        indices: *const RawBuf,
+        qjl_signs: *const RawBuf,
+        value_indices: *const RawBuf,
+        dim: u32,
+        packed_dim: u32,
+        n_rows: u32,
+        cache_seq_capacity: u32,
+    ) -> i32;
+
     fn mlx_inline_turboquant_unpack_sign_bits(
         out: *mut RawBuf,
         packed: *const RawBuf,
@@ -575,6 +586,22 @@ unsafe extern "C" {
         slot_scales: *const RawBuf,
         key_codebook: *const RawBuf,
         value_indices: *const RawBuf,
+        value_codebook: *const RawBuf,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale_bits: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_attention_q8_d256_packed_kv_2pass(
+        out: *mut RawBuf,
+        query_rot: *const RawBuf,
+        query_proj: *const RawBuf,
+        kv_bytes: *const RawBuf,
+        slot_scales: *const RawBuf,
+        key_codebook: *const RawBuf,
         value_codebook: *const RawBuf,
         n_rows: u32,
         n_seq: u32,
@@ -2631,6 +2658,45 @@ impl InlineArray {
         }
     }
 
+    /// Pack q8 key bytes and q8 value indices into one seq-major shadow.
+    ///
+    /// - `indices`: `[N, D, S_cap]` uint8
+    /// - `qjl_signs`: `[N, ceil(D/32), S_cap]` uint32
+    /// - `value_indices`: `[N, S_cap, D]` uint8
+    /// - Returns `[N, S_cap, D]` uint16 where:
+    ///   low byte = key byte (low 7 bits centroid index, high bit QJL sign)
+    ///   high byte = value centroid index
+    pub fn turboquant_pack_q8_kvbytes_seq(
+        indices: &Self,
+        qjl_signs: &Self,
+        value_indices: &Self,
+        dim: u32,
+        packed_dim: u32,
+        n_rows: u32,
+        cache_seq_capacity: u32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_pack_q8_kvbytes_seq(
+                out.as_mut_ptr(),
+                &indices.raw,
+                &qjl_signs.raw,
+                &value_indices.raw,
+                dim,
+                packed_dim,
+                n_rows,
+                cache_seq_capacity,
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
     /// Unpack uint32 sign words back into `{-1,+1}` float32 signs.
     ///
     /// - `packed`: `[N, ceil(D/32)]` uint32
@@ -2791,6 +2857,55 @@ impl InlineArray {
                 &slot_scales.raw,
                 &key_codebook.raw,
                 &value_indices.raw,
+                &value_codebook.raw,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+                attn_scale.to_bits(),
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Specialized long-context q8 TurboQuant decode for D=256/V=256 over
+    /// a seq-major packed `{key,value}` shadow:
+    /// - `kv_bytes`: `[N, S_cap, D]` uint16
+    ///   low byte = key byte
+    ///   high byte = value centroid index
+    /// - `slot_scales`: `[N, S_cap, 4]` f32
+    ///
+    /// Returns the rotated aggregated values `[N, 256]` on success.
+    pub fn turboquant_attention_q8_d256_packed_kv_2pass(
+        query_rot: &Self,
+        query_proj: &Self,
+        kv_bytes: &Self,
+        slot_scales: &Self,
+        key_codebook: &Self,
+        value_codebook: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale: f32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_attention_q8_d256_packed_kv_2pass(
+                out.as_mut_ptr(),
+                &query_rot.raw,
+                &query_proj.raw,
+                &kv_bytes.raw,
+                &slot_scales.raw,
+                &key_codebook.raw,
                 &value_codebook.raw,
                 n_rows,
                 n_seq,

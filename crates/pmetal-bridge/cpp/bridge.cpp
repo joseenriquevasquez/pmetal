@@ -1094,6 +1094,23 @@ static const char* TURBOQUANT_PACK_Q8_KEYBYTES_SEQ_SOURCE = R"(
     output[output_idx] = index | sign_bit;
 )";
 
+static const char* TURBOQUANT_PACK_Q8_KVBYTES_SEQ_SOURCE = R"(
+    uint seq = thread_position_in_grid.x;
+    uint d = thread_position_in_grid.y;
+    uint row = thread_position_in_grid.z;
+    if (row >= n_rows || d >= dim || seq >= cache_seq_capacity) return;
+
+    uint index_base = ((row * dim) + d) * cache_seq_capacity + seq;
+    uint sign_word_idx = ((row * packed_dim) + (d >> 5)) * cache_seq_capacity + seq;
+    uchar key_index = indices[index_base] & 0x7fu;
+    uint sign_word = qjl_signs[sign_word_idx];
+    uchar sign_bit = ((sign_word >> (d & 31u)) & 1u) != 0u ? 0x80u : 0x00u;
+    uchar key_byte = key_index | sign_bit;
+    uint output_idx = ((row * cache_seq_capacity) + seq) * dim + d;
+    ushort value_idx = (ushort)value_indices[output_idx];
+    output[output_idx] = ((value_idx & 0xffu) << 8) | (ushort)key_byte;
+)";
+
 // WEIGHTED_DECODE: aggregate value centroids directly in the rotated domain.
 // This avoids materializing a [row, seq, dim] decoded value tensor before the
 // attention reduction.
@@ -1430,6 +1447,153 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KEYS_2PASS_1_SOURCE = R"(
         acc5 = acc5 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 5u]];
         acc6 = acc6 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 6u]];
         acc7 = acc7 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 7u]];
+    }
+
+    if (lane == 0u) {
+        sums[row * blocks + block] = sum_exp_score;
+        maxs[row * blocks + block] = max_score;
+    }
+    uint out_base = (row * blocks + block) * kDim + d0;
+    partials[out_base + 0u] = acc0;
+    partials[out_base + 1u] = acc1;
+    partials[out_base + 2u] = acc2;
+    partials[out_base + 3u] = acc3;
+    partials[out_base + 4u] = acc4;
+    partials[out_base + 5u] = acc5;
+    partials[out_base + 6u] = acc6;
+    partials[out_base + 7u] = acc7;
+)";
+
+static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KV_2PASS_1_SOURCE = R"(
+    constexpr uint kDim = 256u;
+    constexpr uint kVec = 8u;
+    constexpr uint kKeyCentroids = 128u;
+    constexpr uint kValueCentroids = 256u;
+    constexpr float kQjlConst = 1.2533141373155003f / 256.0f;
+    threadgroup float shared_k_codebook[kKeyCentroids];
+    threadgroup float shared_v_codebook[kValueCentroids];
+
+    uint kv_head = threadgroup_position_in_grid.x;
+    uint batch = threadgroup_position_in_grid.y;
+    uint block = threadgroup_position_in_grid.z;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint groups = q_heads / kv_heads;
+    uint row = batch * q_heads + kv_head * groups + simd_gid;
+    if (row >= n_rows || block >= blocks) return;
+
+    if (simd_gid == 0u) {
+        for (uint c = lane; c < kKeyCentroids; c += 32u) {
+            shared_k_codebook[c] = key_codebook[c];
+        }
+        for (uint c = lane; c < kValueCentroids; c += 32u) {
+            shared_v_codebook[c] = value_codebook[c];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint kv_row = batch * kv_heads + kv_head;
+    uint d0 = lane * kVec;
+    uint query_base = row * kDim + d0;
+
+    float attn_scale = as_type<float>((uint)attn_scale_bits);
+    float qrot0 = attn_scale * query_rot[query_base + 0u];
+    float qrot1 = attn_scale * query_rot[query_base + 1u];
+    float qrot2 = attn_scale * query_rot[query_base + 2u];
+    float qrot3 = attn_scale * query_rot[query_base + 3u];
+    float qrot4 = attn_scale * query_rot[query_base + 4u];
+    float qrot5 = attn_scale * query_rot[query_base + 5u];
+    float qrot6 = attn_scale * query_rot[query_base + 6u];
+    float qrot7 = attn_scale * query_rot[query_base + 7u];
+    float qproj0 = attn_scale * query_proj[query_base + 0u];
+    float qproj1 = attn_scale * query_proj[query_base + 1u];
+    float qproj2 = attn_scale * query_proj[query_base + 2u];
+    float qproj3 = attn_scale * query_proj[query_base + 3u];
+    float qproj4 = attn_scale * query_proj[query_base + 4u];
+    float qproj5 = attn_scale * query_proj[query_base + 5u];
+    float qproj6 = attn_scale * query_proj[query_base + 6u];
+    float qproj7 = attn_scale * query_proj[query_base + 7u];
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    float acc4 = 0.0f;
+    float acc5 = 0.0f;
+    float acc6 = 0.0f;
+    float acc7 = 0.0f;
+    float max_score = -INFINITY;
+    float sum_exp_score = 0.0f;
+
+    for (uint seq = block; seq < n_seq; seq += blocks) {
+        uint scalar_idx = kv_row * cache_seq_capacity + seq;
+        uint scale_base = scalar_idx * 4u;
+        float key_norm = slot_scales[scale_base + 0u];
+        float residual_scale = slot_scales[scale_base + 1u] * kQjlConst;
+        float value_norm = slot_scales[scale_base + 2u];
+        uint kv_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
+
+        ushort kv_pair0 = kv_bytes[kv_base + 0u];
+        ushort kv_pair1 = kv_bytes[kv_base + 1u];
+        ushort kv_pair2 = kv_bytes[kv_base + 2u];
+        ushort kv_pair3 = kv_bytes[kv_base + 3u];
+        ushort kv_pair4 = kv_bytes[kv_base + 4u];
+        ushort kv_pair5 = kv_bytes[kv_base + 5u];
+        ushort kv_pair6 = kv_bytes[kv_base + 6u];
+        ushort kv_pair7 = kv_bytes[kv_base + 7u];
+
+        uchar key_byte0 = (uchar)(kv_pair0 & 0xffu);
+        uchar key_byte1 = (uchar)(kv_pair1 & 0xffu);
+        uchar key_byte2 = (uchar)(kv_pair2 & 0xffu);
+        uchar key_byte3 = (uchar)(kv_pair3 & 0xffu);
+        uchar key_byte4 = (uchar)(kv_pair4 & 0xffu);
+        uchar key_byte5 = (uchar)(kv_pair5 & 0xffu);
+        uchar key_byte6 = (uchar)(kv_pair6 & 0xffu);
+        uchar key_byte7 = (uchar)(kv_pair7 & 0xffu);
+
+        float sign0 = (key_byte0 & 0x80u) == 0u ? -1.0f : 1.0f;
+        float sign1 = (key_byte1 & 0x80u) == 0u ? -1.0f : 1.0f;
+        float sign2 = (key_byte2 & 0x80u) == 0u ? -1.0f : 1.0f;
+        float sign3 = (key_byte3 & 0x80u) == 0u ? -1.0f : 1.0f;
+        float sign4 = (key_byte4 & 0x80u) == 0u ? -1.0f : 1.0f;
+        float sign5 = (key_byte5 & 0x80u) == 0u ? -1.0f : 1.0f;
+        float sign6 = (key_byte6 & 0x80u) == 0u ? -1.0f : 1.0f;
+        float sign7 = (key_byte7 & 0x80u) == 0u ? -1.0f : 1.0f;
+
+        float score_part = 0.0f;
+        score_part += qrot0 * shared_k_codebook[(uint)(key_byte0 & 0x7fu)];
+        score_part += qrot1 * shared_k_codebook[(uint)(key_byte1 & 0x7fu)];
+        score_part += qrot2 * shared_k_codebook[(uint)(key_byte2 & 0x7fu)];
+        score_part += qrot3 * shared_k_codebook[(uint)(key_byte3 & 0x7fu)];
+        score_part += qrot4 * shared_k_codebook[(uint)(key_byte4 & 0x7fu)];
+        score_part += qrot5 * shared_k_codebook[(uint)(key_byte5 & 0x7fu)];
+        score_part += qrot6 * shared_k_codebook[(uint)(key_byte6 & 0x7fu)];
+        score_part += qrot7 * shared_k_codebook[(uint)(key_byte7 & 0x7fu)];
+        score_part += residual_scale * qproj0 * sign0;
+        score_part += residual_scale * qproj1 * sign1;
+        score_part += residual_scale * qproj2 * sign2;
+        score_part += residual_scale * qproj3 * sign3;
+        score_part += residual_scale * qproj4 * sign4;
+        score_part += residual_scale * qproj5 * sign5;
+        score_part += residual_scale * qproj6 * sign6;
+        score_part += residual_scale * qproj7 * sign7;
+        float score = key_norm * simd_sum(score_part);
+
+        float new_max = max(max_score, score);
+        float factor = fast::exp(max_score - new_max);
+        float exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        float value_scale = exp_score * value_norm;
+        acc0 = acc0 * factor + value_scale * shared_v_codebook[(uint)(kv_pair0 >> 8)];
+        acc1 = acc1 * factor + value_scale * shared_v_codebook[(uint)(kv_pair1 >> 8)];
+        acc2 = acc2 * factor + value_scale * shared_v_codebook[(uint)(kv_pair2 >> 8)];
+        acc3 = acc3 * factor + value_scale * shared_v_codebook[(uint)(kv_pair3 >> 8)];
+        acc4 = acc4 * factor + value_scale * shared_v_codebook[(uint)(kv_pair4 >> 8)];
+        acc5 = acc5 * factor + value_scale * shared_v_codebook[(uint)(kv_pair5 >> 8)];
+        acc6 = acc6 * factor + value_scale * shared_v_codebook[(uint)(kv_pair6 >> 8)];
+        acc7 = acc7 * factor + value_scale * shared_v_codebook[(uint)(kv_pair7 >> 8)];
     }
 
     if (lane == 0u) {
@@ -2075,6 +2239,19 @@ static mlx::core::fast::CustomKernelFunction& get_turboquant_pack_q8_keybytes_se
     return kernel;
 }
 
+static mlx::core::fast::CustomKernelFunction& get_turboquant_pack_q8_kvbytes_seq_kernel() {
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "turboquant_pack_q8_kvbytes_seq",
+        {"indices", "qjl_signs", "value_indices"},
+        {"output"},
+        TURBOQUANT_PACK_Q8_KVBYTES_SEQ_SOURCE,
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
 static mlx::core::fast::CustomKernelFunction& get_turboquant_unpack_sign_bits_kernel() {
     static auto kernel = mlx::core::fast::metal_kernel(
         "turboquant_unpack_sign_bits",
@@ -2126,6 +2303,26 @@ static mlx::core::fast::CustomKernelFunction& get_turboquant_attention_q8_d256_p
         },
         {"partials", "sums", "maxs"},
         TURBOQUANT_ATTENTION_Q8_D256_PACKED_KEYS_2PASS_1_SOURCE,
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
+static mlx::core::fast::CustomKernelFunction& get_turboquant_attention_q8_d256_packed_kv_2pass_1_kernel() {
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "turboquant_attention_q8_d256_packed_kv_2pass_1",
+        {
+            "query_rot",
+            "query_proj",
+            "kv_bytes",
+            "slot_scales",
+            "key_codebook",
+            "value_codebook",
+        },
+        {"partials", "sums", "maxs"},
+        TURBOQUANT_ATTENTION_Q8_D256_PACKED_KV_2PASS_1_SOURCE,
         "",
         true,
         false
@@ -2570,6 +2767,41 @@ int mlx_inline_turboquant_pack_q8_keybytes_seq(
     }
 }
 
+int mlx_inline_turboquant_pack_q8_kvbytes_seq(
+    mlx_inline_array*       out,
+    const mlx_inline_array* indices,
+    const mlx_inline_array* qjl_signs,
+    const mlx_inline_array* value_indices,
+    uint32_t                dim,
+    uint32_t                packed_dim,
+    uint32_t                n_rows,
+    uint32_t                cache_seq_capacity)
+{
+    using namespace mlx::core;
+
+    if (dim == 0 || packed_dim == 0 || n_rows == 0 || cache_seq_capacity == 0) return 1;
+
+    try {
+        auto& kernel = get_turboquant_pack_q8_kvbytes_seq_kernel();
+        auto outputs = kernel(
+            {as_arr(indices), as_arr(qjl_signs), as_arr(value_indices)},
+            {{(int)n_rows, (int)cache_seq_capacity, (int)dim}},
+            {uint16},
+            {(int)cache_seq_capacity, (int)dim, (int)n_rows},
+            {(int)std::min(cache_seq_capacity, 256u), 1, 1},
+            {{"dim", (int)dim},
+             {"packed_dim", (int)packed_dim},
+             {"n_rows", (int)n_rows},
+             {"cache_seq_capacity", (int)cache_seq_capacity}},
+            std::nullopt, false, {}
+        );
+        new (out->buf) array(outputs[0]);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
 int mlx_inline_turboquant_unpack_sign_bits(
     mlx_inline_array*       out,
     const mlx_inline_array* packed,
@@ -2739,6 +2971,87 @@ int mlx_inline_turboquant_attention_q8_d256_packed_keys_2pass(
                 slot_scales_arr,
                 key_codebook_arr,
                 value_indices_arr,
+                value_codebook_arr,
+            },
+            {{(int)n_rows, (int)blocks, (int)dim}, {(int)n_rows, (int)blocks}, {(int)n_rows, (int)blocks}},
+            {float32, float32, float32},
+            {32 * (int)kv_heads, (int)((q_heads / kv_heads) * (n_rows / q_heads)), (int)blocks},
+            {32, (int)(q_heads / kv_heads), 1},
+            {
+                {"n_rows", (int)n_rows},
+                {"n_seq", (int)n_seq},
+                {"blocks", (int)blocks},
+                {"cache_seq_capacity", (int)cache_seq_capacity},
+                {"q_heads", (int)q_heads},
+                {"kv_heads", (int)kv_heads},
+                {"attn_scale_bits", (int)attn_scale_bits},
+            },
+            std::nullopt, false, {}
+        );
+
+        auto& pass2 = get_turboquant_attention_q8_d256_2pass_2_kernel();
+        auto pass2_outputs = pass2(
+            {pass1_outputs[0], pass1_outputs[1], pass1_outputs[2]},
+            {{(int)n_rows, (int)dim}},
+            {float32},
+            {1024, (int)n_rows, 1},
+            {1024, 1, 1},
+            {
+                {"n_rows", (int)n_rows},
+                {"blocks", (int)blocks},
+            },
+            std::nullopt, false, {}
+        );
+
+        new (out->buf) array(pass2_outputs[0]);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+int mlx_inline_turboquant_attention_q8_d256_packed_kv_2pass(
+    mlx_inline_array*       out,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* query_proj,
+    const mlx_inline_array* kv_bytes,
+    const mlx_inline_array* slot_scales,
+    const mlx_inline_array* key_codebook,
+    const mlx_inline_array* value_codebook,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits)
+{
+    using namespace mlx::core;
+
+    constexpr uint32_t dim = 256u;
+    const uint32_t blocks = turboquant_q8_2pass_blocks_override_or(32u);
+
+    if (n_rows == 0 || n_seq < 1024 || cache_seq_capacity < n_seq) return 1;
+    if (q_heads == 0 || kv_heads == 0 || (q_heads % kv_heads) != 0) return 1;
+
+    try {
+        const array& query_rot_arr = as_arr(query_rot);
+        const array& query_proj_arr = as_arr(query_proj);
+        const array& kv_bytes_arr = as_arr(kv_bytes);
+        const array& slot_scales_arr = as_arr(slot_scales);
+        const array& key_codebook_arr = as_arr(key_codebook);
+        const array& value_codebook_arr = as_arr(value_codebook);
+
+        if (query_rot_arr.shape(-1) != dim || query_proj_arr.shape(-1) != dim) return 1;
+        if (key_codebook_arr.shape(0) != 128 || value_codebook_arr.shape(0) != 256) return 1;
+
+        auto& pass1 = get_turboquant_attention_q8_d256_packed_kv_2pass_1_kernel();
+        auto pass1_outputs = pass1(
+            {
+                query_rot_arr,
+                query_proj_arr,
+                kv_bytes_arr,
+                slot_scales_arr,
+                key_codebook_arr,
                 value_codebook_arr,
             },
             {{(int)n_rows, (int)blocks, (int)dim}, {(int)n_rows, (int)blocks}, {(int)n_rows, (int)blocks}},
