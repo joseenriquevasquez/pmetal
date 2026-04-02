@@ -2763,7 +2763,9 @@ impl InlineArray {
     }
 
     /// Specialized long-context q8 TurboQuant decode for D=256/V=256 over
-    /// packed key bytes stored as `[N, S_cap, D]`.
+    /// combined slot-major storage:
+    /// - packed key bytes `[N, S_cap, D]`
+    /// - value indices `[N, S_cap, D]`
     ///
     /// Returns the rotated aggregated values `[N, 256]` on success.
     pub fn turboquant_attention_q8_d256_packed_keys_2pass(

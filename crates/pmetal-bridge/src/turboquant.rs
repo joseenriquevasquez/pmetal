@@ -1464,7 +1464,7 @@ impl QuantizedKvCache {
                 &ks.norms.reshape(&[kv_rows, cache_seq_capacity]),
                 &ks.residual_norms.reshape(&[kv_rows, cache_seq_capacity]),
                 key_core.codebook_arr(key_bits.saturating_sub(1))?,
-                &vs.indices_t.reshape(&[kv_rows, value_dim, cache_seq_capacity]),
+                &vs.indices.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
                 &vs.norms.reshape(&[kv_rows, cache_seq_capacity]),
                 value_core.codebook_arr(value_bits)?,
                 q_rows as u32,

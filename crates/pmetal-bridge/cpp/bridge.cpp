@@ -1374,7 +1374,7 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KEYS_2PASS_1_SOURCE = R"(
         float key_norm = key_norms[scalar_idx];
         float residual_scale = key_residual_norms[scalar_idx] * kQjlConst;
         uint key_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
-        uint value_base = (kv_row * kDim + d0) * cache_seq_capacity + seq;
+        uint value_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
 
         uchar key_byte0 = key_bytes[key_base + 0u];
         uchar key_byte1 = key_bytes[key_base + 1u];
@@ -1420,14 +1420,14 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KEYS_2PASS_1_SOURCE = R"(
         sum_exp_score = sum_exp_score * factor + exp_score;
 
         float value_scale = exp_score * value_norms[scalar_idx];
-        acc0 = acc0 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 0u * cache_seq_capacity]];
-        acc1 = acc1 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 1u * cache_seq_capacity]];
-        acc2 = acc2 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 2u * cache_seq_capacity]];
-        acc3 = acc3 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 3u * cache_seq_capacity]];
-        acc4 = acc4 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 4u * cache_seq_capacity]];
-        acc5 = acc5 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 5u * cache_seq_capacity]];
-        acc6 = acc6 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 6u * cache_seq_capacity]];
-        acc7 = acc7 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 7u * cache_seq_capacity]];
+        acc0 = acc0 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 0u]];
+        acc1 = acc1 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 1u]];
+        acc2 = acc2 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 2u]];
+        acc3 = acc3 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 3u]];
+        acc4 = acc4 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 4u]];
+        acc5 = acc5 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 5u]];
+        acc6 = acc6 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 6u]];
+        acc7 = acc7 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 7u]];
     }
 
     if (lane == 0u) {
