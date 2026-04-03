@@ -57,7 +57,9 @@ fn turboquant_trace_enabled() -> bool {
 }
 
 fn turboquant_wht_enabled() -> bool {
-    std::env::var_os("PMETAL_TQ_USE_WHT").is_some()
+    std::env::var_os("PMETAL_TQ_USE_WHT")
+        .map(|value| value != "0")
+        .unwrap_or(true)
 }
 
 fn trace_turboquant_bridge(message: &str) {
@@ -2680,8 +2682,8 @@ fn gpu_dequantize_values(
             TensorRuntime::Uniform { core, .. } => core,
             TensorRuntime::Mixed { .. } => return None,
         };
-        let rot = core.rotation_arr.as_ref()?;
-        return Some(d256_rot_values_seq.as_dtype(Dtype::Float32.as_i32()).matmul(rot));
+        let dense_rot = d256_rot_values_seq.as_dtype(Dtype::Float32.as_i32());
+        return core.inverse_rotate_array(&dense_rot);
     }
 
     let core = match runtime {
