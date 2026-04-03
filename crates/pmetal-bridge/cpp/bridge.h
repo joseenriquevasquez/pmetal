@@ -758,6 +758,26 @@ int mlx_inline_turboquant_attention_q8_d256_packed_keys_2pass(
     uint32_t                attn_scale_bits);
 
 // Specialized long-context q8 decode primitive for D=256/V=256 over a
+// seq-major packed key shadow plus dense rotated values:
+// - `key_bytes`: [N, S_cap, D] uint8
+//   low 7 bits = key centroid index, high bit = QJL sign
+// - `value_dense`: [N, S_cap, D] bf16/f32 rotated dense values
+int mlx_inline_turboquant_attention_q8_d256_packed_keys_dense_values_2pass(
+    mlx_inline_array*       out,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* query_proj,
+    const mlx_inline_array* key_bytes,
+    const mlx_inline_array* slot_scales,
+    const mlx_inline_array* key_codebook,
+    const mlx_inline_array* value_dense,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
+
+// Specialized long-context q8 decode primitive for D=256/V=256 over a
 // seq-major packed `{key,value}` shadow:
 // - `kv_bytes`: [N, S_cap, D] uint16
 //   low byte = key byte, high byte = value centroid index
