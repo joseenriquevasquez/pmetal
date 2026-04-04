@@ -62,6 +62,12 @@ fn turboquant_wht_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn turboquant_q8_fullbyte_enabled() -> bool {
+    std::env::var_os("PMETAL_TQ_Q8_FULLBYTE")
+        .map(|value| value != "0")
+        .unwrap_or(false)
+}
+
 fn trace_turboquant_bridge(message: &str) {
     if turboquant_trace_enabled() {
         eprintln!("[TURBOQUANT TRACE][BRIDGE] {message}");
@@ -955,6 +961,7 @@ fn packed_qjl_words(dim: usize) -> usize {
 ///   indices_t:       [B, H, D, T]  uint8   — score-friendly transposed view
 ///   q8_keybytes_t:   [B, H, D, T]  uint8   — q8-only packed index/sign view
 ///   q8_keybytes_seq: [B, H, T, D]  uint8   — q8 seq-major key shadow
+///   q8_fullbyte_seq: [B, H, T, D]  uint8   — q8 seq-major pure-256-centroid key shadow
 ///   q8_kvbytes_seq:  [B, H, T, D]  uint16  — D256 q8 seq-major packed {key,value}
 ///   q8_slot_scales_seq: [B, H, T, 3]  f32  — [key_norm, residual_norm, value_norm]
 ///   norms:           [B, H, T, 1]  f32     — optional L2 norm before unit-sphere normalise
@@ -967,6 +974,7 @@ struct GpuKeyStore {
     indices_t: Option<InlineArray>,
     q8_keybytes_t: Option<InlineArray>,
     q8_keybytes_seq: Option<InlineArray>,
+    q8_fullbyte_seq: Option<InlineArray>,
     q8_kvbytes_seq: Option<InlineArray>,
     q8_slot_scales_seq: Option<InlineArray>,
     norms: Option<InlineArray>,
@@ -988,6 +996,12 @@ impl GpuKeyStore {
             _ => None,
         };
         self.q8_keybytes_seq = match (self.q8_keybytes_seq.take(), new.q8_keybytes_seq) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
+            (None, Some(next)) => Some(next),
+            (Some(current), None) => Some(current),
+            (None, None) => None,
+        };
+        self.q8_fullbyte_seq = match (self.q8_fullbyte_seq.take(), new.q8_fullbyte_seq) {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
             (None, Some(next)) => Some(next),
             (Some(current), None) => Some(current),
@@ -1083,6 +1097,9 @@ impl GpuKeyStore {
         }
         if let Some(q8_keybytes_seq) = self.q8_keybytes_seq.as_mut() {
             out.push(q8_keybytes_seq);
+        }
+        if let Some(q8_fullbyte_seq) = self.q8_fullbyte_seq.as_mut() {
+            out.push(q8_fullbyte_seq);
         }
         if let Some(q8_kvbytes_seq) = self.q8_kvbytes_seq.as_mut() {
             out.push(q8_kvbytes_seq);
@@ -1763,7 +1780,7 @@ impl QuantizedKvCache {
             }
             UniformAttentionBenchMode::SpecializedQ8D256TwoPass => self
                 .try_gpu_uniform_attention_q8_d256_precomputed(
-                    query_rot, query_proj, q_heads, scale,
+                    query_rot, Some(query_proj), q_heads, scale,
                 ),
             UniformAttentionBenchMode::SpecializedQ8D256FullbytePass1 => {
                 if key_bits != 8
@@ -1974,7 +1991,7 @@ impl QuantizedKvCache {
     fn try_gpu_uniform_attention_q8_d256_precomputed(
         &self,
         query_rot: &InlineArray,
-        query_proj: &InlineArray,
+        query_proj: Option<&InlineArray>,
         q_heads: i32,
         scale: f32,
     ) -> Option<InlineArray> {
@@ -2002,12 +2019,10 @@ impl QuantizedKvCache {
         let q_rows = query_rot.dim(0);
         let n_seq = self.offset as i32;
         let cache_seq_capacity = ks.cache_seq_capacity();
-        let qjl_words = ks.qjl_words();
         if key_bits != 8
             || value_bits != 8
             || key_dim != 256
             || value_dim != 256
-            || qjl_words != 8
             || n_seq < 1024
             || q_rows <= 0
             || q_heads <= 0
@@ -2019,17 +2034,16 @@ impl QuantizedKvCache {
         }
 
         let kv_rows = (layout.batch * layout.heads) as i32;
-        if let (Some(key_bytes), Some(slot_scales), Some(value_rot_dense)) = (
-            ks.q8_keybytes_seq.as_ref(),
+        if let (Some(key_indices), Some(slot_scales), Some(value_rot_dense)) = (
+            ks.q8_fullbyte_seq.as_ref(),
             ks.q8_slot_scales_seq.as_ref(),
             vs.d256_rot_values_seq.as_ref(),
         ) {
-            InlineArray::turboquant_attention_q8_d256_packed_keys_dense_values_2pass(
+            InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
                 query_rot,
-                query_proj,
-                &key_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
+                &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
                 &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
-                key_core.codebook_arr(key_bits.saturating_sub(1))?,
+                key_core.codebook_arr(key_bits)?,
                 &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
                 q_rows as u32,
                 n_seq as u32,
@@ -2038,14 +2052,21 @@ impl QuantizedKvCache {
                 layout.heads as u32,
                 scale,
             )
-        } else if let (Some(kv_bytes), Some(slot_scales)) =
-            (ks.q8_kvbytes_seq.as_ref(), ks.q8_slot_scales_seq.as_ref())
-        {
-            if let Some(value_rot_dense) = vs.d256_rot_values_seq.as_ref() {
-                InlineArray::turboquant_attention_q8_d256_packed_kv_dense_values_2pass(
+        } else {
+            let qjl_words = ks.qjl_words();
+            if qjl_words != 8 {
+                return None;
+            }
+            let query_proj = query_proj?;
+            if let (Some(key_bytes), Some(slot_scales), Some(value_rot_dense)) = (
+                ks.q8_keybytes_seq.as_ref(),
+                ks.q8_slot_scales_seq.as_ref(),
+                vs.d256_rot_values_seq.as_ref(),
+            ) {
+                InlineArray::turboquant_attention_q8_d256_packed_keys_dense_values_2pass(
                     query_rot,
                     query_proj,
-                    &kv_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
+                    &key_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
                     &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
                     key_core.codebook_arr(key_bits.saturating_sub(1))?,
                     &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
@@ -2056,13 +2077,76 @@ impl QuantizedKvCache {
                     layout.heads as u32,
                     scale,
                 )
-            } else {
-                InlineArray::turboquant_attention_q8_d256_packed_kv_2pass(
+            } else if let (Some(kv_bytes), Some(slot_scales)) =
+                (ks.q8_kvbytes_seq.as_ref(), ks.q8_slot_scales_seq.as_ref())
+            {
+                if let Some(value_rot_dense) = vs.d256_rot_values_seq.as_ref() {
+                    InlineArray::turboquant_attention_q8_d256_packed_kv_dense_values_2pass(
+                        query_rot,
+                        query_proj,
+                        &kv_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
+                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                        key_core.codebook_arr(key_bits.saturating_sub(1))?,
+                        &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
+                        q_rows as u32,
+                        n_seq as u32,
+                        cache_seq_capacity as u32,
+                        q_heads as u32,
+                        layout.heads as u32,
+                        scale,
+                    )
+                } else {
+                    InlineArray::turboquant_attention_q8_d256_packed_kv_2pass(
+                        query_rot,
+                        query_proj,
+                        &kv_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
+                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                        key_core.codebook_arr(key_bits.saturating_sub(1))?,
+                        value_core.codebook_arr(value_bits)?,
+                        q_rows as u32,
+                        n_seq as u32,
+                        cache_seq_capacity as u32,
+                        q_heads as u32,
+                        layout.heads as u32,
+                        scale,
+                    )
+                }
+            } else if let (Some(key_bytes), Some(slot_scales)) =
+                (ks.q8_keybytes_seq.as_ref(), ks.q8_slot_scales_seq.as_ref())
+            {
+                InlineArray::turboquant_attention_q8_d256_packed_keys_2pass(
                     query_rot,
                     query_proj,
-                    &kv_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
+                    &key_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
                     &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
                     key_core.codebook_arr(key_bits.saturating_sub(1))?,
+                    &vs.indices
+                        .as_ref()?
+                        .reshape(&[kv_rows, cache_seq_capacity, value_dim]),
+                    value_core.codebook_arr(value_bits)?,
+                    q_rows as u32,
+                    n_seq as u32,
+                    cache_seq_capacity as u32,
+                    q_heads as u32,
+                    layout.heads as u32,
+                    scale,
+                )
+            } else {
+                InlineArray::turboquant_attention_q8_d256_2pass(
+                    query_rot,
+                    query_proj,
+                    &ks.indices_t_array()
+                        .reshape(&[kv_rows, key_dim, cache_seq_capacity]),
+                    &ks.qjl_signs_t_array()
+                        .reshape(&[kv_rows, qjl_words, cache_seq_capacity]),
+                    &ks.key_norms_array()?
+                        .reshape(&[kv_rows, cache_seq_capacity]),
+                    &ks.residual_norms_array()?
+                        .reshape(&[kv_rows, cache_seq_capacity]),
+                    key_core.codebook_arr(key_bits.saturating_sub(1))?,
+                    &vs.indices_t_array()?
+                        .reshape(&[kv_rows, value_dim, cache_seq_capacity]),
+                    &vs.norms_array()?.reshape(&[kv_rows, cache_seq_capacity]),
                     value_core.codebook_arr(value_bits)?,
                     q_rows as u32,
                     n_seq as u32,
@@ -2072,50 +2156,6 @@ impl QuantizedKvCache {
                     scale,
                 )
             }
-        } else if let (Some(key_bytes), Some(slot_scales)) =
-            (ks.q8_keybytes_seq.as_ref(), ks.q8_slot_scales_seq.as_ref())
-        {
-            InlineArray::turboquant_attention_q8_d256_packed_keys_2pass(
-                query_rot,
-                query_proj,
-                &key_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
-                key_core.codebook_arr(key_bits.saturating_sub(1))?,
-                &vs.indices
-                    .as_ref()?
-                    .reshape(&[kv_rows, cache_seq_capacity, value_dim]),
-                value_core.codebook_arr(value_bits)?,
-                q_rows as u32,
-                n_seq as u32,
-                cache_seq_capacity as u32,
-                q_heads as u32,
-                layout.heads as u32,
-                scale,
-            )
-        } else {
-            InlineArray::turboquant_attention_q8_d256_2pass(
-                query_rot,
-                query_proj,
-                &ks.indices_t_array()
-                    .reshape(&[kv_rows, key_dim, cache_seq_capacity]),
-                &ks.qjl_signs_t_array()
-                    .reshape(&[kv_rows, qjl_words, cache_seq_capacity]),
-                &ks.key_norms_array()?
-                    .reshape(&[kv_rows, cache_seq_capacity]),
-                &ks.residual_norms_array()?
-                    .reshape(&[kv_rows, cache_seq_capacity]),
-                key_core.codebook_arr(key_bits.saturating_sub(1))?,
-                &vs.indices_t_array()?
-                    .reshape(&[kv_rows, value_dim, cache_seq_capacity]),
-                &vs.norms_array()?.reshape(&[kv_rows, cache_seq_capacity]),
-                value_core.codebook_arr(value_bits)?,
-                q_rows as u32,
-                n_seq as u32,
-                cache_seq_capacity as u32,
-                q_heads as u32,
-                layout.heads as u32,
-                scale,
-            )
         }
     }
 
@@ -2392,8 +2432,6 @@ impl QuantizedKvCache {
             TensorRuntime::Uniform { .. } | TensorRuntime::Mixed { .. } => return None,
         };
 
-        let key_codebook = key_core.codebook_arr(key_bits.saturating_sub(1))?;
-
         let batch = queries_f32.dim(0);
         let q_heads = queries_f32.dim(1);
         let key_dim = queries_f32.dim(3);
@@ -2418,12 +2456,24 @@ impl QuantizedKvCache {
         } else {
             0
         };
-        let query_proj = key_core.project_array(&query_rows)?;
-        let project_us = if trace_timing {
-            eval_stage_micros(&query_proj)
-        } else {
-            0
-        };
+        let can_try_q8_fullbyte = turboquant_q8_fullbyte_enabled()
+            && key_bits == 8
+            && value_bits == 8
+            && key_dim == 256
+            && value_dim == 256
+            && n_seq >= 1024
+            && ks.q8_fullbyte_seq.is_some()
+            && ks.q8_slot_scales_seq.is_some()
+            && vs.d256_rot_values_seq.is_some();
+        let mut query_proj: Option<InlineArray> = None;
+        let mut project_us = 0;
+        if !can_try_q8_fullbyte {
+            let projected = key_core.project_array(&query_rows)?;
+            if trace_timing {
+                project_us = eval_stage_micros(&projected);
+            }
+            query_proj = Some(projected);
+        }
 
         let kv_rows = (layout.batch * layout.heads) as i32;
         let key_norms = ks
@@ -2433,9 +2483,48 @@ impl QuantizedKvCache {
             .residual_norms_array()?
             .reshape(&[kv_rows, cache_seq_capacity]);
         let qjl_words = ks.qjl_words();
+        if can_try_q8_fullbyte {
+            if let Some(decoded_rot) =
+                self.try_gpu_uniform_attention_q8_d256_precomputed(&query_rot, None, q_heads, scale)
+            {
+                let decode_us = if trace_timing {
+                    eval_stage_micros(&decoded_rot)
+                } else {
+                    0
+                };
+                let output_rows = value_core.inverse_rotate_output_array(&decoded_rot, output_dtype)?;
+                let inverse_rotate_us = if trace_timing {
+                    eval_stage_micros(&output_rows)
+                } else {
+                    0
+                };
+                if trace_timing {
+                    trace_turboquant_bridge(&format!(
+                        "gpu_uniform_q8_d256_fullbyte_densev_2pass_stage_us seq={} q_rows={} query_ready={} rotate={} project={} score=0 softmax=0 decode={} inverse_rotate={}",
+                        n_seq,
+                        q_rows,
+                        query_ready_us,
+                        rotate_us,
+                        project_us,
+                        decode_us,
+                        inverse_rotate_us,
+                    ));
+                }
+                return Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]));
+            }
+        }
+        if query_proj.is_none() {
+            let projected = key_core.project_array(&query_rows)?;
+            if trace_timing {
+                project_us = eval_stage_micros(&projected);
+            }
+            query_proj = Some(projected);
+        }
+        let query_proj = query_proj.as_ref()?;
+        let key_codebook = key_core.codebook_arr(key_bits.saturating_sub(1))?;
         if let Some(decoded_rot) = self.try_gpu_uniform_attention_q8_d256_precomputed(
             &query_rot,
-            &query_proj,
+            Some(query_proj),
             q_heads,
             scale,
         ) {
@@ -2479,7 +2568,7 @@ impl QuantizedKvCache {
                     if let Some(decoded_rot) =
                         InlineArray::turboquant_attention_q8_d128_packed_keys_2pass(
                             &query_rot,
-                            &query_proj,
+                            query_proj,
                             &key_bytes,
                             &key_norms,
                             &key_residual_norms,
@@ -2528,7 +2617,7 @@ impl QuantizedKvCache {
                         .reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
                 if let Some(decoded_rot) = InlineArray::turboquant_attention_q8_d128_2pass(
                     &query_rot,
-                    &query_proj,
+                    query_proj,
                     &key_indices,
                     &key_qjl_signs,
                     &key_norms,
@@ -2574,7 +2663,7 @@ impl QuantizedKvCache {
         }
 
         let scores =
-            self.bench_gpu_uniform_scores_precomputed(&query_rot, &query_proj, q_heads, scale)?;
+            self.bench_gpu_uniform_scores_precomputed(&query_rot, query_proj, q_heads, scale)?;
         let score_us = if trace_timing {
             eval_stage_micros(&scores)
         } else {
@@ -2851,6 +2940,13 @@ fn gpu_quantize_kv(
     } else {
         None
     };
+    let q8_fullbyte_seq = if use_q8_seq_shadow && turboquant_q8_fullbyte_enabled() {
+        k_core
+            .gpu_quantize_mse(&k_rot, 8)
+            .map(|indices| indices.as_dtype(Dtype::Uint8.as_i32()))
+    } else {
+        None
+    };
 
     // ── Values ────────────────────────────────────────────────────────────
     let (v_indices, v_indices_t, val_norms, d256_rot_values_seq) = if use_q8_seq_shadow {
@@ -2893,6 +2989,7 @@ fn gpu_quantize_kv(
             indices_t: k_indices_t,
             q8_keybytes_t,
             q8_keybytes_seq,
+            q8_fullbyte_seq,
             q8_kvbytes_seq,
             q8_slot_scales_seq,
             norms: (!use_q8_seq_shadow).then_some(key_norms),
@@ -4498,6 +4595,104 @@ mod tests {
         assert!(
             max_abs_diff < 1e-4,
             "d256 gqa direct attention diverged from dequantized sdpa: max_abs_diff={max_abs_diff}"
+        );
+    }
+
+    #[test]
+    fn turboquant_attention_q8_d256_fullbyte_dense_values_matches_manual_reference() {
+        let batch = 1i32;
+        let q_heads = 4i32;
+        let kv_heads = 2i32;
+        let groups = q_heads / kv_heads;
+        let dim = 256i32;
+        let seq = 1024i32;
+        let kv_rows = batch * kv_heads;
+        let q_rows = batch * q_heads;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let query_rot_vec: Vec<f32> = (0..(q_rows * dim) as usize)
+            .map(|i| ((i as f32) * 0.013 + 0.4).sin() * 0.7)
+            .collect();
+        let key_indices_vec: Vec<u8> = (0..(kv_rows * seq * dim) as usize)
+            .map(|i| (((i * 17) + 23) & 0xff) as u8)
+            .collect();
+        let slot_scales_vec: Vec<f32> = (0..(kv_rows * seq * 3) as usize)
+            .map(|i| match i % 3 {
+                0 => 0.5 + (((i / 3) % 11) as f32) * 0.03125,
+                1 => 0.0,
+                _ => 1.0,
+            })
+            .collect();
+        let key_codebook_vec: Vec<f32> = (0..256)
+            .map(|i| ((i as f32) - 127.5) / 96.0)
+            .collect();
+        let value_dense_vec: Vec<f32> = (0..(kv_rows * seq * dim) as usize)
+            .map(|i| ((i as f32) * 0.009 - 0.7).cos() * 0.5)
+            .collect();
+
+        let query_rot = InlineArray::from_f32_slice(&query_rot_vec, &[q_rows, dim]);
+        let key_indices = InlineArray::from_u8_slice(&key_indices_vec, &[kv_rows, seq, dim]);
+        let slot_scales = InlineArray::from_f32_slice(&slot_scales_vec, &[kv_rows, seq, 3]);
+        let key_codebook = InlineArray::from_f32_slice(&key_codebook_vec, &[256]);
+        let value_dense = InlineArray::from_f32_slice(&value_dense_vec, &[kv_rows, seq, dim]);
+
+        let mut direct = InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
+            &query_rot,
+            &key_indices,
+            &slot_scales,
+            &key_codebook,
+            &value_dense,
+            q_rows as u32,
+            seq as u32,
+            seq as u32,
+            q_heads as u32,
+            kv_heads as u32,
+            scale,
+        )
+        .expect("fullbyte direct attention");
+
+        let mut keys = vec![0.0f32; (batch * q_heads * seq * dim) as usize];
+        let mut values = vec![0.0f32; (batch * q_heads * seq * dim) as usize];
+        for qh in 0..q_heads as usize {
+            let kvh = qh / groups as usize;
+            for t in 0..seq as usize {
+                let scale_base = (kvh * seq as usize + t) * 3;
+                let key_norm = slot_scales_vec[scale_base];
+                let key_base = (kvh * seq as usize + t) * dim as usize;
+                let out_base = (qh * seq as usize + t) * dim as usize;
+                for d_idx in 0..dim as usize {
+                    let idx = key_indices_vec[key_base + d_idx] as usize;
+                    keys[out_base + d_idx] = key_codebook_vec[idx] * key_norm;
+                    values[out_base + d_idx] = value_dense_vec[key_base + d_idx];
+                }
+            }
+        }
+
+        let mut queries = query_rot.reshape(&[batch, q_heads, 1, dim]);
+        let mut keys = InlineArray::from_f32_slice(&keys, &[batch, q_heads, seq, dim]);
+        let mut values = InlineArray::from_f32_slice(&values, &[batch, q_heads, seq, dim]);
+        let reference_vals = manual_single_token_attention(
+            &mut queries,
+            &mut keys,
+            &mut values,
+            batch,
+            q_heads,
+            seq,
+            dim,
+            scale,
+        );
+
+        let direct_vals = direct
+            .to_f32_vec((batch * q_heads * dim) as usize)
+            .expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff < 1e-4,
+            "d256 fullbyte direct attention diverged from manual reference: max_abs_diff={max_abs_diff}"
         );
     }
 
