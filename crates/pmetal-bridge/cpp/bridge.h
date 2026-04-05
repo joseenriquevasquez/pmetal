@@ -778,6 +778,111 @@ int mlx_inline_turboquant_attention_q8_d256_packed_keys_dense_values_2pass(
     uint32_t                attn_scale_bits);
 
 // Specialized long-context q8 decode primitive for D=256/V=256 over a
+// seq-major pure-q8 key shadow plus dense rotated values:
+// - `key_indices`: [N, S_cap, D] uint8, full 8-bit centroid index
+// - `value_dense`: [N, S_cap, D] bf16/f32 rotated dense values
+int mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
+    mlx_inline_array*       out,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* key_indices,
+    const mlx_inline_array* slot_scales,
+    const mlx_inline_array* key_codebook,
+    const mlx_inline_array* value_dense,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
+
+// Full-byte D256 pass-1 state output only.
+// Returns:
+// - partials: [N, blocks, 256]
+// - sums:     [N, blocks]
+// - maxs:     [N, blocks]
+int mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_state(
+    mlx_inline_array*       out_partials,
+    mlx_inline_array*       out_sums,
+    mlx_inline_array*       out_maxs,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* key_indices,
+    const mlx_inline_array* slot_scales,
+    const mlx_inline_array* key_codebook,
+    const mlx_inline_array* value_dense,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
+
+// Full-byte D256 pass-1 output only.
+// Returns unmerged partial outputs [N, blocks, 256].
+int mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_pass1(
+    mlx_inline_array*       out,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* key_indices,
+    const mlx_inline_array* slot_scales,
+    const mlx_inline_array* key_codebook,
+    const mlx_inline_array* value_dense,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
+
+// Merge precomputed D256 2-pass partials/maxs/sums.
+int mlx_inline_turboquant_attention_q8_d256_pass2_merge(
+    mlx_inline_array*       out,
+    const mlx_inline_array* partials,
+    const mlx_inline_array* sums,
+    const mlx_inline_array* maxs,
+    uint32_t                n_rows,
+    uint32_t                blocks);
+
+// Full-byte D256 2-pass variant that uses a block-local 2-loop softmax
+// in pass 1 instead of online renormalization.
+int mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_localsoftmax(
+    mlx_inline_array*       out,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* key_indices,
+    const mlx_inline_array* slot_scales,
+    const mlx_inline_array* key_codebook,
+    const mlx_inline_array* value_dense,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
+
+// Full-byte D256 score-only long-context kernel.
+int mlx_inline_turboquant_score_q8_d256_fullbyte(
+    mlx_inline_array*       out_scores,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* key_indices,
+    const mlx_inline_array* slot_scales,
+    const mlx_inline_array* key_codebook,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
+
+// D256 dense-value weighted sum over resident rotated values.
+int mlx_inline_turboquant_weighted_sum_d256_dense_values(
+    mlx_inline_array*       out,
+    const mlx_inline_array* weights,
+    const mlx_inline_array* value_dense,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads);
+
+// Specialized long-context q8 decode primitive for D=256/V=256 over a
 // seq-major packed `{key,value}` shadow:
 // - `kv_bytes`: [N, S_cap, D] uint16
 //   low byte = key byte, high byte = value centroid index

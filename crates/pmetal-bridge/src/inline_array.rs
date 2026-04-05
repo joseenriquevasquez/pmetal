@@ -619,6 +619,102 @@ unsafe extern "C" {
         attn_scale_bits: u32,
     ) -> i32;
 
+    fn mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
+        out: *mut RawBuf,
+        query_rot: *const RawBuf,
+        key_indices: *const RawBuf,
+        slot_scales: *const RawBuf,
+        key_codebook: *const RawBuf,
+        value_dense: *const RawBuf,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale_bits: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_state(
+        out_partials: *mut RawBuf,
+        out_sums: *mut RawBuf,
+        out_maxs: *mut RawBuf,
+        query_rot: *const RawBuf,
+        key_indices: *const RawBuf,
+        slot_scales: *const RawBuf,
+        key_codebook: *const RawBuf,
+        value_dense: *const RawBuf,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale_bits: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_pass1(
+        out: *mut RawBuf,
+        query_rot: *const RawBuf,
+        key_indices: *const RawBuf,
+        slot_scales: *const RawBuf,
+        key_codebook: *const RawBuf,
+        value_dense: *const RawBuf,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale_bits: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_attention_q8_d256_pass2_merge(
+        out: *mut RawBuf,
+        partials: *const RawBuf,
+        sums: *const RawBuf,
+        maxs: *const RawBuf,
+        n_rows: u32,
+        blocks: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_localsoftmax(
+        out: *mut RawBuf,
+        query_rot: *const RawBuf,
+        key_indices: *const RawBuf,
+        slot_scales: *const RawBuf,
+        key_codebook: *const RawBuf,
+        value_dense: *const RawBuf,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale_bits: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_score_q8_d256_fullbyte(
+        out: *mut RawBuf,
+        query_rot: *const RawBuf,
+        key_indices: *const RawBuf,
+        slot_scales: *const RawBuf,
+        key_codebook: *const RawBuf,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale_bits: u32,
+    ) -> i32;
+
+    fn mlx_inline_turboquant_weighted_sum_d256_dense_values(
+        out: *mut RawBuf,
+        weights: *const RawBuf,
+        value_dense: *const RawBuf,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+    ) -> i32;
+
     fn mlx_inline_turboquant_attention_q8_d256_packed_kv_2pass(
         out: *mut RawBuf,
         query_rot: *const RawBuf,
@@ -2983,6 +3079,285 @@ impl InlineArray {
                 q_heads,
                 kv_heads,
                 attn_scale.to_bits(),
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Specialized long-context q8 decode for D=256/V=256 over
+    /// a seq-major pure-q8 key shadow plus dense rotated values:
+    /// - `key_indices`: `[N, S_cap, D]` uint8, full 8-bit centroid index
+    /// - `value_dense`: `[N, S_cap, D]` bf16/f32 rotated dense values
+    ///
+    /// Returns the rotated aggregated values `[N, 256]` on success.
+    pub fn turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
+        query_rot: &Self,
+        key_indices: &Self,
+        slot_scales: &Self,
+        key_codebook: &Self,
+        value_dense: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale: f32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
+                out.as_mut_ptr(),
+                &query_rot.raw,
+                &key_indices.raw,
+                &slot_scales.raw,
+                &key_codebook.raw,
+                &value_dense.raw,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+                attn_scale.to_bits(),
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Full-byte D256 long-context pass-1 state output.
+    /// Returns `(partials, sums, maxs)`.
+    pub fn turboquant_attention_q8_d256_fullbyte_dense_values_2pass_state(
+        query_rot: &Self,
+        key_indices: &Self,
+        slot_scales: &Self,
+        key_codebook: &Self,
+        value_dense: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale: f32,
+    ) -> Option<(Self, Self, Self)> {
+        let mut partials = MaybeUninit::<RawBuf>::uninit();
+        let mut sums = MaybeUninit::<RawBuf>::uninit();
+        let mut maxs = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_state(
+                partials.as_mut_ptr(),
+                sums.as_mut_ptr(),
+                maxs.as_mut_ptr(),
+                &query_rot.raw,
+                &key_indices.raw,
+                &slot_scales.raw,
+                &key_codebook.raw,
+                &value_dense.raw,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+                attn_scale.to_bits(),
+            )
+        };
+        if rc == 0 {
+            Some((
+                Self {
+                    raw: unsafe { partials.assume_init() },
+                },
+                Self {
+                    raw: unsafe { sums.assume_init() },
+                },
+                Self {
+                    raw: unsafe { maxs.assume_init() },
+                },
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Full-byte D256 long-context pass-1 output only.
+    /// Returns the unmerged partial outputs `[N, blocks, 256]`.
+    pub fn turboquant_attention_q8_d256_fullbyte_dense_values_2pass_pass1(
+        query_rot: &Self,
+        key_indices: &Self,
+        slot_scales: &Self,
+        key_codebook: &Self,
+        value_dense: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale: f32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_pass1(
+                out.as_mut_ptr(),
+                &query_rot.raw,
+                &key_indices.raw,
+                &slot_scales.raw,
+                &key_codebook.raw,
+                &value_dense.raw,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+                attn_scale.to_bits(),
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Merge precomputed D256 2-pass partials/maxs/sums.
+    pub fn turboquant_attention_q8_d256_pass2_merge(
+        partials: &Self,
+        sums: &Self,
+        maxs: &Self,
+        n_rows: u32,
+        blocks: u32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_attention_q8_d256_pass2_merge(
+                out.as_mut_ptr(),
+                &partials.raw,
+                &sums.raw,
+                &maxs.raw,
+                n_rows,
+                blocks,
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Full-byte D256 long-context 2-pass variant with block-local 2-loop softmax.
+    pub fn turboquant_attention_q8_d256_fullbyte_dense_values_2pass_localsoftmax(
+        query_rot: &Self,
+        key_indices: &Self,
+        slot_scales: &Self,
+        key_codebook: &Self,
+        value_dense: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale: f32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_localsoftmax(
+                out.as_mut_ptr(),
+                &query_rot.raw,
+                &key_indices.raw,
+                &slot_scales.raw,
+                &key_codebook.raw,
+                &value_dense.raw,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+                attn_scale.to_bits(),
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Full-byte D256 score-only long-context kernel.
+    /// Returns scores `[N, S]`.
+    pub fn turboquant_score_q8_d256_fullbyte(
+        query_rot: &Self,
+        key_indices: &Self,
+        slot_scales: &Self,
+        key_codebook: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale: f32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_score_q8_d256_fullbyte(
+                out.as_mut_ptr(),
+                &query_rot.raw,
+                &key_indices.raw,
+                &slot_scales.raw,
+                &key_codebook.raw,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+                attn_scale.to_bits(),
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// D256 dense-value weighted sum over resident rotated values.
+    /// Returns rotated outputs `[N, 256]`.
+    pub fn turboquant_weighted_sum_d256_dense_values(
+        weights: &Self,
+        value_dense: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_weighted_sum_d256_dense_values(
+                out.as_mut_ptr(),
+                &weights.raw,
+                &value_dense.raw,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
             )
         };
         if rc == 0 {

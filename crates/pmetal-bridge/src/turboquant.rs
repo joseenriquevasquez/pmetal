@@ -807,7 +807,7 @@ impl TurboQuantState {
 fn build_tensor_runtime<F>(
     total_dim: usize,
     config: TurboQuantTensorConfig,
-    is_keys: bool,
+    _is_keys: bool,
     get_core: &mut F,
 ) -> TensorRuntime
 where
@@ -815,14 +815,12 @@ where
 {
     match config {
         TurboQuantTensorConfig::Uniform { bits } => {
-            let max_mse_bits = if is_keys {
-                bits.saturating_sub(1)
-            } else {
-                bits
-            };
             TensorRuntime::Uniform {
                 config,
-                core: get_core(total_dim, max_mse_bits),
+                // Build the full MSE codebook ladder even for keys so pure-MSE
+                // key paths (for example the full-byte D256 experiments) can
+                // reuse the same core without a second cache format.
+                core: get_core(total_dim, bits),
             }
         }
         TurboQuantTensorConfig::Mixed {
@@ -831,20 +829,10 @@ where
             outlier_count,
         } => {
             let regular_dim = total_dim - outlier_count;
-            let regular_max = if is_keys {
-                regular_bits.saturating_sub(1)
-            } else {
-                regular_bits
-            };
-            let outlier_max = if is_keys {
-                outlier_bits.saturating_sub(1)
-            } else {
-                outlier_bits
-            };
             TensorRuntime::Mixed {
                 config,
-                regular_core: get_core(regular_dim, regular_max),
-                outlier_core: get_core(outlier_count, outlier_max),
+                regular_core: get_core(regular_dim, regular_bits),
+                outlier_core: get_core(outlier_count, outlier_bits),
             }
         }
     }
@@ -1394,6 +1382,10 @@ pub enum UniformAttentionBenchMode {
     Split,
     SpecializedQ8D128TwoPass,
     SpecializedQ8D256TwoPass,
+    SpecializedQ8D256FullbytePass1,
+    SpecializedQ8D256FullbytePass2,
+    SpecializedQ8D256FullbyteSplitDenseV,
+    SpecializedQ8D256FullbyteLocalSoftmax,
 }
 
 impl QuantizedKvCache {
@@ -1773,6 +1765,131 @@ impl QuantizedKvCache {
                 .try_gpu_uniform_attention_q8_d256_precomputed(
                     query_rot, query_proj, q_heads, scale,
                 ),
+            UniformAttentionBenchMode::SpecializedQ8D256FullbytePass1 => {
+                if key_bits != 8
+                    || value_bits != 8
+                    || key_dim != 256
+                    || value_dim != 256
+                    || n_seq < 1024
+                {
+                    return None;
+                }
+                if let (Some(key_indices), Some(slot_scales), Some(value_rot_dense)) = (
+                    ks.q8_fullbyte_seq.as_ref(),
+                    ks.q8_slot_scales_seq.as_ref(),
+                    vs.d256_rot_values_seq.as_ref(),
+                ) {
+                    InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass_pass1(
+                        query_rot,
+                        &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
+                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                        key_core.codebook_arr(key_bits)?,
+                        &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
+                        q_rows as u32,
+                        n_seq as u32,
+                        cache_seq_capacity as u32,
+                        q_heads as u32,
+                        layout.heads as u32,
+                        scale,
+                    )
+                } else {
+                    None
+                }
+            }
+            UniformAttentionBenchMode::SpecializedQ8D256FullbytePass2 => {
+                if key_bits != 8
+                    || value_bits != 8
+                    || key_dim != 256
+                    || value_dim != 256
+                    || n_seq < 1024
+                {
+                    return None;
+                }
+                let (partials, sums, maxs) = self
+                    .bench_gpu_uniform_attention_state_precomputed_fullbyte(
+                        query_rot,
+                        q_heads,
+                        scale,
+                    )?;
+                InlineArray::turboquant_attention_q8_d256_pass2_merge(
+                    &partials,
+                    &sums,
+                    &maxs,
+                    q_rows as u32,
+                    sums.dim(1) as u32,
+                )
+            }
+            UniformAttentionBenchMode::SpecializedQ8D256FullbyteSplitDenseV => {
+                if key_bits != 8
+                    || value_bits != 8
+                    || key_dim != 256
+                    || value_dim != 256
+                    || n_seq < 1024
+                {
+                    return None;
+                }
+                if let (Some(key_indices), Some(slot_scales), Some(value_rot_dense)) = (
+                    ks.q8_fullbyte_seq.as_ref(),
+                    ks.q8_slot_scales_seq.as_ref(),
+                    vs.d256_rot_values_seq.as_ref(),
+                ) {
+                    let scores = InlineArray::turboquant_score_q8_d256_fullbyte(
+                        query_rot,
+                        &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
+                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                        key_core.codebook_arr(key_bits)?,
+                        q_rows as u32,
+                        n_seq as u32,
+                        cache_seq_capacity as u32,
+                        q_heads as u32,
+                        layout.heads as u32,
+                        scale,
+                    )?;
+                    let weights = scores.softmax(-1);
+                    InlineArray::turboquant_weighted_sum_d256_dense_values(
+                        &weights,
+                        &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
+                        q_rows as u32,
+                        n_seq as u32,
+                        cache_seq_capacity as u32,
+                        q_heads as u32,
+                        layout.heads as u32,
+                    )
+                } else {
+                    None
+                }
+            }
+            UniformAttentionBenchMode::SpecializedQ8D256FullbyteLocalSoftmax => {
+                if key_bits != 8
+                    || value_bits != 8
+                    || key_dim != 256
+                    || value_dim != 256
+                    || n_seq < 1024
+                {
+                    return None;
+                }
+                if let (Some(key_indices), Some(slot_scales), Some(value_rot_dense)) = (
+                    ks.q8_fullbyte_seq.as_ref(),
+                    ks.q8_slot_scales_seq.as_ref(),
+                    vs.d256_rot_values_seq.as_ref(),
+                ) {
+                    InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass_localsoftmax(
+                        query_rot,
+                        &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
+                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                        key_core.codebook_arr(key_bits)?,
+                        &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
+                        q_rows as u32,
+                        n_seq as u32,
+                        cache_seq_capacity as u32,
+                        q_heads as u32,
+                        layout.heads as u32,
+                        scale,
+                    )
+                } else {
+                    None
+                }
+            }
             UniformAttentionBenchMode::Split => {
                 let scores = self
                     .bench_gpu_uniform_scores_precomputed(query_rot, query_proj, q_heads, scale)?;
@@ -2078,6 +2195,114 @@ impl QuantizedKvCache {
     }
 
     #[doc(hidden)]
+    pub fn bench_gpu_uniform_scores_precomputed_fullbyte(
+        &self,
+        query_rot: &InlineArray,
+        q_heads: i32,
+        scale: f32,
+    ) -> Option<InlineArray> {
+        let layout = self.layout?;
+        let ks = self.keys.as_ref()?.gpu.as_ref()?;
+        let state = self.state.as_ref()?;
+        let (key_core, key_bits) = match &state.keys {
+            TensorRuntime::Uniform {
+                config: TurboQuantTensorConfig::Uniform { bits },
+                core,
+            } => (core, *bits),
+            _ => return None,
+        };
+        let key_dim = layout.key_dim as i32;
+        let q_rows = query_rot.dim(0);
+        let n_seq = self.offset as i32;
+        let cache_seq_capacity = ks.cache_seq_capacity();
+        if key_bits != 8
+            || key_dim != 256
+            || q_heads <= 0
+            || q_rows <= 0
+            || n_seq <= 0
+            || cache_seq_capacity < n_seq
+        {
+            return None;
+        }
+        let kv_rows = (layout.batch * layout.heads) as i32;
+        if let (Some(key_indices), Some(slot_scales)) =
+            (ks.q8_fullbyte_seq.as_ref(), ks.q8_slot_scales_seq.as_ref())
+        {
+            InlineArray::turboquant_score_q8_d256_fullbyte(
+                query_rot,
+                &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
+                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                key_core.codebook_arr(key_bits)?,
+                q_rows as u32,
+                n_seq as u32,
+                cache_seq_capacity as u32,
+                q_heads as u32,
+                layout.heads as u32,
+                scale,
+            )
+        } else {
+            None
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn bench_gpu_uniform_attention_state_precomputed_fullbyte(
+        &self,
+        query_rot: &InlineArray,
+        q_heads: i32,
+        scale: f32,
+    ) -> Option<(InlineArray, InlineArray, InlineArray)> {
+        let layout = self.layout?;
+        let ks = self.keys.as_ref()?.gpu.as_ref()?;
+        let vs = self.values.as_ref()?.gpu.as_ref()?;
+        let state = self.state.as_ref()?;
+        let (key_core, key_bits) = match &state.keys {
+            TensorRuntime::Uniform {
+                config: TurboQuantTensorConfig::Uniform { bits },
+                core,
+            } => (core, *bits),
+            _ => return None,
+        };
+        let key_dim = layout.key_dim as i32;
+        let value_dim = layout.value_dim as i32;
+        let q_rows = query_rot.dim(0);
+        let n_seq = self.offset as i32;
+        let cache_seq_capacity = ks.cache_seq_capacity();
+        if key_bits != 8
+            || key_dim != 256
+            || value_dim != 256
+            || q_heads <= 0
+            || q_rows <= 0
+            || n_seq < 1024
+            || cache_seq_capacity < n_seq
+        {
+            return None;
+        }
+        let kv_rows = (layout.batch * layout.heads) as i32;
+        if let (Some(key_indices), Some(slot_scales), Some(value_rot_dense)) = (
+            ks.q8_fullbyte_seq.as_ref(),
+            ks.q8_slot_scales_seq.as_ref(),
+            vs.d256_rot_values_seq.as_ref(),
+        ) {
+            InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass_state(
+                query_rot,
+                &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
+                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                key_core.codebook_arr(key_bits)?,
+                &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
+                q_rows as u32,
+                n_seq as u32,
+                cache_seq_capacity as u32,
+                q_heads as u32,
+                layout.heads as u32,
+                scale,
+            )
+        } else {
+            None
+        }
+    }
+
+    #[doc(hidden)]
     pub fn bench_gpu_uniform_weighted_decode(
         &self,
         weights: &InlineArray,
@@ -2108,6 +2333,34 @@ impl QuantizedKvCache {
             q_rows as u32,
             n_seq as u32,
             indices_t.dim(3) as u32,
+            q_heads as u32,
+            layout.heads as u32,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn bench_gpu_uniform_weighted_sum_dense_values(
+        &self,
+        weights: &InlineArray,
+        q_heads: i32,
+    ) -> Option<InlineArray> {
+        let layout = self.layout?;
+        let vs = self.values.as_ref()?.gpu.as_ref()?;
+        let value_dim = layout.value_dim as i32;
+        let q_rows = weights.dim(0);
+        let n_seq = self.offset as i32;
+        let value_rot_dense = vs.d256_rot_values_seq.as_ref()?;
+        let cache_seq_capacity = value_rot_dense.dim(2);
+        if value_dim != 256 || q_rows <= 0 || n_seq <= 0 || cache_seq_capacity < n_seq {
+            return None;
+        }
+        let kv_rows = (layout.batch * layout.heads) as i32;
+        InlineArray::turboquant_weighted_sum_d256_dense_values(
+            weights,
+            &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
+            q_rows as u32,
+            n_seq as u32,
+            cache_seq_capacity as u32,
             q_heads as u32,
             layout.heads as u32,
         )

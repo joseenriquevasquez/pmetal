@@ -16,7 +16,12 @@ enum Mode {
     Q8Append,
     Q8CoreSplit,
     Q8CoreD256,
+    Q8CoreD256FullbytePass1,
+    Q8CoreD256FullbytePass2,
+    Q8CoreD256FullbyteSplitDenseV,
+    Q8CoreD256FullbyteLocalSoftmax,
     Q8Score,
+    Q8ScoreFullbyte,
     Q8Softmax,
     Q8Decode,
     Q8Transforms,
@@ -64,7 +69,16 @@ fn parse_args() -> Config {
                     "q8-append" => Mode::Q8Append,
                     "q8-core-split" => Mode::Q8CoreSplit,
                     "q8-core-d256" => Mode::Q8CoreD256,
+                    "q8-core-d256-fullbyte-pass1" => Mode::Q8CoreD256FullbytePass1,
+                    "q8-core-d256-fullbyte-pass2" => Mode::Q8CoreD256FullbytePass2,
+                    "q8-core-d256-fullbyte-split-densev" => {
+                        Mode::Q8CoreD256FullbyteSplitDenseV
+                    }
+                    "q8-core-d256-fullbyte-localsoftmax" => {
+                        Mode::Q8CoreD256FullbyteLocalSoftmax
+                    }
                     "q8-score" => Mode::Q8Score,
+                    "q8-score-fullbyte" => Mode::Q8ScoreFullbyte,
                     "q8-softmax" => Mode::Q8Softmax,
                     "q8-decode" => Mode::Q8Decode,
                     "q8-transforms" => Mode::Q8Transforms,
@@ -267,6 +281,33 @@ fn bench_q8_score_ms(
     )
 }
 
+fn bench_q8_score_fullbyte_ms(
+    seed_cache: &QuantizedKvCache,
+    queries: &InlineArray,
+    scale: f32,
+    warmup: usize,
+    iters: usize,
+) -> f64 {
+    let queries_f32 = if queries.dtype_raw() == Dtype::Float32.as_i32() {
+        queries.clone()
+    } else {
+        queries.as_dtype(Dtype::Float32.as_i32())
+    };
+    let (query_rot, _) = seed_cache
+        .bench_gpu_uniform_query_transforms(&queries_f32)
+        .expect("q8 fullbyte score transforms");
+    let q_heads = queries.dim(1);
+    bench_eval_ms(
+        || {
+            seed_cache
+                .bench_gpu_uniform_scores_precomputed_fullbyte(&query_rot, q_heads, scale)
+                .expect("q8 fullbyte score")
+        },
+        warmup,
+        iters,
+    )
+}
+
 fn bench_q8_softmax_ms(
     seed_cache: &QuantizedKvCache,
     queries: &InlineArray,
@@ -449,6 +490,66 @@ fn main() {
                 cfg.iters,
             )
         }
+        Mode::Q8CoreD256FullbytePass1 => {
+            let mut seed_cache = QuantizedKvCache::new(TurboQuantConfig::uniform(8, 8));
+            seed_cache
+                .append(&prefill_keys, &prefill_values)
+                .expect("prefill append");
+            seed_cache.eval_and_detach_gpu_state();
+            bench_q8_core_ms(
+                &seed_cache,
+                &queries,
+                scale,
+                UniformAttentionBenchMode::SpecializedQ8D256FullbytePass1,
+                cfg.warmup,
+                cfg.iters,
+            )
+        }
+        Mode::Q8CoreD256FullbytePass2 => {
+            let mut seed_cache = QuantizedKvCache::new(TurboQuantConfig::uniform(8, 8));
+            seed_cache
+                .append(&prefill_keys, &prefill_values)
+                .expect("prefill append");
+            seed_cache.eval_and_detach_gpu_state();
+            bench_q8_core_ms(
+                &seed_cache,
+                &queries,
+                scale,
+                UniformAttentionBenchMode::SpecializedQ8D256FullbytePass2,
+                cfg.warmup,
+                cfg.iters,
+            )
+        }
+        Mode::Q8CoreD256FullbyteSplitDenseV => {
+            let mut seed_cache = QuantizedKvCache::new(TurboQuantConfig::uniform(8, 8));
+            seed_cache
+                .append(&prefill_keys, &prefill_values)
+                .expect("prefill append");
+            seed_cache.eval_and_detach_gpu_state();
+            bench_q8_core_ms(
+                &seed_cache,
+                &queries,
+                scale,
+                UniformAttentionBenchMode::SpecializedQ8D256FullbyteSplitDenseV,
+                cfg.warmup,
+                cfg.iters,
+            )
+        }
+        Mode::Q8CoreD256FullbyteLocalSoftmax => {
+            let mut seed_cache = QuantizedKvCache::new(TurboQuantConfig::uniform(8, 8));
+            seed_cache
+                .append(&prefill_keys, &prefill_values)
+                .expect("prefill append");
+            seed_cache.eval_and_detach_gpu_state();
+            bench_q8_core_ms(
+                &seed_cache,
+                &queries,
+                scale,
+                UniformAttentionBenchMode::SpecializedQ8D256FullbyteLocalSoftmax,
+                cfg.warmup,
+                cfg.iters,
+            )
+        }
         Mode::Q8Score => {
             let mut seed_cache = QuantizedKvCache::new(TurboQuantConfig::uniform(8, 8));
             seed_cache
@@ -456,6 +557,14 @@ fn main() {
                 .expect("prefill append");
             seed_cache.eval_and_detach_gpu_state();
             bench_q8_score_ms(&seed_cache, &queries, scale, cfg.warmup, cfg.iters)
+        }
+        Mode::Q8ScoreFullbyte => {
+            let mut seed_cache = QuantizedKvCache::new(TurboQuantConfig::uniform(8, 8));
+            seed_cache
+                .append(&prefill_keys, &prefill_values)
+                .expect("prefill append");
+            seed_cache.eval_and_detach_gpu_state();
+            bench_q8_score_fullbyte_ms(&seed_cache, &queries, scale, cfg.warmup, cfg.iters)
         }
         Mode::Q8Softmax => {
             let mut seed_cache = QuantizedKvCache::new(TurboQuantConfig::uniform(8, 8));
@@ -514,7 +623,12 @@ fn main() {
         Mode::Q8Append => "q8-append",
         Mode::Q8CoreSplit => "q8-core-split",
         Mode::Q8CoreD256 => "q8-core-d256",
+        Mode::Q8CoreD256FullbytePass1 => "q8-core-d256-fullbyte-pass1",
+        Mode::Q8CoreD256FullbytePass2 => "q8-core-d256-fullbyte-pass2",
+        Mode::Q8CoreD256FullbyteSplitDenseV => "q8-core-d256-fullbyte-split-densev",
+        Mode::Q8CoreD256FullbyteLocalSoftmax => "q8-core-d256-fullbyte-localsoftmax",
         Mode::Q8Score => "q8-score",
+        Mode::Q8ScoreFullbyte => "q8-score-fullbyte",
         Mode::Q8Softmax => "q8-softmax",
         Mode::Q8Decode => "q8-decode",
         Mode::Q8Transforms => "q8-transforms",
