@@ -1141,19 +1141,29 @@ fn mla_forward(
                 let qp = cache.quantized_k_pe.take().unwrap();
                 cache.quantized_latent = Some(crate::qwen3_native::QuantizedTuple {
                     packed: ql.packed.kv_cache_append(
-                        &InlineArray::zeros(&[b, 1, extend, packed_lat], uint32_dt), 2),
+                        &InlineArray::zeros(&[b, 1, extend, packed_lat], uint32_dt),
+                        2,
+                    ),
                     scales: ql.scales.kv_cache_append(
-                        &InlineArray::zeros(&[b, 1, extend, scales_lat], dtype), 2),
+                        &InlineArray::zeros(&[b, 1, extend, scales_lat], dtype),
+                        2,
+                    ),
                     biases: ql.biases.kv_cache_append(
-                        &InlineArray::zeros(&[b, 1, extend, scales_lat], dtype), 2),
+                        &InlineArray::zeros(&[b, 1, extend, scales_lat], dtype),
+                        2,
+                    ),
                 });
                 cache.quantized_k_pe = Some(crate::qwen3_native::QuantizedTuple {
                     packed: qp.packed.kv_cache_append(
-                        &InlineArray::zeros(&[b, 1, extend, packed_pe], uint32_dt), 2),
-                    scales: qp.scales.kv_cache_append(
-                        &InlineArray::zeros(&[b, 1, extend, scales_pe], dtype), 2),
-                    biases: qp.biases.kv_cache_append(
-                        &InlineArray::zeros(&[b, 1, extend, scales_pe], dtype), 2),
+                        &InlineArray::zeros(&[b, 1, extend, packed_pe], uint32_dt),
+                        2,
+                    ),
+                    scales: qp
+                        .scales
+                        .kv_cache_append(&InlineArray::zeros(&[b, 1, extend, scales_pe], dtype), 2),
+                    biases: qp
+                        .biases
+                        .kv_cache_append(&InlineArray::zeros(&[b, 1, extend, scales_pe], dtype), 2),
                 });
             }
         }

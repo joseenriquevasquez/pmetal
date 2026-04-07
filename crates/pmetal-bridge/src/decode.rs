@@ -187,9 +187,12 @@ pub fn quantized_sdpa(
 
     // Score: Q @ K^T via quantized_matmul (fused dequant inside Metal kernel)
     let scores = queries_work.quantized_matmul(
-        &k_packed, &k_scales, Some(&k_biases),
+        &k_packed,
+        &k_scales,
+        Some(&k_biases),
         true, // transpose=true for Q @ K^T
-        group_size, bits,
+        group_size,
+        bits,
     );
 
     // Apply causal mask for prefill, no mask for decode
@@ -216,9 +219,12 @@ pub fn quantized_sdpa(
 
     // Value aggregation: weights @ V via quantized_matmul (fused dequant)
     let out = weights.quantized_matmul(
-        &v_packed, &v_scales, Some(&v_biases),
+        &v_packed,
+        &v_scales,
+        Some(&v_biases),
         false, // transpose=false for weights @ V
-        group_size, bits,
+        group_size,
+        bits,
     );
 
     // Reshape back for GQA
@@ -272,45 +278,58 @@ pub fn quantized_sdpa_mixed(
     let q_lo_raw = queries_scaled.slice(&[0, 0, 0, outlier_count], &[b, n_q_heads, l, d]);
 
     // GQA expansion
-    let (q_hi, q_lo, kp_hi, ks_hi, kb_hi, vp_hi, vs_hi, vb_hi,
-         kp_lo, ks_lo, kb_lo, vp_lo, vs_lo, vb_lo) =
-        if n_repeats > 1 {
-            let q_h = q_hi_raw.reshape(&[b, n_kv_heads, n_repeats, l, outlier_count]);
-            let q_l = q_lo_raw.reshape(&[b, n_kv_heads, n_repeats, l, rc]);
-            (
-                q_h,
-                q_l,
-                q_keys_hi.0.expand_dims(-3),
-                q_keys_hi.1.expand_dims(-3),
-                q_keys_hi.2.expand_dims(-3),
-                q_values_hi.0.expand_dims(-3),
-                q_values_hi.1.expand_dims(-3),
-                q_values_hi.2.expand_dims(-3),
-                q_keys_lo.0.expand_dims(-3),
-                q_keys_lo.1.expand_dims(-3),
-                q_keys_lo.2.expand_dims(-3),
-                q_values_lo.0.expand_dims(-3),
-                q_values_lo.1.expand_dims(-3),
-                q_values_lo.2.expand_dims(-3),
-            )
-        } else {
-            (
-                q_hi_raw,
-                q_lo_raw,
-                q_keys_hi.0.clone(),
-                q_keys_hi.1.clone(),
-                q_keys_hi.2.clone(),
-                q_values_hi.0.clone(),
-                q_values_hi.1.clone(),
-                q_values_hi.2.clone(),
-                q_keys_lo.0.clone(),
-                q_keys_lo.1.clone(),
-                q_keys_lo.2.clone(),
-                q_values_lo.0.clone(),
-                q_values_lo.1.clone(),
-                q_values_lo.2.clone(),
-            )
-        };
+    let (
+        q_hi,
+        q_lo,
+        kp_hi,
+        ks_hi,
+        kb_hi,
+        vp_hi,
+        vs_hi,
+        vb_hi,
+        kp_lo,
+        ks_lo,
+        kb_lo,
+        vp_lo,
+        vs_lo,
+        vb_lo,
+    ) = if n_repeats > 1 {
+        let q_h = q_hi_raw.reshape(&[b, n_kv_heads, n_repeats, l, outlier_count]);
+        let q_l = q_lo_raw.reshape(&[b, n_kv_heads, n_repeats, l, rc]);
+        (
+            q_h,
+            q_l,
+            q_keys_hi.0.expand_dims(-3),
+            q_keys_hi.1.expand_dims(-3),
+            q_keys_hi.2.expand_dims(-3),
+            q_values_hi.0.expand_dims(-3),
+            q_values_hi.1.expand_dims(-3),
+            q_values_hi.2.expand_dims(-3),
+            q_keys_lo.0.expand_dims(-3),
+            q_keys_lo.1.expand_dims(-3),
+            q_keys_lo.2.expand_dims(-3),
+            q_values_lo.0.expand_dims(-3),
+            q_values_lo.1.expand_dims(-3),
+            q_values_lo.2.expand_dims(-3),
+        )
+    } else {
+        (
+            q_hi_raw,
+            q_lo_raw,
+            q_keys_hi.0.clone(),
+            q_keys_hi.1.clone(),
+            q_keys_hi.2.clone(),
+            q_values_hi.0.clone(),
+            q_values_hi.1.clone(),
+            q_values_hi.2.clone(),
+            q_keys_lo.0.clone(),
+            q_keys_lo.1.clone(),
+            q_keys_lo.2.clone(),
+            q_values_lo.0.clone(),
+            q_values_lo.1.clone(),
+            q_values_lo.2.clone(),
+        )
+    };
 
     // Scores: Q_hi @ K_hi^T + Q_lo @ K_lo^T (both fused-dequant inside Metal kernel)
     let scores_hi = q_hi.quantized_matmul(&kp_hi, &ks_hi, Some(&kb_hi), true, group_size, bits_hi);
@@ -380,9 +399,9 @@ pub fn quantized_sdpa_with_qjl(
     queries: &InlineArray,
     q_keys: (&InlineArray, &InlineArray, &InlineArray),
     q_values: (&InlineArray, &InlineArray, &InlineArray),
-    qjl_signs: &InlineArray,       // [B, Hkv, KV_T, D] ±1.0 model_dtype
+    qjl_signs: &InlineArray,          // [B, Hkv, KV_T, D] ±1.0 model_dtype
     qjl_residual_norms: &InlineArray, // [B, Hkv, KV_T, 1] f32
-    qjl_s: &InlineArray,           // [D, D] model_dtype
+    qjl_s: &InlineArray,              // [D, D] model_dtype
     scale: f32,
     query_len: i32,
     n_q_heads: i32,
@@ -400,8 +419,17 @@ pub fn quantized_sdpa_with_qjl(
     let queries_scaled = queries.multiply(&scale_arr);
 
     // GQA expansion
-    let (queries_work, k_packed, k_scales, k_biases, v_packed, v_scales, v_biases,
-         signs_work, norms_work) = if n_repeats > 1 {
+    let (
+        queries_work,
+        k_packed,
+        k_scales,
+        k_biases,
+        v_packed,
+        v_scales,
+        v_biases,
+        signs_work,
+        norms_work,
+    ) = if n_repeats > 1 {
         let q = queries_scaled.reshape(&[b, n_kv_heads, n_repeats, l, d]);
         (
             q,
@@ -430,9 +458,12 @@ pub fn quantized_sdpa_with_qjl(
 
     // Affine attention scores: Q_scaled @ K^T via quantized_matmul
     let scores_affine = queries_work.quantized_matmul(
-        &k_packed, &k_scales, Some(&k_biases),
+        &k_packed,
+        &k_scales,
+        Some(&k_biases),
         true,
-        group_size, bits,
+        group_size,
+        bits,
     );
 
     // QJL correction:
@@ -504,9 +535,12 @@ pub fn quantized_sdpa_with_qjl(
 
     // Value aggregation
     let out = weights.quantized_matmul(
-        &v_packed, &v_scales, Some(&v_biases),
+        &v_packed,
+        &v_scales,
+        Some(&v_biases),
         false,
-        group_size, bits,
+        group_size,
+        bits,
     );
 
     // Reshape back for GQA

@@ -177,12 +177,7 @@ impl GrpoTab {
                 FieldKind::Integer { min: 1, max: 16 },
                 "Hardware",
             ),
-            FormField::new(
-                "GRPO KV Cache Bits",
-                "",
-                FieldKind::Text,
-                "Hardware",
-            ),
+            FormField::new("GRPO KV Cache Bits", "", FieldKind::Text, "Hardware"),
             // RLKD (optional teacher distillation — leave Teacher Model blank for pure GRPO)
             FormField::new("Teacher Model", "", FieldKind::Text, "RLKD"),
             FormField::new(

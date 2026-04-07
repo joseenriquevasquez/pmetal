@@ -2933,11 +2933,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                     );
                 }
                 commands::quantize::run_quantization_mlx(
-                    &model,
-                    &output,
-                    bits,
-                    group_size,
-                    target_bpw,
+                    &model, &output, bits, group_size, target_bpw,
                 )
                 .await?;
             } else {

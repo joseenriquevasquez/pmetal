@@ -139,8 +139,14 @@ fn build_and_link() {
         // default archive commands to avoid "illegal option" warnings.
         config.define("CMAKE_C_ARCHIVE_CREATE", "<CMAKE_AR> cr <TARGET> <OBJECTS>");
         config.define("CMAKE_C_ARCHIVE_APPEND", "<CMAKE_AR> r <TARGET> <OBJECTS>");
-        config.define("CMAKE_CXX_ARCHIVE_CREATE", "<CMAKE_AR> cr <TARGET> <OBJECTS>");
-        config.define("CMAKE_CXX_ARCHIVE_APPEND", "<CMAKE_AR> r <TARGET> <OBJECTS>");
+        config.define(
+            "CMAKE_CXX_ARCHIVE_CREATE",
+            "<CMAKE_AR> cr <TARGET> <OBJECTS>",
+        );
+        config.define(
+            "CMAKE_CXX_ARCHIVE_APPEND",
+            "<CMAKE_AR> r <TARGET> <OBJECTS>",
+        );
     }
 
     // Metal + Accelerate mirror the features this crate exposes
@@ -218,9 +224,7 @@ fn build_and_link() {
     ];
 
     let mut build = cc::Build::new();
-    build
-        .cpp(true)
-        .std("c++20");
+    build.cpp(true).std("c++20");
 
     for src in &bridge_sources {
         build.file(manifest_dir.join("cpp").join(src));
@@ -327,6 +331,6 @@ fn build_and_link() {
 fn main() {
     // Ensure Cargo re-runs build.rs when C++ sources change.
     // Without this, edits to bridge.cpp/bridge.h produce stale binaries.
-    println!("cargo:rerun-if-changed=cpp/");  // any change in cpp/ dir
+    println!("cargo:rerun-if-changed=cpp/"); // any change in cpp/ dir
     build_and_link();
 }

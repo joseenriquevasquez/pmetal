@@ -375,7 +375,11 @@ impl NativeCache {
                 quantized_values: None,
                 // Disable quantization for sliding layers — their rotating buffer
                 // is incompatible with the pre-allocated quantized buffer scheme.
-                quant_config: if lw.attn_is_sliding { None } else { quant_config },
+                quant_config: if lw.attn_is_sliding {
+                    None
+                } else {
+                    quant_config
+                },
             })
             .collect();
 
@@ -1119,19 +1123,31 @@ fn attn_forward(
                 let qv = cache.quantized_values.take().unwrap();
                 cache.quantized_keys = Some(crate::qwen3_native::QuantizedTuple {
                     packed: qk.packed.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt),
+                        2,
+                    ),
                     scales: qk.scales.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
+                        2,
+                    ),
                     biases: qk.biases.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
+                        2,
+                    ),
                 });
                 cache.quantized_values = Some(crate::qwen3_native::QuantizedTuple {
                     packed: qv.packed.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt),
+                        2,
+                    ),
                     scales: qv.scales.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
+                        2,
+                    ),
                     biases: qv.biases.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
+                        2,
+                    ),
                 });
             }
         }
@@ -1154,13 +1170,25 @@ fn attn_forward(
 
         // Slice valid portions
         let qk = cache.quantized_keys.as_ref().unwrap();
-        let cached_kp = qk.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
-        let cached_ks = qk.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
-        let cached_kb = qk.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let cached_kp = qk
+            .packed
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+        let cached_ks = qk
+            .scales
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let cached_kb = qk
+            .biases
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
         let qv = cache.quantized_values.as_ref().unwrap();
-        let cached_vp = qv.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
-        let cached_vs = qv.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
-        let cached_vb = qv.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let cached_vp = qv
+            .packed
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+        let cached_vs = qv
+            .scales
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let cached_vb = qv
+            .biases
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
 
         let output = crate::decode::quantized_sdpa(
             &q,

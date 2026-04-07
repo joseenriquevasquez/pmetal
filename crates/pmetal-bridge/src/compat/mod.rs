@@ -17,11 +17,11 @@
 mod traits;
 pub use traits::*;
 
-pub mod ops;
-pub mod nn;
 pub mod indexing;
-pub mod optimizers;
 pub mod layers;
+pub mod nn;
+pub mod ops;
+pub mod optimizers;
 
 // ── Array ────────────────────────────────────────────────────────────────────
 

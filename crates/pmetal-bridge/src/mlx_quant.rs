@@ -95,9 +95,7 @@ pub fn is_critical_tensor(name: &str) -> bool {
         return true;
     }
     // Plain ".norm" at the end of a key or followed by ".weight"/".bias".
-    if lower.ends_with(".norm")
-        || lower.ends_with(".norm.weight")
-        || lower.ends_with(".norm.bias")
+    if lower.ends_with(".norm") || lower.ends_with(".norm.weight") || lower.ends_with(".norm.bias")
     {
         return true;
     }
@@ -260,8 +258,8 @@ pub fn allocate_bits_for_bpw(
             // Passthrough tensor (non-matrix or explicit skip).
             continue;
         }
-        let forced = is_critical_tensor(name)
-            || critical_tensors.iter().any(|pat| name.contains(pat));
+        let forced =
+            is_critical_tensor(name) || critical_tensors.iter().any(|pat| name.contains(pat));
         if forced {
             // Find the step for bits >= 8, or clamp to the last step.
             let high_step = scores
@@ -341,10 +339,7 @@ pub fn allocate_bits_for_bpw(
 /// Compute the effective average bits-per-weight across all tensors.
 ///
 /// Passthrough tensors (empty scores / `bits == 0`) count as 16 bits (bf16).
-fn effective_bpw(
-    tensor_scores: &[(String, usize, Vec<(i32, f64)>)],
-    bits_step: &[usize],
-) -> f64 {
+fn effective_bpw(tensor_scores: &[(String, usize, Vec<(i32, f64)>)], bits_step: &[usize]) -> f64 {
     let mut total_weighted: f64 = 0.0;
     let mut total_params: f64 = 0.0;
     for (i, (_, param_count, scores)) in tensor_scores.iter().enumerate() {
@@ -431,7 +426,11 @@ pub fn quantize_and_save_mlx(
             packed_bytes + sb_bytes
         };
 
-        records.push(ShardRecord { idx, array, byte_estimate });
+        records.push(ShardRecord {
+            idx,
+            array,
+            byte_estimate,
+        });
     }
 
     // --- Partition into shards ---
@@ -442,11 +441,7 @@ pub fn quantize_and_save_mlx(
     let mut weight_map: HashMap<String, String> = HashMap::new();
 
     for (shard_num, shard_record_indices) in shards.iter().enumerate() {
-        let shard_filename = format!(
-            "model-{:05}-of-{:05}.safetensors",
-            shard_num + 1,
-            n_shards
-        );
+        let shard_filename = format!("model-{:05}-of-{:05}.safetensors", shard_num + 1, n_shards);
         let shard_path = output_dir.join(&shard_filename);
         let shard_path_str = shard_path
             .to_str()
@@ -542,10 +537,7 @@ fn write_weight_map_index(
 /// Partition shard records into groups not exceeding `max_bytes` each.
 ///
 /// Respects insertion order; never splits a single record across shards.
-fn partition_into_shards<'a>(
-    records: &'a [ShardRecord<'a>],
-    max_bytes: u64,
-) -> Vec<Vec<usize>> {
+fn partition_into_shards<'a>(records: &'a [ShardRecord<'a>], max_bytes: u64) -> Vec<Vec<usize>> {
     let mut shards: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::new();
     let mut current_bytes: u64 = 0;
@@ -633,8 +625,7 @@ pub fn write_quantization_config(
         _ => return Err("config.json root is not a JSON object".to_owned()),
     }
 
-    std::fs::create_dir_all(output_dir)
-        .map_err(|e| format!("failed to create output dir: {e}"))?;
+    std::fs::create_dir_all(output_dir).map_err(|e| format!("failed to create output dir: {e}"))?;
 
     let out_path = output_dir.join("config.json");
     let serialised = serde_json::to_string_pretty(&json)
@@ -680,7 +671,11 @@ pub fn quantize_model(
         let is_matrix = weight.ndim() >= 2;
 
         // MLX quantize requires last dim divisible by group_size and ndim >= 2.
-        let last_dim = if is_matrix { weight.dim(weight.ndim() as i32 - 1) } else { 0 };
+        let last_dim = if is_matrix {
+            weight.dim(weight.ndim() as i32 - 1)
+        } else {
+            0
+        };
         let quantizable = is_matrix && last_dim >= group_size && last_dim % group_size == 0;
 
         let scores: Vec<(i32, f64)> = if !quantizable {
@@ -754,9 +749,7 @@ mod tests {
 
     #[test]
     fn critical_tensor_norm_variants() {
-        assert!(is_critical_tensor(
-            "model.layers.0.input_layernorm.weight"
-        ));
+        assert!(is_critical_tensor("model.layers.0.input_layernorm.weight"));
         assert!(is_critical_tensor(
             "model.layers.0.post_attention_layernorm.weight"
         ));
@@ -782,13 +775,9 @@ mod tests {
         assert!(!is_critical_tensor(
             "model.layers.0.self_attn.q_proj.weight"
         ));
-        assert!(!is_critical_tensor(
-            "model.layers.0.mlp.down_proj.weight"
-        ));
+        assert!(!is_critical_tensor("model.layers.0.mlp.down_proj.weight"));
         assert!(!is_critical_tensor("model.layers.0.mlp.up_proj.weight"));
-        assert!(!is_critical_tensor(
-            "model.layers.0.mlp.gate_proj.weight"
-        ));
+        assert!(!is_critical_tensor("model.layers.0.mlp.gate_proj.weight"));
     }
 
     // ── effective_bpw ─────────────────────────────────────────────────────────
@@ -822,11 +811,7 @@ mod tests {
     fn allocate_critical_always_high() {
         // Critical tensor must end up at 8-bit even with a very low target BPW.
         let scores: Vec<(String, usize, Vec<(i32, f64)>)> = vec![
-            (
-                "model.norm.weight".into(),
-                1024,
-                vec![(4, 0.1), (8, 0.0)],
-            ),
+            ("model.norm.weight".into(), 1024, vec![(4, 0.1), (8, 0.0)]),
             (
                 "model.layers.0.mlp.down_proj.weight".into(),
                 4096,
@@ -834,7 +819,10 @@ mod tests {
             ),
         ];
         let result = allocate_bits_for_bpw(&scores, 2.0, &[]);
-        let norm = result.iter().find(|t| t.name == "model.norm.weight").unwrap();
+        let norm = result
+            .iter()
+            .find(|t| t.name == "model.norm.weight")
+            .unwrap();
         assert_eq!(norm.bits, 8, "critical tensor must be pinned to 8-bit");
     }
 
@@ -915,10 +903,7 @@ mod tests {
             dtype_element_bytes(crate::compat::Dtype::Bfloat16.as_i32()),
             2
         );
-        assert_eq!(
-            dtype_element_bytes(crate::compat::Dtype::Uint8.as_i32()),
-            1
-        );
+        assert_eq!(dtype_element_bytes(crate::compat::Dtype::Uint8.as_i32()), 1);
         assert_eq!(
             dtype_element_bytes(crate::compat::Dtype::Float16.as_i32()),
             2
@@ -953,8 +938,16 @@ mod tests {
     fn partition_fits_in_one_shard() {
         let dummy = InlineArray::from_f32(0.0);
         let records = [
-            ShardRecord { idx: 0, array: &dummy, byte_estimate: 1024 },
-            ShardRecord { idx: 1, array: &dummy, byte_estimate: 1024 },
+            ShardRecord {
+                idx: 0,
+                array: &dummy,
+                byte_estimate: 1024,
+            },
+            ShardRecord {
+                idx: 1,
+                array: &dummy,
+                byte_estimate: 1024,
+            },
         ];
         let shards = partition_into_shards(&records, SHARD_SIZE_BYTES);
         assert_eq!(shards.len(), 1);

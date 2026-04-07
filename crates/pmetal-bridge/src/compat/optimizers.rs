@@ -91,10 +91,8 @@ impl Optimizer for AdamW {
         // Sync the inner optimizer's moment state into the public state
         // map so that Updatable, checkpointing, and test assertions see it.
         if let Some(inner_state) = self.inner.states.get(key.as_ref()) {
-            self.state.insert(
-                key.clone(),
-                (inner_state.m.clone(), inner_state.v.clone()),
-            );
+            self.state
+                .insert(key.clone(), (inner_state.m.clone(), inner_state.v.clone()));
         }
         Ok(())
     }

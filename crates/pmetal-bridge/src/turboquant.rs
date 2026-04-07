@@ -1780,7 +1780,10 @@ impl QuantizedKvCache {
             }
             UniformAttentionBenchMode::SpecializedQ8D256TwoPass => self
                 .try_gpu_uniform_attention_q8_d256_precomputed(
-                    query_rot, Some(query_proj), q_heads, scale,
+                    query_rot,
+                    Some(query_proj),
+                    q_heads,
+                    scale,
                 ),
             UniformAttentionBenchMode::SpecializedQ8D256FullbytePass1 => {
                 if key_bits != 8
@@ -1824,9 +1827,7 @@ impl QuantizedKvCache {
                 }
                 let (partials, sums, maxs) = self
                     .bench_gpu_uniform_attention_state_precomputed_fullbyte(
-                        query_rot,
-                        q_heads,
-                        scale,
+                        query_rot, q_heads, scale,
                     )?;
                 InlineArray::turboquant_attention_q8_d256_pass2_merge(
                     &partials,
@@ -2492,7 +2493,8 @@ impl QuantizedKvCache {
                 } else {
                     0
                 };
-                let output_rows = value_core.inverse_rotate_output_array(&decoded_rot, output_dtype)?;
+                let output_rows =
+                    value_core.inverse_rotate_output_array(&decoded_rot, output_dtype)?;
                 let inverse_rotate_us = if trace_timing {
                     eval_stage_micros(&output_rows)
                 } else {
@@ -4624,9 +4626,7 @@ mod tests {
                 _ => 1.0,
             })
             .collect();
-        let key_codebook_vec: Vec<f32> = (0..256)
-            .map(|i| ((i as f32) - 127.5) / 96.0)
-            .collect();
+        let key_codebook_vec: Vec<f32> = (0..256).map(|i| ((i as f32) - 127.5) / 96.0).collect();
         let value_dense_vec: Vec<f32> = (0..(kv_rows * seq * dim) as usize)
             .map(|i| ((i as f32) * 0.009 - 0.7).cos() * 0.5)
             .collect();

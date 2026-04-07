@@ -858,8 +858,7 @@ impl super::builder::Builder<Conv2d> for Conv2dBuilder {
 ///
 /// Equivalent to `mlx_rs::nn::Sequential` but works with any `Module<&Array>`.
 pub struct Sequential {
-    layers:
-        Vec<Box<dyn super::Module<&'static Array, Output = Array, Error = super::Exception>>>,
+    layers: Vec<Box<dyn super::Module<&'static Array, Output = Array, Error = super::Exception>>>,
 }
 
 // Note: Sequential is intentionally left minimal. Full implementation would

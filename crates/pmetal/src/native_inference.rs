@@ -306,8 +306,13 @@ pub fn run_native_inference(
     mut on_token: impl FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
     run_native_inference_ext(
-        model_path, input_ids, max_tokens, temperature,
-        turboquant, None, &mut on_token,
+        model_path,
+        input_ids,
+        max_tokens,
+        temperature,
+        turboquant,
+        None,
+        &mut on_token,
     )
 }
 
@@ -440,7 +445,10 @@ fn run_bridge_inference<Config, Weights, Cache>(
     let weights = load_model(model_path, &config)?;
     tracing::info!(
         elapsed_s = format!("{:.1}", t0.elapsed().as_secs_f64()),
-        active_mb = format!("{:.0}", pmetal_bridge::inline_array::get_active_memory() as f64 / 1e6),
+        active_mb = format!(
+            "{:.0}",
+            pmetal_bridge::inline_array::get_active_memory() as f64 / 1e6
+        ),
         "Model loaded",
     );
 
@@ -544,8 +552,7 @@ fn run_qwen3(
             // moving high-magnitude channels to the front of each head with zero runtime cost.
             if let Some(qcfg) = quant_config {
                 if let Some(mb) = qcfg.mixed_bit {
-                    let outlier_fraction = mb.outlier_count as f32
-                        / config.get_head_dim() as f32;
+                    let outlier_fraction = mb.outlier_count as f32 / config.get_head_dim() as f32;
                     qwen3_native::apply_outlier_permutation(&mut weights, outlier_fraction);
                 }
                 // Generate QJL projection matrix when QJL residual correction is enabled.

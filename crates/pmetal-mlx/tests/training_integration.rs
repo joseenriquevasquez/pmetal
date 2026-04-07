@@ -49,8 +49,7 @@ fn test_training_attention_forward_backward() {
     let d_output = random_tensor(&[batch, n_heads, seq_len, head_dim]);
 
     // Backward pass
-    let (d_q, d_k, d_v) =
-        compute_attention_gradients(0, &d_output).expect("Backward pass failed");
+    let (d_q, d_k, d_v) = compute_attention_gradients(0, &d_output).expect("Backward pass failed");
 
     d_q.eval();
     d_k.eval();
@@ -254,8 +253,7 @@ fn test_gqa_gradients() {
 
     // Backward pass
     let d_output = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-    let (d_q, d_k, d_v) =
-        compute_attention_gradients(0, &d_output).expect("Backward pass failed");
+    let (d_q, d_k, d_v) = compute_attention_gradients(0, &d_output).expect("Backward pass failed");
 
     d_q.eval();
     d_k.eval();

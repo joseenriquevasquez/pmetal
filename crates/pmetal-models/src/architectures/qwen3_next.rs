@@ -2115,32 +2115,14 @@ impl Qwen3NextSparseMoeBlock {
         // SwitchLinear which calls weight.swapaxes(-1, -2) at forward time).
         let gate_w = self.switch_mlp_gate_proj.as_ref().swap_axes(-1, -2);
         let up_w = self.switch_mlp_up_proj.as_ref().swap_axes(-1, -2);
-        let gate_out = gather_mm(
-            &x_expanded,
-            &gate_w,
-            None,
-            Some(&top_indices_i32),
-            false,
-        )?; // [N, k, 1, intermediate]
-        let up_out = gather_mm(
-            &x_expanded,
-            &up_w,
-            None,
-            Some(&top_indices_i32),
-            false,
-        )?; // [N, k, 1, intermediate]
+        let gate_out = gather_mm(&x_expanded, &gate_w, None, Some(&top_indices_i32), false)?; // [N, k, 1, intermediate]
+        let up_out = gather_mm(&x_expanded, &up_w, None, Some(&top_indices_i32), false)?; // [N, k, 1, intermediate]
 
         let activated = nn::silu(&gate_out).multiply(&up_out);
 
         // Down projection
         let down_w = self.switch_mlp_down_proj.as_ref().swap_axes(-1, -2);
-        let down_out = gather_mm(
-            &activated,
-            &down_w,
-            None,
-            Some(&top_indices_i32),
-            false,
-        )?; // [N, k, 1, D]
+        let down_out = gather_mm(&activated, &down_w, None, Some(&top_indices_i32), false)?; // [N, k, 1, D]
 
         // squeeze(-2) removes the size-1 dim: [N, k, 1, D] → [N, k, D]
         let down_out = down_out.squeeze_axes(&[-2]);

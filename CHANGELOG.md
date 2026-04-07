@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-03-25
+## [0.5.0] - 2026-04-07
 
 ### Added
 
@@ -42,6 +42,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Serve engine accepts explicit `cache_mode_override` via `InferenceEngine::new_with_options()`, bypassing auto-selection when TurboQuant or other explicit modes are requested
 - Dispatcher sanitizes TurboQuant configs per-dimension, clamping outlier counts and falling back to uniform for degenerate head dims
 - All architecture attention forwards auto-detect asymmetric value dims from tensor shapes
+- Split `compat.rs` (3620 lines) into 7-file `compat/` module directory for maintainability
+- Split `bridge.cpp` (6749 lines) into 6 C++ source files with shared `bridge_internal.h`
+
+### Fixed
+
+- **AdamW bias correction**: step counter was advancing per-parameter instead of per-step, corrupting momentum/velocity estimates
+- **Gradient clipping** in compiled training path now uses `_clipped` step variants
+- **FFI exception safety**: ~33 C++ bridge functions wrapped in try/catch to prevent unwinding across the FFI boundary
+- **LoRA inference segfault**: put_along_axis crash during generation
+- **UTF-8 char boundary panics** in inference/GUI output stream handling
+
+### Removed
+
+- 1065 lines of dead code: `qwen3_train.rs`, unused LoRA functions in `qwen3_native.rs`
 
 ## [0.4.0] - 2026-03-23
 

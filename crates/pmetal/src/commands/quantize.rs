@@ -293,7 +293,10 @@ pub(crate) async fn run_quantization_mlx(
     let effective_bpw = target_bpw.unwrap_or(default_bits as f32);
     let source_config = resolved_model_path.join("config.json");
 
-    println!("Evaluating tensor quality and allocating bits (target BPW={:.2})...", effective_bpw);
+    println!(
+        "Evaluating tensor quality and allocating bits (target BPW={:.2})...",
+        effective_bpw
+    );
 
     let assignments = mlx_quant::quantize_model(
         &weights,
@@ -316,7 +319,11 @@ pub(crate) async fn run_quantization_mlx(
         let bits = if a.bits == 0 { 16 } else { a.bits };
         total_weighted_bits += a.param_count as f64 * bits as f64;
     }
-    let final_bpw = if total_params > 0 { total_weighted_bits / total_params as f64 } else { 0.0 };
+    let final_bpw = if total_params > 0 {
+        total_weighted_bits / total_params as f64
+    } else {
+        0.0
+    };
 
     println!("\nBit allocation summary:");
     let mut bit_keys: Vec<_> = counts.keys().collect();

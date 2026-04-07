@@ -886,8 +886,8 @@ pub struct KvLayerCache {
     /// `qjl_residual_norms`: `[B, H, MAX_T, 1]` f32 — L2 norm of residual.
     ///
     /// Both `None` when QJL is disabled or cache is empty.
-    pub qjl_signs: Option<InlineArray>,           // [B, H, MAX_T, D] model_dtype ±1.0
-    pub qjl_residual_norms: Option<InlineArray>,  // [B, H, MAX_T, 1] f32
+    pub qjl_signs: Option<InlineArray>, // [B, H, MAX_T, D] model_dtype ±1.0
+    pub qjl_residual_norms: Option<InlineArray>, // [B, H, MAX_T, 1] f32
 }
 
 /// Full model cache — both GDN and KV layers.
@@ -1198,9 +1198,8 @@ pub fn apply_kv_preconditioning(weights: &mut NativeWeights) {
     }
 
     // Generate deterministic orthogonal rotation R [head_dim, head_dim]
-    let mut rng = rand::rngs::StdRng::seed_from_u64(
-        KV_PRECONDITION_SEED ^ ((head_dim as u64) << 32),
-    );
+    let mut rng =
+        rand::rngs::StdRng::seed_from_u64(KV_PRECONDITION_SEED ^ ((head_dim as u64) << 32));
     let r_data = crate::turboquant::generate_random_orthogonal(head_dim as usize, &mut rng);
     let r_f32 = InlineArray::from_f32_slice(&r_data, &[head_dim, head_dim]);
     // Cast rotation to model dtype to avoid f32 promotion cascade through weights
@@ -1287,10 +1286,7 @@ pub fn apply_qjl_matrix(weights: &mut NativeWeights) {
 ///
 /// Permutation matrices commute with element-wise nonlinearities (sigmoid),
 /// so this is safe for gated attention unlike Hadamard rotation.
-pub fn apply_outlier_permutation(
-    weights: &mut NativeWeights,
-    outlier_fraction: f32,
-) -> i32 {
+pub fn apply_outlier_permutation(weights: &mut NativeWeights, outlier_fraction: f32) -> i32 {
     // Find head_dim from first attention layer
     let (head_dim, _) = weights
         .layers
@@ -1409,7 +1405,9 @@ fn rotate_projection_weight(
         // Standard Q/K/V: rotate all heads
         let w_3d = w.reshape(&[hidden, n_heads, head_dim]);
         let w_rot = w_3d.matmul(r_t);
-        *w_opt = Some(LayerWeight::Dense(w_rot.reshape(&[hidden, n_heads * head_dim])));
+        *w_opt = Some(LayerWeight::Dense(
+            w_rot.reshape(&[hidden, n_heads * head_dim]),
+        ));
     }
 }
 
@@ -1429,7 +1427,9 @@ fn rotate_output_weight(
     let w_3d = w.reshape(&[n_heads, head_dim, hidden]);
     // Batched matmul: [head_dim, head_dim] @ [n_heads, head_dim, hidden] → [n_heads, head_dim, hidden]
     let w_rot = r.matmul(&w_3d);
-    *w_opt = Some(LayerWeight::Dense(w_rot.reshape(&[n_heads * head_dim, hidden])));
+    *w_opt = Some(LayerWeight::Dense(
+        w_rot.reshape(&[n_heads * head_dim, hidden]),
+    ));
 }
 
 /// - norm `(1+w)` offset when the model has `mtp.*` keys or unsanitized conv shapes
@@ -2780,8 +2780,8 @@ fn attn_forward(
             // After outlier permutation, the first `oc` dims of each head are
             // outliers (quantized at higher bits); the remaining `rc` are regular
             // (quantized at lower bits).
-            let oc = mb.outlier_count;      // outlier channel count per head
-            let rc = head_dim - oc;         // regular channel count per head
+            let oc = mb.outlier_count; // outlier channel count per head
+            let rc = head_dim - oc; // regular channel count per head
             let bits_hi = mb.outlier_bits as i32;
             let bits_lo = mb.regular_bits as i32;
 
@@ -2792,9 +2792,9 @@ fn attn_forward(
             let scales_dim_lo = rc / group_size;
 
             // Split K/V along the head-dim axis: [B, Hkv, S, oc] and [B, Hkv, S, rc]
-            let k_hi = keys.slice(&[0, 0, 0, 0],  &[b, n_kv_heads, s, oc]);
+            let k_hi = keys.slice(&[0, 0, 0, 0], &[b, n_kv_heads, s, oc]);
             let k_lo = keys.slice(&[0, 0, 0, oc], &[b, n_kv_heads, s, head_dim]);
-            let v_hi = values.slice(&[0, 0, 0, 0],  &[b, n_kv_heads, s, oc]);
+            let v_hi = values.slice(&[0, 0, 0, 0], &[b, n_kv_heads, s, oc]);
             let v_lo = values.slice(&[0, 0, 0, oc], &[b, n_kv_heads, s, head_dim]);
 
             // Quantize each half → (packed, scales, biases)
@@ -2870,35 +2870,59 @@ fn attn_forward(
                     let qvl = cache.quantized_values.take().unwrap();
                     cache.quantized_keys_hi = Some(QuantizedTuple {
                         packed: qkh.packed.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_hi], uint32_dt), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_hi], uint32_dt),
+                            2,
+                        ),
                         scales: qkh.scales.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype),
+                            2,
+                        ),
                         biases: qkh.biases.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype),
+                            2,
+                        ),
                     });
                     cache.quantized_keys = Some(QuantizedTuple {
                         packed: qkl.packed.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_lo], uint32_dt), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_lo], uint32_dt),
+                            2,
+                        ),
                         scales: qkl.scales.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype),
+                            2,
+                        ),
                         biases: qkl.biases.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype),
+                            2,
+                        ),
                     });
                     cache.quantized_values_hi = Some(QuantizedTuple {
                         packed: qvh.packed.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_hi], uint32_dt), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_hi], uint32_dt),
+                            2,
+                        ),
                         scales: qvh.scales.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype),
+                            2,
+                        ),
                         biases: qvh.biases.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype),
+                            2,
+                        ),
                     });
                     cache.quantized_values = Some(QuantizedTuple {
                         packed: qvl.packed.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_lo], uint32_dt), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_lo], uint32_dt),
+                            2,
+                        ),
                         scales: qvl.scales.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype),
+                            2,
+                        ),
                         biases: qvl.biases.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype),
+                            2,
+                        ),
                     });
                 }
             }
@@ -2907,47 +2931,107 @@ fn attn_forward(
             let start_q = [0, 0, prev, 0];
 
             let qkh_ref = cache.quantized_keys_hi.as_mut().unwrap();
-            qkh_ref.packed = qkh_ref.packed.slice_set(&kp_hi, &start_q, &[b, n_kv_heads, next, packed_dim_hi]);
-            qkh_ref.scales = qkh_ref.scales.slice_set(&ks_hi, &start_q, &[b, n_kv_heads, next, scales_dim_hi]);
-            qkh_ref.biases = qkh_ref.biases.slice_set(&kb_hi, &start_q, &[b, n_kv_heads, next, scales_dim_hi]);
+            qkh_ref.packed =
+                qkh_ref
+                    .packed
+                    .slice_set(&kp_hi, &start_q, &[b, n_kv_heads, next, packed_dim_hi]);
+            qkh_ref.scales =
+                qkh_ref
+                    .scales
+                    .slice_set(&ks_hi, &start_q, &[b, n_kv_heads, next, scales_dim_hi]);
+            qkh_ref.biases =
+                qkh_ref
+                    .biases
+                    .slice_set(&kb_hi, &start_q, &[b, n_kv_heads, next, scales_dim_hi]);
 
             let qkl_ref = cache.quantized_keys.as_mut().unwrap();
-            qkl_ref.packed = qkl_ref.packed.slice_set(&kp_lo, &start_q, &[b, n_kv_heads, next, packed_dim_lo]);
-            qkl_ref.scales = qkl_ref.scales.slice_set(&ks_lo, &start_q, &[b, n_kv_heads, next, scales_dim_lo]);
-            qkl_ref.biases = qkl_ref.biases.slice_set(&kb_lo, &start_q, &[b, n_kv_heads, next, scales_dim_lo]);
+            qkl_ref.packed =
+                qkl_ref
+                    .packed
+                    .slice_set(&kp_lo, &start_q, &[b, n_kv_heads, next, packed_dim_lo]);
+            qkl_ref.scales =
+                qkl_ref
+                    .scales
+                    .slice_set(&ks_lo, &start_q, &[b, n_kv_heads, next, scales_dim_lo]);
+            qkl_ref.biases =
+                qkl_ref
+                    .biases
+                    .slice_set(&kb_lo, &start_q, &[b, n_kv_heads, next, scales_dim_lo]);
 
             let qvh_ref = cache.quantized_values_hi.as_mut().unwrap();
-            qvh_ref.packed = qvh_ref.packed.slice_set(&vp_hi, &start_q, &[b, n_kv_heads, next, packed_dim_hi]);
-            qvh_ref.scales = qvh_ref.scales.slice_set(&vs_hi, &start_q, &[b, n_kv_heads, next, scales_dim_hi]);
-            qvh_ref.biases = qvh_ref.biases.slice_set(&vb_hi, &start_q, &[b, n_kv_heads, next, scales_dim_hi]);
+            qvh_ref.packed =
+                qvh_ref
+                    .packed
+                    .slice_set(&vp_hi, &start_q, &[b, n_kv_heads, next, packed_dim_hi]);
+            qvh_ref.scales =
+                qvh_ref
+                    .scales
+                    .slice_set(&vs_hi, &start_q, &[b, n_kv_heads, next, scales_dim_hi]);
+            qvh_ref.biases =
+                qvh_ref
+                    .biases
+                    .slice_set(&vb_hi, &start_q, &[b, n_kv_heads, next, scales_dim_hi]);
 
             let qvl_ref = cache.quantized_values.as_mut().unwrap();
-            qvl_ref.packed = qvl_ref.packed.slice_set(&vp_lo, &start_q, &[b, n_kv_heads, next, packed_dim_lo]);
-            qvl_ref.scales = qvl_ref.scales.slice_set(&vs_lo, &start_q, &[b, n_kv_heads, next, scales_dim_lo]);
-            qvl_ref.biases = qvl_ref.biases.slice_set(&vb_lo, &start_q, &[b, n_kv_heads, next, scales_dim_lo]);
+            qvl_ref.packed =
+                qvl_ref
+                    .packed
+                    .slice_set(&vp_lo, &start_q, &[b, n_kv_heads, next, packed_dim_lo]);
+            qvl_ref.scales =
+                qvl_ref
+                    .scales
+                    .slice_set(&vs_lo, &start_q, &[b, n_kv_heads, next, scales_dim_lo]);
+            qvl_ref.biases =
+                qvl_ref
+                    .biases
+                    .slice_set(&vb_lo, &start_q, &[b, n_kv_heads, next, scales_dim_lo]);
 
             cache.offset = next;
 
             // Slice valid portions from all four cache buffers
             let qkh = cache.quantized_keys_hi.as_ref().unwrap();
-            let cached_kp_hi = qkh.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim_hi]);
-            let cached_ks_hi = qkh.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_hi]);
-            let cached_kb_hi = qkh.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_hi]);
+            let cached_kp_hi = qkh
+                .packed
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim_hi]);
+            let cached_ks_hi = qkh
+                .scales
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_hi]);
+            let cached_kb_hi = qkh
+                .biases
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_hi]);
 
             let qkl = cache.quantized_keys.as_ref().unwrap();
-            let cached_kp_lo = qkl.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim_lo]);
-            let cached_ks_lo = qkl.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_lo]);
-            let cached_kb_lo = qkl.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_lo]);
+            let cached_kp_lo = qkl
+                .packed
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim_lo]);
+            let cached_ks_lo = qkl
+                .scales
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_lo]);
+            let cached_kb_lo = qkl
+                .biases
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_lo]);
 
             let qvh = cache.quantized_values_hi.as_ref().unwrap();
-            let cached_vp_hi = qvh.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim_hi]);
-            let cached_vs_hi = qvh.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_hi]);
-            let cached_vb_hi = qvh.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_hi]);
+            let cached_vp_hi = qvh
+                .packed
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim_hi]);
+            let cached_vs_hi = qvh
+                .scales
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_hi]);
+            let cached_vb_hi = qvh
+                .biases
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_hi]);
 
             let qvl = cache.quantized_values.as_ref().unwrap();
-            let cached_vp_lo = qvl.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim_lo]);
-            let cached_vs_lo = qvl.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_lo]);
-            let cached_vb_lo = qvl.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_lo]);
+            let cached_vp_lo = qvl
+                .packed
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim_lo]);
+            let cached_vs_lo = qvl
+                .scales
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_lo]);
+            let cached_vb_lo = qvl
+                .biases
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_lo]);
 
             // Mixed-bit SDPA: two quantized_matmul calls per score/value aggregation
             crate::decode::quantized_sdpa_mixed(
@@ -3045,8 +3129,10 @@ fn attn_forward(
                     biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
                 });
                 if qjl_active {
-                    cache.qjl_signs = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
-                    cache.qjl_residual_norms = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, 1], f32_dt));
+                    cache.qjl_signs =
+                        Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
+                    cache.qjl_residual_norms =
+                        Some(InlineArray::zeros(&[b, n_kv_heads, alloc, 1], f32_dt));
                 }
             } else {
                 let allocated = cache.quantized_keys.as_ref().unwrap().packed.dim(2);
@@ -3057,28 +3143,44 @@ fn attn_forward(
                     let qv = cache.quantized_values.take().unwrap();
                     cache.quantized_keys = Some(QuantizedTuple {
                         packed: qk.packed.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt),
+                            2,
+                        ),
                         scales: qk.scales.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
+                            2,
+                        ),
                         biases: qk.biases.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
+                            2,
+                        ),
                     });
                     cache.quantized_values = Some(QuantizedTuple {
                         packed: qv.packed.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt),
+                            2,
+                        ),
                         scales: qv.scales.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
+                            2,
+                        ),
                         biases: qv.biases.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
+                            2,
+                        ),
                     });
                     if qjl_active {
                         if let Some(qs) = cache.qjl_signs.take() {
                             cache.qjl_signs = Some(qs.kv_cache_append(
-                                &InlineArray::zeros(&[b, n_kv_heads, extend, head_dim], dtype), 2));
+                                &InlineArray::zeros(&[b, n_kv_heads, extend, head_dim], dtype),
+                                2,
+                            ));
                         }
                         if let Some(qn) = cache.qjl_residual_norms.take() {
                             cache.qjl_residual_norms = Some(qn.kv_cache_append(
-                                &InlineArray::zeros(&[b, n_kv_heads, extend, 1], f32_dt), 2));
+                                &InlineArray::zeros(&[b, n_kv_heads, extend, 1], f32_dt),
+                                2,
+                            ));
                         }
                     }
                 }
@@ -3113,20 +3215,38 @@ fn attn_forward(
 
             // Slice valid portion
             let qk = cache.quantized_keys.as_ref().unwrap();
-            let cached_kp = qk.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
-            let cached_ks = qk.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
-            let cached_kb = qk.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+            let cached_kp = qk
+                .packed
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+            let cached_ks = qk
+                .scales
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+            let cached_kb = qk
+                .biases
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
             let qv = cache.quantized_values.as_ref().unwrap();
-            let cached_vp = qv.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
-            let cached_vs = qv.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
-            let cached_vb = qv.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+            let cached_vp = qv
+                .packed
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+            let cached_vs = qv
+                .scales
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+            let cached_vb = qv
+                .biases
+                .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
 
             // SDPA — with optional QJL correction when enabled
             if qjl_active {
                 // Slice valid QJL data and project queries through S^T for correction.
-                let cached_signs = cache.qjl_signs.as_ref().unwrap()
+                let cached_signs = cache
+                    .qjl_signs
+                    .as_ref()
+                    .unwrap()
                     .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
-                let cached_norms = cache.qjl_residual_norms.as_ref().unwrap()
+                let cached_norms = cache
+                    .qjl_residual_norms
+                    .as_ref()
+                    .unwrap()
                     .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, 1]);
                 // Project queries through S^T: [B, Hq, L, D] @ [D, D] = [B, Hq, L, D]
                 let s_mat = qjl_matrix.unwrap();

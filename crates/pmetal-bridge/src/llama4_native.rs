@@ -1127,19 +1127,31 @@ fn attn_forward(
                 let qv = cache.quantized_values.take().unwrap();
                 cache.quantized_keys = Some(crate::qwen3_native::QuantizedTuple {
                     packed: qk.packed.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt),
+                        2,
+                    ),
                     scales: qk.scales.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
+                        2,
+                    ),
                     biases: qk.biases.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
+                        2,
+                    ),
                 });
                 cache.quantized_values = Some(crate::qwen3_native::QuantizedTuple {
                     packed: qv.packed.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt),
+                        2,
+                    ),
                     scales: qv.scales.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
+                        2,
+                    ),
                     biases: qv.biases.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
+                        2,
+                    ),
                 });
             }
         }
@@ -1162,13 +1174,25 @@ fn attn_forward(
 
         // Slice valid portions
         let qk = cache.quantized_keys.as_ref().unwrap();
-        let cached_kp = qk.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
-        let cached_ks = qk.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
-        let cached_kb = qk.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let cached_kp = qk
+            .packed
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+        let cached_ks = qk
+            .scales
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let cached_kb = qk
+            .biases
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
         let qv = cache.quantized_values.as_ref().unwrap();
-        let cached_vp = qv.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
-        let cached_vs = qv.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
-        let cached_vb = qv.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let cached_vp = qv
+            .packed
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+        let cached_vs = qv
+            .scales
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let cached_vb = qv
+            .biases
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
 
         if lw.use_rope {
             if let Some(ref mask_int) = chunk_mask {
@@ -1188,10 +1212,7 @@ fn attn_forward(
                     .dequantize(&vs_flat, &vb_flat, group_size, bits)
                     .reshape(&[b, n_kv_heads, next, head_dim]);
 
-                let mask_full = make_additive_mask(
-                    &mask_int.slice(&[0, 0], &[s, next]),
-                    dtype,
-                );
+                let mask_full = make_additive_mask(&mask_int.slice(&[0, 0], &[s, next]), dtype);
                 let mask_4d = mask_full.reshape(&[1, 1, s, next]);
                 queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(&mask_4d))
             } else {

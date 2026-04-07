@@ -1,10 +1,8 @@
+use pmetal_bridge::InlineArray;
 use pmetal_bridge::compat::Dtype;
 use pmetal_bridge::decode::sdpa_causal_like_mlx;
 use pmetal_bridge::inline_array::eval_and_detach_many;
-use pmetal_bridge::InlineArray;
-use pmetal_bridge::turboquant::{
-    QuantizedKvCache, TurboQuantConfig, UniformAttentionBenchMode,
-};
+use pmetal_bridge::turboquant::{QuantizedKvCache, TurboQuantConfig, UniformAttentionBenchMode};
 use std::env;
 use std::time::Instant;
 
@@ -71,12 +69,8 @@ fn parse_args() -> Config {
                     "q8-core-d256" => Mode::Q8CoreD256,
                     "q8-core-d256-fullbyte-pass1" => Mode::Q8CoreD256FullbytePass1,
                     "q8-core-d256-fullbyte-pass2" => Mode::Q8CoreD256FullbytePass2,
-                    "q8-core-d256-fullbyte-split-densev" => {
-                        Mode::Q8CoreD256FullbyteSplitDenseV
-                    }
-                    "q8-core-d256-fullbyte-localsoftmax" => {
-                        Mode::Q8CoreD256FullbyteLocalSoftmax
-                    }
+                    "q8-core-d256-fullbyte-split-densev" => Mode::Q8CoreD256FullbyteSplitDenseV,
+                    "q8-core-d256-fullbyte-localsoftmax" => Mode::Q8CoreD256FullbyteLocalSoftmax,
                     "q8-score" => Mode::Q8Score,
                     "q8-score-fullbyte" => Mode::Q8ScoreFullbyte,
                     "q8-softmax" => Mode::Q8Softmax,
@@ -162,8 +156,18 @@ fn bench_dense_step_ms(
             let k_buf = seed_keys.clone();
             let v_buf = seed_values.clone();
             let start = [0, 0, prefill, 0];
-            let stop = [queries.dim(0), step_keys.dim(1), prefill + 1, step_keys.dim(3)];
-            let valid_stop = [queries.dim(0), step_keys.dim(1), prefill + 1, step_keys.dim(3)];
+            let stop = [
+                queries.dim(0),
+                step_keys.dim(1),
+                prefill + 1,
+                step_keys.dim(3),
+            ];
+            let valid_stop = [
+                queries.dim(0),
+                step_keys.dim(1),
+                prefill + 1,
+                step_keys.dim(3),
+            ];
             let valid_start = [0, 0, 0, 0];
 
             let cache_keys = k_buf.slice_set(step_keys, &start, &stop);
@@ -191,7 +195,12 @@ fn bench_dense_append_ms(
             let k_buf = seed_keys.clone();
             let v_buf = seed_values.clone();
             let start = [0, 0, prefill, 0];
-            let stop = [step_keys.dim(0), step_keys.dim(1), prefill + 1, step_keys.dim(3)];
+            let stop = [
+                step_keys.dim(0),
+                step_keys.dim(1),
+                prefill + 1,
+                step_keys.dim(3),
+            ];
             let cache_keys = k_buf.slice_set(step_keys, &start, &stop);
             let cache_values = v_buf.slice_set(step_values, &start, &stop);
             cache_keys.add(&cache_values)
@@ -245,7 +254,11 @@ fn bench_q8_core_ms(
         || {
             seed_cache
                 .bench_gpu_uniform_attention_core_precomputed(
-                    &query_rot, &query_proj, q_heads, scale, mode,
+                    &query_rot,
+                    &query_proj,
+                    q_heads,
+                    scale,
+                    mode,
                 )
                 .expect("q8 core")
         },
@@ -423,9 +436,8 @@ fn main() {
         .as_dtype(cfg.input_dtype);
     let step_keys = InlineArray::from_f32_slice(&make_data(step_kv_len, 1.9), &[b, kvh, 1, d])
         .as_dtype(cfg.input_dtype);
-    let step_values =
-        InlineArray::from_f32_slice(&make_data(step_kv_len, 2.4), &[b, kvh, 1, d])
-            .as_dtype(cfg.input_dtype);
+    let step_values = InlineArray::from_f32_slice(&make_data(step_kv_len, 2.4), &[b, kvh, 1, d])
+        .as_dtype(cfg.input_dtype);
 
     let bench_ms = match cfg.mode {
         Mode::Q8 => {
@@ -452,13 +464,7 @@ fn main() {
                 .append(&prefill_keys, &prefill_values)
                 .expect("prefill append");
             seed_cache.eval_and_detach_gpu_state();
-            bench_q8_append_ms(
-                &step_keys,
-                &step_values,
-                &seed_cache,
-                cfg.warmup,
-                cfg.iters,
-            )
+            bench_q8_append_ms(&step_keys, &step_values, &seed_cache, cfg.warmup, cfg.iters)
         }
         Mode::Q8CoreSplit => {
             let mut seed_cache = QuantizedKvCache::new(TurboQuantConfig::uniform(8, 8));
@@ -586,8 +592,15 @@ fn main() {
             bench_q8_transforms_ms(&queries, d, cfg.input_dtype, cfg.warmup, cfg.iters)
         }
         Mode::Dense => {
-            let (seed_keys, seed_values) =
-                make_dense_seed(&prefill_keys, &prefill_values, b, kvh, prefill, d, cfg.input_dtype);
+            let (seed_keys, seed_values) = make_dense_seed(
+                &prefill_keys,
+                &prefill_values,
+                b,
+                kvh,
+                prefill,
+                d,
+                cfg.input_dtype,
+            );
             bench_dense_step_ms(
                 &queries,
                 &step_keys,
@@ -601,8 +614,15 @@ fn main() {
             )
         }
         Mode::DenseAppend => {
-            let (seed_keys, seed_values) =
-                make_dense_seed(&prefill_keys, &prefill_values, b, kvh, prefill, d, cfg.input_dtype);
+            let (seed_keys, seed_values) = make_dense_seed(
+                &prefill_keys,
+                &prefill_values,
+                b,
+                kvh,
+                prefill,
+                d,
+                cfg.input_dtype,
+            );
             bench_dense_append_ms(
                 &step_keys,
                 &step_values,
@@ -640,6 +660,14 @@ fn main() {
     };
     println!(
         "mode={} dtype={} batch={} q_heads={} kv_heads={} dim={} prefill={} decode_ms={:.3} tok_s={:.3}",
-        mode, dtype, cfg.batch, cfg.q_heads, cfg.kv_heads, cfg.dim, cfg.prefill + 1, bench_ms, toks_per_s,
+        mode,
+        dtype,
+        cfg.batch,
+        cfg.q_heads,
+        cfg.kv_heads,
+        cfg.dim,
+        cfg.prefill + 1,
+        bench_ms,
+        toks_per_s,
     );
 }

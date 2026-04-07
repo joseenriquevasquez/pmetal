@@ -278,9 +278,13 @@ impl PmetalMcpServer {
         #[description("KV cache quantization bits (8=q8, 4=q4, 0=fp16, default: 8)")]
         kv_quant: Option<u64>,
         #[description("Disable KV cache quantization (use fp16)")] no_kv_quant: Option<bool>,
-        #[description("Mixed-bit TurboQuant v2 preset: \"q2_5\" or \"q3_5\" (outlier-aware split-bit KV cache)")]
+        #[description(
+            "Mixed-bit TurboQuant v2 preset: \"q2_5\" or \"q3_5\" (outlier-aware split-bit KV cache)"
+        )]
         kv_quant_preset: Option<String>,
-        #[description("Enable QJL residual correction for Q2-Q3 uniform KV cache (reduces accuracy loss at low bits)")]
+        #[description(
+            "Enable QJL residual correction for Q2-Q3 uniform KV cache (reduces accuracy loss at low bits)"
+        )]
         kv_qjl: Option<bool>,
     ) -> McpResult<String> {
         let max_tokens_str = max_tokens.unwrap_or(256).to_string();
@@ -598,7 +602,9 @@ impl PmetalMcpServer {
         #[description("Custom JSONL text column name")] text_column: Option<String>,
         #[description("Prompt column for SFT label masking")] prompt_column: Option<String>,
         #[description("Response column for SFT label masking")] response_column: Option<String>,
-        #[description("KV cache quantization bits for rollout generation (2, 4, or 8 — reduces VRAM during rollouts)")]
+        #[description(
+            "KV cache quantization bits for rollout generation (2, 4, or 8 — reduces VRAM during rollouts)"
+        )]
         grpo_kv_bits: Option<u64>,
     ) -> McpResult<String> {
         let mut args = vec![

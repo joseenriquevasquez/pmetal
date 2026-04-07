@@ -344,8 +344,10 @@ impl InferenceRunner {
         let max_seq_len = input_ids.len() + config.max_tokens + 64;
 
         let cache_request = cache_mode_request_from_config(&config);
-        let (model, cache, mamba_cache, native_turboquant, native_quant_config) =
-            if let Some(native_info) = native_bridge_info
+        let (model, cache, mamba_cache, native_turboquant, native_quant_config) = if let Some(
+            native_info,
+        ) =
+            native_bridge_info
         {
             let base_cache_config = native_bridge_base_cache_config(native_info, max_seq_len);
             let cache_selection = select_cache_mode_with_working_set(
@@ -371,7 +373,9 @@ impl InferenceRunner {
                 let qcfg = if let Some(mb) = mixed_bit_override {
                     // Mixed-bit path: QJL not supported (different architecture)
                     if qjl_requested {
-                        tracing::warn!("--kv-qjl is not supported with mixed-bit presets; ignoring");
+                        tracing::warn!(
+                            "--kv-qjl is not supported with mixed-bit presets; ignoring"
+                        );
                     }
                     Some(pmetal_bridge::qwen3_native::QuantCacheConfig {
                         bits: mb.regular_bits,
@@ -437,7 +441,13 @@ impl InferenceRunner {
                 let (lora_model, cache, mamba_cache, cache_selection) =
                     load_model_with_lora(model_path, lora_path, max_seq_len, &config)?;
                 log_cache_selection(&cache_selection, max_seq_len);
-                (LoadedModel::Lora(lora_model), cache, mamba_cache, None, None)
+                (
+                    LoadedModel::Lora(lora_model),
+                    cache,
+                    mamba_cache,
+                    None,
+                    None,
+                )
             }
             #[cfg(not(feature = "lora"))]
             {

@@ -1,5 +1,5 @@
-use pmetal_bridge::inline_array::reset_peak_memory;
 use pmetal_bridge::InlineArray;
+use pmetal_bridge::inline_array::reset_peak_memory;
 use std::env;
 use std::time::Instant;
 
@@ -119,10 +119,14 @@ fn main() {
     let kv_rows = cfg.kv_heads as usize;
     let seq_cap = cfg.cache_seq_capacity as usize;
 
-    let query_rot = InlineArray::from_f32_slice(&build_f32(n_rows * DIM, 0.2), &[n_rows as i32, DIM as i32]);
-    let query_proj = InlineArray::from_f32_slice(&build_f32(n_rows * DIM, 0.1), &[n_rows as i32, DIM as i32]);
-    let key_indices =
-        InlineArray::from_u8_slice(&build_u8(kv_rows * DIM * seq_cap, 128), &[kv_rows as i32, DIM as i32, seq_cap as i32]);
+    let query_rot =
+        InlineArray::from_f32_slice(&build_f32(n_rows * DIM, 0.2), &[n_rows as i32, DIM as i32]);
+    let query_proj =
+        InlineArray::from_f32_slice(&build_f32(n_rows * DIM, 0.1), &[n_rows as i32, DIM as i32]);
+    let key_indices = InlineArray::from_u8_slice(
+        &build_u8(kv_rows * DIM * seq_cap, 128),
+        &[kv_rows as i32, DIM as i32, seq_cap as i32],
+    );
     let key_qjl_signs = InlineArray::from_u32_slice(
         &build_u32_sign_words(kv_rows, seq_cap),
         &[kv_rows as i32, QJL_WORDS as i32, seq_cap as i32],
@@ -136,13 +140,23 @@ fn main() {
         ),
         &[kv_rows as i32, DIM as i32, seq_cap as i32],
     );
-    let key_norms = InlineArray::from_f32_slice(&build_f32(kv_rows * seq_cap, 0.3), &[kv_rows as i32, seq_cap as i32]);
-    let key_residual_norms =
-        InlineArray::from_f32_slice(&build_f32(kv_rows * seq_cap, 0.05), &[kv_rows as i32, seq_cap as i32]);
+    let key_norms = InlineArray::from_f32_slice(
+        &build_f32(kv_rows * seq_cap, 0.3),
+        &[kv_rows as i32, seq_cap as i32],
+    );
+    let key_residual_norms = InlineArray::from_f32_slice(
+        &build_f32(kv_rows * seq_cap, 0.05),
+        &[kv_rows as i32, seq_cap as i32],
+    );
     let key_codebook = InlineArray::from_f32_slice(&build_f32(128, 1.0), &[128]);
-    let value_indices =
-        InlineArray::from_u8_slice(&build_u8(kv_rows * DIM * seq_cap, 256), &[kv_rows as i32, DIM as i32, seq_cap as i32]);
-    let value_norms = InlineArray::from_f32_slice(&build_f32(kv_rows * seq_cap, 0.4), &[kv_rows as i32, seq_cap as i32]);
+    let value_indices = InlineArray::from_u8_slice(
+        &build_u8(kv_rows * DIM * seq_cap, 256),
+        &[kv_rows as i32, DIM as i32, seq_cap as i32],
+    );
+    let value_norms = InlineArray::from_f32_slice(
+        &build_f32(kv_rows * seq_cap, 0.4),
+        &[kv_rows as i32, seq_cap as i32],
+    );
     let value_codebook = InlineArray::from_f32_slice(&build_f32(256, 1.5), &[256]);
 
     let split = InlineArray::turboquant_attention_q8_d128_2pass(
@@ -262,10 +276,7 @@ fn main() {
         ),
         _ => println!(
             "q_heads={} kv_heads={} seq={} split_ms=unavailable packed_ms={:.3}",
-            cfg.q_heads,
-            cfg.kv_heads,
-            cfg.n_seq,
-            packed_ms,
+            cfg.q_heads, cfg.kv_heads, cfg.n_seq, packed_ms,
         ),
     }
 }

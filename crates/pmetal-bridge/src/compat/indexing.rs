@@ -184,10 +184,7 @@ impl IndexOp<(RangeFull, RangeTo<i32>, RangeFull)> for Array {
 
 impl IndexOp<(RangeFull, RangeTo<usize>, RangeFull)> for Array {
     fn index(&self, idx: (RangeFull, RangeTo<usize>, RangeFull)) -> Self {
-        IndexOp::<(RangeFull, RangeTo<i32>, RangeFull)>::index(
-            self,
-            (.., ..(idx.1.end as i32), ..),
-        )
+        IndexOp::<(RangeFull, RangeTo<i32>, RangeFull)>::index(self, (.., ..(idx.1.end as i32), ..))
     }
 }
 

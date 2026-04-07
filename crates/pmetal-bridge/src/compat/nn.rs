@@ -2,8 +2,8 @@
 // as a drop-in for `use mlx_rs::nn`.
 pub use super::layers::{
     Conv1d, Conv1dBuilder, Conv2d, Conv2dBuilder, Embedding, GroupNorm, GroupNormBuilder,
-    LayerNorm, LayerNormBuilder, Linear, LinearBuilder, RmsNorm, RmsNormBuilder, Rope,
-    RopeBuilder, Sequential,
+    LayerNorm, LayerNormBuilder, Linear, LinearBuilder, RmsNorm, RmsNormBuilder, Rope, RopeBuilder,
+    Sequential,
 };
 
 use super::{Array, Exception};
@@ -138,8 +138,7 @@ where
             crate::inline_array::value_and_grad(flat_loss, &param_arrays, &[]);
 
         // 4. Re-key gradients into FlattenedModuleParam.
-        let grads: FlattenedModuleParam =
-            keys.into_iter().zip(grad_arrays.into_iter()).collect();
+        let grads: FlattenedModuleParam = keys.into_iter().zip(grad_arrays.into_iter()).collect();
 
         Ok((loss, grads))
     }
@@ -161,8 +160,7 @@ pub fn keyed_value_and_grad<T, F>(
 ) -> impl FnMut(
     super::FlattenedModuleParam,
     T,
-)
-    -> Result<(Vec<super::Array>, super::FlattenedModuleParam), super::Exception>
+) -> Result<(Vec<super::Array>, super::FlattenedModuleParam), super::Exception>
 where
     T: 'static,
     F: FnMut(super::FlattenedModuleParam, T) -> Result<Vec<super::Array>, super::Exception>,
@@ -213,8 +211,7 @@ where
             crate::inline_array::value_and_grad(flat_loss, &param_arrays, &[]);
 
         // Re-key gradients.
-        let grads: FlattenedModuleParam =
-            keys.into_iter().zip(grad_arrays.into_iter()).collect();
+        let grads: FlattenedModuleParam = keys.into_iter().zip(grad_arrays.into_iter()).collect();
 
         Ok((vec![loss_val], grads))
     }
