@@ -699,6 +699,8 @@ async fn run_grpo_direct(
         has_flag(&spec.args, "--async-rewards"),
         has_flag(&spec.args, "--speculative"),
         parse_arg(&spec.args, "--speculative-draft-tokens", 3usize)?,
+        optional_arg(&spec.args, "--grpo-kv-bits")
+            .and_then(|s| s.parse::<u8>().ok()),
         spec.metrics_file.as_ref().map(|p| p.display().to_string()),
         false,
         callbacks,

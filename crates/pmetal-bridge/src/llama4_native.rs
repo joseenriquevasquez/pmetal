@@ -327,6 +327,10 @@ pub struct KvLayerCache {
     /// For decode we keep the entire sequence visible (attention_chunk_size is just
     /// a mask constraint, not an eviction policy in the native path).
     pub start_position: i32,
+    /// Zero-overhead affine-quantized cache (uniform bit width).
+    pub quantized_keys: Option<crate::qwen3_native::QuantizedTuple>,
+    pub quantized_values: Option<crate::qwen3_native::QuantizedTuple>,
+    pub quant_config: Option<crate::qwen3_native::QuantCacheConfig>,
 }
 
 /// Full model cache.
@@ -371,6 +375,14 @@ impl NativeCache {
 
     /// Create a fresh, empty cache for the given weight set.
     pub fn new_empty(weights: &NativeWeights) -> Self {
+        Self::new_with_quant(weights, None)
+    }
+
+    /// Create a cache with optional zero-overhead affine KV quantization.
+    pub fn new_with_quant(
+        weights: &NativeWeights,
+        quant_config: Option<crate::qwen3_native::QuantCacheConfig>,
+    ) -> Self {
         let kv_caches = weights
             .layers
             .iter()
@@ -379,6 +391,9 @@ impl NativeCache {
                 values: None,
                 offset: 0,
                 start_position: 0,
+                quantized_keys: None,
+                quantized_values: None,
+                quant_config,
             })
             .collect();
 
@@ -1061,67 +1076,216 @@ fn attn_forward(
     let num_new = keys.dim(2); // T for prefill, 1 for decode
     let next = prev + num_new;
 
-    if cache.keys.is_none() {
-        let alloc = 256i32;
+    let output = if let Some(qcfg) = cache.quant_config {
+        // ── Zero-overhead affine-quantized KV cache path ──────────────────
+        // Matches mlx-lm's QuantizedKVCache: quantize K/V immediately after
+        // RoPE/QK-norm, store as (packed_uint32, scales, biases), pass to
+        // quantized_matmul which dequantizes inside the Metal kernel.
+        //
+        // For prefill with a chunk_mask we must dequantize for the masked SDPA
+        // call (quantized_sdpa does not accept an additive mask). Memory savings
+        // still apply for the stored tokens.
+        let bits = qcfg.bits as i32;
+        let group_size = qcfg.group_size;
+        let packed_dim = (head_dim * bits + 31) / 32;
+        let scales_dim = head_dim / group_size;
+        let uint32_dt = crate::compat::Dtype::Uint32.as_i32();
         let dtype = keys.dtype_raw();
-        cache.keys = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
-        cache.values = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
-    } else {
-        // Grow if needed
-        let allocated = cache.keys.as_ref().unwrap().dim(2);
-        if next > allocated {
-            let dtype = cache.keys.as_ref().unwrap().dtype_raw();
-            let old_k = cache.keys.take().unwrap();
-            let old_v = cache.values.take().unwrap();
-            let ext_k = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
-            let ext_v = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
-            cache.keys = Some(old_k.kv_cache_append(&ext_k, 2));
-            cache.values = Some(old_v.kv_cache_append(&ext_v, 2));
-        }
-    }
 
-    let start_coord = [0, 0, prev, 0];
-    let stop_coord = [b, n_kv_heads, next, head_dim];
-    let k_buf = cache.keys.take().unwrap();
-    let v_buf = cache.values.take().unwrap();
-    cache.keys = Some(k_buf.slice_set(&keys, &start_coord, &stop_coord));
-    cache.values = Some(v_buf.slice_set(&values, &start_coord, &stop_coord));
-    cache.offset = next;
+        // Quantize new K/V
+        let keys_2d = keys.reshape(&[b * n_kv_heads * num_new, head_dim]);
+        let (kp, ks, kb) = keys_2d.quantize_weights(group_size, bits);
+        let kp = kp.reshape(&[b, n_kv_heads, num_new, packed_dim]);
+        let ks = ks.reshape(&[b, n_kv_heads, num_new, scales_dim]);
+        let kb = kb.reshape(&[b, n_kv_heads, num_new, scales_dim]);
 
-    // Valid portion of KV cache
-    let valid_keys = cache
-        .keys
-        .as_ref()
-        .unwrap()
-        .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
-    let valid_values = cache
-        .values
-        .as_ref()
-        .unwrap()
-        .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+        let values_2d = values.reshape(&[b * n_kv_heads * num_new, head_dim]);
+        let (vp, vs, vb) = values_2d.quantize_weights(group_size, bits);
+        let vp = vp.reshape(&[b, n_kv_heads, num_new, packed_dim]);
+        let vs = vs.reshape(&[b, n_kv_heads, num_new, scales_dim]);
+        let vb = vb.reshape(&[b, n_kv_heads, num_new, scales_dim]);
 
-    // SDPA
-    let output = if lw.use_rope {
-        // Local (chunked) layer:
-        // - For decode (s=1): use causal SDPA (the single query naturally attends
-        //   to all cached positions; the chunk constraint is handled by not storing
-        //   tokens outside the current chunk — or in this simpler native path, by
-        //   letting the model see a slightly wider window which matches mlx-lm
-        //   behavior for cached keys).
-        // - For prefill (s>1): apply the chunk mask.
-        if let Some(ref mask_int) = chunk_mask {
-            // Build [s, next] additive mask and reshape to [1, 1, s, next] for SDPA.
-            let dtype = queries.dtype_raw();
-            let mask_full = make_additive_mask(&mask_int.slice(&[0, 0], &[s, next]), dtype);
-            let mask_4d = mask_full.reshape(&[1, 1, s, next]);
-            queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(&mask_4d))
+        // Allocate or grow quantized cache buffers
+        if cache.quantized_keys.is_none() {
+            let alloc = ((next + 255) / 256) * 256;
+            cache.quantized_keys = Some(crate::qwen3_native::QuantizedTuple {
+                packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim], uint32_dt),
+                scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+                biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+            });
+            cache.quantized_values = Some(crate::qwen3_native::QuantizedTuple {
+                packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim], uint32_dt),
+                scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+                biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+            });
         } else {
-            // Decode: causal (only 1 query token, always valid)
+            let allocated = cache.quantized_keys.as_ref().unwrap().packed.dim(2);
+            if next > allocated {
+                let grow_to = ((next + 255) / 256) * 256;
+                let extend = grow_to - allocated;
+                let qk = cache.quantized_keys.take().unwrap();
+                let qv = cache.quantized_values.take().unwrap();
+                cache.quantized_keys = Some(crate::qwen3_native::QuantizedTuple {
+                    packed: qk.packed.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
+                    scales: qk.scales.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                    biases: qk.biases.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                });
+                cache.quantized_values = Some(crate::qwen3_native::QuantizedTuple {
+                    packed: qv.packed.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
+                    scales: qv.scales.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                    biases: qv.biases.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                });
+            }
+        }
+
+        // slice_set new tokens into cache buffers
+        let start_q = [0, 0, prev, 0];
+        let stop_kp = [b, n_kv_heads, next, packed_dim];
+        let stop_ks = [b, n_kv_heads, next, scales_dim];
+        let qk_ref = cache.quantized_keys.as_mut().unwrap();
+        qk_ref.packed = qk_ref.packed.slice_set(&kp, &start_q, &stop_kp);
+        qk_ref.scales = qk_ref.scales.slice_set(&ks, &start_q, &stop_ks);
+        qk_ref.biases = qk_ref.biases.slice_set(&kb, &start_q, &stop_ks);
+
+        let qv_ref = cache.quantized_values.as_mut().unwrap();
+        qv_ref.packed = qv_ref.packed.slice_set(&vp, &start_q, &stop_kp);
+        qv_ref.scales = qv_ref.scales.slice_set(&vs, &start_q, &stop_ks);
+        qv_ref.biases = qv_ref.biases.slice_set(&vb, &start_q, &stop_ks);
+
+        cache.offset = next;
+
+        // Slice valid portions
+        let qk = cache.quantized_keys.as_ref().unwrap();
+        let cached_kp = qk.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+        let cached_ks = qk.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let cached_kb = qk.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let qv = cache.quantized_values.as_ref().unwrap();
+        let cached_vp = qv.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+        let cached_vs = qv.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let cached_vb = qv.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+
+        if lw.use_rope {
+            if let Some(ref mask_int) = chunk_mask {
+                // Prefill with chunk mask: dequantize for masked SDPA.
+                // Memory savings still apply; compute overhead only at prefill.
+                let kp_flat = cached_kp.reshape(&[b * n_kv_heads * next, packed_dim]);
+                let ks_flat = cached_ks.reshape(&[b * n_kv_heads * next, scales_dim]);
+                let kb_flat = cached_kb.reshape(&[b * n_kv_heads * next, scales_dim]);
+                let valid_keys = kp_flat
+                    .dequantize(&ks_flat, &kb_flat, group_size, bits)
+                    .reshape(&[b, n_kv_heads, next, head_dim]);
+
+                let vp_flat = cached_vp.reshape(&[b * n_kv_heads * next, packed_dim]);
+                let vs_flat = cached_vs.reshape(&[b * n_kv_heads * next, scales_dim]);
+                let vb_flat = cached_vb.reshape(&[b * n_kv_heads * next, scales_dim]);
+                let valid_values = vp_flat
+                    .dequantize(&vs_flat, &vb_flat, group_size, bits)
+                    .reshape(&[b, n_kv_heads, next, head_dim]);
+
+                let mask_full = make_additive_mask(
+                    &mask_int.slice(&[0, 0], &[s, next]),
+                    dtype,
+                );
+                let mask_4d = mask_full.reshape(&[1, 1, s, next]);
+                queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(&mask_4d))
+            } else {
+                // Decode on a local layer — pure zero-overhead quantized path
+                crate::decode::quantized_sdpa(
+                    &queries,
+                    (&cached_kp, &cached_ks, &cached_kb),
+                    (&cached_vp, &cached_vs, &cached_vb),
+                    scale,
+                    num_new,
+                    n_heads,
+                    n_kv_heads,
+                    group_size,
+                    bits,
+                )
+            }
+        } else {
+            // Global (NoPE) layer: quantized_sdpa handles causal mask internally
+            crate::decode::quantized_sdpa(
+                &queries,
+                (&cached_kp, &cached_ks, &cached_kb),
+                (&cached_vp, &cached_vs, &cached_vb),
+                scale,
+                num_new,
+                n_heads,
+                n_kv_heads,
+                group_size,
+                bits,
+            )
+        }
+    } else {
+        // ── Standard bf16 path ────────────────────────────────────────────
+        if cache.keys.is_none() {
+            let alloc = 256i32;
+            let dtype = keys.dtype_raw();
+            cache.keys = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
+            cache.values = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
+        } else {
+            // Grow if needed
+            let allocated = cache.keys.as_ref().unwrap().dim(2);
+            if next > allocated {
+                let dtype = cache.keys.as_ref().unwrap().dtype_raw();
+                let old_k = cache.keys.take().unwrap();
+                let old_v = cache.values.take().unwrap();
+                let ext_k = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
+                let ext_v = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
+                cache.keys = Some(old_k.kv_cache_append(&ext_k, 2));
+                cache.values = Some(old_v.kv_cache_append(&ext_v, 2));
+            }
+        }
+
+        let start_coord = [0, 0, prev, 0];
+        let stop_coord = [b, n_kv_heads, next, head_dim];
+        let k_buf = cache.keys.take().unwrap();
+        let v_buf = cache.values.take().unwrap();
+        cache.keys = Some(k_buf.slice_set(&keys, &start_coord, &stop_coord));
+        cache.values = Some(v_buf.slice_set(&values, &start_coord, &stop_coord));
+        cache.offset = next;
+
+        // Valid portion of KV cache
+        let valid_keys = cache
+            .keys
+            .as_ref()
+            .unwrap()
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+        let valid_values = cache
+            .values
+            .as_ref()
+            .unwrap()
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+
+        // SDPA
+        if lw.use_rope {
+            // Local (chunked) layer:
+            // - For decode (s=1): use causal SDPA (the single query naturally attends
+            //   to all cached positions; the chunk constraint is handled by not storing
+            //   tokens outside the current chunk — or in this simpler native path, by
+            //   letting the model see a slightly wider window which matches mlx-lm
+            //   behavior for cached keys).
+            // - For prefill (s>1): apply the chunk mask.
+            if let Some(ref mask_int) = chunk_mask {
+                // Build [s, next] additive mask and reshape to [1, 1, s, next] for SDPA.
+                let dtype = queries.dtype_raw();
+                let mask_full = make_additive_mask(&mask_int.slice(&[0, 0], &[s, next]), dtype);
+                let mask_4d = mask_full.reshape(&[1, 1, s, next]);
+                queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(&mask_4d))
+            } else {
+                // Decode: causal (only 1 query token, always valid)
+                crate::decode::sdpa_causal_like_mlx(&queries, &valid_keys, &valid_values, scale, s)
+            }
+        } else {
+            // Global (NoPE) layer: full causal attention, no chunk constraint.
             crate::decode::sdpa_causal_like_mlx(&queries, &valid_keys, &valid_values, scale, s)
         }
-    } else {
-        // Global (NoPE) layer: full causal attention, no chunk constraint.
-        crate::decode::sdpa_causal_like_mlx(&queries, &valid_keys, &valid_values, scale, s)
     };
 
     // Reshape [B, H, S, D] → [B, S, H*D]

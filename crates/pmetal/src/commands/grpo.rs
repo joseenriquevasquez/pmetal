@@ -30,6 +30,7 @@ pub(crate) async fn run_grpo_cli(
     async_rewards: bool,
     use_speculative: bool,
     speculative_draft_tokens: usize,
+    kv_cache_bits: Option<u8>,
     _log_metrics: Option<String>,
     emit_console_output: bool,
     extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
@@ -155,6 +156,7 @@ pub(crate) async fn run_grpo_cli(
     grpo_config.async_rewards = async_rewards;
     grpo_config.use_speculative = use_speculative;
     grpo_config.speculative_draft_tokens = speculative_draft_tokens;
+    grpo_config.kv_cache_bits = kv_cache_bits;
 
     if use_speculative && emit_console_output {
         println!(

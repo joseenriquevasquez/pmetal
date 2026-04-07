@@ -1158,6 +1158,17 @@ enum Commands {
         #[arg(long)]
         response_column: Option<String>,
 
+        /// KV cache quantization bits for GRPO rollout generation (2, 4, or 8).
+        ///
+        /// When set, the KV cache used during completion generation is stored at the
+        /// requested bit width instead of fp16.  This reduces peak memory during rollout
+        /// by 2–8× depending on the bit width, enabling longer completions or larger
+        /// generation group sizes on memory-constrained hardware.
+        ///
+        /// Valid values: 2, 4, 8.  Omit to use the default fp16 cache.
+        #[arg(long)]
+        grpo_kv_bits: Option<u8>,
+
         /// Path to write JSONL metrics log (for TUI dashboard)
         #[arg(long)]
         log_metrics: Option<String>,
@@ -3063,6 +3074,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             async_rewards,
             speculative,
             speculative_draft_tokens,
+            grpo_kv_bits,
             text_column,
             text_columns,
             column_separator,
@@ -3095,6 +3107,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 async_rewards,
                 speculative,
                 speculative_draft_tokens,
+                grpo_kv_bits,
                 log_metrics,
                 true,
                 Vec::new(),

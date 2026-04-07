@@ -189,6 +189,20 @@ pub struct GrpoConfig {
     /// benefit when the draft acceptance rate drops.  Typical sweet-spot: 3–5.
     /// Ignored when `use_speculative` is `false`.  Defaults to 3.
     pub speculative_draft_tokens: usize,
+    /// KV cache quantization bits for the generation (rollout) phase.
+    ///
+    /// When `Some(bits)`, the KV cache used during `generate_completions` is
+    /// configured with [`CacheMode::Quantized`] at the requested bit width
+    /// (valid values: 2, 4, 8).  A group size of 64 is used, which is
+    /// compatible with all standard head dimensions.
+    ///
+    /// Quantizing the KV cache reduces peak memory by 2–8× during rollout
+    /// generation, enabling longer completions or larger group sizes on
+    /// memory-constrained hardware.  The dequantization path is lazy (no
+    /// `.eval()` call), so it adds no synchronisation overhead.
+    ///
+    /// `None` (default) uses the standard fp16 cache.
+    pub kv_cache_bits: Option<u8>,
 }
 
 impl Default for GrpoConfig {
@@ -215,6 +229,7 @@ impl Default for GrpoConfig {
             async_rewards: false,
             use_speculative: false,
             speculative_draft_tokens: 3,
+            kv_cache_bits: None,
         }
     }
 }
@@ -951,9 +966,17 @@ impl GrpoTrainer {
             rl_config = rl_config.with_speculative(draft_tokens);
         }
 
-        let cache = model
-            .create_cache(self.config.max_prompt_length + self.config.max_completion_length)
-            .ok_or_else(|| GrpoError::Generation("Model does not support KV cache".into()))?;
+        let max_len = self.config.max_prompt_length + self.config.max_completion_length;
+        let cache = if let Some(bits) = self.config.kv_cache_bits {
+            let mode = pmetal_mlx::kv_cache::CacheMode::Quantized {
+                bits,
+                group_size: 64,
+            };
+            model.create_cache_with_mode(max_len, mode)
+        } else {
+            model.create_cache(max_len)
+        }
+        .ok_or_else(|| GrpoError::Generation("Model does not support KV cache".into()))?;
         let kv_config = cache.config();
 
         let mut generator = BatchedRlGenerator::new(rl_config, kv_config.clone());

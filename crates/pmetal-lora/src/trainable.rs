@@ -122,6 +122,31 @@ pub trait TrainableModel: ModuleParameters {
         None
     }
 
+    /// Create a KV cache with a specific quantization mode.
+    ///
+    /// Builds a cache configured with the given [`pmetal_mlx::kv_cache::CacheMode`],
+    /// enabling quantized KV storage (e.g., 4-bit or 8-bit) to reduce memory during
+    /// generation.  Falls back to the standard mode when the model does not support
+    /// caching.
+    ///
+    /// # Arguments
+    /// * `max_seq_len` - Maximum sequence length to cache
+    /// * `mode` - Cache mode (e.g., `CacheMode::Quantized { bits: 8, group_size: 64 }`)
+    ///
+    /// # Returns
+    /// A new KVCache instance with the requested mode, or None if the model doesn't
+    /// support caching.
+    fn create_cache_with_mode(
+        &self,
+        max_seq_len: usize,
+        mode: pmetal_mlx::kv_cache::CacheMode,
+    ) -> Option<KVCache> {
+        self.create_cache(max_seq_len).map(|c| {
+            let config = c.config().clone().with_mode(mode);
+            KVCache::new(config)
+        })
+    }
+
     /// Check if this model supports KV caching for efficient inference.
     fn supports_kv_cache(&self) -> bool {
         false

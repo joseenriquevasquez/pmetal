@@ -291,12 +291,21 @@ impl std::fmt::Debug for NativeWeights {
 /// GPT-OSS uses two kinds:
 ///   - Full attention: unbounded growth (256-token chunk reallocation strategy)
 ///   - Sliding attention: rotating window of `sliding_window` tokens
+///
+/// Zero-overhead affine quantization is supported for full-attention layers only.
+/// Sliding window layers use the bf16 rotating buffer path unconditionally (the
+/// rotation logic makes quantized buffers incompatible).
 pub struct KvLayerCache {
     pub keys: Option<InlineArray>, // [B, H, MAX_T, D] (or [B, H, window, D] for sliding)
     pub values: Option<InlineArray>, // [B, H, MAX_T, D]
     pub offset: i32,               // total tokens written
     pub is_sliding: bool,
     pub window: i32, // sliding window size (ignored when is_sliding=false)
+    /// Zero-overhead affine-quantized cache (full-attention layers only).
+    pub quantized_keys: Option<crate::qwen3_native::QuantizedTuple>,
+    pub quantized_values: Option<crate::qwen3_native::QuantizedTuple>,
+    /// None on sliding-window layers or when bf16 cache is used.
+    pub quant_config: Option<crate::qwen3_native::QuantCacheConfig>,
 }
 
 /// Full model cache — one KV entry per layer.
@@ -341,6 +350,18 @@ impl NativeCache {
 
     /// Create a fresh, empty cache for the given weight set.
     pub fn new_empty(weights: &NativeWeights) -> Self {
+        Self::new_with_quant(weights, None)
+    }
+
+    /// Create a cache with optional affine KV quantization.
+    ///
+    /// Quantization is silently disabled for sliding-window layers (the rotation
+    /// logic is incompatible with quantized buffers). Only full-attention layers
+    /// receive a `quant_config`.
+    pub fn new_with_quant(
+        weights: &NativeWeights,
+        quant_config: Option<crate::qwen3_native::QuantCacheConfig>,
+    ) -> Self {
         let kv_caches = weights
             .layers
             .iter()
@@ -350,6 +371,11 @@ impl NativeCache {
                 offset: 0,
                 is_sliding: lw.attn_is_sliding,
                 window: lw.attn_sliding_window,
+                quantized_keys: None,
+                quantized_values: None,
+                // Disable quantization for sliding layers — their rotating buffer
+                // is incompatible with the pre-allocated quantized buffer scheme.
+                quant_config: if lw.attn_is_sliding { None } else { quant_config },
             })
             .collect();
 
@@ -1048,8 +1074,117 @@ fn attn_forward(
             proj = proj.add(ob);
         }
         proj
+    } else if let Some(qcfg) = cache.quant_config {
+        // ── Full attention, zero-overhead quantized KV cache path ──────────
+        // quant_config is None on sliding layers (set in new_with_quant), so
+        // this branch is only reached for full-attention layers.
+        let bits = qcfg.bits as i32;
+        let group_size = qcfg.group_size;
+        let packed_dim = (head_dim * bits + 31) / 32;
+        let scales_dim = head_dim / group_size;
+        let uint32_dt = crate::compat::Dtype::Uint32.as_i32();
+
+        // Quantize new K/V
+        let k_2d = k.reshape(&[b * n_kv_heads * num_new, head_dim]);
+        let (kp, ks, kb) = k_2d.quantize_weights(group_size, bits);
+        let kp = kp.reshape(&[b, n_kv_heads, num_new, packed_dim]);
+        let ks = ks.reshape(&[b, n_kv_heads, num_new, scales_dim]);
+        let kb = kb.reshape(&[b, n_kv_heads, num_new, scales_dim]);
+
+        let v_2d = v.reshape(&[b * n_kv_heads * num_new, head_dim]);
+        let (vp, vs, vb) = v_2d.quantize_weights(group_size, bits);
+        let vp = vp.reshape(&[b, n_kv_heads, num_new, packed_dim]);
+        let vs = vs.reshape(&[b, n_kv_heads, num_new, scales_dim]);
+        let vb = vb.reshape(&[b, n_kv_heads, num_new, scales_dim]);
+
+        // Allocate or grow quantized cache buffers
+        if cache.quantized_keys.is_none() {
+            let alloc = ((next + 255) / 256) * 256;
+            cache.quantized_keys = Some(crate::qwen3_native::QuantizedTuple {
+                packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim], uint32_dt),
+                scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+                biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+            });
+            cache.quantized_values = Some(crate::qwen3_native::QuantizedTuple {
+                packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim], uint32_dt),
+                scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+                biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+            });
+        } else {
+            let allocated = cache.quantized_keys.as_ref().unwrap().packed.dim(2);
+            if next > allocated {
+                let grow_to = ((next + 255) / 256) * 256;
+                let extend = grow_to - allocated;
+                let qk = cache.quantized_keys.take().unwrap();
+                let qv = cache.quantized_values.take().unwrap();
+                cache.quantized_keys = Some(crate::qwen3_native::QuantizedTuple {
+                    packed: qk.packed.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
+                    scales: qk.scales.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                    biases: qk.biases.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                });
+                cache.quantized_values = Some(crate::qwen3_native::QuantizedTuple {
+                    packed: qv.packed.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
+                    scales: qv.scales.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                    biases: qv.biases.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                });
+            }
+        }
+
+        // slice_set new tokens
+        let start_q = [0, 0, prev, 0];
+        let stop_kp = [b, n_kv_heads, next, packed_dim];
+        let stop_ks = [b, n_kv_heads, next, scales_dim];
+        let qk_ref = cache.quantized_keys.as_mut().unwrap();
+        qk_ref.packed = qk_ref.packed.slice_set(&kp, &start_q, &stop_kp);
+        qk_ref.scales = qk_ref.scales.slice_set(&ks, &start_q, &stop_ks);
+        qk_ref.biases = qk_ref.biases.slice_set(&kb, &start_q, &stop_ks);
+
+        let qv_ref = cache.quantized_values.as_mut().unwrap();
+        qv_ref.packed = qv_ref.packed.slice_set(&vp, &start_q, &stop_kp);
+        qv_ref.scales = qv_ref.scales.slice_set(&vs, &start_q, &stop_ks);
+        qv_ref.biases = qv_ref.biases.slice_set(&vb, &start_q, &stop_ks);
+
+        cache.offset = next;
+
+        // Slice valid portions
+        let qk = cache.quantized_keys.as_ref().unwrap();
+        let cached_kp = qk.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+        let cached_ks = qk.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let cached_kb = qk.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let qv = cache.quantized_values.as_ref().unwrap();
+        let cached_vp = qv.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+        let cached_vs = qv.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let cached_vb = qv.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+
+        let output = crate::decode::quantized_sdpa(
+            &q,
+            (&cached_kp, &cached_ks, &cached_kb),
+            (&cached_vp, &cached_vs, &cached_vb),
+            scale,
+            num_new,
+            n_heads,
+            n_kv_heads,
+            group_size,
+            bits,
+        );
+        let output = output
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[b, s, n_heads * head_dim]);
+
+        // Output projection + bias
+        let mut proj = output.matmul(&lw.attn_o_w);
+        if let Some(ref ob) = lw.attn_o_b {
+            proj = proj.add(ob);
+        }
+        proj
     } else {
-        // Full attention: growing pre-allocated buffer (256-token chunk strategy)
+        // ── Full attention: standard bf16 path ────────────────────────────
         if cache.keys.is_none() {
             let alloc = 256i32;
             cache.keys = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));

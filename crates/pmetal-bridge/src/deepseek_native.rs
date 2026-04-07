@@ -310,6 +310,10 @@ impl std::fmt::Debug for NativeWeights {
 /// qk_rope_head_dim=64, the cache is 576 values per token vs
 /// n_heads*(qk_nope_head_dim+v_head_dim) = 128*(128+128) = 32768 values for
 /// standard MHA — a 56x reduction.
+///
+/// When `quant_config` is set, `kv_latent` and `k_pe` are stored in quantized
+/// form using affine group quantization, halving (or further reducing) the cache
+/// memory. Dequantization happens at attention time before SDPA.
 pub struct MlaLayerCache {
     /// Cached KV latent: [B, 1, T, kv_lora_rank]. Initialized lazily.
     pub kv_latent: Option<InlineArray>,
@@ -317,6 +321,12 @@ pub struct MlaLayerCache {
     pub k_pe: Option<InlineArray>,
     /// Number of valid tokens stored.
     pub offset: i32,
+    /// Quantized form of kv_latent (used when quant_config is set).
+    pub quantized_latent: Option<crate::qwen3_native::QuantizedTuple>,
+    /// Quantized form of k_pe (used when quant_config is set).
+    pub quantized_k_pe: Option<crate::qwen3_native::QuantizedTuple>,
+    /// Affine quantization config; None = bf16 (standard) path.
+    pub quant_config: Option<crate::qwen3_native::QuantCacheConfig>,
 }
 
 /// Full model MLA cache — one entry per layer.
@@ -329,11 +339,26 @@ pub struct NativeCache {
 impl NativeCache {
     /// Create a fresh empty cache.
     pub fn new_empty(num_layers: usize) -> Self {
+        Self::new_with_quant(num_layers, None)
+    }
+
+    /// Create a cache with optional affine KV quantization.
+    ///
+    /// MLA already achieves a 56x compression ratio vs standard MHA by caching
+    /// a latent vector rather than full K/V tensors. Quantization provides
+    /// further memory reduction at the cost of a dequantization step before SDPA.
+    pub fn new_with_quant(
+        num_layers: usize,
+        quant_config: Option<crate::qwen3_native::QuantCacheConfig>,
+    ) -> Self {
         let mla_caches = (0..num_layers)
             .map(|_| MlaLayerCache {
                 kv_latent: None,
                 k_pe: None,
                 offset: 0,
+                quantized_latent: None,
+                quantized_k_pe: None,
+                quant_config,
             })
             .collect();
         NativeCache {
@@ -1062,48 +1087,170 @@ fn mla_forward(
 
     // ── KV cache update ───────────────────────────────────────────────────
     // Cache stores (kv_latent, k_pe) — NOT full K,V tensors.
+    // When quant_config is set, the latent and k_pe are stored quantized to
+    // reduce memory; they are dequantized before each SDPA call.
     let prev = cache.offset;
     let next = prev + s;
 
-    if cache.kv_latent.is_none() {
-        let alloc = 256i32;
-        cache.kv_latent = Some(InlineArray::zeros(&[b, 1, alloc, lora_rank], 11));
-        cache.k_pe = Some(InlineArray::zeros(&[b, 1, alloc, rope_dim], 11));
-    } else {
-        let allocated = cache.kv_latent.as_ref().unwrap().dim(2);
-        if next > allocated {
-            let old_kv = cache.kv_latent.take().unwrap();
-            let old_kp = cache.k_pe.take().unwrap();
-            let ext_kv = InlineArray::zeros(&[b, 1, 256, lora_rank], 11);
-            let ext_kp = InlineArray::zeros(&[b, 1, 256, rope_dim], 11);
-            cache.kv_latent = Some(old_kv.kv_cache_append(&ext_kv, 2));
-            cache.k_pe = Some(old_kp.kv_cache_append(&ext_kp, 2));
+    let (all_kv_latent, all_k_pe) = if let Some(qcfg) = cache.quant_config {
+        // ── Quantized latent cache path ───────────────────────────────────
+        let bits = qcfg.bits as i32;
+        let group_size = qcfg.group_size;
+        let uint32_dt = crate::compat::Dtype::Uint32.as_i32();
+        // Use bf16 (dtype=11) for scales/biases — same convention as the
+        // main quantized KV cache in qwen3_native.
+        let dtype = 11i32; // bf16
+
+        // ---- kv_latent: [B, 1, S, lora_rank] ----
+        let packed_lat = (lora_rank * bits + 31) / 32;
+        let scales_lat = lora_rank / group_size;
+        let lat_2d = kv_latent_4d.reshape(&[b * 1 * s, lora_rank]);
+        let (lp, ls, lb) = lat_2d.quantize_weights(group_size, bits);
+        let lp = lp.reshape(&[b, 1, s, packed_lat]);
+        let ls = ls.reshape(&[b, 1, s, scales_lat]);
+        let lb = lb.reshape(&[b, 1, s, scales_lat]);
+
+        // ---- k_pe: [B, 1, S, rope_dim] ----
+        let packed_pe = (rope_dim * bits + 31) / 32;
+        let scales_pe = (rope_dim / group_size).max(1);
+        let pe_2d = k_pe.reshape(&[b * 1 * s, rope_dim]);
+        let (pp, ps, pb) = pe_2d.quantize_weights(group_size, bits);
+        let pp = pp.reshape(&[b, 1, s, packed_pe]);
+        let ps = ps.reshape(&[b, 1, s, scales_pe]);
+        let pb = pb.reshape(&[b, 1, s, scales_pe]);
+
+        // Allocate or grow quantized latent buffers
+        if cache.quantized_latent.is_none() {
+            let alloc = ((next + 255) / 256) * 256;
+            cache.quantized_latent = Some(crate::qwen3_native::QuantizedTuple {
+                packed: InlineArray::zeros(&[b, 1, alloc, packed_lat], uint32_dt),
+                scales: InlineArray::zeros(&[b, 1, alloc, scales_lat], dtype),
+                biases: InlineArray::zeros(&[b, 1, alloc, scales_lat], dtype),
+            });
+            cache.quantized_k_pe = Some(crate::qwen3_native::QuantizedTuple {
+                packed: InlineArray::zeros(&[b, 1, alloc, packed_pe], uint32_dt),
+                scales: InlineArray::zeros(&[b, 1, alloc, scales_pe], dtype),
+                biases: InlineArray::zeros(&[b, 1, alloc, scales_pe], dtype),
+            });
+        } else {
+            let allocated = cache.quantized_latent.as_ref().unwrap().packed.dim(2);
+            if next > allocated {
+                let grow_to = ((next + 255) / 256) * 256;
+                let extend = grow_to - allocated;
+                let ql = cache.quantized_latent.take().unwrap();
+                let qp = cache.quantized_k_pe.take().unwrap();
+                cache.quantized_latent = Some(crate::qwen3_native::QuantizedTuple {
+                    packed: ql.packed.kv_cache_append(
+                        &InlineArray::zeros(&[b, 1, extend, packed_lat], uint32_dt), 2),
+                    scales: ql.scales.kv_cache_append(
+                        &InlineArray::zeros(&[b, 1, extend, scales_lat], dtype), 2),
+                    biases: ql.biases.kv_cache_append(
+                        &InlineArray::zeros(&[b, 1, extend, scales_lat], dtype), 2),
+                });
+                cache.quantized_k_pe = Some(crate::qwen3_native::QuantizedTuple {
+                    packed: qp.packed.kv_cache_append(
+                        &InlineArray::zeros(&[b, 1, extend, packed_pe], uint32_dt), 2),
+                    scales: qp.scales.kv_cache_append(
+                        &InlineArray::zeros(&[b, 1, extend, scales_pe], dtype), 2),
+                    biases: qp.biases.kv_cache_append(
+                        &InlineArray::zeros(&[b, 1, extend, scales_pe], dtype), 2),
+                });
+            }
         }
-    }
 
-    let start_kv = [0i32, 0, prev, 0];
-    let stop_kv = [b, 1, next, lora_rank];
-    let start_kp = [0i32, 0, prev, 0];
-    let stop_kp = [b, 1, next, rope_dim];
+        // slice_set new quantized tokens into cache
+        let start_q = [0i32, 0, prev, 0];
+        let stop_lp = [b, 1, next, packed_lat];
+        let stop_ls = [b, 1, next, scales_lat];
+        let ql_ref = cache.quantized_latent.as_mut().unwrap();
+        ql_ref.packed = ql_ref.packed.slice_set(&lp, &start_q, &stop_lp);
+        ql_ref.scales = ql_ref.scales.slice_set(&ls, &start_q, &stop_ls);
+        ql_ref.biases = ql_ref.biases.slice_set(&lb, &start_q, &stop_ls);
 
-    let kv_buf = cache.kv_latent.take().unwrap();
-    let kp_buf = cache.k_pe.take().unwrap();
+        let stop_pp = [b, 1, next, packed_pe];
+        let stop_ps = [b, 1, next, scales_pe];
+        let qp_ref = cache.quantized_k_pe.as_mut().unwrap();
+        qp_ref.packed = qp_ref.packed.slice_set(&pp, &start_q, &stop_pp);
+        qp_ref.scales = qp_ref.scales.slice_set(&ps, &start_q, &stop_ps);
+        qp_ref.biases = qp_ref.biases.slice_set(&pb, &start_q, &stop_ps);
 
-    cache.kv_latent = Some(kv_buf.slice_set(&kv_latent_4d, &start_kv, &stop_kv));
-    cache.k_pe = Some(kp_buf.slice_set(&k_pe, &start_kp, &stop_kp));
-    cache.offset = next;
+        cache.offset = next;
 
-    // Valid portions of the cache.
-    let all_kv_latent = cache
-        .kv_latent
-        .as_ref()
-        .unwrap()
-        .slice(&[0, 0, 0, 0], &[b, 1, next, lora_rank]); // [B, 1, T_total, lora]
-    let all_k_pe = cache
-        .k_pe
-        .as_ref()
-        .unwrap()
-        .slice(&[0, 0, 0, 0], &[b, 1, next, rope_dim]); // [B, 1, T_total, rope_dim]
+        // Dequantize valid portions for use in SDPA
+        let ql = cache.quantized_latent.as_ref().unwrap();
+        let qp = cache.quantized_k_pe.as_ref().unwrap();
+
+        let lat_packed = ql.packed.slice(&[0, 0, 0, 0], &[b, 1, next, packed_lat]);
+        let lat_scales = ql.scales.slice(&[0, 0, 0, 0], &[b, 1, next, scales_lat]);
+        let lat_biases = ql.biases.slice(&[0, 0, 0, 0], &[b, 1, next, scales_lat]);
+        let all_kv_latent = lat_packed
+            .reshape(&[b * next, packed_lat])
+            .dequantize(
+                &lat_scales.reshape(&[b * next, scales_lat]),
+                &lat_biases.reshape(&[b * next, scales_lat]),
+                group_size,
+                bits,
+            )
+            .reshape(&[b, 1, next, lora_rank]); // [B, 1, T_total, lora]
+
+        let pe_packed = qp.packed.slice(&[0, 0, 0, 0], &[b, 1, next, packed_pe]);
+        let pe_scales = qp.scales.slice(&[0, 0, 0, 0], &[b, 1, next, scales_pe]);
+        let pe_biases = qp.biases.slice(&[0, 0, 0, 0], &[b, 1, next, scales_pe]);
+        let all_k_pe = pe_packed
+            .reshape(&[b * next, packed_pe])
+            .dequantize(
+                &pe_scales.reshape(&[b * next, scales_pe]),
+                &pe_biases.reshape(&[b * next, scales_pe]),
+                group_size,
+                bits,
+            )
+            .reshape(&[b, 1, next, rope_dim]); // [B, 1, T_total, rope_dim]
+
+        (all_kv_latent, all_k_pe)
+    } else {
+        // ── Standard bf16 path ────────────────────────────────────────────
+        if cache.kv_latent.is_none() {
+            let alloc = 256i32;
+            cache.kv_latent = Some(InlineArray::zeros(&[b, 1, alloc, lora_rank], 11));
+            cache.k_pe = Some(InlineArray::zeros(&[b, 1, alloc, rope_dim], 11));
+        } else {
+            let allocated = cache.kv_latent.as_ref().unwrap().dim(2);
+            if next > allocated {
+                let old_kv = cache.kv_latent.take().unwrap();
+                let old_kp = cache.k_pe.take().unwrap();
+                let ext_kv = InlineArray::zeros(&[b, 1, 256, lora_rank], 11);
+                let ext_kp = InlineArray::zeros(&[b, 1, 256, rope_dim], 11);
+                cache.kv_latent = Some(old_kv.kv_cache_append(&ext_kv, 2));
+                cache.k_pe = Some(old_kp.kv_cache_append(&ext_kp, 2));
+            }
+        }
+
+        let start_kv = [0i32, 0, prev, 0];
+        let stop_kv = [b, 1, next, lora_rank];
+        let start_kp = [0i32, 0, prev, 0];
+        let stop_kp = [b, 1, next, rope_dim];
+
+        let kv_buf = cache.kv_latent.take().unwrap();
+        let kp_buf = cache.k_pe.take().unwrap();
+
+        cache.kv_latent = Some(kv_buf.slice_set(&kv_latent_4d, &start_kv, &stop_kv));
+        cache.k_pe = Some(kp_buf.slice_set(&k_pe, &start_kp, &stop_kp));
+        cache.offset = next;
+
+        // Valid portions of the cache.
+        let all_kv_latent = cache
+            .kv_latent
+            .as_ref()
+            .unwrap()
+            .slice(&[0, 0, 0, 0], &[b, 1, next, lora_rank]); // [B, 1, T_total, lora]
+        let all_k_pe = cache
+            .k_pe
+            .as_ref()
+            .unwrap()
+            .slice(&[0, 0, 0, 0], &[b, 1, next, rope_dim]); // [B, 1, T_total, rope_dim]
+
+        (all_kv_latent, all_k_pe)
+    };
 
     // ── PE attention scores ───────────────────────────────────────────────
     // pe_scores = (q_pe * scale) @ k_pe.swapaxes(-1,-2)

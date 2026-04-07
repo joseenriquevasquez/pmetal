@@ -345,6 +345,7 @@ pub fn run_native_inference_ext(
             input_ids,
             max_tokens,
             temperature,
+            quant_config,
             &mut on_token,
         ),
         NativeArch::DeepSeek => run_deepseek(
@@ -352,6 +353,7 @@ pub fn run_native_inference_ext(
             input_ids,
             max_tokens,
             temperature,
+            quant_config,
             &mut on_token,
         ),
         NativeArch::GptOss => run_gpt_oss(
@@ -359,6 +361,7 @@ pub fn run_native_inference_ext(
             input_ids,
             max_tokens,
             temperature,
+            quant_config,
             &mut on_token,
         ),
     }
@@ -681,6 +684,7 @@ fn run_llama4(
     input_ids: &[u32],
     max_tokens: usize,
     temperature: f32,
+    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
     use pmetal_bridge::llama4_native;
@@ -700,7 +704,7 @@ fn run_llama4(
             )
         },
         llama4_native::load_model,
-        |weights, _| llama4_native::NativeCache::new_empty(weights),
+        move |weights, _| llama4_native::NativeCache::new_with_quant(weights, quant_config),
         llama4_native::prefill_first_token,
         |weights, _config, cache, first_tok, remaining, temperature, on_token| {
             llama4_native::generate(weights, cache, first_tok, remaining, temperature, on_token)
@@ -717,6 +721,7 @@ fn run_deepseek(
     input_ids: &[u32],
     max_tokens: usize,
     temperature: f32,
+    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
     use pmetal_bridge::deepseek_native;
@@ -738,7 +743,12 @@ fn run_deepseek(
             )
         },
         deepseek_native::load_model,
-        |_, config| deepseek_native::NativeCache::new_empty(config.num_hidden_layers as usize),
+        move |_, config| {
+            deepseek_native::NativeCache::new_with_quant(
+                config.num_hidden_layers as usize,
+                quant_config,
+            )
+        },
         deepseek_native::prefill_first_token,
         |weights, _config, cache, first_tok, remaining, temperature, on_token| {
             deepseek_native::generate(weights, cache, first_tok, remaining, temperature, on_token)
@@ -755,6 +765,7 @@ fn run_gpt_oss(
     input_ids: &[u32],
     max_tokens: usize,
     temperature: f32,
+    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
     use pmetal_bridge::gpt_oss_native;
@@ -776,7 +787,7 @@ fn run_gpt_oss(
             )
         },
         gpt_oss_native::load_model,
-        |weights, _| gpt_oss_native::NativeCache::new_empty(weights),
+        move |weights, _| gpt_oss_native::NativeCache::new_with_quant(weights, quant_config),
         gpt_oss_native::prefill_first_token,
         |weights, _config, cache, first_tok, remaining, temperature, on_token| {
             gpt_oss_native::generate(weights, cache, first_tok, remaining, temperature, on_token)
