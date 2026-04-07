@@ -26,7 +26,7 @@
 //! # What is NOT in this module
 //!
 //! - The mlx-rs `Array` integration code.
-//! - The `TurboQuantKvCache` struct (we have [`KvLayerCache`] in qwen3_native).
+//! - The `TurboQuantKvCache` struct (see `KvLayerCache` in qwen3_native).
 //! - The pmetal-metal `TurboQuantTransform` (InlineArray.matmul replaces it).
 //! - The fused-attention path (we use standard SDPA).
 
@@ -1407,7 +1407,7 @@ pub enum UniformAttentionBenchMode {
 
 impl QuantizedKvCache {
     /// Create an empty cache.  `state` should be `None` on first use; call
-    /// [`append`] to populate.
+    /// `append` to populate.
     pub fn new(config: TurboQuantConfig) -> Self {
         Self {
             keys: None,

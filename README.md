@@ -131,6 +131,9 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `bench` | Benchmark training performance |
 | `bench-gen` | Benchmark generation loop timing |
 | `bench-ffi` | Benchmark FFI overhead |
+| `bench-workload` | Benchmark real cached inference/training workloads |
+| `bench-corpus` | Structured kernel benchmarking with JSON reporting |
+| `mcp` | Start MCP server (45 tools for Claude Desktop / MCP clients) |
 
 ## SDK
 
@@ -267,10 +270,11 @@ PMetal automatically detects Apple Silicon capabilities at startup and tunes ker
 
 ## Architecture
 
-PMetal is organized as a Rust workspace with 18 specialized crates:
+PMetal is organized as a Rust workspace with 20 specialized crates:
 
 ```
 pmetal/
+├── pmetal-bridge       # Zero-allocation MLX C++ bridge (inline array FFI)
 ├── pmetal-core         # Foundation: configs, traits, types, error handling
 ├── pmetal-metal        # Custom Metal GPU kernels + ANE runtime
 ├── pmetal-mlx          # MLX backend integration (KV cache, RoPE, etc.)
@@ -286,6 +290,7 @@ pmetal/
 ├── pmetal-distributed  # Distributed training (mDNS, Ring All-Reduce)
 ├── pmetal-vocoder      # BigVGAN neural vocoder
 ├── pmetal-serve        # OpenAI-compatible inference server
+├── pmetal-mcp          # MCP server (45 tools for Claude Desktop)
 ├── pmetal-py           # Python bindings (maturin/PyO3)
 ├── pmetal-cli          # Command-line interface + TUI control center
 └── pmetal-gui          # Desktop GUI (Tauri + Svelte + TailwindCSS)
@@ -410,6 +415,16 @@ Native ANE integration for power-efficient training and inference:
 - **CPU RMSNorm**: RMSNorm computed in f32 on CPU to avoid fp16 overflow on ANE (saturation arithmetic)
 - **IOSurface Zero-Copy**: fp32 shared memory surfaces for CPU-ANE data transfer with no serialization overhead
 - **M1-M5 Compatibility**: Per-matrix weight blobs for M1, single-blob for M3+. CPU FFN fallback for 4B+ models
+
+### TurboQuant KV Cache
+
+Near-optimal KV cache compression for long-context inference:
+
+- **Random rotation + Lloyd-Max quantization**: 4-6x cache compression with near-zero quality loss
+- **Mixed-precision presets**: `q3_5` (near-lossless), `q2_5` (6.4x compression)
+- **QJL residual correction**: Unbiased inner product estimates via Johnson-Lindenstrauss random projection
+- **Direct attention path**: Single-token decode avoids full cache dequantization
+- **Data-oblivious**: No calibration data required — quantizes online as KV entries are generated
 
 ### Training Infrastructure
 
@@ -576,6 +591,9 @@ Multiple distillation methods and loss functions:
 | `vocoder` | No | `pmetal-vocoder` | BigVGAN neural vocoder |
 | `distributed` | No | `pmetal-distributed` | Distributed training |
 | `mhc` | No | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |
+| `serve` | No | `pmetal-serve` | OpenAI-compatible inference server |
+| `mcp` | No | `pmetal-mcp` | MCP server (45 tools for Claude Desktop) |
+| `dashboard` | Yes | — | TUI control center |
 | `full` | No | — | All features |
 
 ## Development

@@ -2,12 +2,11 @@
 //!
 //! Provides [`InlineArray`], a stack-allocated wrapper around
 //! `mlx::core::array` with no per-op heap allocation.  All C++ calls go
-//! directly through `extern "C"` declarations; this crate has no dependency
-//! on mlx-rs.
+//! directly through `extern "C"` declarations.
 //!
-//! During the transition period, [`InlineArray::from_raw_ctx`] lets callers
-//! interop with existing mlx-rs `Array` values by passing the opaque context
-//! pointer (`arr.as_ptr().ctx`).
+//! The `compat` module provides drop-in replacements for mlx-rs types
+//! (`Array`, `Dtype`, `Module`, `ModuleParameters`, optimizers, layers, etc.)
+//! so that model code can use a familiar API backed by the zero-allocation bridge.
 
 pub mod inline_array;
 pub use inline_array::InlineArray;
