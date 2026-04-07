@@ -242,17 +242,20 @@ impl TrainingLoop {
                 // Execute fused training step (forward + backward + optimizer update)
                 // DEFERRED EVAL: Loss remains a lazy Array, no GPU-CPU sync here
                 // MLX's lazy evaluation automatically fuses operations when not evaluated
+                let max_grad_norm = self.config.training.max_grad_norm as f32;
                 let mut loss = if self.config.use_cut_cross_entropy {
-                    jit_training_step_cce(
+                    jit_training_step_cce_clipped(
                         &mut state,
                         (&batch.input_ids, &batch.labels),
                         self.config.neftune_noise_alpha,
+                        max_grad_norm,
                     )?
                 } else {
-                    jit_training_step_inner(
+                    jit_training_step_inner_clipped(
                         &mut state,
                         (&batch.input_ids, &batch.labels),
                         self.config.neftune_noise_alpha,
+                        max_grad_norm,
                     )?
                 };
                 // Evaluate each step immediately to prevent computation graph
@@ -649,11 +652,13 @@ impl TrainingLoop {
                 // Execute JIT-compiled training step.
                 // When CCE is enabled, bypass compile_with_state (which requires a plain fn pointer)
                 // and use the CCE step directly — compile_with_state cannot capture neftune_alpha.
+                let max_grad_norm = self.config.training.max_grad_norm as f32;
                 let mut loss = if self.config.use_cut_cross_entropy {
-                    jit_training_step_cce(
+                    jit_training_step_cce_clipped(
                         &mut state,
                         (&batch.input_ids, &batch.labels),
                         self.config.neftune_noise_alpha,
+                        max_grad_norm,
                     )?
                 } else {
                     compiled_step(&mut state, (&batch.input_ids, &batch.labels))?

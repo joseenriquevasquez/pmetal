@@ -97,7 +97,8 @@ mod tests;
 // Re-export step functions so run_*.rs submodules can access them via `use super::*`
 pub(crate) use step_functions::{
     compute_cce_loss, eval_training_state, jit_training_step, jit_training_step_cce,
-    jit_training_step_inner, jit_training_step_packed, jit_training_step_packed_cce,
+    jit_training_step_cce_clipped, jit_training_step_inner, jit_training_step_inner_clipped,
+    jit_training_step_packed, jit_training_step_packed_cce,
 };
 
 /// Training loop configuration.

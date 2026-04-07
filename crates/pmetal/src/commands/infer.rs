@@ -596,9 +596,15 @@ pub(crate) async fn run_inference(
                 token_buf.push(token_id);
                 if let Ok(text) = tokenizer.decode(&token_buf) {
                     if text.len() > streamed_text.len() {
-                        let delta = &text[streamed_text.len()..];
-                        let _ = std::io::stdout().write_all(delta.as_bytes());
-                        let _ = std::io::stdout().flush();
+                        // Tokenizer may retroactively change multi-byte chars
+                        // (e.g. replacement char → full emoji), so the old byte
+                        // offset can land mid-character in the new string.
+                        let start = text.ceil_char_boundary(streamed_text.len());
+                        if start < text.len() {
+                            let delta = &text[start..];
+                            let _ = std::io::stdout().write_all(delta.as_bytes());
+                            let _ = std::io::stdout().flush();
+                        }
                     }
                     streamed_text = text;
                 }
@@ -629,9 +635,15 @@ pub(crate) async fn run_inference(
                 token_buf.push(token_id);
                 if let Ok(text) = tokenizer.decode(&token_buf) {
                     if text.len() > streamed_text.len() {
-                        let delta = &text[streamed_text.len()..];
-                        let _ = std::io::stdout().write_all(delta.as_bytes());
-                        let _ = std::io::stdout().flush();
+                        // Tokenizer may retroactively change multi-byte chars
+                        // (e.g. replacement char → full emoji), so the old byte
+                        // offset can land mid-character in the new string.
+                        let start = text.ceil_char_boundary(streamed_text.len());
+                        if start < text.len() {
+                            let delta = &text[start..];
+                            let _ = std::io::stdout().write_all(delta.as_bytes());
+                            let _ = std::io::stdout().flush();
+                        }
                     }
                     streamed_text = text;
                 }

@@ -76,9 +76,8 @@ fn main() {
             );
         }
     } else if metal4_dir.exists() {
-        println!(
-            "cargo:warning=Metal 4 shaders found but toolchain too old (Metal version {metal_version}, SDK {sdk_version}). Skipping MPP kernels."
-        );
+        // Metal 4 shaders present but toolchain lacks support — expected on SDK < 27.
+        // Not a warning; just skip silently.
     }
 
     // Declare has_metal4 cfg for check-cfg lint

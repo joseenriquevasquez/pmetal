@@ -24,7 +24,8 @@ use std::rc::Rc;
 
 use pmetal_bridge::array;
 use pmetal_bridge::compat::{
-    Array, Exception,
+    Array, Exception, FlattenedModuleParam,
+    module::{ModuleParameters, ModuleParametersExt},
     optimizers::{AdamW, AdamWBuilder, Optimizer, State, Updatable},
 };
 type Result<T> = std::result::Result<T, Exception>;
@@ -283,6 +284,31 @@ impl Optimizer for AdamWGroups {
             }
             ParamClass::Regular => self.lora_optimizer.update_single(key, gradient, parameter),
         }
+    }
+
+    fn update<M: ModuleParameters>(
+        &mut self,
+        model: &mut M,
+        gradients: FlattenedModuleParam,
+    ) -> Result<()> {
+        // Advance step counter on ALL sub-optimizers ONCE per training step.
+        // Each sub-optimizer tracks its own bias-correction term (1 - β^t),
+        // so all must share the same step count regardless of how many
+        // parameters they individually handle.
+        self.lora_optimizer.advance_step();
+        self.embedding_optimizer.advance_step();
+        self.no_decay_optimizer.advance_step();
+        if let Some(ref mut b_opt) = self.loraplus_b_optimizer {
+            b_opt.advance_step();
+        }
+
+        let mut flat = model.flatten_params_mut();
+        for (key, grad) in &gradients {
+            if let Some(arr) = flat.get_mut(key.as_ref()) {
+                let _ = self.update_single(key, grad, arr);
+            }
+        }
+        Ok(())
     }
 }
 

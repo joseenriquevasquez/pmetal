@@ -26,4 +26,3 @@ pub mod deepseek_native;
 pub mod gpt_oss_native;
 pub mod llama4_native;
 pub mod qwen3_native;
-pub mod qwen3_train;

@@ -138,7 +138,9 @@ fn build_and_link() {
         // macOS ar doesn't support -D (deterministic mode). Override CMake's
         // default archive commands to avoid "illegal option" warnings.
         config.define("CMAKE_C_ARCHIVE_CREATE", "<CMAKE_AR> cr <TARGET> <OBJECTS>");
+        config.define("CMAKE_C_ARCHIVE_APPEND", "<CMAKE_AR> r <TARGET> <OBJECTS>");
         config.define("CMAKE_CXX_ARCHIVE_CREATE", "<CMAKE_AR> cr <TARGET> <OBJECTS>");
+        config.define("CMAKE_CXX_ARCHIVE_APPEND", "<CMAKE_AR> r <TARGET> <OBJECTS>");
     }
 
     // Metal + Accelerate mirror the features this crate exposes

@@ -524,7 +524,7 @@ pub fn quantized_sdpa_with_qjl(
 /// it disabled here.
 fn begin_generation_session_impl(
     tag: &str,
-    model_dtype: i32,
+    _model_dtype: i32,
     reset_peak_memory: bool,
     log_session: bool,
 ) {

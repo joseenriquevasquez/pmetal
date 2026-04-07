@@ -272,9 +272,23 @@ impl AdamW {
         }
     }
 
-    /// Update a single parameter in-place given its gradient.
-    pub fn step_single(&mut self, name: &str, gradient: &InlineArray, parameter: &mut InlineArray) {
+    /// Advance the global step counter by one.
+    ///
+    /// Must be called **once per training step** before calling [`step_single`]
+    /// for each parameter.  The batch method [`step`] calls this automatically;
+    /// callers that use `step_single` in a loop must call `advance_step` once
+    /// before the loop.
+    pub fn advance_step(&mut self) {
         self.step_count_inner += 1;
+    }
+
+    /// Update a single parameter in-place given its gradient.
+    ///
+    /// **Important**: call [`advance_step`] once before iterating over
+    /// parameters.  This method does *not* increment the step counter —
+    /// doing so would corrupt the Adam bias-correction terms when multiple
+    /// parameters are updated in one training step.
+    pub fn step_single(&mut self, name: &str, gradient: &InlineArray, parameter: &mut InlineArray) {
         let t = self.step_count_inner as f32;
 
         let class = (self.classifier)(name);

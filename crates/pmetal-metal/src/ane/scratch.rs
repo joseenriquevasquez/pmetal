@@ -36,12 +36,12 @@ impl BackwardScratch {
         #[cfg(debug_assertions)]
         let mut names = Vec::with_capacity(entries.len());
 
-        for &(name, len) in entries {
+        for &(_name, len) in entries {
             regions.push((offset, len));
             offset += len;
             #[cfg(debug_assertions)]
             {
-                names.push(name);
+                names.push(_name);
             }
         }
 

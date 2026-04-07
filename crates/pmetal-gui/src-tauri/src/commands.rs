@@ -1729,12 +1729,15 @@ async fn run_inference_streaming(
             token_buf.push(token_id);
             if let Ok(text) = tokenizer.decode(&token_buf) {
                 if text.len() > streamed_text.len() {
-                    let delta = &text[streamed_text.len()..];
-                    if !delta.is_empty() {
-                        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                            return false;
+                    let start = text.ceil_char_boundary(streamed_text.len());
+                    if start < text.len() {
+                        let delta = &text[start..];
+                        if !delta.is_empty() {
+                            if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                                return false;
+                            }
+                            let _ = app_handle.emit("inference-token", delta);
                         }
-                        let _ = app_handle.emit("inference-token", delta);
                     }
                 }
                 streamed_text = text;

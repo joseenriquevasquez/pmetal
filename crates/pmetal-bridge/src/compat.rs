@@ -2224,6 +2224,14 @@ pub mod optimizers {
                 state: HashMap::new(),
             }
         }
+
+        /// Advance the inner optimizer's step counter by one.
+        ///
+        /// Must be called once per training step before calling `update_single`
+        /// in a loop. The [`Optimizer::update`] override does this automatically.
+        pub fn advance_step(&mut self) {
+            self.inner.advance_step();
+        }
     }
 
     impl Optimizer for AdamW {
@@ -2248,6 +2256,21 @@ pub mod optimizers {
                     key.clone(),
                     (inner_state.m.clone(), inner_state.v.clone()),
                 );
+            }
+            Ok(())
+        }
+        fn update<M: ModuleParameters>(
+            &mut self,
+            model: &mut M,
+            gradients: FlattenedModuleParam,
+        ) -> Result<(), Exception> {
+            // Advance the step counter ONCE per training step, not per parameter.
+            self.inner.advance_step();
+            let mut flat = model.flatten_params_mut();
+            for (key, grad) in &gradients {
+                if let Some(arr) = flat.get_mut(key.as_ref()) {
+                    let _ = self.update_single(key, grad, arr);
+                }
             }
             Ok(())
         }

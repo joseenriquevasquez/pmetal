@@ -1,5 +1,5 @@
 use pmetal_bridge::compat::{
-    Array, Exception,
+    Array, Exception, FlattenedModuleParam,
     module::{ModuleParameters, ModuleParametersExt},
     nn, ops,
     optimizers::{Optimizer, Updatable},
@@ -7,6 +7,24 @@ use pmetal_bridge::compat::{
 };
 use pmetal_data::PackedTrainingBatch;
 use pmetal_lora::TrainableModel;
+
+/// Clip gradients by global L2 norm (GPU-based, lazy).
+///
+/// Same algorithm as `TrainingLoop::clip_gradients_gpu` but usable from
+/// standalone step functions.
+fn clip_grads(grads: &mut FlattenedModuleParam, max_norm: f32) {
+    let mut norm_sq = Array::from_f32(0.0);
+    for grad in grads.values() {
+        norm_sq = norm_sq.add(&grad.multiply(grad).sum(None));
+    }
+    let norm = norm_sq.sqrt();
+    let max_norm_arr = Array::from_f32(max_norm);
+    let norm_clamped = ops::maximum(&norm, &max_norm_arr);
+    let scale = max_norm_arr.divide(&norm_clamped);
+    for grad in grads.values_mut() {
+        *grad = grad.multiply(&scale);
+    }
+}
 
 /// JIT-compiled training step for maximum throughput.
 ///
@@ -27,6 +45,19 @@ pub(crate) fn jit_training_step_inner<M: TrainableModel, O: Optimizer>(
     state: &mut (M, O),
     (input_ids, labels): (&Array, &Array),
     neftune_alpha: Option<f32>,
+) -> std::result::Result<Array, Exception> {
+    jit_training_step_inner_clipped(state, (input_ids, labels), neftune_alpha, 0.0)
+}
+
+/// Inner implementation with optional gradient clipping.
+///
+/// When `max_grad_norm > 0`, gradients are clipped by global L2 norm before
+/// the optimizer step. Pass `0.0` to disable clipping.
+pub(crate) fn jit_training_step_inner_clipped<M: TrainableModel, O: Optimizer>(
+    state: &mut (M, O),
+    (input_ids, labels): (&Array, &Array),
+    neftune_alpha: Option<f32>,
+    max_grad_norm: f32,
 ) -> std::result::Result<Array, Exception> {
     let (model, optimizer) = state;
 
@@ -51,7 +82,12 @@ pub(crate) fn jit_training_step_inner<M: TrainableModel, O: Optimizer>(
 
     // Compute loss and gradients
     let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-    let (loss, grads) = loss_and_grad_fn(model, (input_ids, labels))?;
+    let (loss, mut grads) = loss_and_grad_fn(model, (input_ids, labels))?;
+
+    // Clip gradients by global L2 norm
+    if max_grad_norm > 0.0 {
+        clip_grads(&mut grads, max_grad_norm);
+    }
 
     // Apply gradients via optimizer
     optimizer.update(model, grads)?;
@@ -169,12 +205,18 @@ pub(crate) fn jit_training_step_cce<M: TrainableModel, O: Optimizer>(
     (input_ids, labels): (&Array, &Array),
     neftune_alpha: Option<f32>,
 ) -> std::result::Result<Array, Exception> {
+    jit_training_step_cce_clipped(state, (input_ids, labels), neftune_alpha, 0.0)
+}
+
+/// CCE training step with optional gradient clipping.
+pub(crate) fn jit_training_step_cce_clipped<M: TrainableModel, O: Optimizer>(
+    state: &mut (M, O),
+    (input_ids, labels): (&Array, &Array),
+    neftune_alpha: Option<f32>,
+    max_grad_norm: f32,
+) -> std::result::Result<Array, Exception> {
     let (model, optimizer) = state;
 
-    // Fetch the LM head weight once.  This both serves as a capability probe and
-    // provides the weight to capture into the closure, avoiding a second call inside
-    // the gradient computation graph where calling lm_head_weight() again would clone
-    // the array a second time unnecessarily.
     let lm_weight_cached = model.lm_head_weight();
     let has_cce_support = lm_weight_cached.is_some();
 
@@ -210,12 +252,15 @@ pub(crate) fn jit_training_step_cce<M: TrainableModel, O: Optimizer>(
         };
 
         let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-        let (loss, grads) = loss_and_grad_fn(model, (input_ids, labels))?;
+        let (loss, mut grads) = loss_and_grad_fn(model, (input_ids, labels))?;
+        if max_grad_norm > 0.0 {
+            clip_grads(&mut grads, max_grad_norm);
+        }
         optimizer.update(model, grads)?;
         Ok(loss)
     } else {
         // NEFTune active or model doesn't support CCE — use standard path.
-        jit_training_step_inner(state, (input_ids, labels), neftune_alpha)
+        jit_training_step_inner_clipped(state, (input_ids, labels), neftune_alpha, max_grad_norm)
     }
 }
 
