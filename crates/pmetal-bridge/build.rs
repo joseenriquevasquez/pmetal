@@ -201,22 +201,35 @@ fn build_and_link() {
     println!("cargo:rustc-env=PMETAL_BRIDGE_MLX_GIT_TAG={BUNDLED_MLX_GIT_TAG}");
     emit_bridge_metadata("mlx_lib_dir", mlx_lib_dir.display().to_string());
 
-    // ── Compile bridge.cpp via cc::Build ──
+    // ── Compile bridge C++ sources via cc::Build ──
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let bridge_src = manifest_dir.join("cpp/bridge.cpp");
     let mlx_include = dst.join("build/_deps/mlx-src");
 
     #[cfg(target_os = "macos")]
     let deploy_target = resolve_deployment_target();
 
+    let bridge_sources = [
+        "bridge.cpp",
+        "bridge_inference.cpp",
+        "bridge_turboquant.cpp",
+        "bridge_compiled.cpp",
+        "bridge_native.cpp",
+        "bridge_training.cpp",
+    ];
+
     let mut build = cc::Build::new();
     build
         .cpp(true)
-        .std("c++20")
-        .file(&bridge_src)
+        .std("c++20");
+
+    for src in &bridge_sources {
+        build.file(manifest_dir.join("cpp").join(src));
+    }
+
+    build
         // MLX C++ headers (mlx/mlx.h)
         .include(&mlx_include)
-        // bridge.h lives alongside bridge.cpp
+        // bridge.h / bridge_internal.h live alongside the source files
         .include(manifest_dir.join("cpp"))
         .flag("-w") // suppress warnings from MLX internals
         .flag("-flto=thin") // LTO matches Python's MLX pip wheel build
@@ -301,8 +314,11 @@ fn build_and_link() {
     }
 
     // ── Rerun triggers ──
-    println!("cargo:rerun-if-changed=cpp/bridge.cpp");
+    for src in &bridge_sources {
+        println!("cargo:rerun-if-changed=cpp/{src}");
+    }
     println!("cargo:rerun-if-changed=cpp/bridge.h");
+    println!("cargo:rerun-if-changed=cpp/bridge_internal.h");
     println!("cargo:rerun-if-changed=cmake/CMakeLists.txt");
     println!("cargo:rerun-if-changed=patches/metallib-search-path.patch");
     println!("cargo:rerun-if-changed=patches/slice-output-shapes.patch");
@@ -311,7 +327,6 @@ fn build_and_link() {
 fn main() {
     // Ensure Cargo re-runs build.rs when C++ sources change.
     // Without this, edits to bridge.cpp/bridge.h produce stale binaries.
-    println!("cargo:rerun-if-changed=cpp/bridge.cpp");
-    println!("cargo:rerun-if-changed=cpp/bridge.h");
+    println!("cargo:rerun-if-changed=cpp/");  // any change in cpp/ dir
     build_and_link();
 }
