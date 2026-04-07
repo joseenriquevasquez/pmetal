@@ -302,6 +302,22 @@ pub fn run_native_inference(
     turboquant: Option<TurboQuantConfig>,
     mut on_token: impl FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
+    run_native_inference_ext(
+        model_path, input_ids, max_tokens, temperature,
+        turboquant, None, &mut on_token,
+    )
+}
+
+/// Extended native inference with optional affine KV cache quantization.
+pub fn run_native_inference_ext(
+    model_path: &Path,
+    input_ids: &[u32],
+    max_tokens: usize,
+    temperature: f32,
+    turboquant: Option<TurboQuantConfig>,
+    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
+    mut on_token: impl FnMut(u32) -> bool,
+) -> Result<NativeGenerationOutput, String> {
     let arch = detect_arch(model_path)
         .ok_or_else(|| "unsupported architecture for native inference".to_string())?;
 
@@ -321,6 +337,7 @@ pub fn run_native_inference(
             max_tokens,
             temperature,
             turboquant,
+            quant_config,
             &mut on_token,
         ),
         NativeArch::Llama4 => run_llama4(
@@ -480,6 +497,7 @@ fn run_qwen3(
     max_tokens: usize,
     temperature: f32,
     turboquant: Option<TurboQuantConfig>,
+    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
     use pmetal_bridge::qwen3_native;
@@ -504,8 +522,16 @@ fn run_qwen3(
                 },
             )
         },
-        qwen3_native::load_model,
-        |weights, _| build_qwen3_cache(weights, turboquant),
+        |path, config| {
+            let mut weights = qwen3_native::load_model(path, config)?;
+            // Apply Hadamard preconditioning when affine KV cache quantization is enabled.
+            // Absorbs random rotation into Q/K/V/O weights for better quantization quality.
+            if quant_config.is_some() {
+                qwen3_native::apply_kv_preconditioning(&mut weights);
+            }
+            Ok(weights)
+        },
+        |weights, _| build_qwen3_cache_with_quant(weights, turboquant, quant_config),
         qwen3_native::prefill_first_token,
         |weights, config, cache, first_tok, remaining, temperature, on_token| {
             qwen3_native::generate_canonical(
@@ -526,12 +552,27 @@ fn build_qwen3_cache(
     weights: &pmetal_bridge::qwen3_native::NativeWeights,
     turboquant: Option<TurboQuantConfig>,
 ) -> pmetal_bridge::qwen3_native::NativeCache {
-    match turboquant {
+    build_qwen3_cache_with_quant(weights, turboquant, None)
+}
+
+fn build_qwen3_cache_with_quant(
+    weights: &pmetal_bridge::qwen3_native::NativeWeights,
+    turboquant: Option<TurboQuantConfig>,
+    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
+) -> pmetal_bridge::qwen3_native::NativeCache {
+    let mut cache = match turboquant {
         Some(config) => {
             pmetal_bridge::qwen3_native::NativeCache::new_with_turboquant(weights, Some(config))
         }
         None => pmetal_bridge::qwen3_native::NativeCache::new_empty(weights),
+    };
+    // Apply zero-overhead affine quantization config to all KV layers
+    if let Some(qcfg) = quant_config {
+        for kv in &mut cache.kv_caches {
+            kv.quant_config = Some(qcfg);
+        }
     }
+    cache
 }
 
 /// Benchmark full prompt + generation throughput using the same workload shape

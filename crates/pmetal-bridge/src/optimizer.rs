@@ -42,11 +42,11 @@ pub enum ParamClass {
 }
 
 /// Per-parameter first and second Adam moment arrays.
-struct AdamState {
+pub struct AdamState {
     /// First moment (exponential moving average of gradients).
-    m: InlineArray,
+    pub m: InlineArray,
     /// Second moment (exponential moving average of squared gradients).
-    v: InlineArray,
+    pub v: InlineArray,
 }
 
 /// AdamW optimizer with support for parameter groups and LoRA+.
@@ -70,7 +70,7 @@ pub struct AdamW {
     beta2: f32,
     eps: f32,
     step_count_inner: u64,
-    states: HashMap<String, AdamState>,
+    pub states: HashMap<String, AdamState>,
     /// Maps a parameter name to its [`ParamClass`].
     classifier: Box<dyn Fn(&str) -> ParamClass + Send>,
 }

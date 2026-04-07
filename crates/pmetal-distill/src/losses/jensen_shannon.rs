@@ -380,7 +380,7 @@ mod tests {
         };
 
         let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
-        let (mut loss_val_arr, mut grads) =
+        let (loss_val_arr, grads) =
             value_and_grad_explicit(loss_fn, &[student], &[]).unwrap();
 
         loss_val_arr.eval();

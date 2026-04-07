@@ -235,7 +235,7 @@ mod tests {
     fn test_view_f32() {
         let ctx = MetalContext::new().unwrap();
         let array = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
-        let mut evaled = array.clone();
+        let evaled = array.clone();
         evaled.eval();
 
         let view = MlxMetalBridge::view_f32(&ctx, &array).unwrap();

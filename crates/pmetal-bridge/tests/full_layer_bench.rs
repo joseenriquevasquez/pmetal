@@ -4,7 +4,7 @@ use std::time::Instant;
 /// Create a materialized weight tensor (full Metal buffer, not broadcast).
 fn real_w(shape: &[i32], dtype: i32) -> InlineArray {
     let n: i32 = shape.iter().product();
-    let mut w = InlineArray::arange(n, dtype).reshape(shape);
+    let w = InlineArray::arange(n, dtype).reshape(shape);
     w.eval();
     w
 }
@@ -14,7 +14,7 @@ fn real_w(shape: &[i32], dtype: i32) -> InlineArray {
 /// This creates a column-major view, exactly like ia_from_array(weight).t()
 fn real_wt(in_dim: i32, out_dim: i32, dtype: i32) -> InlineArray {
     let n = in_dim * out_dim;
-    let mut w = InlineArray::arange(n, dtype)
+    let w = InlineArray::arange(n, dtype)
         .reshape(&[out_dim, in_dim])
         .t();
     w.eval();
@@ -225,13 +225,13 @@ fn full_layer_forward() {
 
     // Warmup simplified
     for i in 0..5 {
-        let mut r = simplified_step(i);
+        let r = simplified_step(i);
         r.eval();
     }
     let mut times_a = Vec::new();
     for i in 0..30 {
         let t0 = Instant::now();
-        let mut r = simplified_step(100 + i);
+        let r = simplified_step(100 + i);
         r.eval();
         times_a.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
@@ -240,13 +240,13 @@ fn full_layer_forward() {
 
     // Warmup full
     for i in 0..5 {
-        let mut r = full_step(i, &mut gdn_states, &mut conv_states);
+        let r = full_step(i, &mut gdn_states, &mut conv_states);
         r.eval();
     }
     let mut times_b = Vec::new();
     for i in 0..30 {
         let t0 = Instant::now();
-        let mut r = full_step(200 + i, &mut gdn_states, &mut conv_states);
+        let r = full_step(200 + i, &mut gdn_states, &mut conv_states);
         r.eval();
         times_b.push(t0.elapsed().as_secs_f64() * 1000.0);
     }

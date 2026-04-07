@@ -4,13 +4,13 @@ use std::time::Instant;
 fn bench_eval(label: &str, mut setup: impl FnMut() -> InlineArray, iters: usize) {
     // Warm up
     for _ in 0..3 {
-        let mut r = setup();
+        let r = setup();
         r.eval();
     }
     // Measure
     let mut times = Vec::new();
     for _ in 0..iters {
-        let mut r = setup();
+        let r = setup();
         let t0 = Instant::now();
         r.eval();
         times.push(t0.elapsed().as_secs_f64() * 1000.0);

@@ -23,17 +23,17 @@ fn native_weight_forward() {
     let down_w = load_w("model.language_model.layers.0.mlp.down_proj.weight");
 
     // Transpose projection weights (matching the model's pattern)
-    let mut gate_wt = gate_w.t();
+    let gate_wt = gate_w.t();
     gate_wt.eval();
-    let mut up_wt = up_w.t();
+    let up_wt = up_w.t();
     up_wt.eval();
-    let mut down_wt = down_w.t();
+    let down_wt = down_w.t();
     down_wt.eval();
 
     // Eval all
-    let mut e = embed_w.clone();
+    let e = embed_w.clone();
     e.eval();
-    let mut l = ln_w.clone();
+    let l = ln_w.clone();
     l.eval();
 
     eprintln!(
@@ -95,14 +95,14 @@ fn native_weight_forward() {
 
     // Warmup
     for i in 0..5 {
-        let mut r = run_step(42 + i);
+        let r = run_step(42 + i);
         r.eval();
     }
 
     let mut times = Vec::new();
     for i in 0..30 {
         let t0 = Instant::now();
-        let mut r = run_step(100 + i);
+        let r = run_step(100 + i);
         r.eval();
         times.push(t0.elapsed().as_secs_f64() * 1000.0);
     }

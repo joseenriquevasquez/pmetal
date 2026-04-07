@@ -757,8 +757,16 @@ impl DeepSeekMoE {
     }
 
     fn current_stacked_weight_signature(&self) -> Vec<usize> {
+        // SAFETY: `data_ptr()` calls `array.data<void>()` which accesses
+        // `array_desc_->data->buffer`.  For lazy (unevaluated) arrays the
+        // `data` shared_ptr is null, causing a null-dereference.  Evaluate
+        // each weight first so that the buffer is materialised before we read
+        // its address.
         let mut signature = Vec::with_capacity(self.moe.experts.len() * 3);
         for expert in &self.moe.experts {
+            expert.w1.weight.as_ref().eval();
+            expert.w3.weight.as_ref().eval();
+            expert.w2.weight.as_ref().eval();
             signature.push(expert.w1.weight.as_ref().data_ptr() as usize);
             signature.push(expert.w3.weight.as_ref().data_ptr() as usize);
             signature.push(expert.w2.weight.as_ref().data_ptr() as usize);
@@ -1221,7 +1229,14 @@ mod tests {
     use serial_test::serial;
 
     fn tiny_deepseek_moe_config() -> DeepSeekConfig {
+        // All attention dimensions are proportional to hidden_size=16 so that
+        // projection shapes are consistent when the full model is constructed.
+        // Without these overrides the inherited defaults (kv_lora_rank=512,
+        // q_lora_rank=1536, qk_nope_head_dim=128, v_head_dim=128) produce
+        // cache sizes that don't match the actual tensor shapes, causing SIGSEGV
+        // in the turboquant Metal kernels.
         DeepSeekConfig {
+            vocab_size: 512,
             hidden_size: 16,
             intermediate_size: 32,
             moe_intermediate_size: 24,
@@ -1233,6 +1248,13 @@ mod tests {
             num_experts_per_tok: 2,
             moe_layer_freq: 1,
             first_k_dense_replace: 0,
+            // Attention dimensions: q_head_dim = qk_nope_head_dim + qk_rope_head_dim = 32+32=64.
+            // cache head_dim = 64, value_head_dim = 32.
+            kv_lora_rank: 8,
+            q_lora_rank: Some(16),
+            qk_nope_head_dim: 32,
+            qk_rope_head_dim: 32,
+            v_head_dim: 32,
             ..DeepSeekConfig::default()
         }
     }

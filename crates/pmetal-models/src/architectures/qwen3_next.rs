@@ -942,11 +942,11 @@ impl Qwen3NextGatedDeltaNet {
         let conv_kernel_size = config.linear_conv_kernel_dim;
 
         let conv_dim = key_dim * 2 + value_dim;
-        // Depthwise conv1d: groups=conv_dim, so each group has in_channels/groups=1
-        // Conv1dBuilder doesn't divide in_channels by groups for the weight shape,
-        // so we pass in_channels=1 to get weight shape [conv_dim, kernel, 1].
-        // When loading pretrained weights, sanitize_weights transposes as needed.
-        let conv1d = nn::Conv1dBuilder::new(1, conv_dim, conv_kernel_size)
+        // Depthwise conv1d: in_channels = out_channels = conv_dim, groups = conv_dim.
+        // Weight shape: [conv_dim, kernel, in_channels/groups] = [conv_dim, kernel, 1].
+        // Using in_channels=1 would give in_channels/groups = 1/conv_dim = 0 (integer
+        // division), producing a zero-size weight and crashing during eval.
+        let conv1d = nn::Conv1dBuilder::new(conv_dim, conv_dim, conv_kernel_size)
             .bias(false)
             .groups(conv_dim)
             .padding(0)
@@ -1044,6 +1044,15 @@ impl Qwen3NextGatedDeltaNet {
     }
 
     fn current_input_proj_signature(&self) -> Vec<usize> {
+        // SAFETY: `data_ptr()` calls `array.data<void>()` which accesses
+        // `array_desc_->data->buffer`. For lazy (unevaluated) arrays the
+        // `data` shared_ptr is null, causing a null-dereference. Evaluate
+        // each weight first so that the buffer is materialised before we read
+        // its address.
+        self.in_proj_qkv.weight.as_ref().eval();
+        self.in_proj_z.weight.as_ref().eval();
+        self.in_proj_b.weight.as_ref().eval();
+        self.in_proj_a.weight.as_ref().eval();
         vec![
             self.in_proj_qkv.weight.as_ref().data_ptr() as usize,
             self.in_proj_z.weight.as_ref().data_ptr() as usize,
@@ -1959,6 +1968,10 @@ impl Qwen3NextSparseMoeBlock {
     }
 
     fn current_shared_input_proj_signature(&self) -> Vec<usize> {
+        // SAFETY: same as current_input_proj_signature — evaluate before data_ptr().
+        self.shared_expert.gate_proj.weight.as_ref().eval();
+        self.shared_expert.up_proj.weight.as_ref().eval();
+        self.shared_expert_gate.weight.as_ref().eval();
         vec![
             self.shared_expert.gate_proj.weight.as_ref().data_ptr() as usize,
             self.shared_expert.up_proj.weight.as_ref().data_ptr() as usize,
@@ -2088,38 +2101,49 @@ impl Qwen3NextSparseMoeBlock {
             top_weights
         };
 
-        // SwitchGLU forward using gather_mm
+        // SwitchGLU forward using gather_mm — matches mlx-lm switch_layers.py
         // x_flat: [N, D], indices: [N, k]
         let top_indices_i32 = top_indices.cast(pmetal_bridge::compat::Dtype::Int32);
 
-        // gather_mm: batch matmul with expert selection
+        // Reshape [N, D] → [N, 1, 1, D] — matches mlx-lm's expand_dims(-2, -3).
+        // Critical for gather_mm batch dimension semantics — without this,
+        // M=N gets preserved in output producing [N, k, N, out] instead of [N, k, 1, out].
+        let x_expanded = x_flat.reshape(&[batch_seq, 1, 1, hidden]);
+
+        // Weights are stored as [E, out, in] from checkpoint; gather_mm expects
+        // A[..., M, K] @ B[E, K, N], so we transpose the last two dims (like mlx-lm's
+        // SwitchLinear which calls weight.swapaxes(-1, -2) at forward time).
+        let gate_w = self.switch_mlp_gate_proj.as_ref().swap_axes(-1, -2);
+        let up_w = self.switch_mlp_up_proj.as_ref().swap_axes(-1, -2);
         let gate_out = gather_mm(
-            &x_flat,
-            self.switch_mlp_gate_proj.as_ref(),
+            &x_expanded,
+            &gate_w,
             None,
             Some(&top_indices_i32),
             false,
-        )?; // [N, k, intermediate]
+        )?; // [N, k, 1, intermediate]
         let up_out = gather_mm(
-            &x_flat,
-            self.switch_mlp_up_proj.as_ref(),
+            &x_expanded,
+            &up_w,
             None,
             Some(&top_indices_i32),
             false,
-        )?; // [N, k, intermediate]
+        )?; // [N, k, 1, intermediate]
 
         let activated = nn::silu(&gate_out).multiply(&up_out);
 
-        // Down projection — gather_mm handles [N, k, intermediate] directly with
-        // rhs_indices [N, k], selecting per-expert weight for each (token, slot) pair.
-        // No reshape needed (saves 3 graph nodes per MoE layer).
+        // Down projection
+        let down_w = self.switch_mlp_down_proj.as_ref().swap_axes(-1, -2);
         let down_out = gather_mm(
             &activated,
-            self.switch_mlp_down_proj.as_ref(),
+            &down_w,
             None,
             Some(&top_indices_i32),
             false,
-        )?;
+        )?; // [N, k, 1, D]
+
+        // squeeze(-2) removes the size-1 dim: [N, k, 1, D] → [N, k, D]
+        let down_out = down_out.squeeze_axes(&[-2]);
 
         // Shared expert forward + gate logit
         let (shared_y, shared_gate_logit) = self.forward_shared_expert_and_gate(&x_flat)?;
@@ -4231,7 +4255,7 @@ mod tests {
             &[1, 4, 32],
             pmetal_bridge::compat::Dtype::Float32,
         );
-        let mut output = mlp.forward(&x).unwrap();
+        let output = mlp.forward(&x).unwrap();
         assert_eq!(output.shape(), &[1, 4, 32]);
     }
 
@@ -4293,7 +4317,7 @@ mod tests {
             &[1, 4, 32],
             pmetal_bridge::compat::Dtype::Float32,
         );
-        let mut output = attn.forward(&x, None, None).unwrap();
+        let output = attn.forward(&x, None, None).unwrap();
         assert_eq!(output.shape(), &[1, 4, 32]);
     }
 
@@ -4329,7 +4353,7 @@ mod tests {
             &[1, 4, 32],
             pmetal_bridge::compat::Dtype::Float32,
         );
-        let mut output = gdn.forward(&x, None, None).unwrap();
+        let output = gdn.forward(&x, None, None).unwrap();
         assert_eq!(output.shape(), &[1, 4, 32]);
     }
 
@@ -4395,6 +4419,9 @@ mod tests {
             .unwrap()
             .cast(pmetal_bridge::compat::Dtype::Float32)
             .unwrap();
+        // cast() is lazy; evaluate before reading via as_slice() to avoid a
+        // null-dereference inside Buffer::raw_ptr on an unevaluated array.
+        shifted.eval();
         let shifted_vec: Vec<f32> = shifted.as_slice().to_vec();
         assert_eq!(shifted_vec, vec![1.25, 0.5, 2.0]);
     }
@@ -4598,7 +4625,7 @@ mod tests {
     fn test_gdn_decode_linear_projection_matches_linear_forward() {
         let mut config = tiny_config();
         config.hidden_size = 4096;
-        let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
+        let gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
         let x = pmetal_bridge::compat::random::normal(
             &[1, 1, 4096],
             pmetal_bridge::compat::Dtype::Float32,
@@ -4715,7 +4742,7 @@ mod tests {
     #[test]
     fn test_gdn_decode_out_projection_matches_linear_forward() {
         let config = tiny_config();
-        let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
+        let gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
         let out = pmetal_bridge::compat::random::normal(
             &[1, 1, gdn.num_v_heads, gdn.head_v_dim],
             pmetal_bridge::compat::Dtype::Float32,
@@ -4724,7 +4751,7 @@ mod tests {
             .out_proj
             .forward(&out.reshape(&[1, 1, gdn.value_dim]).unwrap())
             .unwrap();
-        let mut projected = gdn.decode_out_projection(&out, 1).unwrap();
+        let projected = gdn.decode_out_projection(&out, 1).unwrap();
 
         reference.eval().unwrap();
         projected.eval().unwrap();
@@ -4872,7 +4899,7 @@ mod tests {
         let mut model = Qwen3NextForCausalLM::new(config).unwrap();
 
         let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
-        let mut logits = model.forward(&input_ids, None).unwrap();
+        let logits = model.forward(&input_ids, None).unwrap();
         assert_eq!(logits.shape(), &[1, 4, vocab_size]);
     }
 

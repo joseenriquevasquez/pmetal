@@ -479,8 +479,8 @@ fn fast_fused_sdpa(
         // Causal masking - use MLX's built-in causal mask
         (AttentionMaskType::Causal, None) => Ok(queries.sdpa(keys, values, config.scale, "causal")),
 
-        // No mask (bidirectional attention)
-        (AttentionMaskType::None, None) => Ok(queries.sdpa(keys, values, config.scale, "none")),
+        // No mask (bidirectional attention) — MLX accepts "" for no mask, not "none"
+        (AttentionMaskType::None, None) => Ok(queries.sdpa(keys, values, config.scale, "")),
 
         // Sliding window - create custom mask
         (AttentionMaskType::SlidingWindow(window_size), None) => {

@@ -582,7 +582,7 @@ mod tests {
     use pmetal_bridge::compat::{Array, Dtype, random};
 
     fn eval_item(arr: &Array) -> f32 {
-        let mut v = arr.clone();
+        let v = arr.clone();
         v.eval();
         v.item_f32()
     }

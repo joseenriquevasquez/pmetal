@@ -429,10 +429,12 @@ impl FalconH1Mamba {
             .bias(config.mamba_proj_bias)
             .build()?;
 
-        // Depthwise conv1d: use (1, conv_dim, kernel) with groups=conv_dim to get
-        // the correct MLX weight shape [conv_dim, kernel, 1].
+        // Depthwise conv1d: in_channels = out_channels = conv_dim, groups = conv_dim.
+        // This gives weight shape [conv_dim, kernel, in_channels/groups] = [conv_dim, kernel, 1],
+        // which matches the PyTorch depthwise conv weight after the [out, in/g, k] → [out, k, in/g]
+        // transpose applied during weight loading.
         // Padding is applied manually (causal left-padding) in forward().
-        let conv1d = nn::Conv1dBuilder::new(1, conv_dim, conv_kernel_size)
+        let conv1d = nn::Conv1dBuilder::new(conv_dim, conv_dim, conv_kernel_size)
             .groups(conv_dim)
             .bias(config.use_conv_bias)
             .padding(0)
@@ -1034,6 +1036,10 @@ mod tests {
     use super::*;
 
     fn small_config() -> FalconH1Config {
+        // mamba_head_dim must be a multiple of 32 for the fused Metal GDN kernel
+        // dispatch path (dk % 32 == 0 check in gated_delta.rs). Use mamba_num_heads=2
+        // with mamba_head_dim=32 to preserve mamba_intermediate_size=64 and
+        // mamba_conv_dim=128 so that the config-helper assertions remain correct.
         FalconH1Config {
             model_type: "falcon_h1".to_string(),
             vocab_size: 512,
@@ -1049,8 +1055,8 @@ mod tests {
             mamba_d_ssm: 16,
             mamba_d_conv: 4,
             mamba_n_groups: 2,
-            mamba_num_heads: 4,
-            mamba_head_dim: 16,
+            mamba_num_heads: 2,
+            mamba_head_dim: 32,
             mamba_proj_bias: false,
             use_conv_bias: true,
             time_step_limit: (0.0, f32::INFINITY),
@@ -1068,9 +1074,9 @@ mod tests {
     fn test_config_helpers() {
         let cfg = small_config();
         assert_eq!(cfg.head_dim(), 16);
-        // intermediate = 4 * 16 = 64
+        // intermediate = mamba_num_heads * mamba_head_dim = 2 * 32 = 64
         assert_eq!(cfg.mamba_intermediate_size(), 64);
-        // conv_dim = 64 + 2*2*16 = 128
+        // conv_dim = 64 + 2 * n_groups * d_ssm = 64 + 2*2*16 = 128
         assert_eq!(cfg.mamba_conv_dim(), 128);
         assert_eq!(cfg.attn_multiplier_for_layer(0), 0.5);
         assert_eq!(cfg.ssm_multiplier_for_layer(1), 0.5);

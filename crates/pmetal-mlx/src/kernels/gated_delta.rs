@@ -942,7 +942,7 @@ mod tests {
         let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
         let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
         let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
-        let a = random::normal(&[2, 4, 3], Dtype::Float32);
+        let a = random::normal(&[b, t, hv], Dtype::Float32);
         let b_input = random::normal(&[b, t, hv], Dtype::Float32);
         let a_log = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[hv]);
         let dt_bias = Array::from_f32_slice(&[0.1f32, 0.2, 0.3, 0.4], &[hv]);
@@ -976,7 +976,7 @@ mod tests {
         let beta = random::uniform(&[b, t, hv], Dtype::Float32);
 
         // Process all 4 steps at once
-        let (_y_full, mut state_full) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
+        let (_y_full, state_full) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
         // Process in two chunks of 2
         let q1 = q.slice(&[0, 0, 0, 0], &[b, 2, hk, dk]);
@@ -993,14 +993,14 @@ mod tests {
         let g2 = g.slice(&[0, 2, 0], &[b, t, hv]);
         let beta2 = beta.slice(&[0, 2, 0], &[b, t, hv]);
 
-        let (_y2, mut state2) =
+        let (_y2, state2) =
             gated_delta_ops(&q2, &k2, &v2, &g2, &beta2, Some(&state1), None).unwrap();
 
         // States should match
         state_full.eval();
         state2.eval();
         let diff = state_full.subtract(&state2).abs();
-        let mut max_diff = diff.max(None);
+        let max_diff = diff.max(None);
         max_diff.eval();
         let max_diff_val: f32 = max_diff.item();
         assert!(
@@ -1012,12 +1012,12 @@ mod tests {
 
     /// Helper: assert two arrays are close within tolerance, returning the max diff.
     fn assert_close(a: &Array, b: &Array, tol: f32, msg: &str) {
-        let mut a_eval = a.clone();
-        let mut b_eval = b.clone();
+        let a_eval = a.clone();
+        let b_eval = b.clone();
         a_eval.eval();
         b_eval.eval();
         let diff = a_eval.subtract(&b_eval).abs();
-        let mut max_diff = diff.max(None);
+        let max_diff = diff.max(None);
         max_diff.eval();
         let max_diff_val: f32 = max_diff.item();
         assert!(
@@ -1262,12 +1262,12 @@ mod tests {
         let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
         let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
         let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
-        let a = random::normal(&[2, 4, 3], Dtype::Float32);
+        let a = random::normal(&[b, t, hv], Dtype::Float32);
         let b_input = random::normal(&[b, t, hv], Dtype::Float32);
         let a_log = Array::from_f32_slice(&[0.5f32, 1.0], &[hv]);
         let dt_bias = Array::from_f32_slice(&[0.1f32, 0.2], &[hv]);
 
-        let (mut y, mut state) = gated_delta_update(
+        let (y, state) = gated_delta_update(
             &q, &k, &v, &a, &b_input, &a_log, &dt_bias, None, None, false,
         )
         .unwrap();
@@ -1432,7 +1432,7 @@ mod tests {
         let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
         let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
         let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
-        let a = random::normal(&[2, 4, 3], Dtype::Float32);
+        let a = random::normal(&[b, t, hv], Dtype::Float32);
         let b_in = random::normal(&[b, t, hv], Dtype::Float32);
         let a_log = random::normal(&[hv], Dtype::Float32).abs();
         let dt_bias = random::normal(&[hv], Dtype::Float32);
@@ -1479,7 +1479,7 @@ mod tests {
         let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
         let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
         let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
-        let a = random::normal(&[2, 4, 3], Dtype::Float32);
+        let a = random::normal(&[b, t, hv], Dtype::Float32);
         let b_in = random::normal(&[b, t, hv], Dtype::Float32);
         let a_log = random::normal(&[hv], Dtype::Float32).abs();
         let dt_bias = random::normal(&[hv], Dtype::Float32);

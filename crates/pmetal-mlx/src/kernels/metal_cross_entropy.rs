@@ -832,7 +832,7 @@ mod tests {
         let targets = Array::from_i32_slice(&[0i32, 5, 10, 15]).reshape(&[4]);
 
         let loss = fused_linear_cross_entropy_loss(&hidden, &weight, &targets, -100).unwrap();
-        let mut loss_eval = loss.clone();
+        let loss_eval = loss.clone();
         loss_eval.eval();
 
         let loss_value = loss_eval.item_f32();
@@ -861,7 +861,7 @@ mod tests {
             metal_fused_linear_cross_entropy(&ctx, &hidden, &weight, &targets, &config).unwrap();
 
         assert_eq!(output.n_valid, 2);
-        let mut loss_eval = output.loss.clone();
+        let loss_eval = output.loss.clone();
         loss_eval.eval();
         assert!(loss_eval.item_f32().is_finite());
     }
@@ -915,7 +915,7 @@ mod tests {
         let ctx = MetalCrossEntropyContext::new().unwrap();
         let config = MetalCrossEntropyConfig::new().with_ignore_index(-100);
 
-        let mut output =
+        let output =
             metal_fused_linear_cross_entropy(&ctx, &hidden, &weight, &targets, &config).unwrap();
         output.loss.eval();
 
@@ -943,7 +943,7 @@ mod tests {
 
         let targets = Array::from_slice(&[0i32, 1, 2, 3, 4, 5, 6, 7], &[8]);
 
-        let mut loss = fused_linear_cross_entropy_loss(&hidden, &weight, &targets, -100).unwrap();
+        let loss = fused_linear_cross_entropy_loss(&hidden, &weight, &targets, -100).unwrap();
         loss.eval();
 
         let loss_value = loss.item::<f32>();

@@ -166,6 +166,8 @@ pub struct InferenceGenState {
     cache: KVCache,
     mamba_cache: Option<MambaCache>,
     native_turboquant: Option<BridgeTurboQuantConfig>,
+    /// Zero-overhead affine KV cache quantization config for native path
+    native_quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
     /// Model directory path — used for native InlineArray weight loading
     /// (bypasses mlx-rs to avoid dual-MLX-instance 6x slowdown).
     model_path: PathBuf,
@@ -327,8 +329,8 @@ impl InferenceRunner {
         let max_seq_len = input_ids.len() + config.max_tokens + 64;
 
         let cache_request = cache_mode_request_from_config(&config);
-        let (model, cache, mamba_cache, native_turboquant) = if let Some(native_info) =
-            native_bridge_info
+        let (model, cache, mamba_cache, native_turboquant, native_quant_config) =
+            if let Some(native_info) = native_bridge_info
         {
             let base_cache_config = native_bridge_base_cache_config(native_info, max_seq_len);
             let cache_selection = select_cache_mode_with_working_set(
@@ -342,11 +344,22 @@ impl InferenceRunner {
                 log_cache_selection(&cache_selection, max_seq_len);
                 let cache = build_native_placeholder_cache(&base_cache_config);
                 let mamba_cache = Some(MambaCache::new(native_info.num_layers));
+                // Extract affine quant config from cache mode
+                let qcfg = match cache_selection.mode {
+                    CacheMode::Quantized { bits, group_size } => {
+                        Some(pmetal_bridge::qwen3_native::QuantCacheConfig {
+                            bits: bits as u8,
+                            group_size: group_size as i32,
+                        })
+                    }
+                    _ => None,
+                };
                 (
                     LoadedModel::NativeOnly,
                     cache,
                     mamba_cache,
                     turboquant_config_from_mode(native_info, cache_selection.mode),
+                    qcfg,
                 )
             } else {
                 tracing::info!(
@@ -371,7 +384,7 @@ impl InferenceRunner {
 
                 let cache = build_cache_from_base_config(&base_cache_config, cache_selection.mode);
                 let mamba_cache = m.create_mamba_cache();
-                (LoadedModel::Standard(m), cache, mamba_cache, None)
+                (LoadedModel::Standard(m), cache, mamba_cache, None, None)
             }
         } else if let Some(ref lora_path) = config.lora_path {
             #[cfg(feature = "lora")]
@@ -379,7 +392,7 @@ impl InferenceRunner {
                 let (lora_model, cache, mamba_cache, cache_selection) =
                     load_model_with_lora(model_path, lora_path, max_seq_len, &config)?;
                 log_cache_selection(&cache_selection, max_seq_len);
-                (LoadedModel::Lora(lora_model), cache, mamba_cache, None)
+                (LoadedModel::Lora(lora_model), cache, mamba_cache, None, None)
             }
             #[cfg(not(feature = "lora"))]
             {
@@ -405,7 +418,7 @@ impl InferenceRunner {
 
             let cache = build_cache_from_base_config(&base_cache_config, cache_selection.mode);
             let mamba_cache = m.create_mamba_cache();
-            (LoadedModel::Standard(m), cache, mamba_cache, None)
+            (LoadedModel::Standard(m), cache, mamba_cache, None, None)
         };
 
         Ok(Self {
@@ -417,6 +430,7 @@ impl InferenceRunner {
                 cache,
                 mamba_cache,
                 native_turboquant,
+                native_quant_config,
                 model_path: config.model_path.clone(),
             },
             chat_template_type: template_type,
@@ -481,12 +495,13 @@ impl InferenceGenState {
         if matches!(self.model, LoadedModel::NativeOnly) {
             let stop_tokens = self.gen_config.stop_tokens.clone();
             let mut on_token = on_token;
-            let output = crate::native_inference::run_native_inference(
+            let output = crate::native_inference::run_native_inference_ext(
                 &self.model_path,
                 &self.input_ids,
                 self.gen_config.max_new_tokens,
                 self.gen_config.temperature,
                 self.native_turboquant,
+                self.native_quant_config,
                 |token| forward_native_token(&stop_tokens, &mut on_token, token),
             )
             .map_err(Exception::custom)?;
@@ -778,6 +793,8 @@ fn native_cache_mode_supported(
     match mode {
         CacheMode::Standard => true,
         CacheMode::TurboQuant { .. } => info.supports_turboquant,
+        // Zero-overhead quantized KV cache via quantized_matmul (matches mlx-lm)
+        CacheMode::Quantized { bits, .. } => bits == 4 || bits == 8,
         _ => false,
     }
 }

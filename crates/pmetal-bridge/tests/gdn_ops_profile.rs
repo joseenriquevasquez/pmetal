@@ -3,12 +3,12 @@ use std::time::Instant;
 
 fn bench(label: &str, mut setup: impl FnMut() -> InlineArray, iters: usize) {
     for _ in 0..5 {
-        let mut r = setup();
+        let r = setup();
         r.eval();
     }
     let mut times = Vec::new();
     for _ in 0..iters {
-        let mut r = setup();
+        let r = setup();
         let t0 = Instant::now();
         r.eval();
         times.push(t0.elapsed().as_secs_f64() * 1000.0);
@@ -20,7 +20,7 @@ fn bench(label: &str, mut setup: impl FnMut() -> InlineArray, iters: usize) {
 
 fn bench2(label: &str, mut setup: impl FnMut() -> (InlineArray, InlineArray), iters: usize) {
     for _ in 0..5 {
-        let (mut a, mut b) = setup();
+        let (a, b) = setup();
         a.eval();
         b.eval();
     }

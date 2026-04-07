@@ -39,7 +39,7 @@ fn test_training_attention_forward_backward() {
     let config = FusedAttentionConfig::new(n_heads, n_kv_heads, head_dim);
 
     // Forward pass
-    let mut output = differentiable_attention(0, &queries, &keys, &values, &config)
+    let output = differentiable_attention(0, &queries, &keys, &values, &config)
         .expect("Forward pass failed");
 
     output.eval();
@@ -49,7 +49,7 @@ fn test_training_attention_forward_backward() {
     let d_output = random_tensor(&[batch, n_heads, seq_len, head_dim]);
 
     // Backward pass
-    let (mut d_q, mut d_k, mut d_v) =
+    let (d_q, d_k, d_v) =
         compute_attention_gradients(0, &d_output).expect("Backward pass failed");
 
     d_q.eval();
@@ -62,9 +62,9 @@ fn test_training_attention_forward_backward() {
     assert_eq!(d_v.shape(), &[batch, n_kv_heads, seq_len, head_dim]);
 
     // Verify gradients are non-zero (basic sanity check)
-    let mut d_q_sum = d_q.abs().sum(None);
-    let mut d_k_sum = d_k.abs().sum(None);
-    let mut d_v_sum = d_v.abs().sum(None);
+    let d_q_sum = d_q.abs().sum(None);
+    let d_k_sum = d_k.abs().sum(None);
+    let d_v_sum = d_v.abs().sum(None);
 
     d_q_sum.eval();
     d_k_sum.eval();
@@ -98,15 +98,15 @@ fn test_with_training_mode_helper() {
         let config = FusedAttentionConfig::new(n_heads, n_kv_heads, head_dim);
 
         // Forward pass
-        let mut output = differentiable_attention(0, &queries, &keys, &values, &config)?;
+        let output = differentiable_attention(0, &queries, &keys, &values, &config)?;
         output.eval();
 
         // Backward pass
         let d_output = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let (mut d_q, _d_k, _d_v) = compute_attention_gradients(0, &d_output)?;
+        let (d_q, _d_k, _d_v) = compute_attention_gradients(0, &d_output)?;
         d_q.eval();
 
-        let mut loss = output.sum(None);
+        let loss = output.sum(None);
         Ok(loss.item::<f32>())
     });
 
@@ -143,7 +143,7 @@ fn test_multi_layer_training() {
         let keys = random_tensor(&[batch, n_kv_heads, seq_len, head_dim]);
         let values = random_tensor(&[batch, n_kv_heads, seq_len, head_dim]);
 
-        let mut output = differentiable_attention(layer_id, &queries, &keys, &values, &config)
+        let output = differentiable_attention(layer_id, &queries, &keys, &values, &config)
             .expect(&format!("Forward pass failed for layer {}", layer_id));
         output.eval();
         outputs.push(output);
@@ -162,7 +162,7 @@ fn test_multi_layer_training() {
     // Simulate backward pass (in reverse order, like real backprop)
     for layer_id in (0..num_layers).rev() {
         let d_output = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let (mut d_q, mut d_k, mut d_v) = compute_attention_gradients(layer_id, &d_output)
+        let (d_q, d_k, d_v) = compute_attention_gradients(layer_id, &d_output)
             .expect(&format!("Backward pass failed for layer {}", layer_id));
 
         d_q.eval();
@@ -206,7 +206,7 @@ fn test_inference_mode_no_cache() {
     let config = FusedAttentionConfig::new(n_heads, n_kv_heads, head_dim);
 
     // Forward pass in inference mode
-    let mut output = differentiable_attention(0, &queries, &keys, &values, &config)
+    let output = differentiable_attention(0, &queries, &keys, &values, &config)
         .expect("Forward pass failed");
 
     output.eval();
@@ -245,7 +245,7 @@ fn test_gqa_gradients() {
     let config = FusedAttentionConfig::new(n_heads, n_kv_heads, head_dim);
 
     // Forward pass
-    let mut output = differentiable_attention(0, &queries, &keys, &values, &config)
+    let output = differentiable_attention(0, &queries, &keys, &values, &config)
         .expect("Forward pass failed");
     output.eval();
 
@@ -254,7 +254,7 @@ fn test_gqa_gradients() {
 
     // Backward pass
     let d_output = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-    let (mut d_q, mut d_k, mut d_v) =
+    let (d_q, d_k, d_v) =
         compute_attention_gradients(0, &d_output).expect("Backward pass failed");
 
     d_q.eval();

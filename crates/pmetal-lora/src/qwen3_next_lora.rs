@@ -420,7 +420,7 @@ impl Qwen3NextLoraGDN {
         let conv_dim = key_dim * 2 + value_dim;
 
         // Frozen conv1d: depthwise over [q, k, v] concatenated.
-        let conv1d = nn::Conv1dBuilder::new(1, conv_dim, conv_kernel_size)
+        let conv1d = nn::Conv1dBuilder::new(conv_dim, conv_dim, conv_kernel_size)
             .bias(false)
             .groups(conv_dim)
             .padding(0)

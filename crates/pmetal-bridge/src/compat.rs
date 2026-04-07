@@ -1576,9 +1576,42 @@ pub(crate) fn update_trainable_param(
     key: &std::rc::Rc<str>,
     value: Array,
 ) {
-    if let Some(entry) = pm.get_mut(key) {
-        if let NestedValue::Value(arr) = entry {
-            **arr = value;
+    // The nested tree may use multi-segment keys at any level
+    // (e.g. "layers.0" as a single key at the root, then "self_attn", etc.).
+    // We try all possible splits: consume dots left-to-right, testing whether
+    // the current prefix exists as a key in the current map.
+    update_trainable_param_recurse(pm, key.as_ref(), value);
+}
+
+fn update_trainable_param_recurse(
+    map: &mut std::collections::HashMap<std::rc::Rc<str>, NestedValue<&mut Array>>,
+    remaining: &str,
+    value: Array,
+) {
+    // Try the whole remaining string as a direct key first (leaf case).
+    let remaining_rc: std::rc::Rc<str> = remaining.into();
+    if let Some(entry) = map.get_mut(&remaining_rc) {
+        match entry {
+            NestedValue::Value(arr) => {
+                **arr = value;
+                return;
+            }
+            NestedValue::Map(_) => {
+                // Exact match hit a map, not a leaf — shouldn't happen, but bail.
+                return;
+            }
+        }
+    }
+
+    // Try progressively longer prefixes up to each '.' separator.
+    let bytes = remaining.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'.' {
+            let prefix: std::rc::Rc<str> = remaining[..i].into();
+            if let Some(NestedValue::Map(child)) = map.get_mut(&prefix) {
+                update_trainable_param_recurse(child, &remaining[i + 1..], value);
+                return;
+            }
         }
     }
 }
@@ -2126,7 +2159,7 @@ pub mod losses {
 // Drop-in shims for `mlx_rs::optimizers::*` used by the training infrastructure.
 
 pub mod optimizers {
-    use super::{Array, Exception, FlattenedModuleParam, ModuleParameters, NestedValue};
+    use super::{Array, Exception, FlattenedModuleParam, ModuleParameters, ModuleParametersExt};
     use std::collections::HashMap;
     use std::rc::Rc;
 
@@ -2149,25 +2182,17 @@ pub mod optimizers {
             model: &mut M,
             gradients: FlattenedModuleParam,
         ) -> Result<(), Exception> {
-            let mut pm = model.parameters_mut();
+            // Flatten the nested parameter tree so that dotted keys from
+            // value_and_grad (e.g. "layers.0.self_attn.q_proj.lora_a") can
+            // be matched directly.  The old code looked up flat keys against
+            // the nested root map, where they could never be found.
+            let mut flat = model.flatten_params_mut();
             for (key, grad) in &gradients {
-                update_leaf(&mut pm, key, |arr| {
+                if let Some(arr) = flat.get_mut(key.as_ref()) {
                     let _ = self.update_single(key, grad, arr);
-                });
+                }
             }
             Ok(())
-        }
-    }
-
-    fn update_leaf<F: FnMut(&mut Array)>(
-        params: &mut HashMap<Rc<str>, NestedValue<&mut Array>>,
-        key: &Rc<str>,
-        mut f: F,
-    ) {
-        if let Some(v) = params.get_mut(key) {
-            if let NestedValue::Value(arr) = v {
-                f(arr);
-            }
         }
     }
 
@@ -2216,6 +2241,14 @@ pub mod optimizers {
             parameter: &mut Array,
         ) -> Result<(), Exception> {
             self.inner.step_single(key.as_ref(), gradient, parameter);
+            // Sync the inner optimizer's moment state into the public state
+            // map so that Updatable, checkpointing, and test assertions see it.
+            if let Some(inner_state) = self.inner.states.get(key.as_ref()) {
+                self.state.insert(
+                    key.clone(),
+                    (inner_state.m.clone(), inner_state.v.clone()),
+                );
+            }
             Ok(())
         }
     }

@@ -6,7 +6,7 @@ use std::time::Instant;
 /// arange() creates unique elements, forcing a FULL Metal buffer allocation.
 fn rand_w(shape: &[i32], dtype: i32) -> InlineArray {
     let n: i32 = shape.iter().product();
-    let mut w = InlineArray::arange(n, dtype).reshape(shape);
+    let w = InlineArray::arange(n, dtype).reshape(shape);
     w.eval();
     w
 }
@@ -75,7 +75,7 @@ fn simplified_decode_benchmark() {
 
     // Eval all weights
     for lw in &layers {
-        let mut w = lw.ln1_w.clone();
+        let w = lw.ln1_w.clone();
         w.eval();
     }
 
@@ -86,7 +86,7 @@ fn simplified_decode_benchmark() {
     let chunk = 10_000_000i32; // 10M elements per chunk = 20MB
     let n_chunks = dummy_bytes / chunk;
     for _ in 0..n_chunks {
-        let mut d = InlineArray::arange(chunk, 11);
+        let d = InlineArray::arange(chunk, 11);
         d.eval();
         dummy_buffers.push(d);
     }
@@ -131,7 +131,7 @@ fn simplified_decode_benchmark() {
 
     // Warmup
     for i in 0..5 {
-        let mut r = decode_step(42 + i);
+        let r = decode_step(42 + i);
         r.eval();
     }
 
@@ -139,7 +139,7 @@ fn simplified_decode_benchmark() {
     let mut times = Vec::new();
     for i in 0..50 {
         let t0 = Instant::now();
-        let mut r = decode_step(100 + i);
+        let r = decode_step(100 + i);
         r.eval();
         times.push(t0.elapsed().as_secs_f64() * 1000.0);
     }

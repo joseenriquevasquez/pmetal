@@ -2695,7 +2695,7 @@ mod tests {
         let input_ids = vec![11, 22, 33, 44, 55];
         let mut seen_chunks = Vec::new();
 
-        let mut logits = run_cached_prefill_chunks(&input_ids, 2, |chunk_input| {
+        let logits = run_cached_prefill_chunks(&input_ids, 2, |chunk_input| {
             let seq_len = chunk_input.dim(1);
             seen_chunks.push(seq_len);
 
@@ -2736,7 +2736,7 @@ mod tests {
         // Create logits where token 5 has highest value
         let mut logits_vec = vec![-10.0f32; 100];
         logits_vec[5] = 10.0;
-        let mut logits = Array::from_slice(&logits_vec, &[100]);
+        let logits = Array::from_slice(&logits_vec, &[100]);
 
         let token = greedy_sample(&logits).unwrap();
         assert_eq!(token, 5);
@@ -2749,7 +2749,7 @@ mod tests {
         logits_vec[0] = 10.0;
         logits_vec[1] = 9.0;
         logits_vec[2] = 8.0;
-        let mut logits = Array::from_slice(&logits_vec, &[10]);
+        let logits = Array::from_slice(&logits_vec, &[10]);
 
         let filtered = top_k_filter(&logits, 3).unwrap();
         filtered.eval().unwrap();
@@ -2780,7 +2780,7 @@ mod tests {
 
         let mut logits_vec = vec![-10.0f32; 100];
         logits_vec[42] = 10.0;
-        let mut logits = Array::from_slice(&logits_vec, &[100]);
+        let logits = Array::from_slice(&logits_vec, &[100]);
 
         let token = sampler.sample(&logits, &[]).unwrap();
         assert_eq!(token, 42);
@@ -2799,7 +2799,7 @@ mod tests {
     #[test]
     fn test_top_p_filter() {
         // Create logits with uneven distribution
-        let mut logits = Array::from_slice(&[10.0f32, 5.0, 1.0, 0.0, -10.0], &[5]);
+        let logits = Array::from_slice(&[10.0f32, 5.0, 1.0, 0.0, -10.0], &[5]);
 
         let filtered = top_p_filter(&logits, 0.9).unwrap();
         filtered.eval().unwrap();
@@ -2830,7 +2830,7 @@ mod tests {
     fn test_min_p_filter() {
         // Create logits with descending probabilities
         // After softmax: ~0.88, ~0.12, ~0.004, ... (very small for rest)
-        let mut logits = Array::from_slice(&[10.0f32, 8.0, 5.0, 1.0, -5.0], &[5]);
+        let logits = Array::from_slice(&[10.0f32, 8.0, 5.0, 1.0, -5.0], &[5]);
 
         // With min_p = 0.1, threshold = 0.1 * 0.88 = 0.088
         // Should keep tokens with prob >= 0.088 (token 0 and 1)
@@ -2873,7 +2873,7 @@ mod tests {
 
     #[test]
     fn test_frequency_presence_penalty() {
-        let mut logits = Array::from_slice(&[5.0f32, 5.0, 5.0, 5.0, 5.0], &[5]);
+        let logits = Array::from_slice(&[5.0f32, 5.0, 5.0, 5.0, 5.0], &[5]);
 
         // Token 0 appeared once, token 2 appeared 3 times
         let mut counts = HashMap::new();

@@ -152,7 +152,11 @@ impl JambaMambaMixer {
         let in_proj = nn::LinearBuilder::new(hidden_size, hidden_size * 2)
             .bias(false)
             .build()?;
-        let conv1d = nn::Conv1dBuilder::new(1, hidden_size, conv_kernel_size)
+        // Depthwise conv1d: in_channels = out_channels = hidden_size, groups = hidden_size.
+        // Weight shape: [hidden_size, kernel, in_channels/groups] = [hidden_size, kernel, 1].
+        // Using in_channels=1 would give in_channels/groups=0 (integer division), producing a
+        // zero-size weight and crashing during eval.
+        let conv1d = nn::Conv1dBuilder::new(hidden_size, hidden_size, conv_kernel_size)
             .groups(hidden_size)
             .bias(false)
             .padding(0)

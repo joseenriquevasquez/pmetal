@@ -117,6 +117,105 @@ pub fn sdpa_causal_like_mlx(
     }
 }
 
+/// Quantized scaled-dot-product attention using MLX's fused `quantized_matmul`.
+///
+/// Matches mlx-lm's `quantized_scaled_dot_product_attention` (base.py:64-105).
+/// K/V are stored as `(packed_uint32, scales, biases)` tuples and never fully
+/// dequantized — `quantized_matmul` dequantizes inside the Metal kernel during
+/// the matmul, yielding zero overhead vs standard SDPA.
+///
+/// - `queries`: `[B, n_q_heads, L, D]`
+/// - `q_keys` / `q_values`: `(packed, scales, biases)` where packed is uint32
+/// - For GQA (`n_q_heads > n_kv_heads`): queries are reshaped and quantized
+///   tuples are broadcast, matching upstream behavior exactly.
+pub fn quantized_sdpa(
+    queries: &InlineArray,
+    q_keys: (&InlineArray, &InlineArray, &InlineArray),
+    q_values: (&InlineArray, &InlineArray, &InlineArray),
+    scale: f32,
+    query_len: i32,
+    n_q_heads: i32,
+    n_kv_heads: i32,
+    group_size: i32,
+    bits: i32,
+) -> InlineArray {
+    let b = queries.dim(0);
+    let l = queries.dim(2);
+    let d = queries.dim(3);
+    let n_repeats = n_q_heads / n_kv_heads;
+
+    // Scale queries (matches: queries *= scale)
+    let scale_arr = InlineArray::from_f32(scale).as_dtype(queries.dtype_raw());
+    let queries_scaled = queries.multiply(&scale_arr);
+
+    // GQA expansion: reshape queries [B, n_kv, n_rep, L, D], expand quantized tuples
+    let (queries_work, k_packed, k_scales, k_biases, v_packed, v_scales, v_biases) =
+        if n_repeats > 1 {
+            let q = queries_scaled.reshape(&[b, n_kv_heads, n_repeats, l, d]);
+            // expand_dims(-3) on each quantized component
+            let kp = q_keys.0.expand_dims(-3);
+            let ks = q_keys.1.expand_dims(-3);
+            let kb = q_keys.2.expand_dims(-3);
+            let vp = q_values.0.expand_dims(-3);
+            let vs = q_values.1.expand_dims(-3);
+            let vb = q_values.2.expand_dims(-3);
+            (q, kp, ks, kb, vp, vs, vb)
+        } else {
+            (
+                queries_scaled,
+                q_keys.0.clone(),
+                q_keys.1.clone(),
+                q_keys.2.clone(),
+                q_values.0.clone(),
+                q_values.1.clone(),
+                q_values.2.clone(),
+            )
+        };
+
+    // Score: Q @ K^T via quantized_matmul (fused dequant inside Metal kernel)
+    let scores = queries_work.quantized_matmul(
+        &k_packed, &k_scales, Some(&k_biases),
+        true, // transpose=true for Q @ K^T
+        group_size, bits,
+    );
+
+    // Apply causal mask for prefill, no mask for decode
+    let scores = if query_len > 1 {
+        // Build causal mask: q_indices[:, None] >= k_indices[None]
+        let kl = scores.dim(-1); // total KV length
+        let ql = scores.dim(-2); // query length
+        let dtype_i32 = crate::compat::Dtype::Int32.as_i32();
+        let k_indices = InlineArray::arange(kl, dtype_i32);
+        // q_indices = arange(ql) + (kl - ql)
+        let offset = InlineArray::from_i32(kl - ql);
+        let q_indices = InlineArray::arange(ql, dtype_i32).add(&offset);
+        let q_col = q_indices.reshape(&[ql, 1]);
+        let k_row = k_indices.reshape(&[1, kl]);
+        let mask = q_col.greater_equal(&k_row);
+        let neg_inf = InlineArray::from_f32(f32::NEG_INFINITY).as_dtype(scores.dtype_raw());
+        mask.where_cond(&scores, &neg_inf)
+    } else {
+        scores
+    };
+
+    // Softmax with precise=true
+    let weights = scores.softmax_precise(-1);
+
+    // Value aggregation: weights @ V via quantized_matmul (fused dequant)
+    let out = weights.quantized_matmul(
+        &v_packed, &v_scales, Some(&v_biases),
+        false, // transpose=false for weights @ V
+        group_size, bits,
+    );
+
+    // Reshape back for GQA
+    if n_repeats > 1 {
+        out.reshape(&[b, n_q_heads, l, d])
+    } else {
+        out
+    }
+}
+
 /// Shared generation-session setup for bridge-native decode loops.
 ///
 /// `mlx::core::enable_compile()` was benchmarked and shown to regress decode

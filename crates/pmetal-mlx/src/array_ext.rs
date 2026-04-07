@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn test_zeros_uses_requested_dtype() {
-        let mut array = zeros(&[2, 3], Dtype::Int32).unwrap();
+        let array = zeros(&[2, 3], Dtype::Int32).unwrap();
         array.eval();
 
         assert_eq!(array.dtype(), Dtype::Int32);
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_ones_uses_requested_dtype() {
-        let mut array = ones(&[2, 2], Dtype::Int32).unwrap();
+        let array = ones(&[2, 2], Dtype::Int32).unwrap();
         array.eval();
 
         assert_eq!(array.dtype(), Dtype::Int32);
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_randn_uses_requested_dtype() {
-        let mut array = randn(&[4, 5], Dtype::Float16).unwrap();
+        let array = randn(&[4, 5], Dtype::Float16).unwrap();
         array.eval();
 
         assert_eq!(array.dtype(), Dtype::Float16);
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn test_rand_uses_requested_dtype() {
-        let mut array = rand(&[3, 2], -1.0, 1.0, Dtype::Float16).unwrap();
+        let array = rand(&[3, 2], -1.0, 1.0, Dtype::Float16).unwrap();
         array.eval();
 
         assert_eq!(array.dtype(), Dtype::Float16);

@@ -347,9 +347,9 @@ mod tests {
         assert_eq!(x.shape(), dequantized.shape());
 
         // Evaluate to check no errors
-        let mut x_owned = x.clone();
+        let x_owned = x.clone();
         x_owned.eval();
-        let mut deq_owned = dequantized.clone();
+        let deq_owned = dequantized.clone();
         deq_owned.eval();
     }
 
@@ -365,7 +365,7 @@ mod tests {
 
         let x = random::normal(&[2, 8], Dtype::Float32);
         let output = fp8_linear.forward(&x).unwrap();
-        let mut out_owned = output.clone();
+        let out_owned = output.clone();
         out_owned.eval();
 
         assert_eq!(output.shape(), &[2, 16]);

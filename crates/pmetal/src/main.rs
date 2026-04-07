@@ -868,6 +868,22 @@ enum Commands {
         /// Lower values preserve more quality; higher values allow more compression.
         #[arg(long, default_value = "0.01")]
         kl_threshold: f64,
+
+        /// Output format: "gguf" (default) or "mlx" (MLX safetensors with per-tensor bit
+        /// allocation).  When "mlx" is selected the --output argument is treated as an
+        /// output directory path rather than a file.
+        #[arg(long, default_value = "gguf")]
+        format: String,
+
+        /// Default bit-width for MLX-format quantization (3, 4, 5, 6, or 8).
+        /// Only used when --format mlx is set.
+        #[arg(long, default_value_t = 4)]
+        bits: i32,
+
+        /// Group size for MLX-format quantization.
+        /// Only used when --format mlx is set.
+        #[arg(long, default_value_t = 64)]
+        group_size: i32,
     },
 
     /// Knowledge Distillation from teacher to student
@@ -2875,52 +2891,75 @@ async fn tokio_main() -> anyhow::Result<()> {
             kl_calibrate,
             target_bpw,
             kl_threshold,
+            format,
+            bits,
+            group_size,
         } => {
-            #[cfg(feature = "lora")]
-            if let Some(lora_path) = &lora {
-                // Fuse LoRA first, then quantize the fused model
-                let fused_dir = format!("{output}.fused_tmp");
-                commands::fuse::run_fuse(&model, lora_path, &fused_dir, None, None).await?;
-                commands::quantize::run_quantization(
-                    &fused_dir,
-                    &output,
-                    imatrix.as_deref(),
-                    method,
-                    kl_calibrate,
-                    target_bpw,
-                    kl_threshold,
-                )
-                .await?;
-                // Clean up temp dir
-                let _ = std::fs::remove_dir_all(&fused_dir);
-            } else {
-                commands::quantize::run_quantization(
-                    &model,
-                    &output,
-                    imatrix.as_deref(),
-                    method,
-                    kl_calibrate,
-                    target_bpw,
-                    kl_threshold,
-                )
-                .await?;
-            }
-
-            #[cfg(not(feature = "lora"))]
-            {
+            if format == "mlx" {
+                // MLX safetensors path — no LoRA fusion support in this path yet.
                 if lora.is_some() {
-                    anyhow::bail!("LoRA fusion during quantization requires the `lora` feature");
+                    anyhow::bail!(
+                        "--lora is not yet supported with --format mlx; \
+                         fuse the adapter first with `pmetal fuse` then quantize"
+                    );
                 }
-                commands::quantize::run_quantization(
+                commands::quantize::run_quantization_mlx(
                     &model,
                     &output,
-                    imatrix.as_deref(),
-                    method,
-                    kl_calibrate,
+                    bits,
+                    group_size,
                     target_bpw,
-                    kl_threshold,
                 )
                 .await?;
+            } else {
+                #[cfg(feature = "lora")]
+                if let Some(lora_path) = &lora {
+                    // Fuse LoRA first, then quantize the fused model
+                    let fused_dir = format!("{output}.fused_tmp");
+                    commands::fuse::run_fuse(&model, lora_path, &fused_dir, None, None).await?;
+                    commands::quantize::run_quantization(
+                        &fused_dir,
+                        &output,
+                        imatrix.as_deref(),
+                        method,
+                        kl_calibrate,
+                        target_bpw,
+                        kl_threshold,
+                    )
+                    .await?;
+                    // Clean up temp dir
+                    let _ = std::fs::remove_dir_all(&fused_dir);
+                } else {
+                    commands::quantize::run_quantization(
+                        &model,
+                        &output,
+                        imatrix.as_deref(),
+                        method,
+                        kl_calibrate,
+                        target_bpw,
+                        kl_threshold,
+                    )
+                    .await?;
+                }
+
+                #[cfg(not(feature = "lora"))]
+                {
+                    if lora.is_some() {
+                        anyhow::bail!(
+                            "LoRA fusion during quantization requires the `lora` feature"
+                        );
+                    }
+                    commands::quantize::run_quantization(
+                        &model,
+                        &output,
+                        imatrix.as_deref(),
+                        method,
+                        kl_calibrate,
+                        target_bpw,
+                        kl_threshold,
+                    )
+                    .await?;
+                }
             }
         }
 

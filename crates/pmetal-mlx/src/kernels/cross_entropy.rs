@@ -485,7 +485,7 @@ mod tests {
         let targets = Array::from_i32_slice(&[3_i32, 0]).reshape(&[1, 2]);
 
         let loss = cross_entropy_loss(&logits, &targets, None, 0.0).unwrap();
-        let mut loss_eval = loss.clone();
+        let loss_eval = loss.clone();
         loss_eval.eval();
 
         // Should be close to 0 since we're predicting the argmax
@@ -506,7 +506,7 @@ mod tests {
         let targets = Array::from_i32_slice(&[3_i32, 0, -100]).reshape(&[1, 3]);
 
         let loss = cross_entropy_loss(&logits, &targets, Some(-100), 0.0).unwrap();
-        let mut loss_eval = loss.clone();
+        let loss_eval = loss.clone();
         loss_eval.eval();
 
         let value = loss_eval.item_f32();
@@ -520,7 +520,7 @@ mod tests {
 
         let config = CrossEntropyConfig::new().with_ignore_index(-100);
         let loss = fast_cross_entropy_loss(&logits, &targets, &config).unwrap();
-        let mut loss_eval = loss.clone();
+        let loss_eval = loss.clone();
         loss_eval.eval();
 
         assert!(loss_eval.item_f32().is_finite());
@@ -533,7 +533,7 @@ mod tests {
 
         let config = CrossEntropyConfig::new().with_softcapping(30.0);
         let loss = fast_cross_entropy_loss(&logits, &targets, &config).unwrap();
-        let mut loss_eval = loss.clone();
+        let loss_eval = loss.clone();
         loss_eval.eval();
 
         assert!(loss_eval.item_f32().is_finite());
@@ -545,7 +545,7 @@ mod tests {
         let targets = Array::from_i32_slice(&[3_i32, 0]).reshape(&[2]);
 
         let loss = gemma2_cross_entropy_loss(&logits, &targets, None).unwrap();
-        let mut loss_eval = loss.clone();
+        let loss_eval = loss.clone();
         loss_eval.eval();
 
         assert!(loss_eval.item_f32().is_finite());
@@ -555,7 +555,7 @@ mod tests {
     fn test_perplexity() {
         let loss = Array::from_f32(2.0);
         let ppl = perplexity(&loss).unwrap();
-        let mut ppl_eval = ppl.clone();
+        let ppl_eval = ppl.clone();
         ppl_eval.eval();
 
         let expected = 2.0_f32.exp();
@@ -567,7 +567,7 @@ mod tests {
     fn test_stable_logsumexp() {
         let logits = Array::from_f32_slice(&[1000.0_f32, 1001.0, 1002.0, 1003.0], &[1, 4]);
         let lse = stable_logsumexp(&logits);
-        let mut lse_eval = lse.clone();
+        let lse_eval = lse.clone();
         lse_eval.eval();
 
         let value = lse_eval.item_f32();
@@ -579,11 +579,11 @@ mod tests {
     fn test_chunked_logsumexp_small_vocab() {
         let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 4]);
         let lse = chunked_logsumexp(&logits, 4);
-        let mut lse_eval = lse.clone();
+        let lse_eval = lse.clone();
         lse_eval.eval();
 
         let expected = stable_logsumexp(&logits);
-        let mut exp_eval = expected.clone();
+        let exp_eval = expected.clone();
         exp_eval.eval();
 
         let lse_val = lse_eval.item_f32();
@@ -636,7 +636,7 @@ mod tests {
         let lengths = Array::from_i32_slice(&[3i32, 4]).reshape(&[batch_size]);
 
         let loss = cross_entropy_loss_with_lengths(&logits, &labels, &lengths, 0.0).unwrap();
-        let mut loss_eval = loss.clone();
+        let loss_eval = loss.clone();
         loss_eval.eval();
 
         let loss_val = loss_eval.item_f32();
@@ -655,7 +655,7 @@ mod tests {
 
         let config = CrossEntropyConfig::new().with_ignore_index(-100);
         let loss = fast_cross_entropy_loss(&logits, &targets, &config).unwrap();
-        let mut loss_eval = loss.clone();
+        let loss_eval = loss.clone();
         loss_eval.eval();
 
         let loss_val = loss_eval.item_f32();

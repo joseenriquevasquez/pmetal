@@ -5084,17 +5084,17 @@ mod tests {
 
     #[test]
     fn test_scalar_roundtrip() {
-        let mut a = InlineArray::from_f32(3.14);
+        let a = InlineArray::from_f32(std::f32::consts::PI);
         a.eval();
         let v = a.item_f32();
-        assert!((v - 3.14).abs() < 1e-5, "got {v}");
+        assert!((v - std::f32::consts::PI).abs() < 1e-5, "got {v}");
     }
 
     #[test]
     fn test_add_scalars() {
         let a = InlineArray::from_f32(2.0);
         let b = InlineArray::from_f32(3.0);
-        let mut c = a.add(&b);
+        let c = a.add(&b);
         c.eval();
         let v = c.item_f32();
         assert!((v - 5.0).abs() < 1e-6, "expected 5.0, got {v}");

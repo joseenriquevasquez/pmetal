@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use pmetal_mlx::{Array, Dtype};
@@ -239,5 +240,117 @@ pub(crate) async fn run_quantization(
     builder.write(&mut file)?;
 
     println!("Quantization complete!");
+    Ok(())
+}
+
+// ── MLX safetensors path ──────────────────────────────────────────────────────
+
+/// Run MLX-format safetensors quantization with per-tensor quality-based bit allocation.
+///
+/// `output_path` is treated as a directory.  The directory is created if it
+/// does not exist.  Inside it the function writes:
+/// - `model.safetensors`   — quantized weights in MLX affine format
+/// - `config.json`         — source config + injected `quantization_config`
+/// - `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`,
+///   `merges.txt`, `vocab.json`, `tokenizer.model` (copied if present)
+pub(crate) async fn run_quantization_mlx(
+    model_path: &str,
+    output_path: &str,
+    default_bits: i32,
+    group_size: i32,
+    target_bpw: Option<f32>,
+) -> anyhow::Result<()> {
+    use pmetal_bridge::mlx_quant;
+
+    println!("========================================");
+    println!("  PMetal MLX Safetensors Quantization");
+    println!("========================================");
+    println!("Model:      {}", model_path);
+    println!("Output:     {}", output_path);
+    println!("Bits:       {}", default_bits);
+    println!("Group size: {}", group_size);
+    if let Some(bpw) = target_bpw {
+        println!("Target BPW: {:.2}", bpw);
+    }
+    println!("========================================\n");
+
+    // 1. Resolve HuggingFace model ID to local path.
+    let resolved_model_path: std::path::PathBuf =
+        if model_path.contains('/') && !std::path::PathBuf::from(model_path).exists() {
+            println!("Resolving HuggingFace model: {}", model_path);
+            pmetal_hub::download_model(model_path, None, None).await?
+        } else {
+            std::path::PathBuf::from(model_path)
+        };
+
+    // 2. Load all weights as InlineArray (stays on GPU, avoids f32 copy).
+    println!("Loading weights...");
+    let weights = pmetal_models::loader::load_weights(&resolved_model_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load weights: {}", e))?;
+    println!("Loaded {} tensors", weights.len());
+
+    // 3. Run the full pipeline: evaluate quality → allocate bits → quantize → save.
+    let output_dir = std::path::PathBuf::from(output_path);
+    let effective_bpw = target_bpw.unwrap_or(default_bits as f32);
+    let source_config = resolved_model_path.join("config.json");
+
+    println!("Evaluating tensor quality and allocating bits (target BPW={:.2})...", effective_bpw);
+
+    let assignments = mlx_quant::quantize_model(
+        &weights,
+        &source_config,
+        &output_dir,
+        effective_bpw,
+        group_size,
+        mlx_quant::DEFAULT_BITS_CANDIDATES,
+        &[], // no extra critical tensor patterns
+    )
+    .map_err(|e| anyhow::anyhow!("Quantization failed: {}", e))?;
+
+    // 4. Print allocation summary.
+    let mut counts: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    let mut total_params: usize = 0;
+    let mut total_weighted_bits: f64 = 0.0;
+    for a in &assignments {
+        *counts.entry(a.bits).or_insert(0) += 1;
+        total_params += a.param_count;
+        let bits = if a.bits == 0 { 16 } else { a.bits };
+        total_weighted_bits += a.param_count as f64 * bits as f64;
+    }
+    let final_bpw = if total_params > 0 { total_weighted_bits / total_params as f64 } else { 0.0 };
+
+    println!("\nBit allocation summary:");
+    let mut bit_keys: Vec<_> = counts.keys().collect();
+    bit_keys.sort();
+    for &bits in &bit_keys {
+        let count = counts[&bits];
+        if *bits == 0 {
+            println!("  bf16 (passthrough): {} tensors", count);
+        } else {
+            println!("  Q{}: {} tensors", *bits, count);
+        }
+    }
+    println!("Effective BPW: {:.3}", final_bpw);
+    println!("Total tensors: {}", assignments.len());
+
+    // 5. Copy tokenizer files from source to output.
+    let tokenizer_files = [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "merges.txt",
+        "vocab.json",
+        "tokenizer.model",
+    ];
+    for fname in &tokenizer_files {
+        let src = resolved_model_path.join(fname);
+        if src.exists() {
+            let dst = output_dir.join(fname);
+            std::fs::copy(&src, &dst).ok();
+        }
+    }
+
+    println!("\nMLX quantization complete!");
+    println!("Output: {}", output_dir.display());
     Ok(())
 }

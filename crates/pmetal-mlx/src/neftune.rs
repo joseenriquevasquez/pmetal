@@ -268,11 +268,11 @@ mod tests {
         let config = NEFTuneConfig::new(5.0);
         let embeds = Array::zeros_f32(&[2, 10, 768]);
 
-        let mut noisy = apply_neftune(&embeds, &config).unwrap();
+        let noisy = apply_neftune(&embeds, &config).unwrap();
         noisy.eval();
 
         // Sum should not be zero (noise was added)
-        let mut sum = noisy.abs().sum(None);
+        let sum = noisy.abs().sum(None);
         sum.eval();
         let sum_val = sum.item::<f32>();
         assert!(sum_val > 0.0);
@@ -283,12 +283,12 @@ mod tests {
         let config = NEFTuneConfig::disabled();
         let embeds = Array::ones_f32(&[2, 10, 768]);
 
-        let mut result = apply_neftune(&embeds, &config).unwrap();
+        let result = apply_neftune(&embeds, &config).unwrap();
         result.eval();
 
         // Should be exactly the same
         let diff = result.subtract(&embeds);
-        let mut sum = diff.abs().sum(None);
+        let sum = diff.abs().sum(None);
         sum.eval();
         assert!(sum.item::<f32>() < 1e-6);
     }
@@ -303,14 +303,14 @@ mod tests {
         let hidden_dim = 1000;
         let embeds = Array::zeros_f32(&[1, seq_len, hidden_dim]);
 
-        let mut noisy = apply_neftune(&embeds, &config).unwrap();
+        let noisy = apply_neftune(&embeds, &config).unwrap();
         noisy.eval();
 
         // Expected magnitude: alpha / sqrt(seq_len * hidden_dim)
         let expected_magnitude = alpha / ((seq_len * hidden_dim) as f32).sqrt();
 
         // Max value should be around the expected magnitude
-        let mut max_val = noisy.abs().max(None);
+        let max_val = noisy.abs().max(None);
         max_val.eval();
         let max_f32 = max_val.item::<f32>();
 
@@ -337,11 +337,11 @@ mod tests {
         let wrapper = NEFTuneEmbedding::new(NEFTuneConfig::default());
         let embeds = Array::zeros_f32(&[2, 10, 768]);
 
-        let mut output = wrapper.forward(&embeds).unwrap();
+        let output = wrapper.forward(&embeds).unwrap();
         output.eval();
 
         // Should have noise added
-        let mut sum = output.abs().sum(None);
+        let sum = output.abs().sum(None);
         sum.eval();
         assert!(sum.item::<f32>() > 0.0);
     }
@@ -352,13 +352,13 @@ mod tests {
         wrapper.eval();
 
         let embeds = Array::ones_f32(&[2, 10, 768]);
-        let mut output = wrapper.forward(&embeds).unwrap();
+        let output = wrapper.forward(&embeds).unwrap();
 
         output.eval();
 
         // Should be unchanged
         let diff = output.subtract(&embeds);
-        let mut sum = diff.abs().sum(None);
+        let sum = diff.abs().sum(None);
         sum.eval();
         assert!(sum.item::<f32>() < 1e-6);
     }

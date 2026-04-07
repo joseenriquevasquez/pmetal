@@ -3772,7 +3772,7 @@ fn build_beta_codebook(dim: usize, bits: u8) -> Vec<f32> {
 /// Gram-Schmidt QR decomposition of a Gaussian random matrix.
 ///
 /// Returns a row-major [dim × dim] orthogonal matrix Q (f32).
-fn generate_random_orthogonal(dim: usize, rng: &mut StdRng) -> Vec<f32> {
+pub(crate) fn generate_random_orthogonal(dim: usize, rng: &mut StdRng) -> Vec<f32> {
     let mut q = vec![0.0f64; dim * dim];
 
     for column in 0..dim {
@@ -3879,6 +3879,7 @@ fn signed_fwht_forward(values: &mut [f32], left_signs: &[f32], right_signs: &[f3
     }
 }
 
+#[allow(dead_code)] // Inverse path for TurboQuant CPU dequantization — paired with signed_fwht_forward
 fn signed_fwht_inverse(values: &mut [f32], left_signs: &[f32], right_signs: &[f32]) {
     debug_assert_eq!(values.len(), left_signs.len());
     debug_assert_eq!(values.len(), right_signs.len());
@@ -4569,8 +4570,8 @@ mod tests {
         ref_cache
             .append(&step_keys, &step_values)
             .expect("reference append");
-        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
-        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let full_values = ref_cache.dequantize_values().expect("dequantize values");
         let repeated_keys = full_keys.repeat(q_heads / kv_heads, 1);
         let repeated_values = full_values.repeat(q_heads / kv_heads, 1);
         let reference_vals = manual_single_token_attention(

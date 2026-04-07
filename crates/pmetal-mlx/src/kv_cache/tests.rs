@@ -778,8 +778,8 @@ fn test_turboquant_cache_nonzero_inputs_stay_finite() {
     let values = Array::from_f32_slice(&data, &[1, 1, 2, 16]);
 
     let (cached_k, cached_v) = cache.update_and_fetch(&keys, &values).unwrap();
-    let mut ck = cached_k.clone();
-    let mut cv = cached_v.clone();
+    let ck = cached_k.clone();
+    let cv = cached_v.clone();
     ck.eval();
     cv.eval();
 
@@ -798,8 +798,8 @@ fn test_turboquant_mixed_cache_nonzero_inputs_stay_finite() {
     let values = Array::from_f32_slice(&data, &[1, 1, 4, 16]);
 
     let (cached_k, cached_v) = cache.update_and_fetch(&keys, &values).unwrap();
-    let mut ck = cached_k.clone();
-    let mut cv = cached_v.clone();
+    let ck = cached_k.clone();
+    let cv = cached_v.clone();
     ck.eval();
     cv.eval();
 
@@ -838,8 +838,8 @@ fn test_turboquant_direct_attention_matches_reference_uniform() {
     let (ref_keys, ref_values) = ref_cache.update_and_fetch(0, &new_k, &new_v).unwrap();
     let ref_output = fused_sdpa(&queries, &ref_keys, &ref_values, &attn_config, None).unwrap();
 
-    let mut fo = fast_output.clone();
-    let mut ro = ref_output.clone();
+    let fo = fast_output.clone();
+    let ro = ref_output.clone();
     fo.eval();
     ro.eval();
 
@@ -881,8 +881,8 @@ fn test_turboquant_direct_attention_matches_reference_mixed_sliding_window() {
     let (ref_keys, ref_values) = ref_cache.update_and_fetch(0, &new_k, &new_v).unwrap();
     let ref_output = fused_sdpa(&queries, &ref_keys, &ref_values, &attn_config, None).unwrap();
 
-    let mut fo = fast_output.clone();
-    let mut ro = ref_output.clone();
+    let fo = fast_output.clone();
+    let ro = ref_output.clone();
     fo.eval();
     ro.eval();
 
@@ -926,8 +926,8 @@ fn test_turboquant_direct_attention_matches_reference_asymmetric_value_dim() {
     let ref_output =
         manual_attention_output(&queries, &ref_keys, &ref_values, (16.0f32).sqrt().recip());
 
-    let mut fo = fast_output.clone();
-    let mut ro = ref_output.clone();
+    let fo = fast_output.clone();
+    let ro = ref_output.clone();
     fo.eval();
     ro.eval();
 

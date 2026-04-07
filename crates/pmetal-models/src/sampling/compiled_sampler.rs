@@ -633,6 +633,7 @@ mod tests {
 
         let filtered = apply_top_k_2d(&log_probs, 2, 5, &neg_inf).unwrap();
         let filtered = filtered.squeeze_axes(&[0]);
+        filtered.eval().unwrap();
         let values: Vec<f32> = filtered.as_slice().to_vec();
 
         // Top 2 should be preserved, others should be -inf
@@ -650,6 +651,7 @@ mod tests {
         // With min_p = 0.1, only tokens with prob >= 0.1 * max_prob should survive
         let filtered = apply_min_p_2d(&log_probs, 0.1, 4, &neg_inf).unwrap();
         let filtered = filtered.squeeze_axes(&[0]);
+        filtered.eval().unwrap();
         let values: Vec<f32> = filtered.as_slice().to_vec();
 
         // First token (highest) should survive

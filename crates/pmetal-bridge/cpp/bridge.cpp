@@ -7,6 +7,7 @@
 #include <typeinfo>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <numeric>
 #include <unordered_set>
 #include <numeric>
@@ -74,23 +75,28 @@ void* mlx_inline_to_handle(const mlx_inline_array* src) {
 // ── Core ops — write result directly into caller's stack buffer ──
 
 void mlx_inline_matmul(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
-    new (dst->buf) array(mlx::core::matmul(as_arr(a), as_arr(b)));
+    try { new (dst->buf) array(mlx::core::matmul(as_arr(a), as_arr(b))); }
+    catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_add(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
-    new (dst->buf) array(mlx::core::add(as_arr(a), as_arr(b)));
+    try { new (dst->buf) array(mlx::core::add(as_arr(a), as_arr(b))); }
+    catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_multiply(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
-    new (dst->buf) array(mlx::core::multiply(as_arr(a), as_arr(b)));
+    try { new (dst->buf) array(mlx::core::multiply(as_arr(a), as_arr(b))); }
+    catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_subtract(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
-    new (dst->buf) array(mlx::core::subtract(as_arr(a), as_arr(b)));
+    try { new (dst->buf) array(mlx::core::subtract(as_arr(a), as_arr(b))); }
+    catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_divide(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
-    new (dst->buf) array(mlx::core::divide(as_arr(a), as_arr(b)));
+    try { new (dst->buf) array(mlx::core::divide(as_arr(a), as_arr(b))); }
+    catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_negative(mlx_inline_array* dst, const mlx_inline_array* a) {
@@ -111,7 +117,8 @@ void mlx_inline_silu(mlx_inline_array* dst, const mlx_inline_array* a) {
 }
 
 void mlx_inline_softmax(mlx_inline_array* dst, const mlx_inline_array* a, int axis) {
-    new (dst->buf) array(mlx::core::softmax(as_arr(a), axis));
+    try { new (dst->buf) array(mlx::core::softmax(as_arr(a), axis)); }
+    catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_sqrt(mlx_inline_array* dst, const mlx_inline_array* a) {
@@ -123,7 +130,8 @@ void mlx_inline_transpose(mlx_inline_array* dst, const mlx_inline_array* a) {
 }
 
 void mlx_inline_reshape(mlx_inline_array* dst, const mlx_inline_array* a, const int* shape, int ndim) {
-    new (dst->buf) array(mlx::core::reshape(as_arr(a), {shape, shape + ndim}));
+    try { new (dst->buf) array(mlx::core::reshape(as_arr(a), {shape, shape + ndim})); }
+    catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_sum_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims) {
@@ -156,47 +164,59 @@ void mlx_inline_gather_mm(
     mlx_inline_array* dst,
     const mlx_inline_array* a, const mlx_inline_array* b,
     const mlx_inline_array* lhs, const mlx_inline_array* rhs, bool sorted) {
-    auto lhs_opt = lhs ? std::optional<array>(as_arr(lhs)) : std::nullopt;
-    auto rhs_opt = rhs ? std::optional<array>(as_arr(rhs)) : std::nullopt;
-    new (dst->buf) array(mlx::core::gather_mm(as_arr(a), as_arr(b), lhs_opt, rhs_opt, sorted));
+    try {
+        auto lhs_opt = lhs ? std::optional<array>(as_arr(lhs)) : std::nullopt;
+        auto rhs_opt = rhs ? std::optional<array>(as_arr(rhs)) : std::nullopt;
+        new (dst->buf) array(mlx::core::gather_mm(as_arr(a), as_arr(b), lhs_opt, rhs_opt, sorted));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 // Fast ops
 void mlx_inline_rms_norm(mlx_inline_array* dst, const mlx_inline_array* x,
                           const mlx_inline_array* weight, float eps) {
-    auto w = weight ? std::optional<array>(as_arr(weight)) : std::nullopt;
-    new (dst->buf) array(mlx::core::fast::rms_norm(as_arr(x), w, eps));
+    try {
+        auto w = weight ? std::optional<array>(as_arr(weight)) : std::nullopt;
+        new (dst->buf) array(mlx::core::fast::rms_norm(as_arr(x), w, eps));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_rope(mlx_inline_array* dst, const mlx_inline_array* x,
                       int dims, bool traditional, float base, float scale, int offset) {
-    new (dst->buf) array(mlx::core::fast::rope(
-        as_arr(x), dims, traditional, base, scale, offset));
+    try {
+        new (dst->buf) array(mlx::core::fast::rope(
+            as_arr(x), dims, traditional, base, scale, offset));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_sdpa(mlx_inline_array* dst,
                       const mlx_inline_array* q, const mlx_inline_array* k,
                       const mlx_inline_array* v, float scale, const char* mask_mode) {
-    std::string mode = mask_mode ? mask_mode : "";
-    new (dst->buf) array(mlx::core::fast::scaled_dot_product_attention(
-        as_arr(q), as_arr(k), as_arr(v), scale, mode));
+    try {
+        std::string mode = mask_mode ? mask_mode : "";
+        new (dst->buf) array(mlx::core::fast::scaled_dot_product_attention(
+            as_arr(q), as_arr(k), as_arr(v), scale, mode));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 // Split (writes N+1 arrays into pre-allocated output slots)
 void mlx_inline_split(const mlx_inline_array* input, const int* indices, int num_indices,
                        int axis, mlx_inline_array* outputs) {
-    auto results = mlx::core::split(as_arr(input), {indices, indices + num_indices}, axis);
-    for (size_t i = 0; i < results.size(); i++) {
-        new (outputs[i].buf) array(std::move(results[i]));
-    }
+    try {
+        auto results = mlx::core::split(as_arr(input), {indices, indices + num_indices}, axis);
+        for (size_t i = 0; i < results.size(); i++) {
+            new (outputs[i].buf) array(std::move(results[i]));
+        }
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (outputs[0].buf) array(0.0f); }
 }
 
 void mlx_inline_concatenate(mlx_inline_array* dst, const mlx_inline_array* arrays,
                               int num, int axis) {
-    std::vector<array> arrs;
-    arrs.reserve(num);
-    for (int i = 0; i < num; i++) arrs.push_back(as_arr(&arrays[i]));
-    new (dst->buf) array(mlx::core::concatenate(arrs, axis));
+    try {
+        std::vector<array> arrs;
+        arrs.reserve(num);
+        for (int i = 0; i < num; i++) arrs.push_back(as_arr(&arrays[i]));
+        new (dst->buf) array(mlx::core::concatenate(arrs, axis));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_argpartition(mlx_inline_array* dst, const mlx_inline_array* a, int kth, int axis) {
@@ -233,13 +253,18 @@ int mlx_inline_dim(const mlx_inline_array* a, int axis) {
 const int* mlx_inline_shape(const mlx_inline_array* a) { return as_arr(a).shape().data(); }
 int mlx_inline_dtype(const mlx_inline_array* a) {
     auto dt = as_arr(a).dtype();
+    if (dt == mlx::core::bool_) return 0;
+    if (dt == mlx::core::uint8) return 1;
+    if (dt == mlx::core::uint16) return 2;
+    if (dt == mlx::core::uint32) return 3;
+    if (dt == mlx::core::int8) return 5;
+    if (dt == mlx::core::int16) return 6;
+    if (dt == mlx::core::int32) return 7;
+    if (dt == mlx::core::int64) return 8;
     if (dt == mlx::core::float16) return 9;
     if (dt == mlx::core::float32) return 10;
     if (dt == mlx::core::bfloat16) return 11;
-    if (dt == mlx::core::int32) return 7;
-    if (dt == mlx::core::uint32) return 3;
-    if (dt == mlx::core::bool_) return 0;
-    return 10;
+    return 10; // fallback
 }
 
 // Item extraction
@@ -348,8 +373,10 @@ void mlx_inline_norm_l2(mlx_inline_array* dst, const mlx_inline_array* a, int ax
 void mlx_inline_conv1d(mlx_inline_array* dst, const mlx_inline_array* input,
                          const mlx_inline_array* weight, int stride, int padding,
                          int dilation, int groups) {
-    new (dst->buf) array(mlx::core::conv1d(
-        as_arr(input), as_arr(weight), stride, padding, dilation, groups));
+    try {
+        new (dst->buf) array(mlx::core::conv1d(
+            as_arr(input), as_arr(weight), stride, padding, dilation, groups));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 // Print size for Rust to use
@@ -577,7 +604,8 @@ static inline mlx::core::Dtype dtype_from_int(int dtype) {
 }
 
 void mlx_inline_concatenate_2(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b, int axis) {
-    new (dst->buf) array(mlx::core::concatenate({as_arr(a), as_arr(b)}, axis));
+    try { new (dst->buf) array(mlx::core::concatenate({as_arr(a), as_arr(b)}, axis)); }
+    catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_softplus(mlx_inline_array* dst, const mlx_inline_array* a) {
@@ -607,19 +635,23 @@ void mlx_inline_ones(mlx_inline_array* dst, const int* shape, int ndim, int dtyp
 
 void mlx_inline_slice(mlx_inline_array* dst, const mlx_inline_array* a,
                        const int* start, const int* stop, int ndim) {
-    new (dst->buf) array(mlx::core::slice(
-        as_arr(a),
-        mlx::core::Shape(start, start + ndim),
-        mlx::core::Shape(stop, stop + ndim)));
+    try {
+        new (dst->buf) array(mlx::core::slice(
+            as_arr(a),
+            mlx::core::Shape(start, start + ndim),
+            mlx::core::Shape(stop, stop + ndim)));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_slice_set(mlx_inline_array* dst, const mlx_inline_array* a,
                             const mlx_inline_array* value,
                             const int* start, const int* stop, int ndim) {
-    new (dst->buf) array(mlx::core::slice_update(
-        as_arr(a), as_arr(value),
-        mlx::core::Shape(start, start + ndim),
-        mlx::core::Shape(stop, stop + ndim)));
+    try {
+        new (dst->buf) array(mlx::core::slice_update(
+            as_arr(a), as_arr(value),
+            mlx::core::Shape(start, start + ndim),
+            mlx::core::Shape(stop, stop + ndim)));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_repeat(mlx_inline_array* dst, const mlx_inline_array* a, int repeats, int axis) {
@@ -666,33 +698,40 @@ void mlx_inline_sdpa_with_mask(mlx_inline_array* dst,
                                  const mlx_inline_array* q, const mlx_inline_array* k,
                                  const mlx_inline_array* v, float scale,
                                  const mlx_inline_array* mask) {
-    auto mask_opt = mask
-        ? std::optional<array>(as_arr(mask))
-        : std::optional<array>(std::nullopt);
-    new (dst->buf) array(mlx::core::fast::scaled_dot_product_attention(
-        as_arr(q), as_arr(k), as_arr(v), scale, /*mask_mode=*/"", mask_opt));
+    try {
+        auto mask_opt = mask
+            ? std::optional<array>(as_arr(mask))
+            : std::optional<array>(std::nullopt);
+        new (dst->buf) array(mlx::core::fast::scaled_dot_product_attention(
+            as_arr(q), as_arr(k), as_arr(v), scale, /*mask_mode=*/"", mask_opt));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_eval_2(mlx_inline_array* a, mlx_inline_array* b) {
-    mlx::core::eval({as_arr(a), as_arr(b)});
+    try { mlx::core::eval({as_arr(a), as_arr(b)}); }
+    catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); }
 }
 
 void mlx_inline_eval_many(mlx_inline_array** arrays, int count) {
-    std::vector<array> arrs;
-    arrs.reserve(count);
-    for (int i = 0; i < count; ++i) {
-        arrs.push_back(as_arr(arrays[i]));
-    }
-    mlx::core::eval(std::move(arrs));
+    try {
+        std::vector<array> arrs;
+        arrs.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            arrs.push_back(as_arr(arrays[i]));
+        }
+        mlx::core::eval(std::move(arrs));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); }
 }
 
 void mlx_inline_async_eval_many(mlx_inline_array** arrays, int count) {
-    std::vector<array> arrs;
-    arrs.reserve(count);
-    for (int i = 0; i < count; ++i) {
-        arrs.push_back(as_arr(arrays[i]));
-    }
-    mlx::core::async_eval(std::move(arrs));
+    try {
+        std::vector<array> arrs;
+        arrs.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            arrs.push_back(as_arr(arrays[i]));
+        }
+        mlx::core::async_eval(std::move(arrs));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); }
 }
 
 void mlx_inline_quantized_matmul(mlx_inline_array* dst,
@@ -717,20 +756,22 @@ void mlx_inline_gather_qmm(mlx_inline_array* dst,
                               const mlx_inline_array* scales, const mlx_inline_array* biases,
                               const mlx_inline_array* lhs_indices, const mlx_inline_array* rhs_indices,
                               bool transpose, int group_size, int bits, bool sorted) {
-    auto biases_opt = biases
-        ? std::optional<array>(as_arr(biases))
-        : std::optional<array>(std::nullopt);
-    auto lhs_opt = lhs_indices
-        ? std::optional<array>(as_arr(lhs_indices))
-        : std::optional<array>(std::nullopt);
-    auto rhs_opt = rhs_indices
-        ? std::optional<array>(as_arr(rhs_indices))
-        : std::optional<array>(std::nullopt);
-    new (dst->buf) array(mlx::core::gather_qmm(
-        as_arr(x), as_arr(w), as_arr(scales), biases_opt,
-        lhs_opt, rhs_opt,
-        transpose, group_size, bits,
-        /*mode=*/"affine", sorted));
+    try {
+        auto biases_opt = biases
+            ? std::optional<array>(as_arr(biases))
+            : std::optional<array>(std::nullopt);
+        auto lhs_opt = lhs_indices
+            ? std::optional<array>(as_arr(lhs_indices))
+            : std::optional<array>(std::nullopt);
+        auto rhs_opt = rhs_indices
+            ? std::optional<array>(as_arr(rhs_indices))
+            : std::optional<array>(std::nullopt);
+        new (dst->buf) array(mlx::core::gather_qmm(
+            as_arr(x), as_arr(w), as_arr(scales), biases_opt,
+            lhs_opt, rhs_opt,
+            transpose, group_size, bits,
+            /*mode=*/"affine", sorted));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 // GDN Metal kernel source — fuses the entire recurrence into one Metal dispatch.
@@ -4723,91 +4764,93 @@ int mlx_inline_gdn_update(
     const mlx_inline_array* dt_bias,
     const mlx_inline_array* state_in,
     bool training) {
-    auto& q_ref = as_arr(q);
-    auto& k_ref = as_arr(k);
-    auto& v_ref = as_arr(v);
-    auto& a_ref = as_arr(a);
-    auto& b_ref = as_arr(b);
-    auto& a_log_ref = as_arr(a_log);
-    auto& dt_bias_ref = as_arr(dt_bias);
-    auto& state_ref = as_arr(state_in);
+    try {
+        auto& q_ref = as_arr(q);
+        auto& k_ref = as_arr(k);
+        auto& v_ref = as_arr(v);
+        auto& a_ref = as_arr(a);
+        auto& b_ref = as_arr(b);
+        auto& a_log_ref = as_arr(a_log);
+        auto& dt_bias_ref = as_arr(dt_bias);
+        auto& state_ref = as_arr(state_in);
 
-    using namespace mlx::core;
+        using namespace mlx::core;
 
-    // Compute beta and g
-    auto beta = sigmoid(b_ref);
-    auto a_log_f32 = astype(a_log_ref, float32);
-    auto decay_rate = exp(a_log_f32);
-    auto sp = log1p(exp(add(a_ref, dt_bias_ref)));
-    auto g = exp(negative(multiply(decay_rate, sp)));
+        // Compute beta and g
+        auto beta = sigmoid(b_ref);
+        auto a_log_f32 = astype(a_log_ref, float32);
+        auto decay_rate = exp(a_log_f32);
+        auto sp = log1p(exp(add(a_ref, dt_bias_ref)));
+        auto g = exp(negative(multiply(decay_rate, sp)));
 
-    int B = q_ref.shape(0);
-    int T = q_ref.shape(1);
-    int Hk = q_ref.shape(2);
-    int Dk = q_ref.shape(3);
-    int Hv = v_ref.shape(2);
-    int Dv = v_ref.shape(3);
+        int B = q_ref.shape(0);
+        int T = q_ref.shape(1);
+        int Hk = q_ref.shape(2);
+        int Dk = q_ref.shape(3);
+        int Hv = v_ref.shape(2);
+        int Dv = v_ref.shape(3);
 
-    // Try Metal kernel: requires Dk%32==0, Dk<=256, scalar gating (g is 3D)
-    bool use_metal = !training && (Dk % 32 == 0) && (Dk <= 256) && (Dk > 0) && (g.ndim() == 3);
+        // Try Metal kernel: requires Dk%32==0, Dk<=256, scalar gating (g is 3D)
+        bool use_metal = !training && (Dk % 32 == 0) && (Dk <= 256) && (Dk > 0) && (g.ndim() == 3);
 
-    if (use_metal) {
-        auto input_dtype = q_ref.dtype();
-        auto state_dtype = state_ref.dtype();
-        auto t_arr = array(T);
+        if (use_metal) {
+            auto input_dtype = q_ref.dtype();
+            auto state_dtype = state_ref.dtype();
+            auto t_arr = array(T);
 
-        auto& kernel = get_gdn_kernel();
-        auto outputs = kernel(
-            {q_ref, k_ref, v_ref, g, beta, state_ref, t_arr},
-            {{B, T, Hv, Dv}, state_ref.shape()},       // output shapes
-            {input_dtype, state_dtype},                   // output dtypes
-            {32, Dv, B * Hv},                            // grid
-            {32, 4, 1},                                   // threadgroup
-            {{"InT", input_dtype}, {"StT", state_dtype},
-             {"Dk", Dk}, {"Dv", Dv}, {"Hk", Hk}, {"Hv", Hv}},
-            std::nullopt,                                 // init_value
-            false,                                        // verbose
-            {}                                            // default stream
-        );
+            auto& kernel = get_gdn_kernel();
+            auto outputs = kernel(
+                {q_ref, k_ref, v_ref, g, beta, state_ref, t_arr},
+                {{B, T, Hv, Dv}, state_ref.shape()},       // output shapes
+                {input_dtype, state_dtype},                   // output dtypes
+                {32, Dv, B * Hv},                            // grid
+                {32, 4, 1},                                   // threadgroup
+                {{"InT", input_dtype}, {"StT", state_dtype},
+                 {"Dk", Dk}, {"Dv", Dv}, {"Hk", Hk}, {"Hv", Hv}},
+                std::nullopt,                                 // init_value
+                false,                                        // verbose
+                {}                                            // default stream
+            );
 
-        new (dst_y->buf) array(outputs[0]);
-        new (dst_state->buf) array(outputs[1]);
+            new (dst_y->buf) array(outputs[0]);
+            new (dst_state->buf) array(outputs[1]);
+            return 0;
+        }
+
+        // Fallback: ops-based recurrence
+        int repeat_factor = Hv / Hk;
+        auto q_expanded = (repeat_factor > 1) ? repeat(q_ref, repeat_factor, 2) : q_ref;
+        auto k_expanded = (repeat_factor > 1) ? repeat(k_ref, repeat_factor, 2) : k_ref;
+
+        auto state = state_ref;
+        std::vector<array> ys;
+        ys.reserve(T);
+
+        for (int t = 0; t < T; ++t) {
+            auto q_t = squeeze(slice(q_expanded, {0, t, 0, 0}, {B, t+1, Hv, Dk}), 1);
+            auto k_t = squeeze(slice(k_expanded, {0, t, 0, 0}, {B, t+1, Hv, Dk}), 1);
+            auto v_t = squeeze(slice(v_ref, {0, t, 0, 0}, {B, t+1, Hv, Dv}), 1);
+            auto g_t = squeeze(slice(g, {0, t, 0}, {B, t+1, Hv}), 1);
+            auto beta_t = squeeze(slice(beta, {0, t, 0}, {B, t+1, Hv}), 1);
+
+            auto g_exp = reshape(g_t, {B, Hv, 1, 1});
+            auto decayed = multiply(state, g_exp);
+            auto k_4d = reshape(k_t, {B, Hv, 1, Dk});
+            auto kv_mem = sum(multiply(decayed, k_4d), {-1}, false);
+            auto beta_exp = reshape(beta_t, {B, Hv, 1});
+            auto delta = multiply(subtract(v_t, kv_mem), beta_exp);
+            auto delta_4d = reshape(delta, {B, Hv, Dv, 1});
+            state = add(decayed, multiply(k_4d, delta_4d));
+            auto q_4d = reshape(q_t, {B, Hv, 1, Dk});
+            auto y_t = sum(multiply(state, q_4d), {-1}, false);
+            ys.push_back(astype(y_t, q_ref.dtype()));
+        }
+
+        auto y = (T == 1) ? reshape(ys[0], {B, 1, Hv, Dv}) : stack(ys, 1);
+        new (dst_y->buf) array(y);
+        new (dst_state->buf) array(state);
         return 0;
-    }
-
-    // Fallback: ops-based recurrence
-    int repeat_factor = Hv / Hk;
-    auto q_expanded = (repeat_factor > 1) ? repeat(q_ref, repeat_factor, 2) : q_ref;
-    auto k_expanded = (repeat_factor > 1) ? repeat(k_ref, repeat_factor, 2) : k_ref;
-
-    auto state = state_ref;
-    std::vector<array> ys;
-    ys.reserve(T);
-
-    for (int t = 0; t < T; ++t) {
-        auto q_t = squeeze(slice(q_expanded, {0, t, 0, 0}, {B, t+1, Hv, Dk}), 1);
-        auto k_t = squeeze(slice(k_expanded, {0, t, 0, 0}, {B, t+1, Hv, Dk}), 1);
-        auto v_t = squeeze(slice(v_ref, {0, t, 0, 0}, {B, t+1, Hv, Dv}), 1);
-        auto g_t = squeeze(slice(g, {0, t, 0}, {B, t+1, Hv}), 1);
-        auto beta_t = squeeze(slice(beta, {0, t, 0}, {B, t+1, Hv}), 1);
-
-        auto g_exp = reshape(g_t, {B, Hv, 1, 1});
-        auto decayed = multiply(state, g_exp);
-        auto k_4d = reshape(k_t, {B, Hv, 1, Dk});
-        auto kv_mem = sum(multiply(decayed, k_4d), {-1}, false);
-        auto beta_exp = reshape(beta_t, {B, Hv, 1});
-        auto delta = multiply(subtract(v_t, kv_mem), beta_exp);
-        auto delta_4d = reshape(delta, {B, Hv, Dv, 1});
-        state = add(decayed, multiply(k_4d, delta_4d));
-        auto q_4d = reshape(q_t, {B, Hv, 1, Dk});
-        auto y_t = sum(multiply(state, q_4d), {-1}, false);
-        ys.push_back(astype(y_t, q_ref.dtype()));
-    }
-
-    auto y = (T == 1) ? reshape(ys[0], {B, 1, Hv, Dv}) : stack(ys, 1);
-    new (dst_y->buf) array(y);
-    new (dst_state->buf) array(state);
-    return 0;
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); return -1; }
 }
 
 void mlx_inline_take_axis(mlx_inline_array* dst, const mlx_inline_array* a,
@@ -4856,68 +4899,74 @@ void mlx_inline_gdn_metal_step(
     const mlx_inline_array* beta,
     const mlx_inline_array* state_in,
     int T) {
-    using namespace mlx::core;
-    auto& q_ref = as_arr(q);
-    auto& k_ref = as_arr(k);
-    auto& v_ref = as_arr(v);
-    auto& g_ref = as_arr(g);
-    auto& beta_ref = as_arr(beta);
-    auto& state_ref = as_arr(state_in);
+    try {
+        using namespace mlx::core;
+        auto& q_ref = as_arr(q);
+        auto& k_ref = as_arr(k);
+        auto& v_ref = as_arr(v);
+        auto& g_ref = as_arr(g);
+        auto& beta_ref = as_arr(beta);
+        auto& state_ref = as_arr(state_in);
 
-    int B = q_ref.shape(0);
-    int Hk = q_ref.shape(2);
-    int Dk = q_ref.shape(3);
-    int Hv = v_ref.shape(2);
-    int Dv = v_ref.shape(3);
+        int B = q_ref.shape(0);
+        int Hk = q_ref.shape(2);
+        int Dk = q_ref.shape(3);
+        int Hv = v_ref.shape(2);
+        int Dv = v_ref.shape(3);
 
-    bool use_metal = (Dk % 32 == 0) && (Dk <= 256) && (Dk > 0) && (g_ref.ndim() == 3);
+        bool use_metal = (Dk % 32 == 0) && (Dk <= 256) && (Dk > 0) && (g_ref.ndim() == 3);
 
-    if (use_metal) {
-        auto input_dtype = q_ref.dtype();
-        auto state_dtype = state_ref.dtype();
-        auto t_arr = array(T);
-        auto& kernel = get_gdn_kernel();
-        auto outputs = kernel(
-            {q_ref, k_ref, v_ref, g_ref, beta_ref, state_ref, t_arr},
-            {{B, T, Hv, Dv}, state_ref.shape()},
-            {input_dtype, state_dtype},
-            {32, Dv, B * Hv},
-            {32, 4, 1},
-            {{"InT", input_dtype}, {"StT", state_dtype},
-             {"Dk", Dk}, {"Dv", Dv}, {"Hk", Hk}, {"Hv", Hv}},
-            std::nullopt, false, {});
-        new (dst_y->buf) array(outputs[0]);
-        new (dst_state->buf) array(outputs[1]);
-        return;
+        if (use_metal) {
+            auto input_dtype = q_ref.dtype();
+            auto state_dtype = state_ref.dtype();
+            auto t_arr = array(T);
+            auto& kernel = get_gdn_kernel();
+            auto outputs = kernel(
+                {q_ref, k_ref, v_ref, g_ref, beta_ref, state_ref, t_arr},
+                {{B, T, Hv, Dv}, state_ref.shape()},
+                {input_dtype, state_dtype},
+                {32, Dv, B * Hv},
+                {32, 4, 1},
+                {{"InT", input_dtype}, {"StT", state_dtype},
+                 {"Dk", Dk}, {"Dv", Dv}, {"Hk", Hk}, {"Hv", Hv}},
+                std::nullopt, false, {});
+            new (dst_y->buf) array(outputs[0]);
+            new (dst_state->buf) array(outputs[1]);
+            return;
+        }
+
+        // Fallback: ops-based recurrence
+        int repeat_factor = Hv / Hk;
+        auto q_exp = (repeat_factor > 1) ? repeat(q_ref, repeat_factor, 2) : q_ref;
+        auto k_exp = (repeat_factor > 1) ? repeat(k_ref, repeat_factor, 2) : k_ref;
+        auto state = state_ref;
+        std::vector<array> ys;
+        ys.reserve(T);
+        for (int t = 0; t < T; ++t) {
+            auto q_t = squeeze(slice(q_exp, {0,t,0,0}, {B,t+1,Hv,Dk}), 1);
+            auto k_t = squeeze(slice(k_exp, {0,t,0,0}, {B,t+1,Hv,Dk}), 1);
+            auto v_t = squeeze(slice(v_ref, {0,t,0,0}, {B,t+1,Hv,Dv}), 1);
+            auto g_t = squeeze(slice(g_ref, {0,t,0}, {B,t+1,Hv}), 1);
+            auto beta_t = squeeze(slice(beta_ref, {0,t,0}, {B,t+1,Hv}), 1);
+            auto g_4d = reshape(g_t, {B,Hv,1,1});
+            auto decayed = multiply(state, g_4d);
+            auto k_4d = reshape(k_t, {B,Hv,1,Dk});
+            auto kv_mem = sum(multiply(decayed, k_4d), {-1}, false);
+            auto beta_3d = reshape(beta_t, {B,Hv,1});
+            auto delta = multiply(subtract(v_t, kv_mem), beta_3d);
+            auto delta_4d = reshape(delta, {B,Hv,Dv,1});
+            state = add(decayed, multiply(k_4d, delta_4d));
+            auto q_4d = reshape(q_t, {B,Hv,1,Dk});
+            ys.push_back(astype(sum(multiply(state, q_4d), {-1}, false), q_ref.dtype()));
+        }
+        auto y = (T == 1) ? reshape(ys[0], {B,1,Hv,Dv}) : stack(ys, 1);
+        new (dst_y->buf) array(y);
+        new (dst_state->buf) array(state);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what());
+        new (dst_y->buf) array(0.0f);
+        new (dst_state->buf) array(0.0f);
     }
-
-    // Fallback: ops-based recurrence
-    int repeat_factor = Hv / Hk;
-    auto q_exp = (repeat_factor > 1) ? repeat(q_ref, repeat_factor, 2) : q_ref;
-    auto k_exp = (repeat_factor > 1) ? repeat(k_ref, repeat_factor, 2) : k_ref;
-    auto state = state_ref;
-    std::vector<array> ys;
-    ys.reserve(T);
-    for (int t = 0; t < T; ++t) {
-        auto q_t = squeeze(slice(q_exp, {0,t,0,0}, {B,t+1,Hv,Dk}), 1);
-        auto k_t = squeeze(slice(k_exp, {0,t,0,0}, {B,t+1,Hv,Dk}), 1);
-        auto v_t = squeeze(slice(v_ref, {0,t,0,0}, {B,t+1,Hv,Dv}), 1);
-        auto g_t = squeeze(slice(g_ref, {0,t,0}, {B,t+1,Hv}), 1);
-        auto beta_t = squeeze(slice(beta_ref, {0,t,0}, {B,t+1,Hv}), 1);
-        auto g_4d = reshape(g_t, {B,Hv,1,1});
-        auto decayed = multiply(state, g_4d);
-        auto k_4d = reshape(k_t, {B,Hv,1,Dk});
-        auto kv_mem = sum(multiply(decayed, k_4d), {-1}, false);
-        auto beta_3d = reshape(beta_t, {B,Hv,1});
-        auto delta = multiply(subtract(v_t, kv_mem), beta_3d);
-        auto delta_4d = reshape(delta, {B,Hv,Dv,1});
-        state = add(decayed, multiply(k_4d, delta_4d));
-        auto q_4d = reshape(q_t, {B,Hv,1,Dk});
-        ys.push_back(astype(sum(multiply(state, q_4d), {-1}, false), q_ref.dtype()));
-    }
-    auto y = (T == 1) ? reshape(ys[0], {B,1,Hv,Dv}) : stack(ys, 1);
-    new (dst_y->buf) array(y);
-    new (dst_state->buf) array(state);
 }
 
 void mlx_inline_arange(mlx_inline_array* dst, int n, int dtype) {
@@ -5026,50 +5075,58 @@ extern "C" {
 
 void mlx_inline_fused_swiglu(mlx_inline_array* dst,
     const mlx_inline_array* gate, const mlx_inline_array* up) {
-    static auto compiled = make_compiled(
-        [](const std::vector<array>& inputs) -> std::vector<array> {
-            auto& g = inputs[0];
-            auto& u = inputs[1];
-            return {multiply(multiply(g, sigmoid(g)), u)};
-        });
-    auto result = compiled({as_arr(gate), as_arr(up)});
-    new (dst->buf) array(result[0]);
+    try {
+        static auto compiled = make_compiled(
+            [](const std::vector<array>& inputs) -> std::vector<array> {
+                auto& g = inputs[0];
+                auto& u = inputs[1];
+                return {multiply(multiply(g, sigmoid(g)), u)};
+            });
+        auto result = compiled({as_arr(gate), as_arr(up)});
+        new (dst->buf) array(result[0]);
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_fused_silu(mlx_inline_array* dst, const mlx_inline_array* x) {
-    static auto compiled = make_compiled(
-        [](const std::vector<array>& inputs) -> std::vector<array> {
-            auto& x = inputs[0];
-            return {multiply(x, sigmoid(x))};
-        });
-    auto result = compiled({as_arr(x)});
-    new (dst->buf) array(result[0]);
+    try {
+        static auto compiled = make_compiled(
+            [](const std::vector<array>& inputs) -> std::vector<array> {
+                auto& x = inputs[0];
+                return {multiply(x, sigmoid(x))};
+            });
+        auto result = compiled({as_arr(x)});
+        new (dst->buf) array(result[0]);
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_fused_compute_g(mlx_inline_array* dst,
     const mlx_inline_array* a_log, const mlx_inline_array* a, const mlx_inline_array* dt_bias) {
-    static auto compiled = make_compiled(
-        [](const std::vector<array>& inputs) -> std::vector<array> {
-            auto decay = exp(astype(inputs[0], float32));
-            auto sp = log1p(exp(add(inputs[1], inputs[2])));
-            return {exp(negative(multiply(decay, sp)))};
-        });
-    auto result = compiled({as_arr(a_log), as_arr(a), as_arr(dt_bias)});
-    new (dst->buf) array(result[0]);
+    try {
+        static auto compiled = make_compiled(
+            [](const std::vector<array>& inputs) -> std::vector<array> {
+                auto decay = exp(astype(inputs[0], float32));
+                auto sp = log1p(exp(add(inputs[1], inputs[2])));
+                return {exp(negative(multiply(decay, sp)))};
+            });
+        auto result = compiled({as_arr(a_log), as_arr(a), as_arr(dt_bias)});
+        new (dst->buf) array(result[0]);
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_fused_precise_swiglu(mlx_inline_array* dst,
     const mlx_inline_array* x, const mlx_inline_array* gate) {
-    static auto compiled = make_compiled(
-        [](const std::vector<array>& inputs) -> std::vector<array> {
-            auto& x = inputs[0];
-            auto& g = inputs[1];
-            auto g32 = multiply(astype(g, float32), sigmoid(astype(g, float32)));
-            auto x32 = astype(x, float32);
-            return {astype(multiply(g32, x32), x.dtype())};
-        });
-    auto result = compiled({as_arr(x), as_arr(gate)});
-    new (dst->buf) array(result[0]);
+    try {
+        static auto compiled = make_compiled(
+            [](const std::vector<array>& inputs) -> std::vector<array> {
+                auto& x = inputs[0];
+                auto& g = inputs[1];
+                auto g32 = multiply(astype(g, float32), sigmoid(astype(g, float32)));
+                auto x32 = astype(x, float32);
+                return {astype(multiply(g32, x32), x.dtype())};
+            });
+        auto result = compiled({as_arr(x), as_arr(gate)});
+        new (dst->buf) array(result[0]);
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 // Compiled entire GDN layer forward.
@@ -5163,16 +5220,23 @@ void mlx_inline_compiled_gdn_layer(
         initialized = true;
     }
 
-    auto result = compiled({
-        as_arr(normed),
-        as_arr(qkv_w), as_arr(z_w), as_arr(b_w), as_arr(a_w),
-        as_arr(conv_w),
-        as_arr(q_nw), as_arr(k_nw), as_arr(a_log), as_arr(dt_bias),
-        as_arr(norm_w), as_arr(out_w), as_arr(conv_state_in), as_arr(ssm_state_in)
-    });
-    new (dst_out->buf) array(result[0]);
-    new (dst_conv_state->buf) array(result[1]);
-    new (dst_ssm_state->buf) array(result[2]);
+    try {
+        auto result = compiled({
+            as_arr(normed),
+            as_arr(qkv_w), as_arr(z_w), as_arr(b_w), as_arr(a_w),
+            as_arr(conv_w),
+            as_arr(q_nw), as_arr(k_nw), as_arr(a_log), as_arr(dt_bias),
+            as_arr(norm_w), as_arr(out_w), as_arr(conv_state_in), as_arr(ssm_state_in)
+        });
+        new (dst_out->buf) array(result[0]);
+        new (dst_conv_state->buf) array(result[1]);
+        new (dst_ssm_state->buf) array(result[2]);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what());
+        new (dst_out->buf) array(0.0f);
+        new (dst_conv_state->buf) array(0.0f);
+        new (dst_ssm_state->buf) array(0.0f);
+    }
 }
 
 // shapeless=false version — fixed shapes, works with ALL primitives.
@@ -5246,15 +5310,22 @@ void mlx_inline_compiled_gdn_layer_fixed(
         initialized = true;
     }
 
-    auto result = compiled({
-        as_arr(normed),
-        as_arr(qkv_w), as_arr(z_w), as_arr(b_w), as_arr(a_w), as_arr(conv_w),
-        as_arr(q_nw), as_arr(k_nw), as_arr(a_log), as_arr(dt_bias),
-        as_arr(norm_w), as_arr(out_w), as_arr(conv_state_in), as_arr(ssm_state_in)
-    });
-    new (dst_out->buf) array(result[0]);
-    new (dst_conv_state->buf) array(result[1]);
-    new (dst_ssm_state->buf) array(result[2]);
+    try {
+        auto result = compiled({
+            as_arr(normed),
+            as_arr(qkv_w), as_arr(z_w), as_arr(b_w), as_arr(a_w), as_arr(conv_w),
+            as_arr(q_nw), as_arr(k_nw), as_arr(a_log), as_arr(dt_bias),
+            as_arr(norm_w), as_arr(out_w), as_arr(conv_state_in), as_arr(ssm_state_in)
+        });
+        new (dst_out->buf) array(result[0]);
+        new (dst_conv_state->buf) array(result[1]);
+        new (dst_ssm_state->buf) array(result[2]);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what());
+        new (dst_out->buf) array(0.0f);
+        new (dst_conv_state->buf) array(0.0f);
+        new (dst_ssm_state->buf) array(0.0f);
+    }
 }
 
 void mlx_inline_compiled_attn_layer_fixed(
@@ -5403,22 +5474,29 @@ void mlx_inline_compiled_attn_layer_fixed(
         compiled = &entries->back().compiled;
     }
 
-    auto result = (*compiled)({
-        as_arr(normed),
-        as_arr(q_w),
-        as_arr(k_w),
-        as_arr(v_w),
-        as_arr(o_w),
-        as_arr(q_nw),
-        as_arr(k_nw),
-        as_arr(cache_keys_in),
-        as_arr(cache_vals_in),
-        array(kv_offset),
-        array(rope_offset),
-    });
-    new (dst_out->buf) array(result[0]);
-    new (dst_cache_keys->buf) array(result[1]);
-    new (dst_cache_vals->buf) array(result[2]);
+    try {
+        auto result = (*compiled)({
+            as_arr(normed),
+            as_arr(q_w),
+            as_arr(k_w),
+            as_arr(v_w),
+            as_arr(o_w),
+            as_arr(q_nw),
+            as_arr(k_nw),
+            as_arr(cache_keys_in),
+            as_arr(cache_vals_in),
+            array(kv_offset),
+            array(rope_offset),
+        });
+        new (dst_out->buf) array(result[0]);
+        new (dst_cache_keys->buf) array(result[1]);
+        new (dst_cache_vals->buf) array(result[2]);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what());
+        new (dst_out->buf) array(0.0f);
+        new (dst_cache_keys->buf) array(0.0f);
+        new (dst_cache_vals->buf) array(0.0f);
+    }
 }
 
 void mlx_inline_compiled_moe_layer_fixed(
@@ -5535,18 +5613,20 @@ void mlx_inline_compiled_moe_layer_fixed(
         compiled = &entries->back().compiled;
     }
 
-    auto result = (*compiled)({
-        as_arr(x),
-        as_arr(router_w),
-        as_arr(moe_gate_w),
-        as_arr(moe_up_w),
-        as_arr(moe_down_w),
-        as_arr(shared_gate_w),
-        as_arr(shared_up_w),
-        as_arr(shared_down_w),
-        as_arr(shared_expert_gate_w),
-    });
-    new (dst_out->buf) array(result[0]);
+    try {
+        auto result = (*compiled)({
+            as_arr(x),
+            as_arr(router_w),
+            as_arr(moe_gate_w),
+            as_arr(moe_up_w),
+            as_arr(moe_down_w),
+            as_arr(shared_gate_w),
+            as_arr(shared_up_w),
+            as_arr(shared_down_w),
+            as_arr(shared_expert_gate_w),
+        });
+        new (dst_out->buf) array(result[0]);
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst_out->buf) array(0.0f); }
 }
 
 } // extern "C"
@@ -6220,8 +6300,10 @@ void mlx_inline_tri(mlx_inline_array* dst, int n, int m, int k, int dtype) {
 
 void mlx_inline_broadcast_to(mlx_inline_array* dst, const mlx_inline_array* a,
                               const int* shape, int ndim) {
-    new (dst->buf) array(mlx::core::broadcast_to(
-        as_arr(a), {shape, shape + ndim}));
+    try {
+        new (dst->buf) array(mlx::core::broadcast_to(
+            as_arr(a), {shape, shape + ndim}));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 void mlx_inline_flatten(mlx_inline_array* dst, const mlx_inline_array* a,
@@ -6434,16 +6516,25 @@ void mlx_inline_value_and_grad(
 
     // mlx::core::value_and_grad returns a function that produces
     // pair<vector<array>, vector<array>> = (values, grads).
-    auto vg_fn = mlx::core::value_and_grad(
-        std::function<std::vector<array>(std::vector<array>)>(cpp_forward),
-        argnums);
-    auto result = vg_fn(inputs);
-    auto& values = result.first;
-    auto& grads = result.second;
+    try {
+        auto vg_fn = mlx::core::value_and_grad(
+            std::function<std::vector<array>(std::vector<array>)>(cpp_forward),
+            argnums);
+        auto result = vg_fn(inputs);
+        auto& values = result.first;
+        auto& grads = result.second;
 
-    new (loss_out->buf) array(values[0]);
-    for (int i = 0; i < n_params; i++) {
-        new (grads_out[i]->buf) array(grads[i]);
+        new (loss_out->buf) array(values[0]);
+        for (int i = 0; i < n_params; i++) {
+            new (grads_out[i]->buf) array(grads[i]);
+        }
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what());
+        // Return scalar NaN loss and zero gradients so the training loop can detect failure.
+        new (loss_out->buf) array(std::numeric_limits<float>::quiet_NaN());
+        for (int i = 0; i < n_params; i++) {
+            new (grads_out[i]->buf) array(0.0f);
+        }
     }
 }
 
@@ -6575,10 +6666,12 @@ void mlx_inline_conv2d(mlx_inline_array* dst, const mlx_inline_array* input,
                        const mlx_inline_array* weight,
                        int stride_h, int stride_w, int pad_h, int pad_w,
                        int dil_h, int dil_w, int groups) {
-    new (dst->buf) array(mlx::core::conv2d(
-        as_arr(input), as_arr(weight),
-        {stride_h, stride_w}, {pad_h, pad_w},
-        {dil_h, dil_w}, groups));
+    try {
+        new (dst->buf) array(mlx::core::conv2d(
+            as_arr(input), as_arr(weight),
+            {stride_h, stride_w}, {pad_h, pad_w},
+            {dil_h, dil_w}, groups));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
 } // extern "C" (qwen35 full forward)

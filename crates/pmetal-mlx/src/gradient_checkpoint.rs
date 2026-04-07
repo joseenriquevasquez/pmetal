@@ -334,7 +334,7 @@ mod tests {
         // Simple identity layer for testing
         let input = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
 
-        let mut output = checkpointed_forward(|x| Ok(x.clone()), &input, 0, &config).unwrap();
+        let output = checkpointed_forward(|x| Ok(x.clone()), &input, 0, &config).unwrap();
         output.eval();
 
         assert_eq!(output.shape(), input.shape());
@@ -396,7 +396,7 @@ mod tests {
         // After 3 add operations, values should be [4, 5, 6, 7]
         let expected = Array::from_slice(&[4.0f32, 5.0, 6.0, 7.0], &[2, 2]);
         let diff = hidden.subtract(&expected);
-        let mut sum = diff.abs().sum(None);
+        let sum = diff.abs().sum(None);
         sum.eval();
         assert!(sum.item::<f32>() < 1e-5);
     }

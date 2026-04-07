@@ -567,7 +567,7 @@ mod tests {
         let hidden = ops::zeros(&[2, 4, 64], Dtype::Float32);
         let (output, aux_loss) = moe.forward(&hidden).unwrap();
 
-        let mut out_owned = output.clone();
+        let out_owned = output.clone();
         out_owned.eval();
 
         assert_eq!(out_owned.shape(), &[2, 4, 64]);
@@ -585,12 +585,12 @@ mod tests {
         let hidden = random::normal(&[2, 4, 64], Dtype::Float32);
         let (output, aux_loss) = moe.forward(&hidden).unwrap();
 
-        let mut out_owned = output.clone();
+        let out_owned = output.clone();
         out_owned.eval();
         assert!(aux_loss.is_some());
 
         let loss = aux_loss.unwrap();
-        let mut loss_owned = loss.clone();
+        let loss_owned = loss.clone();
         loss_owned.eval();
         assert_eq!(loss_owned.ndim(), 0);
     }
@@ -607,7 +607,7 @@ mod tests {
         let hidden = ops::zeros(&[2, 4, 64], Dtype::Float32);
         let (output, _) = moe.forward(&hidden).unwrap();
 
-        let mut out_owned = output.clone();
+        let out_owned = output.clone();
         out_owned.eval();
         assert_eq!(out_owned.shape(), &[2, 4, 64]);
     }
@@ -619,7 +619,7 @@ mod tests {
         let x = ops::zeros(&[4, 64], Dtype::Float32);
         let out = expert.forward(&x).unwrap();
 
-        let mut out_owned = out.clone();
+        let out_owned = out.clone();
         out_owned.eval();
         assert_eq!(out_owned.shape(), &[4, 64]);
     }
@@ -634,7 +634,7 @@ mod tests {
         let w = ops::zeros(&[4, 64, 128], Dtype::Float32);
 
         let result = moe.batched_matmul(&x, &w);
-        let mut res_owned = result.clone();
+        let res_owned = result.clone();
         res_owned.eval();
 
         assert_eq!(res_owned.shape(), &[4, 128]);

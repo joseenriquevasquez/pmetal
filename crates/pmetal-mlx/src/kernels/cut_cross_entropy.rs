@@ -562,7 +562,7 @@ mod tests {
         let cce = CutCrossEntropy::new(config);
 
         let output = cce.forward(&hidden, &weight, &targets, None).unwrap();
-        let mut loss_eval = output.loss.clone();
+        let loss_eval = output.loss.clone();
         loss_eval.eval();
 
         let loss_value = loss_eval.item_f32();
@@ -613,7 +613,7 @@ mod tests {
         let output_no_cap = cce_no_cap
             .forward(&hidden, &weight, &targets, None)
             .unwrap();
-        let mut loss_eval_no_cap = output_no_cap.loss.clone();
+        let loss_eval_no_cap = output_no_cap.loss.clone();
         loss_eval_no_cap.eval();
 
         let config_cap = CutCrossEntropyConfig::new()
@@ -621,7 +621,7 @@ mod tests {
             .with_vocab_chunk_size(4);
         let cce_cap = CutCrossEntropy::new(config_cap);
         let output_cap = cce_cap.forward(&hidden, &weight, &targets, None).unwrap();
-        let mut loss_eval_cap = output_cap.loss.clone();
+        let loss_eval_cap = output_cap.loss.clone();
         loss_eval_cap.eval();
 
         assert!(loss_eval_no_cap.item_f32().is_finite());
@@ -647,7 +647,7 @@ mod tests {
         let targets = Array::from_i32_slice(&[0i32, 5, 10, 15]).reshape(&[4]);
 
         let loss = cut_cross_entropy_loss(&hidden, &weight, &targets, -100).unwrap();
-        let mut loss_eval = loss.clone();
+        let loss_eval = loss.clone();
         loss_eval.eval();
 
         assert!(loss_eval.item_f32().is_finite());

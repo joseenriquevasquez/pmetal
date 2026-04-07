@@ -533,6 +533,9 @@ mod tests {
                 values: Some(InlineArray::zeros(&[1, 2, 16, 8], dt)),
                 offset: 12,
                 turboquant: None,
+                quantized_keys: None,
+                quantized_values: None,
+                quant_config: None,
             }],
             rope_offset: 0,
             turboquant_state: None,
@@ -828,6 +831,25 @@ pub struct GdnCache {
     pub ssm_state: Option<InlineArray>,
 }
 
+/// Affine-quantized KV cache tuple: (packed_uint32, scales, biases).
+///
+/// Matches mlx-lm's `QuantizedKVCache` storage format. The packed data, scales,
+/// and biases are passed directly to `quantized_matmul` which dequantizes inside
+/// the Metal kernel — zero-overhead vs bf16 SDPA.
+#[derive(Clone)]
+pub struct QuantizedTuple {
+    pub packed: InlineArray, // [B, H, T, D_packed] uint32
+    pub scales: InlineArray, // [B, H, T, D/group_size]
+    pub biases: InlineArray, // [B, H, T, D/group_size]
+}
+
+/// Configuration for zero-overhead affine KV cache quantization.
+#[derive(Clone, Copy, Debug)]
+pub struct QuantCacheConfig {
+    pub bits: u8,
+    pub group_size: i32,
+}
+
 /// Per-layer KV cache using pre-allocated buffers with O(1) slice_set updates.
 pub struct KvLayerCache {
     pub keys: Option<InlineArray>,   // [B, H, MAX_T, D] pre-allocated
@@ -835,6 +857,10 @@ pub struct KvLayerCache {
     pub offset: i32,                 // number of valid tokens
     /// TurboQuant compressed cache (replaces keys/values when enabled)
     pub turboquant: Option<crate::turboquant::QuantizedKvCache>,
+    /// Zero-overhead affine-quantized cache (uses quantized_matmul for SDPA)
+    pub quantized_keys: Option<QuantizedTuple>,
+    pub quantized_values: Option<QuantizedTuple>,
+    pub quant_config: Option<QuantCacheConfig>,
 }
 
 /// Full model cache — both GDN and KV layers.
@@ -936,6 +962,9 @@ impl NativeCache {
                     values: None,
                     offset: 0,
                     turboquant: tq_cache,
+                    quantized_keys: None,
+                    quantized_values: None,
+                    quant_config: None,
                 });
             }
         }
@@ -1103,6 +1132,141 @@ fn get_stacked_expert_weight(
 /// - `A_log` → `a_log` rename
 /// - `mtp.*` key drop
 /// - conv1d weight transpose (when shape is `[out, k, in]` not `[out, k, 1]`)
+// ============================================================================
+// Hadamard preconditioning — absorb random rotation into Q/K/V/O weights
+// ============================================================================
+
+/// Seed for KV cache preconditioning rotation (distinct from TURBOQUANT_SEED).
+const KV_PRECONDITION_SEED: u64 = 0x4b56_5052_4543_4f4e; // "KVPRECON"
+
+/// Apply per-head random orthogonal rotation to attention projection weights.
+///
+/// Absorbs a random rotation R into Q/K/V/O weights at model load time so that
+/// K/V vectors in the cache have more uniform coordinate distributions, improving
+/// affine quantization quality at the same bit-width (TurboQuant/PolarQuant/QuIP# insight).
+///
+/// - Q: `W_q' = W_q @ R_block^T`  (queries in rotated space)
+/// - K: `W_k' = W_k @ R_block^T`  (keys in rotated space → better quantization)
+/// - V: `W_v' = W_v @ R_block^T`  (values in rotated space → better quantization)
+/// - O: `W_o' = R_block @ W_o`    (undo rotation on output)
+///
+/// Since R is orthogonal (R^T R = I), attention scores Q@K^T are unchanged.
+/// Zero runtime cost — rotation is in the weights, not the inference path.
+pub fn apply_kv_preconditioning(weights: &mut NativeWeights) {
+    use rand::SeedableRng;
+
+    // Find head_dim from first attention layer
+    let head_dim = weights
+        .layers
+        .iter()
+        .find(|lw| !lw.is_linear)
+        .map(|lw| lw.attn_head_dim)
+        .unwrap_or(0);
+    if head_dim == 0 {
+        return;
+    }
+
+    // Generate deterministic orthogonal rotation R [head_dim, head_dim]
+    let mut rng = rand::rngs::StdRng::seed_from_u64(
+        KV_PRECONDITION_SEED ^ ((head_dim as u64) << 32),
+    );
+    let r_data = crate::turboquant::generate_random_orthogonal(head_dim as usize, &mut rng);
+    let r_f32 = InlineArray::from_f32_slice(&r_data, &[head_dim, head_dim]);
+    // Cast rotation to model dtype to avoid f32 promotion cascade through weights
+    let r = r_f32.as_dtype(weights.model_dtype);
+    let r_t = r.transpose_axes(&[1, 0]); // R^T [head_dim, head_dim]
+
+    eprintln!(
+        "[PRECONDITION] Applying Hadamard preconditioning to attention weights (head_dim={})",
+        head_dim
+    );
+
+    for lw in &mut weights.layers {
+        if lw.is_linear {
+            continue; // GDN layers — no Q/K/V/O
+        }
+        let n_heads = lw.attn_n_heads;
+        let n_kv = lw.attn_n_kv_heads;
+
+        if lw.attn_gated {
+            // Gated attention (Qwen3.5): element-wise gate*sigmoid doesn't commute
+            // with rotation, so we can only rotate Q (queries portion) and K.
+            // V stays in original space → gate multiplication is correct.
+            // O projection is unchanged (output stays in original space).
+            // Key benefit: K preconditioning improves key quantization quality.
+            rotate_projection_weight(&mut lw.attn_q_w, &r_t, n_heads, head_dim, true);
+            rotate_projection_weight(&mut lw.attn_k_w, &r_t, n_kv, head_dim, false);
+            // V and O untouched
+        } else {
+            // Non-gated attention (Qwen3): full Q/K/V/O rotation is exact.
+            rotate_projection_weight(&mut lw.attn_q_w, &r_t, n_heads, head_dim, false);
+            rotate_projection_weight(&mut lw.attn_k_w, &r_t, n_kv, head_dim, false);
+            rotate_projection_weight(&mut lw.attn_v_w, &r_t, n_kv, head_dim, false);
+            rotate_output_weight(&mut lw.attn_o_w, &r, n_heads, head_dim);
+        }
+    }
+}
+
+/// Rotate a Q/K/V projection weight in-place: `W' = W @ R_block^T`
+/// For gated Q (Qwen3.5): treats both query and gate halves as heads to rotate.
+fn rotate_projection_weight(
+    w_opt: &mut Option<LayerWeight>,
+    r_t: &InlineArray,
+    n_heads: i32,
+    head_dim: i32,
+    gated: bool,
+) {
+    let w = match w_opt {
+        Some(LayerWeight::Dense(w)) => w,
+        _ => return,
+    };
+    let shape = w.shape();
+    let hidden = shape[0];
+
+    if gated {
+        // Gated Q (Qwen3.5): W_q is [hidden, n_heads * head_dim * 2].
+        // Per-head layout is interleaved: [head0_q(256), head0_gate(256), head1_q(256), ...].
+        // After reshape to [hidden, n_heads, 2*head_dim], split at head_dim:
+        //   queries = [:, :, :head_dim]  →  rotate by R^T
+        //   gate    = [:, :, head_dim:]  →  leave alone (sigmoid doesn't commute)
+        let w_3d = w.reshape(&[hidden, n_heads, head_dim * 2]);
+        let w_queries = w_3d.slice(&[0, 0, 0], &[hidden, n_heads, head_dim]);
+        let w_gate = w_3d.slice(&[0, 0, head_dim], &[hidden, n_heads, head_dim * 2]);
+
+        let w_q_rot = w_queries.matmul(r_t); // [hidden, n_heads, head_dim] @ [head_dim, head_dim]
+
+        // Concatenate rotated queries + original gate along last dim
+        let w_combined = w_q_rot.kv_cache_append(&w_gate, 2); // [hidden, n_heads, 2*head_dim]
+        *w_opt = Some(LayerWeight::Dense(
+            w_combined.reshape(&[hidden, n_heads * head_dim * 2]),
+        ));
+    } else {
+        // Standard Q/K/V: rotate all heads
+        let w_3d = w.reshape(&[hidden, n_heads, head_dim]);
+        let w_rot = w_3d.matmul(r_t);
+        *w_opt = Some(LayerWeight::Dense(w_rot.reshape(&[hidden, n_heads * head_dim])));
+    }
+}
+
+/// Rotate an O-projection weight in-place: `W_o' = R_block @ W_o`
+fn rotate_output_weight(
+    w_opt: &mut Option<LayerWeight>,
+    r: &InlineArray,
+    n_heads: i32,
+    head_dim: i32,
+) {
+    let w = match w_opt {
+        Some(LayerWeight::Dense(w)) => w,
+        _ => return,
+    };
+    let shape = w.shape();
+    let hidden = shape[1];
+    let w_3d = w.reshape(&[n_heads, head_dim, hidden]);
+    // Batched matmul: [head_dim, head_dim] @ [n_heads, head_dim, hidden] → [n_heads, head_dim, hidden]
+    let w_rot = r.matmul(&w_3d);
+    *w_opt = Some(LayerWeight::Dense(w_rot.reshape(&[n_heads * head_dim, hidden])));
+}
+
 /// - norm `(1+w)` offset when the model has `mtp.*` keys or unsanitized conv shapes
 /// - Q/K scale synthesis for GDN (not stored in safetensors)
 /// - MoE expert weight stacking into `[E, in, out]` for `gather_mm`
@@ -2426,7 +2590,7 @@ fn attn_forward(
         }
     }
 
-    if s == 1 && cache.turboquant.is_none() {
+    if s == 1 && cache.turboquant.is_none() && cache.quant_config.is_none() {
         if let (
             Some(LayerWeight::Dense(q_w)),
             Some(LayerWeight::Dense(k_w)),
@@ -2568,6 +2732,109 @@ fn attn_forward(
                 crate::decode::sdpa_causal_like_mlx(&queries, &full_keys, &full_values, scale, s)
             }
         }
+    } else if let Some(qcfg) = cache.quant_config {
+        // Zero-overhead quantized KV cache path using quantized_matmul.
+        // Matches mlx-lm's QuantizedKVCache: quantize K/V immediately after RoPE,
+        // store as (packed_uint32, scales, biases), pass to quantized_matmul
+        // which dequantizes inside the Metal kernel. No separate dequant pass.
+        let bits = qcfg.bits as i32;
+        let group_size = qcfg.group_size;
+        let el_per_int = 32 / bits; // e.g. 4 for Q8, 8 for Q4
+
+        // Quantize new K/V → (packed, scales, biases)
+        let keys_2d = keys.reshape(&[b * n_kv_heads * s, head_dim]);
+        let (kp, ks, kb) = keys_2d.quantize_weights(group_size, bits);
+        let packed_dim = head_dim / el_per_int;
+        let scales_dim = head_dim / group_size;
+        let kp = kp.reshape(&[b, n_kv_heads, s, packed_dim]);
+        let ks = ks.reshape(&[b, n_kv_heads, s, scales_dim]);
+        let kb = kb.reshape(&[b, n_kv_heads, s, scales_dim]);
+
+        let values_2d = values.reshape(&[b * n_kv_heads * s, head_dim]);
+        let (vp, vs, vb) = values_2d.quantize_weights(group_size, bits);
+        let vp = vp.reshape(&[b, n_kv_heads, s, packed_dim]);
+        let vs = vs.reshape(&[b, n_kv_heads, s, scales_dim]);
+        let vb = vb.reshape(&[b, n_kv_heads, s, scales_dim]);
+
+        // Cache management: allocate or grow quantized buffers
+        if cache.quantized_keys.is_none() {
+            let alloc = ((next + 255) / 256) * 256;
+            cache.quantized_keys = Some(QuantizedTuple {
+                packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim],
+                    crate::compat::Dtype::Uint32.as_i32()),
+                scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+                biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+            });
+            cache.quantized_values = Some(QuantizedTuple {
+                packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim],
+                    crate::compat::Dtype::Uint32.as_i32()),
+                scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+                biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+            });
+        } else {
+            let allocated = cache.quantized_keys.as_ref().unwrap().packed.dim(2);
+            if next > allocated {
+                let grow_to = ((next + 255) / 256) * 256;
+                let extend = grow_to - allocated;
+                let qk = cache.quantized_keys.take().unwrap();
+                let qv = cache.quantized_values.take().unwrap();
+                let uint32_dt = crate::compat::Dtype::Uint32.as_i32();
+                cache.quantized_keys = Some(QuantizedTuple {
+                    packed: qk.packed.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
+                    scales: qk.scales.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                    biases: qk.biases.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                });
+                cache.quantized_values = Some(QuantizedTuple {
+                    packed: qv.packed.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
+                    scales: qv.scales.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                    biases: qv.biases.kv_cache_append(
+                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                });
+            }
+        }
+
+        // slice_set quantized data into cache
+        let start_q = [0, 0, prev, 0];
+        let qk_ref = cache.quantized_keys.as_mut().unwrap();
+        let stop_kp = [b, n_kv_heads, next, packed_dim];
+        let stop_ks = [b, n_kv_heads, next, scales_dim];
+        qk_ref.packed = qk_ref.packed.slice_set(&kp, &start_q, &stop_kp);
+        qk_ref.scales = qk_ref.scales.slice_set(&ks, &start_q, &stop_ks);
+        qk_ref.biases = qk_ref.biases.slice_set(&kb, &start_q, &stop_ks);
+
+        let qv_ref = cache.quantized_values.as_mut().unwrap();
+        qv_ref.packed = qv_ref.packed.slice_set(&vp, &start_q, &stop_kp);
+        qv_ref.scales = qv_ref.scales.slice_set(&vs, &start_q, &stop_ks);
+        qv_ref.biases = qv_ref.biases.slice_set(&vb, &start_q, &stop_ks);
+        cache.offset = next;
+
+        // Slice valid portion
+        let qk = cache.quantized_keys.as_ref().unwrap();
+        let cached_kp = qk.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+        let cached_ks = qk.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let cached_kb = qk.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let qv = cache.quantized_values.as_ref().unwrap();
+        let cached_vp = qv.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+        let cached_vs = qv.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+        let cached_vb = qv.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+
+        // Quantized SDPA — zero overhead, dequant fused into Metal kernel
+        crate::decode::quantized_sdpa(
+            &queries,
+            (&cached_kp, &cached_ks, &cached_kb),
+            (&cached_vp, &cached_vs, &cached_vb),
+            scale,
+            s,
+            n_heads,
+            n_kv_heads,
+            group_size,
+            bits,
+        )
     } else {
         // Standard bf16 path
         let start = [0, 0, prev, 0];

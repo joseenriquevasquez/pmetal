@@ -66,7 +66,7 @@ mod tests {
         let shared_out = random::normal(&[batch_seq, dim], Dtype::Float32);
         let shared_gate_logit = Array::from_f32(0.5);
 
-        let mut result = moe_combine_mlx(
+        let result = moe_combine_mlx(
             &residual,
             &expert_outs,
             &expert_weights,
@@ -100,7 +100,7 @@ mod tests {
         let shared_out = random::normal(&[batch_seq, dim], Dtype::Float32);
         let shared_gate_logit = random::normal(&[batch_seq, 1], Dtype::Float32);
 
-        let mut result = moe_combine_mlx(
+        let result = moe_combine_mlx(
             &residual,
             &expert_outs,
             &expert_weights,

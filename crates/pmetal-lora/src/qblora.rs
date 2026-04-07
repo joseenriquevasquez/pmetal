@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn test_qblora_creation() {
         let config = default_config();
-        let qblora = QBLoraLinear::new(64, 128, &config, false);
+        let qblora = QBLoraLinear::new(64, 128, &config, false).unwrap();
 
         assert_eq!(qblora.in_features, 64);
         assert_eq!(qblora.out_features, 128);
@@ -567,13 +567,13 @@ mod tests {
     #[test]
     fn test_qblora_forward() {
         let config = default_config();
-        let qblora = QBLoraLinear::new(32, 64, &config, false);
+        let qblora = QBLoraLinear::new(32, 64, &config, false).unwrap();
 
         let x = pmetal_bridge::compat::random::normal(
             &[2, 4, 32],
             pmetal_bridge::compat::Dtype::Float32,
         );
-        let output = qblora.forward(&x);
+        let output = qblora.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[2, 4, 64]);
     }
@@ -581,7 +581,7 @@ mod tests {
     #[test]
     fn test_qblora_with_input_proj() {
         let config = default_config().with_input_proj(16);
-        let qblora = QBLoraLinear::new(64, 128, &config, false);
+        let qblora = QBLoraLinear::new(64, 128, &config, false).unwrap();
 
         assert!(qblora.has_input_proj());
         assert!(!qblora.has_output_proj());
@@ -590,7 +590,7 @@ mod tests {
             &[2, 4, 64],
             pmetal_bridge::compat::Dtype::Float32,
         );
-        let output = qblora.forward(&x);
+        let output = qblora.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[2, 4, 128]);
     }
@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn test_qblora_with_output_proj() {
         let config = default_config().with_output_proj(32);
-        let qblora = QBLoraLinear::new(64, 128, &config, false);
+        let qblora = QBLoraLinear::new(64, 128, &config, false).unwrap();
 
         assert!(!qblora.has_input_proj());
         assert!(qblora.has_output_proj());
@@ -607,7 +607,7 @@ mod tests {
             &[2, 4, 64],
             pmetal_bridge::compat::Dtype::Float32,
         );
-        let output = qblora.forward(&x);
+        let output = qblora.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[2, 4, 128]);
     }
@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn test_qblora_with_both_projections() {
         let config = default_config().with_input_proj(16).with_output_proj(32);
-        let qblora = QBLoraLinear::new(64, 128, &config, false);
+        let qblora = QBLoraLinear::new(64, 128, &config, false).unwrap();
 
         assert!(qblora.has_input_proj());
         assert!(qblora.has_output_proj());
@@ -624,7 +624,7 @@ mod tests {
             &[2, 4, 64],
             pmetal_bridge::compat::Dtype::Float32,
         );
-        let output = qblora.forward(&x);
+        let output = qblora.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[2, 4, 128]);
     }
@@ -633,14 +633,14 @@ mod tests {
     fn test_qblora_higher_rank() {
         // With 4x rank multiplier
         let config = default_config().with_rank_multiplier(4.0);
-        let qblora = QBLoraLinear::new(64, 128, &config, false);
+        let qblora = QBLoraLinear::new(64, 128, &config, false).unwrap();
 
         // Effective rank = 8 * 4.0 = 32
         assert_eq!(qblora.rank, 32);
 
         // More trainable params due to higher rank
         let standard_config = default_config();
-        let standard = QBLoraLinear::new(64, 128, &standard_config, false);
+        let standard = QBLoraLinear::new(64, 128, &standard_config, false).unwrap();
 
         assert!(qblora.num_trainable_params() > standard.num_trainable_params());
     }
@@ -650,7 +650,7 @@ mod tests {
         let config = default_config()
             .with_input_proj(16)
             .with_fixed_projections();
-        let qblora = QBLoraLinear::new(64, 128, &config, false);
+        let qblora = QBLoraLinear::new(64, 128, &config, false).unwrap();
 
         // With fixed projections, trainable params should not include projection
         let (_, _, p_in, p_out) = qblora.trainable_params();
@@ -661,7 +661,7 @@ mod tests {
     #[test]
     fn test_qblora_param_count() {
         let config = default_config();
-        let qblora = QBLoraLinear::new(512, 1024, &config, false);
+        let qblora = QBLoraLinear::new(512, 1024, &config, false).unwrap();
 
         // Effective rank = 16
         // Trainable: A (16 * 512) + B (1024 * 16) = 8192 + 16384 = 24576
