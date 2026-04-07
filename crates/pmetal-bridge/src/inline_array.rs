@@ -153,6 +153,7 @@ unsafe extern "C" {
     fn mlx_inline_get_max_recommended_size() -> usize;
     fn mlx_inline_new_stream() -> i32;
     fn mlx_inline_set_default_stream(index: i32);
+    fn mlx_inline_reset_default_stream();
     fn mlx_inline_synchronize();
     fn mlx_inline_clear_cache();
     fn mlx_inline_set_cache_limit(limit: usize) -> usize;
@@ -1095,6 +1096,18 @@ pub fn new_generation_stream() {
 pub fn set_generation_stream() {
     unsafe {
         mlx_inline_set_default_stream(0);
+    }
+}
+
+/// Restore MLX's original default stream (GPU stream on the default device).
+///
+/// Must be called after generation completes and before returning from the
+/// inference function, so that InlineArray drops execute on the main stream
+/// instead of the generation stream. Without this, array destructors race
+/// with Metal teardown and cause SIGSEGV at program exit.
+pub fn reset_default_stream() {
+    unsafe {
+        mlx_inline_reset_default_stream();
     }
 }
 

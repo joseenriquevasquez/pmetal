@@ -630,6 +630,11 @@ pub fn generate_from_primed_sample<Weights, Cache>(
     }
 
     crate::inline_array::synchronize();
+    // Restore the default stream before returning. InlineArray Drops happen
+    // when the caller's weights/cache go out of scope — they must execute on
+    // the main stream, not the generation stream, to avoid SIGSEGV from
+    // Metal teardown racing with stream cleanup.
+    crate::inline_array::reset_default_stream();
     tokens
 }
 

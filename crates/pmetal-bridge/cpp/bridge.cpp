@@ -424,6 +424,15 @@ void mlx_inline_set_default_stream(int /*index*/) {
     }
 }
 
+void mlx_inline_reset_default_stream(void) {
+    // Restore MLX's original default stream (GPU stream on the default device).
+    // Must be called after generation completes and before InlineArray drops,
+    // otherwise array destructors execute on the generation stream which can
+    // race with Metal teardown and cause SIGSEGV.
+    mlx::core::set_default_stream(
+        mlx::core::default_stream(mlx::core::default_device()));
+}
+
 void mlx_inline_synchronize(void) {
     if (generation_stream_) {
         mlx::core::synchronize(*generation_stream_);

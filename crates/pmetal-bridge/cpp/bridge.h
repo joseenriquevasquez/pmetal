@@ -354,6 +354,7 @@ size_t mlx_inline_get_max_recommended_size(void);
 // Stream management — match Python's mx.new_stream + mx.stream context
 int mlx_inline_new_stream(void);  // Returns stream index
 void mlx_inline_set_default_stream(int index);
+void mlx_inline_reset_default_stream(void);  // Restore original default stream
 void mlx_inline_synchronize(void);
 
 // Memory management — matches Python's mx.metal.clear_cache(), mx.metal.set_cache_limit()
