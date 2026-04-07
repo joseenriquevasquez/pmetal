@@ -524,12 +524,7 @@ fn begin_generation_session_impl(
     crate::inline_array::set_generation_stream();
     crate::inline_array::set_wired_limit_max();
 
-    if log_session {
-        eprintln!(
-            "[{tag}] generate: dtype={model_dtype} active={:.0}MB",
-            crate::inline_array::get_active_memory() as f64 / 1e6,
-        );
-    }
+    let _ = (tag, log_session);
 }
 
 pub fn begin_generation_session(tag: &str, model_dtype: i32) {
@@ -623,10 +618,8 @@ pub fn generate_from_primed_sample<Weights, Cache>(
         let skip = 10;
         let avg = step_times[skip..].iter().sum::<f64>() / (step_times.len() - skip) as f64;
         let p50 = step_times[step_times.len() / 2];
-        eprintln!(
-            "[{tag}] per-step: avg={avg:.2}ms p50={p50:.2}ms = {:.0} tok/s",
-            1000.0 / avg
-        );
+        let tps = 1000.0 / avg;
+        eprintln!("Decode: {tps:.0} tok/s (avg={avg:.2}ms p50={p50:.2}ms)");
     }
 
     crate::inline_array::synchronize();

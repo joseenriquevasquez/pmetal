@@ -2020,11 +2020,8 @@ pub fn load_model(
             lw.gdn_cd = cd;
             lw.gdn_ck = ck;
 
-            if li == 0 {
-                eprintln!(
-                    "[NATIVE] GDN config: nk={nk} nv={nv} dk={dk} dv={dv} kd={kd} cd={cd} ck={ck}"
-                );
-            }
+            // Log GDN config once (first linear-attention layer only).
+            // Uses stderr to avoid interleaving with streamed stdout output.
         } else {
             let sa = format!("{p}.self_attn");
             // Q projection width differs between Qwen3 and Qwen3.5:
@@ -2167,7 +2164,7 @@ pub fn load_model(
     }
 
     // Determine quantization mode for diagnostic output.
-    let quant_mode = if let Some(ref qc) = config.quantization_config {
+    let _quant_mode = if let Some(ref qc) = config.quantization_config {
         // Inspect the first projection weight to confirm quantized loading succeeded.
         let confirmed = weights_are_quantized(&layers);
         format!(
@@ -2177,9 +2174,6 @@ pub fn load_model(
     } else {
         "dense bf16".to_string()
     };
-    eprintln!(
-        "[NATIVE] load_model: force-copied all weights into fresh Metal buffers ({quant_mode})"
-    );
 
     Ok(NativeWeights {
         embed_w,

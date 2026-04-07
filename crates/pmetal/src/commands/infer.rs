@@ -439,10 +439,9 @@ pub(crate) async fn run_inference(
     if use_chat && no_thinking {
         println!("Thinking:    disabled");
     }
-    println!("========================================\n");
-
-    println!("Prompt: {}\n", prompt);
-    println!("Generating...\n");
+    println!("========================================");
+    println!();
+    println!("Generating...");
 
     // Extract refs for generation dispatch (split borrow)
     let input_ids = runner.state.input_ids().to_vec();
@@ -667,13 +666,13 @@ pub(crate) async fn run_inference(
         println!();
     }
 
+    // Ensure a clean newline between streamed output and stats
+    println!();
     println!("---");
-    let tokens_per_sec = output.num_generated as f64 / elapsed.as_secs_f64();
     println!(
-        "Generated {} tokens in {:.2}s ({:.1} tok/s)",
+        "Generated {} tokens in {:.2}s",
         output.num_generated,
         elapsed.as_secs_f64(),
-        tokens_per_sec
     );
     if output.stopped_by_token {
         println!("Stopped by: EOS token");

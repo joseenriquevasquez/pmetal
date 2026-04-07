@@ -427,14 +427,14 @@ fn run_bridge_inference<Config, Weights, Cache>(
     ) -> Vec<u32>,
 ) -> Result<NativeGenerationOutput, String> {
     let config = load_config(model_path)?;
-    eprintln!("[NATIVE] {}", describe_config(&config));
+    tracing::debug!("{}", describe_config(&config));
 
     let t0 = std::time::Instant::now();
     let weights = load_model(model_path, &config)?;
-    eprintln!(
-        "[NATIVE] Loaded in {:.1}s, active={:.0}MB",
-        t0.elapsed().as_secs_f64(),
-        pmetal_bridge::inline_array::get_active_memory() as f64 / 1e6,
+    tracing::info!(
+        elapsed_s = format!("{:.1}", t0.elapsed().as_secs_f64()),
+        active_mb = format!("{:.0}", pmetal_bridge::inline_array::get_active_memory() as f64 / 1e6),
+        "Model loaded",
     );
 
     let mut cache = build_cache(&weights, &config);
