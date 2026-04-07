@@ -1,8 +1,8 @@
 //! MLX-format weight quantization with per-tensor sensitivity analysis.
 //!
 //! Produces MLX-compatible safetensors (packed weights + scales + biases) with
-//! per-tensor bit allocation driven by reconstruction quality rather than the
-//! static per-class rules used by Unsloth Dynamic 2.0.
+//! per-tensor bit allocation driven by reconstruction quality rather than
+//! static per-class rules.
 //!
 //! # Pipeline
 //!
