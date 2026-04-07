@@ -1314,7 +1314,7 @@ pub fn apply_outlier_permutation(
     outlier_fraction: f32,
 ) -> i32 {
     // Find head_dim from first attention layer
-    let (head_dim, n_kv) = weights
+    let (head_dim, _) = weights
         .layers
         .iter()
         .find(|lw| !lw.is_linear)

@@ -70,10 +70,21 @@
   let messages = $state<ChatMessage[]>([]);
   let userInput = $state('');
   let isGenerating = $state(false);
+  let inferenceStatus = $state<'idle' | 'loading' | 'generating' | 'done'>('idle');
   let error = $state<string | null>(null);
   let showThinking = $state(true);
+  let expandedThinking = $state(new Set<number>());
   const truncatedThinkingReply =
     '[Response truncated - model was still thinking. Disable thinking or increase Max Tokens.]';
+
+  function toggleThinking(idx: number) {
+    expandedThinking = new Set(expandedThinking);
+    if (expandedThinking.has(idx)) {
+      expandedThinking.delete(idx);
+    } else {
+      expandedThinking.add(idx);
+    }
+  }
 
   // Scroll ref
   let messagesEl = $state<HTMLElement | null>(null);
@@ -144,7 +155,9 @@
     await scrollToBottom();
 
     isGenerating = true;
+    inferenceStatus = 'loading';
     let currentContent = '';
+    let firstTokenReceived = false;
 
     try {
       // Set up listeners before invoking
@@ -153,6 +166,10 @@
       unlistenError?.();
 
       unlistenToken = await onInferenceToken((token) => {
+        if (!firstTokenReceived) {
+          firstTokenReceived = true;
+          inferenceStatus = 'generating';
+        }
         currentContent += token;
         messages = messages.map((m, i) => {
           if (i === messages.length - 1) {
@@ -183,6 +200,7 @@
           return m;
         });
         isGenerating = false;
+        inferenceStatus = 'done';
         scrollToBottom();
       });
 
@@ -190,6 +208,7 @@
         error = message;
         messages = messages.filter((m, i) => !(i === messages.length - 1 && m.isStreaming));
         isGenerating = false;
+        inferenceStatus = 'idle';
       });
 
       await startInference({
@@ -237,6 +256,7 @@
       // Remove the streaming placeholder on error
       messages = messages.slice(0, -1);
       isGenerating = false;
+      inferenceStatus = 'idle';
     }
   }
 
@@ -250,6 +270,7 @@
       return m;
     });
     isGenerating = false;
+    inferenceStatus = 'idle';
   }
 
   function clearChat() {
@@ -529,16 +550,30 @@
         <!-- Assistant message -->
         <div class="group flex justify-start gap-1 items-end" role="article" aria-label="Assistant message">
           <div class="max-w-[80%] space-y-2">
-            <!-- Thinking block -->
+            <!-- Thinking block (collapsible, global showThinking filter) -->
             {#if message.thinking && showThinking}
-              <div class="rounded-xl bg-surface-100 dark:bg-surface-800 border border-surface-200 dark:border-surface-700 p-3">
-                <div class="flex items-center gap-2 mb-2">
-                  <svg class="w-3 h-3 text-surface-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
-                  </svg>
-                  <span class="text-xs font-medium text-surface-500 uppercase tracking-wider">Thinking</span>
-                </div>
-                <p class="text-xs text-surface-600 dark:text-surface-400 font-mono whitespace-pre-wrap leading-relaxed">{message.thinking}</p>
+              <div class="border border-surface-200 dark:border-surface-700 rounded-lg overflow-hidden">
+                <button
+                  class="w-full flex items-center justify-between px-3 py-2 text-xs text-surface-500 dark:text-surface-400 hover:bg-surface-100 dark:hover:bg-surface-800 transition-colors"
+                  aria-expanded={expandedThinking.has(idx)}
+                  onclick={() => toggleThinking(idx)}
+                >
+                  <span class="flex items-center gap-1.5">
+                    <svg class="w-3 h-3 text-surface-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                    </svg>
+                    <span class="font-medium uppercase tracking-wider">Thinking</span>
+                    <span class="text-surface-400 dark:text-surface-500">({message.thinking.length} chars)</span>
+                  </span>
+                  <span class="text-surface-400 dark:text-surface-500">
+                    {expandedThinking.has(idx) ? '▼' : '▶'}
+                  </span>
+                </button>
+                {#if expandedThinking.has(idx)}
+                  <div class="px-3 py-2 text-xs text-surface-600 dark:text-surface-400 font-mono whitespace-pre-wrap leading-relaxed border-t border-surface-200 dark:border-surface-700 max-h-96 overflow-y-auto bg-surface-50 dark:bg-surface-900/50">
+                    {message.thinking}
+                  </div>
+                {/if}
               </div>
             {/if}
 
@@ -603,6 +638,18 @@
 
   <!-- Input area -->
   <div class="flex-shrink-0 p-4 bg-white dark:bg-surface-800 border-t border-surface-200 dark:border-surface-700">
+    <!-- Status indicator bar -->
+    {#if inferenceStatus === 'loading'}
+      <div class="flex items-center gap-2 mb-2 text-xs text-surface-400 dark:text-surface-500">
+        <span class="inline-block w-3 h-3 rounded-full border-2 border-primary-400 border-t-transparent animate-spin" aria-hidden="true"></span>
+        <span>Loading model...</span>
+      </div>
+    {:else if inferenceStatus === 'generating'}
+      <div class="flex items-center gap-2 mb-2 text-xs text-primary-500 dark:text-primary-400">
+        <span class="inline-block w-2 h-2 rounded-full bg-primary-500 animate-pulse" aria-hidden="true"></span>
+        <span>Generating...</span>
+      </div>
+    {/if}
     <div class="flex gap-2 items-end">
       <label for="inf-input" class="sr-only">Type a message</label>
       <textarea

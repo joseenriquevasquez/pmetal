@@ -1744,12 +1744,14 @@ async fn run_inference_streaming(
         .map_err(|e| e.to_string())?;
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+    // TTFT is measured from when generate_streaming starts (post model-load), so it correctly
+    // captures only prefill + first-token latency.  decode_ms = total - ttft covers decode only.
     let ttft_ms = first_token_time.map(|t| t.duration_since(start).as_secs_f64() * 1000.0);
     let decode_ms = ttft_ms.map(|ttft| total_ms - ttft);
-    let decode_tokens = generated_tokens.saturating_sub(1);
+    // Token 1 is the prefill output (counted in TTFT); tokens 2..N are decode steps.
     let tok_per_sec = if let Some(dm) = decode_ms {
-        if dm > 0.0 && decode_tokens > 0 {
-            Some(decode_tokens as f64 / (dm / 1000.0))
+        if dm > 0.0 && generated_tokens > 1 {
+            Some((generated_tokens - 1) as f64 / (dm / 1000.0))
         } else {
             None
         }
@@ -3099,13 +3101,13 @@ fn run_quantize_in_process(
             .ok_or_else(|| AppError(format!("Tensor {name} not found")))?;
         let shape_u64: Vec<u64> = tensor.shape().iter().map(|&d| d as u64).collect();
         let target_type = quantizer.get_tensor_type(name, &shape_u64);
-        let mut tensor = tensor.clone();
+        let tensor = tensor.clone();
         tensor.eval();
 
         let data_f32: Vec<f32> = match tensor.dtype() {
             pmetal::mlx::Dtype::Float32 => tensor.as_slice::<f32>().to_vec(),
             pmetal::mlx::Dtype::Float16 | pmetal::mlx::Dtype::Bfloat16 => {
-                let mut t_f32 = tensor.as_dtype(pmetal::mlx::Dtype::Float32.as_i32());
+                let t_f32 = tensor.as_dtype(pmetal::mlx::Dtype::Float32.as_i32());
                 t_f32.eval();
                 t_f32.as_slice::<f32>().to_vec()
             }

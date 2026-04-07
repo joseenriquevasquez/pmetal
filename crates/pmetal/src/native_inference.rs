@@ -566,13 +566,6 @@ fn run_qwen3(
     )
 }
 
-fn build_qwen3_cache(
-    weights: &pmetal_bridge::qwen3_native::NativeWeights,
-    turboquant: Option<TurboQuantConfig>,
-) -> pmetal_bridge::qwen3_native::NativeCache {
-    build_qwen3_cache_with_quant(weights, turboquant, None)
-}
-
 fn build_qwen3_cache_with_quant(
     weights: &pmetal_bridge::qwen3_native::NativeWeights,
     turboquant: Option<TurboQuantConfig>,
