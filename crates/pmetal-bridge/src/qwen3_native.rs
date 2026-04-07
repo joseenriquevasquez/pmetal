@@ -538,6 +538,8 @@ mod tests {
                 quantized_keys_hi: None,
                 quantized_values_hi: None,
                 quant_config: None,
+                qjl_signs: None,
+                qjl_residual_norms: None,
             }],
             rope_offset: 0,
             turboquant_state: None,
@@ -811,6 +813,12 @@ pub struct NativeWeights {
     pub(crate) layers: Vec<LayerWeights>,
     /// Model activation dtype (e.g., 11 = bfloat16).
     pub model_dtype: i32,
+    /// QJL projection matrix S [head_dim, head_dim] for key residual correction.
+    ///
+    /// Generated at load time when `apply_qjl_matrix` is called. Used during
+    /// attention to compute sign(S · residual) for unbiased inner product
+    /// estimation at Q2-Q3 bits. `None` when QJL is disabled.
+    pub qjl_matrix: Option<InlineArray>,
 }
 
 impl std::fmt::Debug for NativeWeights {
@@ -870,6 +878,14 @@ pub struct QuantCacheConfig {
     /// outlier/regular split is used instead. Channel permutation must be
     /// applied to projection weights at load time via [`apply_outlier_permutation`].
     pub mixed_bit: Option<MixedBitConfig>,
+    /// QJL residual correction for keys at Q2-Q3.
+    ///
+    /// When true, the uniform quantized path computes a 1-bit sign vector on
+    /// the quantization residual and stores it in `KvLayerCache::qjl_signs`.
+    /// At SDPA time, a correction term is added to attention scores to make
+    /// the inner product estimate unbiased. Only active for bits <= 3 and
+    /// uniform quantization (not mixed-bit).
+    pub qjl: bool,
 }
 
 /// Per-layer KV cache using pre-allocated buffers with O(1) slice_set updates.
@@ -886,6 +902,14 @@ pub struct KvLayerCache {
     pub quantized_keys_hi: Option<QuantizedTuple>,
     pub quantized_values_hi: Option<QuantizedTuple>,
     pub quant_config: Option<QuantCacheConfig>,
+    /// QJL residual correction for key inner products (uniform Q2-Q3 only).
+    ///
+    /// `qjl_signs`: `[B, H, MAX_T, D]` bf16 ±1.0 — sign(S · residual).
+    /// `qjl_residual_norms`: `[B, H, MAX_T, 1]` f32 — L2 norm of residual.
+    ///
+    /// Both `None` when QJL is disabled or cache is empty.
+    pub qjl_signs: Option<InlineArray>,           // [B, H, MAX_T, D] model_dtype ±1.0
+    pub qjl_residual_norms: Option<InlineArray>,  // [B, H, MAX_T, 1] f32
 }
 
 /// Full model cache — both GDN and KV layers.
@@ -992,6 +1016,8 @@ impl NativeCache {
                     quantized_keys_hi: None,
                     quantized_values_hi: None,
                     quant_config: None,
+                    qjl_signs: None,
+                    qjl_residual_norms: None,
                 });
             }
         }
@@ -1232,6 +1258,45 @@ pub fn apply_kv_preconditioning(weights: &mut NativeWeights) {
             rotate_output_weight(&mut lw.attn_o_w, &r, n_heads, head_dim);
         }
     }
+}
+
+/// Generate and store the QJL projection matrix S on `weights`.
+///
+/// S is a [head_dim × head_dim] Gaussian random matrix used to project key
+/// quantization residuals before taking their sign. Stored as the model dtype.
+/// Must be called after `apply_kv_preconditioning` if both are used.
+///
+/// Only the uniform Q2-Q3 path uses QJL; mixed-bit paths are unaffected.
+pub fn apply_qjl_matrix(weights: &mut NativeWeights) {
+    use rand::SeedableRng;
+
+    let head_dim = weights
+        .layers
+        .iter()
+        .find(|lw| !lw.is_linear)
+        .map(|lw| lw.attn_head_dim)
+        .unwrap_or(0);
+    if head_dim == 0 {
+        return;
+    }
+
+    // Use a seed distinct from the Hadamard rotation seed so S is independent of R.
+    let qjl_seed = KV_PRECONDITION_SEED ^ 0x514a_4c00; // "QJL\0"
+    let mut rng = rand::rngs::StdRng::seed_from_u64(qjl_seed ^ ((head_dim as u64) << 32));
+    let s_data = crate::turboquant::generate_random_projection(head_dim as usize, &mut rng);
+    let s_f32 = InlineArray::from_f32_slice(&s_data, &[head_dim, head_dim]);
+    let s = s_f32.as_dtype(weights.model_dtype);
+    // Eval and detach into a fresh Metal buffer.
+    let zero = InlineArray::from_f32(0.0).as_dtype(weights.model_dtype);
+    let mut s = s.add(&zero);
+    s.eval();
+    s.detach();
+    weights.qjl_matrix = Some(s);
+
+    eprintln!(
+        "[QJL] QJL projection matrix generated (head_dim={})",
+        head_dim
+    );
 }
 
 /// Reorder head dimensions so outlier channels come first, enabling mixed-bit
@@ -2127,6 +2192,7 @@ pub fn load_model(
         quantization_config: config.quantization_config.clone(),
         layers,
         model_dtype,
+        qjl_matrix: None, // populated by apply_qjl_matrix() when --kv-qjl is set
     })
 }
 
@@ -2193,6 +2259,7 @@ pub fn forward_step(
                 &mut cache.kv_caches[attn_slot],
                 cache.rope_offset,
                 dtype,
+                weights.qjl_matrix.as_ref(),
             );
             attn_slot += 1;
             result
@@ -2687,6 +2754,7 @@ fn attn_forward(
     cache: &mut KvLayerCache,
     rope_offset: i32,
     dtype: i32,
+    qjl_matrix: Option<&InlineArray>,
 ) -> InlineArray {
     let n_heads = lw.attn_n_heads;
     let n_kv_heads = lw.attn_n_kv_heads;
@@ -3067,27 +3135,69 @@ fn attn_forward(
             let ks = ks.reshape(&[b, n_kv_heads, s, scales_dim]);
             let kb = kb.reshape(&[b, n_kv_heads, s, scales_dim]);
 
+            // QJL residual computation (keys only, Q2-Q3, uniform path).
+            //
+            // After quantizing keys, reconstruct the approximate key, compute the
+            // residual (original - reconstructed), and store:
+            //   qjl_signs      = sign(S · residual)  [B, Hkv, s, D] dtype ±1.0
+            //   residual_norms = ||residual||₂        [B, Hkv, s, 1] f32
+            //
+            // These are later used in quantized_sdpa_with_qjl to add an unbiased
+            // correction to attention scores: E[⟨q, k̃⟩] = ⟨q, k⟩.
+            let qjl_active = qcfg.qjl && bits <= 3 && qjl_matrix.is_some();
+            let (new_qjl_signs, new_qjl_norms) = if qjl_active {
+                let s_mat = qjl_matrix.unwrap();
+                // Dequantize to get the affine reconstruction.
+                // kp/ks/kb are [B,Hkv,s,*] — reshape back to 2D for dequantize.
+                let kp_flat = kp.reshape(&[b * n_kv_heads * s, packed_dim]);
+                let ks_flat = ks.reshape(&[b * n_kv_heads * s, scales_dim]);
+                let kb_flat = kb.reshape(&[b * n_kv_heads * s, scales_dim]);
+                let k_recon_2d = kp_flat.dequantize(&ks_flat, &kb_flat, group_size, bits);
+                // Residual: original keys (2D) minus affine reconstruction.
+                let residual = keys_2d.subtract(&k_recon_2d); // [N, D]
+                // Per-row L2 norm: [N, 1]
+                let norms_2d = residual.square().sum_axis(-1, true).sqrt(); // [N, 1]
+                // Project residual through S: [N, D] @ [D, D]^T = [N, D]
+                // S is [D, D], so S^T = S.transpose_axes([1, 0])
+                let s_t = s_mat.transpose_axes(&[1, 0]);
+                let projected = residual.matmul(&s_t); // [N, D]
+                // sign: positive → 1.0, negative → -1.0, zero → 0.0
+                let signs_2d = projected.sign(); // [N, D] dtype (same as keys)
+                // Reshape back to [B, Hkv, s, D] and [B, Hkv, s, 1]
+                let signs = signs_2d.reshape(&[b, n_kv_heads, s, head_dim]);
+                let norms = norms_2d.reshape(&[b, n_kv_heads, s, 1]);
+                // Cast norms to f32 for numerical stability in correction.
+                let norms_f32 = norms.as_dtype(crate::compat::Dtype::Float32.as_i32());
+                (Some(signs), Some(norms_f32))
+            } else {
+                (None, None)
+            };
+
             let values_2d = values.reshape(&[b * n_kv_heads * s, head_dim]);
             let (vp, vs, vb) = values_2d.quantize_weights(group_size, bits);
             let vp = vp.reshape(&[b, n_kv_heads, s, packed_dim]);
             let vs = vs.reshape(&[b, n_kv_heads, s, scales_dim]);
             let vb = vb.reshape(&[b, n_kv_heads, s, scales_dim]);
 
-            // Cache management: allocate or grow quantized buffers
+            // Cache management: allocate or grow quantized + QJL buffers
+            let uint32_dt = crate::compat::Dtype::Uint32.as_i32();
+            let f32_dt = crate::compat::Dtype::Float32.as_i32();
             if cache.quantized_keys.is_none() {
                 let alloc = ((next + 255) / 256) * 256;
                 cache.quantized_keys = Some(QuantizedTuple {
-                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim],
-                        crate::compat::Dtype::Uint32.as_i32()),
+                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim], uint32_dt),
                     scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
                     biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
                 });
                 cache.quantized_values = Some(QuantizedTuple {
-                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim],
-                        crate::compat::Dtype::Uint32.as_i32()),
+                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim], uint32_dt),
                     scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
                     biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
                 });
+                if qjl_active {
+                    cache.qjl_signs = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
+                    cache.qjl_residual_norms = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, 1], f32_dt));
+                }
             } else {
                 let allocated = cache.quantized_keys.as_ref().unwrap().packed.dim(2);
                 if next > allocated {
@@ -3095,7 +3205,6 @@ fn attn_forward(
                     let extend = grow_to - allocated;
                     let qk = cache.quantized_keys.take().unwrap();
                     let qv = cache.quantized_values.take().unwrap();
-                    let uint32_dt = crate::compat::Dtype::Uint32.as_i32();
                     cache.quantized_keys = Some(QuantizedTuple {
                         packed: qk.packed.kv_cache_append(
                             &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
@@ -3112,6 +3221,16 @@ fn attn_forward(
                         biases: qv.biases.kv_cache_append(
                             &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
                     });
+                    if qjl_active {
+                        if let Some(qs) = cache.qjl_signs.take() {
+                            cache.qjl_signs = Some(qs.kv_cache_append(
+                                &InlineArray::zeros(&[b, n_kv_heads, extend, head_dim], dtype), 2));
+                        }
+                        if let Some(qn) = cache.qjl_residual_norms.take() {
+                            cache.qjl_residual_norms = Some(qn.kv_cache_append(
+                                &InlineArray::zeros(&[b, n_kv_heads, extend, 1], f32_dt), 2));
+                        }
+                    }
                 }
             }
 
@@ -3128,6 +3247,18 @@ fn attn_forward(
             qv_ref.packed = qv_ref.packed.slice_set(&vp, &start_q, &stop_kp);
             qv_ref.scales = qv_ref.scales.slice_set(&vs, &start_q, &stop_ks);
             qv_ref.biases = qv_ref.biases.slice_set(&vb, &start_q, &stop_ks);
+
+            // slice_set QJL data into cache
+            if let (Some(signs), Some(norms)) = (new_qjl_signs, new_qjl_norms) {
+                let stop_signs = [b, n_kv_heads, next, head_dim];
+                let stop_norms = [b, n_kv_heads, next, 1];
+                if let Some(ref mut qs) = cache.qjl_signs {
+                    *qs = qs.slice_set(&signs, &start_q, &stop_signs);
+                }
+                if let Some(ref mut qn) = cache.qjl_residual_norms {
+                    *qn = qn.slice_set(&norms, &start_q, &stop_norms);
+                }
+            }
             cache.offset = next;
 
             // Slice valid portion
@@ -3140,18 +3271,43 @@ fn attn_forward(
             let cached_vs = qv.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
             let cached_vb = qv.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
 
-            // Quantized SDPA — zero overhead, dequant fused into Metal kernel
-            crate::decode::quantized_sdpa(
-                &queries,
-                (&cached_kp, &cached_ks, &cached_kb),
-                (&cached_vp, &cached_vs, &cached_vb),
-                scale,
-                s,
-                n_heads,
-                n_kv_heads,
-                group_size,
-                bits,
-            )
+            // SDPA — with optional QJL correction when enabled
+            if qjl_active {
+                // Slice valid QJL data and project queries through S^T for correction.
+                let cached_signs = cache.qjl_signs.as_ref().unwrap()
+                    .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+                let cached_norms = cache.qjl_residual_norms.as_ref().unwrap()
+                    .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, 1]);
+                // Project queries through S^T: [B, Hq, L, D] @ [D, D] = [B, Hq, L, D]
+                let s_mat = qjl_matrix.unwrap();
+                crate::decode::quantized_sdpa_with_qjl(
+                    &queries,
+                    (&cached_kp, &cached_ks, &cached_kb),
+                    (&cached_vp, &cached_vs, &cached_vb),
+                    &cached_signs,
+                    &cached_norms,
+                    s_mat,
+                    scale,
+                    s,
+                    n_heads,
+                    n_kv_heads,
+                    group_size,
+                    bits,
+                )
+            } else {
+                // Quantized SDPA — zero overhead, dequant fused into Metal kernel
+                crate::decode::quantized_sdpa(
+                    &queries,
+                    (&cached_kp, &cached_ks, &cached_kb),
+                    (&cached_vp, &cached_vs, &cached_vb),
+                    scale,
+                    s,
+                    n_heads,
+                    n_kv_heads,
+                    group_size,
+                    bits,
+                )
+            }
         }
     } else {
         // Standard bf16 path

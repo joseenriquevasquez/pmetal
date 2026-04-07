@@ -1699,6 +1699,7 @@ async fn run_inference_streaming(
         kv_turboquant_preset,
         kv_quant_preset: None, // GUI does not expose mixed-bit presets yet
         no_kv_quant: config.no_kv_quant.unwrap_or(false),
+        kv_qjl: false, // GUI does not expose QJL yet
     };
 
     let prompt_tokens = runner_config.prompt.len(); // rough pre-tokenize hint

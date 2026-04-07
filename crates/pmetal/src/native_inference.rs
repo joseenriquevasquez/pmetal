@@ -538,6 +538,11 @@ fn run_qwen3(
                         / config.get_head_dim() as f32;
                     qwen3_native::apply_outlier_permutation(&mut weights, outlier_fraction);
                 }
+                // Generate QJL projection matrix when QJL residual correction is enabled.
+                // Must be called after apply_kv_preconditioning so S is in the same space as R.
+                if qcfg.qjl {
+                    qwen3_native::apply_qjl_matrix(&mut weights);
+                }
             }
             Ok(weights)
         },

@@ -305,6 +305,7 @@ pub(crate) async fn run_inference(
     kv_turboquant_preset: Option<pmetal::inference_runner::TurboQuantPreset>,
     kv_quant_preset: Option<String>,
     no_kv_quant: bool,
+    kv_qjl: bool,
     experts_dir: Option<&str>,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "ane"))]
@@ -358,6 +359,7 @@ pub(crate) async fn run_inference(
         kv_turboquant_preset,
         kv_quant_preset,
         no_kv_quant,
+        kv_qjl,
     };
 
     let mut runner = InferenceRunner::prepare(runner_config)?;

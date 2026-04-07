@@ -338,6 +338,172 @@ pub fn quantized_sdpa_mixed(
     }
 }
 
+/// Quantized SDPA with QJL residual correction for unbiased key inner products.
+///
+/// Adds an additive correction term to attention scores computed from affine-
+/// quantized keys. The correction makes `E[⟨q, k̃⟩] = ⟨q, k⟩` (unbiased),
+/// using the 1-bit QJL sign vectors stored alongside the quantized cache.
+///
+/// # Correction formula
+///
+/// From TurboQuant Algorithm 2:
+///
+/// ```text
+/// q_proj = queries @ S            [B, Hq, L, D]
+/// correction_raw = q_proj @ qjl_signs^T  [B, Hq, L, KV_T]
+/// correction = residual_norms^T * sqrt(π/2) / D * correction_raw
+/// scores_corrected = scores_affine + correction
+/// ```
+///
+/// # Arguments
+///
+/// - `queries`: `[B, n_q_heads, L, D]`
+/// - `q_keys` / `q_values`: `(packed, scales, biases)` quantized KV tuples
+/// - `qjl_signs`: `[B, n_kv_heads, KV_T, D]` — sign(S · residual), ±1.0
+/// - `qjl_residual_norms`: `[B, n_kv_heads, KV_T, 1]` f32 — L2 norm of residual
+/// - `qjl_s`: `[D, D]` Gaussian projection matrix S (model dtype)
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_sdpa_with_qjl(
+    queries: &InlineArray,
+    q_keys: (&InlineArray, &InlineArray, &InlineArray),
+    q_values: (&InlineArray, &InlineArray, &InlineArray),
+    qjl_signs: &InlineArray,       // [B, Hkv, KV_T, D] ±1.0 model_dtype
+    qjl_residual_norms: &InlineArray, // [B, Hkv, KV_T, 1] f32
+    qjl_s: &InlineArray,           // [D, D] model_dtype
+    scale: f32,
+    query_len: i32,
+    n_q_heads: i32,
+    n_kv_heads: i32,
+    group_size: i32,
+    bits: i32,
+) -> InlineArray {
+    let b = queries.dim(0);
+    let l = queries.dim(2);
+    let d = queries.dim(3);
+    let n_repeats = n_q_heads / n_kv_heads;
+
+    // Scale queries (matches: queries *= scale)
+    let scale_arr = InlineArray::from_f32(scale).as_dtype(queries.dtype_raw());
+    let queries_scaled = queries.multiply(&scale_arr);
+
+    // GQA expansion
+    let (queries_work, k_packed, k_scales, k_biases, v_packed, v_scales, v_biases,
+         signs_work, norms_work) = if n_repeats > 1 {
+        let q = queries_scaled.reshape(&[b, n_kv_heads, n_repeats, l, d]);
+        (
+            q,
+            q_keys.0.expand_dims(-3),
+            q_keys.1.expand_dims(-3),
+            q_keys.2.expand_dims(-3),
+            q_values.0.expand_dims(-3),
+            q_values.1.expand_dims(-3),
+            q_values.2.expand_dims(-3),
+            qjl_signs.expand_dims(-3),
+            qjl_residual_norms.expand_dims(-3),
+        )
+    } else {
+        (
+            queries_scaled,
+            q_keys.0.clone(),
+            q_keys.1.clone(),
+            q_keys.2.clone(),
+            q_values.0.clone(),
+            q_values.1.clone(),
+            q_values.2.clone(),
+            qjl_signs.clone(),
+            qjl_residual_norms.clone(),
+        )
+    };
+
+    // Affine attention scores: Q_scaled @ K^T via quantized_matmul
+    let scores_affine = queries_work.quantized_matmul(
+        &k_packed, &k_scales, Some(&k_biases),
+        true,
+        group_size, bits,
+    );
+
+    // QJL correction:
+    //   q_proj = queries_work @ S      [B, Hq/Hkv, (n_rep,) L, D]
+    //   correction_raw = q_proj @ signs^T  [B, Hq/Hkv, (n_rep,) L, KV_T]
+    //
+    // queries_work is [B, Hkv, n_rep, L, D] (GQA) or [B, Hq, L, D] (uniform).
+    // We apply S as a linear map on the last dimension, then matmul with signs^T.
+    //
+    // signs_work is [B, Hkv, (n_rep,) KV_T, D] — transpose last two dims to get
+    // [B, Hkv, (n_rep,) D, KV_T] for the matmul.
+    // Project queries through S^T: q_proj = queries @ S^T
+    // Signs were computed as sign(S · r), so the inner product estimate is:
+    //   E[q^T s] ≈ sqrt(π/2) * q^T S^T sign(S r) / ||sign(S r)||
+    // giving unbiased E[q · r] recovery after scaling by ||r||.
+    let qjl_s_t = qjl_s.transpose_axes(&[1, 0]); // [D, D]
+    let q_proj = queries_work.matmul(&qjl_s_t); // [*, L, D] @ [D, D] = [*, L, D]
+    // signs^T: swap last two axes of signs_work
+    let ndim_signs = signs_work.ndim() as i32;
+    let signs_t = signs_work.transpose_axes(&{
+        let mut axes: Vec<i32> = (0..ndim_signs).collect();
+        let last = (ndim_signs - 1) as usize;
+        let second_last = (ndim_signs - 2) as usize;
+        axes.swap(last, second_last);
+        axes
+    }); // [*, D, KV_T]
+    let correction_raw = q_proj.matmul(&signs_t); // [*, L, KV_T]
+
+    // Scale factor: sqrt(π/2) / D (cast to query dtype for graph coherence)
+    let qjl_factor = ((std::f32::consts::PI / 2.0).sqrt()) / (d as f32);
+    let qjl_factor_arr = InlineArray::from_f32(qjl_factor).as_dtype(queries.dtype_raw());
+
+    // norms_work is [B, Hkv, (n_rep,) KV_T, 1] f32.
+    // We need [B, Hkv, (n_rep,) 1, KV_T] to broadcast against [*, L, KV_T].
+    let ndim_norms = norms_work.ndim() as i32;
+    let norms_t = norms_work.transpose_axes(&{
+        let mut axes: Vec<i32> = (0..ndim_norms).collect();
+        let last = (ndim_norms - 1) as usize;
+        let second_last = (ndim_norms - 2) as usize;
+        axes.swap(last, second_last);
+        axes
+    }); // [*, 1, KV_T] f32
+    // Cast norms to query dtype for multiply
+    let norms_t_cast = norms_t.as_dtype(queries.dtype_raw());
+    let correction = correction_raw
+        .multiply(&norms_t_cast)
+        .multiply(&qjl_factor_arr);
+
+    let scores = scores_affine.add(&correction);
+
+    // Apply causal mask for prefill
+    let scores = if query_len > 1 {
+        let kl = scores.dim(-1);
+        let ql = scores.dim(-2);
+        let dtype_i32 = crate::compat::Dtype::Int32.as_i32();
+        let k_indices = InlineArray::arange(kl, dtype_i32);
+        let offset = InlineArray::from_i32(kl - ql);
+        let q_indices = InlineArray::arange(ql, dtype_i32).add(&offset);
+        let q_col = q_indices.reshape(&[ql, 1]);
+        let k_row = k_indices.reshape(&[1, kl]);
+        let mask = q_col.greater_equal(&k_row);
+        let neg_inf = InlineArray::from_f32(f32::NEG_INFINITY).as_dtype(scores.dtype_raw());
+        mask.where_cond(&scores, &neg_inf)
+    } else {
+        scores
+    };
+
+    let weights = scores.softmax_precise(-1);
+
+    // Value aggregation
+    let out = weights.quantized_matmul(
+        &v_packed, &v_scales, Some(&v_biases),
+        false,
+        group_size, bits,
+    );
+
+    // Reshape back for GQA
+    if n_repeats > 1 {
+        out.reshape(&[b, n_q_heads, l, d])
+    } else {
+        out
+    }
+}
+
 /// Shared generation-session setup for bridge-native decode loops.
 ///
 /// `mlx::core::enable_compile()` was benchmarked and shown to regress decode

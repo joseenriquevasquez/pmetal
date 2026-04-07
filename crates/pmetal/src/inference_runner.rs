@@ -93,6 +93,13 @@ pub struct InferenceRunnerConfig {
     pub kv_quant_preset: Option<String>,
     /// Disable KV cache quantization entirely.
     pub no_kv_quant: bool,
+    /// Enable QJL residual correction for Q2-Q3 keys (native path only).
+    ///
+    /// When true and the cache is configured for uniform Q2 or Q3 quantization,
+    /// stores 1-bit sign vectors on key quantization residuals and applies an
+    /// additive correction to attention scores. Only active for bits <= 3,
+    /// uniform (non-mixed-bit) KV cache.
+    pub kv_qjl: bool,
 }
 
 impl Default for InferenceRunnerConfig {
@@ -125,6 +132,7 @@ impl Default for InferenceRunnerConfig {
             kv_turboquant_preset: None,
             kv_quant_preset: None,
             no_kv_quant: false,
+            kv_qjl: false,
         }
     }
 }
@@ -354,22 +362,35 @@ impl InferenceRunner {
                 let mixed_bit_override =
                     mixed_bit_config_from_preset(config.kv_quant_preset.as_deref(), native_info);
 
-                // Extract affine quant config from cache mode (or from mixed-bit preset)
+                // Extract affine quant config from cache mode (or from mixed-bit preset).
+                // QJL is only active for uniform (non-mixed-bit) Q2-Q3.
+                let qjl_requested = config.kv_qjl;
                 let qcfg = if let Some(mb) = mixed_bit_override {
-                    // Use the lower bit-width as the "base" bits for the config;
-                    // the split is encoded entirely in MixedBitConfig.
+                    // Mixed-bit path: QJL not supported (different architecture)
+                    if qjl_requested {
+                        tracing::warn!("--kv-qjl is not supported with mixed-bit presets; ignoring");
+                    }
                     Some(pmetal_bridge::qwen3_native::QuantCacheConfig {
                         bits: mb.regular_bits,
                         group_size: 64,
                         mixed_bit: Some(mb),
+                        qjl: false,
                     })
                 } else {
                     match cache_selection.mode {
                         CacheMode::Quantized { bits, group_size } => {
+                            let qjl_active = qjl_requested && bits <= 3;
+                            if qjl_requested && bits > 3 {
+                                tracing::warn!(
+                                    bits,
+                                    "--kv-qjl is only effective for Q2-Q3; ignoring for Q{bits}"
+                                );
+                            }
                             Some(pmetal_bridge::qwen3_native::QuantCacheConfig {
                                 bits: bits as u8,
                                 group_size: group_size as i32,
                                 mixed_bit: None,
+                                qjl: qjl_active,
                             })
                         }
                         _ => None,

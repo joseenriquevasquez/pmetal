@@ -570,6 +570,15 @@ enum Commands {
         /// Disable KV cache quantization (use fp16 KV cache).
         #[arg(long)]
         no_kv_quant: bool,
+
+        /// Enable QJL residual correction for Q2-Q3 key quantization.
+        ///
+        /// Stores 1-bit sign vectors on quantization residuals and applies an
+        /// additive correction to attention scores, making key inner products
+        /// unbiased. Only active for --kv-quant 2 or 3 (uniform, non-mixed-bit).
+        /// Adds ~2-5% latency overhead from one extra D×D matmul per decode step.
+        #[arg(long)]
+        kv_qjl: bool,
     },
 
     /// Download a model from HuggingFace
@@ -2613,6 +2622,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             kv_turboquant_preset,
             kv_quant_preset,
             no_kv_quant,
+            kv_qjl,
         } => {
             // Load tool definitions if provided
             let tool_defs: Option<Vec<pmetal_data::chat_templates::ToolDefinition>> =
@@ -2681,6 +2691,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 kv_turboquant_preset.map(Into::into),
                 kv_quant_preset,
                 no_kv_quant,
+                kv_qjl,
                 experts_dir.as_deref(),
             )
             .await?;

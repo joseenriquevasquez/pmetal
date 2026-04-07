@@ -3810,7 +3810,7 @@ pub(crate) fn generate_random_orthogonal(dim: usize, rng: &mut StdRng) -> Vec<f3
 }
 
 /// Row-major [dim × dim] Gaussian random matrix for QJL projection.
-fn generate_random_projection(dim: usize, rng: &mut StdRng) -> Vec<f32> {
+pub(crate) fn generate_random_projection(dim: usize, rng: &mut StdRng) -> Vec<f32> {
     let mut projection = Vec::with_capacity(dim * dim);
     for _ in 0..(dim * dim) {
         projection.push(sample_standard_normal(rng));
