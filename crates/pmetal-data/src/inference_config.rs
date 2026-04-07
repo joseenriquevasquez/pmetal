@@ -138,19 +138,16 @@ impl Default for SamplingDefaults {
 /// Load sampling defaults from a model's `generation_config.json`.
 ///
 /// Falls back to sensible defaults if the file doesn't exist or fields are missing.
-/// When `thinking_mode` is true, uses lower temperature (0.6) and wider top_p (0.95).
+///
+/// When `thinking_mode` is true, Qwen3-family recommended parameters (temp=0.6,
+/// top_p=0.95, top_k=20) take precedence over `generation_config.json` for
+/// temperature, because models often ship with generic temp=1.0 defaults that
+/// produce noisy thinking traces. Other parameters still respect the model's
+/// config.
 pub fn load_sampling_defaults(model_path: &Path, thinking_mode: bool) -> SamplingDefaults {
-    let mut defaults = if thinking_mode {
-        SamplingDefaults {
-            temperature: 0.6,
-            top_k: 20,
-            top_p: 0.95,
-            ..Default::default()
-        }
-    } else {
-        SamplingDefaults::default()
-    };
+    let mut defaults = SamplingDefaults::default();
 
+    // Read generation_config.json first (model's declared defaults)
     let config_path = model_path.join("generation_config.json");
     if config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
@@ -177,6 +174,18 @@ pub fn load_sampling_defaults(model_path: &Path, thinking_mode: bool) -> Samplin
                     defaults.presence_penalty = v as f32;
                 }
             }
+        }
+    }
+
+    // Thinking mode: override temperature with Qwen3 recommendations.
+    // Models ship with generic temp=1.0 in generation_config.json, but thinking
+    // mode needs lower temperature (0.6) for focused reasoning. top_k/top_p from
+    // the model config are usually fine.
+    if thinking_mode {
+        defaults.temperature = 0.6;
+        // Ensure top_p is wide enough for thinking (Qwen3 recommends 0.95)
+        if defaults.top_p < 0.9 {
+            defaults.top_p = 0.95;
         }
     }
 
