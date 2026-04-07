@@ -177,6 +177,12 @@ impl GrpoTab {
                 FieldKind::Integer { min: 1, max: 16 },
                 "Hardware",
             ),
+            FormField::new(
+                "GRPO KV Cache Bits",
+                "",
+                FieldKind::Text,
+                "Hardware",
+            ),
             // RLKD (optional teacher distillation — leave Teacher Model blank for pure GRPO)
             FormField::new("Teacher Model", "", FieldKind::Text, "RLKD"),
             FormField::new(
@@ -412,6 +418,11 @@ impl GrpoTab {
                 "--speculative-draft-tokens".into(),
                 self.field_value("Draft Tokens"),
             ]);
+        }
+        let grpo_kv_bits = self.field_value("GRPO KV Cache Bits");
+        if !grpo_kv_bits.is_empty() {
+            args.push("--grpo-kv-bits".to_string());
+            args.push(grpo_kv_bits);
         }
         if self.field_value("VLM Mode") == "Enabled" {
             args.push("--vlm".into());

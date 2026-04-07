@@ -359,6 +359,8 @@ pub struct GrpoConfig {
     pub output_dir: Option<String>,
     pub use_reasoning_rewards: Option<bool>,
     pub text_column: Option<String>,
+    /// KV cache quantization bits for rollout generation (2, 4, or 8).
+    pub kv_cache_bits: Option<u8>,
 }
 
 /// Inference config matching TS `InferenceConfig`.
@@ -426,6 +428,10 @@ pub struct InferenceConfig {
     pub kv_turboquant: Option<bool>,
     /// Mixed-bit TurboQuant preset (`q2_5` or `q3_5`).
     pub kv_turboquant_preset: Option<String>,
+    /// TurboQuant v2 affine mixed-bit preset ("q2_5" or "q3_5").
+    pub kv_quant_preset: Option<String>,
+    /// Enable QJL residual correction for Q2-Q3 uniform KV cache.
+    pub kv_qjl: Option<bool>,
 }
 
 /// Merge config matching TS `MergeConfig`.
@@ -1697,9 +1703,9 @@ async fn run_inference_streaming(
         kv_group_size: config.kv_group_size.unwrap_or(64),
         kv_turboquant: config.kv_turboquant.unwrap_or(false),
         kv_turboquant_preset,
-        kv_quant_preset: None, // GUI does not expose mixed-bit presets yet
+        kv_quant_preset: config.kv_quant_preset.clone(),
         no_kv_quant: config.no_kv_quant.unwrap_or(false),
-        kv_qjl: false, // GUI does not expose QJL yet
+        kv_qjl: config.kv_qjl.unwrap_or(false),
     };
 
     let prompt_tokens = runner_config.prompt.len(); // rough pre-tokenize hint
@@ -2794,6 +2800,7 @@ async fn run_grpo_in_process(
         .with_beta(config.beta.unwrap_or(0.04));
     grpo_config.max_prompt_length = max_seq_len;
     grpo_config.max_completion_length = 512;
+    grpo_config.kv_cache_bits = config.kv_cache_bits;
 
     let mut rewards = pmetal::trainer::CombinedReward::new();
     if config.use_reasoning_rewards.unwrap_or(false) {

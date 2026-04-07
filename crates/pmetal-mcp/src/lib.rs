@@ -278,6 +278,10 @@ impl PmetalMcpServer {
         #[description("KV cache quantization bits (8=q8, 4=q4, 0=fp16, default: 8)")]
         kv_quant: Option<u64>,
         #[description("Disable KV cache quantization (use fp16)")] no_kv_quant: Option<bool>,
+        #[description("Mixed-bit TurboQuant v2 preset: \"q2_5\" or \"q3_5\" (outlier-aware split-bit KV cache)")]
+        kv_quant_preset: Option<String>,
+        #[description("Enable QJL residual correction for Q2-Q3 uniform KV cache (reduces accuracy loss at low bits)")]
+        kv_qjl: Option<bool>,
     ) -> McpResult<String> {
         let max_tokens_str = max_tokens.unwrap_or(256).to_string();
         let mut args: Vec<&str> = vec![
@@ -375,6 +379,14 @@ impl PmetalMcpServer {
         }
         if no_kv_quant.unwrap_or(false) {
             args.push("--no-kv-quant");
+        }
+        let kv_quant_preset_ref;
+        if let Some(ref preset) = kv_quant_preset {
+            kv_quant_preset_ref = preset.as_str();
+            args.extend_from_slice(&["--kv-quant-preset", kv_quant_preset_ref]);
+        }
+        if kv_qjl.unwrap_or(false) {
+            args.push("--kv-qjl");
         }
 
         util::run_pmetal_blocking(&args).await
@@ -586,6 +598,8 @@ impl PmetalMcpServer {
         #[description("Custom JSONL text column name")] text_column: Option<String>,
         #[description("Prompt column for SFT label masking")] prompt_column: Option<String>,
         #[description("Response column for SFT label masking")] response_column: Option<String>,
+        #[description("KV cache quantization bits for rollout generation (2, 4, or 8 — reduces VRAM during rollouts)")]
+        grpo_kv_bits: Option<u64>,
     ) -> McpResult<String> {
         let mut args = vec![
             "--model".to_string(),
@@ -626,6 +640,7 @@ impl PmetalMcpServer {
         push_opt(&mut args, "--text-column", &text_column);
         push_opt(&mut args, "--prompt-column", &prompt_column);
         push_opt(&mut args, "--response-column", &response_column);
+        push_opt(&mut args, "--grpo-kv-bits", &grpo_kv_bits);
 
         let mut mgr = self.jobs.write().await;
         let id = mgr.spawn("grpo", args).await?;
