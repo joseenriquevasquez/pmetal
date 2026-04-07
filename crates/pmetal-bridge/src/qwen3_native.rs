@@ -535,6 +535,8 @@ mod tests {
                 turboquant: None,
                 quantized_keys: None,
                 quantized_values: None,
+                quantized_keys_hi: None,
+                quantized_values_hi: None,
                 quant_config: None,
             }],
             rope_offset: 0,
@@ -843,11 +845,31 @@ pub struct QuantizedTuple {
     pub biases: InlineArray, // [B, H, T, D/group_size]
 }
 
+/// Mixed-bit configuration for TurboQuant v2 presets (Q2.5, Q3.5).
+///
+/// Splits head dimensions into outlier channels (top 25% by magnitude) and
+/// regular channels, quantizing each at different bit widths. The channel
+/// permutation is absorbed into projection weights at load time for zero
+/// runtime overhead.
+#[derive(Clone, Copy, Debug)]
+pub struct MixedBitConfig {
+    /// Number of outlier channels per head (quantized at higher bits).
+    pub outlier_count: i32,
+    /// Bit width for outlier channels (e.g., 3 for Q2.5, 4 for Q3.5).
+    pub outlier_bits: u8,
+    /// Bit width for regular channels (e.g., 2 for Q2.5, 3 for Q3.5).
+    pub regular_bits: u8,
+}
+
 /// Configuration for zero-overhead affine KV cache quantization.
 #[derive(Clone, Copy, Debug)]
 pub struct QuantCacheConfig {
     pub bits: u8,
     pub group_size: i32,
+    /// Mixed-bit mode (TurboQuant v2). When set, `bits` is ignored and the
+    /// outlier/regular split is used instead. Channel permutation must be
+    /// applied to projection weights at load time via [`apply_outlier_permutation`].
+    pub mixed_bit: Option<MixedBitConfig>,
 }
 
 /// Per-layer KV cache using pre-allocated buffers with O(1) slice_set updates.
@@ -857,9 +879,12 @@ pub struct KvLayerCache {
     pub offset: i32,                 // number of valid tokens
     /// TurboQuant compressed cache (replaces keys/values when enabled)
     pub turboquant: Option<crate::turboquant::QuantizedKvCache>,
-    /// Zero-overhead affine-quantized cache (uses quantized_matmul for SDPA)
+    /// Zero-overhead affine-quantized cache — regular channels (lower bits)
     pub quantized_keys: Option<QuantizedTuple>,
     pub quantized_values: Option<QuantizedTuple>,
+    /// Mixed-bit outlier channels (higher bits). `None` in uniform-quantization mode.
+    pub quantized_keys_hi: Option<QuantizedTuple>,
+    pub quantized_values_hi: Option<QuantizedTuple>,
     pub quant_config: Option<QuantCacheConfig>,
 }
 
@@ -964,6 +989,8 @@ impl NativeCache {
                     turboquant: tq_cache,
                     quantized_keys: None,
                     quantized_values: None,
+                    quantized_keys_hi: None,
+                    quantized_values_hi: None,
                     quant_config: None,
                 });
             }
@@ -1205,6 +1232,101 @@ pub fn apply_kv_preconditioning(weights: &mut NativeWeights) {
             rotate_output_weight(&mut lw.attn_o_w, &r, n_heads, head_dim);
         }
     }
+}
+
+/// Reorder head dimensions so outlier channels come first, enabling mixed-bit
+/// quantization where outlier channels get higher precision.
+///
+/// Computes per-channel L2 norms from K projection weights, finds the top
+/// `outlier_fraction` channels, and builds a permutation that moves them to
+/// the front of each head. The permutation is then absorbed into Q/K/V/O
+/// projection weights — zero runtime cost.
+///
+/// Permutation matrices commute with element-wise nonlinearities (sigmoid),
+/// so this is safe for gated attention unlike Hadamard rotation.
+pub fn apply_outlier_permutation(
+    weights: &mut NativeWeights,
+    outlier_fraction: f32,
+) -> i32 {
+    // Find head_dim from first attention layer
+    let (head_dim, n_kv) = weights
+        .layers
+        .iter()
+        .find(|lw| !lw.is_linear)
+        .map(|lw| (lw.attn_head_dim, lw.attn_n_kv_heads))
+        .unwrap_or((0, 0));
+    if head_dim == 0 {
+        return 0;
+    }
+
+    let outlier_count = (head_dim as f32 * outlier_fraction).round() as i32;
+    // Round to group_size boundary for clean quantization
+    let outlier_count = (outlier_count / 64) * 64;
+    if outlier_count == 0 || outlier_count >= head_dim {
+        return 0;
+    }
+
+    // Compute per-channel importance from K projection weights (first attn layer).
+    // Use L2 norm of each output channel across the hidden dimension.
+    let k_w = weights
+        .layers
+        .iter()
+        .find(|lw| !lw.is_linear)
+        .and_then(|lw| match &lw.attn_k_w {
+            Some(LayerWeight::Dense(w)) => Some(w.clone()),
+            _ => None,
+        });
+    let Some(k_weight) = k_w else { return 0 };
+
+    // k_weight shape: [hidden, n_kv * head_dim] (pre-transposed)
+    // Compute L2 norm per output channel (columns)
+    let col_norms = k_weight.square().sum_axis(0, false); // [n_kv * head_dim]
+    col_norms.eval();
+
+    // Build per-head permutation: sort channels by norm (descending), outliers first.
+    // The permutation is the same for all heads (same relative ordering).
+    let first_head_norms = col_norms.slice(&[0], &[head_dim]);
+    first_head_norms.eval();
+    let norms_slice: &[f32] = first_head_norms.as_slice();
+    let mut indices: Vec<usize> = (0..head_dim as usize).collect();
+    indices.sort_by(|&a, &b| {
+        norms_slice[b]
+            .partial_cmp(&norms_slice[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Build permutation matrix P [head_dim, head_dim]
+    let mut p_data = vec![0.0f32; (head_dim * head_dim) as usize];
+    for (new_pos, &old_pos) in indices.iter().enumerate() {
+        p_data[new_pos * head_dim as usize + old_pos] = 1.0;
+    }
+    let p = InlineArray::from_f32_slice(&p_data, &[head_dim, head_dim]);
+    let p = p.as_dtype(weights.model_dtype);
+    let p_t = p.transpose_axes(&[1, 0]);
+
+    eprintln!(
+        "[PRECONDITION] Applying outlier channel permutation (outlier_count={}, head_dim={})",
+        outlier_count, head_dim
+    );
+
+    // Apply P to all attention projection weights.
+    // W' = W @ P^T moves outlier channels to front of each head.
+    // Permutation commutes with sigmoid, so safe for gated attention.
+    for lw in &mut weights.layers {
+        if lw.is_linear {
+            continue;
+        }
+        let n_heads = lw.attn_n_heads;
+        let n_kv = lw.attn_n_kv_heads;
+
+        // Q (including gate for Qwen3.5): permute query channels, gate channels
+        rotate_projection_weight(&mut lw.attn_q_w, &p_t, n_heads, head_dim, lw.attn_gated);
+        rotate_projection_weight(&mut lw.attn_k_w, &p_t, n_kv, head_dim, false);
+        rotate_projection_weight(&mut lw.attn_v_w, &p_t, n_kv, head_dim, false);
+        rotate_output_weight(&mut lw.attn_o_w, &p, n_heads, head_dim);
+    }
+
+    outlier_count
 }
 
 /// Rotate a Q/K/V projection weight in-place: `W' = W @ R_block^T`
@@ -2733,108 +2855,304 @@ fn attn_forward(
             }
         }
     } else if let Some(qcfg) = cache.quant_config {
-        // Zero-overhead quantized KV cache path using quantized_matmul.
-        // Matches mlx-lm's QuantizedKVCache: quantize K/V immediately after RoPE,
-        // store as (packed_uint32, scales, biases), pass to quantized_matmul
-        // which dequantizes inside the Metal kernel. No separate dequant pass.
-        let bits = qcfg.bits as i32;
         let group_size = qcfg.group_size;
-        let el_per_int = 32 / bits; // e.g. 4 for Q8, 8 for Q4
 
-        // Quantize new K/V → (packed, scales, biases)
-        let keys_2d = keys.reshape(&[b * n_kv_heads * s, head_dim]);
-        let (kp, ks, kb) = keys_2d.quantize_weights(group_size, bits);
-        let packed_dim = head_dim / el_per_int;
-        let scales_dim = head_dim / group_size;
-        let kp = kp.reshape(&[b, n_kv_heads, s, packed_dim]);
-        let ks = ks.reshape(&[b, n_kv_heads, s, scales_dim]);
-        let kb = kb.reshape(&[b, n_kv_heads, s, scales_dim]);
+        if let Some(mb) = qcfg.mixed_bit {
+            // ---- MIXED-BIT PATH (TurboQuant v2: Q2.5 / Q3.5) ----
+            // After outlier permutation, the first `oc` dims of each head are
+            // outliers (quantized at higher bits); the remaining `rc` are regular
+            // (quantized at lower bits).
+            let oc = mb.outlier_count;      // outlier channel count per head
+            let rc = head_dim - oc;         // regular channel count per head
+            let bits_hi = mb.outlier_bits as i32;
+            let bits_lo = mb.regular_bits as i32;
 
-        let values_2d = values.reshape(&[b * n_kv_heads * s, head_dim]);
-        let (vp, vs, vb) = values_2d.quantize_weights(group_size, bits);
-        let vp = vp.reshape(&[b, n_kv_heads, s, packed_dim]);
-        let vs = vs.reshape(&[b, n_kv_heads, s, scales_dim]);
-        let vb = vb.reshape(&[b, n_kv_heads, s, scales_dim]);
+            // MLX packed-uint32 dims for each half
+            let packed_dim_hi = (oc * bits_hi + 31) / 32;
+            let packed_dim_lo = (rc * bits_lo + 31) / 32;
+            let scales_dim_hi = oc / group_size;
+            let scales_dim_lo = rc / group_size;
 
-        // Cache management: allocate or grow quantized buffers
-        if cache.quantized_keys.is_none() {
-            let alloc = ((next + 255) / 256) * 256;
-            cache.quantized_keys = Some(QuantizedTuple {
-                packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim],
-                    crate::compat::Dtype::Uint32.as_i32()),
-                scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-                biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-            });
-            cache.quantized_values = Some(QuantizedTuple {
-                packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim],
-                    crate::compat::Dtype::Uint32.as_i32()),
-                scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-                biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-            });
-        } else {
-            let allocated = cache.quantized_keys.as_ref().unwrap().packed.dim(2);
-            if next > allocated {
-                let grow_to = ((next + 255) / 256) * 256;
-                let extend = grow_to - allocated;
-                let qk = cache.quantized_keys.take().unwrap();
-                let qv = cache.quantized_values.take().unwrap();
-                let uint32_dt = crate::compat::Dtype::Uint32.as_i32();
+            // Split K/V along the head-dim axis: [B, Hkv, S, oc] and [B, Hkv, S, rc]
+            let k_hi = keys.slice(&[0, 0, 0, 0],  &[b, n_kv_heads, s, oc]);
+            let k_lo = keys.slice(&[0, 0, 0, oc], &[b, n_kv_heads, s, head_dim]);
+            let v_hi = values.slice(&[0, 0, 0, 0],  &[b, n_kv_heads, s, oc]);
+            let v_lo = values.slice(&[0, 0, 0, oc], &[b, n_kv_heads, s, head_dim]);
+
+            // Quantize each half → (packed, scales, biases)
+            let (kp_hi, ks_hi, kb_hi) = {
+                let flat = k_hi.reshape(&[b * n_kv_heads * s, oc]);
+                let (p, s_, bi) = flat.quantize_weights(group_size, bits_hi);
+                (
+                    p.reshape(&[b, n_kv_heads, s, packed_dim_hi]),
+                    s_.reshape(&[b, n_kv_heads, s, scales_dim_hi]),
+                    bi.reshape(&[b, n_kv_heads, s, scales_dim_hi]),
+                )
+            };
+            let (kp_lo, ks_lo, kb_lo) = {
+                let flat = k_lo.reshape(&[b * n_kv_heads * s, rc]);
+                let (p, s_, bi) = flat.quantize_weights(group_size, bits_lo);
+                (
+                    p.reshape(&[b, n_kv_heads, s, packed_dim_lo]),
+                    s_.reshape(&[b, n_kv_heads, s, scales_dim_lo]),
+                    bi.reshape(&[b, n_kv_heads, s, scales_dim_lo]),
+                )
+            };
+            let (vp_hi, vs_hi, vb_hi) = {
+                let flat = v_hi.reshape(&[b * n_kv_heads * s, oc]);
+                let (p, s_, bi) = flat.quantize_weights(group_size, bits_hi);
+                (
+                    p.reshape(&[b, n_kv_heads, s, packed_dim_hi]),
+                    s_.reshape(&[b, n_kv_heads, s, scales_dim_hi]),
+                    bi.reshape(&[b, n_kv_heads, s, scales_dim_hi]),
+                )
+            };
+            let (vp_lo, vs_lo, vb_lo) = {
+                let flat = v_lo.reshape(&[b * n_kv_heads * s, rc]);
+                let (p, s_, bi) = flat.quantize_weights(group_size, bits_lo);
+                (
+                    p.reshape(&[b, n_kv_heads, s, packed_dim_lo]),
+                    s_.reshape(&[b, n_kv_heads, s, scales_dim_lo]),
+                    bi.reshape(&[b, n_kv_heads, s, scales_dim_lo]),
+                )
+            };
+
+            // ---- Cache management: allocate or grow 4 quantized buffers ----
+            let uint32_dt = crate::compat::Dtype::Uint32.as_i32();
+            if cache.quantized_keys_hi.is_none() {
+                let alloc = ((next + 255) / 256) * 256;
+                cache.quantized_keys_hi = Some(QuantizedTuple {
+                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim_hi], uint32_dt),
+                    scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_hi], dtype),
+                    biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_hi], dtype),
+                });
                 cache.quantized_keys = Some(QuantizedTuple {
-                    packed: qk.packed.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
-                    scales: qk.scales.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
-                    biases: qk.biases.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim_lo], uint32_dt),
+                    scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_lo], dtype),
+                    biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_lo], dtype),
+                });
+                cache.quantized_values_hi = Some(QuantizedTuple {
+                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim_hi], uint32_dt),
+                    scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_hi], dtype),
+                    biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_hi], dtype),
                 });
                 cache.quantized_values = Some(QuantizedTuple {
-                    packed: qv.packed.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
-                    scales: qv.scales.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
-                    biases: qv.biases.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim_lo], uint32_dt),
+                    scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_lo], dtype),
+                    biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_lo], dtype),
                 });
+            } else {
+                let allocated = cache.quantized_keys_hi.as_ref().unwrap().packed.dim(2);
+                if next > allocated {
+                    let grow_to = ((next + 255) / 256) * 256;
+                    let extend = grow_to - allocated;
+                    let qkh = cache.quantized_keys_hi.take().unwrap();
+                    let qkl = cache.quantized_keys.take().unwrap();
+                    let qvh = cache.quantized_values_hi.take().unwrap();
+                    let qvl = cache.quantized_values.take().unwrap();
+                    cache.quantized_keys_hi = Some(QuantizedTuple {
+                        packed: qkh.packed.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_hi], uint32_dt), 2),
+                        scales: qkh.scales.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype), 2),
+                        biases: qkh.biases.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype), 2),
+                    });
+                    cache.quantized_keys = Some(QuantizedTuple {
+                        packed: qkl.packed.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_lo], uint32_dt), 2),
+                        scales: qkl.scales.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype), 2),
+                        biases: qkl.biases.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype), 2),
+                    });
+                    cache.quantized_values_hi = Some(QuantizedTuple {
+                        packed: qvh.packed.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_hi], uint32_dt), 2),
+                        scales: qvh.scales.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype), 2),
+                        biases: qvh.biases.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype), 2),
+                    });
+                    cache.quantized_values = Some(QuantizedTuple {
+                        packed: qvl.packed.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_lo], uint32_dt), 2),
+                        scales: qvl.scales.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype), 2),
+                        biases: qvl.biases.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype), 2),
+                    });
+                }
             }
+
+            // slice_set new tokens into all four cache buffers
+            let start_q = [0, 0, prev, 0];
+
+            let qkh_ref = cache.quantized_keys_hi.as_mut().unwrap();
+            qkh_ref.packed = qkh_ref.packed.slice_set(&kp_hi, &start_q, &[b, n_kv_heads, next, packed_dim_hi]);
+            qkh_ref.scales = qkh_ref.scales.slice_set(&ks_hi, &start_q, &[b, n_kv_heads, next, scales_dim_hi]);
+            qkh_ref.biases = qkh_ref.biases.slice_set(&kb_hi, &start_q, &[b, n_kv_heads, next, scales_dim_hi]);
+
+            let qkl_ref = cache.quantized_keys.as_mut().unwrap();
+            qkl_ref.packed = qkl_ref.packed.slice_set(&kp_lo, &start_q, &[b, n_kv_heads, next, packed_dim_lo]);
+            qkl_ref.scales = qkl_ref.scales.slice_set(&ks_lo, &start_q, &[b, n_kv_heads, next, scales_dim_lo]);
+            qkl_ref.biases = qkl_ref.biases.slice_set(&kb_lo, &start_q, &[b, n_kv_heads, next, scales_dim_lo]);
+
+            let qvh_ref = cache.quantized_values_hi.as_mut().unwrap();
+            qvh_ref.packed = qvh_ref.packed.slice_set(&vp_hi, &start_q, &[b, n_kv_heads, next, packed_dim_hi]);
+            qvh_ref.scales = qvh_ref.scales.slice_set(&vs_hi, &start_q, &[b, n_kv_heads, next, scales_dim_hi]);
+            qvh_ref.biases = qvh_ref.biases.slice_set(&vb_hi, &start_q, &[b, n_kv_heads, next, scales_dim_hi]);
+
+            let qvl_ref = cache.quantized_values.as_mut().unwrap();
+            qvl_ref.packed = qvl_ref.packed.slice_set(&vp_lo, &start_q, &[b, n_kv_heads, next, packed_dim_lo]);
+            qvl_ref.scales = qvl_ref.scales.slice_set(&vs_lo, &start_q, &[b, n_kv_heads, next, scales_dim_lo]);
+            qvl_ref.biases = qvl_ref.biases.slice_set(&vb_lo, &start_q, &[b, n_kv_heads, next, scales_dim_lo]);
+
+            cache.offset = next;
+
+            // Slice valid portions from all four cache buffers
+            let qkh = cache.quantized_keys_hi.as_ref().unwrap();
+            let cached_kp_hi = qkh.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim_hi]);
+            let cached_ks_hi = qkh.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_hi]);
+            let cached_kb_hi = qkh.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_hi]);
+
+            let qkl = cache.quantized_keys.as_ref().unwrap();
+            let cached_kp_lo = qkl.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim_lo]);
+            let cached_ks_lo = qkl.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_lo]);
+            let cached_kb_lo = qkl.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_lo]);
+
+            let qvh = cache.quantized_values_hi.as_ref().unwrap();
+            let cached_vp_hi = qvh.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim_hi]);
+            let cached_vs_hi = qvh.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_hi]);
+            let cached_vb_hi = qvh.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_hi]);
+
+            let qvl = cache.quantized_values.as_ref().unwrap();
+            let cached_vp_lo = qvl.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim_lo]);
+            let cached_vs_lo = qvl.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_lo]);
+            let cached_vb_lo = qvl.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim_lo]);
+
+            // Mixed-bit SDPA: two quantized_matmul calls per score/value aggregation
+            crate::decode::quantized_sdpa_mixed(
+                &queries,
+                (&cached_kp_lo, &cached_ks_lo, &cached_kb_lo),
+                (&cached_vp_lo, &cached_vs_lo, &cached_vb_lo),
+                (&cached_kp_hi, &cached_ks_hi, &cached_kb_hi),
+                (&cached_vp_hi, &cached_vs_hi, &cached_vb_hi),
+                scale,
+                s,
+                n_heads,
+                n_kv_heads,
+                oc,
+                group_size,
+                bits_lo,
+                bits_hi,
+            )
+        } else {
+            // ---- UNIFORM-BIT PATH (unchanged) ----
+            // Zero-overhead quantized KV cache path using quantized_matmul.
+            // Matches mlx-lm's QuantizedKVCache: quantize K/V immediately after RoPE,
+            // store as (packed_uint32, scales, biases), pass to quantized_matmul
+            // which dequantizes inside the Metal kernel. No separate dequant pass.
+            let bits = qcfg.bits as i32;
+
+            // MLX packs quantized values into uint32: packed_dim = ceil(head_dim * bits / 32).
+            // This is NOT head_dim / (32/bits) which fails for non-power-of-2 bit widths (Q3, Q5, Q6).
+            let packed_dim = (head_dim * bits + 31) / 32;
+            let scales_dim = head_dim / group_size;
+
+            // Quantize new K/V → (packed, scales, biases)
+            let keys_2d = keys.reshape(&[b * n_kv_heads * s, head_dim]);
+            let (kp, ks, kb) = keys_2d.quantize_weights(group_size, bits);
+            let kp = kp.reshape(&[b, n_kv_heads, s, packed_dim]);
+            let ks = ks.reshape(&[b, n_kv_heads, s, scales_dim]);
+            let kb = kb.reshape(&[b, n_kv_heads, s, scales_dim]);
+
+            let values_2d = values.reshape(&[b * n_kv_heads * s, head_dim]);
+            let (vp, vs, vb) = values_2d.quantize_weights(group_size, bits);
+            let vp = vp.reshape(&[b, n_kv_heads, s, packed_dim]);
+            let vs = vs.reshape(&[b, n_kv_heads, s, scales_dim]);
+            let vb = vb.reshape(&[b, n_kv_heads, s, scales_dim]);
+
+            // Cache management: allocate or grow quantized buffers
+            if cache.quantized_keys.is_none() {
+                let alloc = ((next + 255) / 256) * 256;
+                cache.quantized_keys = Some(QuantizedTuple {
+                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim],
+                        crate::compat::Dtype::Uint32.as_i32()),
+                    scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+                    biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+                });
+                cache.quantized_values = Some(QuantizedTuple {
+                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim],
+                        crate::compat::Dtype::Uint32.as_i32()),
+                    scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+                    biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
+                });
+            } else {
+                let allocated = cache.quantized_keys.as_ref().unwrap().packed.dim(2);
+                if next > allocated {
+                    let grow_to = ((next + 255) / 256) * 256;
+                    let extend = grow_to - allocated;
+                    let qk = cache.quantized_keys.take().unwrap();
+                    let qv = cache.quantized_values.take().unwrap();
+                    let uint32_dt = crate::compat::Dtype::Uint32.as_i32();
+                    cache.quantized_keys = Some(QuantizedTuple {
+                        packed: qk.packed.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
+                        scales: qk.scales.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                        biases: qk.biases.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                    });
+                    cache.quantized_values = Some(QuantizedTuple {
+                        packed: qv.packed.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt), 2),
+                        scales: qv.scales.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                        biases: qv.biases.kv_cache_append(
+                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype), 2),
+                    });
+                }
+            }
+
+            // slice_set quantized data into cache
+            let start_q = [0, 0, prev, 0];
+            let qk_ref = cache.quantized_keys.as_mut().unwrap();
+            let stop_kp = [b, n_kv_heads, next, packed_dim];
+            let stop_ks = [b, n_kv_heads, next, scales_dim];
+            qk_ref.packed = qk_ref.packed.slice_set(&kp, &start_q, &stop_kp);
+            qk_ref.scales = qk_ref.scales.slice_set(&ks, &start_q, &stop_ks);
+            qk_ref.biases = qk_ref.biases.slice_set(&kb, &start_q, &stop_ks);
+
+            let qv_ref = cache.quantized_values.as_mut().unwrap();
+            qv_ref.packed = qv_ref.packed.slice_set(&vp, &start_q, &stop_kp);
+            qv_ref.scales = qv_ref.scales.slice_set(&vs, &start_q, &stop_ks);
+            qv_ref.biases = qv_ref.biases.slice_set(&vb, &start_q, &stop_ks);
+            cache.offset = next;
+
+            // Slice valid portion
+            let qk = cache.quantized_keys.as_ref().unwrap();
+            let cached_kp = qk.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+            let cached_ks = qk.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+            let cached_kb = qk.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+            let qv = cache.quantized_values.as_ref().unwrap();
+            let cached_vp = qv.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+            let cached_vs = qv.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+            let cached_vb = qv.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+
+            // Quantized SDPA — zero overhead, dequant fused into Metal kernel
+            crate::decode::quantized_sdpa(
+                &queries,
+                (&cached_kp, &cached_ks, &cached_kb),
+                (&cached_vp, &cached_vs, &cached_vb),
+                scale,
+                s,
+                n_heads,
+                n_kv_heads,
+                group_size,
+                bits,
+            )
         }
-
-        // slice_set quantized data into cache
-        let start_q = [0, 0, prev, 0];
-        let qk_ref = cache.quantized_keys.as_mut().unwrap();
-        let stop_kp = [b, n_kv_heads, next, packed_dim];
-        let stop_ks = [b, n_kv_heads, next, scales_dim];
-        qk_ref.packed = qk_ref.packed.slice_set(&kp, &start_q, &stop_kp);
-        qk_ref.scales = qk_ref.scales.slice_set(&ks, &start_q, &stop_ks);
-        qk_ref.biases = qk_ref.biases.slice_set(&kb, &start_q, &stop_ks);
-
-        let qv_ref = cache.quantized_values.as_mut().unwrap();
-        qv_ref.packed = qv_ref.packed.slice_set(&vp, &start_q, &stop_kp);
-        qv_ref.scales = qv_ref.scales.slice_set(&vs, &start_q, &stop_ks);
-        qv_ref.biases = qv_ref.biases.slice_set(&vb, &start_q, &stop_ks);
-        cache.offset = next;
-
-        // Slice valid portion
-        let qk = cache.quantized_keys.as_ref().unwrap();
-        let cached_kp = qk.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
-        let cached_ks = qk.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
-        let cached_kb = qk.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
-        let qv = cache.quantized_values.as_ref().unwrap();
-        let cached_vp = qv.packed.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
-        let cached_vs = qv.scales.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
-        let cached_vb = qv.biases.slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
-
-        // Quantized SDPA — zero overhead, dequant fused into Metal kernel
-        crate::decode::quantized_sdpa(
-            &queries,
-            (&cached_kp, &cached_ks, &cached_kb),
-            (&cached_vp, &cached_vs, &cached_vb),
-            scale,
-            s,
-            n_heads,
-            n_kv_heads,
-            group_size,
-            bits,
-        )
     } else {
         // Standard bf16 path
         let start = [0, 0, prev, 0];

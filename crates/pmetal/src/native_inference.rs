@@ -529,6 +529,16 @@ fn run_qwen3(
             if quant_config.is_some() {
                 qwen3_native::apply_kv_preconditioning(&mut weights);
             }
+            // Apply outlier channel permutation for mixed-bit presets (TurboQuant v2).
+            // This absorbs the permutation into Q/K/V/O projection weights at load time,
+            // moving high-magnitude channels to the front of each head with zero runtime cost.
+            if let Some(qcfg) = quant_config {
+                if let Some(mb) = qcfg.mixed_bit {
+                    let outlier_fraction = mb.outlier_count as f32
+                        / config.get_head_dim() as f32;
+                    qwen3_native::apply_outlier_permutation(&mut weights, outlier_fraction);
+                }
+            }
             Ok(weights)
         },
         |weights, _| build_qwen3_cache_with_quant(weights, turboquant, quant_config),

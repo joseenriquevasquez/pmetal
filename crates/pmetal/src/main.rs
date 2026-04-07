@@ -562,6 +562,11 @@ enum Commands {
         #[arg(long, value_enum)]
         kv_turboquant_preset: Option<TurboQuantPresetArg>,
 
+        /// TurboQuant v2 mixed-bit affine preset: "q2_5" (2.5-bit) or "q3_5" (3.5-bit).
+        /// Enables outlier channel detection + split-bit quantized KV cache (native path only).
+        #[arg(long, value_parser = ["q2_5", "q3_5"])]
+        kv_quant_preset: Option<String>,
+
         /// Disable KV cache quantization (use fp16 KV cache).
         #[arg(long)]
         no_kv_quant: bool,
@@ -2606,6 +2611,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             kv_group_size,
             kv_turboquant,
             kv_turboquant_preset,
+            kv_quant_preset,
             no_kv_quant,
         } => {
             // Load tool definitions if provided
@@ -2673,6 +2679,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 kv_group_size,
                 kv_turboquant,
                 kv_turboquant_preset.map(Into::into),
+                kv_quant_preset,
                 no_kv_quant,
                 experts_dir.as_deref(),
             )

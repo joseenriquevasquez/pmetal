@@ -88,6 +88,9 @@ pub struct InferenceRunnerConfig {
     pub kv_turboquant: bool,
     /// Mixed-bit TurboQuant preset.
     pub kv_turboquant_preset: Option<TurboQuantPreset>,
+    /// TurboQuant v2 affine mixed-bit preset: "q2_5" or "q3_5".
+    /// Enables outlier channel permutation + split-bit KV cache (native path only).
+    pub kv_quant_preset: Option<String>,
     /// Disable KV cache quantization entirely.
     pub no_kv_quant: bool,
 }
@@ -120,6 +123,7 @@ impl Default for InferenceRunnerConfig {
             kv_group_size: 64,
             kv_turboquant: false,
             kv_turboquant_preset: None,
+            kv_quant_preset: None,
             no_kv_quant: false,
         }
     }
@@ -344,15 +348,32 @@ impl InferenceRunner {
                 log_cache_selection(&cache_selection, max_seq_len);
                 let cache = build_native_placeholder_cache(&base_cache_config);
                 let mamba_cache = Some(MambaCache::new(native_info.num_layers));
-                // Extract affine quant config from cache mode
-                let qcfg = match cache_selection.mode {
-                    CacheMode::Quantized { bits, group_size } => {
-                        Some(pmetal_bridge::qwen3_native::QuantCacheConfig {
-                            bits: bits as u8,
-                            group_size: group_size as i32,
-                        })
+
+                // TurboQuant v2 mixed-bit preset overrides the standard cache mode.
+                // Outlier count is rounded down to the nearest group_size (64) boundary.
+                let mixed_bit_override =
+                    mixed_bit_config_from_preset(config.kv_quant_preset.as_deref(), native_info);
+
+                // Extract affine quant config from cache mode (or from mixed-bit preset)
+                let qcfg = if let Some(mb) = mixed_bit_override {
+                    // Use the lower bit-width as the "base" bits for the config;
+                    // the split is encoded entirely in MixedBitConfig.
+                    Some(pmetal_bridge::qwen3_native::QuantCacheConfig {
+                        bits: mb.regular_bits,
+                        group_size: 64,
+                        mixed_bit: Some(mb),
+                    })
+                } else {
+                    match cache_selection.mode {
+                        CacheMode::Quantized { bits, group_size } => {
+                            Some(pmetal_bridge::qwen3_native::QuantCacheConfig {
+                                bits: bits as u8,
+                                group_size: group_size as i32,
+                                mixed_bit: None,
+                            })
+                        }
+                        _ => None,
                     }
-                    _ => None,
                 };
                 (
                     LoadedModel::NativeOnly,
@@ -793,10 +814,60 @@ fn native_cache_mode_supported(
     match mode {
         CacheMode::Standard => true,
         CacheMode::TurboQuant { .. } => info.supports_turboquant,
-        // Zero-overhead quantized KV cache via quantized_matmul (matches mlx-lm)
-        CacheMode::Quantized { bits, .. } => bits == 4 || bits == 8,
+        // Zero-overhead quantized KV cache via quantized_matmul (matches mlx-lm).
+        // MLX supports 2, 3, 4, 5, 6, 8 bits for affine group quantization.
+        CacheMode::Quantized { bits, .. } => matches!(bits, 2 | 3 | 4 | 5 | 6 | 8),
         _ => false,
     }
+}
+
+/// Construct a `MixedBitConfig` from a CLI preset string and the model's head_dim.
+///
+/// Presets:
+/// - "q2_5": outlier_bits=3, regular_bits=2, outlier_fraction=0.25
+/// - "q3_5": outlier_bits=4, regular_bits=3, outlier_fraction=0.25
+///
+/// Outlier count is rounded down to the nearest multiple of 64 (the group_size)
+/// so that quantization groups align cleanly.
+fn mixed_bit_config_from_preset(
+    preset: Option<&str>,
+    info: crate::native_inference::NativeBridgeInfo,
+) -> Option<pmetal_bridge::qwen3_native::MixedBitConfig> {
+    let preset = preset?;
+    let (outlier_bits, regular_bits) = match preset {
+        "q2_5" => (3u8, 2u8),
+        "q3_5" => (4u8, 3u8),
+        other => {
+            tracing::warn!(preset = other, "Unknown --kv-quant-preset; ignoring");
+            return None;
+        }
+    };
+    const OUTLIER_FRACTION: f32 = 0.25;
+    const GROUP_SIZE: i32 = 64;
+    let head_dim = info.head_dim as i32;
+    let raw = (head_dim as f32 * OUTLIER_FRACTION).round() as i32;
+    let outlier_count = (raw / GROUP_SIZE) * GROUP_SIZE;
+    if outlier_count == 0 || outlier_count >= head_dim {
+        tracing::warn!(
+            head_dim,
+            outlier_count,
+            "Mixed-bit outlier_count is invalid for this model's head_dim; ignoring --kv-quant-preset"
+        );
+        return None;
+    }
+    tracing::info!(
+        preset,
+        outlier_count,
+        head_dim,
+        outlier_bits,
+        regular_bits,
+        "Enabling TurboQuant v2 mixed-bit KV cache"
+    );
+    Some(pmetal_bridge::qwen3_native::MixedBitConfig {
+        outlier_count,
+        outlier_bits,
+        regular_bits,
+    })
 }
 
 fn turboquant_config_from_mode(

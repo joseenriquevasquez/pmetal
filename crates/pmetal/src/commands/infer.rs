@@ -303,6 +303,7 @@ pub(crate) async fn run_inference(
     kv_group_size: usize,
     kv_turboquant: bool,
     kv_turboquant_preset: Option<pmetal::inference_runner::TurboQuantPreset>,
+    kv_quant_preset: Option<String>,
     no_kv_quant: bool,
     experts_dir: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -355,6 +356,7 @@ pub(crate) async fn run_inference(
         kv_group_size,
         kv_turboquant,
         kv_turboquant_preset,
+        kv_quant_preset,
         no_kv_quant,
     };
 

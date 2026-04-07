@@ -216,6 +216,128 @@ pub fn quantized_sdpa(
     }
 }
 
+/// Mixed-bit quantized SDPA for TurboQuant v2 presets (Q2.5 / Q3.5).
+///
+/// Splits queries into outlier and regular channels, computes attention scores
+/// via two `quantized_matmul` calls (one per group), sums them, then applies
+/// softmax. Values are also split and aggregated separately, then concatenated
+/// back to reconstruct the full `[B, H, L, D]` output.
+///
+/// Channel layout (post-permutation): `[outlier_count | head_dim - outlier_count]`
+///
+/// - `queries`: `[B, n_q_heads, L, D]`
+/// - `q_keys_lo` / `q_values_lo`: regular-channel (lower-bit) `(packed, scales, biases)`
+/// - `q_keys_hi` / `q_values_hi`: outlier-channel (higher-bit) `(packed, scales, biases)`
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_sdpa_mixed(
+    queries: &InlineArray,
+    q_keys_lo: (&InlineArray, &InlineArray, &InlineArray),
+    q_values_lo: (&InlineArray, &InlineArray, &InlineArray),
+    q_keys_hi: (&InlineArray, &InlineArray, &InlineArray),
+    q_values_hi: (&InlineArray, &InlineArray, &InlineArray),
+    scale: f32,
+    query_len: i32,
+    n_q_heads: i32,
+    n_kv_heads: i32,
+    outlier_count: i32,
+    group_size: i32,
+    bits_lo: i32,
+    bits_hi: i32,
+) -> InlineArray {
+    let b = queries.dim(0);
+    let l = queries.dim(2);
+    let d = queries.dim(3);
+    let n_repeats = n_q_heads / n_kv_heads;
+    let rc = d - outlier_count; // regular channel count
+
+    // Scale queries
+    let scale_arr = InlineArray::from_f32(scale).as_dtype(queries.dtype_raw());
+    let queries_scaled = queries.multiply(&scale_arr);
+
+    // Split scaled queries along last dim: outlier (hi) and regular (lo) halves
+    let q_hi_raw = queries_scaled.slice(&[0, 0, 0, 0], &[b, n_q_heads, l, outlier_count]);
+    let q_lo_raw = queries_scaled.slice(&[0, 0, 0, outlier_count], &[b, n_q_heads, l, d]);
+
+    // GQA expansion
+    let (q_hi, q_lo, kp_hi, ks_hi, kb_hi, vp_hi, vs_hi, vb_hi,
+         kp_lo, ks_lo, kb_lo, vp_lo, vs_lo, vb_lo) =
+        if n_repeats > 1 {
+            let q_h = q_hi_raw.reshape(&[b, n_kv_heads, n_repeats, l, outlier_count]);
+            let q_l = q_lo_raw.reshape(&[b, n_kv_heads, n_repeats, l, rc]);
+            (
+                q_h,
+                q_l,
+                q_keys_hi.0.expand_dims(-3),
+                q_keys_hi.1.expand_dims(-3),
+                q_keys_hi.2.expand_dims(-3),
+                q_values_hi.0.expand_dims(-3),
+                q_values_hi.1.expand_dims(-3),
+                q_values_hi.2.expand_dims(-3),
+                q_keys_lo.0.expand_dims(-3),
+                q_keys_lo.1.expand_dims(-3),
+                q_keys_lo.2.expand_dims(-3),
+                q_values_lo.0.expand_dims(-3),
+                q_values_lo.1.expand_dims(-3),
+                q_values_lo.2.expand_dims(-3),
+            )
+        } else {
+            (
+                q_hi_raw,
+                q_lo_raw,
+                q_keys_hi.0.clone(),
+                q_keys_hi.1.clone(),
+                q_keys_hi.2.clone(),
+                q_values_hi.0.clone(),
+                q_values_hi.1.clone(),
+                q_values_hi.2.clone(),
+                q_keys_lo.0.clone(),
+                q_keys_lo.1.clone(),
+                q_keys_lo.2.clone(),
+                q_values_lo.0.clone(),
+                q_values_lo.1.clone(),
+                q_values_lo.2.clone(),
+            )
+        };
+
+    // Scores: Q_hi @ K_hi^T + Q_lo @ K_lo^T (both fused-dequant inside Metal kernel)
+    let scores_hi = q_hi.quantized_matmul(&kp_hi, &ks_hi, Some(&kb_hi), true, group_size, bits_hi);
+    let scores_lo = q_lo.quantized_matmul(&kp_lo, &ks_lo, Some(&kb_lo), true, group_size, bits_lo);
+    let scores = scores_hi.add(&scores_lo);
+
+    // Causal mask for prefill
+    let scores = if query_len > 1 {
+        let kl = scores.dim(-1);
+        let ql = scores.dim(-2);
+        let dtype_i32 = crate::compat::Dtype::Int32.as_i32();
+        let k_indices = InlineArray::arange(kl, dtype_i32);
+        let offset = InlineArray::from_i32(kl - ql);
+        let q_indices = InlineArray::arange(ql, dtype_i32).add(&offset);
+        let q_col = q_indices.reshape(&[ql, 1]);
+        let k_row = k_indices.reshape(&[1, kl]);
+        let mask = q_col.greater_equal(&k_row);
+        let neg_inf = InlineArray::from_f32(f32::NEG_INFINITY).as_dtype(scores.dtype_raw());
+        mask.where_cond(&scores, &neg_inf)
+    } else {
+        scores
+    };
+
+    let weights = scores.softmax_precise(-1);
+
+    // Value aggregation: split into outlier and regular, each via fused-dequant matmul
+    let out_hi = weights.quantized_matmul(&vp_hi, &vs_hi, Some(&vb_hi), false, group_size, bits_hi);
+    let out_lo = weights.quantized_matmul(&vp_lo, &vs_lo, Some(&vb_lo), false, group_size, bits_lo);
+
+    // Concatenate outlier and regular value outputs along last dim
+    let out = out_hi.kv_cache_append(&out_lo, -1);
+
+    // Reshape back for GQA
+    if n_repeats > 1 {
+        out.reshape(&[b, n_q_heads, l, d])
+    } else {
+        out
+    }
+}
+
 /// Shared generation-session setup for bridge-native decode loops.
 ///
 /// `mlx::core::enable_compile()` was benchmarked and shown to regress decode

@@ -1697,6 +1697,7 @@ async fn run_inference_streaming(
         kv_group_size: config.kv_group_size.unwrap_or(64),
         kv_turboquant: config.kv_turboquant.unwrap_or(false),
         kv_turboquant_preset,
+        kv_quant_preset: None, // GUI does not expose mixed-bit presets yet
         no_kv_quant: config.no_kv_quant.unwrap_or(false),
     };
 
