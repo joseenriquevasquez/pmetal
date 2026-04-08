@@ -75,7 +75,7 @@ fn compile_with_state<F: FnMut(S, I) -> O, S, I, O>(f: F, _shapeless: Option<boo
 use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
 use pmetal_data::{
     DataLoader, DataLoaderConfig, PackedDataLoader, PackedTrainingBatch, PackerConfig,
-    TrainingBatch, TrainingDataset,
+    TrainingBatch, TrainingDataset, compute_pack_seq_len,
 };
 use pmetal_lora::TrainableModel;
 use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
