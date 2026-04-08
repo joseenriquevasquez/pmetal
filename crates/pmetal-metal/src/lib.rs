@@ -65,6 +65,7 @@ pub mod accelerate;
 #[cfg(feature = "ane")]
 pub mod ane;
 pub mod async_scheduler;
+pub mod backend;
 pub mod bridge;
 pub mod buffer;
 pub mod context;
