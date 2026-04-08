@@ -61,9 +61,19 @@ impl TrainingLoop {
         // up to the next power of 2, capped at the configured max. This avoids the
         // O(n²) attention cost when max_seq_len auto-detects to the model architectural
         // maximum (e.g. 8192) for datasets with short sequences (e.g. 50–400 tokens).
-        let configured_max_seq_len = self.config.dataloader.max_seq_len;
-        let sample_lengths: Vec<usize> = samples.iter().map(|s| s.input_ids.len()).collect();
-        let max_seq_len = compute_pack_seq_len(&sample_lengths, configured_max_seq_len);
+        //
+        // If the caller provided an explicit override via `--pack-max-seq-len`, use
+        // that value directly instead of the adaptive computation.
+        let max_seq_len = if let Some(explicit) = self.config.pack_max_seq_len {
+            tracing::info!(
+                "Using explicit pack_max_seq_len={} (overrides adaptive p99 heuristic)",
+                explicit
+            );
+            explicit
+        } else {
+            let sample_lengths: Vec<usize> = samples.iter().map(|s| s.input_ids.len()).collect();
+            compute_pack_seq_len(&sample_lengths, self.config.dataloader.max_seq_len)
+        };
         let packer_config = PackerConfig::with_max_length(max_seq_len)
             .with_max_seq_length(max_seq_len) // Truncate sequences to adaptive max
             .mask_boundaries(true);
