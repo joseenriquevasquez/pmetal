@@ -68,6 +68,8 @@ pub mod async_scheduler;
 pub mod backend;
 pub mod bridge;
 pub mod dispatch;
+#[cfg(has_metal4)]
+pub mod metal4;
 pub mod metal3_backend;
 pub mod buffer;
 pub mod context;
