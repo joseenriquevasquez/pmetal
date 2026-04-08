@@ -114,6 +114,27 @@ impl KernelBackend for Metal4Backend {
         &self.caps
     }
 
+    // ---- Routing hints ------------------------------------------------------
+
+    /// Override the default `should_handle_gemm` to add the problem-size
+    /// heuristic from [`DeviceProperties::should_consider_mpp_gemm`].
+    ///
+    /// The default trait implementation only checks structural constraints
+    /// (M >= 2, K % 32 == 0). That alone would route tiny GEMMs like
+    /// (2, 64, 64) to Metal 4, where NAX dispatch overhead exceeds the
+    /// compute benefit. This override adds the tier-based FLOP threshold.
+    fn should_handle_gemm(&self, m: usize, n: usize, k: usize) -> bool {
+        let caps = self.caps();
+        // Structural constraints: minimum M and K alignment.
+        if m < caps.gemm_min_m || (caps.gemm_k_alignment > 1 && k % caps.gemm_k_alignment != 0) {
+            return false;
+        }
+        // Problem-size heuristic: only route to Metal 4 when the FLOP count
+        // is large enough to amortise NAX dispatch overhead. Uses fp16=true
+        // since Metal 4 GEMM always operates in fp16.
+        self.ctx.properties().should_consider_mpp_gemm(m, n, k, true)
+    }
+
     // ---- GEMM family --------------------------------------------------------
 
     fn gemm(

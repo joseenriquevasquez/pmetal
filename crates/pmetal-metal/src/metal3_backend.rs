@@ -4,10 +4,10 @@
 //! the corresponding existing Metal 3 kernel struct. No logic lives here; this
 //! file is pure glue.
 //!
-//! # todo! stubs
+//! # Remaining todo! stubs
 //!
-//! Several methods are stubbed with `todo!` because the existing kernel structs
-//! have API shapes that don't align cleanly with the [`KernelBackend`] trait:
+//! Two methods remain stubbed because the type impedance cannot be bridged
+//! without a structural change to the underlying kernel:
 //!
 //! - **`quantized_gemm`**: Metal 3 has no quantized GEMM path
 //!   (`BackendCaps::metal3()` reports `has_quantized_gemm: false`).
@@ -16,37 +16,22 @@
 //!   but the trait supplies a flat [`GroupedGemmDescriptor`]. An adapter is
 //!   needed in Task 3 (KernelDispatch).
 //!
-//! - **`fused_lora_forward`**: [`FusedLora::forward`] is generic over
-//!   `B: AsMetalBuffer` (static dispatch) while the trait provides
-//!   `&dyn AsMetalBuffer`. A typed shim or a new `forward_dyn` method on
-//!   [`FusedLora`] is needed.
+//! - **`fused_moe_expert`**: [`ExpertWeightBuffers`] stores scales/biases as
+//!   `MetalBuffer<u16>` (raw bits), but [`MoeExpertDescriptor`] carries them
+//!   as `&MetalBuffer<f16>`. A reinterpret-cast shim or a `MetalBuffer::reinterpret`
+//!   constructor is needed before this can be wired without a copy.
 //!
-//! - **`fused_cross_entropy`**: [`FusedCrossEntropy::forward`] takes
-//!   `&MetalBuffer<f32>`; the trait provides `&dyn AsMetalBuffer`. Same fix
-//!   needed as `fused_lora_forward`.
+//! # Resolved stubs
 //!
-//! - **`fused_moe_expert`**: [`FusedMoeExpert::forward_single_expert`] takes
-//!   `&ExpertWeightBuffers` (a pre-built buffer bundle) while
-//!   [`MoeExpertDescriptor`] carries flat individual `MetalBuffer` references.
-//!   An adapter that assembles `ExpertWeightBuffers` from the descriptor fields
-//!   is required.
-//!
-//! - **`fused_distill_loss`**: [`FusedDistill::forward`] is generic over
-//!   `impl AsMetalBuffer`; same static-vs-dynamic dispatch mismatch as
-//!   `fused_lora_forward`.
-//!
-//! - **`fused_adamw_step`**: [`FusedAdamW::new`] requires a `&[usize]` of
-//!   per-parameter sizes to size its internal grid, which isn't carried in
-//!   [`AdamWDescriptor`]. A count shim or a `FusedAdamW::new_single` variant
-//!   is needed.
-//!
-//! None of the stubs affect compilation correctness — they will panic at
-//! runtime only if a caller routes to Metal3Backend for these operations,
-//! which the `BackendCaps` flags prevent for the quantized path.
+//! `fused_lora_forward`, `fused_cross_entropy`, `fused_distill_loss`, and
+//! `fused_adamw_step` are now wired using [`DynBufRef`] (for the sampler-trait
+//! mismatch) and param-info extraction from the `AdamWDescriptor` (for AdamW).
 
 use std::sync::Arc;
 
 use half::f16;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLBuffer;
 
 use crate::{
     backend::{
@@ -59,17 +44,56 @@ use crate::{
     kernels::{
         dw_gemm::DwGemm,
         flash_attention::{FlashAttention, FlashAttentionConfig, FlashAttentionOutput},
-        fused_cross_entropy::{FusedCrossEntropyConfig, FusedCrossEntropyOutput},
-        fused_distill::{DistillLossType, FusedDistillConfig, FusedDistillOutput},
-        fused_lora::{FusedLoraConfig, FusedLoraOutput},
+        fused_cross_entropy::{FusedCrossEntropy, FusedCrossEntropyConfig, FusedCrossEntropyOutput},
+        fused_distill::{DistillLossType, FusedDistill, FusedDistillConfig, FusedDistillOutput},
+        fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput},
         fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput},
         fused_rope::{FusedRoPE, FusedRoPEConfig},
+        fused_sampler::AsMetalBuffer as SamplerBuf,
         fused_swiglu::{FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput},
-        fused_training::BatchedCommandBuffer,
+        fused_training::{BatchedCommandBuffer, FusedAdamW},
         moe::{MoeConfig, MoeKernel, MoeRouting},
         mpp_gemm::MppGemm,
     },
 };
+
+// ============================================================================
+// DynBufRef — bridges &dyn buffer::AsMetalBuffer to both AsMetalBuffer traits
+// ============================================================================
+
+/// Newtype wrapper that adapts a `&dyn buffer::AsMetalBuffer` reference into
+/// types implementing both `buffer::AsMetalBuffer` and
+/// `fused_sampler::AsMetalBuffer`.
+///
+/// The two traits are identically-shaped but distinct:
+/// - `buffer::AsMetalBuffer` uses `as_metal_buffer()`
+/// - `fused_sampler::AsMetalBuffer` uses `metal_buffer()`
+///
+/// Both return `&ProtocolObject<dyn MTLBuffer>`, so the adapter is
+/// zero-overhead — it simply re-names the call. Implementing both lets
+/// `DynBufRef` be passed to kernel methods regardless of which variant they
+/// expect.
+struct DynBufRef<'a>(&'a dyn AsMetalBuffer);
+
+impl SamplerBuf for DynBufRef<'_> {
+    fn metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        self.0.as_metal_buffer()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl AsMetalBuffer for DynBufRef<'_> {
+    fn as_metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        self.0.as_metal_buffer()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
 
 // ============================================================================
 // Metal3Backend
@@ -290,67 +314,64 @@ impl KernelBackend for Metal3Backend {
         kernel.forward(input, gamma, weight, lora_a, lora_b)
     }
 
-    /// Fused LoRA forward — requires a typed shim.
+    /// Fused LoRA forward via [`FusedLora::forward`].
     ///
-    /// [`FusedLora::forward`] is generic over `B: AsMetalBuffer` (static
-    /// dispatch). The trait provides `&dyn AsMetalBuffer` (dynamic dispatch).
-    /// Rust does not allow calling a generic method through a trait object.
-    /// A `forward_dyn` method on [`FusedLora`] (or a concrete-type accessor on
-    /// [`FusedLoraConfig`]) is needed before this stub can be replaced.
+    /// [`FusedLora::forward`] is generic over `B: fused_sampler::AsMetalBuffer`.
+    /// The trait provides `&dyn buffer::AsMetalBuffer`. We bridge the gap with
+    /// [`DynBufRef`], which implements `fused_sampler::AsMetalBuffer` by
+    /// delegating `metal_buffer()` to `buffer::AsMetalBuffer::as_metal_buffer()`.
     fn fused_lora_forward(
         &self,
-        _ctx: &Arc<MetalContext>,
-        _config: &FusedLoraConfig,
-        _x: &dyn AsMetalBuffer,
-        _weight: &dyn AsMetalBuffer,
-        _lora_a: &dyn AsMetalBuffer,
-        _lora_b: &dyn AsMetalBuffer,
+        ctx: &Arc<MetalContext>,
+        config: &FusedLoraConfig,
+        x: &dyn AsMetalBuffer,
+        weight: &dyn AsMetalBuffer,
+        lora_a: &dyn AsMetalBuffer,
+        lora_b: &dyn AsMetalBuffer,
     ) -> Result<FusedLoraOutput> {
-        todo!(
-            "FusedLora::forward<B: AsMetalBuffer> is statically dispatched; \
-             trait provides &dyn AsMetalBuffer — add FusedLora::forward_dyn() \
-             or expose execute_forward as pub"
-        )
+        let kernel = FusedLora::new(ctx.clone(), config.clone())?;
+        kernel.forward(&DynBufRef(x), &DynBufRef(weight), &DynBufRef(lora_a), &DynBufRef(lora_b))
     }
 
     // ---- Training optimizers and losses -------------------------------------
 
-    /// Fused AdamW step — requires per-parameter size metadata.
+    /// Fused AdamW step via [`FusedAdamW::queue_update`].
     ///
-    /// [`FusedAdamW::new`] needs a `&[usize]` of per-parameter element counts
-    /// to size its internal dispatch grid. [`AdamWDescriptor`] does not carry
-    /// that slice. Either add a `param_count` field to the descriptor or expose
-    /// a `FusedAdamW::new_single(ctx, max_param_size, num_params)` constructor.
+    /// [`FusedAdamW::new`] needs `&[usize]` param sizes to pre-compute the
+    /// kernel grid (`max_param_size`, `num_params`). [`AdamWDescriptor`] does
+    /// not carry that slice directly, but `param_info` is a `MetalBuffer<ParamInfo>`
+    /// where each `ParamInfo::size` holds the per-parameter element count.
+    /// We read the slice, extract sizes, build a temporary `FusedAdamW`, and
+    /// delegate to `queue_update`.
     fn fused_adamw_step(
         &self,
-        _batch: &mut BatchedCommandBuffer,
-        _desc: &AdamWDescriptor<'_>,
+        batch: &mut BatchedCommandBuffer,
+        desc: &AdamWDescriptor<'_>,
     ) -> Result<()> {
-        todo!(
-            "FusedAdamW::new() requires &[usize] param_sizes; AdamWDescriptor \
-             does not carry per-parameter size metadata — add param_sizes field \
-             or a FusedAdamW::queue_update_raw() accepting (num_params, max_param_size)"
-        )
+        let param_sizes: Vec<usize> = desc
+            .param_info
+            .as_slice()
+            .iter()
+            .map(|p| p.size as usize)
+            .collect();
+        let adamw = FusedAdamW::new(self.ctx.clone(), &param_sizes);
+        adamw.queue_update(batch, desc.params, desc.grads, desc.m, desc.v, desc.param_info, &desc.config)
     }
 
-    /// Fused cross-entropy — requires a typed shim.
+    /// Fused cross-entropy via [`FusedCrossEntropy::forward_dyn`].
     ///
-    /// [`FusedCrossEntropy::forward`] takes `&MetalBuffer<f32>`; the trait
-    /// provides `logits: &dyn AsMetalBuffer`. The same static-vs-dynamic
-    /// dispatch gap as `fused_lora_forward`. Either expose `execute_forward`
-    /// as public or add a `forward_dyn` variant to [`FusedCrossEntropy`].
+    /// The trait provides `logits: &dyn AsMetalBuffer` to support both f32
+    /// and f16 logits without an extra type parameter. [`FusedCrossEntropy`]
+    /// exposes [`forward_dyn`] which accepts the same type-erased buffer.
     fn fused_cross_entropy(
         &self,
-        _ctx: &Arc<MetalContext>,
-        _config: &FusedCrossEntropyConfig,
-        _logits: &dyn AsMetalBuffer,
-        _targets: &MetalBuffer<i32>,
+        ctx: &Arc<MetalContext>,
+        config: &FusedCrossEntropyConfig,
+        logits: &dyn AsMetalBuffer,
+        targets: &MetalBuffer<i32>,
     ) -> Result<FusedCrossEntropyOutput> {
-        todo!(
-            "FusedCrossEntropy::forward takes &MetalBuffer<f32>; trait provides \
-             &dyn AsMetalBuffer — add FusedCrossEntropy::forward_dyn() or \
-             expose execute_forward as pub"
-        )
+        let kernel = FusedCrossEntropy::new(ctx.clone(), config.clone())?;
+        kernel.forward_dyn(logits, targets)
     }
 
     /// Fused RoPE via [`FusedRoPE`].
@@ -395,12 +416,20 @@ impl KernelBackend for Metal3Backend {
         kernel.route(router_logits)
     }
 
-    /// Fused MoE expert forward — requires an adapter struct.
+    /// Fused MoE expert forward — blocked on dtype type mismatch.
     ///
-    /// [`FusedMoeExpert::forward_single_expert`] takes an [`ExpertWeightBuffers`]
-    /// bundle, but [`MoeExpertDescriptor`] carries flat individual buffer
-    /// references. An adapter that assembles the bundle needs to be written
-    /// before this stub can be replaced.
+    /// [`ExpertWeightBuffers`] stores scales/biases as `MetalBuffer<u16>`
+    /// (raw 16-bit values), but [`MoeExpertDescriptor`] carries them as
+    /// `&MetalBuffer<f16>` (typed half-precision). Assembling an
+    /// `ExpertWeightBuffers` from the descriptor fields would require either:
+    ///
+    /// 1. A `MetalBuffer::reinterpret::<f16, u16>()` constructor that
+    ///    returns an alias with the new element type; or
+    /// 2. Changing `ExpertWeightBuffers` to use `MetalBuffer<f16>` throughout.
+    ///
+    /// Until one of those changes lands, this stub correctly panics when called.
+    /// `BackendCaps::metal3()` does NOT set `has_moe: false`, so if a caller
+    /// routes here for expert forward the panic is the correct signal.
     ///
     /// [`ExpertWeightBuffers`]: crate::kernels::fused_moe::ExpertWeightBuffers
     fn fused_moe_expert(
@@ -409,32 +438,30 @@ impl KernelBackend for Metal3Backend {
         _desc: &MoeExpertDescriptor<'_>,
     ) -> Result<MetalBuffer<f32>> {
         todo!(
-            "FusedMoeExpert::forward_single_expert takes ExpertWeightBuffers; \
-             MoeExpertDescriptor carries flat buffers — write an adapter that \
-             assembles ExpertWeightBuffers from the descriptor fields"
+            "ExpertWeightBuffers uses MetalBuffer<u16> for scales/biases but \
+             MoeExpertDescriptor carries &MetalBuffer<f16> — add \
+             MetalBuffer::reinterpret() or change ExpertWeightBuffers to f16 \
+             (Task 3 adapter)"
         )
     }
 
     // ---- Distillation -------------------------------------------------------
 
-    /// Fused distillation loss — requires a typed shim.
+    /// Fused distillation loss via [`FusedDistill::forward`].
     ///
-    /// [`FusedDistill::forward`] is generic over `impl AsMetalBuffer`; the trait
-    /// provides `&dyn AsMetalBuffer`. Same static-vs-dynamic dispatch gap as
-    /// `fused_lora_forward`. Either expose `execute_forward` as public or add a
-    /// `forward_dyn` variant to [`FusedDistill`].
+    /// [`FusedDistill::forward`] is generic over `impl buffer::AsMetalBuffer`.
+    /// [`DynBufRef`] implements `buffer::AsMetalBuffer` by delegating to
+    /// `as_metal_buffer()`, so we wrap the `&dyn` references and pass them
+    /// directly to the generic method.
     fn fused_distill_loss(
         &self,
-        _ctx: &Arc<MetalContext>,
-        _config: &FusedDistillConfig,
-        _teacher_logits: &dyn AsMetalBuffer,
-        _student_logits: &dyn AsMetalBuffer,
-        _loss_type: DistillLossType,
+        ctx: &Arc<MetalContext>,
+        config: &FusedDistillConfig,
+        teacher_logits: &dyn AsMetalBuffer,
+        student_logits: &dyn AsMetalBuffer,
+        loss_type: DistillLossType,
     ) -> Result<FusedDistillOutput> {
-        todo!(
-            "FusedDistill::forward<impl AsMetalBuffer> is statically dispatched; \
-             trait provides &dyn AsMetalBuffer — add FusedDistill::forward_dyn() \
-             or expose execute_forward as pub"
-        )
+        let kernel = FusedDistill::new(ctx.clone(), config.clone())?;
+        kernel.forward(&DynBufRef(teacher_logits), &DynBufRef(student_logits), loss_type)
     }
 }

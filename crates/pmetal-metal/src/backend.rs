@@ -143,7 +143,10 @@ impl BackendCaps {
         Self {
             name: "Metal4",
             has_gemm: true,
-            has_quantized_gemm: true,
+            // Task 12+: set to true once the MPP quantized GEMM path is wired in.
+            // Leaving this true while Metal4Backend::quantized_gemm() delegates to
+            // Metal3Backend (which has a todo!()) causes a panic on M5 hardware.
+            has_quantized_gemm: false,
             has_flash_attention: false,
             has_mpp_flash_attention: true,
             has_swiglu: false,
