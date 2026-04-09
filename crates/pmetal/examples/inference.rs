@@ -45,7 +45,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model = DynamicModel::load(&model_path)?;
 
     // Configure generation — load model's recommended defaults
-    let defaults = pmetal::data::inference_config::load_sampling_defaults(&model_path, false);
+    let defaults = pmetal::data::inference_config::load_sampling_defaults(
+        &model_path,
+        None,
+        pmetal::data::inference_config::SamplingMode::Auto,
+        false,
+    );
     let max_tokens = 256;
     let mut gen_config = GenerationConfig::sampling(max_tokens, defaults.temperature)
         .with_top_k(defaults.top_k)

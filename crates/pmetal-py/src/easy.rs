@@ -161,7 +161,12 @@ pub fn infer(
 
             // Gen config — load model defaults, user params override
             let defaults =
-                pmetal_data::inference_config::load_sampling_defaults(&model_path, false);
+                pmetal_data::inference_config::load_sampling_defaults(
+                    &model_path,
+                    None,
+                    pmetal_data::inference_config::SamplingMode::Auto,
+                    false,
+                );
             let mut gen_config = if temperature < 1e-6 {
                 GenerationConfig::greedy(max_tokens)
             } else {
