@@ -145,7 +145,19 @@ impl MppFusedAdamW {
         eps: f32,
         wd: f32,
     ) -> Result<()> {
-        let cb = self.execute_async(params, grads, m, v, param_infos, param_info_buf, lr, beta1, beta2, eps, wd)?;
+        let cb = self.execute_async(
+            params,
+            grads,
+            m,
+            v,
+            param_infos,
+            param_info_buf,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            wd,
+        )?;
         cb.waitUntilCompleted();
         if let Some(error) = cb.error() {
             return Err(MetalError::ExecutionFailed(error.to_string()));
@@ -207,7 +219,11 @@ impl MppFusedAdamW {
             height: self.config.num_params,
             depth: 1,
         };
-        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
+        let tg_size = objc2_metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
 
         let params_buf = params.as_metal_buffer();
         let grads_buf = grads.as_metal_buffer();
@@ -287,7 +303,11 @@ impl MppGradScale {
             height: 1,
             depth: 1,
         };
-        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
+        let tg_size = objc2_metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
 
         let grads_buf = grads.as_metal_buffer();
 

@@ -163,7 +163,13 @@ impl MppFusedDistill {
         teacher_lse: &dyn AsMetalBuffer,
         student_lse: &dyn AsMetalBuffer,
     ) -> Result<()> {
-        let cb = self.execute_async(teacher_logits, student_logits, losses, teacher_lse, student_lse)?;
+        let cb = self.execute_async(
+            teacher_logits,
+            student_logits,
+            losses,
+            teacher_lse,
+            student_lse,
+        )?;
         cb.waitUntilCompleted();
         if let Some(e) = cb.error() {
             return Err(MetalError::ExecutionFailed(e.to_string()));
@@ -202,7 +208,11 @@ impl MppFusedDistill {
             height: 1,
             depth: 1,
         };
-        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
+        let tg_size = objc2_metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
 
         let teacher_buf = teacher_logits.as_metal_buffer();
         let student_buf = student_logits.as_metal_buffer();
@@ -223,11 +233,11 @@ impl MppFusedDistill {
 
     fn select_kernel(&self) -> &'static str {
         match (self.config.loss_type, self.config.use_fp16) {
-            (MppDistillLossType::ForwardKL,       true)  => "mpp_fused_kl_divergence_f16",
-            (MppDistillLossType::ForwardKL,       false) => "mpp_fused_kl_divergence_f32",
-            (MppDistillLossType::ReverseKL,       _)     => "mpp_fused_reverse_kl_f32",
-            (MppDistillLossType::JensenShannon,   _)     => "mpp_fused_js_divergence_f32",
-            (MppDistillLossType::SoftCrossEntropy, _)    => "mpp_fused_soft_cross_entropy_f32",
+            (MppDistillLossType::ForwardKL, true) => "mpp_fused_kl_divergence_f16",
+            (MppDistillLossType::ForwardKL, false) => "mpp_fused_kl_divergence_f32",
+            (MppDistillLossType::ReverseKL, _) => "mpp_fused_reverse_kl_f32",
+            (MppDistillLossType::JensenShannon, _) => "mpp_fused_js_divergence_f32",
+            (MppDistillLossType::SoftCrossEntropy, _) => "mpp_fused_soft_cross_entropy_f32",
         }
     }
 }
@@ -254,19 +264,34 @@ mod tests {
         // (constructing the struct requires a live Arc<MetalContext>).
         fn kernel_name_for(lt: MppDistillLossType, use_fp16: bool) -> &'static str {
             match (lt, use_fp16) {
-                (MppDistillLossType::ForwardKL,        true)  => "mpp_fused_kl_divergence_f16",
-                (MppDistillLossType::ForwardKL,        false) => "mpp_fused_kl_divergence_f32",
-                (MppDistillLossType::ReverseKL,        _)     => "mpp_fused_reverse_kl_f32",
-                (MppDistillLossType::JensenShannon,    _)     => "mpp_fused_js_divergence_f32",
-                (MppDistillLossType::SoftCrossEntropy, _)     => "mpp_fused_soft_cross_entropy_f32",
+                (MppDistillLossType::ForwardKL, true) => "mpp_fused_kl_divergence_f16",
+                (MppDistillLossType::ForwardKL, false) => "mpp_fused_kl_divergence_f32",
+                (MppDistillLossType::ReverseKL, _) => "mpp_fused_reverse_kl_f32",
+                (MppDistillLossType::JensenShannon, _) => "mpp_fused_js_divergence_f32",
+                (MppDistillLossType::SoftCrossEntropy, _) => "mpp_fused_soft_cross_entropy_f32",
             }
         }
 
-        assert_eq!(kernel_name_for(MppDistillLossType::ForwardKL, false), "mpp_fused_kl_divergence_f32");
-        assert_eq!(kernel_name_for(MppDistillLossType::ForwardKL, true),  "mpp_fused_kl_divergence_f16");
-        assert_eq!(kernel_name_for(MppDistillLossType::ReverseKL, false), "mpp_fused_reverse_kl_f32");
-        assert_eq!(kernel_name_for(MppDistillLossType::JensenShannon, false), "mpp_fused_js_divergence_f32");
-        assert_eq!(kernel_name_for(MppDistillLossType::SoftCrossEntropy, false), "mpp_fused_soft_cross_entropy_f32");
+        assert_eq!(
+            kernel_name_for(MppDistillLossType::ForwardKL, false),
+            "mpp_fused_kl_divergence_f32"
+        );
+        assert_eq!(
+            kernel_name_for(MppDistillLossType::ForwardKL, true),
+            "mpp_fused_kl_divergence_f16"
+        );
+        assert_eq!(
+            kernel_name_for(MppDistillLossType::ReverseKL, false),
+            "mpp_fused_reverse_kl_f32"
+        );
+        assert_eq!(
+            kernel_name_for(MppDistillLossType::JensenShannon, false),
+            "mpp_fused_js_divergence_f32"
+        );
+        assert_eq!(
+            kernel_name_for(MppDistillLossType::SoftCrossEntropy, false),
+            "mpp_fused_soft_cross_entropy_f32"
+        );
     }
 
     #[test]

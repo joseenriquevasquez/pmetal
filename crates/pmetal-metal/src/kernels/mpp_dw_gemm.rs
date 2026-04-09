@@ -184,14 +184,20 @@ impl MppDwGemm {
         let b_buf = b.as_metal_buffer();
         let c_buf = c.as_metal_buffer();
 
-        encode_mpp_kernel(&self.ctx, "mpp_dw_gemm_accum", grid, tg_size, |encoder| unsafe {
-            // buffer(0): A, buffer(1): B, buffer(2): C, buffer(3): params
-            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(c_buf), 0, 2);
-            let params_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 3);
-        })
+        encode_mpp_kernel(
+            &self.ctx,
+            "mpp_dw_gemm_accum",
+            grid,
+            tg_size,
+            |encoder| unsafe {
+                // buffer(0): A, buffer(1): B, buffer(2): C, buffer(3): params
+                encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(c_buf), 0, 2);
+                let params_ptr = NonNull::from(&params).cast();
+                encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 3);
+            },
+        )
     }
 }
 

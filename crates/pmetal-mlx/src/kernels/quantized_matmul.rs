@@ -8,7 +8,8 @@ use std::{sync::OnceLock, time::Instant};
 use crate::ArrayDtypeExt;
 use pmetal_bridge::compat::{Array, Dtype, Exception};
 use pmetal_metal::{
-    BufferUsage, KernelDispatch, MetalBuffer, MetalContext, MppQuantizedGemm, MppQuantizedGemmConfig,
+    BufferUsage, KernelDispatch, MetalBuffer, MetalContext, MppQuantizedGemm,
+    MppQuantizedGemmConfig,
     context::{DeviceProperties, DeviceTier},
 };
 use serde::{Deserialize, Serialize};

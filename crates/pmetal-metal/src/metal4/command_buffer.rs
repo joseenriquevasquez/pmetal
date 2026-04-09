@@ -39,8 +39,8 @@ use std::sync::Arc;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
+    MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue, MTL4ComputeCommandEncoder,
     MTLAllocation, MTLDevice, MTLSharedEvent,
-    MTL4CommandBuffer, MTL4CommandEncoder, MTL4ComputeCommandEncoder, MTL4CommandQueue,
 };
 use tracing::trace;
 
@@ -100,7 +100,9 @@ impl Metal4CommandBuffer {
         device: &ProtocolObject<dyn MTLDevice>,
         pool: Arc<CommandAllocatorPool>,
     ) -> Result<Self> {
-        let cb = device.newCommandBuffer().ok_or(MetalError::CommandBufferCreation)?;
+        let cb = device
+            .newCommandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
         Ok(Self {
             cb,
             encoder: None,
@@ -150,9 +152,7 @@ impl Metal4CommandBuffer {
     ///
     /// - `MetalError::InvalidConfig` if not in `Began` state.
     /// - `MetalError::EncoderCreation` if Metal fails to allocate the encoder.
-    pub fn encoder(
-        &mut self,
-    ) -> Result<&ProtocolObject<dyn MTL4ComputeCommandEncoder>> {
+    pub fn encoder(&mut self) -> Result<&ProtocolObject<dyn MTL4ComputeCommandEncoder>> {
         if self.state != CbState::Began {
             return Err(MetalError::InvalidConfig(format!(
                 "Metal4CommandBuffer::encoder called in {:?} state (expected Began)",
@@ -228,10 +228,7 @@ impl Metal4CommandBuffer {
             let cb_ptr: NonNull<ProtocolObject<dyn MTL4CommandBuffer>> =
                 NonNull::from(self.cb.as_ref());
             let mut array = [cb_ptr];
-            queue.commit_count(
-                NonNull::new_unchecked(array.as_mut_ptr()),
-                1,
-            );
+            queue.commit_count(NonNull::new_unchecked(array.as_mut_ptr()), 1);
         }
 
         // Release the allocator slot back to the pool.  The pool will call

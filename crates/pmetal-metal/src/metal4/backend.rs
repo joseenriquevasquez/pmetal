@@ -123,7 +123,9 @@ impl KernelBackend for Metal4Backend {
         if m < caps.gemm_min_m || (caps.gemm_k_alignment > 1 && k % caps.gemm_k_alignment != 0) {
             return false;
         }
-        self.ctx.properties().should_consider_mpp_gemm(m, n, k, true)
+        self.ctx
+            .properties()
+            .should_consider_mpp_gemm(m, n, k, true)
     }
 
     // ---- GEMM family --------------------------------------------------------
@@ -151,7 +153,8 @@ impl KernelBackend for Metal4Backend {
         output: &dyn AsMetalBuffer,
     ) -> Result<()> {
         // MPP quantized GEMM is handled by mpp_quantized.rs, wired in Task 12.
-        self.fallback.quantized_gemm(ctx, desc, x, w_q, scales, biases, output)
+        self.fallback
+            .quantized_gemm(ctx, desc, x, w_q, scales, biases, output)
     }
 
     fn dw_gemm_accum(
@@ -170,12 +173,19 @@ impl KernelBackend for Metal4Backend {
         // caller's BatchedCommandBuffer. We dispatch it synchronously here and
         // ignore the `_batch` parameter. This is semantically correct — dW
         // accumulation completes before the next layer's backward kernel starts.
-        let config = MppDwGemmConfig { m, n, k, alpha, beta };
+        let config = MppDwGemmConfig {
+            m,
+            n,
+            k,
+            alpha,
+            beta,
+        };
         let dispatcher = MppDwGemm::new(self.ctx.clone(), config);
         if dispatcher.is_available() {
             dispatcher.execute(a, b, c)
         } else {
-            self.fallback.dw_gemm_accum(_batch, a, b, c, m, n, k, alpha, beta)
+            self.fallback
+                .dw_gemm_accum(_batch, a, b, c, m, n, k, alpha, beta)
         }
     }
 
@@ -218,7 +228,8 @@ impl KernelBackend for Metal4Backend {
     ) -> Result<FlashAttentionOutput> {
         // MPP flash attention is handled by mpp_flash_attention.rs (Task 13).
         // Metal 4 does NOT advertise has_flash_attention; the MPP path is separate.
-        self.fallback.flash_attention_forward(ctx, config, queries, keys, values)
+        self.fallback
+            .flash_attention_forward(ctx, config, queries, keys, values)
     }
 
     fn flash_attention_backward(
@@ -233,8 +244,9 @@ impl KernelBackend for Metal4Backend {
         logsumexp: &MetalBuffer<f32>,
     ) -> Result<(MetalBuffer<f16>, MetalBuffer<f16>, MetalBuffer<f16>)> {
         // No MPP backward flash attention path exists yet.
-        self.fallback
-            .flash_attention_backward(ctx, config, queries, keys, values, output, d_output, logsumexp)
+        self.fallback.flash_attention_backward(
+            ctx, config, queries, keys, values, output, d_output, logsumexp,
+        )
     }
 
     // ---- Fused linear operations --------------------------------------------
@@ -314,7 +326,8 @@ impl KernelBackend for Metal4Backend {
         down_weight: &MetalBuffer<f32>,
     ) -> Result<FusedMLPOutput> {
         // No MPP full-MLP (gate+up+down) kernel exists yet.
-        self.fallback.fused_mlp(ctx, config, input, gate_weight, up_weight, down_weight)
+        self.fallback
+            .fused_mlp(ctx, config, input, gate_weight, up_weight, down_weight)
     }
 
     fn fused_norm_lora(
@@ -338,7 +351,9 @@ impl KernelBackend for Metal4Backend {
         let dispatcher = MppFusedNormLora::new(self.ctx.clone(), mpp_config);
 
         if !dispatcher.is_available() {
-            return self.fallback.fused_norm_lora(ctx, config, input, gamma, weight, lora_a, lora_b);
+            return self
+                .fallback
+                .fused_norm_lora(ctx, config, input, gamma, weight, lora_a, lora_b);
         }
 
         let output = MetalBuffer::<f32>::new(
@@ -369,7 +384,9 @@ impl KernelBackend for Metal4Backend {
         let dispatcher = MppFusedLora::new(self.ctx.clone(), mpp_config);
 
         if !dispatcher.is_available() {
-            return self.fallback.fused_lora_forward(ctx, config, x, weight, lora_a, lora_b);
+            return self
+                .fallback
+                .fused_lora_forward(ctx, config, x, weight, lora_a, lora_b);
         }
 
         let output = MetalBuffer::<f16>::new(
@@ -378,7 +395,10 @@ impl KernelBackend for Metal4Backend {
             BufferUsage::Shared,
         )?;
         dispatcher.execute_inference(x, weight, lora_a, lora_b, &output)?;
-        Ok(FusedLoraOutput { output, intermediate: None })
+        Ok(FusedLoraOutput {
+            output,
+            intermediate: None,
+        })
     }
 
     // ---- Training optimizers and losses -------------------------------------
@@ -413,13 +433,13 @@ impl KernelBackend for Metal4Backend {
         let dispatcher = MppFusedCrossEntropy::new(self.ctx.clone(), mpp_config);
 
         if !dispatcher.is_available() {
-            return self.fallback.fused_cross_entropy(ctx, config, logits, targets);
+            return self
+                .fallback
+                .fused_cross_entropy(ctx, config, logits, targets);
         }
 
-        let losses =
-            MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
-        let logsumexp =
-            MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
+        let losses = MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
+        let logsumexp = MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
 
         // MPP cross-entropy fwd+bwd kernel writes gradients into grad_logits.
         // For the forward-only output shape (losses + logsumexp), we pass logsumexp
@@ -451,13 +471,16 @@ impl KernelBackend for Metal4Backend {
         let dispatcher = MppFusedRoPE::new(self.ctx.clone(), mpp_config);
 
         if !dispatcher.is_available() {
-            return self.fallback.fused_rope(ctx, config, queries, keys, position_ids);
+            return self
+                .fallback
+                .fused_rope(ctx, config, queries, keys, position_ids);
         }
 
         match (keys, position_ids) {
             (Some(k), Some(pos_ids)) => {
                 // Fused QK RoPE with custom position IDs.
-                dispatcher.apply_qk_inplace_async(queries, k, Some(pos_ids as &dyn AsMetalBuffer))?
+                dispatcher
+                    .apply_qk_inplace_async(queries, k, Some(pos_ids as &dyn AsMetalBuffer))?
                     .waitUntilCompleted();
             }
             (Some(k), None) => {
@@ -537,8 +560,7 @@ impl KernelBackend for Metal4Backend {
             );
         }
 
-        let losses =
-            MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
+        let losses = MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
         let teacher_lse =
             MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
         let student_lse =
@@ -552,6 +574,10 @@ impl KernelBackend for Metal4Backend {
             &student_lse,
         )?;
 
-        Ok(FusedDistillOutput { losses, teacher_lse, student_lse })
+        Ok(FusedDistillOutput {
+            losses,
+            teacher_lse,
+            student_lse,
+        })
     }
 }

@@ -32,8 +32,7 @@ use std::sync::Arc;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLAllocation, MTLDevice, MTLResidencySet, MTLResidencySetDescriptor,
-    MTL4CommandQueue,
+    MTL4CommandQueue, MTLAllocation, MTLDevice, MTLResidencySet, MTLResidencySetDescriptor,
 };
 use parking_lot::RwLock;
 use tracing::trace;
@@ -74,9 +73,7 @@ impl ResidencyManager {
 
         let set = device
             .newResidencySetWithDescriptor_error(&desc)
-            .map_err(|e| {
-                MetalError::Internal(format!("MTLResidencySet creation failed: {}", e))
-            })?;
+            .map_err(|e| MetalError::Internal(format!("MTLResidencySet creation failed: {}", e)))?;
 
         Ok(Arc::new(Self {
             inner: RwLock::new(ManagerInner { set, pending: 0 }),
@@ -102,7 +99,10 @@ impl ResidencyManager {
         let mut inner = self.inner.write();
         inner.set.addAllocation(allocation);
         inner.pending += 1;
-        trace!("ResidencyManager: registered allocation (pending={})", inner.pending);
+        trace!(
+            "ResidencyManager: registered allocation (pending={})",
+            inner.pending
+        );
     }
 
     /// Mark `allocation` for removal from the set.
@@ -113,7 +113,10 @@ impl ResidencyManager {
         let mut inner = self.inner.write();
         inner.set.removeAllocation(allocation);
         inner.pending += 1;
-        trace!("ResidencyManager: unregistered allocation (pending={})", inner.pending);
+        trace!(
+            "ResidencyManager: unregistered allocation (pending={})",
+            inner.pending
+        );
     }
 
     /// Commit all pending adds and removes to the residency set.
@@ -127,7 +130,10 @@ impl ResidencyManager {
     pub fn commit(&self) {
         let mut inner = self.inner.write();
         inner.set.commit();
-        trace!("ResidencyManager: committed {} pending changes", inner.pending);
+        trace!(
+            "ResidencyManager: committed {} pending changes",
+            inner.pending
+        );
         inner.pending = 0;
     }
 

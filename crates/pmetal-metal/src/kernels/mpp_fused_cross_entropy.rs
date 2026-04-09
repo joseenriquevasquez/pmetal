@@ -158,7 +158,11 @@ impl MppFusedCrossEntropy {
             height: 1,
             depth: 1,
         };
-        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
+        let tg_size = objc2_metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
 
         let logits_buf = logits.as_metal_buffer();
         let labels_buf = labels.as_metal_buffer();

@@ -30,6 +30,7 @@ use crate::{
     context::MetalContext,
     error::Result,
     kernels::{
+        flash_attention::{FlashAttentionConfig, FlashAttentionOutput},
         fused_cross_entropy::{FusedCrossEntropyConfig, FusedCrossEntropyOutput},
         fused_distill::{DistillLossType, FusedDistillConfig, FusedDistillOutput},
         fused_lora::{FusedLoraConfig, FusedLoraOutput},
@@ -38,7 +39,6 @@ use crate::{
         fused_rope::FusedRoPEConfig,
         fused_swiglu::{FusedMLPOutput, FusedSwiGLUConfig, FusedSwiGLUOutput},
         fused_training::{AdamWConfig, BatchedCommandBuffer, ParamInfo},
-        flash_attention::{FlashAttentionConfig, FlashAttentionOutput},
         moe::MoeConfig,
     },
 };

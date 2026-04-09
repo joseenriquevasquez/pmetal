@@ -35,8 +35,8 @@ use std::time::Duration;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice, MTLSharedEvent};
 use objc2_metal::{MTL4CommandAllocator, MTL4CommandAllocatorDescriptor};
+use objc2_metal::{MTLDevice, MTLSharedEvent};
 use parking_lot::Mutex;
 use tracing::trace;
 
@@ -108,7 +108,9 @@ impl CommandAllocatorPool {
             });
         }
 
-        Ok(Arc::new(Self { slots: Mutex::new(slots) }))
+        Ok(Arc::new(Self {
+            slots: Mutex::new(slots),
+        }))
     }
 
     /// Acquire an idle slot and invoke `f` with a reference to its allocator.
@@ -192,7 +194,10 @@ impl CommandAllocatorPool {
     ) {
         let mut slots = self.slots.lock();
         slots[index].state = AllocatorState::InFlight { event, value };
-        trace!("CommandAllocatorPool: released slot {} (event value={})", index, value);
+        trace!(
+            "CommandAllocatorPool: released slot {} (event value={})",
+            index, value
+        );
     }
 
     /// Reset a slot directly to `Idle` without a GPU completion check.
@@ -215,9 +220,7 @@ impl CommandAllocatorPool {
     fn poll_completed_locked(slots: &mut Vec<AllocatorSlot>) {
         for slot in slots.iter_mut() {
             let completed = match &slot.state {
-                AllocatorState::InFlight { event, value } => {
-                    event.signaledValue() >= *value
-                }
+                AllocatorState::InFlight { event, value } => event.signaledValue() >= *value,
                 AllocatorState::Idle => false,
             };
 

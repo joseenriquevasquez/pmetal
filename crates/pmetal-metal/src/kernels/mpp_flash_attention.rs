@@ -258,7 +258,11 @@ impl MppFlashAttention {
             height: self.config.num_heads,
             depth: self.config.batch_size,
         };
-        let tg_size = objc2_metal::MTLSize { width: 32, height: 4, depth: 1 };
+        let tg_size = objc2_metal::MTLSize {
+            width: 32,
+            height: 4,
+            depth: 1,
+        };
 
         let q_buf = queries.metal_buffer();
         let k_buf = keys.metal_buffer();

@@ -50,7 +50,11 @@ pub struct MppFusedMoEConfig {
 impl MppFusedMoEConfig {
     /// Create a new expert config.
     pub fn new(batch_size: usize, hidden_dim: usize, intermediate_dim: usize) -> Self {
-        Self { batch_size, hidden_dim, intermediate_dim }
+        Self {
+            batch_size,
+            hidden_dim,
+            intermediate_dim,
+        }
     }
 }
 
@@ -153,21 +157,31 @@ impl MppFusedMoE {
             height: self.config.batch_size.div_ceil(32),
             depth: 1,
         };
-        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
+        let tg_size = objc2_metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
 
         let input_buf = input.as_metal_buffer();
         let gate_buf = gate_weight.as_metal_buffer();
         let up_buf = up_weight.as_metal_buffer();
         let act_buf = act_out.as_metal_buffer();
 
-        encode_mpp_kernel(&self.ctx, "mpp_fused_moe_gate_up_f16", grid, tg_size, |encoder| unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(gate_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(up_buf), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 3);
-            let p_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 4);
-        })
+        encode_mpp_kernel(
+            &self.ctx,
+            "mpp_fused_moe_gate_up_f16",
+            grid,
+            tg_size,
+            |encoder| unsafe {
+                encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(gate_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(up_buf), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 3);
+                let p_ptr = NonNull::from(&params).cast();
+                encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 4);
+            },
+        )
     }
 
     /// Execute the down projection synchronously.
@@ -214,19 +228,29 @@ impl MppFusedMoE {
             height: self.config.batch_size.div_ceil(32),
             depth: 1,
         };
-        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
+        let tg_size = objc2_metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
 
         let act_buf = act_in.as_metal_buffer();
         let down_buf = down_weight.as_metal_buffer();
         let out_buf = out.as_metal_buffer();
 
-        encode_mpp_kernel(&self.ctx, "mpp_fused_moe_down_f16", grid, tg_size, |encoder| unsafe {
-            encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(down_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
-            let p_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 3);
-        })
+        encode_mpp_kernel(
+            &self.ctx,
+            "mpp_fused_moe_down_f16",
+            grid,
+            tg_size,
+            |encoder| unsafe {
+                encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(down_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                let p_ptr = NonNull::from(&params).cast();
+                encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 3);
+            },
+        )
     }
 }
 
@@ -296,19 +320,29 @@ impl MppMoEScatter {
             height: 1,
             depth: 1,
         };
-        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
+        let tg_size = objc2_metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
 
         let expert_buf = expert_out.as_metal_buffer();
         let weights_buf = weights.as_metal_buffer();
         let accum_buf = accum.as_metal_buffer();
 
-        encode_mpp_kernel(&self.ctx, "mpp_moe_weighted_scatter_f16", grid, tg_size, |encoder| unsafe {
-            encoder.setBuffer_offset_atIndex(Some(expert_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(weights_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(accum_buf), 0, 2);
-            let p_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 3);
-        })
+        encode_mpp_kernel(
+            &self.ctx,
+            "mpp_moe_weighted_scatter_f16",
+            grid,
+            tg_size,
+            |encoder| unsafe {
+                encoder.setBuffer_offset_atIndex(Some(expert_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(weights_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(accum_buf), 0, 2);
+                let p_ptr = NonNull::from(&params).cast();
+                encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 3);
+            },
+        )
     }
 }
 
@@ -344,7 +378,10 @@ mod tests {
 
     #[test]
     fn test_scatter_config() {
-        let cfg = MppMoEScatterConfig { num_tokens: 8, hidden_dim: 2048 };
+        let cfg = MppMoEScatterConfig {
+            num_tokens: 8,
+            hidden_dim: 2048,
+        };
         assert_eq!(cfg.num_tokens, 8);
     }
 }

@@ -201,7 +201,13 @@ impl MppFusedRoPE {
         } else {
             "mpp_rope_with_positions_f32"
         };
-        self.dispatch_1buf(x, Some(position_ids), kernel_name, self.config.num_heads, true)
+        self.dispatch_1buf(
+            x,
+            Some(position_ids),
+            kernel_name,
+            self.config.num_heads,
+            true,
+        )
     }
 
     /// Apply RoPE to both Q and K in a single dispatch (fp16).
@@ -245,7 +251,11 @@ impl MppFusedRoPE {
             height: self.config.seq_len,
             depth: 1,
         };
-        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
+        let tg_size = objc2_metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
 
         let q_buf = q.as_metal_buffer();
         let k_buf = k.as_metal_buffer();
@@ -295,7 +305,11 @@ impl MppFusedRoPE {
             height: self.config.num_heads,
             depth: self.config.seq_len,
         };
-        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
+        let tg_size = objc2_metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
 
         let x_buf = x.as_metal_buffer();
         let pos_buf = position_ids.map(|p| p.as_metal_buffer());

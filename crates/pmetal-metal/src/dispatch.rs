@@ -59,8 +59,7 @@ impl KernelDispatch {
         let metal3 = Metal3Backend::new(ctx.clone());
 
         #[cfg(has_metal4)]
-        let metal4 = if ctx.properties().has_nax
-            && ctx.pipeline_cache().metal4_library().is_some()
+        let metal4 = if ctx.properties().has_nax && ctx.pipeline_cache().metal4_library().is_some()
         {
             match Metal4Backend::new(ctx.clone()) {
                 Ok(m4) => {

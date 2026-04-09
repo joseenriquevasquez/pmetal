@@ -28,25 +28,25 @@ pub mod mpp_quantized;
 pub mod turboquant;
 
 #[cfg(has_metal4)]
-pub mod mpp_fused_swiglu;
-#[cfg(has_metal4)]
-pub mod mpp_fused_norm_lora;
-#[cfg(has_metal4)]
 pub mod mpp_dw_gemm;
-#[cfg(has_metal4)]
-pub mod mpp_grouped_gemm;
-#[cfg(has_metal4)]
-pub mod mpp_fused_lora;
-#[cfg(has_metal4)]
-pub mod mpp_fused_training;
 #[cfg(has_metal4)]
 pub mod mpp_fused_cross_entropy;
 #[cfg(has_metal4)]
-pub mod mpp_fused_rope;
+pub mod mpp_fused_distill;
+#[cfg(has_metal4)]
+pub mod mpp_fused_lora;
 #[cfg(has_metal4)]
 pub mod mpp_fused_moe;
 #[cfg(has_metal4)]
-pub mod mpp_fused_distill;
+pub mod mpp_fused_norm_lora;
+#[cfg(has_metal4)]
+pub mod mpp_fused_rope;
+#[cfg(has_metal4)]
+pub mod mpp_fused_swiglu;
+#[cfg(has_metal4)]
+pub mod mpp_fused_training;
+#[cfg(has_metal4)]
+pub mod mpp_grouped_gemm;
 
 // Re-export main types
 pub use batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};

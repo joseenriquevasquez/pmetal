@@ -67,15 +67,15 @@ pub mod ane;
 pub mod async_scheduler;
 pub mod backend;
 pub mod bridge;
-pub mod dispatch;
-#[cfg(has_metal4)]
-pub mod metal4;
-pub mod metal3_backend;
 pub mod buffer;
 pub mod context;
+pub mod dispatch;
 pub mod error;
 pub mod expert_buffer;
 pub mod kernels;
+pub mod metal3_backend;
+#[cfg(has_metal4)]
+pub mod metal4;
 pub mod neon_convert;
 pub mod pipeline;
 pub mod tuna;

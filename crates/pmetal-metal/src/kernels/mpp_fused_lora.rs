@@ -271,18 +271,24 @@ impl MppFusedLora {
         let y_buf = y.as_metal_buffer();
         let xa_buf = xa_out.as_metal_buffer();
 
-        encode_mpp_kernel(&self.ctx, "mpp_fused_lora_forward_f16", grid, tg_size, |encoder| unsafe {
-            // Training: buffer(0): x, buffer(1): W, buffer(2): A, buffer(3): B,
-            //           buffer(4): y, buffer(5): xA_out, buffer(6): params
-            encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(w_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(y_buf), 0, 4);
-            encoder.setBuffer_offset_atIndex(Some(xa_buf), 0, 5);
-            let params_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 6);
-        })
+        encode_mpp_kernel(
+            &self.ctx,
+            "mpp_fused_lora_forward_f16",
+            grid,
+            tg_size,
+            |encoder| unsafe {
+                // Training: buffer(0): x, buffer(1): W, buffer(2): A, buffer(3): B,
+                //           buffer(4): y, buffer(5): xA_out, buffer(6): params
+                encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(w_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(y_buf), 0, 4);
+                encoder.setBuffer_offset_atIndex(Some(xa_buf), 0, 5);
+                let params_ptr = NonNull::from(&params).cast();
+                encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 6);
+            },
+        )
     }
 
     /// Asynchronous inference dispatch.
@@ -330,17 +336,23 @@ impl MppFusedLora {
         let b_buf = b.as_metal_buffer();
         let y_buf = y.as_metal_buffer();
 
-        encode_mpp_kernel(&self.ctx, "mpp_lora_forward_inference_f16", grid, tg_size, |encoder| unsafe {
-            // Inference: buffer(0): x, buffer(1): W, buffer(2): A, buffer(3): B,
-            //            buffer(4): y, buffer(5): params
-            encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(w_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(y_buf), 0, 4);
-            let params_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 5);
-        })
+        encode_mpp_kernel(
+            &self.ctx,
+            "mpp_lora_forward_inference_f16",
+            grid,
+            tg_size,
+            |encoder| unsafe {
+                // Inference: buffer(0): x, buffer(1): W, buffer(2): A, buffer(3): B,
+                //            buffer(4): y, buffer(5): params
+                encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(w_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(y_buf), 0, 4);
+                let params_ptr = NonNull::from(&params).cast();
+                encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 5);
+            },
+        )
     }
 }
 
@@ -359,8 +371,8 @@ mod tests {
     fn test_dispatch_geometry_tile_counts() {
         let config = MppFusedLoraConfig::new_training(128, 2048, 4096, 16, 1.0);
         let geom = dispatch_geometry(&config);
-        assert_eq!(geom.num_batch_tiles, 2);  // 128 / 64
-        assert_eq!(geom.num_out_tiles, 64);   // 4096 / 64
+        assert_eq!(geom.num_batch_tiles, 2); // 128 / 64
+        assert_eq!(geom.num_out_tiles, 64); // 4096 / 64
         assert_eq!(geom.threads_per_threadgroup, 128);
     }
 
@@ -368,8 +380,8 @@ mod tests {
     fn test_dispatch_geometry_non_aligned() {
         let config = MppFusedLoraConfig::new_inference(65, 1024, 1024, 8, 0.5);
         let geom = dispatch_geometry(&config);
-        assert_eq!(geom.num_batch_tiles, 2);  // ceil(65/64)
-        assert_eq!(geom.num_out_tiles, 16);   // 1024 / 64
+        assert_eq!(geom.num_batch_tiles, 2); // ceil(65/64)
+        assert_eq!(geom.num_out_tiles, 16); // 1024 / 64
     }
 
     #[test]

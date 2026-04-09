@@ -16,8 +16,8 @@ use std::{sync::OnceLock, time::Instant};
 use crate::ArrayDtypeExt;
 use pmetal_bridge::compat::{Array, Dtype, Exception, ops, random};
 use pmetal_metal::{
-    FlashAttention, FlashAttentionConfig as MetalFlashAttentionConfig, KernelDispatch, MetalContext,
-    MppFlashAttention, MppFlashAttentionConfig,
+    FlashAttention, FlashAttentionConfig as MetalFlashAttentionConfig, KernelDispatch,
+    MetalContext, MppFlashAttention, MppFlashAttentionConfig,
     context::{DeviceProperties, DeviceTier},
 };
 use serde::{Deserialize, Serialize};

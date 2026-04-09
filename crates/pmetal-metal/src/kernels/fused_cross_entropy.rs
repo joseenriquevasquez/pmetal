@@ -33,7 +33,9 @@ use std::sync::Arc;
 
 use half::f16;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+};
 
 use crate::{
     buffer::{AsMetalBuffer, BufferUsage, MetalBuffer},

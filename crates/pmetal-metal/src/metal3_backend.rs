@@ -44,13 +44,17 @@ use crate::{
     kernels::{
         dw_gemm::DwGemm,
         flash_attention::{FlashAttention, FlashAttentionConfig, FlashAttentionOutput},
-        fused_cross_entropy::{FusedCrossEntropy, FusedCrossEntropyConfig, FusedCrossEntropyOutput},
+        fused_cross_entropy::{
+            FusedCrossEntropy, FusedCrossEntropyConfig, FusedCrossEntropyOutput,
+        },
         fused_distill::{DistillLossType, FusedDistill, FusedDistillConfig, FusedDistillOutput},
         fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput},
         fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput},
         fused_rope::{FusedRoPE, FusedRoPEConfig},
         fused_sampler::AsMetalBuffer as SamplerBuf,
-        fused_swiglu::{FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput},
+        fused_swiglu::{
+            FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput,
+        },
         fused_training::{BatchedCommandBuffer, FusedAdamW},
         moe::{MoeConfig, MoeKernel, MoeRouting},
         mpp_gemm::MppGemm,
@@ -330,7 +334,12 @@ impl KernelBackend for Metal3Backend {
         lora_b: &dyn AsMetalBuffer,
     ) -> Result<FusedLoraOutput> {
         let kernel = FusedLora::new(ctx.clone(), config.clone())?;
-        kernel.forward(&DynBufRef(x), &DynBufRef(weight), &DynBufRef(lora_a), &DynBufRef(lora_b))
+        kernel.forward(
+            &DynBufRef(x),
+            &DynBufRef(weight),
+            &DynBufRef(lora_a),
+            &DynBufRef(lora_b),
+        )
     }
 
     // ---- Training optimizers and losses -------------------------------------
@@ -355,7 +364,15 @@ impl KernelBackend for Metal3Backend {
             .map(|p| p.size as usize)
             .collect();
         let adamw = FusedAdamW::new(self.ctx.clone(), &param_sizes);
-        adamw.queue_update(batch, desc.params, desc.grads, desc.m, desc.v, desc.param_info, &desc.config)
+        adamw.queue_update(
+            batch,
+            desc.params,
+            desc.grads,
+            desc.m,
+            desc.v,
+            desc.param_info,
+            &desc.config,
+        )
     }
 
     /// Fused cross-entropy via [`FusedCrossEntropy::forward_dyn`].
@@ -462,6 +479,10 @@ impl KernelBackend for Metal3Backend {
         loss_type: DistillLossType,
     ) -> Result<FusedDistillOutput> {
         let kernel = FusedDistill::new(ctx.clone(), config.clone())?;
-        kernel.forward(&DynBufRef(teacher_logits), &DynBufRef(student_logits), loss_type)
+        kernel.forward(
+            &DynBufRef(teacher_logits),
+            &DynBufRef(student_logits),
+            loss_type,
+        )
     }
 }

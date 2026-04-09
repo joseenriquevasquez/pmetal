@@ -125,8 +125,7 @@ impl MppFusedNormLora {
         lora_b: &dyn AsMetalBuffer,
         output: &dyn AsMetalBuffer,
     ) -> Result<()> {
-        let command_buffer =
-            self.execute_async(input, gamma, weight, lora_a, lora_b, output)?;
+        let command_buffer = self.execute_async(input, gamma, weight, lora_a, lora_b, output)?;
         command_buffer.waitUntilCompleted();
 
         if let Some(error) = command_buffer.error() {
@@ -182,19 +181,25 @@ impl MppFusedNormLora {
         let lora_b_buf = lora_b.as_metal_buffer();
         let output_buf = output.as_metal_buffer();
 
-        encode_mpp_kernel(&self.ctx, "mpp_fused_norm_lora_forward_f16", grid, tg_size, |encoder| unsafe {
-            // buffer(0): input, buffer(1): gamma, buffer(2): weight,
-            // buffer(3): lora_a, buffer(4): lora_b, buffer(5): output,
-            // buffer(6): params
-            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(gamma_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(weight_buf), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(lora_a_buf), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(lora_b_buf), 0, 4);
-            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 5);
-            let params_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 6);
-        })
+        encode_mpp_kernel(
+            &self.ctx,
+            "mpp_fused_norm_lora_forward_f16",
+            grid,
+            tg_size,
+            |encoder| unsafe {
+                // buffer(0): input, buffer(1): gamma, buffer(2): weight,
+                // buffer(3): lora_a, buffer(4): lora_b, buffer(5): output,
+                // buffer(6): params
+                encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(gamma_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(weight_buf), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(lora_a_buf), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(lora_b_buf), 0, 4);
+                encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 5);
+                let params_ptr = NonNull::from(&params).cast();
+                encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 6);
+            },
+        )
     }
 }
 
