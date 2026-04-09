@@ -119,10 +119,10 @@ fn dispatch_geometry(config: &MppFusedSwiGLUConfig) -> DispatchGeometry {
 
 fn kernel_name(config: &MppFusedSwiGLUConfig) -> &'static str {
     match (config.has_lora(), config.use_fp16) {
-        (false, true)  => "mpp_fused_swiglu_forward_f16",
+        (false, true) => "mpp_fused_swiglu_forward_f16",
         (false, false) => "mpp_fused_swiglu_forward_f32",
-        (true,  true)  => "mpp_fused_swiglu_lora_forward_f16",
-        (true,  false) => "mpp_fused_swiglu_lora_forward_f32",
+        (true, true) => "mpp_fused_swiglu_lora_forward_f16",
+        (true, false) => "mpp_fused_swiglu_lora_forward_f32",
     }
 }
 
@@ -202,15 +202,15 @@ impl MppFusedSwiGLU {
             depth: 1,
         };
 
-        let input_buf  = input.as_metal_buffer();
-        let gate_buf   = gate_weight.as_metal_buffer();
-        let up_buf     = up_weight.as_metal_buffer();
+        let input_buf = input.as_metal_buffer();
+        let gate_buf = gate_weight.as_metal_buffer();
+        let up_buf = up_weight.as_metal_buffer();
         let output_buf = output.as_metal_buffer();
 
         encode_mpp_kernel(&self.ctx, kname, grid, tg_size, |encoder| unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input_buf),  0, 0);
-            encoder.setBuffer_offset_atIndex(Some(gate_buf),   0, 1);
-            encoder.setBuffer_offset_atIndex(Some(up_buf),     0, 2);
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(gate_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(up_buf), 0, 2);
             encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 3);
             let params_ptr = NonNull::from(&params).cast();
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 4);
@@ -270,7 +270,8 @@ impl MppFusedSwiGLU {
         }
         if self.config.lora_rank == 0 {
             return Err(MetalError::InvalidConfig(
-                "execute_lora called but lora_rank is 0; use execute() for the base path".to_string(),
+                "execute_lora called but lora_rank is 0; use execute() for the base path"
+                    .to_string(),
             ));
         }
 
@@ -299,24 +300,24 @@ impl MppFusedSwiGLU {
             depth: 1,
         };
 
-        let input_buf  = input.as_metal_buffer();
-        let gate_buf   = gate_weight.as_metal_buffer();
-        let up_buf     = up_weight.as_metal_buffer();
-        let gla_buf    = gate_lora_a.as_metal_buffer();
-        let glb_buf    = gate_lora_b.as_metal_buffer();
-        let ula_buf    = up_lora_a.as_metal_buffer();
-        let ulb_buf    = up_lora_b.as_metal_buffer();
+        let input_buf = input.as_metal_buffer();
+        let gate_buf = gate_weight.as_metal_buffer();
+        let up_buf = up_weight.as_metal_buffer();
+        let gla_buf = gate_lora_a.as_metal_buffer();
+        let glb_buf = gate_lora_b.as_metal_buffer();
+        let ula_buf = up_lora_a.as_metal_buffer();
+        let ulb_buf = up_lora_b.as_metal_buffer();
         let output_buf = output.as_metal_buffer();
 
         encode_mpp_kernel(&self.ctx, kname, grid, tg_size, |encoder| unsafe {
             // buffer(0..7): inputs; buffer(8): params; threadgroup(0): scratch
-            encoder.setBuffer_offset_atIndex(Some(input_buf),  0, 0);
-            encoder.setBuffer_offset_atIndex(Some(gate_buf),   0, 1);
-            encoder.setBuffer_offset_atIndex(Some(up_buf),     0, 2);
-            encoder.setBuffer_offset_atIndex(Some(gla_buf),    0, 3);
-            encoder.setBuffer_offset_atIndex(Some(glb_buf),    0, 4);
-            encoder.setBuffer_offset_atIndex(Some(ula_buf),    0, 5);
-            encoder.setBuffer_offset_atIndex(Some(ulb_buf),    0, 6);
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(gate_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(up_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(gla_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(glb_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(ula_buf), 0, 5);
+            encoder.setBuffer_offset_atIndex(Some(ulb_buf), 0, 6);
             encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 7);
             let params_ptr = NonNull::from(&params).cast();
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 8);
@@ -510,7 +511,10 @@ mod tests {
 
         let mut config_f32 = config.clone();
         config_f32.use_fp16 = false;
-        assert_eq!(kernel_name(&config_f32), "mpp_fused_swiglu_lora_forward_f32");
+        assert_eq!(
+            kernel_name(&config_f32),
+            "mpp_fused_swiglu_lora_forward_f32"
+        );
     }
 
     #[test]
@@ -545,7 +549,7 @@ mod tests {
         let config = MppFusedMLPConfig::new(65, 2048, 4096);
         let tiles_b = config.batch_size.div_ceil(32);
         let tiles_h = config.hidden_size.div_ceil(32);
-        assert_eq!(tiles_b, 3);  // ceil(65/32)
+        assert_eq!(tiles_b, 3); // ceil(65/32)
         assert_eq!(tiles_h, 64); // 2048/32
     }
 }

@@ -258,7 +258,12 @@ impl<T: Copy + FromBytes + IntoBytes> MetalBuffer<T> {
     ///
     /// Panics at compile time if `size_of::<T>() != size_of::<U>()`.
     pub fn reinterpret<U: Copy + FromBytes + IntoBytes>(&self) -> MetalBuffer<U> {
-        const { assert!(mem::size_of::<T>() == mem::size_of::<U>(), "reinterpret requires equal element sizes") };
+        const {
+            assert!(
+                mem::size_of::<T>() == mem::size_of::<U>(),
+                "reinterpret requires equal element sizes"
+            )
+        };
         MetalBuffer {
             buffer: self.buffer.clone(),
             len: self.len,

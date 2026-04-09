@@ -3577,13 +3577,7 @@ pub fn generate(
         true,
     );
     generate_from_primed_sample_impl(
-        weights,
-        cache,
-        current_y,
-        max_tokens,
-        params,
-        true,
-        on_token,
+        weights, cache, current_y, max_tokens, params, true, on_token,
     )
 }
 

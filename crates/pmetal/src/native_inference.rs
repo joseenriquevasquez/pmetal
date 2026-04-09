@@ -569,14 +569,7 @@ fn run_qwen3(
         qwen3_native::prefill_first_token,
         |weights, config, cache, first_tok, remaining, params, on_token| {
             qwen3_native::generate_canonical(
-                weights,
-                cache,
-                config,
-                first_tok,
-                remaining,
-                params,
-                turboquant,
-                on_token,
+                weights, cache, config, first_tok, remaining, params, turboquant, on_token,
             )
         },
     )

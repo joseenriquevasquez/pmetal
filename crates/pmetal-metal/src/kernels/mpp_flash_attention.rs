@@ -351,8 +351,7 @@ impl MppFlashAttentionBackward {
         d_output: &MetalBuffer<f16>,
         logsumexp: &MetalBuffer<f32>,
     ) -> Result<Option<MppFlashAttentionBwdOutput>> {
-        if !self.ctx.properties().has_nax()
-            || self.ctx.pipeline_cache().metal4_library().is_none()
+        if !self.ctx.properties().has_nax() || self.ctx.pipeline_cache().metal4_library().is_none()
         {
             return Ok(None);
         }
@@ -362,55 +361,65 @@ impl MppFlashAttentionBackward {
 
         validate_input_sizes(&self.config, queries, keys, values)?;
 
-        let q_size  = self.config.batch_size * self.config.num_heads    * self.config.query_seq_len * self.config.head_dim;
-        let kv_size = self.config.batch_size * self.config.num_kv_heads * self.config.kv_seq_len   * self.config.head_dim;
+        let q_size = self.config.batch_size
+            * self.config.num_heads
+            * self.config.query_seq_len
+            * self.config.head_dim;
+        let kv_size = self.config.batch_size
+            * self.config.num_kv_heads
+            * self.config.kv_seq_len
+            * self.config.head_dim;
 
-        let d_queries = MetalBuffer::<f16>::zeros(&self.ctx, q_size,  BufferUsage::Shared)?;
-        let d_keys    = MetalBuffer::<f16>::zeros(&self.ctx, kv_size, BufferUsage::Shared)?;
-        let d_values  = MetalBuffer::<f16>::zeros(&self.ctx, kv_size, BufferUsage::Shared)?;
+        let d_queries = MetalBuffer::<f16>::zeros(&self.ctx, q_size, BufferUsage::Shared)?;
+        let d_keys = MetalBuffer::<f16>::zeros(&self.ctx, kv_size, BufferUsage::Shared)?;
+        let d_values = MetalBuffer::<f16>::zeros(&self.ctx, kv_size, BufferUsage::Shared)?;
 
         let params = FlashAttentionParams {
-            batch_size:     self.config.batch_size     as u32,
-            num_heads:      self.config.num_heads      as u32,
-            num_kv_heads:   self.config.num_kv_heads   as u32,
-            query_seq_len:  self.config.query_seq_len  as u32,
-            kv_seq_len:     self.config.kv_seq_len     as u32,
-            head_dim:       self.config.head_dim       as u32,
-            scale:          self.config.scaling_factor(),
-            block_q:        32,
-            block_k:        32,
-            gqa_ratio:      self.config.gqa_ratio()    as u32,
-            is_causal:      self.config.is_causal      as u32,
+            batch_size: self.config.batch_size as u32,
+            num_heads: self.config.num_heads as u32,
+            num_kv_heads: self.config.num_kv_heads as u32,
+            query_seq_len: self.config.query_seq_len as u32,
+            kv_seq_len: self.config.kv_seq_len as u32,
+            head_dim: self.config.head_dim as u32,
+            scale: self.config.scaling_factor(),
+            block_q: 32,
+            block_k: 32,
+            gqa_ratio: self.config.gqa_ratio() as u32,
+            is_causal: self.config.is_causal as u32,
             sliding_window: self.config.sliding_window.unwrap_or(0) as u32,
-            softcap:        self.config.softcap.unwrap_or(0.0),
+            softcap: self.config.softcap.unwrap_or(0.0),
         };
 
         // --- dQ kernel: grid = [num_q_blocks, num_heads, batch_size] --------
         let dq_grid = objc2_metal::MTLSize {
-            width:  self.config.query_seq_len.div_ceil(32),
+            width: self.config.query_seq_len.div_ceil(32),
             height: self.config.num_heads,
-            depth:  self.config.batch_size,
+            depth: self.config.batch_size,
         };
-        let tg_size = objc2_metal::MTLSize { width: 32, height: 4, depth: 1 };
+        let tg_size = objc2_metal::MTLSize {
+            width: 32,
+            height: 4,
+            depth: 1,
+        };
 
-        let q_buf   = queries.metal_buffer();
-        let k_buf   = keys.metal_buffer();
-        let v_buf   = values.metal_buffer();
-        let o_buf   = output.metal_buffer();
-        let do_buf  = d_output.metal_buffer();
+        let q_buf = queries.metal_buffer();
+        let k_buf = keys.metal_buffer();
+        let v_buf = values.metal_buffer();
+        let o_buf = output.metal_buffer();
+        let do_buf = d_output.metal_buffer();
         let lse_buf = logsumexp.metal_buffer();
-        let dq_buf  = d_queries.metal_buffer();
-        let dk_buf  = d_keys.metal_buffer();
-        let dv_buf  = d_values.metal_buffer();
+        let dq_buf = d_queries.metal_buffer();
+        let dk_buf = d_keys.metal_buffer();
+        let dv_buf = d_values.metal_buffer();
 
         let cmd_dq = encode_mpp_kernel(&self.ctx, dq_name, dq_grid, tg_size, |enc| unsafe {
-            enc.setBuffer_offset_atIndex(Some(q_buf),   0, 0);
-            enc.setBuffer_offset_atIndex(Some(k_buf),   0, 1);
-            enc.setBuffer_offset_atIndex(Some(v_buf),   0, 2);
-            enc.setBuffer_offset_atIndex(Some(o_buf),   0, 3);
-            enc.setBuffer_offset_atIndex(Some(do_buf),  0, 4);
+            enc.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(k_buf), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(v_buf), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(o_buf), 0, 3);
+            enc.setBuffer_offset_atIndex(Some(do_buf), 0, 4);
             enc.setBuffer_offset_atIndex(Some(lse_buf), 0, 5);
-            enc.setBuffer_offset_atIndex(Some(dq_buf),  0, 6);
+            enc.setBuffer_offset_atIndex(Some(dq_buf), 0, 6);
             let params_ptr = NonNull::from(&params).cast();
             enc.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 7);
         })?;
@@ -421,20 +430,20 @@ impl MppFlashAttentionBackward {
 
         // --- dKV kernel: grid = [num_kv_blocks, num_kv_heads, batch_size] ---
         let dkv_grid = objc2_metal::MTLSize {
-            width:  self.config.kv_seq_len.div_ceil(32),
+            width: self.config.kv_seq_len.div_ceil(32),
             height: self.config.num_kv_heads,
-            depth:  self.config.batch_size,
+            depth: self.config.batch_size,
         };
 
         let cmd_dkv = encode_mpp_kernel(&self.ctx, dkv_name, dkv_grid, tg_size, |enc| unsafe {
-            enc.setBuffer_offset_atIndex(Some(q_buf),   0, 0);
-            enc.setBuffer_offset_atIndex(Some(k_buf),   0, 1);
-            enc.setBuffer_offset_atIndex(Some(v_buf),   0, 2);
-            enc.setBuffer_offset_atIndex(Some(o_buf),   0, 3);
-            enc.setBuffer_offset_atIndex(Some(do_buf),  0, 4);
+            enc.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(k_buf), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(v_buf), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(o_buf), 0, 3);
+            enc.setBuffer_offset_atIndex(Some(do_buf), 0, 4);
             enc.setBuffer_offset_atIndex(Some(lse_buf), 0, 5);
-            enc.setBuffer_offset_atIndex(Some(dk_buf),  0, 6);
-            enc.setBuffer_offset_atIndex(Some(dv_buf),  0, 7);
+            enc.setBuffer_offset_atIndex(Some(dk_buf), 0, 6);
+            enc.setBuffer_offset_atIndex(Some(dv_buf), 0, 7);
             let params_ptr = NonNull::from(&params).cast();
             enc.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 8);
         })?;

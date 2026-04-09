@@ -539,8 +539,7 @@ impl MppFusedMoEQuant {
         down_biases: &dyn AsMetalBuffer,
         out: &dyn AsMetalBuffer,
     ) -> Result<()> {
-        let cb =
-            self.execute_down_async(act_in, down_w_q, down_scales, down_biases, out)?;
+        let cb = self.execute_down_async(act_in, down_w_q, down_scales, down_biases, out)?;
         cb.waitUntilCompleted();
         if let Some(e) = cb.error() {
             return Err(MetalError::ExecutionFailed(e.to_string()));
@@ -677,11 +676,8 @@ impl MppGroupedGemmTileCount {
         };
 
         // 1-element output buffer (atomic u32, zero-initialized via Shared).
-        let tile_count_buf = crate::buffer::MetalBuffer::<u32>::new(
-            &self.ctx,
-            1,
-            BufferUsage::Shared,
-        )?;
+        let tile_count_buf =
+            crate::buffer::MetalBuffer::<u32>::new(&self.ctx, 1, BufferUsage::Shared)?;
 
         let eo_buf = expert_offsets.as_metal_buffer();
         let tc_buf = tile_count_buf.as_metal_buffer();

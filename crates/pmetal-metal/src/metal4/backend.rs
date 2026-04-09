@@ -17,6 +17,7 @@ use crate::{
     buffer::{AsMetalBuffer, BufferUsage, MetalBuffer},
     context::MetalContext,
     error::Result,
+    kernels::fused_moe::ExpertBits,
     kernels::{
         flash_attention::{FlashAttentionConfig, FlashAttentionOutput},
         fused_cross_entropy::{FusedCrossEntropyConfig, FusedCrossEntropyOutput},
@@ -28,21 +29,18 @@ use crate::{
         fused_training::BatchedCommandBuffer,
         moe::{MoeConfig, MoeRouting},
         mpp_dw_gemm::{MppDwGemm, MppDwGemmConfig},
+        mpp_flash_attention::{MppFlashAttentionBackward, MppFlashAttentionConfig as MppFAConfig},
         mpp_fused_cross_entropy::{MppFusedCrossEntropy, MppFusedCrossEntropyConfig},
         mpp_fused_distill::{MppDistillLossType, MppFusedDistill, MppFusedDistillConfig},
         mpp_fused_lora::{MppFusedLora, MppFusedLoraConfig},
+        mpp_fused_moe::{MppFusedMoEQuant, MppFusedMoEQuantConfig, MppGroupedGemmTileCount},
         mpp_fused_norm_lora::{MppFusedNormLora, MppFusedNormLoraConfig},
         mpp_fused_rope::{MppFusedRoPE, MppFusedRoPEConfig},
-        mpp_flash_attention::{MppFlashAttentionBackward, MppFlashAttentionConfig as MppFAConfig},
-        mpp_fused_moe::{
-            MppFusedMoEQuant, MppFusedMoEQuantConfig, MppGroupedGemmTileCount,
-        },
         mpp_fused_swiglu::{MppFusedMLP, MppFusedMLPConfig, MppFusedSwiGLU, MppFusedSwiGLUConfig},
         mpp_fused_training::{MppFusedAdamW, MppFusedAdamWConfig, MppParamInfo},
         mpp_grouped_gemm::{GroupedGemmDispatch, MppGroupedGemm, MppGroupedGemmConfig},
         mpp_quantized::{MppQuantizedGemm, MppQuantizedGemmConfig},
     },
-    kernels::fused_moe::ExpertBits,
     metal3_backend::Metal3Backend,
     metal4::{allocator_pool::CommandAllocatorPool, residency::ResidencyManager},
 };
@@ -318,16 +316,16 @@ impl KernelBackend for Metal4Backend {
     ) -> Result<(MetalBuffer<f16>, MetalBuffer<f16>, MetalBuffer<f16>)> {
         // Attempt the MPP backward path (D=128 causal only; falls back otherwise).
         let mpp_config = MppFAConfig {
-            batch_size:     config.batch_size,
-            num_heads:      config.num_heads,
-            num_kv_heads:   config.num_kv_heads,
-            query_seq_len:  config.query_seq_len,
-            kv_seq_len:     config.kv_seq_len,
-            head_dim:       config.head_dim,
-            scale:          config.scale,
-            is_causal:      config.is_causal,
+            batch_size: config.batch_size,
+            num_heads: config.num_heads,
+            num_kv_heads: config.num_kv_heads,
+            query_seq_len: config.query_seq_len,
+            kv_seq_len: config.kv_seq_len,
+            head_dim: config.head_dim,
+            scale: config.scale,
+            is_causal: config.is_causal,
             sliding_window: config.sliding_window,
-            softcap:        config.softcap,
+            softcap: config.softcap,
         };
 
         if let Ok(dispatcher) = MppFlashAttentionBackward::new(self.ctx.clone(), mpp_config) {
@@ -431,9 +429,14 @@ impl KernelBackend for Metal4Backend {
         let dispatcher = MppFusedMLP::new(self.ctx.clone(), mpp_config);
 
         if !dispatcher.is_available() {
-            return self
-                .fallback
-                .fused_mlp(ctx, config, input, gate_weight, up_weight, down_weight);
+            return self.fallback.fused_mlp(
+                ctx,
+                config,
+                input,
+                gate_weight,
+                up_weight,
+                down_weight,
+            );
         }
 
         let output = MetalBuffer::<f32>::new(

@@ -1725,12 +1725,6 @@ pub fn generate(
     let current_y =
         prime_generation_impl(weights, cache, first_token, params.temperature, true, true);
     generate_from_primed_sample_impl(
-        weights,
-        cache,
-        current_y,
-        max_tokens,
-        params,
-        true,
-        on_token,
+        weights, cache, current_y, max_tokens, params, true, on_token,
     )
 }

@@ -501,8 +501,13 @@ impl KernelBackend for Metal3Backend {
         let hidden_dim = desc.expert_config.hidden_dim as usize;
         let intermediate_dim = desc.expert_config.intermediate_dim as usize;
 
-        let output = MetalBuffer::<f32>::new(&self.ctx, desc.num_tokens * hidden_dim, BufferUsage::Shared)?;
-        let intermediate = MetalBuffer::<f32>::new(&self.ctx, desc.num_tokens * intermediate_dim, BufferUsage::Shared)?;
+        let output =
+            MetalBuffer::<f32>::new(&self.ctx, desc.num_tokens * hidden_dim, BufferUsage::Shared)?;
+        let intermediate = MetalBuffer::<f32>::new(
+            &self.ctx,
+            desc.num_tokens * intermediate_dim,
+            BufferUsage::Shared,
+        )?;
 
         kernel.forward_single_expert(desc.input, &weights, &output, &intermediate)?;
 
