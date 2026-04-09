@@ -10,18 +10,18 @@
 //! In ANE training: 20 layers × 7 GEMMs = 140 dispatches per step.
 //! These run on the GPU while ANE handles dx propagation.
 
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::AsMetalBuffer,
     context::MetalContext,
     error::{MetalError, Result},
+    kernels::mpp_dispatch::encode_mpp_kernel,
 };
 
 /// Configuration for MPP weight gradient GEMM.
@@ -82,9 +82,6 @@ struct DwGemmParams {
 
 #[derive(Debug, Clone, Copy)]
 struct DispatchGeometry {
-    /// Tile size (64×64 for both M and N dimensions).
-    bm: usize,
-    bn: usize,
     num_tiles_m: usize,
     num_tiles_n: usize,
     /// Threads per threadgroup: 32 (single SIMD group).
@@ -99,8 +96,6 @@ fn dispatch_geometry(config: &MppDwGemmConfig) -> DispatchGeometry {
     const BM: usize = 64;
     const BN: usize = 64;
     DispatchGeometry {
-        bm: BM,
-        bn: BN,
         num_tiles_m: config.m.div_ceil(BM),
         num_tiles_n: config.n.div_ceil(BN),
         threads_per_threadgroup: 32,
@@ -161,27 +156,6 @@ impl MppDwGemm {
         }
 
         let geometry = dispatch_geometry(&self.config);
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(
-                self.ctx.device(),
-                "mpp_dw_gemm_accum",
-                &constants,
-            )?
-        };
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
 
         let params = DwGemmParams {
             m: self.config.m as u32,
@@ -193,34 +167,31 @@ impl MppDwGemm {
             num_tiles_n: geometry.num_tiles_n as u32,
         };
 
-        unsafe {
-            // buffer(0): A, buffer(1): B, buffer(2): C, buffer(3): params
-            encoder.setBuffer_offset_atIndex(Some(a.as_metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(b.as_metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(c.as_metal_buffer()), 0, 2);
-
-            let params_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 3);
-        }
-
         // 2D grid: [num_n_tiles, num_m_tiles, 1]
         // (Metal shader uses tgid.x for N tiles, tgid.y for M tiles)
-        let threadgroup_size = objc2_metal::MTLSize {
-            width: geometry.threads_per_threadgroup,
-            height: 1,
-            depth: 1,
-        };
-        let grid_size = objc2_metal::MTLSize {
+        let grid = objc2_metal::MTLSize {
             width: geometry.num_tiles_n,
             height: geometry.num_tiles_m,
             depth: 1,
         };
+        let tg_size = objc2_metal::MTLSize {
+            width: geometry.threads_per_threadgroup,
+            height: 1,
+            depth: 1,
+        };
 
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
+        let a_buf = a.as_metal_buffer();
+        let b_buf = b.as_metal_buffer();
+        let c_buf = c.as_metal_buffer();
 
-        Ok(command_buffer)
+        encode_mpp_kernel(&self.ctx, "mpp_dw_gemm_accum", grid, tg_size, |encoder| unsafe {
+            // buffer(0): A, buffer(1): B, buffer(2): C, buffer(3): params
+            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(c_buf), 0, 2);
+            let params_ptr = NonNull::from(&params).cast();
+            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 3);
+        })
     }
 }
 

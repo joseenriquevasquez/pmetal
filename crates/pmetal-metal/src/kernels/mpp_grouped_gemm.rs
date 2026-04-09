@@ -10,18 +10,18 @@
 //!
 //! Computes: Y[token, :] = X[token, :] @ W[expert, :, :]^T per expert bucket.
 
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::AsMetalBuffer,
     context::MetalContext,
     error::{MetalError, Result},
+    kernels::mpp_dispatch::encode_mpp_kernel,
 };
 
 /// Configuration for MPP Grouped GEMM.
@@ -215,23 +215,6 @@ impl MppGroupedGemm {
         }
 
         let kernel_name = kernel_name(&self.config);
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(self.ctx.device(), kernel_name, &constants)?
-        };
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
 
         let params = GroupedGemmParams {
             total_tokens: self.config.total_tokens as u32,
@@ -245,41 +228,42 @@ impl MppGroupedGemm {
             fuse_mul: 0,
         };
 
-        unsafe {
-            // buffer(0): x, buffer(1): w, buffer(2): y,
-            // buffer(3): expert_offsets, buffer(4): gather_indices,
-            // buffer(5): scatter_indices, buffer(6): topk_weights,
-            // buffer(7): params
-            encoder.setBuffer_offset_atIndex(Some(x.as_metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(w.as_metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(y.as_metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(expert_offsets.as_metal_buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(gather_indices.as_metal_buffer()), 0, 4);
-            encoder.setBuffer_offset_atIndex(Some(scatter_indices.as_metal_buffer()), 0, 5);
-            encoder.setBuffer_offset_atIndex(Some(topk_weights.as_metal_buffer()), 0, 6);
-
-            let params_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 7);
-        }
-
         // 1D flat grid: each threadgroup handles one tile from one expert.
         // The shader iterates expert_offsets to find which expert owns the tile.
-        let threadgroup_size = objc2_metal::MTLSize {
-            width: dispatch.threads_per_threadgroup,
-            height: 1,
-            depth: 1,
-        };
-        let grid_size = objc2_metal::MTLSize {
+        let grid = objc2_metal::MTLSize {
             width: dispatch.total_tiles,
             height: 1,
             depth: 1,
         };
+        let tg_size = objc2_metal::MTLSize {
+            width: dispatch.threads_per_threadgroup,
+            height: 1,
+            depth: 1,
+        };
 
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
+        let x_buf = x.as_metal_buffer();
+        let w_buf = w.as_metal_buffer();
+        let y_buf = y.as_metal_buffer();
+        let eo_buf = expert_offsets.as_metal_buffer();
+        let gi_buf = gather_indices.as_metal_buffer();
+        let si_buf = scatter_indices.as_metal_buffer();
+        let tw_buf = topk_weights.as_metal_buffer();
 
-        Ok(command_buffer)
+        encode_mpp_kernel(&self.ctx, kernel_name, grid, tg_size, |encoder| unsafe {
+            // buffer(0): x, buffer(1): w, buffer(2): y,
+            // buffer(3): expert_offsets, buffer(4): gather_indices,
+            // buffer(5): scatter_indices, buffer(6): topk_weights,
+            // buffer(7): params
+            encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(w_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(y_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(eo_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(gi_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(si_buf), 0, 5);
+            encoder.setBuffer_offset_atIndex(Some(tw_buf), 0, 6);
+            let params_ptr = NonNull::from(&params).cast();
+            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 7);
+        })
     }
 }
 

@@ -21,6 +21,7 @@ pub mod fused_swiglu;
 pub mod fused_training;
 pub mod moe;
 pub mod mpp_bench;
+pub mod mpp_dispatch;
 pub mod mpp_flash_attention;
 pub mod mpp_gemm;
 pub mod mpp_quantized;

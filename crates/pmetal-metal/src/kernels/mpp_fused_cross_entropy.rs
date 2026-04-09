@@ -16,18 +16,18 @@
 //! Grid layout: `[num_tokens, 1, 1]`
 //! Each threadgroup is exactly one SIMD group (32 lanes).
 
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::AsMetalBuffer,
     context::MetalContext,
     error::{MetalError, Result},
+    kernels::mpp_dispatch::encode_mpp_kernel,
 };
 
 // =============================================================================
@@ -148,56 +148,35 @@ impl MppFusedCrossEntropy {
             "mpp_fused_cross_entropy_fwd_bwd_f32"
         };
 
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(self.ctx.device(), kernel_name, &constants)?
-        };
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
-
         let n = self.config.num_tokens as u32;
         let vocab = self.config.vocab_size as u32;
         let ignore = self.config.ignore_index;
 
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(logits.as_metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(labels.as_metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(grad_logits.as_metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(loss.as_metal_buffer()), 0, 3);
-
-            let n_ptr = NonNull::from(&n).cast();
-            encoder.setBytes_length_atIndex(n_ptr, std::mem::size_of_val(&n), 4);
-
-            let v_ptr = NonNull::from(&vocab).cast();
-            encoder.setBytes_length_atIndex(v_ptr, std::mem::size_of_val(&vocab), 5);
-
-            let ig_ptr = NonNull::from(&ignore).cast();
-            encoder.setBytes_length_atIndex(ig_ptr, std::mem::size_of_val(&ignore), 6);
-        }
-
         // Grid: [num_tokens, 1, 1]  Threadgroup: [32, 1, 1]
-        let threadgroup_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
-        let grid_size = objc2_metal::MTLSize {
+        let grid = objc2_metal::MTLSize {
             width: self.config.num_tokens,
             height: 1,
             depth: 1,
         };
+        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
 
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
+        let logits_buf = logits.as_metal_buffer();
+        let labels_buf = labels.as_metal_buffer();
+        let grad_buf = grad_logits.as_metal_buffer();
+        let loss_buf = loss.as_metal_buffer();
 
-        Ok(command_buffer)
+        encode_mpp_kernel(&self.ctx, kernel_name, grid, tg_size, |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(logits_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(labels_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(grad_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(loss_buf), 0, 3);
+            let n_ptr = NonNull::from(&n).cast();
+            encoder.setBytes_length_atIndex(n_ptr, std::mem::size_of_val(&n), 4);
+            let v_ptr = NonNull::from(&vocab).cast();
+            encoder.setBytes_length_atIndex(v_ptr, std::mem::size_of_val(&vocab), 5);
+            let ig_ptr = NonNull::from(&ignore).cast();
+            encoder.setBytes_length_atIndex(ig_ptr, std::mem::size_of_val(&ignore), 6);
+        })
     }
 }
 

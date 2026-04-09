@@ -11,18 +11,18 @@
 //!   Phase 3: lora_out = scale * (norm_x @ A^T) @ B^T — small-rank LoRA
 //!   Phase 4: output = base + lora_out
 
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::AsMetalBuffer,
     context::MetalContext,
     error::{MetalError, Result},
+    kernels::mpp_dispatch::encode_mpp_kernel,
 };
 
 /// Configuration for MPP Fused RMSNorm + Linear + LoRA.
@@ -74,8 +74,6 @@ struct FusedNormLoraParams {
 
 #[derive(Debug, Clone, Copy)]
 struct DispatchGeometry {
-    /// Output tile size (BN = 64).
-    bn: usize,
     /// Number of output tiles per token row.
     num_out_tiles: usize,
     /// Threads per threadgroup: 4 simdgroups × 32 = 128.
@@ -85,7 +83,6 @@ struct DispatchGeometry {
 fn dispatch_geometry(config: &MppFusedNormLoraConfig) -> DispatchGeometry {
     const BN: usize = 64;
     DispatchGeometry {
-        bn: BN,
         num_out_tiles: config.out_features.div_ceil(BN),
         threads_per_threadgroup: 4 * 32,
     }
@@ -156,27 +153,6 @@ impl MppFusedNormLora {
         }
 
         let geometry = dispatch_geometry(&self.config);
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(
-                self.ctx.device(),
-                "mpp_fused_norm_lora_forward_f16",
-                &constants,
-            )?
-        };
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
 
         let params = FusedNormLoraParams {
             batch_size: self.config.batch_size as u32,
@@ -187,38 +163,38 @@ impl MppFusedNormLora {
             lora_scale: self.config.lora_scale,
         };
 
-        unsafe {
-            // buffer(0): input, buffer(1): gamma, buffer(2): weight,
-            // buffer(3): lora_a, buffer(4): lora_b, buffer(5): output,
-            // buffer(6): params
-            encoder.setBuffer_offset_atIndex(Some(input.as_metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(gamma.as_metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(weight.as_metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(lora_a.as_metal_buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(lora_b.as_metal_buffer()), 0, 4);
-            encoder.setBuffer_offset_atIndex(Some(output.as_metal_buffer()), 0, 5);
-
-            let params_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 6);
-        }
-
         // Grid: [num_out_tiles, batch_size, 1] — one threadgroup per token per output tile
-        let threadgroup_size = objc2_metal::MTLSize {
-            width: geometry.threads_per_threadgroup,
-            height: 1,
-            depth: 1,
-        };
-        let grid_size = objc2_metal::MTLSize {
+        let grid = objc2_metal::MTLSize {
             width: geometry.num_out_tiles,
             height: self.config.batch_size,
             depth: 1,
         };
+        let tg_size = objc2_metal::MTLSize {
+            width: geometry.threads_per_threadgroup,
+            height: 1,
+            depth: 1,
+        };
 
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
+        let input_buf = input.as_metal_buffer();
+        let gamma_buf = gamma.as_metal_buffer();
+        let weight_buf = weight.as_metal_buffer();
+        let lora_a_buf = lora_a.as_metal_buffer();
+        let lora_b_buf = lora_b.as_metal_buffer();
+        let output_buf = output.as_metal_buffer();
 
-        Ok(command_buffer)
+        encode_mpp_kernel(&self.ctx, "mpp_fused_norm_lora_forward_f16", grid, tg_size, |encoder| unsafe {
+            // buffer(0): input, buffer(1): gamma, buffer(2): weight,
+            // buffer(3): lora_a, buffer(4): lora_b, buffer(5): output,
+            // buffer(6): params
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(gamma_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(weight_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(lora_a_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(lora_b_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 5);
+            let params_ptr = NonNull::from(&params).cast();
+            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 6);
+        })
     }
 }
 

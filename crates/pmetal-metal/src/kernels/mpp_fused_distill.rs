@@ -18,18 +18,18 @@
 //! Grid layout: `[num_tokens, 1, 1]`
 //! Each threadgroup = one SIMD group (32 lanes) per token.
 
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::AsMetalBuffer,
     context::MetalContext,
     error::{MetalError, Result},
+    kernels::mpp_dispatch::encode_mpp_kernel,
 };
 
 // =============================================================================
@@ -188,23 +188,6 @@ impl MppFusedDistill {
 
         let kernel_name = self.select_kernel();
 
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(self.ctx.device(), kernel_name, &constants)?
-        };
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
-
         let params = MppDistillParamsMetal {
             num_tokens: self.config.num_tokens as u32,
             vocab_size: self.config.vocab_size as u32,
@@ -213,29 +196,29 @@ impl MppFusedDistill {
             ignore_index: self.config.ignore_index,
         };
 
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(teacher_logits.as_metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(student_logits.as_metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(losses.as_metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(teacher_lse.as_metal_buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(student_lse.as_metal_buffer()), 0, 4);
-            let p_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 5);
-        }
-
         // Grid: [num_tokens, 1, 1]  Threadgroup: [32, 1, 1]
-        let threadgroup_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
-        let grid_size = objc2_metal::MTLSize {
+        let grid = objc2_metal::MTLSize {
             width: self.config.num_tokens,
             height: 1,
             depth: 1,
         };
+        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
 
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
+        let teacher_buf = teacher_logits.as_metal_buffer();
+        let student_buf = student_logits.as_metal_buffer();
+        let losses_buf = losses.as_metal_buffer();
+        let tlse_buf = teacher_lse.as_metal_buffer();
+        let slse_buf = student_lse.as_metal_buffer();
 
-        Ok(command_buffer)
+        encode_mpp_kernel(&self.ctx, kernel_name, grid, tg_size, |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(teacher_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(student_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(losses_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(tlse_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(slse_buf), 0, 4);
+            let p_ptr = NonNull::from(&params).cast();
+            encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 5);
+        })
     }
 
     fn select_kernel(&self) -> &'static str {

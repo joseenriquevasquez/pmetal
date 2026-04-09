@@ -18,18 +18,18 @@
 //! Grid for gate/up: `[ceil(intermediate/32), ceil(tokens/32), 1]`
 //! Grid for down:    `[ceil(hidden/32), ceil(tokens/32), 1]`
 
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::AsMetalBuffer,
     context::MetalContext,
     error::{MetalError, Result},
+    kernels::mpp_dispatch::encode_mpp_kernel,
 };
 
 // =============================================================================
@@ -141,45 +141,33 @@ impl MppFusedMoE {
             ));
         }
 
-        let pipeline = self.get_pipeline("mpp_fused_moe_gate_up_f16")?;
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
-
         let params = MppMoEParamsMetal {
             batch_size: self.config.batch_size as u32,
             hidden_dim: self.config.hidden_dim as u32,
             intermediate_dim: self.config.intermediate_dim as u32,
         };
 
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input.as_metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(gate_weight.as_metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(up_weight.as_metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(act_out.as_metal_buffer()), 0, 3);
+        // Grid: [ceil(intermediate/32), ceil(batch/32), 1]
+        let grid = objc2_metal::MTLSize {
+            width: self.config.intermediate_dim.div_ceil(32),
+            height: self.config.batch_size.div_ceil(32),
+            depth: 1,
+        };
+        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
+
+        let input_buf = input.as_metal_buffer();
+        let gate_buf = gate_weight.as_metal_buffer();
+        let up_buf = up_weight.as_metal_buffer();
+        let act_buf = act_out.as_metal_buffer();
+
+        encode_mpp_kernel(&self.ctx, "mpp_fused_moe_gate_up_f16", grid, tg_size, |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(gate_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(up_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 3);
             let p_ptr = NonNull::from(&params).cast();
             encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 4);
-        }
-
-        // Grid: [ceil(intermediate/32), ceil(batch/32), 1]
-        let tiles_i = self.config.intermediate_dim.div_ceil(32);
-        let tiles_b = self.config.batch_size.div_ceil(32);
-        let threadgroup_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
-        let grid_size = objc2_metal::MTLSize { width: tiles_i, height: tiles_b, depth: 1 };
-
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
-
-        Ok(command_buffer)
+        })
     }
 
     /// Execute the down projection synchronously.
@@ -214,53 +202,31 @@ impl MppFusedMoE {
             ));
         }
 
-        let pipeline = self.get_pipeline("mpp_fused_moe_down_f16")?;
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
-
         let params = MppMoEParamsMetal {
             batch_size: self.config.batch_size as u32,
             hidden_dim: self.config.hidden_dim as u32,
             intermediate_dim: self.config.intermediate_dim as u32,
         };
 
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(act_in.as_metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(down_weight.as_metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(out.as_metal_buffer()), 0, 2);
+        // Grid: [ceil(hidden/32), ceil(batch/32), 1]
+        let grid = objc2_metal::MTLSize {
+            width: self.config.hidden_dim.div_ceil(32),
+            height: self.config.batch_size.div_ceil(32),
+            depth: 1,
+        };
+        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
+
+        let act_buf = act_in.as_metal_buffer();
+        let down_buf = down_weight.as_metal_buffer();
+        let out_buf = out.as_metal_buffer();
+
+        encode_mpp_kernel(&self.ctx, "mpp_fused_moe_down_f16", grid, tg_size, |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(down_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
             let p_ptr = NonNull::from(&params).cast();
             encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 3);
-        }
-
-        // Grid: [ceil(hidden/32), ceil(batch/32), 1]
-        let tiles_h = self.config.hidden_dim.div_ceil(32);
-        let tiles_b = self.config.batch_size.div_ceil(32);
-        let threadgroup_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
-        let grid_size = objc2_metal::MTLSize { width: tiles_h, height: tiles_b, depth: 1 };
-
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
-
-        Ok(command_buffer)
-    }
-
-    fn get_pipeline(
-        &self,
-        kernel_name: &str,
-    ) -> Result<objc2::rc::Retained<objc2_metal::MTLComputePipelineState>> {
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-        let mut cache = self.ctx.pipeline_cache_mut();
-        cache.get_or_create_metal4_pipeline(self.ctx.device(), kernel_name, &constants)
+        })
     }
 }
 
@@ -319,53 +285,30 @@ impl MppMoEScatter {
             ));
         }
 
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(
-                self.ctx.device(),
-                "mpp_moe_weighted_scatter_f16",
-                &constants,
-            )?
-        };
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
-
         let params = MppMoEScatterParamsMetal {
             num_tokens: self.config.num_tokens as u32,
             hidden_dim: self.config.hidden_dim as u32,
         };
 
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(expert_out.as_metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(weights.as_metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(accum.as_metal_buffer()), 0, 2);
-            let p_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 3);
-        }
-
         // Grid: [num_tokens, 1, 1]  Threadgroup: [32, 1, 1]
-        let threadgroup_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
-        let grid_size = objc2_metal::MTLSize {
+        let grid = objc2_metal::MTLSize {
             width: self.config.num_tokens,
             height: 1,
             depth: 1,
         };
+        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
 
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
+        let expert_buf = expert_out.as_metal_buffer();
+        let weights_buf = weights.as_metal_buffer();
+        let accum_buf = accum.as_metal_buffer();
 
-        Ok(command_buffer)
+        encode_mpp_kernel(&self.ctx, "mpp_moe_weighted_scatter_f16", grid, tg_size, |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(expert_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(weights_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(accum_buf), 0, 2);
+            let p_ptr = NonNull::from(&params).cast();
+            encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 3);
+        })
     }
 }
 

@@ -14,18 +14,18 @@
 //! - Training: saves xA intermediate for backward pass (`mpp_fused_lora_forward_f16`)
 //! - Inference: skips xA save (`mpp_lora_forward_inference_f16`)
 
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::AsMetalBuffer,
     context::MetalContext,
     error::{MetalError, Result},
+    kernels::mpp_dispatch::encode_mpp_kernel,
 };
 
 /// Whether to use the training variant (saves xA for backward) or inference variant.
@@ -124,10 +124,6 @@ struct FusedLoraParams {
 
 #[derive(Debug, Clone, Copy)]
 struct DispatchGeometry {
-    /// Batch tile size (BM = 64).
-    bm: usize,
-    /// Output tile size (BN = 64).
-    bn: usize,
     num_batch_tiles: usize,
     num_out_tiles: usize,
     /// Threads per threadgroup: 4 simdgroups × 32 = 128.
@@ -138,8 +134,6 @@ fn dispatch_geometry(config: &MppFusedLoraConfig) -> DispatchGeometry {
     const BM: usize = 64;
     const BN: usize = 64;
     DispatchGeometry {
-        bm: BM,
-        bn: BN,
         num_batch_tiles: config.batch_size.div_ceil(BM),
         num_out_tiles: config.out_features.div_ceil(BN),
         threads_per_threadgroup: 4 * 32,
@@ -247,27 +241,6 @@ impl MppFusedLora {
         }
 
         let geometry = dispatch_geometry(&self.config);
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(
-                self.ctx.device(),
-                "mpp_fused_lora_forward_f16",
-                &constants,
-            )?
-        };
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
 
         let params = FusedLoraParams {
             batch_size: self.config.batch_size as u32,
@@ -279,25 +252,37 @@ impl MppFusedLora {
             lr_scale_b: self.config.lr_scale_b,
         };
 
-        unsafe {
+        // Grid: [num_out_tiles, num_batch_tiles, 1]
+        let grid = objc2_metal::MTLSize {
+            width: geometry.num_out_tiles,
+            height: geometry.num_batch_tiles,
+            depth: 1,
+        };
+        let tg_size = objc2_metal::MTLSize {
+            width: geometry.threads_per_threadgroup,
+            height: 1,
+            depth: 1,
+        };
+
+        let x_buf = x.as_metal_buffer();
+        let w_buf = w.as_metal_buffer();
+        let a_buf = a.as_metal_buffer();
+        let b_buf = b.as_metal_buffer();
+        let y_buf = y.as_metal_buffer();
+        let xa_buf = xa_out.as_metal_buffer();
+
+        encode_mpp_kernel(&self.ctx, "mpp_fused_lora_forward_f16", grid, tg_size, |encoder| unsafe {
             // Training: buffer(0): x, buffer(1): W, buffer(2): A, buffer(3): B,
             //           buffer(4): y, buffer(5): xA_out, buffer(6): params
-            encoder.setBuffer_offset_atIndex(Some(x.as_metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(w.as_metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(a.as_metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(b.as_metal_buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(y.as_metal_buffer()), 0, 4);
-            encoder.setBuffer_offset_atIndex(Some(xa_out.as_metal_buffer()), 0, 5);
-
+            encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(w_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(y_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(xa_buf), 0, 5);
             let params_ptr = NonNull::from(&params).cast();
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 6);
-        }
-
-        Self::dispatch_grid(&encoder, &geometry);
-        encoder.endEncoding();
-        command_buffer.commit();
-
-        Ok(command_buffer)
+        })
     }
 
     /// Asynchronous inference dispatch.
@@ -316,27 +301,6 @@ impl MppFusedLora {
         }
 
         let geometry = dispatch_geometry(&self.config);
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(
-                self.ctx.device(),
-                "mpp_lora_forward_inference_f16",
-                &constants,
-            )?
-        };
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
 
         let params = FusedLoraParams {
             batch_size: self.config.batch_size as u32,
@@ -348,42 +312,35 @@ impl MppFusedLora {
             lr_scale_b: self.config.lr_scale_b,
         };
 
-        unsafe {
-            // Inference: buffer(0): x, buffer(1): W, buffer(2): A, buffer(3): B,
-            //            buffer(4): y, buffer(5): params
-            encoder.setBuffer_offset_atIndex(Some(x.as_metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(w.as_metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(a.as_metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(b.as_metal_buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(y.as_metal_buffer()), 0, 4);
-
-            let params_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 5);
-        }
-
-        Self::dispatch_grid(&encoder, &geometry);
-        encoder.endEncoding();
-        command_buffer.commit();
-
-        Ok(command_buffer)
-    }
-
-    fn dispatch_grid(
-        encoder: &objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLComputeCommandEncoder>>,
-        geometry: &DispatchGeometry,
-    ) {
         // Grid: [num_out_tiles, num_batch_tiles, 1]
-        let threadgroup_size = objc2_metal::MTLSize {
-            width: geometry.threads_per_threadgroup,
-            height: 1,
-            depth: 1,
-        };
-        let grid_size = objc2_metal::MTLSize {
+        let grid = objc2_metal::MTLSize {
             width: geometry.num_out_tiles,
             height: geometry.num_batch_tiles,
             depth: 1,
         };
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
+        let tg_size = objc2_metal::MTLSize {
+            width: geometry.threads_per_threadgroup,
+            height: 1,
+            depth: 1,
+        };
+
+        let x_buf = x.as_metal_buffer();
+        let w_buf = w.as_metal_buffer();
+        let a_buf = a.as_metal_buffer();
+        let b_buf = b.as_metal_buffer();
+        let y_buf = y.as_metal_buffer();
+
+        encode_mpp_kernel(&self.ctx, "mpp_lora_forward_inference_f16", grid, tg_size, |encoder| unsafe {
+            // Inference: buffer(0): x, buffer(1): W, buffer(2): A, buffer(3): B,
+            //            buffer(4): y, buffer(5): params
+            encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(w_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(y_buf), 0, 4);
+            let params_ptr = NonNull::from(&params).cast();
+            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 5);
+        })
     }
 }
 

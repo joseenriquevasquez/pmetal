@@ -10,18 +10,18 @@
 //! Single kernel launch combines both projections and the activation, eliminating
 //! intermediate buffer round-trips that would stall the memory bus.
 
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::AsMetalBuffer,
     context::MetalContext,
     error::{MetalError, Result},
+    kernels::mpp_dispatch::encode_mpp_kernel,
 };
 
 /// Configuration for MPP Fused SwiGLU.
@@ -66,10 +66,6 @@ struct FusedSwiGLUParams {
 
 #[derive(Debug, Clone, Copy)]
 struct DispatchGeometry {
-    /// Batch tile size (BM = 32, matching the shader's single-simdgroup tile).
-    bm: usize,
-    /// Intermediate tile size (BN = 32, matching the shader's single-simdgroup tile).
-    bn: usize,
     /// Threadgroups in the intermediate (x) dimension.
     num_tiles_intermediate: usize,
     /// Threadgroups in the batch (y) dimension.
@@ -88,8 +84,6 @@ fn dispatch_geometry(config: &MppFusedSwiGLUConfig) -> DispatchGeometry {
     const BM: usize = 32;
     const BN: usize = 32;
     DispatchGeometry {
-        bm: BM,
-        bn: BN,
         num_tiles_intermediate: config.intermediate_size.div_ceil(BN),
         num_tiles_batch: config.batch_size.div_ceil(BM),
         threads_per_threadgroup: 32,
@@ -160,23 +154,6 @@ impl MppFusedSwiGLU {
 
         let geometry = dispatch_geometry(&self.config);
         let kernel_name = kernel_name(&self.config);
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(self.ctx.device(), kernel_name, &constants)?
-        };
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
 
         let params = FusedSwiGLUParams {
             batch_size: self.config.batch_size as u32,
@@ -187,35 +164,33 @@ impl MppFusedSwiGLU {
             lora_scale: 0.0,
         };
 
-        unsafe {
-            // buffer(0): input, buffer(1): gate_weight, buffer(2): up_weight,
-            // buffer(3): output, buffer(4): params
-            encoder.setBuffer_offset_atIndex(Some(input.as_metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(gate_weight.as_metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(up_weight.as_metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(output.as_metal_buffer()), 0, 3);
-
-            let params_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 4);
-        }
-
         // Grid: [num_intermediate_tiles, num_batch_tiles, 1]
-        let threadgroup_size = objc2_metal::MTLSize {
-            width: geometry.threads_per_threadgroup,
-            height: 1,
-            depth: 1,
-        };
-        let grid_size = objc2_metal::MTLSize {
+        let grid = objc2_metal::MTLSize {
             width: geometry.num_tiles_intermediate,
             height: geometry.num_tiles_batch,
             depth: 1,
         };
+        let tg_size = objc2_metal::MTLSize {
+            width: geometry.threads_per_threadgroup,
+            height: 1,
+            depth: 1,
+        };
 
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
+        let input_buf = input.as_metal_buffer();
+        let gate_buf = gate_weight.as_metal_buffer();
+        let up_buf = up_weight.as_metal_buffer();
+        let output_buf = output.as_metal_buffer();
 
-        Ok(command_buffer)
+        encode_mpp_kernel(&self.ctx, kernel_name, grid, tg_size, |encoder| unsafe {
+            // buffer(0): input, buffer(1): gate_weight, buffer(2): up_weight,
+            // buffer(3): output, buffer(4): params
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(gate_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(up_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 3);
+            let params_ptr = NonNull::from(&params).cast();
+            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 4);
+        })
     }
 }
 

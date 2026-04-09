@@ -19,18 +19,18 @@
 //! Grid layout for standalone: `[batch, heads, seq_len]`
 //! Each threadgroup = one SIMD group (32 lanes) covering half_dim pairs.
 
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::AsMetalBuffer,
     context::MetalContext,
     error::{MetalError, Result},
+    kernels::mpp_dispatch::encode_mpp_kernel,
 };
 
 // =============================================================================
@@ -236,33 +236,28 @@ impl MppFusedRoPE {
             "mpp_rope_qk_inplace_f16"
         };
 
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(self.ctx.device(), kernel_name, &constants)?
-        };
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
-
         let params = MppRoPEParamsMetal::from_config(&self.config);
         let kv_heads = self.config.num_kv_heads as u32;
 
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(q.as_metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(k.as_metal_buffer()), 0, 1);
+        // Grid: [batch_size, seq_len, 1]  Threadgroup: [32, 1, 1]
+        let grid = objc2_metal::MTLSize {
+            width: self.config.batch_size,
+            height: self.config.seq_len,
+            depth: 1,
+        };
+        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
 
-            if let Some(pos_ids) = position_ids {
+        let q_buf = q.as_metal_buffer();
+        let k_buf = k.as_metal_buffer();
+        let pos_buf = position_ids.map(|p| p.as_metal_buffer());
+
+        encode_mpp_kernel(&self.ctx, kernel_name, grid, tg_size, |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(k_buf), 0, 1);
+
+            if let Some(pos) = pos_buf {
                 // mpp_rope_qk_with_positions_f16: pos_ids at buffer 2, params at 3, kv_heads at 4
-                encoder.setBuffer_offset_atIndex(Some(pos_ids.as_metal_buffer()), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(pos), 0, 2);
                 let p_ptr = NonNull::from(&params).cast();
                 encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 3);
                 let kv_ptr = NonNull::from(&kv_heads).cast();
@@ -274,21 +269,7 @@ impl MppFusedRoPE {
                 let kv_ptr = NonNull::from(&kv_heads).cast();
                 encoder.setBytes_length_atIndex(kv_ptr, std::mem::size_of_val(&kv_heads), 3);
             }
-        }
-
-        // Grid: [batch_size, seq_len, 1]  Threadgroup: [32, 1, 1]
-        let threadgroup_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
-        let grid_size = objc2_metal::MTLSize {
-            width: self.config.batch_size,
-            height: self.config.seq_len,
-            depth: 1,
-        };
-
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
-
-        Ok(command_buffer)
+        })
     }
 
     // Internal helper for single-buffer kernels (inplace / with_positions).
@@ -306,30 +287,24 @@ impl MppFusedRoPE {
             ));
         }
 
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(self.ctx.device(), kernel_name, &constants)?
-        };
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
-
         let params = MppRoPEParamsMetal::from_config(&self.config);
 
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(x.as_metal_buffer()), 0, 0);
+        // Grid: [batch, heads, seq_len]  Threadgroup: [32, 1, 1]
+        let grid = objc2_metal::MTLSize {
+            width: self.config.batch_size,
+            height: self.config.num_heads,
+            depth: self.config.seq_len,
+        };
+        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
+
+        let x_buf = x.as_metal_buffer();
+        let pos_buf = position_ids.map(|p| p.as_metal_buffer());
+
+        encode_mpp_kernel(&self.ctx, kernel_name, grid, tg_size, |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
             if has_positions {
-                if let Some(pos) = position_ids {
-                    encoder.setBuffer_offset_atIndex(Some(pos.as_metal_buffer()), 0, 1);
+                if let Some(pos) = pos_buf {
+                    encoder.setBuffer_offset_atIndex(Some(pos), 0, 1);
                 }
                 let p_ptr = NonNull::from(&params).cast();
                 encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 2);
@@ -337,21 +312,7 @@ impl MppFusedRoPE {
                 let p_ptr = NonNull::from(&params).cast();
                 encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 1);
             }
-        }
-
-        // Grid: [batch, heads, seq_len]  Threadgroup: [32, 1, 1]
-        let threadgroup_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
-        let grid_size = objc2_metal::MTLSize {
-            width: self.config.batch_size,
-            height: self.config.num_heads,
-            depth: self.config.seq_len,
-        };
-
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
-
-        Ok(command_buffer)
+        })
     }
 }
 

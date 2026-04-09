@@ -16,18 +16,18 @@
 //! Grid layout: `[ceil(max_param_elements / 32), num_params, 1]`
 //! Each threadgroup is exactly one SIMD group (32 lanes).
 
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::AsMetalBuffer,
     context::MetalContext,
     error::{MetalError, Result},
+    kernels::mpp_dispatch::encode_mpp_kernel,
 };
 
 // =============================================================================
@@ -189,23 +189,6 @@ impl MppFusedAdamW {
             "mpp_fused_adamw_f32"
         };
 
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(self.ctx.device(), kernel_name, &constants)?
-        };
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
-
         let metal_config = MppAdamWConfigMetal {
             learning_rate: lr,
             beta1,
@@ -216,35 +199,33 @@ impl MppFusedAdamW {
         };
         let num_params = self.config.num_params as u32;
 
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(params.as_metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(grads.as_metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(m.as_metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(v.as_metal_buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(param_info_buf.as_metal_buffer()), 0, 4);
-
-            let cfg_ptr = NonNull::from(&metal_config).cast();
-            encoder.setBytes_length_atIndex(cfg_ptr, std::mem::size_of_val(&metal_config), 5);
-
-            let np_ptr = NonNull::from(&num_params).cast();
-            encoder.setBytes_length_atIndex(np_ptr, std::mem::size_of_val(&num_params), 6);
-        }
-
         // Grid: [ceil(max_param_elements / 32), num_params, 1]
         // Threadgroup: [32, 1, 1] — single SIMD group
         let tiles_x = self.config.max_param_elements.div_ceil(32);
-        let threadgroup_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
-        let grid_size = objc2_metal::MTLSize {
+        let grid = objc2_metal::MTLSize {
             width: tiles_x,
             height: self.config.num_params,
             depth: 1,
         };
+        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
 
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
+        let params_buf = params.as_metal_buffer();
+        let grads_buf = grads.as_metal_buffer();
+        let m_buf = m.as_metal_buffer();
+        let v_buf = v.as_metal_buffer();
+        let info_buf = param_info_buf.as_metal_buffer();
 
-        Ok(command_buffer)
+        encode_mpp_kernel(&self.ctx, kernel_name, grid, tg_size, |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(params_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(grads_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(m_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(v_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(info_buf), 0, 4);
+            let cfg_ptr = NonNull::from(&metal_config).cast();
+            encoder.setBytes_length_atIndex(cfg_ptr, std::mem::size_of_val(&metal_config), 5);
+            let np_ptr = NonNull::from(&num_params).cast();
+            encoder.setBytes_length_atIndex(np_ptr, std::mem::size_of_val(&num_params), 6);
+        })
     }
 }
 
@@ -297,47 +278,26 @@ impl MppGradScale {
             "mpp_scale_gradients"
         };
 
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(self.ctx.device(), kernel_name, &constants)?
-        };
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
-
         let total = self.config.total_elements as u32;
-
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(grads.as_metal_buffer()), 0, 0);
-            let scale_ptr = NonNull::from(&scale).cast();
-            encoder.setBytes_length_atIndex(scale_ptr, std::mem::size_of_val(&scale), 1);
-            let total_ptr = NonNull::from(&total).cast();
-            encoder.setBytes_length_atIndex(total_ptr, std::mem::size_of_val(&total), 2);
-        }
 
         // Each thread handles 4 elements → ceil(total/4) threads, groups of 32
         let num_threads = self.config.total_elements.div_ceil(4);
-        let threadgroup_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
-        let grid_size = objc2_metal::MTLSize {
+        let grid = objc2_metal::MTLSize {
             width: num_threads.div_ceil(32),
             height: 1,
             depth: 1,
         };
+        let tg_size = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
 
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
+        let grads_buf = grads.as_metal_buffer();
 
-        Ok(command_buffer)
+        encode_mpp_kernel(&self.ctx, kernel_name, grid, tg_size, |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(grads_buf), 0, 0);
+            let scale_ptr = NonNull::from(&scale).cast();
+            encoder.setBytes_length_atIndex(scale_ptr, std::mem::size_of_val(&scale), 1);
+            let total_ptr = NonNull::from(&total).cast();
+            encoder.setBytes_length_atIndex(total_ptr, std::mem::size_of_val(&total), 2);
+        })
     }
 }
 
