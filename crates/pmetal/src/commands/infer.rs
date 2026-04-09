@@ -698,10 +698,23 @@ pub(crate) async fn run_inference(
         println!("Stopped by: max length");
     }
     if let Some(m) = runner.state.last_decode_metrics {
-        println!(
-            "Decode: {:.0} tok/s (avg={:.2}ms p50={:.2}ms over {} steps)",
-            m.tok_per_sec, m.avg_step_ms, m.p50_step_ms, m.measured_steps,
-        );
+        let chip = if let Ok(ctx) = pmetal_metal::context::MetalContext::global() {
+            let name = &ctx.properties().name;
+            name.strip_prefix("Apple ").unwrap_or(name).to_string()
+        } else {
+            String::new()
+        };
+        if chip.is_empty() {
+            println!(
+                "Decode: {:.0} tok/s (avg={:.2}ms p50={:.2}ms over {} steps)",
+                m.tok_per_sec, m.avg_step_ms, m.p50_step_ms, m.measured_steps,
+            );
+        } else {
+            println!(
+                "Decode: {:.0} tok/s (avg={:.2}ms p50={:.2}ms over {} steps) [{}]",
+                m.tok_per_sec, m.avg_step_ms, m.p50_step_ms, m.measured_steps, chip,
+            );
+        }
     }
 
     // Print expert prefetch stats if offloading was active
