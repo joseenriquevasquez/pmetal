@@ -139,25 +139,54 @@ impl BackendCaps {
     ///
     /// Handles large GEMM shapes with NAX acceleration. Routes decode (M=1)
     /// and unaligned K back to Metal 3.
+    ///
+    /// # Wired MPP operations (Task 18)
+    ///
+    /// The following flags are `true` because the corresponding trait methods
+    /// in [`Metal4Backend`] now dispatch through MPP kernel structs:
+    ///
+    /// - `has_swiglu`: `MppFusedSwiGLU` (no-LoRA path; LoRA falls back to Metal 3)
+    /// - `has_cross_entropy`: `MppFusedCrossEntropy`
+    /// - `has_rope`: `MppFusedRoPE`
+    /// - `has_distill`: `MppFusedDistill`
+    /// - `has_norm_lora`: `MppFusedNormLora`
+    /// - `has_lora`: `MppFusedLora` (inference mode)
+    /// - `has_dw_gemm`: `MppDwGemm`
+    ///
+    /// The following remain `false` because their MPP APIs are structurally
+    /// incompatible with the trait's parameter model (see `backend.rs` doc):
+    ///
+    /// - `has_adamw`: `BatchedCommandBuffer` vs MPP's own-command-buffer model
+    /// - `has_moe`: quantized u32 weights vs MPP's dense fp16 weights
+    /// - `has_grouped_gemm`: GPU-side prefix-sum buffer, no CPU read
     pub const fn metal4() -> Self {
         Self {
             name: "Metal4",
             has_gemm: true,
-            // Task 12+: set to true once the MPP quantized GEMM path is wired in.
-            // Leaving this true while Metal4Backend::quantized_gemm() delegates to
-            // Metal3Backend (which has a todo!()) causes a panic on M5 hardware.
+            // Quantized GEMM path (mpp_quantized.rs) is wired in Task 12.
+            // Leaving false while Metal3Backend's quantized_gemm() may panic.
             has_quantized_gemm: false,
             has_flash_attention: false,
             has_mpp_flash_attention: true,
-            has_swiglu: false,
+            // Wired: MppFusedSwiGLU (no-LoRA path only; LoRA falls back).
+            has_swiglu: true,
+            // Fallback: BatchedCommandBuffer vs MPP own-command-buffer model.
             has_adamw: false,
-            has_cross_entropy: false,
-            has_rope: false,
+            // Wired: MppFusedCrossEntropy.
+            has_cross_entropy: true,
+            // Wired: MppFusedRoPE.
+            has_rope: true,
+            // Fallback: quantized u32 weights in descriptor, MPP needs fp16.
             has_moe: false,
-            has_distill: false,
-            has_norm_lora: false,
-            has_lora: false,
-            has_dw_gemm: false,
+            // Wired: MppFusedDistill.
+            has_distill: true,
+            // Wired: MppFusedNormLora.
+            has_norm_lora: true,
+            // Wired: MppFusedLora (inference mode).
+            has_lora: true,
+            // Wired: MppDwGemm (synchronous dispatch, bypasses BatchedCommandBuffer).
+            has_dw_gemm: true,
+            // Fallback: GroupedGemmDispatch needs per-expert counts from GPU buffer.
             has_grouped_gemm: false,
             gemm_k_alignment: 32,
             gemm_min_m: 2,

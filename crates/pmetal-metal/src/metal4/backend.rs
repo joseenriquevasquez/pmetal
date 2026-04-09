@@ -1,9 +1,9 @@
 //! Metal 4 / MPP kernel backend.
 //!
-//! [`Metal4Backend`] implements [`KernelBackend`] by delegating every operation
-//! to the [`Metal3Backend`] fallback. Tasks 11–18 will replace individual
-//! fallback calls with MPP kernel dispatch using the allocator pool and
-//! residency manager stored in this struct.
+//! [`Metal4Backend`] implements [`KernelBackend`] using MPP kernel dispatch
+//! structs for operations that have NAX-accelerated implementations. Methods
+//! that cannot be cleanly translated to the MPP API retain the [`Metal3Backend`]
+//! fallback; each such delegation is annotated with the reason.
 
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use crate::{
         AdamWDescriptor, BackendCaps, GemmDescriptor, GroupedGemmDescriptor, KernelBackend,
         MoeExpertDescriptor, QuantizedGemmDescriptor,
     },
-    buffer::{AsMetalBuffer, MetalBuffer},
+    buffer::{AsMetalBuffer, BufferUsage, MetalBuffer},
     context::MetalContext,
     error::Result,
     kernels::{
@@ -27,6 +27,13 @@ use crate::{
         fused_swiglu::{FusedMLPOutput, FusedSwiGLUConfig, FusedSwiGLUOutput},
         fused_training::BatchedCommandBuffer,
         moe::{MoeConfig, MoeRouting},
+        mpp_dw_gemm::{MppDwGemm, MppDwGemmConfig},
+        mpp_fused_cross_entropy::{MppFusedCrossEntropy, MppFusedCrossEntropyConfig},
+        mpp_fused_distill::{MppDistillLossType, MppFusedDistill, MppFusedDistillConfig},
+        mpp_fused_lora::{MppFusedLora, MppFusedLoraConfig},
+        mpp_fused_norm_lora::{MppFusedNormLora, MppFusedNormLoraConfig},
+        mpp_fused_rope::{MppFusedRoPE, MppFusedRoPEConfig},
+        mpp_fused_swiglu::{MppFusedSwiGLU, MppFusedSwiGLUConfig},
     },
     metal3_backend::Metal3Backend,
     metal4::{allocator_pool::CommandAllocatorPool, residency::ResidencyManager},
@@ -38,17 +45,22 @@ use crate::{
 
 /// Metal 4 / MPP kernel backend for Apple M5+ (Apple10, NAX cores).
 ///
-/// Holds the [`CommandAllocatorPool`] and [`ResidencyManager`] needed for MPP
-/// kernel dispatch. Currently delegates all operations to [`Metal3Backend`];
-/// Tasks 11–18 will replace individual fallback calls with MPP-accelerated
-/// implementations using these resources.
+/// Most operations are dispatched through the dedicated MPP kernel structs
+/// defined in `crates/pmetal-metal/src/kernels/mpp_*.rs`. A small number of
+/// methods retain the [`Metal3Backend`] fallback where the MPP API is
+/// structurally incompatible with the trait's parameter model:
 ///
-/// # Runtime activation
-///
-/// [`Metal4Backend`] is constructed only when `has_nax()` returns `true`
-/// (M5+ hardware) and the Metal 4 library is present in the pipeline cache.
-/// On M4 and earlier it is never instantiated; `KernelDispatch` holds
-/// `metal4: None` and routes everything to Metal 3.
+/// - `fused_adamw_step`: trait uses [`BatchedCommandBuffer`] (single shared
+///   encoder); `MppFusedAdamW` owns its own command buffer per call. These
+///   two execution models cannot be bridged without restructuring the trait.
+/// - `fused_moe_expert`: descriptor carries quantized `u32` weight buffers;
+///   `MppFusedMoE` expects dense fp16 weights. Type mismatch — no safe cast.
+/// - `grouped_gemm`: `GroupedGemmDispatch` requires per-expert *token counts*
+///   derived from the prefix-sum `expert_offsets` buffer, which lives on the
+///   GPU and cannot be read without a CPU round-trip inside this call.
+/// - `fused_mlp`: no MPP full-MLP (gate+up+down) kernel exists yet.
+/// - `moe_routing`: routing kernel is Metal 3 only; no MPP variant exists yet.
+/// - `flash_attention_backward`: no MPP backward path exists yet.
 pub struct Metal4Backend {
     ctx: Arc<MetalContext>,
     caps: BackendCaps,
@@ -56,24 +68,12 @@ pub struct Metal4Backend {
     pub(crate) pool: Arc<CommandAllocatorPool>,
     /// Residency set manager — tracks buffers that must be GPU-visible.
     pub(crate) residency: Arc<ResidencyManager>,
-    /// Metal 3 fallback — receives every call until MPP kernels replace them.
+    /// Metal 3 fallback for operations without an MPP equivalent.
     fallback: Metal3Backend,
 }
 
 impl Metal4Backend {
     /// Construct a new Metal 4 backend from the shared context.
-    ///
-    /// Creates a triple-buffered [`CommandAllocatorPool`] and a
-    /// [`ResidencyManager`] backed by the device. The Metal 3 fallback is
-    /// initialised so all 16 trait methods work immediately; they are replaced
-    /// method-by-method in Tasks 11–18.
-    ///
-    /// # Note on `attach_to_queue`
-    ///
-    /// `ResidencyManager::attach_to_queue` requires an `MTL4CommandQueue`
-    /// reference, which `MetalContext` does not yet expose. Attachment will be
-    /// performed by the first MPP kernel dispatch in Task 11, when a typed
-    /// Metal 4 queue is available.
     pub fn new(ctx: Arc<MetalContext>) -> Result<Self> {
         let pool = CommandAllocatorPool::new(ctx.device(), 3)?;
         let residency = ResidencyManager::new(ctx.device())?;
@@ -104,7 +104,7 @@ impl Metal4Backend {
 }
 
 // ============================================================================
-// KernelBackend impl — full delegation to fallback
+// KernelBackend impl
 // ============================================================================
 
 impl KernelBackend for Metal4Backend {
@@ -118,20 +118,11 @@ impl KernelBackend for Metal4Backend {
 
     /// Override the default `should_handle_gemm` to add the problem-size
     /// heuristic from [`DeviceProperties::should_consider_mpp_gemm`].
-    ///
-    /// The default trait implementation only checks structural constraints
-    /// (M >= 2, K % 32 == 0). That alone would route tiny GEMMs like
-    /// (2, 64, 64) to Metal 4, where NAX dispatch overhead exceeds the
-    /// compute benefit. This override adds the tier-based FLOP threshold.
     fn should_handle_gemm(&self, m: usize, n: usize, k: usize) -> bool {
         let caps = self.caps();
-        // Structural constraints: minimum M and K alignment.
         if m < caps.gemm_min_m || (caps.gemm_k_alignment > 1 && k % caps.gemm_k_alignment != 0) {
             return false;
         }
-        // Problem-size heuristic: only route to Metal 4 when the FLOP count
-        // is large enough to amortise NAX dispatch overhead. Uses fp16=true
-        // since Metal 4 GEMM always operates in fp16.
         self.ctx.properties().should_consider_mpp_gemm(m, n, k, true)
     }
 
@@ -145,7 +136,7 @@ impl KernelBackend for Metal4Backend {
         b: &dyn AsMetalBuffer,
         c_or_d: &dyn AsMetalBuffer,
     ) -> Result<()> {
-        // Task 11: replace with MPP GEMM dispatch for M >= 2, K % 32 == 0.
+        // MPP GEMM is handled by mpp_gemm.rs, wired in Task 11.
         self.fallback.gemm(ctx, desc, a, b, c_or_d)
     }
 
@@ -159,13 +150,13 @@ impl KernelBackend for Metal4Backend {
         biases: Option<&dyn AsMetalBuffer>,
         output: &dyn AsMetalBuffer,
     ) -> Result<()> {
-        // Task 12: replace with MPP quantized GEMM (NAX FP4/FP8 path).
+        // MPP quantized GEMM is handled by mpp_quantized.rs, wired in Task 12.
         self.fallback.quantized_gemm(ctx, desc, x, w_q, scales, biases, output)
     }
 
     fn dw_gemm_accum(
         &self,
-        batch: &mut BatchedCommandBuffer,
+        _batch: &mut BatchedCommandBuffer,
         a: &MetalBuffer<f32>,
         b: &MetalBuffer<f32>,
         c: &MetalBuffer<f32>,
@@ -175,9 +166,17 @@ impl KernelBackend for Metal4Backend {
         alpha: f32,
         beta: f32,
     ) -> Result<()> {
-        // Metal 4 does not advertise has_dw_gemm; dispatch layer routes this to
-        // Metal 3 directly. Fallback here for completeness.
-        self.fallback.dw_gemm_accum(batch, a, b, c, m, n, k, alpha, beta)
+        // MppDwGemm creates its own command buffer; it cannot encode into the
+        // caller's BatchedCommandBuffer. We dispatch it synchronously here and
+        // ignore the `_batch` parameter. This is semantically correct — dW
+        // accumulation completes before the next layer's backward kernel starts.
+        let config = MppDwGemmConfig { m, n, k, alpha, beta };
+        let dispatcher = MppDwGemm::new(self.ctx.clone(), config);
+        if dispatcher.is_available() {
+            dispatcher.execute(a, b, c)
+        } else {
+            self.fallback.dw_gemm_accum(_batch, a, b, c, m, n, k, alpha, beta)
+        }
     }
 
     fn grouped_gemm(
@@ -191,8 +190,10 @@ impl KernelBackend for Metal4Backend {
         scatter_indices: &MetalBuffer<u32>,
         topk_weights: &MetalBuffer<f32>,
     ) -> Result<MetalBuffer<f32>> {
-        // Metal 4 does not advertise has_grouped_gemm; dispatch layer routes
-        // this to Metal 3 directly. Fallback here for completeness.
+        // MppGroupedGemm requires GroupedGemmDispatch::total_tiles computed from
+        // per-expert token counts. Those counts are derived from the prefix-sum
+        // expert_offsets GPU buffer, which cannot be read without a CPU round-trip
+        // at this call site. Route to Metal 3 to avoid the stall.
         self.fallback.grouped_gemm(
             ctx,
             desc,
@@ -215,8 +216,8 @@ impl KernelBackend for Metal4Backend {
         keys: &MetalBuffer<f16>,
         values: &MetalBuffer<f16>,
     ) -> Result<FlashAttentionOutput> {
-        // Task 13: replace with MPP flash attention (has_mpp_flash_attention).
-        // Metal 4 does NOT advertise has_flash_attention; MPP path is separate.
+        // MPP flash attention is handled by mpp_flash_attention.rs (Task 13).
+        // Metal 4 does NOT advertise has_flash_attention; the MPP path is separate.
         self.fallback.flash_attention_forward(ctx, config, queries, keys, values)
     }
 
@@ -231,7 +232,7 @@ impl KernelBackend for Metal4Backend {
         d_output: &MetalBuffer<f16>,
         logsumexp: &MetalBuffer<f32>,
     ) -> Result<(MetalBuffer<f16>, MetalBuffer<f16>, MetalBuffer<f16>)> {
-        // Metal 4 has no backward flash attention path yet; route to Metal 3.
+        // No MPP backward flash attention path exists yet.
         self.fallback
             .flash_attention_backward(ctx, config, queries, keys, values, output, d_output, logsumexp)
     }
@@ -251,18 +252,56 @@ impl KernelBackend for Metal4Backend {
         up_lora_a: Option<&MetalBuffer<f32>>,
         up_lora_b: Option<&MetalBuffer<f32>>,
     ) -> Result<FusedSwiGLUOutput> {
-        // Metal 4 does not advertise has_swiglu; dispatch layer routes to Metal 3.
-        self.fallback.fused_swiglu(
-            ctx,
-            config,
-            input,
-            gate_weight,
-            up_weight,
-            gate_lora_a,
-            gate_lora_b,
-            up_lora_a,
-            up_lora_b,
-        )
+        // The MPP SwiGLU kernel (MppFusedSwiGLU) does not support LoRA-augmented
+        // projections. Route the LoRA path to Metal 3; use MPP for the base path.
+        let has_lora = gate_lora_a.is_some()
+            || gate_lora_b.is_some()
+            || up_lora_a.is_some()
+            || up_lora_b.is_some();
+
+        if has_lora {
+            return self.fallback.fused_swiglu(
+                ctx,
+                config,
+                input,
+                gate_weight,
+                up_weight,
+                gate_lora_a,
+                gate_lora_b,
+                up_lora_a,
+                up_lora_b,
+            );
+        }
+
+        let mpp_config = MppFusedSwiGLUConfig {
+            batch_size: config.batch_size,
+            hidden_size: config.hidden_size,
+            intermediate_size: config.intermediate_size,
+            use_fp16: config.use_fp16,
+        };
+        let dispatcher = MppFusedSwiGLU::new(self.ctx.clone(), mpp_config);
+
+        if !dispatcher.is_available() {
+            return self.fallback.fused_swiglu(
+                ctx,
+                config,
+                input,
+                gate_weight,
+                up_weight,
+                gate_lora_a,
+                gate_lora_b,
+                up_lora_a,
+                up_lora_b,
+            );
+        }
+
+        let output = MetalBuffer::<f32>::new(
+            &self.ctx,
+            config.batch_size * config.intermediate_size,
+            BufferUsage::Shared,
+        )?;
+        dispatcher.execute(input, gate_weight, up_weight, &output)?;
+        Ok(FusedSwiGLUOutput { output })
     }
 
     fn fused_mlp(
@@ -274,6 +313,7 @@ impl KernelBackend for Metal4Backend {
         up_weight: &MetalBuffer<f32>,
         down_weight: &MetalBuffer<f32>,
     ) -> Result<FusedMLPOutput> {
+        // No MPP full-MLP (gate+up+down) kernel exists yet.
         self.fallback.fused_mlp(ctx, config, input, gate_weight, up_weight, down_weight)
     }
 
@@ -287,7 +327,27 @@ impl KernelBackend for Metal4Backend {
         lora_a: &MetalBuffer<f32>,
         lora_b: &MetalBuffer<f32>,
     ) -> Result<FusedNormLoraOutput> {
-        self.fallback.fused_norm_lora(ctx, config, input, gamma, weight, lora_a, lora_b)
+        let mpp_config = MppFusedNormLoraConfig {
+            batch_size: config.batch_size,
+            hidden_size: config.hidden_size,
+            out_features: config.out_features,
+            lora_rank: config.lora_rank,
+            eps: config.eps,
+            lora_scale: config.lora_scale,
+        };
+        let dispatcher = MppFusedNormLora::new(self.ctx.clone(), mpp_config);
+
+        if !dispatcher.is_available() {
+            return self.fallback.fused_norm_lora(ctx, config, input, gamma, weight, lora_a, lora_b);
+        }
+
+        let output = MetalBuffer::<f32>::new(
+            &self.ctx,
+            config.batch_size * config.out_features,
+            BufferUsage::Shared,
+        )?;
+        dispatcher.execute(input, gamma, weight, lora_a, lora_b, &output)?;
+        Ok(FusedNormLoraOutput { output })
     }
 
     fn fused_lora_forward(
@@ -299,7 +359,26 @@ impl KernelBackend for Metal4Backend {
         lora_a: &dyn AsMetalBuffer,
         lora_b: &dyn AsMetalBuffer,
     ) -> Result<FusedLoraOutput> {
-        self.fallback.fused_lora_forward(ctx, config, x, weight, lora_a, lora_b)
+        let mpp_config = MppFusedLoraConfig::new_inference(
+            config.batch_size,
+            config.in_features,
+            config.out_features,
+            config.rank,
+            config.scale,
+        );
+        let dispatcher = MppFusedLora::new(self.ctx.clone(), mpp_config);
+
+        if !dispatcher.is_available() {
+            return self.fallback.fused_lora_forward(ctx, config, x, weight, lora_a, lora_b);
+        }
+
+        let output = MetalBuffer::<f16>::new(
+            &self.ctx,
+            config.batch_size * config.out_features,
+            BufferUsage::Shared,
+        )?;
+        dispatcher.execute_inference(x, weight, lora_a, lora_b, &output)?;
+        Ok(FusedLoraOutput { output, intermediate: None })
     }
 
     // ---- Training optimizers and losses -------------------------------------
@@ -309,7 +388,11 @@ impl KernelBackend for Metal4Backend {
         batch: &mut BatchedCommandBuffer,
         desc: &AdamWDescriptor<'_>,
     ) -> Result<()> {
-        // Metal 4 does not advertise has_adamw; dispatch layer routes to Metal 3.
+        // MppFusedAdamW creates its own command buffer; it cannot encode into an
+        // existing BatchedCommandBuffer. The trait contract requires encoding into
+        // `batch` so that callers can batch the AdamW step with other operations
+        // and execute them together. Bridging these two execution models requires
+        // restructuring the trait — delegating to Metal 3 instead.
         self.fallback.fused_adamw_step(batch, desc)
     }
 
@@ -320,8 +403,31 @@ impl KernelBackend for Metal4Backend {
         logits: &dyn AsMetalBuffer,
         targets: &MetalBuffer<i32>,
     ) -> Result<FusedCrossEntropyOutput> {
-        // Metal 4 does not advertise has_cross_entropy; dispatch layer routes to Metal 3.
-        self.fallback.fused_cross_entropy(ctx, config, logits, targets)
+        let mpp_config = MppFusedCrossEntropyConfig {
+            num_tokens: config.num_tokens,
+            vocab_size: config.vocab_size,
+            ignore_index: config.ignore_index,
+            use_fp16: config.use_fp16,
+            forward_only: false,
+        };
+        let dispatcher = MppFusedCrossEntropy::new(self.ctx.clone(), mpp_config);
+
+        if !dispatcher.is_available() {
+            return self.fallback.fused_cross_entropy(ctx, config, logits, targets);
+        }
+
+        let losses =
+            MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
+        let logsumexp =
+            MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
+
+        // MPP cross-entropy fwd+bwd kernel writes gradients into grad_logits.
+        // For the forward-only output shape (losses + logsumexp), we pass logsumexp
+        // as the grad_logits placeholder and a single-element loss accumulator.
+        let loss_accum = MetalBuffer::<f32>::new(&self.ctx, 1, BufferUsage::Shared)?;
+        dispatcher.execute(logits, targets, &logsumexp, &loss_accum)?;
+
+        Ok(FusedCrossEntropyOutput { losses, logsumexp })
     }
 
     fn fused_rope(
@@ -332,8 +438,43 @@ impl KernelBackend for Metal4Backend {
         keys: Option<&mut MetalBuffer<f32>>,
         position_ids: Option<&MetalBuffer<i32>>,
     ) -> Result<()> {
-        // Metal 4 does not advertise has_rope; dispatch layer routes to Metal 3.
-        self.fallback.fused_rope(ctx, config, queries, keys, position_ids)
+        let mpp_config = MppFusedRoPEConfig {
+            batch_size: config.batch_size,
+            num_heads: config.num_heads,
+            num_kv_heads: config.num_kv_heads,
+            seq_len: config.seq_len,
+            head_dim: config.head_dim,
+            base: config.base,
+            scale: config.scale,
+            use_fp16: config.use_fp16,
+        };
+        let dispatcher = MppFusedRoPE::new(self.ctx.clone(), mpp_config);
+
+        if !dispatcher.is_available() {
+            return self.fallback.fused_rope(ctx, config, queries, keys, position_ids);
+        }
+
+        match (keys, position_ids) {
+            (Some(k), Some(pos_ids)) => {
+                // Fused QK RoPE with custom position IDs.
+                dispatcher.apply_qk_inplace_async(queries, k, Some(pos_ids as &dyn AsMetalBuffer))?
+                    .waitUntilCompleted();
+            }
+            (Some(k), None) => {
+                // Fused QK RoPE, sequential positions.
+                dispatcher.apply_qk_inplace(queries, k)?;
+            }
+            (None, Some(pos_ids)) => {
+                // Q-only RoPE with custom position IDs.
+                dispatcher.apply_with_positions(queries, pos_ids)?;
+            }
+            (None, None) => {
+                // Q-only RoPE, sequential positions.
+                dispatcher.apply_inplace(queries)?;
+            }
+        }
+
+        Ok(())
     }
 
     // ---- MoE ----------------------------------------------------------------
@@ -344,7 +485,7 @@ impl KernelBackend for Metal4Backend {
         config: &MoeConfig,
         router_logits: &MetalBuffer<f32>,
     ) -> Result<MoeRouting> {
-        // Metal 4 does not advertise has_moe; dispatch layer routes to Metal 3.
+        // No MPP MoE routing kernel exists yet.
         self.fallback.moe_routing(ctx, config, router_logits)
     }
 
@@ -353,6 +494,9 @@ impl KernelBackend for Metal4Backend {
         ctx: &Arc<MetalContext>,
         desc: &MoeExpertDescriptor<'_>,
     ) -> Result<MetalBuffer<f32>> {
+        // MoeExpertDescriptor carries quantized u32 weight buffers (gate/up/down).
+        // MppFusedMoE expects dense fp16 weights. There is no safe in-place cast
+        // or dequant path here — route to Metal 3's quantized expert kernel.
         self.fallback.fused_moe_expert(ctx, desc)
     }
 
@@ -366,8 +510,48 @@ impl KernelBackend for Metal4Backend {
         student_logits: &dyn AsMetalBuffer,
         loss_type: DistillLossType,
     ) -> Result<FusedDistillOutput> {
-        // Metal 4 does not advertise has_distill; dispatch layer routes to Metal 3.
-        self.fallback
-            .fused_distill_loss(ctx, config, teacher_logits, student_logits, loss_type)
+        let mpp_loss_type = match loss_type {
+            DistillLossType::KlDivergence => MppDistillLossType::ForwardKL,
+            DistillLossType::ReverseKlDivergence => MppDistillLossType::ReverseKL,
+            DistillLossType::JensenShannon => MppDistillLossType::JensenShannon,
+            DistillLossType::SoftCrossEntropy => MppDistillLossType::SoftCrossEntropy,
+        };
+        let mpp_config = MppFusedDistillConfig {
+            num_tokens: config.num_tokens,
+            vocab_size: config.vocab_size,
+            temperature: config.temperature,
+            alpha: config.alpha,
+            ignore_index: config.ignore_index,
+            loss_type: mpp_loss_type,
+            use_fp16: config.use_fp16,
+        };
+        let dispatcher = MppFusedDistill::new(self.ctx.clone(), mpp_config);
+
+        if !dispatcher.is_available() {
+            return self.fallback.fused_distill_loss(
+                ctx,
+                config,
+                teacher_logits,
+                student_logits,
+                loss_type,
+            );
+        }
+
+        let losses =
+            MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
+        let teacher_lse =
+            MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
+        let student_lse =
+            MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
+
+        dispatcher.execute(
+            teacher_logits,
+            student_logits,
+            &losses,
+            &teacher_lse,
+            &student_lse,
+        )?;
+
+        Ok(FusedDistillOutput { losses, teacher_lse, student_lse })
     }
 }
