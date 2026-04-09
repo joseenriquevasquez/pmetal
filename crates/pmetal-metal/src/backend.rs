@@ -380,6 +380,7 @@ pub struct MoeExpertDescriptor<'a> {
 /// Before calling any GEMM method, callers should invoke [`should_handle_gemm`] to
 /// confirm the backend can efficiently handle the shape. If it returns `false`, the
 /// caller should fall back to the other backend.
+#[allow(clippy::too_many_arguments)]
 pub trait KernelBackend: Send + Sync {
     // ---- Capabilities -------------------------------------------------------
 
