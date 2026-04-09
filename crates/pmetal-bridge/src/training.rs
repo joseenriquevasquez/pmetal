@@ -183,6 +183,7 @@ pub fn lora_forward(
 /// - `scale`:         `alpha / rank`
 ///
 /// Returns `[batch, seq, out_features]`.
+#[allow(clippy::too_many_arguments)]
 pub fn lora_forward_quantized(
     x: &InlineArray,
     base_weight: &InlineArray,

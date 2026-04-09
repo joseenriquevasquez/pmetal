@@ -848,7 +848,7 @@ fn validate_shard_path(
         )));
     }
     let shard_path = model_dir.join(shard_file);
-    let canonical_dir = model_dir.canonicalize().map_err(|e| LoadError::Io(e))?;
+    let canonical_dir = model_dir.canonicalize().map_err(LoadError::Io)?;
     let canonical_shard = shard_path.canonicalize().map_err(|e| {
         LoadError::Io(std::io::Error::new(
             e.kind(),

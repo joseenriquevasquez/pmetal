@@ -436,7 +436,7 @@ impl TurboQuantCore {
             if ndim == 2 {
                 return Some(indices_2d);
             }
-            let mut out_shape: Vec<i32> = shape[..ndim - 1].iter().map(|&x| x as i32).collect();
+            let mut out_shape: Vec<i32> = shape[..ndim - 1].to_vec();
             out_shape.push(dim as i32);
             return Some(indices_2d.reshape(&out_shape));
         }
@@ -476,14 +476,14 @@ impl TurboQuantCore {
             if ndim == 2 {
                 return Some(recon_2d);
             }
-            let mut out_shape: Vec<i32> = shape[..ndim - 1].iter().map(|&x| x as i32).collect();
+            let mut out_shape: Vec<i32> = shape[..ndim - 1].to_vec();
             out_shape.push(dim as i32);
             return Some(recon_2d.reshape(&out_shape));
         }
 
         // Ops fallback — original take_axis+reshape path.
         let cb_arr = self.codebook_arr(bits)?;
-        let orig_shape: Vec<i32> = shape.iter().map(|&x| x as i32).collect();
+        let orig_shape: Vec<i32> = shape.to_vec();
         let n: i32 = orig_shape.iter().product();
         let flat_idx = indices.reshape(&[n]);
         let gathered = cb_arr.take_axis(&flat_idx, 0);
@@ -689,7 +689,7 @@ impl TurboQuantCore {
         if ndim == 2 {
             Some(output_rows)
         } else {
-            Some(output_rows.reshape(&shape))
+            Some(output_rows.reshape(shape))
         }
     }
 
@@ -1918,7 +1918,7 @@ impl QuantizedKvCache {
                     &vs.norms_array()?.reshape(&[kv_rows, cache_seq_capacity]),
                     value_core.codebook_arr(value_bits)?,
                     value_dim as u32,
-                    (1u32 << value_bits) as u32,
+                    1u32 << value_bits,
                     q_rows as u32,
                     n_seq as u32,
                     cache_seq_capacity as u32,
@@ -2370,7 +2370,7 @@ impl QuantizedKvCache {
             &vs.norms_array()?.reshape(&[kv_rows, indices_t.dim(3)]),
             value_core.codebook_arr(value_bits)?,
             value_dim as u32,
-            (1u32 << value_bits) as u32,
+            1u32 << value_bits,
             q_rows as u32,
             n_seq as u32,
             indices_t.dim(3) as u32,
@@ -2684,7 +2684,7 @@ impl QuantizedKvCache {
             &value_norms,
             value_core.codebook_arr(value_bits)?,
             value_dim as u32,
-            (1u32 << value_bits) as u32,
+            1u32 << value_bits,
             q_rows as u32,
             n_seq as u32,
             cache_seq_capacity as u32,
@@ -3103,7 +3103,7 @@ fn gpu_dequantize_values(
             .collect();
         let norms = inline_array_to_f32_vec(norms_arr, rows)?;
         let reconstructed = decode_value_component_rows_raw(core, &indices, &norms, val_bits);
-        return Some(InlineArray::from_f32_slice(&reconstructed, &shape));
+        return Some(InlineArray::from_f32_slice(&reconstructed, shape));
     }
 
     // 1. Reconstruct MSE centroids in rotated space.
@@ -3225,6 +3225,7 @@ fn encode_value_rows(runtime: &TensorRuntime, total_dim: usize, rows: &[f32]) ->
 }
 
 /// Two-stage key encoder: MSE at (bits-1) + QJL on residual.
+#[allow(clippy::needless_range_loop)]
 fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key_bits: u8) -> EncodedKeyRows {
     let num_rows = rows.len() / core.dim;
     let mut norms = vec![0.0f32; num_rows];
@@ -3299,6 +3300,7 @@ fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key_bits: u8) 
 }
 
 /// MSE-only value encoder.
+#[allow(clippy::needless_range_loop)]
 fn encode_value_component_rows(
     core: &TurboQuantCore,
     rows: &[f32],
@@ -3475,6 +3477,7 @@ fn decode_value_rows(
 ///
 /// Formula (per row):
 ///   k̃ = Π^T · codebook[idx] · norm + (√(π/2)/D) · Π^T · J^T · sign · residual_norm · norm
+#[allow(clippy::needless_range_loop)]
 fn decode_key_component_rows_raw(
     core: &TurboQuantCore,
     indices: &[u16],
@@ -3536,6 +3539,7 @@ fn decode_key_component_rows_raw(
 }
 
 /// Reconstruct value rows from MSE indices + norms.
+#[allow(clippy::needless_range_loop)]
 fn decode_value_component_rows_raw(
     core: &TurboQuantCore,
     indices: &[u16],
@@ -4142,6 +4146,8 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::needless_range_loop)]
     fn manual_single_token_attention(
         queries: &mut InlineArray,
         keys: &mut InlineArray,
@@ -4230,7 +4236,7 @@ mod tests {
     #[test]
     fn codebook_range_within_unit_interval() {
         let codebook = build_beta_codebook(128, 4);
-        assert!(codebook.iter().all(|&v| v >= -1.0 && v <= 1.0));
+        assert!(codebook.iter().all(|&v| (-1.0..=1.0).contains(&v)));
     }
 
     #[test]
@@ -4316,7 +4322,7 @@ mod tests {
     ///   1. The GPU path is actually taken (store.gpu is Some).
     ///   2. The GPU dequantised output is close to the CPU dequantised output
     ///      (same algorithm, both paths should produce bitwise-close results
-    ///       modulo f32 ordering differences).
+    ///      modulo f32 ordering differences).
     #[test]
     fn turboquant_gpu_path_round_trip() {
         // Small dim so the test is fast.
@@ -4776,7 +4782,7 @@ mod tests {
         let d = dim as i32;
 
         let make_data = |seed: f32| -> Vec<f32> {
-            (0..b * h * 1 * d)
+            (0..b * h * d)
                 .map(|i| (i as f32 * 0.15 + seed).sin())
                 .collect()
         };

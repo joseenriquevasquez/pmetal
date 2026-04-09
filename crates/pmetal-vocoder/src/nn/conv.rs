@@ -437,7 +437,7 @@ mod tests {
 
         let x = Array::random_normal(&[2, 4, 16], 10);
         let y = conv.forward(&x).unwrap();
-        let mut y2 = y.clone();
+        let y2 = y.clone();
         y2.eval();
 
         // With padding=1, kernel=3, stride=1: output_len = input_len
@@ -451,7 +451,7 @@ mod tests {
 
         let x = Array::random_normal(&[2, 4, 16], 10);
         let y = conv.forward(&x).unwrap();
-        let mut y2 = y.clone();
+        let y2 = y.clone();
         y2.eval();
 
         assert_eq!(y2.shape(), &[2, 8, 16]);
@@ -464,7 +464,7 @@ mod tests {
         let conv = WeightNormConv1d::new(2, 4, 3, None, None, None, None, None).unwrap();
 
         let weight = conv.compute_weight().unwrap();
-        let mut w2 = weight.clone();
+        let w2 = weight.clone();
         w2.eval();
 
         // The weight should be properly normalized
@@ -480,7 +480,7 @@ mod tests {
 
         let x = Array::random_normal(&[1, 8, 16], 10);
         let y = conv.forward(&x).unwrap();
-        let mut y2 = y.clone();
+        let y2 = y.clone();
         y2.eval();
 
         // ConvTranspose1d output: (L-1)*S - 2*P + D*(K-1) + OP + 1
@@ -506,7 +506,7 @@ mod tests {
 
         let x = Array::random_normal(&[1, 512, 8], 10);
         let y = conv.forward(&x).unwrap();
-        let mut y2 = y.clone();
+        let y2 = y.clone();
         y2.eval();
 
         // Output length should be approximately 4x input

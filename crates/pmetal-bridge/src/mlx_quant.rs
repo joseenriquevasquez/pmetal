@@ -27,6 +27,11 @@ use std::path::Path;
 
 use crate::InlineArray;
 
+/// Per-tensor sensitivity scores: `(name, num_elements, [(bits, score)])`.
+/// The inner list is sorted ascending by bits as returned by
+/// [`evaluate_tensor_quality`]. An empty inner list signals passthrough.
+type TensorScores = Vec<(String, usize, Vec<(i32, f64)>)>;
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Default MLX quantization group size.
@@ -239,7 +244,7 @@ fn quality_score(orig: &InlineArray, recon: &InlineArray) -> f64 {
 /// - `critical_tensors`: additional name fragments to force to the highest
 ///   available bit-width, supplementing [`is_critical_tensor`].
 pub fn allocate_bits_for_bpw(
-    tensor_scores: &[(String, usize, Vec<(i32, f64)>)],
+    tensor_scores: &TensorScores,
     target_bpw: f32,
     critical_tensors: &[&str],
 ) -> Vec<TensorQuant> {
@@ -339,7 +344,7 @@ pub fn allocate_bits_for_bpw(
 /// Compute the effective average bits-per-weight across all tensors.
 ///
 /// Passthrough tensors (empty scores / `bits == 0`) count as 16 bits (bf16).
-fn effective_bpw(tensor_scores: &[(String, usize, Vec<(i32, f64)>)], bits_step: &[usize]) -> f64 {
+fn effective_bpw(tensor_scores: &TensorScores, bits_step: &[usize]) -> f64 {
     let mut total_weighted: f64 = 0.0;
     let mut total_params: f64 = 0.0;
     for (i, (_, param_count, scores)) in tensor_scores.iter().enumerate() {
@@ -662,8 +667,7 @@ pub fn quantize_model(
     sorted_names.sort();
 
     // Phase 1: evaluate quality for each quantizable weight.
-    let mut tensor_scores: Vec<(String, usize, Vec<(i32, f64)>)> =
-        Vec::with_capacity(weights.len());
+    let mut tensor_scores: TensorScores = Vec::with_capacity(weights.len());
 
     for name in &sorted_names {
         let weight = &weights[*name];
@@ -672,7 +676,7 @@ pub fn quantize_model(
 
         // MLX quantize requires last dim divisible by group_size and ndim >= 2.
         let last_dim = if is_matrix {
-            weight.dim(weight.ndim() as i32 - 1)
+            weight.dim(weight.ndim() - 1)
         } else {
             0
         };
@@ -784,7 +788,7 @@ mod tests {
 
     #[test]
     fn effective_bpw_uniform_4bit() {
-        let scores: Vec<(String, usize, Vec<(i32, f64)>)> = vec![
+        let scores: TensorScores = vec![
             ("a".into(), 100, vec![(4, 0.01)]),
             ("b".into(), 200, vec![(4, 0.02)]),
         ];
@@ -796,7 +800,7 @@ mod tests {
     #[test]
     fn effective_bpw_mixed() {
         // 100-param tensor at 4-bit, 100-param tensor at 8-bit → 6.0 BPW.
-        let scores: Vec<(String, usize, Vec<(i32, f64)>)> = vec![
+        let scores: TensorScores = vec![
             ("a".into(), 100, vec![(4, 0.05), (8, 0.0)]),
             ("b".into(), 100, vec![(4, 0.05), (8, 0.0)]),
         ];
@@ -810,7 +814,7 @@ mod tests {
     #[test]
     fn allocate_critical_always_high() {
         // Critical tensor must end up at 8-bit even with a very low target BPW.
-        let scores: Vec<(String, usize, Vec<(i32, f64)>)> = vec![
+        let scores: TensorScores = vec![
             ("model.norm.weight".into(), 1024, vec![(4, 0.1), (8, 0.0)]),
             (
                 "model.layers.0.mlp.down_proj.weight".into(),
@@ -834,7 +838,7 @@ mod tests {
         // At BPW=6.0 with two equal-size tensors and only [4, 8] as candidates,
         // exactly one upgrade is needed: (4+8)/2 = 6.0. The greedy allocator
         // should choose down_proj (higher score → worse quality).
-        let scores: Vec<(String, usize, Vec<(i32, f64)>)> = vec![
+        let scores: TensorScores = vec![
             (
                 "model.layers.0.mlp.gate_proj.weight".into(),
                 1024,
@@ -875,7 +879,7 @@ mod tests {
     #[test]
     fn allocate_passthrough_for_empty_scores() {
         // A tensor with an empty scores list should become BITS_PASSTHROUGH.
-        let scores: Vec<(String, usize, Vec<(i32, f64)>)> = vec![
+        let scores: TensorScores = vec![
             ("model.embed_tokens.weight".into(), 512, vec![]),
             (
                 "model.layers.0.mlp.down_proj.weight".into(),

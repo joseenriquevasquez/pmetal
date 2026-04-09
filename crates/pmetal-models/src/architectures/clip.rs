@@ -236,7 +236,7 @@ impl CLIPTextModel {
         let l = input_ids.dim(1);
         let mut x = self.token_embedding.forward(input_ids);
         let pos_emb = self.position_embedding.as_ref();
-        x = x.add(&slice_axis(&pos_emb, 1, 0, l as i32));
+        x = x.add(&slice_axis(pos_emb, 1, 0, l as i32));
 
         let mask = Self::create_causal_mask(l)?;
 

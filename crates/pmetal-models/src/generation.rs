@@ -282,7 +282,7 @@ impl Drop for StreamContext {
 #[inline]
 fn create_generation_stream() -> Stream {
     pmetal_bridge::inline_array::new_generation_stream();
-    Stream::default()
+    Stream
 }
 
 /// Build a `[1, seq_len]` Int32 token array from token IDs.
@@ -1635,7 +1635,7 @@ where
     // Avoiding squeeze reduces reshape operations in sampling pipeline
     let extract_logits = |logits: &Array| -> Array {
         let last_idx = logits.dim(1) - 1;
-        select_axis(&logits, last_idx, 1) // Returns [1, vocab]
+        select_axis(logits, last_idx, 1) // Returns [1, vocab]
     };
 
     let (mut current_y, mut current_logprobs) = {
@@ -1755,7 +1755,7 @@ where
 
     let extract_logits = |logits: &Array| -> Array {
         let last_idx = logits.dim(1) - 1;
-        select_axis(&logits, last_idx, 1)
+        select_axis(logits, last_idx, 1)
     };
 
     let (mut current_y, mut current_logprobs) = {
@@ -1922,7 +1922,7 @@ where
     // Helper to get last logits from output
     let extract_logits = |logits: &Array| -> Result<Array, Exception> {
         let last_idx = logits.dim(1) - 1;
-        let last_logits = select_axis(&logits, last_idx, 1);
+        let last_logits = select_axis(logits, last_idx, 1);
         // Ensure f32 for Metal kernel
         ensure_f32(&last_logits)
     };
@@ -2699,7 +2699,7 @@ mod tests {
             let seq_len = chunk_input.dim(1);
             seen_chunks.push(seq_len);
 
-            let last_token = select_axis(&select_axis(&chunk_input, 0, 0), (seq_len - 1) as i32, 0)
+            let last_token = select_axis(&select_axis(chunk_input, 0, 0), (seq_len - 1) as i32, 0)
                 .item::<i32>() as usize;
             let vocab = 64usize;
             let mut data = vec![-1000.0f32; seq_len as usize * vocab];

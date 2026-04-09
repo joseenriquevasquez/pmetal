@@ -148,6 +148,7 @@ struct ReplayWeights {
     k_norm_w: InlineArray,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_qkv(
     normed: &InlineArray,
     weights: &ReplayWeights,

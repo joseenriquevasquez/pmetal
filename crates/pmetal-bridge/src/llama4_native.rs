@@ -962,13 +962,13 @@ fn build_chunk_mask(offset: i32, s: i32, end: i32, chunk_size: i32) -> InlineArr
 
     // Create [s, total_kv] int32 array then cast to bool (dtype=7 in MLX).
     let flat = InlineArray::from_i32_slice(&mask_data);
-    let mask = flat.reshape(&[s, end]);
+    
     // Cast to bfloat16 additive mask: 0 → 0.0, 1 → ... actually MLX sdpa_with_mask
     // expects an additive float mask where -inf means masked. Convert boolean to float:
     // where mask=1 → 0.0, mask=0 → -inf (large negative).
     // We return the boolean-as-int32 array and convert in the attention function
     // using where_cond.
-    mask
+    flat.reshape(&[s, end])
 }
 
 /// Convert a 0/1 int32 mask `[q, k]` to an additive attention bias `[q, k]`.
@@ -1195,7 +1195,7 @@ fn attn_forward(
             .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
 
         if lw.use_rope {
-            if let Some(ref mask_int) = chunk_mask {
+            if let Some(mask_int) = chunk_mask {
                 // Prefill with chunk mask: dequantize for masked SDPA.
                 // Memory savings still apply; compute overhead only at prefill.
                 let kp_flat = cached_kp.reshape(&[b * n_kv_heads * next, packed_dim]);
@@ -1293,7 +1293,7 @@ fn attn_forward(
             //   letting the model see a slightly wider window which matches mlx-lm
             //   behavior for cached keys).
             // - For prefill (s>1): apply the chunk mask.
-            if let Some(ref mask_int) = chunk_mask {
+            if let Some(mask_int) = chunk_mask {
                 // Build [s, next] additive mask and reshape to [1, 1, s, next] for SDPA.
                 let dtype = queries.dtype_raw();
                 let mask_full = make_additive_mask(&mask_int.slice(&[0, 0], &[s, next]), dtype);
@@ -1523,7 +1523,7 @@ fn generate_from_primed_sample_impl(
     max_tokens: usize,
     temperature: f32,
     log_stats: bool,
-    mut on_token: impl FnMut(u32) -> bool,
+    on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     crate::decode::generate_from_primed_sample(
         "LLAMA4_NATIVE",
@@ -1533,7 +1533,7 @@ fn generate_from_primed_sample_impl(
         max_tokens,
         temperature,
         log_stats,
-        |token| on_token(token),
+        on_token,
         forward_step,
     )
 }
@@ -1594,7 +1594,7 @@ pub fn generate(
     first_token: u32,
     max_tokens: usize,
     temperature: f32,
-    mut on_token: impl FnMut(u32) -> bool,
+    on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     let current_y = prime_generation_impl(weights, cache, first_token, temperature, true, true);
     generate_from_primed_sample_impl(
@@ -1604,6 +1604,6 @@ pub fn generate(
         max_tokens,
         temperature,
         true,
-        |token| on_token(token),
+        on_token,
     )
 }

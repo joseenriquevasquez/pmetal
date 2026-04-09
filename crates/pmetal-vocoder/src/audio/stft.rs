@@ -309,7 +309,7 @@ mod tests {
     #[test]
     fn test_hann_window() {
         let window = hann_window(4).unwrap();
-        let mut w2 = window.clone();
+        let w2 = window.clone();
         w2.eval();
         assert_eq!(w2.shape(), &[4]);
 
@@ -356,7 +356,7 @@ mod tests {
 
         // Inverse STFT (overlap-add reconstruction).
         let reconstructed = istft(&spectrum, &config).unwrap();
-        let mut r2 = reconstructed.clone();
+        let r2 = reconstructed.clone();
         r2.eval();
 
         // The reconstructed signal should have the same length as the original.
@@ -366,7 +366,7 @@ mod tests {
         let diff = r2.subtract(&signal);
         let abs_diff = diff.abs_val();
         // Reduce to scalar maximum.
-        let mut max_err_arr = abs_diff.max(None);
+        let max_err_arr = abs_diff.max(None);
         max_err_arr.eval();
         let max_err: f32 = max_err_arr.item_f32();
         assert!(
@@ -399,7 +399,7 @@ mod tests {
 
         let spectrum = stft(&signal, &config).unwrap();
         let reconstructed = istft(&spectrum, &config).unwrap();
-        let mut r2 = reconstructed.clone();
+        let r2 = reconstructed.clone();
         r2.eval();
 
         // Output batch dimension must be preserved.

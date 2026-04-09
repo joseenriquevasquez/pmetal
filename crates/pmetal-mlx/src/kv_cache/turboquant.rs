@@ -1145,6 +1145,7 @@ impl TurboQuantKvCache {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn direct_attention_output(
     queries: &Array,
     layout: TurboLayout,
@@ -1391,6 +1392,7 @@ fn direct_attention_scores_for_query(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn score_key_component_row(
     core: &TurboQuantCore,
     indices: &PackedBits,

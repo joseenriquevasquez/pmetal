@@ -130,7 +130,6 @@ impl DistributedBackend for MlxDistributedBackend {
         let zero = Array::from_f32_slice(&[0.0f32], &[1]);
         let result = ops::all_sum(&zero, Some(&self.group))
             .map_err(|e| anyhow::anyhow!("mlx barrier (all_sum) failed: {e}"))?;
-        let mut result = result;
         result.eval();
         Ok(())
     }

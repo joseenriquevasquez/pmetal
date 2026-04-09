@@ -277,8 +277,8 @@ fn required_component_dir(
 
 fn read_json(path: &Path) -> Result<Value> {
     let raw = std::fs::read_to_string(path).map_err(pmetal_core::PMetalError::Io)?;
-    Ok(serde_json::from_str(&raw)
-        .map_err(|e| pmetal_core::PMetalError::Serialization(e.to_string()))?)
+    serde_json::from_str(&raw)
+        .map_err(|e| pmetal_core::PMetalError::Serialization(e.to_string()))
 }
 
 fn load_clip_config(component_dir: &Path) -> Result<CLIPConfig> {

@@ -276,7 +276,7 @@ mod tests {
     fn test_generator_adversarial_loss() {
         let outputs = create_dummy_outputs(2);
         let loss = generator_adversarial_loss(&outputs).unwrap();
-        let mut l2 = loss.clone();
+        let l2 = loss.clone();
         l2.eval();
 
         assert_eq!(l2.ndim(), 0); // scalar
@@ -287,9 +287,9 @@ mod tests {
         let real = create_dummy_outputs(2);
         let fake = create_dummy_outputs(2);
         let (real_loss, fake_loss) = discriminator_adversarial_loss(&real, &fake).unwrap();
-        let mut rl2 = real_loss.clone();
+        let rl2 = real_loss.clone();
         rl2.eval();
-        let mut fl2 = fake_loss.clone();
+        let fl2 = fake_loss.clone();
         fl2.eval();
 
         assert_eq!(rl2.ndim(), 0);
@@ -301,7 +301,7 @@ mod tests {
         let real = create_dummy_outputs(2);
         let fake = create_dummy_outputs(2);
         let loss = feature_matching_loss(&real, &fake).unwrap();
-        let mut l2 = loss.clone();
+        let l2 = loss.clone();
         l2.eval();
 
         assert_eq!(l2.ndim(), 0);
@@ -316,7 +316,7 @@ mod tests {
         let fake = Array::random_normal(&[1, 8000], 10);
 
         let loss = mel_reconstruction_loss(&real, &fake, &mel_config, &stft_config).unwrap();
-        let mut l2 = loss.clone();
+        let l2 = loss.clone();
         l2.eval();
 
         assert_eq!(l2.ndim(), 0);

@@ -400,13 +400,8 @@ pub fn tile(a: &Array, reps: &[i32]) -> Array {
         }
     }
     let effective_ndim = arr.ndim() as usize;
-    let pad = if nrep < effective_ndim {
-        effective_ndim - nrep
-    } else {
-        0
-    };
-    let full_reps: Vec<i32> = std::iter::repeat(1)
-        .take(pad)
+    let pad = effective_ndim.saturating_sub(nrep);
+    let full_reps: Vec<i32> = std::iter::repeat_n(1, pad)
         .chain(reps.iter().copied())
         .collect();
     for (axis, &rep) in full_reps.iter().enumerate() {
@@ -559,7 +554,7 @@ pub fn is_inf(a: &Array) -> Array {
 /// Reduce a bool/numeric array with logical-OR along all axes (or a given axis).
 /// Equivalent to mlx_rs::ops::any(a, axes, keepdims).
 /// `axes`: None = reduce all axes.
-pub fn any(a: &Array, axes: Option<&[i32]>, keep_dims: bool) -> Array {
+pub fn any(a: &Array, axes: Option<&[i32]>, _keep_dims: bool) -> Array {
     // Cast to bool first, then sum. Any nonzero sum → true.
     let b = a.as_dtype(Dtype::Bool.as_i32());
     let s = match axes {
@@ -573,8 +568,7 @@ pub fn any(a: &Array, axes: Option<&[i32]>, keep_dims: bool) -> Array {
             result
         }
     };
-    let out = s.as_dtype(Dtype::Bool.as_i32());
-    if keep_dims { out } else { out }
+    s.as_dtype(Dtype::Bool.as_i32())
 }
 
 /// Returns `true` (scalar bool) if any element is NaN.
@@ -589,7 +583,7 @@ pub fn item_bool(a: &Array) -> bool {
 /// Select a single index along `axis`, removing that dimension.
 /// Equivalent to `a[..., idx, ...]` in Python/mlx.
 pub fn select_axis(a: &Array, idx: i32, axis: i32) -> Array {
-    let ndim = a.ndim() as i32;
+    let ndim = a.ndim();
     let ax = if axis < 0 { ndim + axis } else { axis };
     let i = Array::from_i32_slice_shaped(&[idx], &[1]);
     let out = a.take_axis(&i, ax);
@@ -602,7 +596,7 @@ pub fn slice_last_to(a: &Array, end: i32) -> Array {
     let ndim = a.ndim() as usize;
     let shape = a.shape();
     let s: Vec<i32> = vec![0; ndim];
-    let mut e: Vec<i32> = shape.iter().map(|&x| x as i32).collect();
+    let mut e: Vec<i32> = shape.to_vec();
     e[ndim - 1] = end;
     a.slice(&s, &e)
 }
@@ -613,7 +607,7 @@ pub fn slice_last_from(a: &Array, start: i32) -> Array {
     let ndim = a.ndim() as usize;
     let shape = a.shape();
     let mut s: Vec<i32> = vec![0; ndim];
-    let e: Vec<i32> = shape.iter().map(|&x| x as i32).collect();
+    let e: Vec<i32> = shape.to_vec();
     s[ndim - 1] = start;
     a.slice(&s, &e)
 }
@@ -621,7 +615,7 @@ pub fn slice_last_from(a: &Array, start: i32) -> Array {
 /// Slice a specific axis from `start` to `end`, all other axes full.
 /// Equivalent to `a[..., start:end, ...]` at the given axis.
 pub fn slice_axis(a: &Array, axis: i32, start: i32, end: i32) -> Array {
-    let ndim = a.ndim() as i32;
+    let ndim = a.ndim();
     let ax = if axis < 0 {
         (ndim + axis) as usize
     } else {
@@ -629,7 +623,7 @@ pub fn slice_axis(a: &Array, axis: i32, start: i32, end: i32) -> Array {
     };
     let shape = a.shape();
     let mut s: Vec<i32> = vec![0; ndim as usize];
-    let mut e: Vec<i32> = shape.iter().map(|&x| x as i32).collect();
+    let mut e: Vec<i32> = shape.to_vec();
     s[ax] = start;
     e[ax] = end;
     a.slice(&s, &e)
@@ -637,7 +631,7 @@ pub fn slice_axis(a: &Array, axis: i32, start: i32, end: i32) -> Array {
 
 /// Slice a specific axis from `start` to the end, all other axes full.
 pub fn slice_axis_from(a: &Array, axis: i32, start: i32) -> Array {
-    let ndim = a.ndim() as i32;
+    let ndim = a.ndim();
     let ax = if axis < 0 {
         (ndim + axis) as usize
     } else {
@@ -645,7 +639,7 @@ pub fn slice_axis_from(a: &Array, axis: i32, start: i32) -> Array {
     };
     let shape = a.shape();
     let mut s: Vec<i32> = vec![0; ndim as usize];
-    let e: Vec<i32> = shape.iter().map(|&x| x as i32).collect();
+    let e: Vec<i32> = shape.to_vec();
     s[ax] = start;
     a.slice(&s, &e)
 }

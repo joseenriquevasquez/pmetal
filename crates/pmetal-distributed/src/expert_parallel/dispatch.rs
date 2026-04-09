@@ -76,7 +76,7 @@ impl ExpertDispatcher {
     {
         let mut routing_indices = routing_indices.clone();
         let mut routing_weights = routing_weights.clone();
-        let mut hidden_states = hidden_states.clone();
+        let hidden_states = hidden_states.clone();
         routing_indices.eval();
         routing_weights.eval();
         hidden_states.eval();
@@ -131,13 +131,13 @@ impl ExpertDispatcher {
                 let local_tokens = gather_tokens(&hidden_states, token_indices)?;
 
                 // Send tokens to remote rank.
-                let mut send_sentinel = ops::send(&local_tokens, dest as i32, Some(group))?;
+                let send_sentinel = ops::send(&local_tokens, dest as i32, Some(group))?;
                 send_sentinel.eval();
 
                 // Receive computed results from remote rank.
                 let result_shape = vec![token_indices.len() as i32, hidden_dim as i32];
                 // Use Float32 as the receive dtype (matches the hidden_states dtype assumption).
-                let mut result =
+                let result =
                     ops::recv(&result_shape, Dtype::Float32, dest as i32, Some(group))?;
                 result.eval();
                 received_results[dest] = Some(result);
@@ -157,12 +157,12 @@ impl ExpertDispatcher {
             }
 
             let incoming_shape = vec![expected_tokens as i32, hidden_dim as i32];
-            let mut incoming = ops::recv(&incoming_shape, Dtype::Float32, src as i32, Some(group))?;
+            let incoming = ops::recv(&incoming_shape, Dtype::Float32, src as i32, Some(group))?;
             incoming.eval();
 
             let result = local_expert_fn(&incoming, &expert_for_token[src])?;
 
-            let mut send_sentinel = ops::send(&result, src as i32, Some(group))?;
+            let send_sentinel = ops::send(&result, src as i32, Some(group))?;
             send_sentinel.eval();
         }
 

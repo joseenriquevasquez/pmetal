@@ -314,7 +314,7 @@ impl PhiRMSNorm {
         let variance = x.square().mean_axis(-1, true);
         let eps = Array::from_f32(self.eps);
         let x_normed = x.divide(&variance.add(&eps).sqrt());
-        Ok(x_normed.multiply(&*self.weight))
+        Ok(x_normed.multiply(&self.weight))
     }
 }
 

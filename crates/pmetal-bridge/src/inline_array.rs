@@ -2544,6 +2544,7 @@ impl InlineArray {
     /// - `codebook`: `[C]` f32
     ///
     /// Returns `scores [N, S]` f32 on success.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_score(
         query_rot: &Self,
         query_proj: &Self,
@@ -2594,6 +2595,7 @@ impl InlineArray {
     }
 
     /// Specialized q8 key scoring for D=256 on the seq-major transposed cache layout.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_score_q8_d256(
         query_rot: &Self,
         query_proj: &Self,
@@ -2639,6 +2641,7 @@ impl InlineArray {
 
     /// Fused mixed TurboQuant key scoring directly from regular/outlier
     /// compressed subspaces.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_mixed_score(
         regular_query_rot: &Self,
         regular_query_proj: &Self,
@@ -2916,6 +2919,7 @@ impl InlineArray {
     /// - `codebook`: `[C]` f32
     ///
     /// Returns `output [N, D]` f32 on success.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_weighted_decode(
         weights: &Self,
         indices: &Self,
@@ -2958,6 +2962,7 @@ impl InlineArray {
     /// Specialized long-context q8 TurboQuant decode for D=256/V=256.
     ///
     /// Returns the rotated aggregated values `[N, 256]` on success.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_attention_q8_d256_2pass(
         query_rot: &Self,
         query_proj: &Self,
@@ -3013,6 +3018,7 @@ impl InlineArray {
     /// - value indices `[N, S_cap, D]`
     ///
     /// Returns the rotated aggregated values `[N, 256]` on success.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_attention_q8_d256_packed_keys_2pass(
         query_rot: &Self,
         query_proj: &Self,
@@ -3062,6 +3068,7 @@ impl InlineArray {
     /// - `value_dense`: `[N, S_cap, D]` bf16/f32 rotated dense values
     ///
     /// Returns the rotated aggregated values `[N, 256]` on success.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_attention_q8_d256_packed_keys_dense_values_2pass(
         query_rot: &Self,
         query_proj: &Self,
@@ -3109,6 +3116,7 @@ impl InlineArray {
     /// - `value_dense`: `[N, S_cap, D]` bf16/f32 rotated dense values
     ///
     /// Returns the rotated aggregated values `[N, 256]` on success.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
         query_rot: &Self,
         key_indices: &Self,
@@ -3150,6 +3158,7 @@ impl InlineArray {
 
     /// Full-byte D256 long-context pass-1 state output.
     /// Returns `(partials, sums, maxs)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_attention_q8_d256_fullbyte_dense_values_2pass_state(
         query_rot: &Self,
         key_indices: &Self,
@@ -3203,6 +3212,7 @@ impl InlineArray {
 
     /// Full-byte D256 long-context pass-1 output only.
     /// Returns the unmerged partial outputs `[N, blocks, 256]`.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_attention_q8_d256_fullbyte_dense_values_2pass_pass1(
         query_rot: &Self,
         key_indices: &Self,
@@ -3271,6 +3281,7 @@ impl InlineArray {
     }
 
     /// Full-byte D256 long-context 2-pass variant with block-local 2-loop softmax.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_attention_q8_d256_fullbyte_dense_values_2pass_localsoftmax(
         query_rot: &Self,
         key_indices: &Self,
@@ -3312,6 +3323,7 @@ impl InlineArray {
 
     /// Full-byte D256 score-only long-context kernel.
     /// Returns scores `[N, S]`.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_score_q8_d256_fullbyte(
         query_rot: &Self,
         key_indices: &Self,
@@ -3390,6 +3402,7 @@ impl InlineArray {
     /// - `slot_scales`: `[N, S_cap, 4]` f32
     ///
     /// Returns the rotated aggregated values `[N, 256]` on success.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_attention_q8_d256_packed_kv_2pass(
         query_rot: &Self,
         query_proj: &Self,
@@ -3437,6 +3450,7 @@ impl InlineArray {
     /// - `value_dense`: `[N, S_cap, D]` bf16/f32 rotated dense values
     ///
     /// Returns the rotated aggregated values `[N, 256]` on success.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_attention_q8_d256_packed_kv_dense_values_2pass(
         query_rot: &Self,
         query_proj: &Self,
@@ -3481,6 +3495,7 @@ impl InlineArray {
     /// Specialized long-context q8 TurboQuant decode for D=128/V=128.
     ///
     /// Returns the rotated aggregated values `[N, 128]` on success.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_attention_q8_d128_2pass(
         query_rot: &Self,
         query_proj: &Self,
@@ -3534,6 +3549,7 @@ impl InlineArray {
     /// packed key bytes stored as `[N, D, S_cap]`.
     ///
     /// Returns the rotated aggregated values `[N, 128]` on success.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_attention_q8_d128_packed_keys_2pass(
         query_rot: &Self,
         query_proj: &Self,
@@ -3610,6 +3626,7 @@ impl InlineArray {
     }
 
     /// Scatter regular/outlier component rows back into `[N, D]` f32 rows.
+    #[allow(clippy::too_many_arguments)]
     pub fn turboquant_scatter_last_dim(
         regular: &Self,
         outlier: &Self,
@@ -3918,6 +3935,7 @@ impl InlineArray {
     ///
     /// Returns `(y, new_state)`.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn gdn_update(
         q: &Self,
         k: &Self,
@@ -3992,6 +4010,7 @@ impl InlineArray {
 
     /// Gather quantized matmul (MoE expert routing).
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn gather_qmm(
         &self,
         w: &Self,
@@ -4452,9 +4471,9 @@ impl InlineArray {
     /// Swap two axes.
     pub fn swap_axes(&self, a: i32, b: i32) -> Self {
         let ndim = self.ndim();
-        let mut perm: Vec<i32> = (0..ndim).map(|i| i as i32).collect();
-        let a_idx = if a < 0 { ndim as i32 + a } else { a } as usize;
-        let b_idx = if b < 0 { ndim as i32 + b } else { b } as usize;
+        let mut perm: Vec<i32> = (0..ndim).collect();
+        let a_idx = if a < 0 { ndim + a } else { a } as usize;
+        let b_idx = if b < 0 { ndim + b } else { b } as usize;
         perm.swap(a_idx, b_idx);
         self.transpose_axes(&perm)
     }
@@ -4656,6 +4675,7 @@ impl InlineArray {
     }
 
     /// 2-D convolution (NHWC format, MLX standard).
+    #[allow(clippy::too_many_arguments)]
     pub fn conv2d(
         &self,
         weight: &Self,

@@ -330,7 +330,7 @@ mod tests {
         // Create a small mel spectrogram
         let mel = Array::random_normal(&[1, 100, 10], 10);
         let audio = model.forward(&mel).unwrap();
-        let mut a2 = audio.clone();
+        let a2 = audio.clone();
         a2.eval();
 
         // Output should be [1, 1, samples]
@@ -348,7 +348,7 @@ mod tests {
         // Test 2D input (no batch)
         let mel = Array::random_normal(&[100, 8], 10);
         let audio = model.generate(&mel).unwrap();
-        let mut a2 = audio.clone();
+        let a2 = audio.clone();
         a2.eval();
 
         // Should be 1D output
@@ -362,12 +362,12 @@ mod tests {
 
         let mel = Array::random_normal(&[1, 100, 4], 10);
         let audio = model.forward(&mel).unwrap();
-        let mut a2 = audio.clone();
+        let a2 = audio.clone();
         a2.eval();
 
         // Output should be in [-1, 1] due to tanh
-        let mut max_val = a2.max(None);
-        let mut min_val = a2.min(None);
+        let max_val = a2.max(None);
+        let min_val = a2.min(None);
         max_val.eval();
         min_val.eval();
 

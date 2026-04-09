@@ -293,9 +293,6 @@ impl Stream {
     pub fn gpu() -> Self {
         Self
     }
-    pub fn default() -> Self {
-        Self
-    }
 }
 
 /// Stub for `mlx_rs::fast::ScaledDotProductAttentionMask`.
@@ -844,6 +841,7 @@ pub mod compile {
     /// The bridge does not need this type for its own code paths; it exists solely
     /// to satisfy compilation of model files that reference it.
     pub struct Closure {
+        #[allow(clippy::type_complexity)]
         f: Box<dyn Fn(&[Array]) -> Vec<Array>>,
     }
 
@@ -908,6 +906,12 @@ pub mod losses {
     pub struct BinaryCrossEntropyBuilder {
         reduction: LossReduction,
         with_logits: bool,
+    }
+
+    impl Default for BinaryCrossEntropyBuilder {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl BinaryCrossEntropyBuilder {
@@ -1024,10 +1028,8 @@ pub mod module {
     ) {
         let mut pm = model.parameters_mut();
         for (key, val) in updates {
-            if let Some(entry) = pm.get_mut(&key) {
-                if let super::NestedValue::Value(arr) = entry {
-                    **arr = val;
-                }
+            if let Some(super::NestedValue::Value(arr)) = pm.get_mut(&key) {
+                **arr = val;
             }
         }
     }

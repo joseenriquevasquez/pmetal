@@ -210,7 +210,7 @@ mod tests {
 
         let x = Array::random_normal(&[1, 64, 128], 10);
         let y = amp.forward(&x).unwrap();
-        let mut y2 = y.clone();
+        let y2 = y.clone();
         y2.eval();
 
         assert_eq!(y2.shape(), &[1, 64, 128]);
@@ -222,7 +222,7 @@ mod tests {
 
         let x = Array::random_normal(&[2, 128, 64], 10);
         let y = amp.forward(&x).unwrap();
-        let mut y2 = y.clone();
+        let y2 = y.clone();
         y2.eval();
 
         assert_eq!(y2.shape(), &[2, 128, 64]);
@@ -236,9 +236,9 @@ mod tests {
 
         let x = Array::random_normal(&[1, 32, 16], 10);
         let y = amp.forward(&x).unwrap();
-        let mut x2 = x.clone();
+        let x2 = x.clone();
         x2.eval();
-        let mut y2 = y.clone();
+        let y2 = y.clone();
         y2.eval();
 
         // Output should be different from input (processed) but same shape
@@ -251,7 +251,7 @@ mod tests {
 
         let x = Array::random_normal(&[1, 64, 32], 10);
         let y = amp.forward(&x).unwrap();
-        let mut y2 = y.clone();
+        let y2 = y.clone();
         y2.eval();
 
         assert_eq!(y2.shape(), &[1, 64, 32]);
@@ -265,7 +265,7 @@ mod tests {
 
         let x = Array::random_normal(&[1, 256, 64], 10);
         let y = amp.forward(&x).unwrap();
-        let mut y2 = y.clone();
+        let y2 = y.clone();
         y2.eval();
 
         assert_eq!(y2.shape(), &[1, 256, 64]);

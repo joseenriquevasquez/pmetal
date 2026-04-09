@@ -140,6 +140,7 @@ fn make_dense_seed(
     (k_buf, v_buf)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_dense_step_ms(
     queries: &InlineArray,
     step_keys: &InlineArray,

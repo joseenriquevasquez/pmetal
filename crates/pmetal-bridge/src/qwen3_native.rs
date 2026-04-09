@@ -308,7 +308,7 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<Qwen3Config, String> {
 
 fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
     let json: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
+        serde_json::from_str(text).map_err(|e| format!("failed to parse config.json: {e}"))?;
 
     // Qwen3.5 nests the LM config under `text_config`.
     // For plain Qwen3, the config.json is flat.
@@ -572,6 +572,7 @@ mod tests {
 /// Dense weights are pre-transposed at load time (`w.t()`); quantized weights
 /// are stored as-is from the checkpoint and the `transpose=true` flag handles
 /// the layout internally inside `mx.quantized_matmul`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum LayerWeight {
     Dense(InlineArray),
@@ -1149,20 +1150,20 @@ fn get_stacked_expert_weight(
     }
 }
 
-/// Load model weights from a directory containing safetensors shards.
-///
-/// Supports all three Qwen variants:
-///   - **Qwen3 dense** (`model_type = "qwen3"`): standard attention, full RoPE.
-///   - **Qwen3.5 dense** (`model_type = "qwen3_5"` / `"qwen3_5_text"`, `num_experts = 0`).
-///   - **Qwen3.5 MoE** (same type but `num_experts > 0`): routes through SwitchGLU +
-///     shared expert. Per-expert weights are stacked into [E, in, out] tensors at
-///     load time (matches Python's `sanitize()` stacking).
-///
-/// Applies the same sanitization as the mlx-rs loader:
-/// - VLM prefix stripping (`model.language_model.` → `model.`)
-/// - `A_log` → `a_log` rename
-/// - `mtp.*` key drop
-/// - conv1d weight transpose (when shape is `[out, k, in]` not `[out, k, 1]`)
+// Load model weights from a directory containing safetensors shards.
+//
+// Supports all three Qwen variants:
+//   - Qwen3 dense (model_type = "qwen3"): standard attention, full RoPE.
+//   - Qwen3.5 dense (model_type = "qwen3_5" / "qwen3_5_text", num_experts = 0).
+//   - Qwen3.5 MoE (same type but num_experts > 0): routes through SwitchGLU +
+//     shared expert. Per-expert weights are stacked into [E, in, out] tensors at
+//     load time (matches Python's sanitize() stacking).
+//
+// Applies the same sanitization as the mlx-rs loader:
+// - VLM prefix stripping (model.language_model. -> model.)
+// - A_log -> a_log rename
+// - mtp.* key drop
+// - conv1d weight transpose (when shape is [out, k, in] not [out, k, 1])
 // ============================================================================
 // Hadamard preconditioning — absorb random rotation into Q/K/V/O weights
 // ============================================================================
@@ -2391,14 +2392,14 @@ fn moe_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
 
     if s == 1 {
         if let (
-            Some(ref router_w),
+            Some(router_w),
             Some(LayerWeight::Dense(moe_gate_w)),
             Some(LayerWeight::Dense(moe_up_w)),
             Some(LayerWeight::Dense(moe_down_w)),
             Some(LayerWeight::Dense(shared_gate_w)),
             Some(LayerWeight::Dense(shared_up_w)),
             Some(LayerWeight::Dense(shared_down_w)),
-            Some(ref shared_expert_gate_w),
+            Some(shared_expert_gate_w),
         ) = (
             lw.moe_router_w.as_ref(),
             lw.moe_gate_w.as_ref(),
@@ -2596,6 +2597,7 @@ fn gdn_forward(
 // Attention layer forward
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn attn_forward(
     lw: &LayerWeights,
     normed: &InlineArray,
@@ -3406,7 +3408,7 @@ fn generate_from_primed_sample_impl(
     max_tokens: usize,
     temperature: f32,
     log_stats: bool,
-    mut on_token: impl FnMut(u32) -> bool,
+    on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     crate::decode::generate_from_primed_sample(
         "NATIVE",
@@ -3416,7 +3418,7 @@ fn generate_from_primed_sample_impl(
         max_tokens,
         temperature,
         log_stats,
-        |token| on_token(token),
+        on_token,
         forward_step,
     )
 }
@@ -3597,6 +3599,7 @@ pub fn canonical_decode_backend(
     QwenDecodeBackend::RustBridge
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn generate_canonical(
     weights: &NativeWeights,
     cache: &mut NativeCache,
@@ -4243,6 +4246,11 @@ pub unsafe fn build_cpp_forward_state(
 /// This still builds the MLX graph for the full model on each call; it only
 /// avoids Rust-side per-op FFI traffic by doing the work inside one C++ entry
 /// point.
+///
+/// # Safety
+///
+/// The `state` must have been created by `build_cpp_forward_state` with valid
+/// weight and cache pointers that outlive this call.
 #[allow(dead_code)]
 pub unsafe fn forward_step_cpp_with_token(
     state: &mut CppForwardState,

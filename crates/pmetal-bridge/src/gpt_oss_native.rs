@@ -797,7 +797,7 @@ fn split_gate_up(v: &InlineArray, suffix: &str) -> (InlineArray, InlineArray) {
         return (v.clone(), v.clone());
     }
 
-    let split_dim = (ndim - 2) as i32; // second-to-last axis
+    let split_dim = ndim - 2; // second-to-last axis
     let fused_size = v.dim(split_dim);
     let half = fused_size / 2;
 
@@ -840,7 +840,7 @@ fn split_gate_up(v: &InlineArray, suffix: &str) -> (InlineArray, InlineArray) {
 /// Shape `[out*2]` → gate `[out]`, up `[out]`.
 fn split_gate_up_bias(v: &InlineArray) -> (InlineArray, InlineArray) {
     let ndim = v.ndim();
-    let last = (ndim - 1) as i32;
+    let last = ndim - 1;
     let total = v.dim(last);
     let half = total / 2;
 
@@ -1463,7 +1463,7 @@ fn generate_from_primed_sample_impl(
     max_tokens: usize,
     temperature: f32,
     log_stats: bool,
-    mut on_token: impl FnMut(u32) -> bool,
+    on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     crate::decode::generate_from_primed_sample(
         "GPT-OSS",
@@ -1473,7 +1473,7 @@ fn generate_from_primed_sample_impl(
         max_tokens,
         temperature,
         log_stats,
-        |token| on_token(token),
+        on_token,
         forward_step,
     )
 }
@@ -1534,7 +1534,7 @@ pub fn generate(
     first_token: u32,
     max_tokens: usize,
     temperature: f32,
-    mut on_token: impl FnMut(u32) -> bool,
+    on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     let current_y = prime_generation_impl(weights, cache, first_token, temperature, true, true);
     generate_from_primed_sample_impl(
@@ -1544,6 +1544,6 @@ pub fn generate(
         max_tokens,
         temperature,
         true,
-        |token| on_token(token),
+        on_token,
     )
 }

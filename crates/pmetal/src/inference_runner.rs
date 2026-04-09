@@ -394,7 +394,7 @@ impl InferenceRunner {
                                 );
                             }
                             Some(pmetal_bridge::qwen3_native::QuantCacheConfig {
-                                bits: bits as u8,
+                                bits,
                                 group_size: group_size as i32,
                                 mixed_bit: None,
                                 qjl: qjl_active,

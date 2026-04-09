@@ -404,7 +404,7 @@ pub(crate) async fn run_inference(
 
         if !trials.is_empty() {
             let avg = |f: fn(&pmetal::native_inference::MlxLmBenchmarkTrial) -> f64| -> f64 {
-                trials.iter().map(|trial| f(trial)).sum::<f64>() / trials.len() as f64
+                trials.iter().map(f).sum::<f64>() / trials.len() as f64
             };
             println!(
                 "Averages: prompt_tps={:.3}, generation_tps={:.3}, peak_memory={:.3}",
@@ -599,7 +599,10 @@ pub(crate) async fn run_inference(
                         // Tokenizer may retroactively change multi-byte chars
                         // (e.g. replacement char → full emoji), so the old byte
                         // offset can land mid-character in the new string.
-                        let start = text.ceil_char_boundary(streamed_text.len());
+                        let idx = streamed_text.len();
+                        let start = (idx..=text.len())
+                            .find(|&i| text.is_char_boundary(i))
+                            .unwrap_or(text.len());
                         if start < text.len() {
                             let delta = &text[start..];
                             let _ = std::io::stdout().write_all(delta.as_bytes());
@@ -638,7 +641,10 @@ pub(crate) async fn run_inference(
                         // Tokenizer may retroactively change multi-byte chars
                         // (e.g. replacement char → full emoji), so the old byte
                         // offset can land mid-character in the new string.
-                        let start = text.ceil_char_boundary(streamed_text.len());
+                        let idx = streamed_text.len();
+                        let start = (idx..=text.len())
+                            .find(|&i| text.is_char_boundary(i))
+                            .unwrap_or(text.len());
                         if start < text.len() {
                             let delta = &text[start..];
                             let _ = std::io::stdout().write_all(delta.as_bytes());

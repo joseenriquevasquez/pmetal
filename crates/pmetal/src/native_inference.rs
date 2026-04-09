@@ -417,6 +417,7 @@ fn finish_with_bridge_generate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_bridge_inference<Config, Weights, Cache>(
     model_path: &Path,
     input_ids: &[u32],

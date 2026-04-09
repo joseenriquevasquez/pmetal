@@ -95,8 +95,7 @@ impl MambaCacheEntry {
         } else {
             // Initialize to zeros with shape [batch, pad_len, conv_dim]
             // Match the input dtype to avoid dtype mismatch issues
-            let z = ops::zeros(&[batch, pad_len as i32, conv_dim], input.dtype());
-            z
+            ops::zeros(&[batch, pad_len as i32, conv_dim], input.dtype())
         };
 
         // Concatenate state with new input along sequence dimension

@@ -182,7 +182,7 @@ mod tests {
 
         let audio = Array::random_normal(&[1, 1, 4096], 10);
         let output = disc.forward(&audio).unwrap();
-        let mut l2 = output.logits.clone();
+        let l2 = output.logits.clone();
         l2.eval();
 
         assert!(!output.features.is_empty());

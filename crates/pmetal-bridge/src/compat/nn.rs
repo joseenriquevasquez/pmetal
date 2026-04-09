@@ -138,7 +138,7 @@ where
             crate::inline_array::value_and_grad(flat_loss, &param_arrays, &[]);
 
         // 4. Re-key gradients into FlattenedModuleParam.
-        let grads: FlattenedModuleParam = keys.into_iter().zip(grad_arrays.into_iter()).collect();
+        let grads: FlattenedModuleParam = keys.into_iter().zip(grad_arrays).collect();
 
         Ok((loss, grads))
     }
@@ -211,7 +211,7 @@ where
             crate::inline_array::value_and_grad(flat_loss, &param_arrays, &[]);
 
         // Re-key gradients.
-        let grads: FlattenedModuleParam = keys.into_iter().zip(grad_arrays.into_iter()).collect();
+        let grads: FlattenedModuleParam = keys.into_iter().zip(grad_arrays).collect();
 
         Ok((vec![loss_val], grads))
     }

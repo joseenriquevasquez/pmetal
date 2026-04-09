@@ -450,7 +450,7 @@ impl LoraLinear {
             let xa = x_lora.matmul(&self.lora_a.t());
             let xab = xa.matmul(&self.lora_b.t());
             let scale_arr = &self.scale_arr;
-            let y_lora = xab.multiply(&scale_arr);
+            let y_lora = xab.multiply(scale_arr);
 
             // Combined output
             let y = y_base.add(&y_lora);

@@ -93,10 +93,10 @@ fn ring_attention_pass_kv(
     // Ring exchange: world_size - 1 steps.
     for _step in 1..world_size {
         // Send current KV to next rank, receive from previous rank.
-        let mut send_k = ops::send(&current_k, next_rank, Some(group))?;
-        let mut send_v = ops::send(&current_v, next_rank, Some(group))?;
-        let mut recv_k = ops::recv_like(&current_k, prev_rank, Some(group))?;
-        let mut recv_v = ops::recv_like(&current_v, prev_rank, Some(group))?;
+        let send_k = ops::send(&current_k, next_rank, Some(group))?;
+        let send_v = ops::send(&current_v, next_rank, Some(group))?;
+        let recv_k = ops::recv_like(&current_k, prev_rank, Some(group))?;
+        let recv_v = ops::recv_like(&current_v, prev_rank, Some(group))?;
 
         // Evaluate sends and receives.
         send_k.eval();
@@ -141,8 +141,8 @@ fn ring_attention_pass_q(
     let mut current_q = query.clone();
 
     for _step in 1..world_size {
-        let mut send_q = ops::send(&current_q, next_rank, Some(group))?;
-        let mut recv_q = ops::recv_like(&current_q, prev_rank, Some(group))?;
+        let send_q = ops::send(&current_q, next_rank, Some(group))?;
+        let recv_q = ops::recv_like(&current_q, prev_rank, Some(group))?;
         send_q.eval();
         recv_q.eval();
 
@@ -170,7 +170,7 @@ fn local_attention(
 ) -> Result<(Array, Array), Exception> {
     // scores = Q @ K^T * scale  → [B, H, S_q, S_k]
     // Transpose last two dims: ndim-2 and ndim-1.
-    let ndim = k.ndim() as i32;
+    let ndim = k.ndim();
     let mut axes: Vec<i32> = (0..ndim).collect();
     let last = axes.len() - 1;
     let second_last = last - 1;
@@ -249,10 +249,8 @@ mod tests {
         let out2 = Array::from_f32_slice(&[3.0f32, 4.0], &[1, 1, 1, 2]);
         let lse2 = Array::from_f32_slice(&[0.5f32], &[1, 1, 1, 1]);
 
-        let (combined, new_lse) = online_softmax_update(&out1, &lse1, &out2, &lse2).unwrap();
+        let (mut combined, new_lse) = online_softmax_update(&out1, &lse1, &out2, &lse2).unwrap();
 
-        let mut combined = combined;
-        let mut new_lse = new_lse;
         combined.eval();
         new_lse.eval();
 

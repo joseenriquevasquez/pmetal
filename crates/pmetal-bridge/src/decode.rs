@@ -141,6 +141,7 @@ pub fn sdpa_causal_like_mlx(
 /// - `q_keys` / `q_values`: `(packed, scales, biases)` where packed is uint32
 /// - For GQA (`n_q_heads > n_kv_heads`): queries are reshaped and quantized
 ///   tuples are broadcast, matching upstream behavior exactly.
+#[allow(clippy::too_many_arguments)]
 pub fn quantized_sdpa(
     queries: &InlineArray,
     q_keys: (&InlineArray, &InlineArray, &InlineArray),
@@ -482,7 +483,7 @@ pub fn quantized_sdpa_with_qjl(
     let qjl_s_t = qjl_s.transpose_axes(&[1, 0]); // [D, D]
     let q_proj = queries_work.matmul(&qjl_s_t); // [*, L, D] @ [D, D] = [*, L, D]
     // signs^T: swap last two axes of signs_work
-    let ndim_signs = signs_work.ndim() as i32;
+    let ndim_signs = signs_work.ndim();
     let signs_t = signs_work.transpose_axes(&{
         let mut axes: Vec<i32> = (0..ndim_signs).collect();
         let last = (ndim_signs - 1) as usize;
@@ -498,7 +499,7 @@ pub fn quantized_sdpa_with_qjl(
 
     // norms_work is [B, Hkv, (n_rep,) KV_T, 1] f32.
     // We need [B, Hkv, (n_rep,) 1, KV_T] to broadcast against [*, L, KV_T].
-    let ndim_norms = norms_work.ndim() as i32;
+    let ndim_norms = norms_work.ndim();
     let norms_t = norms_work.transpose_axes(&{
         let mut axes: Vec<i32> = (0..ndim_norms).collect();
         let last = (ndim_norms - 1) as usize;
@@ -588,6 +589,7 @@ pub fn begin_generation_session_preserve_peak_silent(tag: &str, model_dtype: i32
 
 /// Prime a decode loop by preparing the cache, running one forward step, and
 /// asynchronously sampling the first decode token.
+#[allow(clippy::too_many_arguments)]
 pub fn prime_generation<Weights, Cache>(
     tag: &str,
     model_dtype: i32,
@@ -612,6 +614,7 @@ pub fn prime_generation<Weights, Cache>(
 }
 
 /// Continue generation from an already-primed async sample.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_from_primed_sample<Weights, Cache>(
     tag: &str,
     weights: &Weights,

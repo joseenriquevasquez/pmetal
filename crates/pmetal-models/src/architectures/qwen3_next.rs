@@ -461,7 +461,7 @@ fn compiled_precise_swiglu(
 ) -> Result<Array, Exception> {
     thread_local! {
         static COMPILED: std::cell::RefCell<Option<pmetal_bridge::compat::compile::Closure>> =
-            std::cell::RefCell::new(None);
+            const { std::cell::RefCell::new(None) };
     }
 
     // Initialize the compiled closure on first call
@@ -1141,21 +1141,12 @@ impl Qwen3NextGatedDeltaNet {
         } else {
             slice_last_to(&projected, qkv_end)
         };
-        let z = if s == 1 {
-            slice_axis(&projected, -1, qkv_end, z_end).reshape(&[
-                b,
-                s,
-                self.num_v_heads,
-                self.head_v_dim,
-            ])
-        } else {
-            slice_axis(&projected, -1, qkv_end, z_end).reshape(&[
-                b,
-                s,
-                self.num_v_heads,
-                self.head_v_dim,
-            ])
-        };
+        let z = slice_axis(&projected, -1, qkv_end, z_end).reshape(&[
+            b,
+            s,
+            self.num_v_heads,
+            self.head_v_dim,
+        ]);
         let b_val = if s == 1 {
             slice_axis(&projected, -1, z_end, b_end).reshape(&[b, s, self.num_v_heads])
         } else {
@@ -1281,7 +1272,7 @@ impl Qwen3NextGatedDeltaNet {
         // Gated norm (f32 precision)
         let out_n = self.norm.forward(&out, Some(&z))?;
         let result = self.out_proj.forward(&out_n.reshape(&[b_dim, s, -1]));
-        let outputs = vec![result, new_conv, new_ssm];
+        let outputs = [result, new_conv, new_ssm];
 
         cache.conv_state = Some(outputs[1].clone());
         cache.ssm_state = Some(outputs[2].clone());
@@ -1455,7 +1446,7 @@ impl Qwen3NextGatedDeltaNet {
     ) -> Result<Array, Exception> {
         // Split conv output into q, k, v using mx.split (1 op vs 3 index ops).
         // Matches mlx-lm qwen3_5.py line 163: mx.split(conv_out, [...], -1)
-        let splits = ops::split_sections(&conv_out, &[self.key_dim, self.key_dim * 2], -1);
+        let splits = ops::split_sections(conv_out, &[self.key_dim, self.key_dim * 2], -1);
         let (q_conv, k_conv, v_conv) = (&splits[0], &splits[1], &splits[2]);
 
         // Reshape to head dimensions.
@@ -1509,9 +1500,9 @@ impl Qwen3NextGatedDeltaNet {
         layer_profile: &mut Qwen3NextLayerProfile,
     ) -> Result<Array, Exception> {
         let recurrence_start = Instant::now();
-        let q_conv = slice_last_to(&conv_out, self.key_dim);
-        let k_conv = slice_axis(&conv_out, -1, self.key_dim, self.key_dim * 2);
-        let v_conv = slice_last_from(&conv_out, self.key_dim * 2);
+        let q_conv = slice_last_to(conv_out, self.key_dim);
+        let k_conv = slice_axis(conv_out, -1, self.key_dim, self.key_dim * 2);
+        let v_conv = slice_last_from(conv_out, self.key_dim * 2);
         let out_len = q_conv.dim(1);
         let q_conv = slice_axis_from(&q_conv, 1, out_len - seq_len).reshape(&[
             batch,
@@ -3354,11 +3345,13 @@ impl Qwen3NextForCausalLM {
                 // Bootstrap InlineCache on first decode (from mlx-rs caches, called once)
                 if self.inline_cache.is_none() {
                     eprintln!("[INLINE] Bootstrapping InlineCache from mlx-rs caches...");
-                    self.inline_cache = Some(super::qwen3_next_inline::InlineCache::from_caches(
-                        kv_cache.as_ref().unwrap(),
-                        mamba_cache.as_ref().unwrap(),
-                        &weights.layers,
-                    ));
+                    if let (Some(kv), Some(mb)) = (kv_cache.as_ref(), mamba_cache.as_ref()) {
+                        self.inline_cache = Some(super::qwen3_next_inline::InlineCache::from_caches(
+                            kv,
+                            mb,
+                            &weights.layers,
+                        ));
+                    }
                 }
 
                 // Pure InlineArray decode — ZERO mlx-rs per step
@@ -3374,12 +3367,14 @@ impl Qwen3NextForCausalLM {
                 // owns the state now. write_back() is called only if we need to
                 // switch back to the standard path.
                 #[allow(unreachable_code)]
-                return super::qwen3_next_inline::inline_decode_step(
-                    weights,
-                    input_ids,
-                    kv_cache.unwrap(),
-                    mamba_cache.unwrap(),
-                );
+                if let (Some(kv), Some(mb)) = (kv_cache, mamba_cache) {
+                    return super::qwen3_next_inline::inline_decode_step(
+                        weights,
+                        input_ids,
+                        kv,
+                        mb,
+                    );
+                }
             }
         }
         let h = self

@@ -186,7 +186,7 @@ impl JambaMambaMixer {
             Some(0.0),
         );
         let mixed = Module::forward(&mut self.conv1d, &padded)?;
-        let gated = nn::silu(&gate).multiply(&nn::silu(&mixed));
+        let gated = nn::silu(gate).multiply(&nn::silu(&mixed));
         Ok(self.out_proj.forward(&gated))
     }
 }

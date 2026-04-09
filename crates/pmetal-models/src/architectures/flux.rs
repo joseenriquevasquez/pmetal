@@ -101,7 +101,7 @@ impl AdaLayerNorm {
         x: &Array,
         emb: &Array,
     ) -> Result<(Array, Array, Array, Array, Array), Exception> {
-        let emb = self.linear.forward(&nn::silu(&emb));
+        let emb = self.linear.forward(&nn::silu(emb));
         // Reshape emb to [batch, 1, 6 * dim] for broadcasting
         let emb = emb.expand_dims_axes(&[1]);
         let chunks = pmetal_bridge::compat::ops::split(&emb, 6, -1);
@@ -150,7 +150,7 @@ impl AdaLayerNormSingle {
     }
 
     pub fn forward(&mut self, x: &Array, emb: &Array) -> Result<(Array, Array), Exception> {
-        let emb = self.linear.forward(&nn::silu(&emb));
+        let emb = self.linear.forward(&nn::silu(emb));
         let emb = emb.expand_dims_axes(&[1]);
         let chunks = pmetal_bridge::compat::ops::split(&emb, 3, -1);
 
@@ -189,7 +189,7 @@ impl AdaLayerNormContinuous {
     }
 
     pub fn forward(&mut self, x: &Array, conditioning: &Array) -> Result<Array, Exception> {
-        let emb = self.linear.forward(&nn::silu(&conditioning));
+        let emb = self.linear.forward(&nn::silu(conditioning));
         let emb = emb.expand_dims_axes(&[1]);
         let chunks = pmetal_bridge::compat::ops::split(&emb, 2, -1);
 

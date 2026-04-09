@@ -866,6 +866,7 @@ impl Qwen3NextLoraSparseMoE {
 // Feed-forward enum (Dense or MoE)
 // ============================================================================
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Qwen3NextLoraFeedForward {
     Dense(Qwen3NextLoraMLP),

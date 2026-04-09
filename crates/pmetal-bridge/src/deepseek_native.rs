@@ -872,8 +872,8 @@ fn dequantize_fp8_block(
     let n = w_f.dim(1);
     let bs = 128i32;
 
-    let pad_bottom = ((-m).rem_euclid(bs)) as i32;
-    let pad_side = ((-n).rem_euclid(bs)) as i32;
+    let pad_bottom = (-m).rem_euclid(bs);
+    let pad_side = (-n).rem_euclid(bs);
 
     let m_pad = m + pad_bottom;
     let n_pad = n + pad_side;
@@ -1104,7 +1104,7 @@ fn mla_forward(
         // ---- kv_latent: [B, 1, S, lora_rank] ----
         let packed_lat = (lora_rank * bits + 31) / 32;
         let scales_lat = lora_rank / group_size;
-        let lat_2d = kv_latent_4d.reshape(&[b * 1 * s, lora_rank]);
+        let lat_2d = kv_latent_4d.reshape(&[b * s, lora_rank]);
         let (lp, ls, lb) = lat_2d.quantize_weights(group_size, bits);
         let lp = lp.reshape(&[b, 1, s, packed_lat]);
         let ls = ls.reshape(&[b, 1, s, scales_lat]);
@@ -1113,7 +1113,7 @@ fn mla_forward(
         // ---- k_pe: [B, 1, S, rope_dim] ----
         let packed_pe = (rope_dim * bits + 31) / 32;
         let scales_pe = (rope_dim / group_size).max(1);
-        let pe_2d = k_pe.reshape(&[b * 1 * s, rope_dim]);
+        let pe_2d = k_pe.reshape(&[b * s, rope_dim]);
         let (pp, ps, pb) = pe_2d.quantize_weights(group_size, bits);
         let pp = pp.reshape(&[b, 1, s, packed_pe]);
         let ps = ps.reshape(&[b, 1, s, scales_pe]);
@@ -1465,6 +1465,7 @@ fn moe_forward(lw: &LayerWeights, x: &InlineArray, b: i32, s: i32) -> InlineArra
 /// When `n_group == 1` and `topk_group == 1`, this degenerates to simple
 /// top-k on sigmoid scores (the V3 671B default of n_group=8, topk_group=4
 /// applies group masking for load balance).
+#[allow(clippy::too_many_arguments)]
 fn group_topk(
     biased_scores: &InlineArray, // [T, n_experts] — for routing decision
     orig_scores: &InlineArray,   // [T, n_experts] — for weight computation
@@ -1648,7 +1649,7 @@ fn generate_from_primed_sample_impl(
     max_tokens: usize,
     temperature: f32,
     log_stats: bool,
-    mut on_token: impl FnMut(u32) -> bool,
+    on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     crate::decode::generate_from_primed_sample(
         "DEEPSEEK",
@@ -1658,7 +1659,7 @@ fn generate_from_primed_sample_impl(
         max_tokens,
         temperature,
         log_stats,
-        |token| on_token(token),
+        on_token,
         forward_step,
     )
 }
@@ -1719,7 +1720,7 @@ pub fn generate(
     first_token: u32,
     max_tokens: usize,
     temperature: f32,
-    mut on_token: impl FnMut(u32) -> bool,
+    on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     let current_y = prime_generation_impl(weights, cache, first_token, temperature, true, true);
     generate_from_primed_sample_impl(
@@ -1729,6 +1730,6 @@ pub fn generate(
         max_tokens,
         temperature,
         true,
-        |token| on_token(token),
+        on_token,
     )
 }

@@ -272,7 +272,7 @@ impl GroupNorm {
                 .transpose_axes(&[0, 2, 1, 3])
                 .reshape(&[batch, self.group_count, -1]);
             let x2 = x2.layer_norm(None, None, eps_f);
-            let ndim = x.ndim() as i32;
+            let ndim = x.ndim();
             let new_shape: Vec<i32> = std::iter::once(batch)
                 .chain(x.shape()[1..(ndim as usize - 1)].iter().copied())
                 .chain(std::iter::once(dims))
@@ -287,7 +287,7 @@ impl GroupNorm {
             let var = x2.subtract(&mean).square().mean_axis(1, true);
             let eps_arr = Array::from_f32(eps_f);
             let x2 = x2.subtract(&mean).multiply(&var.add(&eps_arr).rsqrt());
-            let ndim = x.ndim() as i32;
+            let ndim = x.ndim();
             let new_shape: Vec<i32> = std::iter::once(batch)
                 .chain(x.shape()[1..(ndim as usize - 1)].iter().copied())
                 .chain(std::iter::once(dims))
@@ -404,6 +404,7 @@ impl Conv1d {
     pub const DEFAULT_DILATION: i32 = 1;
     pub const DEFAULT_GROUPS: i32 = 1;
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         in_channels: i32,
         out_channels: i32,
@@ -867,6 +868,12 @@ pub struct Sequential {
 impl std::fmt::Debug for Sequential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Sequential({})", self.layers.len())
+    }
+}
+
+impl Default for Sequential {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

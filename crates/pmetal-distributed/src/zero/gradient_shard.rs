@@ -166,7 +166,7 @@ mod tests {
         local.insert("b".to_string(), vec![5u8, 6, 7, 8]);
 
         // Stage 1 doesn't partition parameters, only optimizer states.
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _rt = tokio::runtime::Runtime::new().unwrap();
         // Can't actually call all_gather_params without a backend, but we can
         // verify the partitioner logic.
         assert_eq!(partitioner.stage, ZeROStage::Stage1);

@@ -28,6 +28,7 @@
 //! - Standard RLHF implementations
 
 use pmetal_bridge::compat::{Array, Exception, indexing::IndexOp, nn, ops};
+#[allow(dead_code)]
 type Result<T> = std::result::Result<T, Exception>;
 use pmetal_core::TrainingConfig;
 

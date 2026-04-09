@@ -686,7 +686,6 @@ fn gated_delta_chunk_ops(
     gated_delta_chunk_ops_impl(q, k, v, g, beta, state, mask, DEFAULT_GDN_CHUNK_SIZE)
 }
 
-#[allow(clippy::too_many_arguments)]
 // ============================================================================
 // Fused Metal GDN kernel (single kernel launch per layer)
 // ============================================================================
@@ -756,6 +755,7 @@ pub fn gated_delta_inference_dispatch(
     gated_delta_ops(q, k, v, g, beta, Some(state), mask)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gated_delta_dispatch(
     q: &Array,
     k: &Array,

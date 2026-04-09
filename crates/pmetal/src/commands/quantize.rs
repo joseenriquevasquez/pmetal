@@ -329,7 +329,7 @@ pub(crate) async fn run_quantization_mlx(
     let mut bit_keys: Vec<_> = counts.keys().collect();
     bit_keys.sort();
     for &bits in &bit_keys {
-        let count = counts[&bits];
+        let count = counts[bits];
         if *bits == 0 {
             println!("  bf16 (passthrough): {} tensors", count);
         } else {

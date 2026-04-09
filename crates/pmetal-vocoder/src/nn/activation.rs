@@ -283,7 +283,7 @@ mod tests {
         let x = Array::random_normal(&[1, 4, 16], 10);
 
         let y = snake.forward(&x).unwrap();
-        let mut y2 = y.clone();
+        let y2 = y.clone();
         y2.eval();
 
         assert_eq!(y2.shape(), &[1, 4, 16]);
@@ -295,7 +295,7 @@ mod tests {
         let x = Array::random_normal(&[2, 8, 32], 10);
 
         let y = snake.forward(&x).unwrap();
-        let mut y2 = y.clone();
+        let y2 = y.clone();
         y2.eval();
 
         assert_eq!(y2.shape(), &[2, 8, 32]);
@@ -308,11 +308,11 @@ mod tests {
         let x = Array::zeros(&[1, 1, 4], 10);
 
         let y = snake.forward(&x).unwrap();
-        let mut y2 = y.clone();
+        let y2 = y.clone();
         y2.eval();
 
         // Output should be close to 0
-        let mut sum = y2.sum_all();
+        let sum = y2.sum_all();
         sum.eval();
         assert!(sum.item_f32().abs() < 1e-5);
     }
@@ -321,7 +321,7 @@ mod tests {
     fn test_upsample_1d() {
         let x = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let y = upsample_1d(&x, 2).unwrap();
-        let mut y2 = y.clone();
+        let y2 = y.clone();
         y2.eval();
 
         assert_eq!(y2.shape(), &[1, 1, 8]);
@@ -335,7 +335,7 @@ mod tests {
 
         let x = Array::random_normal(&[1, 4, 16], 10);
         let y = act1d.forward(&x).unwrap();
-        let mut y2 = y.clone();
+        let y2 = y.clone();
         y2.eval();
 
         // Output should have same shape (up 2x, down 2x)

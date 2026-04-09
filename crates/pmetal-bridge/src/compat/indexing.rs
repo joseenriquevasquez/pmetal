@@ -24,17 +24,17 @@ fn normalize_bound(bound: i32, dim: i32) -> i32 {
 
 fn slice_axis_range(a: &Array, axis: usize, start: i32, end: i32) -> Array {
     let shape = a.shape();
-    let dim = shape[axis] as i32;
+    let dim = shape[axis];
     let ndim = shape.len();
     let mut starts = vec![0; ndim];
-    let mut stops: Vec<i32> = shape.iter().map(|&x| x as i32).collect();
+    let mut stops: Vec<i32> = shape.to_vec();
     starts[axis] = normalize_bound(start, dim);
     stops[axis] = normalize_bound(end, dim);
     a.slice(&starts, &stops)
 }
 
 fn slice_axis_from(a: &Array, axis: usize, start: i32) -> Array {
-    let end = a.shape()[axis] as i32;
+    let end = a.shape()[axis];
     slice_axis_range(a, axis, start, end)
 }
 

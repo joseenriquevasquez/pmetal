@@ -520,7 +520,7 @@ impl GptOssMLP {
 }
 
 fn clamp_swiglu_hidden(gate: &Array, up: &Array, limit: f32) -> Result<Array, Exception> {
-    let activated = nn::silu(&gate).multiply(up);
+    let activated = nn::silu(gate).multiply(up);
     let limit = Array::from_f32(limit);
     let neg_limit = Array::from_f32(-limit.item::<f32>());
     let clamped = pmetal_bridge::compat::ops::minimum(&activated, &limit);

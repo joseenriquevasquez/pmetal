@@ -557,8 +557,8 @@ impl GemmaMLP {
     fn apply_activation(&self, x: &Array) -> Array {
         match self.hidden_act.as_str() {
             "gelu" | "gelu_pytorch_tanh" | "gelu_tanh" => gelu_tanh(x),
-            "silu" | "swish" => pmetal_bridge::compat::nn::silu(&x),
-            "relu" => pmetal_bridge::compat::nn::relu(&x),
+            "silu" | "swish" => pmetal_bridge::compat::nn::silu(x),
+            "relu" => pmetal_bridge::compat::nn::relu(x),
             _ => gelu_tanh(x), // Default to gelu_tanh for Gemma
         }
     }

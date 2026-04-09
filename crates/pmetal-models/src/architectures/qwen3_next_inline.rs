@@ -154,10 +154,10 @@ impl InlineCache {
                 gdn_caches.push(InlineGdnCache {
                     conv_state: entry
                         .and_then(|e| e.conv_state.as_ref())
-                        .map(|a| ia_from_array(a)),
+                        .map(ia_from_array),
                     ssm_state: entry
                         .and_then(|e| e.ssm_state.as_ref())
-                        .map(|a| ia_from_array(a)),
+                        .map(ia_from_array),
                 });
             } else {
                 attn_layer_indices.push(i);
@@ -190,11 +190,11 @@ impl InlineCache {
                 entry.conv_state = self.gdn_caches[slot]
                     .conv_state
                     .as_ref()
-                    .map(|a| ia_to_array(a));
+                    .map(ia_to_array);
                 entry.ssm_state = self.gdn_caches[slot]
                     .ssm_state
                     .as_ref()
-                    .map(|a| ia_to_array(a));
+                    .map(ia_to_array);
             }
         }
         for (slot, &layer_idx) in self.attn_layer_indices.iter().enumerate() {
@@ -1113,7 +1113,7 @@ pub fn inline_decode_step_pure(
     let mut gdn_slot = 0usize;
     let mut attn_slot = 0usize;
 
-    for (_layer_idx, lw) in weights.layers.iter().enumerate() {
+    for lw in weights.layers.iter() {
         // Input LayerNorm
         let normed = hidden.rms_norm(Some(&lw.input_ln_w), lw.input_ln_eps);
 
@@ -1545,7 +1545,7 @@ fn inline_gdn_forward(
     let conv_state = entry
         .conv_state
         .as_ref()
-        .map(|s| ia_from_array(s))
+        .map(ia_from_array)
         .unwrap_or_else(|| InlineArray::zeros(&[b, ck - 1, cd], dtype));
 
     // Conv: concat state + qkv, extract new state, apply conv1d + silu
@@ -1586,7 +1586,7 @@ fn inline_gdn_forward(
     let ssm_state = entry
         .ssm_state
         .as_ref()
-        .map(|s| ia_from_array(s))
+        .map(ia_from_array)
         .unwrap_or_else(|| InlineArray::zeros(&[b, nv, dv, dk], 10));
 
     // Direct Metal kernel dispatch with pre-computed g/beta

@@ -430,6 +430,7 @@ struct GdnPrefillBenchmarkSetup {
     reference_output_data: Vec<f32>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum GdnBenchmarkSetup {
     InputProj(GdnInputProjectionBenchmarkSetup),
     OutProj(GdnLinearProjectionBenchmarkSetup),

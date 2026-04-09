@@ -171,7 +171,7 @@ impl MambaRMSNormGated {
     pub fn forward(&self, x: &Array, gate: Option<&Array>) -> Result<Array, Exception> {
         // Apply gating if provided: x = x * silu(gate)
         let x = if let Some(g) = gate {
-            let gate_activated = nn::silu(&g);
+            let gate_activated = nn::silu(g);
             x.multiply(&gate_activated)
         } else {
             x.clone()

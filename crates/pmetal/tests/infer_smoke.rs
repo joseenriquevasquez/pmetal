@@ -86,7 +86,7 @@ fn qwen35_cached_first_token_matches_plain_and_cached_paths() {
     let mut plain_model = DynamicModel::load(&model_path).expect("load plain model");
     let plain_logits = plain_model.forward(&input, None).expect("plain forward");
     let plain_last = ops::select_axis(&plain_logits, -1, 1);
-    let mut plain_next = ops::argmax_axis(&plain_last, -1);
+    let plain_next = ops::argmax_axis(&plain_last, -1);
     plain_next.eval();
     let plain_next = plain_next.item::<u32>();
 
@@ -97,7 +97,7 @@ fn qwen35_cached_first_token_matches_plain_and_cached_paths() {
         .forward_with_hybrid_cache(&input, None, Some(&mut cache), mamba_cache.as_mut())
         .expect("cached forward");
     let cached_last = ops::select_axis(&cached_logits, -1, 1);
-    let mut cached_next = ops::argmax_axis(&cached_last, -1);
+    let cached_next = ops::argmax_axis(&cached_last, -1);
     cached_next.eval();
     let cached_next = cached_next.item::<u32>();
     let decoded = tokenizer

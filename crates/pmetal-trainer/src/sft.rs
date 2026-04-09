@@ -127,7 +127,7 @@ impl SftTrainer {
             let zero = Array::from_int(0).as_dtype(mask_dtype);
             let cond = mask.ne(&zero);
             let ignore = Array::from_int(-100).as_dtype(labels.dtype_raw());
-            let ignore_full = ops::broadcast_to(&ignore, &labels.shape());
+            let ignore_full = ops::broadcast_to(&ignore, labels.shape());
             let masked_labels = ops::where_fn(&cond, labels, &ignore_full);
             Ok(pmetal_bridge::training::causal_lm_loss(
                 logits,

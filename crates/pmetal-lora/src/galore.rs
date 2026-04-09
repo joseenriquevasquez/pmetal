@@ -194,7 +194,7 @@ impl GaloreProjector {
 
         // Compute SVD on CPU (GPU SVD not yet implemented in MLX)
         // G = U @ diag(S) @ Vt
-        let (u, _s, vt) = pmetal_bridge::compat::linalg::svd(&grad);
+        let (u, _s, vt) = pmetal_bridge::compat::linalg::svd(grad);
 
         let rank = self.config.rank as i32;
 

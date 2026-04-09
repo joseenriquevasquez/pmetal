@@ -294,7 +294,7 @@ mod tests {
         };
 
         let fb = mel_filterbank(&config).unwrap();
-        let mut fb2 = fb.clone();
+        let fb2 = fb.clone();
         fb2.eval();
 
         // Should be [n_mels, n_fft/2+1] = [80, 513]
@@ -314,12 +314,12 @@ mod tests {
         };
 
         let fb = mel_filterbank(&config).unwrap();
-        let mut fb2 = fb.clone();
+        let fb2 = fb.clone();
         fb2.eval();
 
         // Sum of each filter should be reasonable (not all zeros)
         let row_sums = fb2.sum_axis(1, false);
-        let mut rs2 = row_sums.clone();
+        let rs2 = row_sums.clone();
         rs2.eval();
 
         // Each mel filter should sum to something positive

@@ -58,7 +58,7 @@ impl PhiLoraRmsNorm {
     /// Forward pass using optimized fast::rms_norm.
     pub fn forward(&self, x: &Array) -> Result<Array, Exception> {
         // Use the optimized fused RMS norm kernel
-        Ok(fast::rms_norm(x, &*self.weight, self.eps))
+        Ok(fast::rms_norm(x, &self.weight, self.eps))
     }
 }
 
