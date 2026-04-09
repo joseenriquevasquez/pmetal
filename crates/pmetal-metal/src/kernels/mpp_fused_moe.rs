@@ -346,6 +346,383 @@ impl MppMoEScatter {
     }
 }
 
+// =============================================================================
+// Quantized MoE Expert Dispatchers
+// =============================================================================
+
+/// Configuration for quantized MPP MoE expert forward pass.
+#[derive(Debug, Clone)]
+pub struct MppFusedMoEQuantConfig {
+    /// Number of tokens dispatched to this expert.
+    pub batch_size: usize,
+    /// Hidden dimension (input and output of the expert).
+    pub hidden_dim: usize,
+    /// Expert intermediate dimension.
+    pub intermediate_dim: usize,
+    /// Quantization group size (e.g., 64).
+    pub group_size: usize,
+    /// Quantization bits (must be 4).
+    pub bits: u32,
+}
+
+impl MppFusedMoEQuantConfig {
+    /// Create a new quantized expert config.
+    pub fn new(
+        batch_size: usize,
+        hidden_dim: usize,
+        intermediate_dim: usize,
+        group_size: usize,
+        bits: u32,
+    ) -> Self {
+        Self {
+            batch_size,
+            hidden_dim,
+            intermediate_dim,
+            group_size,
+            bits,
+        }
+    }
+}
+
+/// Metal-side parameter block (must match `MppMoEQuantParams` in Metal).
+#[repr(C)]
+struct MppMoEQuantParamsMetal {
+    batch_size: u32,
+    hidden_dim: u32,
+    intermediate_dim: u32,
+    group_size: u32,
+    bits: u32,
+}
+
+/// MPP Fused MoE expert forward dispatcher for quantized (4-bit) weights.
+///
+/// Accepts packed `u32` gate/up/down weights and fp16 scales/biases as carried
+/// by `MoeExpertDescriptor`. Dequantizes cooperatively on-GPU, then uses MPP
+/// matmul2d for the GEMM steps.
+pub struct MppFusedMoEQuant {
+    ctx: Arc<MetalContext>,
+    config: MppFusedMoEQuantConfig,
+}
+
+impl MppFusedMoEQuant {
+    /// Create a new dispatcher.
+    pub fn new(ctx: Arc<MetalContext>, config: MppFusedMoEQuantConfig) -> Self {
+        Self { ctx, config }
+    }
+
+    /// Returns true when quantized MPP MoE is available (requires M5+ NAX).
+    pub fn is_available(&self) -> bool {
+        self.ctx.properties().has_nax()
+            && self.ctx.pipeline_cache().metal4_library().is_some()
+            && self.config.bits == 4
+    }
+
+    fn make_params(&self) -> MppMoEQuantParamsMetal {
+        MppMoEQuantParamsMetal {
+            batch_size: self.config.batch_size as u32,
+            hidden_dim: self.config.hidden_dim as u32,
+            intermediate_dim: self.config.intermediate_dim as u32,
+            group_size: self.config.group_size as u32,
+            bits: self.config.bits,
+        }
+    }
+
+    /// Execute gate + up SwiGLU (quantized) synchronously.
+    ///
+    /// - `input`: `[batch, hidden]` fp16
+    /// - `gate_w_q`: `[intermediate, hidden/8]` packed 4-bit
+    /// - `gate_scales`, `gate_biases`: `[intermediate, hidden/group_size]` fp16
+    /// - `up_w_q`, `up_scales`, `up_biases`: same layout
+    /// - `act_out`: `[batch, intermediate]` fp16 — SwiGLU output
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_gate_up(
+        &self,
+        input: &dyn AsMetalBuffer,
+        gate_w_q: &dyn AsMetalBuffer,
+        gate_scales: &dyn AsMetalBuffer,
+        gate_biases: &dyn AsMetalBuffer,
+        up_w_q: &dyn AsMetalBuffer,
+        up_scales: &dyn AsMetalBuffer,
+        up_biases: &dyn AsMetalBuffer,
+        act_out: &dyn AsMetalBuffer,
+    ) -> Result<()> {
+        let cb = self.execute_gate_up_async(
+            input,
+            gate_w_q,
+            gate_scales,
+            gate_biases,
+            up_w_q,
+            up_scales,
+            up_biases,
+            act_out,
+        )?;
+        cb.waitUntilCompleted();
+        if let Some(e) = cb.error() {
+            return Err(MetalError::ExecutionFailed(e.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Execute gate + up SwiGLU (quantized) asynchronously.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_gate_up_async(
+        &self,
+        input: &dyn AsMetalBuffer,
+        gate_w_q: &dyn AsMetalBuffer,
+        gate_scales: &dyn AsMetalBuffer,
+        gate_biases: &dyn AsMetalBuffer,
+        up_w_q: &dyn AsMetalBuffer,
+        up_scales: &dyn AsMetalBuffer,
+        up_biases: &dyn AsMetalBuffer,
+        act_out: &dyn AsMetalBuffer,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        if !self.is_available() {
+            return Err(MetalError::ExecutionFailed(
+                "MPP quantized MoE gate_up not available (requires M5+ NAX, bits=4)".to_string(),
+            ));
+        }
+
+        let params = self.make_params();
+
+        // Grid: [ceil(I/32), ceil(B/32), 1]  Threadgroup: [128, 1, 1]
+        let grid = objc2_metal::MTLSize {
+            width: self.config.intermediate_dim.div_ceil(32),
+            height: self.config.batch_size.div_ceil(32),
+            depth: 1,
+        };
+        let tg_size = objc2_metal::MTLSize {
+            width: 128, // 4 simdgroups for cooperative dequant
+            height: 1,
+            depth: 1,
+        };
+
+        let input_buf = input.as_metal_buffer();
+        let gw_buf = gate_w_q.as_metal_buffer();
+        let gs_buf = gate_scales.as_metal_buffer();
+        let gb_buf = gate_biases.as_metal_buffer();
+        let uw_buf = up_w_q.as_metal_buffer();
+        let us_buf = up_scales.as_metal_buffer();
+        let ub_buf = up_biases.as_metal_buffer();
+        let act_buf = act_out.as_metal_buffer();
+
+        encode_mpp_kernel(
+            &self.ctx,
+            "mpp_fused_moe_gate_up_quant_f16",
+            grid,
+            tg_size,
+            |encoder| unsafe {
+                encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(gw_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(gs_buf), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(gb_buf), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(uw_buf), 0, 4);
+                encoder.setBuffer_offset_atIndex(Some(us_buf), 0, 5);
+                encoder.setBuffer_offset_atIndex(Some(ub_buf), 0, 6);
+                encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 7);
+                let p_ptr = NonNull::from(&params).cast();
+                encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 8);
+            },
+        )
+    }
+
+    /// Execute down projection (quantized) synchronously.
+    ///
+    /// - `act_in`: `[batch, intermediate]` fp16 — SwiGLU output
+    /// - `down_w_q`: `[hidden, intermediate/8]` packed 4-bit
+    /// - `down_scales`, `down_biases`: `[hidden, intermediate/group_size]` fp16
+    /// - `out`: `[batch, hidden]` fp16
+    pub fn execute_down(
+        &self,
+        act_in: &dyn AsMetalBuffer,
+        down_w_q: &dyn AsMetalBuffer,
+        down_scales: &dyn AsMetalBuffer,
+        down_biases: &dyn AsMetalBuffer,
+        out: &dyn AsMetalBuffer,
+    ) -> Result<()> {
+        let cb =
+            self.execute_down_async(act_in, down_w_q, down_scales, down_biases, out)?;
+        cb.waitUntilCompleted();
+        if let Some(e) = cb.error() {
+            return Err(MetalError::ExecutionFailed(e.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Execute down projection (quantized) asynchronously.
+    pub fn execute_down_async(
+        &self,
+        act_in: &dyn AsMetalBuffer,
+        down_w_q: &dyn AsMetalBuffer,
+        down_scales: &dyn AsMetalBuffer,
+        down_biases: &dyn AsMetalBuffer,
+        out: &dyn AsMetalBuffer,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        if !self.is_available() {
+            return Err(MetalError::ExecutionFailed(
+                "MPP quantized MoE down not available (requires M5+ NAX, bits=4)".to_string(),
+            ));
+        }
+
+        let params = self.make_params();
+
+        // Grid: [ceil(H/32), ceil(B/32), 1]  Threadgroup: [128, 1, 1]
+        let grid = objc2_metal::MTLSize {
+            width: self.config.hidden_dim.div_ceil(32),
+            height: self.config.batch_size.div_ceil(32),
+            depth: 1,
+        };
+        let tg_size = objc2_metal::MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        };
+
+        let act_buf = act_in.as_metal_buffer();
+        let dw_buf = down_w_q.as_metal_buffer();
+        let ds_buf = down_scales.as_metal_buffer();
+        let db_buf = down_biases.as_metal_buffer();
+        let out_buf = out.as_metal_buffer();
+
+        encode_mpp_kernel(
+            &self.ctx,
+            "mpp_fused_moe_down_quant_f16",
+            grid,
+            tg_size,
+            |encoder| unsafe {
+                encoder.setBuffer_offset_atIndex(Some(act_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(dw_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(ds_buf), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(db_buf), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 4);
+                let p_ptr = NonNull::from(&params).cast();
+                encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 5);
+            },
+        )
+    }
+}
+
+// =============================================================================
+// GPU Tile Count for Grouped GEMM
+// =============================================================================
+
+/// Metal-side parameter block (must match `TileCountParams` in Metal).
+#[repr(C)]
+struct TileCountParams {
+    num_experts: u32,
+    intermediate: u32,
+    block_m: u32,
+    block_n: u32,
+}
+
+/// Computes the grouped GEMM tile count from `expert_offsets` entirely on GPU.
+///
+/// Eliminates the CPU round-trip in `Metal4Backend::grouped_gemm`: instead of
+/// copying `expert_offsets` to host, reading each expert's token count, and
+/// computing the tile sum, this dispatches a single tiny kernel that atomically
+/// accumulates the tile count into a 1-element output buffer.
+///
+/// The result is a `MetalBuffer<u32>` containing `total_tiles`. The caller
+/// reads this single u32 (4 bytes) to construct `GroupedGemmDispatch`.
+pub struct MppGroupedGemmTileCount {
+    ctx: Arc<MetalContext>,
+}
+
+impl MppGroupedGemmTileCount {
+    /// Create a new tile count dispatcher.
+    pub fn new(ctx: Arc<MetalContext>) -> Self {
+        Self { ctx }
+    }
+
+    /// Returns true when the tile count kernel is available (requires M5+ NAX).
+    pub fn is_available(&self) -> bool {
+        self.ctx.properties().has_nax() && self.ctx.pipeline_cache().metal4_library().is_some()
+    }
+
+    /// Compute the total grouped GEMM tile count on GPU and return it as a u32.
+    ///
+    /// `expert_offsets`: GPU buffer `[num_experts + 1]` u32 (prefix sum),
+    /// `num_experts`: number of experts E,
+    /// `intermediate`: output dimension N (used to compute num_n_tiles),
+    /// `block_m`, `block_n`: tile dimensions (64 for grouped GEMM).
+    ///
+    /// Returns the `total_tiles` value needed for `GroupedGemmDispatch`.
+    pub fn compute(
+        &self,
+        expert_offsets: &dyn AsMetalBuffer,
+        num_experts: usize,
+        intermediate: usize,
+        block_m: usize,
+        block_n: usize,
+    ) -> Result<usize> {
+        use crate::buffer::BufferUsage;
+
+        if !self.is_available() {
+            return Err(MetalError::ExecutionFailed(
+                "MPP tile count kernel not available (requires M5+ GPU with NAX)".to_string(),
+            ));
+        }
+
+        // Clamp num_experts to Metal's max threadgroup size.
+        // A single threadgroup handles all experts — E <= 1024 is safe on M5.
+        let e = num_experts.min(1024);
+        if e == 0 {
+            return Ok(0);
+        }
+
+        let params = TileCountParams {
+            num_experts: e as u32,
+            intermediate: intermediate as u32,
+            block_m: block_m as u32,
+            block_n: block_n as u32,
+        };
+
+        // 1-element output buffer (atomic u32, zero-initialized via Shared).
+        let tile_count_buf = crate::buffer::MetalBuffer::<u32>::new(
+            &self.ctx,
+            1,
+            BufferUsage::Shared,
+        )?;
+
+        let eo_buf = expert_offsets.as_metal_buffer();
+        let tc_buf = tile_count_buf.as_metal_buffer();
+
+        // Grid: [1, 1, 1]  Threadgroup: [E, 1, 1]
+        let grid = objc2_metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let tg_size = objc2_metal::MTLSize {
+            width: e,
+            height: 1,
+            depth: 1,
+        };
+
+        let cb = encode_mpp_kernel(
+            &self.ctx,
+            "mpp_grouped_gemm_tile_count",
+            grid,
+            tg_size,
+            |encoder| unsafe {
+                encoder.setBuffer_offset_atIndex(Some(eo_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(tc_buf), 0, 1);
+                let p_ptr = NonNull::from(&params).cast();
+                encoder.setBytes_length_atIndex(p_ptr, std::mem::size_of_val(&params), 2);
+            },
+        )?;
+
+        cb.waitUntilCompleted();
+        if let Some(e) = cb.error() {
+            return Err(MetalError::ExecutionFailed(e.to_string()));
+        }
+
+        // Read the single u32 result — 4 bytes, trivial CPU cost.
+        let contents = tile_count_buf.contents();
+        let total_tiles = contents[0] as usize;
+        Ok(total_tiles)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +760,43 @@ mod tests {
             hidden_dim: 2048,
         };
         assert_eq!(cfg.num_tokens, 8);
+    }
+
+    // MppFusedMoEQuant config tests
+    #[test]
+    fn test_quant_config() {
+        let cfg = MppFusedMoEQuantConfig::new(4, 2048, 4096, 64, 4);
+        assert_eq!(cfg.batch_size, 4);
+        assert_eq!(cfg.hidden_dim, 2048);
+        assert_eq!(cfg.intermediate_dim, 4096);
+        assert_eq!(cfg.group_size, 64);
+        assert_eq!(cfg.bits, 4);
+    }
+
+    #[test]
+    fn test_quant_gate_up_tiles() {
+        let cfg = MppFusedMoEQuantConfig::new(1, 2048, 4096, 64, 4);
+        // Grid: [ceil(I/32), ceil(B/32), 1]
+        let tiles_i = cfg.intermediate_dim.div_ceil(32);
+        let tiles_b = cfg.batch_size.div_ceil(32);
+        assert_eq!(tiles_i, 128);
+        assert_eq!(tiles_b, 1);
+    }
+
+    #[test]
+    fn test_quant_down_tiles() {
+        let cfg = MppFusedMoEQuantConfig::new(32, 2048, 4096, 64, 4);
+        // Grid: [ceil(H/32), ceil(B/32), 1]
+        let tiles_h = cfg.hidden_dim.div_ceil(32);
+        let tiles_b = cfg.batch_size.div_ceil(32);
+        assert_eq!(tiles_h, 64);
+        assert_eq!(tiles_b, 1);
+    }
+
+    // TileCountParams layout test
+    #[test]
+    fn test_tile_count_params_size() {
+        // Must be 4 × u32 = 16 bytes to match Metal struct.
+        assert_eq!(std::mem::size_of::<TileCountParams>(), 16);
     }
 }
