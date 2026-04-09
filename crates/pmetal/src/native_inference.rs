@@ -309,7 +309,7 @@ pub fn run_native_inference(
         model_path,
         input_ids,
         max_tokens,
-        temperature,
+        pmetal_bridge::decode::SamplingParams::new(temperature),
         turboquant,
         None,
         &mut on_token,
@@ -321,7 +321,7 @@ pub fn run_native_inference_ext(
     model_path: &Path,
     input_ids: &[u32],
     max_tokens: usize,
-    temperature: f32,
+    params: pmetal_bridge::decode::SamplingParams,
     turboquant: Option<TurboQuantConfig>,
     quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
     mut on_token: impl FnMut(u32) -> bool,
@@ -343,7 +343,7 @@ pub fn run_native_inference_ext(
             model_path,
             input_ids,
             max_tokens,
-            temperature,
+            params,
             turboquant,
             quant_config,
             &mut on_token,
@@ -352,7 +352,7 @@ pub fn run_native_inference_ext(
             model_path,
             input_ids,
             max_tokens,
-            temperature,
+            params,
             quant_config,
             &mut on_token,
         ),
@@ -360,7 +360,7 @@ pub fn run_native_inference_ext(
             model_path,
             input_ids,
             max_tokens,
-            temperature,
+            params,
             quant_config,
             &mut on_token,
         ),
@@ -368,7 +368,7 @@ pub fn run_native_inference_ext(
             model_path,
             input_ids,
             max_tokens,
-            temperature,
+            params,
             quant_config,
             &mut on_token,
         ),
@@ -422,7 +422,7 @@ fn run_bridge_inference<Config, Weights, Cache>(
     model_path: &Path,
     input_ids: &[u32],
     max_tokens: usize,
-    temperature: f32,
+    params: pmetal_bridge::decode::SamplingParams,
     on_token: &mut dyn FnMut(u32) -> bool,
     load_config: impl Fn(&Path) -> Result<Config, String>,
     describe_config: impl Fn(&Config) -> String,
@@ -435,7 +435,7 @@ fn run_bridge_inference<Config, Weights, Cache>(
         &mut Cache,
         u32,
         usize,
-        f32,
+        pmetal_bridge::decode::SamplingParams,
         &mut dyn FnMut(u32) -> bool,
     ) -> (Vec<u32>, Option<pmetal_bridge::decode::DecodeMetrics>),
 ) -> Result<NativeGenerationOutput, String> {
@@ -453,6 +453,7 @@ fn run_bridge_inference<Config, Weights, Cache>(
         "Model loaded",
     );
 
+    let temperature = params.temperature;
     let mut cache = build_cache(&weights, &config);
     let first_tok = prefill_first_token(&weights, &mut cache, input_ids, temperature);
 
@@ -468,7 +469,7 @@ fn run_bridge_inference<Config, Weights, Cache>(
                 &mut cache,
                 first_tok,
                 max_tokens.saturating_sub(1),
-                temperature,
+                params,
                 on_token,
             )
         },
@@ -514,7 +515,7 @@ fn run_qwen3(
     model_path: &Path,
     input_ids: &[u32],
     max_tokens: usize,
-    temperature: f32,
+    params: pmetal_bridge::decode::SamplingParams,
     turboquant: Option<TurboQuantConfig>,
     quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
@@ -525,7 +526,7 @@ fn run_qwen3(
         model_path,
         input_ids,
         max_tokens,
-        temperature,
+        params,
         on_token,
         qwen3_native::load_config,
         |config| {
@@ -566,14 +567,14 @@ fn run_qwen3(
         },
         |weights, _| build_qwen3_cache_with_quant(weights, turboquant, quant_config),
         qwen3_native::prefill_first_token,
-        |weights, config, cache, first_tok, remaining, temperature, on_token| {
+        |weights, config, cache, first_tok, remaining, params, on_token| {
             qwen3_native::generate_canonical(
                 weights,
                 cache,
                 config,
                 first_tok,
                 remaining,
-                temperature,
+                params,
                 turboquant,
                 on_token,
             )
@@ -691,7 +692,7 @@ fn run_llama4(
     model_path: &Path,
     input_ids: &[u32],
     max_tokens: usize,
-    temperature: f32,
+    params: pmetal_bridge::decode::SamplingParams,
     quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
@@ -701,7 +702,7 @@ fn run_llama4(
         model_path,
         input_ids,
         max_tokens,
-        temperature,
+        params,
         on_token,
         llama4_native::load_config,
         |config| {
@@ -714,8 +715,8 @@ fn run_llama4(
         llama4_native::load_model,
         move |weights, _| llama4_native::NativeCache::new_with_quant(weights, quant_config),
         llama4_native::prefill_first_token,
-        |weights, _config, cache, first_tok, remaining, temperature, on_token| {
-            llama4_native::generate(weights, cache, first_tok, remaining, temperature, on_token)
+        |weights, _config, cache, first_tok, remaining, params, on_token| {
+            llama4_native::generate(weights, cache, first_tok, remaining, params, on_token)
         },
     )
 }
@@ -728,7 +729,7 @@ fn run_deepseek(
     model_path: &Path,
     input_ids: &[u32],
     max_tokens: usize,
-    temperature: f32,
+    params: pmetal_bridge::decode::SamplingParams,
     quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
@@ -738,7 +739,7 @@ fn run_deepseek(
         model_path,
         input_ids,
         max_tokens,
-        temperature,
+        params,
         on_token,
         deepseek_native::load_config,
         |config| {
@@ -758,8 +759,8 @@ fn run_deepseek(
             )
         },
         deepseek_native::prefill_first_token,
-        |weights, _config, cache, first_tok, remaining, temperature, on_token| {
-            deepseek_native::generate(weights, cache, first_tok, remaining, temperature, on_token)
+        |weights, _config, cache, first_tok, remaining, params, on_token| {
+            deepseek_native::generate(weights, cache, first_tok, remaining, params, on_token)
         },
     )
 }
@@ -772,7 +773,7 @@ fn run_gpt_oss(
     model_path: &Path,
     input_ids: &[u32],
     max_tokens: usize,
-    temperature: f32,
+    params: pmetal_bridge::decode::SamplingParams,
     quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
@@ -782,7 +783,7 @@ fn run_gpt_oss(
         model_path,
         input_ids,
         max_tokens,
-        temperature,
+        params,
         on_token,
         gpt_oss_native::load_config,
         |config| {
@@ -797,8 +798,8 @@ fn run_gpt_oss(
         gpt_oss_native::load_model,
         move |weights, _| gpt_oss_native::NativeCache::new_with_quant(weights, quant_config),
         gpt_oss_native::prefill_first_token,
-        |weights, _config, cache, first_tok, remaining, temperature, on_token| {
-            gpt_oss_native::generate(weights, cache, first_tok, remaining, temperature, on_token)
+        |weights, _config, cache, first_tok, remaining, params, on_token| {
+            gpt_oss_native::generate(weights, cache, first_tok, remaining, params, on_token)
         },
     )
 }

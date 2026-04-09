@@ -593,11 +593,17 @@ impl InferenceGenState {
 
         if matches!(self.model, LoadedModel::NativeOnly) {
             let stop_tokens = self.gen_config.stop_tokens.clone();
+            let sampling_params = pmetal_bridge::decode::SamplingParams {
+                temperature: self.gen_config.temperature,
+                repetition_penalty: self.gen_config.repetition_penalty,
+                frequency_penalty: self.gen_config.frequency_penalty,
+                presence_penalty: self.gen_config.presence_penalty,
+            };
             let output = crate::native_inference::run_native_inference_ext(
                 &self.model_path,
                 &self.input_ids,
                 self.gen_config.max_new_tokens,
-                self.gen_config.temperature,
+                sampling_params,
                 self.native_turboquant,
                 self.native_quant_config,
                 |token| forward_native_token(&stop_tokens, &mut on_token_guarded, token),

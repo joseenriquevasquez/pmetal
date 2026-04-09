@@ -3406,17 +3406,17 @@ fn generate_from_primed_sample_impl(
     cache: &mut NativeCache,
     current_y: InlineArray,
     max_tokens: usize,
-    temperature: f32,
+    params: crate::decode::SamplingParams,
     log_stats: bool,
     on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
-    crate::decode::generate_from_primed_sample(
+    crate::decode::generate_from_primed_sample_with_params(
         "NATIVE",
         weights,
         cache,
         current_y,
         max_tokens,
-        temperature,
+        params,
         log_stats,
         on_token,
         forward_step,
@@ -3480,7 +3480,7 @@ pub fn generate_from_primed_sample(
         cache,
         current_y,
         max_tokens,
-        temperature,
+        crate::decode::SamplingParams::new(temperature),
         true,
         on_token,
     )
@@ -3552,7 +3552,7 @@ pub fn generate_from_primed_sample_silent(
         cache,
         current_y,
         max_tokens,
-        temperature,
+        crate::decode::SamplingParams::new(temperature),
         false,
         on_token,
     )
@@ -3564,7 +3564,7 @@ pub fn generate(
     cache: &mut NativeCache,
     first_token: u32,
     max_tokens: usize,
-    temperature: f32,
+    params: crate::decode::SamplingParams,
     on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     let current_y = prime_generation_impl(
@@ -3572,7 +3572,7 @@ pub fn generate(
         cache,
         first_token,
         max_tokens,
-        temperature,
+        params.temperature,
         true,
         true,
     );
@@ -3581,7 +3581,7 @@ pub fn generate(
         cache,
         current_y,
         max_tokens,
-        temperature,
+        params,
         true,
         on_token,
     )
@@ -3606,19 +3606,14 @@ pub fn generate_canonical(
     config: &Qwen3Config,
     first_token: u32,
     max_tokens: usize,
-    temperature: f32,
+    params: crate::decode::SamplingParams,
     turboquant: Option<crate::turboquant::TurboQuantConfig>,
     on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     match canonical_decode_backend(config, turboquant) {
-        QwenDecodeBackend::RustBridge => generate(
-            weights,
-            cache,
-            first_token,
-            max_tokens,
-            temperature,
-            on_token,
-        ),
+        QwenDecodeBackend::RustBridge => {
+            generate(weights, cache, first_token, max_tokens, params, on_token)
+        }
     }
 }
 
@@ -3658,7 +3653,7 @@ pub fn generate_preserve_peak(
         cache,
         current_y,
         max_tokens,
-        temperature,
+        crate::decode::SamplingParams::new(temperature),
         true,
         on_token,
     )
@@ -3775,7 +3770,7 @@ fn generate_cpp(
             cache,
             first_token,
             max_tokens,
-            temperature,
+            crate::decode::SamplingParams::new(temperature),
             on_token,
         )
         .0;

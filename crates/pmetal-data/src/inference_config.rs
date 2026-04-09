@@ -194,9 +194,9 @@ impl std::str::FromStr for SamplingMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "auto" => Ok(Self::Auto),
-            "thinking-general" | "thinking" => Ok(Self::ThinkingGeneral),
+            "thinking-general" | "general-thinking" | "thinking" => Ok(Self::ThinkingGeneral),
             "thinking-coding" | "coding" => Ok(Self::ThinkingCoding),
-            "instruct-general" | "instruct" => Ok(Self::InstructGeneral),
+            "instruct-general" | "general-instruct" | "instruct" => Ok(Self::InstructGeneral),
             "instruct-reasoning" | "reasoning" => Ok(Self::InstructReasoning),
             _ => Err(format!(
                 "unknown mode '{s}': expected auto, thinking-general, thinking-coding, \

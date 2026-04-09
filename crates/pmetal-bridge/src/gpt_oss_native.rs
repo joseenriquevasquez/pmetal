@@ -1461,17 +1461,17 @@ fn generate_from_primed_sample_impl(
     cache: &mut NativeCache,
     current_y: InlineArray,
     max_tokens: usize,
-    temperature: f32,
+    params: crate::decode::SamplingParams,
     log_stats: bool,
     on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
-    crate::decode::generate_from_primed_sample(
+    crate::decode::generate_from_primed_sample_with_params(
         "GPT-OSS",
         weights,
         cache,
         current_y,
         max_tokens,
-        temperature,
+        params,
         log_stats,
         on_token,
         forward_step,
@@ -1499,7 +1499,7 @@ pub fn benchmark_mlx_lm_trial(
             &mut cache,
             current_y,
             generation_tokens - 1,
-            0.0,
+            crate::decode::SamplingParams::new(0.0),
             false,
             |_| true,
         );
@@ -1533,16 +1533,17 @@ pub fn generate(
     cache: &mut NativeCache,
     first_token: u32,
     max_tokens: usize,
-    temperature: f32,
+    params: crate::decode::SamplingParams,
     on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
-    let current_y = prime_generation_impl(weights, cache, first_token, temperature, true, true);
+    let current_y =
+        prime_generation_impl(weights, cache, first_token, params.temperature, true, true);
     generate_from_primed_sample_impl(
         weights,
         cache,
         current_y,
         max_tokens,
-        temperature,
+        params,
         true,
         on_token,
     )

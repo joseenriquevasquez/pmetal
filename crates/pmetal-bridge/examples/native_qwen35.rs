@@ -118,7 +118,7 @@ fn main() {
         &config,
         first_tok_id,
         max_tokens,
-        temperature,
+        pmetal_bridge::decode::SamplingParams::new(temperature),
         tq_bits.map(|bits| pmetal_bridge::turboquant::TurboQuantConfig::uniform(bits, bits)),
         |_tok| true,
     );
