@@ -4,28 +4,26 @@
 //! the corresponding existing Metal 3 kernel struct. No logic lives here; this
 //! file is pure glue.
 //!
-//! # Remaining todo! stubs
-//!
-//! Two methods remain stubbed because the type impedance cannot be bridged
-//! without a structural change to the underlying kernel:
-//!
-//! - **`quantized_gemm`**: Metal 3 has no quantized GEMM path
-//!   (`BackendCaps::metal3()` reports `has_quantized_gemm: false`).
-//!
-//! - **`grouped_gemm`**: [`MoeKernel`] takes [`MoeConfig`] + [`MoeRouting`],
-//!   but the trait supplies a flat [`GroupedGemmDescriptor`]. An adapter is
-//!   needed in Task 3 (KernelDispatch).
-//!
-//! - **`fused_moe_expert`**: [`ExpertWeightBuffers`] stores scales/biases as
-//!   `MetalBuffer<u16>` (raw bits), but [`MoeExpertDescriptor`] carries them
-//!   as `&MetalBuffer<f16>`. A reinterpret-cast shim or a `MetalBuffer::reinterpret`
-//!   constructor is needed before this can be wired without a copy.
-//!
 //! # Resolved stubs
 //!
-//! `fused_lora_forward`, `fused_cross_entropy`, `fused_distill_loss`, and
-//! `fused_adamw_step` are now wired using [`DynBufRef`] (for the sampler-trait
-//! mismatch) and param-info extraction from the `AdamWDescriptor` (for AdamW).
+//! All `todo!()` stubs have been closed:
+//!
+//! - **`quantized_gemm`**: returns `Err(InvalidConfig)` — Metal 3 has no quantized
+//!   GEMM path (`BackendCaps::metal3()` reports `has_quantized_gemm: false`).
+//!
+//! - **`grouped_gemm`**: returns `Err(InvalidConfig)` — [`MoeKernel`] requires
+//!   `topk_ids` and `token_counts` buffers that are not present in
+//!   [`GroupedGemmDescriptor`], making the adapter impossible without routing
+//!   through the full `MoeKernel::route()` path.
+//!
+//! - **`fused_moe_expert`**: fully wired via [`MetalBuffer::reinterpret`] —
+//!   the descriptor's `&MetalBuffer<f16>` scale/bias buffers are reinterpreted
+//!   as `MetalBuffer<u16>` (same 2-byte layout, Metal does not distinguish them)
+//!   and passed directly to [`FusedMoeExpert::forward_single_expert`].
+//!
+//! - **`fused_lora_forward`**, **`fused_cross_entropy`**, **`fused_distill_loss`**,
+//!   and **`fused_adamw_step`**: wired using [`DynBufRef`] (for the sampler-trait
+//!   mismatch) and param-info extraction from the `AdamWDescriptor` (for AdamW).
 
 use std::sync::Arc;
 
@@ -38,9 +36,9 @@ use crate::{
         AdamWDescriptor, BackendCaps, GemmDescriptor, GroupedGemmDescriptor, KernelBackend,
         MoeExpertDescriptor, QuantizedGemmDescriptor,
     },
-    buffer::{AsMetalBuffer, MetalBuffer},
+    buffer::{AsMetalBuffer, BufferUsage, MetalBuffer},
     context::MetalContext,
-    error::Result,
+    error::{MetalError, Result},
     kernels::{
         dw_gemm::DwGemm,
         flash_attention::{FlashAttention, FlashAttentionConfig, FlashAttentionOutput},
@@ -49,6 +47,7 @@ use crate::{
         },
         fused_distill::{DistillLossType, FusedDistill, FusedDistillConfig, FusedDistillOutput},
         fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput},
+        fused_moe::{ExpertWeightBuffers, FusedMoeExpert},
         fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput},
         fused_rope::{FusedRoPE, FusedRoPEConfig},
         fused_sampler::AsMetalBuffer as SamplerBuf,
@@ -183,7 +182,15 @@ impl KernelBackend for Metal3Backend {
         _biases: Option<&dyn AsMetalBuffer>,
         _output: &dyn AsMetalBuffer,
     ) -> Result<()> {
-        todo!("Metal3 has no quantized GEMM path; BackendCaps::metal3() has_quantized_gemm=false")
+        // Metal 3 has no quantized GEMM kernel. BackendCaps::metal3() reports
+        // has_quantized_gemm: false, so the dispatch layer must never route here.
+        // Return a proper error instead of panicking so the process can recover.
+        Err(MetalError::InvalidConfig(
+            "quantized_gemm is not available on the Metal 3 backend \
+             (BackendCaps::metal3() has_quantized_gemm=false); \
+             route quantized GEMM to Metal 4 or the MLX compute graph path"
+                .into(),
+        ))
     }
 
     /// Depthwise GEMM accumulate via [`DwGemm::queue_gemm_accum`].
@@ -221,10 +228,21 @@ impl KernelBackend for Metal3Backend {
         _scatter_indices: &MetalBuffer<u32>,
         _topk_weights: &MetalBuffer<f32>,
     ) -> Result<MetalBuffer<f32>> {
-        todo!(
-            "MoeKernel API takes MoeConfig+MoeRouting, not GroupedGemmDescriptor; \
-             adapter needed in KernelDispatch (Task 3)"
-        )
+        // MoeKernel::forward() requires a MoeRouting, which bundles topk_ids and
+        // token_counts in addition to the index buffers supplied here.
+        // GroupedGemmDescriptor does not carry those fields — they are intermediate
+        // routing state produced by MoeKernel::route() and not preserved in the
+        // descriptor. Building the adapter is impossible without a full re-route,
+        // which would duplicate work already done by the caller. Return a proper
+        // error; the dispatch layer (KernelDispatch) should call moe_routing() +
+        // MoeKernel::forward() directly rather than going through grouped_gemm().
+        Err(MetalError::InvalidConfig(
+            "grouped_gemm on Metal 3 cannot be bridged to MoeKernel::forward(): \
+             MoeRouting requires topk_ids and token_counts buffers that are absent \
+             from GroupedGemmDescriptor; use moe_routing() + MoeKernel::forward() \
+             directly from the dispatch layer"
+                .into(),
+        ))
     }
 
     // ---- Attention ----------------------------------------------------------
@@ -451,33 +469,44 @@ impl KernelBackend for Metal3Backend {
         kernel.route(router_logits)
     }
 
-    /// Fused MoE expert forward — blocked on dtype type mismatch.
+    /// Fused MoE expert forward via [`FusedMoeExpert::forward_single_expert`].
     ///
-    /// [`ExpertWeightBuffers`] stores scales/biases as `MetalBuffer<u16>`
-    /// (raw 16-bit values), but [`MoeExpertDescriptor`] carries them as
-    /// `&MetalBuffer<f16>` (typed half-precision). Assembling an
-    /// `ExpertWeightBuffers` from the descriptor fields would require either:
-    ///
-    /// 1. A `MetalBuffer::reinterpret::<f16, u16>()` constructor that
-    ///    returns an alias with the new element type; or
-    /// 2. Changing `ExpertWeightBuffers` to use `MetalBuffer<f16>` throughout.
-    ///
-    /// Until one of those changes lands, this stub correctly panics when called.
-    /// `BackendCaps::metal3()` does NOT set `has_moe: false`, so if a caller
-    /// routes here for expert forward the panic is the correct signal.
-    ///
-    /// [`ExpertWeightBuffers`]: crate::kernels::fused_moe::ExpertWeightBuffers
+    /// [`ExpertWeightBuffers`] stores scales/biases as `MetalBuffer<u16>` (raw
+    /// 16-bit values), while [`MoeExpertDescriptor`] carries them as
+    /// `&MetalBuffer<f16>` (typed half-precision). In Metal both are 2-byte
+    /// values and the buffer layout is identical — no data movement is required.
+    /// [`MetalBuffer::reinterpret`] aliases the same `MTLBuffer` allocation with
+    /// the new Rust element type at zero cost.
     fn fused_moe_expert(
         &self,
         _ctx: &Arc<MetalContext>,
-        _desc: &MoeExpertDescriptor<'_>,
+        desc: &MoeExpertDescriptor<'_>,
     ) -> Result<MetalBuffer<f32>> {
-        todo!(
-            "ExpertWeightBuffers uses MetalBuffer<u16> for scales/biases but \
-             MoeExpertDescriptor carries &MetalBuffer<f16> — add \
-             MetalBuffer::reinterpret() or change ExpertWeightBuffers to f16 \
-             (Task 3 adapter)"
-        )
+        let kernel = FusedMoeExpert::new(self.ctx.clone(), desc.expert_config.clone())?;
+
+        // Reinterpret f16 scale/bias buffers as u16 — same 2-byte layout, Metal
+        // does not distinguish half from uint16 at the buffer level.
+        let weights = ExpertWeightBuffers {
+            gate_weights: desc.gate_weight.clone(),
+            gate_scales: desc.gate_scales.reinterpret::<u16>(),
+            gate_biases: desc.gate_biases.reinterpret::<u16>(),
+            up_weights: desc.up_weight.clone(),
+            up_scales: desc.up_scales.reinterpret::<u16>(),
+            up_biases: desc.up_biases.reinterpret::<u16>(),
+            down_weights: desc.down_weight.clone(),
+            down_scales: desc.down_scales.reinterpret::<u16>(),
+            down_biases: desc.down_biases.reinterpret::<u16>(),
+        };
+
+        let hidden_dim = desc.expert_config.hidden_dim as usize;
+        let intermediate_dim = desc.expert_config.intermediate_dim as usize;
+
+        let output = MetalBuffer::<f32>::new(&self.ctx, desc.num_tokens * hidden_dim, BufferUsage::Shared)?;
+        let intermediate = MetalBuffer::<f32>::new(&self.ctx, desc.num_tokens * intermediate_dim, BufferUsage::Shared)?;
+
+        kernel.forward_single_expert(desc.input, &weights, &output, &intermediate)?;
+
+        Ok(output)
     }
 
     // ---- Distillation -------------------------------------------------------

@@ -239,6 +239,34 @@ impl<T: Copy + FromBytes + IntoBytes> MetalBuffer<T> {
         self.buffer.clone()
     }
 
+    /// Reinterpret this buffer as a `MetalBuffer<U>` without copying.
+    ///
+    /// `T` and `U` must have the same size (checked at compile time via a
+    /// `const` assert). The underlying `MTLBuffer` allocation is shared —
+    /// both the original and the returned buffer point to the same GPU memory.
+    /// This mirrors C's type-punning of a raw pointer: the bytes are identical,
+    /// only the Rust element type changes.
+    ///
+    /// # Use case
+    ///
+    /// Metal does not distinguish `half` from `uint16_t` at the buffer level;
+    /// both are 2-byte values. Use this to adapt a `MetalBuffer<f16>` into a
+    /// `MetalBuffer<u16>` (or vice-versa) when a kernel struct requires the
+    /// opposite type but the memory layout is identical.
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time if `size_of::<T>() != size_of::<U>()`.
+    pub fn reinterpret<U: Copy + FromBytes + IntoBytes>(&self) -> MetalBuffer<U> {
+        const { assert!(mem::size_of::<T>() == mem::size_of::<U>(), "reinterpret requires equal element sizes") };
+        MetalBuffer {
+            buffer: self.buffer.clone(),
+            len: self.len,
+            usage: self.usage,
+            _phantom: PhantomData,
+        }
+    }
+
     /// Get a raw pointer to the buffer contents.
     ///
     /// Returns `None` for private buffers (no CPU access).
