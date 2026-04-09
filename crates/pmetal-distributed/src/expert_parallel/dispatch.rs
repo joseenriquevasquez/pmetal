@@ -137,8 +137,7 @@ impl ExpertDispatcher {
                 // Receive computed results from remote rank.
                 let result_shape = vec![token_indices.len() as i32, hidden_dim as i32];
                 // Use Float32 as the receive dtype (matches the hidden_states dtype assumption).
-                let result =
-                    ops::recv(&result_shape, Dtype::Float32, dest as i32, Some(group))?;
+                let result = ops::recv(&result_shape, Dtype::Float32, dest as i32, Some(group))?;
                 result.eval();
                 received_results[dest] = Some(result);
             }

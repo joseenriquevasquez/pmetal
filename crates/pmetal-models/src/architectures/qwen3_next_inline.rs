@@ -152,12 +152,8 @@ impl InlineCache {
                 gdn_layer_indices.push(i);
                 let entry = mamba_cache.get(i);
                 gdn_caches.push(InlineGdnCache {
-                    conv_state: entry
-                        .and_then(|e| e.conv_state.as_ref())
-                        .map(ia_from_array),
-                    ssm_state: entry
-                        .and_then(|e| e.ssm_state.as_ref())
-                        .map(ia_from_array),
+                    conv_state: entry.and_then(|e| e.conv_state.as_ref()).map(ia_from_array),
+                    ssm_state: entry.and_then(|e| e.ssm_state.as_ref()).map(ia_from_array),
                 });
             } else {
                 attn_layer_indices.push(i);
@@ -187,14 +183,8 @@ impl InlineCache {
     pub fn write_back(&self, kv_cache: &mut KVCache, mamba_cache: &mut MambaCache) {
         for (slot, &layer_idx) in self.gdn_layer_indices.iter().enumerate() {
             if let Some(entry) = mamba_cache.get_mut(layer_idx) {
-                entry.conv_state = self.gdn_caches[slot]
-                    .conv_state
-                    .as_ref()
-                    .map(ia_to_array);
-                entry.ssm_state = self.gdn_caches[slot]
-                    .ssm_state
-                    .as_ref()
-                    .map(ia_to_array);
+                entry.conv_state = self.gdn_caches[slot].conv_state.as_ref().map(ia_to_array);
+                entry.ssm_state = self.gdn_caches[slot].ssm_state.as_ref().map(ia_to_array);
             }
         }
         for (slot, &layer_idx) in self.attn_layer_indices.iter().enumerate() {

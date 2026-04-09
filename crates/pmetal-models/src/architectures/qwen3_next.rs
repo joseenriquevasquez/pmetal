@@ -3346,11 +3346,12 @@ impl Qwen3NextForCausalLM {
                 if self.inline_cache.is_none() {
                     eprintln!("[INLINE] Bootstrapping InlineCache from mlx-rs caches...");
                     if let (Some(kv), Some(mb)) = (kv_cache.as_ref(), mamba_cache.as_ref()) {
-                        self.inline_cache = Some(super::qwen3_next_inline::InlineCache::from_caches(
-                            kv,
-                            mb,
-                            &weights.layers,
-                        ));
+                        self.inline_cache =
+                            Some(super::qwen3_next_inline::InlineCache::from_caches(
+                                kv,
+                                mb,
+                                &weights.layers,
+                            ));
                     }
                 }
 
@@ -3369,10 +3370,7 @@ impl Qwen3NextForCausalLM {
                 #[allow(unreachable_code)]
                 if let (Some(kv), Some(mb)) = (kv_cache, mamba_cache) {
                     return super::qwen3_next_inline::inline_decode_step(
-                        weights,
-                        input_ids,
-                        kv,
-                        mb,
+                        weights, input_ids, kv, mb,
                     );
                 }
             }

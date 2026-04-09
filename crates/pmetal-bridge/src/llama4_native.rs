@@ -962,7 +962,7 @@ fn build_chunk_mask(offset: i32, s: i32, end: i32, chunk_size: i32) -> InlineArr
 
     // Create [s, total_kv] int32 array then cast to bool (dtype=7 in MLX).
     let flat = InlineArray::from_i32_slice(&mask_data);
-    
+
     // Cast to bfloat16 additive mask: 0 → 0.0, 1 → ... actually MLX sdpa_with_mask
     // expects an additive float mask where -inf means masked. Convert boolean to float:
     // where mask=1 → 0.0, mask=0 → -inf (large negative).

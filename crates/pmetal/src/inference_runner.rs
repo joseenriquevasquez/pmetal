@@ -572,7 +572,9 @@ impl InferenceGenState {
         // When enabled, detects n-gram repetition loops (8-token n-gram × 4
         // repeats = 32-token window) and force-stops generation. Useful as a
         // safety net for small models prone to infinite loops.
-        let mut detector = self.detect_repetition.then(|| RepetitionDetector::new(8, 4));
+        let mut detector = self
+            .detect_repetition
+            .then(|| RepetitionDetector::new(8, 4));
         let mut token_count = 0usize;
         let mut on_token = on_token;
         let mut on_token_guarded = |token: u32| -> bool {
@@ -820,7 +822,8 @@ impl RepetitionDetector {
         }
         let tail = &self.window[self.window.len() - required..];
         let ngram = &tail[..self.ngram_size];
-        tail.chunks_exact(self.ngram_size).all(|chunk| chunk == ngram)
+        tail.chunks_exact(self.ngram_size)
+            .all(|chunk| chunk == ngram)
     }
 }
 
