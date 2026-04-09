@@ -93,6 +93,11 @@ pub struct InferenceRunnerConfig {
     pub kv_quant_preset: Option<String>,
     /// Disable KV cache quantization entirely.
     pub no_kv_quant: bool,
+    /// Enable n-gram repetition loop detection.
+    /// When enabled, force-stops generation when the same 8-token pattern
+    /// repeats 4 times (32-token window). Useful for small models prone to
+    /// infinite loops in thinking mode.
+    pub detect_repetition: bool,
     /// Enable QJL residual correction for Q2-Q3 keys (native path only).
     ///
     /// When true and the cache is configured for uniform Q2 or Q3 quantization,
@@ -133,6 +138,7 @@ impl Default for InferenceRunnerConfig {
             kv_quant_preset: None,
             no_kv_quant: false,
             kv_qjl: false,
+            detect_repetition: false,
         }
     }
 }
@@ -186,6 +192,8 @@ pub struct InferenceGenState {
     /// Decode throughput metrics from the last native generation run.
     /// `None` on non-native paths or when fewer than 20 steps were measured.
     pub last_decode_metrics: Option<pmetal_bridge::decode::DecodeMetrics>,
+    /// Enable n-gram repetition loop detection (opt-in).
+    detect_repetition: bool,
 }
 
 impl InferenceRunner {
@@ -314,21 +322,27 @@ impl InferenceRunner {
 
         tracing::info!(tokens = input_ids.len(), "Prompt tokenized");
 
-        // 6b. Apply thinking-model repetition penalty default.
+        // 6b. Apply Qwen3.5 model-card recommended presence_penalty defaults.
         //
-        // Qwen3.5 thinking mode is prone to infinite repetition loops on small
-        // models. When the user didn't explicitly set a repetition penalty and
-        // the model uses the Qwen chat template (which enables thinking mode),
-        // default to 1.1 instead of 1.0 to discourage repetition loops.
-        let repetition_penalty = if config.repetition_penalty.is_none()
-            && matches!(template_type, Some(ChatTemplateType::Qwen))
-            && !no_thinking
-        {
-            tracing::info!("Thinking model detected, using default repetition_penalty=1.1");
-            1.1_f32
-        } else {
-            repetition_penalty
-        };
+        // Qwen3.5 README specifies presence_penalty as the primary anti-loop
+        // mechanism: 1.5 for thinking mode, 2.0 for non-thinking. These are NOT
+        // in generation_config.json — only in README prose. Only override when
+        // the user didn't explicitly set via CLI.
+        //
+        // TODO: Generalize this to a per-model-family sampling preset system.
+        // Each model family should define its own mode presets loaded from
+        // model card metadata. See the Qwen3.5 README "Best Practices" section
+        // for the full parameter matrix.
+        let presence_penalty =
+            if config.presence_penalty.is_none()
+                && matches!(template_type, Some(ChatTemplateType::Qwen))
+            {
+                let pp = if no_thinking { 2.0 } else { 1.5 };
+                tracing::info!("Qwen3.5: using model-card default presence_penalty={pp}");
+                pp
+            } else {
+                presence_penalty
+            };
 
         // 7. Collect stop tokens from all sources
         let stop_tokens = pmetal_data::inference_config::collect_all_stop_tokens(
@@ -504,6 +518,7 @@ impl InferenceRunner {
                 native_quant_config,
                 model_path: config.model_path.clone(),
                 last_decode_metrics: None,
+                detect_repetition: config.detect_repetition,
             },
             chat_template_type: template_type,
             is_chat: use_chat,
@@ -564,22 +579,24 @@ impl InferenceGenState {
     where
         F: FnMut(u32) -> bool,
     {
-        // Wrap the caller's callback with a repetition-loop detector.
+        // Optional repetition-loop detector (opt-in via --detect-repetition).
         //
-        // Default window: 8-token n-gram × 4 repeats = 32-token detection window.
-        // This catches "in the canton of the canton of..." patterns without
-        // false-positives on legitimate phrase repetition.
-        let mut detector = RepetitionDetector::new(8, 4);
+        // When enabled, detects n-gram repetition loops (8-token n-gram × 4
+        // repeats = 32-token window) and force-stops generation. Useful as a
+        // safety net for small models prone to infinite loops.
+        let mut detector = self.detect_repetition.then(|| RepetitionDetector::new(8, 4));
         let mut token_count = 0usize;
         let mut on_token = on_token;
         let mut on_token_guarded = |token: u32| -> bool {
             token_count += 1;
-            if detector.push_and_check(token) {
-                tracing::warn!(
-                    "Repetition loop detected after {} tokens, stopping",
-                    token_count
-                );
-                return false;
+            if let Some(ref mut det) = detector {
+                if det.push_and_check(token) {
+                    tracing::warn!(
+                        "Repetition loop detected after {} tokens, stopping",
+                        token_count
+                    );
+                    return false;
+                }
             }
             on_token(token)
         };

@@ -588,6 +588,12 @@ enum Commands {
         /// Adds ~2-5% latency overhead from one extra D×D matmul per decode step.
         #[arg(long)]
         kv_qjl: bool,
+
+        /// Enable n-gram repetition loop detection.
+        /// Force-stops generation when the same 8-token pattern repeats 4 times.
+        /// Useful for small models prone to infinite loops in thinking mode.
+        #[arg(long)]
+        detect_repetition: bool,
     },
 
     /// Download a model from HuggingFace
@@ -2645,6 +2651,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             kv_quant_preset,
             no_kv_quant,
             kv_qjl,
+            detect_repetition,
         } => {
             // Load tool definitions if provided
             let tool_defs: Option<Vec<pmetal_data::chat_templates::ToolDefinition>> =
@@ -2714,6 +2721,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 kv_quant_preset,
                 no_kv_quant,
                 kv_qjl,
+                detect_repetition,
                 experts_dir.as_deref(),
             )
             .await?;

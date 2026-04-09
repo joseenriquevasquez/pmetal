@@ -306,6 +306,7 @@ pub(crate) async fn run_inference(
     kv_quant_preset: Option<String>,
     no_kv_quant: bool,
     kv_qjl: bool,
+    detect_repetition: bool,
     experts_dir: Option<&str>,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "ane"))]
@@ -360,6 +361,7 @@ pub(crate) async fn run_inference(
         kv_quant_preset,
         no_kv_quant,
         kv_qjl,
+        detect_repetition,
     };
 
     let mut runner = InferenceRunner::prepare(runner_config)?;
