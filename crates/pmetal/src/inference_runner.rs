@@ -564,9 +564,28 @@ impl InferenceGenState {
     where
         F: FnMut(u32) -> bool,
     {
+        // Wrap the caller's callback with a repetition-loop detector.
+        //
+        // Default window: 8-token n-gram × 4 repeats = 32-token detection window.
+        // This catches "in the canton of the canton of..." patterns without
+        // false-positives on legitimate phrase repetition.
+        let mut detector = RepetitionDetector::new(8, 4);
+        let mut token_count = 0usize;
+        let mut on_token = on_token;
+        let mut on_token_guarded = |token: u32| -> bool {
+            token_count += 1;
+            if detector.push_and_check(token) {
+                tracing::warn!(
+                    "Repetition loop detected after {} tokens, stopping",
+                    token_count
+                );
+                return false;
+            }
+            on_token(token)
+        };
+
         if matches!(self.model, LoadedModel::NativeOnly) {
             let stop_tokens = self.gen_config.stop_tokens.clone();
-            let mut on_token = on_token;
             let output = crate::native_inference::run_native_inference_ext(
                 &self.model_path,
                 &self.input_ids,
@@ -574,7 +593,7 @@ impl InferenceGenState {
                 self.gen_config.temperature,
                 self.native_turboquant,
                 self.native_quant_config,
-                |token| forward_native_token(&stop_tokens, &mut on_token, token),
+                |token| forward_native_token(&stop_tokens, &mut on_token_guarded, token),
             )
             .map_err(Exception::custom)?;
 
@@ -597,7 +616,7 @@ impl InferenceGenState {
                     &self.input_ids,
                     self.gen_config.clone(),
                     &mut self.cache,
-                    on_token,
+                    on_token_guarded,
                 )
             }
             #[cfg(feature = "lora")]
@@ -612,7 +631,7 @@ impl InferenceGenState {
                     &self.input_ids,
                     self.gen_config.clone(),
                     &mut self.cache,
-                    on_token,
+                    on_token_guarded,
                 )
             }
             LoadedModel::NativeOnly => {
@@ -756,6 +775,48 @@ where
         return false;
     }
     on_token(token)
+}
+
+// ── Repetition loop detection ─────────────────────────────────────────────────
+
+/// Detects infinite n-gram repetition loops in the token stream.
+///
+/// Maintains a sliding window of recent tokens. After each push, checks whether
+/// the last `max_repeats * ngram_size` tokens are the same n-gram repeated
+/// `max_repeats` times. Returns `true` (stop signal) when a loop is detected.
+///
+/// Default parameters (8 tokens × 4 repeats = 32-token window) catch patterns
+/// like "in the canton of the canton of the canton of the canton of" without
+/// false-positives on legitimate repeated phrases.
+pub(crate) struct RepetitionDetector {
+    window: Vec<u32>,
+    ngram_size: usize,
+    max_repeats: usize,
+}
+
+impl RepetitionDetector {
+    pub(crate) fn new(ngram_size: usize, max_repeats: usize) -> Self {
+        Self {
+            window: Vec::new(),
+            ngram_size,
+            max_repeats,
+        }
+    }
+
+    /// Push `token` and return `true` if a repetition loop is detected.
+    ///
+    /// A loop is detected when the last `max_repeats * ngram_size` tokens
+    /// consist of exactly the same n-gram repeated `max_repeats` times.
+    pub(crate) fn push_and_check(&mut self, token: u32) -> bool {
+        self.window.push(token);
+        let required = self.ngram_size * self.max_repeats;
+        if self.window.len() < required {
+            return false;
+        }
+        let tail = &self.window[self.window.len() - required..];
+        let ngram = &tail[..self.ngram_size];
+        tail.chunks_exact(self.ngram_size).all(|chunk| chunk == ngram)
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1879,5 +1940,47 @@ mod tests {
         std::fs::write(snapshot.join("config.json"), b"{}").unwrap();
 
         assert_eq!(estimate_weight_bytes(&snapshot, 0, false), 3072);
+    }
+
+    #[test]
+    fn repetition_detector_no_loop_short_stream() {
+        let mut det = RepetitionDetector::new(4, 3);
+        for tok in [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
+            assert!(!det.push_and_check(tok), "false positive on token {tok}");
+        }
+    }
+
+    #[test]
+    fn repetition_detector_detects_exact_ngram_repeat() {
+        let mut det = RepetitionDetector::new(4, 3);
+        // Feed 3 × [1,2,3,4] = 12 tokens; loop fires at the 12th push.
+        let pattern = [1u32, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4];
+        let last = pattern.len() - 1;
+        for (i, &tok) in pattern.iter().enumerate() {
+            let fired = det.push_and_check(tok);
+            if i == last {
+                assert!(fired, "expected loop detection on final token");
+            } else {
+                assert!(!fired, "false positive at position {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn repetition_detector_does_not_fire_on_partial_repeat() {
+        let mut det = RepetitionDetector::new(4, 3);
+        // Only 2 repetitions of [1,2,3,4] — not enough for max_repeats=3.
+        for tok in [1u32, 2, 3, 4, 1, 2, 3, 4] {
+            assert!(!det.push_and_check(tok));
+        }
+    }
+
+    #[test]
+    fn repetition_detector_does_not_fire_on_different_tail() {
+        let mut det = RepetitionDetector::new(4, 3);
+        // Two full repeats then a different final ngram.
+        for tok in [1u32, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8] {
+            assert!(!det.push_and_check(tok));
+        }
     }
 }
