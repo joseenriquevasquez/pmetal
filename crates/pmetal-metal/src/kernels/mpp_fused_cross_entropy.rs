@@ -132,6 +132,14 @@ impl MppFusedCrossEntropy {
             ));
         }
 
+        // NOTE: `mpp_cross_entropy_forward_f32` is currently unreachable —
+        // `forward_only` defaults to false and no caller sets it to true.
+        // If forward-only dispatch is ever wired up, the buffer binding below
+        // must be updated: the forward-only kernel has no buffer(3) (no loss
+        // accumulator); it writes per-token losses to `per_token[buffer(2)]`
+        // and expects constants at buffer(4..6). Binding `loss` at index 3
+        // as this function currently does would corrupt the kernel's constant
+        // parameters. See the shader comment for the full explanation.
         let kernel_name = if self.config.forward_only {
             "mpp_cross_entropy_forward_f32"
         } else if self.config.use_fp16 {

@@ -66,27 +66,33 @@ struct FusedSwiGLUParams {
 
 #[derive(Debug, Clone, Copy)]
 struct DispatchGeometry {
-    /// Batch tile size (BM = 64).
+    /// Batch tile size (BM = 32, matching the shader's single-simdgroup tile).
     bm: usize,
-    /// Intermediate tile size (BN = 64).
+    /// Intermediate tile size (BN = 32, matching the shader's single-simdgroup tile).
     bn: usize,
     /// Threadgroups in the intermediate (x) dimension.
     num_tiles_intermediate: usize,
     /// Threadgroups in the batch (y) dimension.
     num_tiles_batch: usize,
-    /// Threads per threadgroup: 4 simdgroups × 32 = 128.
+    /// Threads per threadgroup: 32 (single SIMD group).
+    ///
+    /// The shader uses `execution_simdgroup` (MPP Guide §2.3.1 single-simdgroup
+    /// pattern). Only one simdgroup per threadgroup is active; dispatching 128
+    /// would waste 96 threads per threadgroup with zero benefit.
     threads_per_threadgroup: usize,
 }
 
 fn dispatch_geometry(config: &MppFusedSwiGLUConfig) -> DispatchGeometry {
-    const BM: usize = 64;
-    const BN: usize = 64;
+    // The shader tile sizes are BM=32, BN=32 (single-simdgroup 32×32 tile).
+    // The dispatch tile sizes must match to avoid under-covering the output.
+    const BM: usize = 32;
+    const BN: usize = 32;
     DispatchGeometry {
         bm: BM,
         bn: BN,
         num_tiles_intermediate: config.intermediate_size.div_ceil(BN),
         num_tiles_batch: config.batch_size.div_ceil(BM),
-        threads_per_threadgroup: 4 * 32,
+        threads_per_threadgroup: 32,
     }
 }
 
@@ -227,17 +233,19 @@ mod tests {
     fn test_dispatch_geometry_tile_counts() {
         let config = MppFusedSwiGLUConfig::new(1, 2048, 8192);
         let geom = dispatch_geometry(&config);
-        assert_eq!(geom.num_tiles_intermediate, 8192 / 64);
+        // Shader tile size is BN=32 (single-simdgroup), so 8192/32 = 256 tiles.
+        assert_eq!(geom.num_tiles_intermediate, 8192 / 32);
         assert_eq!(geom.num_tiles_batch, 1);
-        assert_eq!(geom.threads_per_threadgroup, 128);
+        assert_eq!(geom.threads_per_threadgroup, 32);
     }
 
     #[test]
     fn test_dispatch_geometry_non_aligned_batch() {
         let config = MppFusedSwiGLUConfig::new(65, 2048, 128);
         let geom = dispatch_geometry(&config);
-        assert_eq!(geom.num_tiles_batch, 2);
-        assert_eq!(geom.num_tiles_intermediate, 2);
+        // ceil(65/32) = 3, ceil(128/32) = 4
+        assert_eq!(geom.num_tiles_batch, 3);
+        assert_eq!(geom.num_tiles_intermediate, 4);
     }
 
     #[test]

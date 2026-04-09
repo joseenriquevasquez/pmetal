@@ -93,7 +93,11 @@ struct GroupedGemmParams {
 pub struct GroupedGemmDispatch {
     /// Total tiles across all non-empty experts (1D grid width).
     pub total_tiles: usize,
-    /// Threads per threadgroup: 4 simdgroups × 32 = 128.
+    /// Threads per threadgroup: 32 (single SIMD group).
+    ///
+    /// The shader uses `execution_simdgroup` (MPP single-simdgroup API).
+    /// Each 64×64 tile is handled by one simdgroup; additional simdgroups
+    /// in the threadgroup would be idle.
     pub threads_per_threadgroup: usize,
 }
 
@@ -112,7 +116,7 @@ impl GroupedGemmDispatch {
             .sum();
         Self {
             total_tiles,
-            threads_per_threadgroup: 4 * 32,
+            threads_per_threadgroup: 32,
         }
     }
 }
@@ -295,7 +299,7 @@ mod tests {
         // expert 2: 128 tokens → 2 m-tiles × 8 n-tiles = 16
         // total = 24
         assert_eq!(dispatch.total_tiles, 24);
-        assert_eq!(dispatch.threads_per_threadgroup, 128);
+        assert_eq!(dispatch.threads_per_threadgroup, 32);
     }
 
     #[test]

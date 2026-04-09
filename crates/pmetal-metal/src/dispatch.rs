@@ -125,8 +125,11 @@ impl KernelDispatch {
     /// Return the Metal 3 backend directly.
     ///
     /// Used for explicit fallback paths and for operations that Metal 4 does
-    /// not support (training losses, RoPE, etc.) as advertised by
+    /// not support (training losses, etc.) as advertised by
     /// [`BackendCaps::metal4`][crate::backend::BackendCaps::metal4].
+    ///
+    /// Note: RoPE is wired to Metal 4 on M5+ hardware and is no longer a
+    /// Metal-3-only operation.
     pub fn metal3(&self) -> &Metal3Backend {
         &self.metal3
     }

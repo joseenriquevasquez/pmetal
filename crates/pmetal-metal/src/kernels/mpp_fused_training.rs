@@ -161,7 +161,7 @@ impl MppFusedAdamW {
         grads: &dyn AsMetalBuffer,
         m: &dyn AsMetalBuffer,
         v: &dyn AsMetalBuffer,
-        _param_infos: &[MppParamInfo],
+        param_infos: &[MppParamInfo],
         param_info_buf: &dyn AsMetalBuffer,
         lr: f32,
         beta1: f32,
@@ -174,6 +174,14 @@ impl MppFusedAdamW {
                 "MPP Fused AdamW not available (requires M5+ GPU with NAX)".to_string(),
             ));
         }
+
+        assert_eq!(
+            param_infos.len(),
+            self.config.num_params,
+            "param_infos length ({}) must match config.num_params ({})",
+            param_infos.len(),
+            self.config.num_params,
+        );
 
         let kernel_name = if self.config.use_fp16 {
             "mpp_fused_adamw_f16"

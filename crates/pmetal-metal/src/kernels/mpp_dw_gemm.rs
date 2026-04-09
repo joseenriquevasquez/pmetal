@@ -87,7 +87,11 @@ struct DispatchGeometry {
     bn: usize,
     num_tiles_m: usize,
     num_tiles_n: usize,
-    /// Threads per threadgroup: 4 simdgroups × 32 = 128.
+    /// Threads per threadgroup: 32 (single SIMD group).
+    ///
+    /// The shader uses `execution_simdgroup` (MPP single-simdgroup API).
+    /// Thread management within each 64×64 tile is handled by MPP internally;
+    /// dispatching more than one simdgroup wastes the extra threads.
     threads_per_threadgroup: usize,
 }
 
@@ -99,7 +103,7 @@ fn dispatch_geometry(config: &MppDwGemmConfig) -> DispatchGeometry {
         bn: BN,
         num_tiles_m: config.m.div_ceil(BM),
         num_tiles_n: config.n.div_ceil(BN),
-        threads_per_threadgroup: 4 * 32,
+        threads_per_threadgroup: 32,
     }
 }
 
@@ -236,7 +240,7 @@ mod tests {
         let geom = dispatch_geometry(&config);
         assert_eq!(geom.num_tiles_m, 2);
         assert_eq!(geom.num_tiles_n, 4);
-        assert_eq!(geom.threads_per_threadgroup, 128);
+        assert_eq!(geom.threads_per_threadgroup, 32);
     }
 
     #[test]

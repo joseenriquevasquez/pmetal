@@ -149,11 +149,24 @@ kernel void mpp_fused_cross_entropy_fwd_bwd_f16(
 // =============================================================================
 //
 // Only computes loss, no gradients. Cheaper when backward is not needed.
+//
+// NOTE: buffer(3) is intentionally absent from this forward-only signature.
+// The fwd+bwd variants bind an `atomic_float* loss` accumulator at buffer(3).
+// This kernel writes per-token losses to `per_token[buffer(2)]` instead of
+// accumulating into a scalar, so there is no buffer(3) binding.
+//
+// IMPORTANT: The Rust dispatcher (`mpp_fused_cross_entropy.rs`) always uses
+// `forward_only: false` (the default). The `mpp_cross_entropy_forward_f32`
+// kernel is currently unreachable from the Rust side. If forward-only dispatch
+// is ever needed, the Rust caller must NOT bind a loss buffer at index 3, and
+// must instead pass a per_token output buffer. The buffer index gap is load-
+// bearing for future callers — do not renumber without updating the dispatcher.
 
 kernel void mpp_cross_entropy_forward_f32(
     device const float*   logits       [[buffer(0)]],
     device const int*     labels       [[buffer(1)]],
     device float*         per_token    [[buffer(2)]],   // [N] per-token loss
+    // buffer(3) intentionally absent — see note above
     constant uint&        N            [[buffer(4)]],
     constant uint&        vocab_size   [[buffer(5)]],
     constant int&         ignore_index [[buffer(6)]],
