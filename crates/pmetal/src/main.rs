@@ -464,6 +464,13 @@ enum Commands {
         #[arg(long)]
         no_thinking: bool,
 
+        /// Sampling mode preset with model-card recommended parameters.
+        /// Available modes: auto, thinking-general (thinking), thinking-coding (coding),
+        /// instruct-general (instruct), instruct-reasoning (reasoning).
+        /// "auto" selects based on --no-thinking flag. CLI sampling params override mode defaults.
+        #[arg(long, default_value = "auto")]
+        mode: pmetal_data::inference_config::SamplingMode,
+
         /// Use fused Metal sampling kernel for better battery performance
         /// (bypasses mlx-rs sampling, uses single GPU kernel launch)
         #[arg(long)]
@@ -2623,6 +2630,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             chat,
             system,
             no_thinking,
+            mode,
             metal_sampler,
             compiled,
             stream,
@@ -2688,6 +2696,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 chat,
                 system.as_deref(),
                 no_thinking,
+                mode,
                 metal_sampler,
                 compiled,
                 stream,

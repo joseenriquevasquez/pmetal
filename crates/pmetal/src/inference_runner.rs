@@ -93,6 +93,10 @@ pub struct InferenceRunnerConfig {
     pub kv_quant_preset: Option<String>,
     /// Disable KV cache quantization entirely.
     pub no_kv_quant: bool,
+    /// Sampling mode preset (model-family-specific recommended parameters).
+    /// `Auto` selects based on thinking flag. Explicit modes override
+    /// generation_config.json defaults. CLI param overrides beat mode presets.
+    pub mode: pmetal_data::inference_config::SamplingMode,
     /// Enable n-gram repetition loop detection.
     /// When enabled, force-stops generation when the same 8-token pattern
     /// repeats 4 times (32-token window). Useful for small models prone to
@@ -138,6 +142,7 @@ impl Default for InferenceRunnerConfig {
             kv_quant_preset: None,
             no_kv_quant: false,
             kv_qjl: false,
+            mode: pmetal_data::inference_config::SamplingMode::Auto,
             detect_repetition: false,
         }
     }
@@ -227,22 +232,8 @@ impl InferenceRunner {
             config.no_thinking
         };
 
-        // 3. Load sampling defaults from model's generation_config.json
-        let defaults = pmetal_data::inference_config::load_sampling_defaults(
-            model_path,
-            use_chat && !no_thinking,
-        );
-        let temperature = config.temperature.unwrap_or(defaults.temperature);
-        let top_k = config.top_k.unwrap_or(defaults.top_k);
-        let top_p = config.top_p.unwrap_or(defaults.top_p);
-        let min_p = config.min_p.unwrap_or(defaults.min_p);
-        let repetition_penalty = config
-            .repetition_penalty
-            .unwrap_or(defaults.repetition_penalty);
-        let frequency_penalty = config
-            .frequency_penalty
-            .unwrap_or(defaults.frequency_penalty);
-        let presence_penalty = config.presence_penalty.unwrap_or(defaults.presence_penalty);
+        // 3. Sampling defaults are loaded after template detection (step 6b)
+        //    because mode presets depend on the detected model family.
         let native_bridge_info =
             if config.lora_path.is_none() && !config.fp8 && config.experts_dir.is_none() {
                 crate::native_inference::load_native_bridge_info(model_path)
@@ -322,27 +313,24 @@ impl InferenceRunner {
 
         tracing::info!(tokens = input_ids.len(), "Prompt tokenized");
 
-        // 6b. Apply Qwen3.5 model-card recommended presence_penalty defaults.
-        //
-        // Qwen3.5 README specifies presence_penalty as the primary anti-loop
-        // mechanism: 1.5 for thinking mode, 2.0 for non-thinking. These are NOT
-        // in generation_config.json — only in README prose. Only override when
-        // the user didn't explicitly set via CLI.
-        //
-        // TODO: Generalize this to a per-model-family sampling preset system.
-        // Each model family should define its own mode presets loaded from
-        // model card metadata. See the Qwen3.5 README "Best Practices" section
-        // for the full parameter matrix.
-        let presence_penalty =
-            if config.presence_penalty.is_none()
-                && matches!(template_type, Some(ChatTemplateType::Qwen))
-            {
-                let pp = if no_thinking { 2.0 } else { 1.5 };
-                tracing::info!("Qwen3.5: using model-card default presence_penalty={pp}");
-                pp
-            } else {
-                presence_penalty
-            };
+        // 6b. Load sampling defaults: global fallback → generation_config.json → mode preset
+        let defaults = pmetal_data::inference_config::load_sampling_defaults(
+            model_path,
+            template_type,
+            config.mode,
+            use_chat && !no_thinking,
+        );
+        let temperature = config.temperature.unwrap_or(defaults.temperature);
+        let top_k = config.top_k.unwrap_or(defaults.top_k);
+        let top_p = config.top_p.unwrap_or(defaults.top_p);
+        let min_p = config.min_p.unwrap_or(defaults.min_p);
+        let repetition_penalty = config
+            .repetition_penalty
+            .unwrap_or(defaults.repetition_penalty);
+        let frequency_penalty = config
+            .frequency_penalty
+            .unwrap_or(defaults.frequency_penalty);
+        let presence_penalty = config.presence_penalty.unwrap_or(defaults.presence_penalty);
 
         // 7. Collect stop tokens from all sources
         let stop_tokens = pmetal_data::inference_config::collect_all_stop_tokens(

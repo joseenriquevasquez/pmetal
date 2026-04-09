@@ -282,6 +282,7 @@ pub(crate) async fn run_inference(
     chat: bool,
     system: Option<&str>,
     no_thinking: bool,
+    mode: pmetal_data::inference_config::SamplingMode,
     metal_sampler: bool,
     compiled: bool,
     _stream: bool,
@@ -361,6 +362,7 @@ pub(crate) async fn run_inference(
         kv_quant_preset,
         no_kv_quant,
         kv_qjl,
+        mode,
         detect_repetition,
     };
 
