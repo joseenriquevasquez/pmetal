@@ -265,7 +265,9 @@ impl PmetalMcpServer {
         #[description("Disable thinking mode for models that support it")] no_thinking: Option<
             bool,
         >,
-        #[description("Hide thinking trace from output (shown by default)")] hide_thinking: Option<bool>,
+        #[description("Hide thinking trace from output (shown by default)")] hide_thinking: Option<
+            bool,
+        >,
         #[description("Use FP8 quantization for weights (~2x memory reduction)")] fp8: Option<bool>,
         #[description("Packed expert weights dir for SSD-offloaded MoE")] experts_dir: Option<
             String,
