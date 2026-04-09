@@ -287,7 +287,7 @@ pub(crate) async fn run_inference(
     compiled: bool,
     _stream: bool,
     minimal: bool,
-    show_thinking: bool,
+    hide_thinking: bool,
     fp8: bool,
     tools: Option<&[pmetal_data::chat_templates::ToolDefinition]>,
     ane: bool,
@@ -672,7 +672,7 @@ pub(crate) async fn run_inference(
         } else {
             raw_text
         };
-        if use_chat && show_thinking {
+        if use_chat && !hide_thinking {
             if let Some(thinking) = extract_thinking_content(&text) {
                 println!("=== Thinking ===");
                 println!("{}", thinking);

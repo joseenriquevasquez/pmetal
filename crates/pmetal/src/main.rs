@@ -490,9 +490,9 @@ enum Commands {
         #[arg(long)]
         minimal: bool,
 
-        /// Show thinking content in output (if model generates it)
+        /// Hide thinking trace from output (shown by default for thinking models)
         #[arg(long)]
-        show_thinking: bool,
+        hide_thinking: bool,
 
         /// Path to a JSON file containing tool/function definitions (OpenAI format).
         /// Tools are injected into the system prompt using the model's native format.
@@ -2635,7 +2635,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             compiled,
             stream,
             minimal,
-            show_thinking,
+            hide_thinking,
             tools,
             fp8,
             experts_dir,
@@ -2701,7 +2701,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 compiled,
                 stream,
                 minimal,
-                show_thinking,
+                hide_thinking,
                 fp8,
                 tool_defs.as_deref(),
                 #[cfg(feature = "ane")]
