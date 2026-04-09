@@ -49,9 +49,14 @@ jobs:
 
       - name: Stage metallib
         run: |
-          MLX_METALLIB=$(find target/aarch64-apple-darwin/release/build/pmetal-mlx-sys-*/out/build/lib -name "mlx.metallib" | head -1)
+          # Search both old (pmetal-mlx-sys) and new (pmetal-bridge) crate names
+          MLX_METALLIB=$(find target/aarch64-apple-darwin/release/build/ -name "mlx.metallib" -path "*/out/build/lib/*" | head -1)
           if [ -z "$MLX_METALLIB" ]; then
-            echo "ERROR: mlx.metallib not found in build output"
+            # Also check the user cache (build.rs caches metallib here)
+            MLX_METALLIB="$HOME/.cache/pmetal/lib/mlx.metallib"
+          fi
+          if [ ! -f "$MLX_METALLIB" ]; then
+            echo "ERROR: mlx.metallib not found in build output or cache"
             exit 1
           fi
           cp "$MLX_METALLIB" "target/aarch64-apple-darwin/release/mlx.metallib"
