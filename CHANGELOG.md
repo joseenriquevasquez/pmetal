@@ -7,46 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **Metal 4 / MPP kernel backend** (Epistates/pmetal#14): Trait-based kernel dispatch with `Metal3Backend` and `Metal4Backend` for M5+ (Apple10/NAX) GPUs
-  - `KernelBackend` trait with 16 methods covering GEMM, attention, fused linear, training, MoE, distillation
-  - `KernelDispatch` router on `MetalContext` — selects Metal 4 for large GEMMs (M>1, K%32==0) on M5, Metal 3 for everything else
-  - `Metal4CommandBuffer` with correct begin/end lifecycle state machine and safe Drop (fixes SIGSEGV crash class from Metal 3 command buffer patterns on Metal 4 hardware)
-  - `CommandAllocatorPool` with GPU-completion-tracked allocator reuse (prevents premature reset crashes)
-  - `ResidencyManager` wrapping mandatory Metal 4 `MTLResidencySet` for GPU resource visibility
-  - Compile-time `#[cfg(has_metal4)]` gating + runtime `has_nax` check — zero overhead on M1-M4
-
-- **13 MPP-optimized Metal 4 shaders**: All following Apple MPP best practices (single simdgroup execution, Morton-order threadgroup walk, K-dimension alignment to 32, accumulation-loop barriers at BK=128, static tensor extents)
-  - 8 existing shaders optimized: `mpp_gemm`, `mpp_flash_attention`, `mpp_quantized`, `mpp_fused_swiglu` (rewritten with register-space cooperative tensor fusion), `mpp_fused_norm_lora`, `mpp_dw_gemm`, `mpp_grouped_gemm`, `mpp_fused_lora`
-  - 5 new shaders: `mpp_fused_training` (AdamW), `mpp_fused_cross_entropy` (log-softmax + NLL), `mpp_fused_rope` (4 variants with postfix fusion), `mpp_fused_moe` (gate+up SwiGLU fusion + down projection), `mpp_fused_distill` (KL/reverse-KL/JS/soft-CE)
-  - Shared `encode_mpp_kernel()` dispatch helper eliminates boilerplate across 15 dispatch sites
-
-- **Adaptive sequence packing**: `compute_pack_seq_len()` uses p99 of actual dataset sequence lengths (rounded to next power of 2, capped at model max) instead of blindly using `max_position_embeddings`. Fixes O(n^2) attention cost when packing short sequences (50-400 tokens) into 8192-token batches — up to 256x reduction in wasted compute
-  - `--pack-max-seq-len` CLI flag for explicit override
-
-- **`--mode` sampling presets**: Per-model-family recommended sampling parameters sourced from model card READMEs
-  - Qwen3/3.5 modes: `thinking-general` (temp=1.0, pp=1.5), `thinking-coding` (temp=0.6, pp=0.0), `instruct-general` (temp=0.7, pp=1.5), `instruct-reasoning` (temp=1.0, pp=2.0)
-  - `--mode auto` (default) selects based on `--no-thinking` flag
-  - Resolution order: CLI explicit > mode preset > generation_config.json > global fallback
-  - Available modes listed via `available_modes()` for GUI/TUI integration
-
-- **`--detect-repetition`**: Opt-in n-gram repetition loop detection (8-token pattern x 4 repeats). Force-stops generation when infinite loops are detected. Safety net for small models in thinking mode
-
-- **Chip name in decode stats**: Inference output now shows the Apple Silicon chip (e.g., `[M4 Max]`) in the decode performance line
-
-### Changed
-
-- Migrated scattered `has_nax()` checks in `pmetal-mlx` to use `MetalContext::dispatch()` for centralized backend routing
-- `load_sampling_defaults()` now accepts `ChatTemplateType` and `SamplingMode` for preset-aware parameter resolution
-
-### Fixed
-
-- Zero clippy warnings across entire workspace (`cargo clippy --workspace --all-targets --all-features -- -D warnings`)
-- Redundant `as usize` cast in turboquant threadgroup width
-- Needless borrow in pmetal-bridge build.rs
-
-## [0.5.0] - 2026-04-07
+## [0.5.0] - 2026-04-08
 
 ### Added
 
@@ -75,7 +36,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Benchmark enhancements**: Warmup passes, session repeats, GDN prefill stage profiling, TurboQuant flag for bench commands, fused gate/up expert packing with auto-detected tensor layout
 
+- **Metal 4 / MPP kernel backend** (Epistates/pmetal#14): Trait-based kernel dispatch with `Metal3Backend` and `Metal4Backend` for M5+ (Apple10/NAX) GPUs
+  - `KernelBackend` trait with 16 methods covering GEMM, attention, fused linear, training, MoE, distillation
+  - `KernelDispatch` router on `MetalContext` — selects Metal 4 for large GEMMs (M>1, K%32==0) on M5, Metal 3 for everything else
+  - `Metal4CommandBuffer` with correct begin/end lifecycle state machine and safe Drop (fixes SIGSEGV crash class from Metal 3 command buffer patterns on Metal 4 hardware)
+  - `CommandAllocatorPool` with GPU-completion-tracked allocator reuse (prevents premature reset crashes)
+  - `ResidencyManager` wrapping mandatory Metal 4 `MTLResidencySet` for GPU resource visibility
+  - Compile-time `#[cfg(has_metal4)]` gating + runtime `has_nax` check — zero overhead on M1-M4
+
+- **13 MPP-optimized Metal 4 shaders**: All following Apple MPP best practices (single simdgroup execution, Morton-order threadgroup walk, K-dimension alignment to 32, accumulation-loop barriers at BK=128, static tensor extents)
+  - 8 existing shaders optimized: `mpp_gemm`, `mpp_flash_attention`, `mpp_quantized`, `mpp_fused_swiglu` (rewritten with register-space cooperative tensor fusion), `mpp_fused_norm_lora`, `mpp_dw_gemm`, `mpp_grouped_gemm`, `mpp_fused_lora`
+  - 5 new shaders: `mpp_fused_training` (AdamW), `mpp_fused_cross_entropy` (log-softmax + NLL), `mpp_fused_rope` (4 variants with postfix fusion), `mpp_fused_moe` (gate+up SwiGLU fusion + down projection), `mpp_fused_distill` (KL/reverse-KL/JS/soft-CE)
+  - Shared `encode_mpp_kernel()` dispatch helper eliminates boilerplate across 15 dispatch sites
+
+- **Adaptive sequence packing**: `compute_pack_seq_len()` uses p99 of actual dataset sequence lengths (rounded to next power of 2, capped at model max) instead of blindly using `max_position_embeddings`. Fixes O(n^2) attention cost when packing short sequences (50-400 tokens) into 8192-token batches — up to 256x reduction in wasted compute
+  - `--pack-max-seq-len` CLI flag for explicit override
+
+- **`--mode` sampling presets**: Per-model-family recommended sampling parameters sourced from model card READMEs
+  - Qwen3/3.5 modes: `thinking-general` (temp=1.0, pp=1.5), `thinking-coding` (temp=0.6, pp=0.0), `instruct-general` (temp=0.7, pp=1.5), `instruct-reasoning` (temp=1.0, pp=2.0)
+  - `--mode auto` (default) selects based on `--no-thinking` flag
+  - Resolution order: CLI explicit > mode preset > generation_config.json > global fallback
+
+- **`--detect-repetition`**: Opt-in n-gram repetition loop detection (8-token pattern x 4 repeats). Force-stops generation when infinite loops are detected
+
+- **Chip name in decode stats**: Inference output now shows the Apple Silicon chip (e.g., `[M4 Max]`) in the decode performance line
+
 ### Changed
+
+- Thinking trace shown by default for thinking models; use `--hide-thinking` to suppress
+- Migrated scattered `has_nax()` checks in `pmetal-mlx` to use `MetalContext::dispatch()` for centralized backend routing
+- `load_sampling_defaults()` now accepts `ChatTemplateType` and `SamplingMode` for preset-aware parameter resolution
 
 - Fused attention config carries optional `value_head_dim` for architectures with asymmetric K/V projections; Metal backends reject asymmetric dims and fall through to MLX SDPA
 - Serve engine accepts explicit `cache_mode_override` via `InferenceEngine::new_with_options()`, bypassing auto-selection when TurboQuant or other explicit modes are requested
@@ -91,6 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **FFI exception safety**: ~33 C++ bridge functions wrapped in try/catch to prevent unwinding across the FFI boundary
 - **LoRA inference segfault**: put_along_axis crash during generation
 - **UTF-8 char boundary panics** in inference/GUI output stream handling
+- Zero clippy warnings across entire workspace (`cargo clippy --workspace --all-targets --all-features -- -D warnings`)
+- Stale `pmetal-mlx-sys` metallib path in release workflow (renamed to `pmetal-bridge`)
 
 ### Removed
 
