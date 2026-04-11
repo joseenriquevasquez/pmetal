@@ -57,9 +57,14 @@ fn profile_real_ops() {
     bench_eval("Embed lookup [248K,1024]", || em.take_axis(&tok, 0), 20);
 
     // Full 24-layer MLP (real dims: hidden=1024, intermediate=3584)
-    let gw = InlineArray::ones(&[3584, h], 10);
-    let uw = InlineArray::ones(&[3584, h], 10);
-    let dw = InlineArray::ones(&[h, 3584], 10);
+    // Weights are pre-transposed: storage shape [out, in] -> .t() for [in, out]
+    // so matmul(x[...,in], w[in,out]) -> [...,out].
+    let gw = InlineArray::ones(&[3584, h], 10).t(); // [h=1024, 3584]
+    gw.eval();
+    let uw = InlineArray::ones(&[3584, h], 10).t(); // [h=1024, 3584]
+    uw.eval();
+    let dw = InlineArray::ones(&[h, 3584], 10).t(); // [3584, h=1024]
+    dw.eval();
     let nw = InlineArray::ones(&[h], 10);
     bench_eval(
         "24-layer MLP (real dims)",
