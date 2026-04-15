@@ -90,6 +90,20 @@ pub enum JobType {
     Grpo,
     Download,
     Convert,
+    /// Long-running HTTP server (`pmetal serve`). No metrics file, pure
+    /// stdout tailing, lives until the user cancels the job.
+    Serve,
+    /// One-shot quantize job (`pmetal quantize`). Progress tracked by
+    /// parsing `[N/M]` tensor lines from stdout.
+    Quantize,
+    /// One-shot benchmark job (`pmetal bench` / `bench-workload`).
+    /// Trial rows are parsed out of stdout.
+    Bench,
+    /// One-shot evaluation job (`pmetal eval`). Metrics are parsed out
+    /// of stdout (perplexity / accuracy / loss).
+    Eval,
+    /// One-shot model-merge job (`pmetal merge`).
+    Merge,
 }
 
 impl std::fmt::Display for JobType {
@@ -101,6 +115,11 @@ impl std::fmt::Display for JobType {
             JobType::Grpo => write!(f, "GRPO"),
             JobType::Download => write!(f, "Download"),
             JobType::Convert => write!(f, "Convert"),
+            JobType::Serve => write!(f, "Serve"),
+            JobType::Quantize => write!(f, "Quantize"),
+            JobType::Bench => write!(f, "Bench"),
+            JobType::Eval => write!(f, "Eval"),
+            JobType::Merge => write!(f, "Merge"),
         }
     }
 }

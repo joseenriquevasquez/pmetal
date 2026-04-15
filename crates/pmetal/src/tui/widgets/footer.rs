@@ -108,6 +108,66 @@ impl Widget for Footer {
             Tab::Device => {
                 // Device tab is read-only; no tab-specific bindings
             }
+            Tab::Serve => {
+                spans.extend([
+                    Span::styled("jk", THEME.footer_key),
+                    Span::styled(" navigate  ", THEME.footer_desc),
+                    Span::styled("Enter", THEME.footer_key),
+                    Span::styled(" edit/pick  ", THEME.footer_desc),
+                    Span::styled("S", THEME.footer_key),
+                    Span::styled(" start  ", THEME.footer_desc),
+                    Span::styled("x", THEME.footer_key),
+                    Span::styled(" stop  ", THEME.footer_desc),
+                ]);
+            }
+            Tab::Quantize => {
+                spans.extend([
+                    Span::styled("jk", THEME.footer_key),
+                    Span::styled(" navigate  ", THEME.footer_desc),
+                    Span::styled("Enter", THEME.footer_key),
+                    Span::styled(" edit/pick  ", THEME.footer_desc),
+                    Span::styled("S", THEME.footer_key),
+                    Span::styled(" start  ", THEME.footer_desc),
+                    Span::styled("x", THEME.footer_key),
+                    Span::styled(" cancel  ", THEME.footer_desc),
+                ]);
+            }
+            Tab::Bench => {
+                spans.extend([
+                    Span::styled("jk", THEME.footer_key),
+                    Span::styled(" navigate  ", THEME.footer_desc),
+                    Span::styled("Enter", THEME.footer_key),
+                    Span::styled(" edit/pick  ", THEME.footer_desc),
+                    Span::styled("S", THEME.footer_key),
+                    Span::styled(" start  ", THEME.footer_desc),
+                    Span::styled("x", THEME.footer_key),
+                    Span::styled(" cancel  ", THEME.footer_desc),
+                ]);
+            }
+            Tab::Eval => {
+                spans.extend([
+                    Span::styled("jk", THEME.footer_key),
+                    Span::styled(" navigate  ", THEME.footer_desc),
+                    Span::styled("Enter", THEME.footer_key),
+                    Span::styled(" edit/pick  ", THEME.footer_desc),
+                    Span::styled("S", THEME.footer_key),
+                    Span::styled(" start  ", THEME.footer_desc),
+                    Span::styled("x", THEME.footer_key),
+                    Span::styled(" cancel  ", THEME.footer_desc),
+                ]);
+            }
+            Tab::Merge => {
+                spans.extend([
+                    Span::styled("jk", THEME.footer_key),
+                    Span::styled(" navigate  ", THEME.footer_desc),
+                    Span::styled("Enter", THEME.footer_key),
+                    Span::styled(" edit/pick  ", THEME.footer_desc),
+                    Span::styled("S", THEME.footer_key),
+                    Span::styled(" start  ", THEME.footer_desc),
+                    Span::styled("x", THEME.footer_key),
+                    Span::styled(" cancel  ", THEME.footer_desc),
+                ]);
+            }
         }
 
         // Global keybindings (not shown for Inference since it has its own quit)

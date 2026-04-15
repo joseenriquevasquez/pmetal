@@ -1,5 +1,6 @@
 //! Inference tab — interactive chat/completion with real model inference.
 
+use pmetal_data::inference_config::InferenceBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -38,6 +39,10 @@ impl std::fmt::Display for ChatRole {
 }
 
 /// Inference settings that can be navigated with arrow keys.
+///
+/// Order here must match the index arms in `increment_setting` /
+/// `decrement_setting` and the column layout in `render_settings`.
+/// Backend is last so existing indices stay stable.
 const SETTING_NAMES: &[&str] = &[
     "Temperature",
     "Max Tokens",
@@ -51,6 +56,7 @@ const SETTING_NAMES: &[&str] = &[
     "KV Cache",
     "FP8",
     "No Thinking",
+    "Backend",
 ];
 
 /// Focus mode for the inference tab.
@@ -85,6 +91,8 @@ pub struct InferenceTab {
     pub kv_quant_mode: u8,
     pub fp8: bool,
     pub no_thinking: bool,
+    /// Execution backend (Auto lets `pmetal infer` pick the fastest path).
+    pub backend: InferenceBackend,
     pub focus: InferenceFocus,
     pub settings_selected: usize,
     message_scroll: usize,
@@ -127,6 +135,7 @@ impl InferenceTab {
             kv_quant_mode: 0, // auto
             fp8: false,
             no_thinking: false,
+            backend: InferenceBackend::Auto,
             focus: InferenceFocus::Input,
             settings_selected: 0,
             message_scroll: 0,
@@ -392,6 +401,7 @@ impl InferenceTab {
             }
             10 => self.fp8 = !self.fp8,
             11 => self.no_thinking = !self.no_thinking,
+            12 => self.backend = cycle_backend(self.backend, 1),
             _ => {}
         }
     }
@@ -426,6 +436,7 @@ impl InferenceTab {
             }
             10 => self.fp8 = !self.fp8,
             11 => self.no_thinking = !self.no_thinking,
+            12 => self.backend = cycle_backend(self.backend, -1),
             _ => {}
         }
     }
@@ -1005,7 +1016,7 @@ impl InferenceTab {
             Some(s) => format!("{s}"),
             None => "Random".to_string(),
         };
-        let setting_values: [String; 12] = [
+        let setting_values: [String; 13] = [
             format!("{:.1}", self.temperature),
             format!("{}", self.max_tokens),
             format!("{}", self.top_k),
@@ -1026,6 +1037,7 @@ impl InferenceTab {
             } else {
                 "Off".to_string()
             },
+            self.backend.label().to_string(),
         ];
 
         for (i, (name, val)) in SETTING_NAMES.iter().zip(setting_values.iter()).enumerate() {
@@ -1044,6 +1056,13 @@ impl InferenceTab {
         }
 
         lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  ", THEME.text_muted),
+            Span::styled(self.backend.label(), THEME.kv_value),
+            Span::styled(" — ", THEME.text_muted),
+            Span::styled(self.backend.description(), THEME.text_muted),
+        ]));
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             if is_focused {
                 " Ctrl+S: back to input"
@@ -1059,4 +1078,14 @@ impl InferenceTab {
 
         Paragraph::new(lines).render(inner, buf);
     }
+}
+
+/// Cycle the inference backend dropdown. `step=1` advances, `step=-1`
+/// goes backward. Wraps at both ends.
+fn cycle_backend(current: InferenceBackend, step: i32) -> InferenceBackend {
+    let all = InferenceBackend::ALL;
+    let idx = all.iter().position(|b| *b == current).unwrap_or(0);
+    let len = all.len() as i32;
+    let next = ((idx as i32 + step).rem_euclid(len)) as usize;
+    all[next]
 }

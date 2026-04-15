@@ -1,24 +1,34 @@
 //! Tab definitions and implementations for the PMetal TUI.
 
 pub mod dashboard;
+mod bench;
 mod datasets;
 mod device;
 mod distillation;
+mod eval;
 mod grpo;
 mod inference;
 mod jobs;
+mod merge;
 mod models;
+mod quantize;
+mod serve;
 mod training;
 
+pub use bench::BenchTab;
 pub use dashboard::DashboardTab;
 pub use datasets::DatasetsTab;
 pub use device::DeviceTab;
-pub use distillation::{DistillAction, DistillationTab};
-pub use grpo::{GrpoAction, GrpoTab};
+pub use distillation::DistillationTab;
+pub use eval::EvalTab;
+pub use grpo::GrpoTab;
 pub use inference::{InferenceFocus, InferenceTab};
 pub use jobs::JobsTab;
+pub use merge::MergeTab;
 pub use models::{ModelSource, ModelsTab, write_training_info};
-pub use training::{TrainingAction, TrainingStatus, TrainingTab};
+pub use quantize::QuantizeTab;
+pub use serve::ServeTab;
+pub use training::{TrainingStatus, TrainingTab};
 
 /// Extract a short model name from a model ID.
 /// e.g. "Qwen/Qwen3-0.6B" → "Qwen3-0.6B", "trained/foo" → "foo"
@@ -37,6 +47,11 @@ pub enum Tab {
     Distillation,
     Grpo,
     Inference,
+    Serve,
+    Quantize,
+    Merge,
+    Bench,
+    Eval,
     Jobs,
 }
 
@@ -51,6 +66,11 @@ impl Tab {
         Tab::Grpo,
         Tab::Dashboard,
         Tab::Inference,
+        Tab::Serve,
+        Tab::Quantize,
+        Tab::Merge,
+        Tab::Bench,
+        Tab::Eval,
         Tab::Jobs,
     ];
 
@@ -65,6 +85,11 @@ impl Tab {
             Tab::Distillation => "^",
             Tab::Grpo => "!",
             Tab::Inference => "$",
+            Tab::Serve => "*",
+            Tab::Quantize => "=",
+            Tab::Merge => "x",
+            Tab::Bench => "+",
+            Tab::Eval => "?",
             Tab::Jobs => "%",
         }
     }
@@ -95,6 +120,11 @@ impl std::fmt::Display for Tab {
             Tab::Distillation => write!(f, "Distill"),
             Tab::Grpo => write!(f, "GRPO"),
             Tab::Inference => write!(f, "Inference"),
+            Tab::Serve => write!(f, "Serve"),
+            Tab::Quantize => write!(f, "Quantize"),
+            Tab::Merge => write!(f, "Merge"),
+            Tab::Bench => write!(f, "Bench"),
+            Tab::Eval => write!(f, "Eval"),
             Tab::Jobs => write!(f, "Jobs"),
         }
     }

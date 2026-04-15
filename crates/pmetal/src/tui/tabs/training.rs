@@ -1,31 +1,23 @@
 //! Training configuration and control tab.
 //!
-//! Provides editable form fields for all training parameters. Users can
-//! navigate fields, edit values inline, pick models/datasets via modals,
-//! and launch training runs.
+//! Form navigation, inline edit, and rendering are delegated to
+//! `FormTabState`; this module owns only the SFT-specific field list,
+//! dataset peek logic, metric-aware status rendering, and the CLI arg
+//! builder.
 
 use std::path::PathBuf;
 
-use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Sparkline, Widget, Wrap,
+    Block, Borders, Gauge, Paragraph, Sparkline, Widget, Wrap,
 };
 
 use crate::tui::tabs::dashboard::MetricSample;
 use crate::tui::tabs::model_short_name;
 use crate::tui::theme::{THEME, palette};
-use crate::tui::widgets::{FieldKind, FormField};
-
-/// Actions the training tab can request from the app.
-#[derive(Debug)]
-pub enum TrainingAction {
-    OpenModelPicker,
-    OpenDatasetPicker,
-    StartEdit,
-}
+use crate::tui::widgets::{FieldKind, FormAction, FormField, FormTabState};
 
 /// Training run status.
 #[derive(Debug, Clone)]
@@ -48,10 +40,8 @@ pub enum TrainingStatus {
 
 /// Training tab state.
 pub struct TrainingTab {
-    pub fields: Vec<FormField>,
-    pub list_state: ListState,
+    pub form: FormTabState,
     pub status: TrainingStatus,
-    field_idx: usize,
     /// Dataset info message shown below the form (columns, seq len hint).
     pub dataset_info: Option<String>,
     /// Seq len warning/suggestion from dataset peek.
@@ -61,10 +51,8 @@ pub struct TrainingTab {
 impl TrainingTab {
     pub fn new() -> Self {
         Self {
-            fields: Self::default_fields(),
-            list_state: ListState::default().with_selected(Some(1)),
+            form: FormTabState::new(Self::default_fields()),
             status: TrainingStatus::Idle,
-            field_idx: 0,
             dataset_info: None,
             seq_len_warning: None,
         }
@@ -246,7 +234,7 @@ impl TrainingTab {
             .unwrap_or(avg);
         let suggested = if p95 > 0 { p95.div_ceil(64) * 64 } else { 2048 };
 
-        let max_seq_len: usize = self.field_value("Max Seq Len").parse().unwrap_or(2048);
+        let max_seq_len: usize = self.form.value("Max Seq Len").parse().unwrap_or(2048);
 
         let info = format!(
             "~{} samples | avg ~{} tok, max ~{} tok | suggest seq_len {}",
@@ -275,133 +263,63 @@ impl TrainingTab {
         }
     }
 
+    // ── Form delegation ─────────────────────────────────────────────────
+
     pub fn is_editing(&self) -> bool {
-        self.fields.get(self.field_idx).is_some_and(|f| f.editing)
+        self.form.is_editing()
     }
-
-    pub fn handle_edit_key(&mut self, key: KeyEvent) {
-        if let Some(field) = self.fields.get_mut(self.field_idx) {
-            field.handle_edit_key(key);
-        }
+    pub fn handle_edit_key(&mut self, k: crossterm::event::KeyEvent) {
+        self.form.handle_edit_key(k);
     }
-
     pub fn confirm_edit(&mut self) {
-        if let Some(field) = self.fields.get_mut(self.field_idx) {
-            field.confirm_edit();
-        }
+        self.form.confirm_edit();
     }
-
     pub fn cancel_edit(&mut self) {
-        if let Some(field) = self.fields.get_mut(self.field_idx) {
-            field.cancel_edit();
-        }
+        self.form.cancel_edit();
+    }
+    pub fn handle_enter(&mut self) -> Option<FormAction> {
+        self.form.handle_enter()
     }
 
-    /// Handle Enter on the currently selected field. Returns an action if
-    /// the app needs to open a modal or perform something external.
-    pub fn handle_enter(&mut self) -> Option<TrainingAction> {
-        let field = self.fields.get_mut(self.field_idx)?;
-
-        if field.is_picker() {
-            return match &field.kind {
-                FieldKind::ModelPicker => Some(TrainingAction::OpenModelPicker),
-                FieldKind::DatasetPicker => Some(TrainingAction::OpenDatasetPicker),
-                _ => None,
-            };
-        }
-        if field.is_cycleable() {
-            field.cycle();
-            return None;
-        }
-        if field.is_inline_editable() {
-            field.start_edit();
-            return Some(TrainingAction::StartEdit);
-        }
-        None
-    }
-
+    /// Skip read-only rows (e.g. the auto-detected Architecture field).
     pub fn next_param(&mut self) {
-        let count = self.fields.len();
-        if count == 0 {
-            return;
-        }
-        let start = self.field_idx;
-        self.field_idx = (self.field_idx + 1) % count;
-        // Skip all consecutive read-only fields (guard against all-ReadOnly edge case)
-        while matches!(self.fields[self.field_idx].kind, FieldKind::ReadOnly)
-            && self.field_idx != start
-        {
-            self.field_idx = (self.field_idx + 1) % count;
-        }
-        self.sync_list_selection();
+        self.form
+            .next_param(|f| !matches!(f.kind, FieldKind::ReadOnly));
     }
 
     pub fn prev_param(&mut self) {
-        let count = self.fields.len();
-        if count == 0 {
-            return;
-        }
-        let start = self.field_idx;
-        self.field_idx = (self.field_idx + count - 1) % count;
-        // Skip all consecutive read-only fields (guard against all-ReadOnly edge case)
-        while matches!(self.fields[self.field_idx].kind, FieldKind::ReadOnly)
-            && self.field_idx != start
-        {
-            self.field_idx = (self.field_idx + count - 1) % count;
-        }
-        self.sync_list_selection();
+        self.form
+            .prev_param(|f| !matches!(f.kind, FieldKind::ReadOnly));
     }
 
-    fn sync_list_selection(&mut self) {
-        // Account for section headers in the flat list
-        let flat = self.flat_index_for_field(self.field_idx);
-        self.list_state.select(Some(flat));
-    }
-
-    fn flat_index_for_field(&self, field_idx: usize) -> usize {
-        let mut flat = 0;
-        let mut current_section: Option<&str> = None;
-        for (i, field) in self.fields.iter().enumerate() {
-            if current_section != Some(&field.section) {
-                current_section = Some(&field.section);
-                flat += 1; // section header
-            }
-            if i == field_idx {
-                return flat;
-            }
-            flat += 1;
-        }
-        flat
-    }
-
-    // --- Model/Dataset setters ---
+    // ── Setters ─────────────────────────────────────────────────────────
 
     pub fn set_model(&mut self, model_id: &str) {
-        if let Some(f) = self.fields.iter_mut().find(|f| f.label == "Model") {
-            f.value = model_id.to_string();
-        }
-        // Auto-detect architecture (will be updated when model is loaded)
-        if let Some(f) = self.fields.iter_mut().find(|f| f.label == "Architecture") {
-            f.value = "(auto-detect)".to_string();
-        }
-        // Auto-update output dir with base model name
+        self.form.set_value("Model", model_id);
+        // Architecture is ReadOnly; populated once the model is actually
+        // loaded by the trainer. Reset to the placeholder here so the tab
+        // doesn't show a stale entry from a previous pick.
+        self.form.set_value("Architecture", "(auto-detect)");
         let short_name = model_short_name(model_id);
-        if let Some(f) = self.fields.iter_mut().find(|f| f.label == "Output Dir") {
-            f.value = format!("./output/{short_name}--lora");
-        }
+        self.form
+            .set_value("Output Dir", format!("./output/{short_name}--lora"));
     }
 
-    /// Focus a specific field by label.
+    /// Focus a specific field by label, stepping forward through the
+    /// nav helper so list-state stays in sync.
     pub fn focus_field(&mut self, label: &str) {
-        if let Some(idx) = self.fields.iter().position(|f| f.label == label) {
-            self.field_idx = idx;
+        if let Some(idx) = self.form.fields.iter().position(|f| f.label == label) {
+            let current = self.form.field_idx();
+            let count = self.form.fields.len();
+            let forward = (count + idx - current) % count;
+            for _ in 0..forward {
+                self.next_param();
+            }
         }
     }
 
     pub fn set_dataset(&mut self, path: &str) {
-        if let Some(f) = self.fields.iter_mut().find(|f| f.label == "Dataset") {
-            f.value = path.to_string();
-        }
+        self.form.set_value("Dataset", path);
     }
 
     // --- Status updates ---
@@ -437,11 +355,11 @@ impl TrainingTab {
     // --- Config validation and CLI arg building ---
 
     pub fn validate_config(&self) -> Result<(), String> {
-        let model = self.field_value("Model");
+        let model = self.form.value("Model");
         if model == "(not selected)" || model.is_empty() {
             return Err("Model is required. Press Enter on the Model field to select one.".into());
         }
-        let dataset = self.field_value("Dataset");
+        let dataset = self.form.value("Dataset");
         if dataset == "(not selected)" || dataset.is_empty() {
             return Err(
                 "Dataset is required. Press Enter on the Dataset field to select one.".into(),
@@ -452,80 +370,72 @@ impl TrainingTab {
 
     pub fn config_summary(&self) -> Vec<String> {
         vec![
-            format!("Model:     {}", self.field_value("Model")),
-            format!("Dataset:   {}", self.field_value("Dataset")),
-            format!("LR:        {}", self.field_value("Learning Rate")),
-            format!("Batch:     {}", self.field_value("Batch Size")),
-            format!("Epochs:    {}", self.field_value("Epochs")),
-            format!("LoRA r:    {}", self.field_value("LoRA Rank")),
-            format!("Quant:     {}", self.field_value("Quantization")),
+            format!("Model:     {}", self.form.value("Model")),
+            format!("Dataset:   {}", self.form.value("Dataset")),
+            format!("LR:        {}", self.form.value("Learning Rate")),
+            format!("Batch:     {}", self.form.value("Batch Size")),
+            format!("Epochs:    {}", self.form.value("Epochs")),
+            format!("LoRA r:    {}", self.form.value("LoRA Rank")),
+            format!("Quant:     {}", self.form.value("Quantization")),
             String::new(),
             "Proceed?".into(),
         ]
     }
 
     pub fn output_dir(&self) -> PathBuf {
-        PathBuf::from(self.field_value("Output Dir"))
+        PathBuf::from(self.form.value("Output Dir"))
     }
 
     pub fn build_cli_args(&self, subcommand: &str) -> Vec<String> {
         let mut args = vec![subcommand.to_string()];
 
-        args.extend(["--model".into(), self.field_value("Model")]);
-        args.extend(["--dataset".into(), self.field_value("Dataset")]);
-        args.extend(["--output".into(), self.field_value("Output Dir")]);
-        args.extend(["--learning-rate".into(), self.field_value("Learning Rate")]);
-        args.extend(["--batch-size".into(), self.field_value("Batch Size")]);
-        args.extend(["--epochs".into(), self.field_value("Epochs")]);
-        args.extend(["--max-seq-len".into(), self.field_value("Max Seq Len")]);
+        args.extend(["--model".into(), self.form.value("Model")]);
+        args.extend(["--dataset".into(), self.form.value("Dataset")]);
+        args.extend(["--output".into(), self.form.value("Output Dir")]);
+        args.extend(["--learning-rate".into(), self.form.value("Learning Rate")]);
+        args.extend(["--batch-size".into(), self.form.value("Batch Size")]);
+        args.extend(["--epochs".into(), self.form.value("Epochs")]);
+        args.extend(["--max-seq-len".into(), self.form.value("Max Seq Len")]);
         args.extend([
             "--gradient-accumulation-steps".into(),
-            self.field_value("Grad Accum Steps"),
+            self.form.value("Grad Accum Steps"),
         ]);
-        args.extend(["--max-grad-norm".into(), self.field_value("Max Grad Norm")]);
-        args.extend(["--warmup-steps".into(), self.field_value("Warmup Steps")]);
-        args.extend(["--weight-decay".into(), self.field_value("Weight Decay")]);
-        args.extend(["--lora-r".into(), self.field_value("LoRA Rank")]);
-        args.extend(["--lora-alpha".into(), self.field_value("LoRA Alpha")]);
+        args.extend(["--max-grad-norm".into(), self.form.value("Max Grad Norm")]);
+        args.extend(["--warmup-steps".into(), self.form.value("Warmup Steps")]);
+        args.extend(["--weight-decay".into(), self.form.value("Weight Decay")]);
+        args.extend(["--lora-r".into(), self.form.value("LoRA Rank")]);
+        args.extend(["--lora-alpha".into(), self.form.value("LoRA Alpha")]);
 
-        let quant = self.field_value("Quantization").to_lowercase();
+        let quant = self.form.value("Quantization").to_lowercase();
         if quant != "none" {
             args.extend(["--quantization".into(), quant]);
         }
 
-        let eval = self.field_value("Eval Dataset");
+        let eval = self.form.value("Eval Dataset");
         if eval != "(none)" && !eval.is_empty() {
             args.extend(["--eval-dataset".into(), eval]);
         }
 
-        if self.field_value("Flash Attention") == "Disabled" {
+        if self.form.value("Flash Attention") == "Disabled" {
             args.push("--no-flash-attention".into());
         }
-        if self.field_value("Fused Optimizer") == "Disabled" {
+        if self.form.value("Fused Optimizer") == "Disabled" {
             args.push("--no-metal-fused-optimizer".into());
         }
-        if self.field_value("JIT Compilation") == "Disabled" {
+        if self.form.value("JIT Compilation") == "Disabled" {
             args.push("--no-jit-compilation".into());
         }
-        if self.field_value("Sequence Packing") == "Disabled" {
+        if self.form.value("Sequence Packing") == "Disabled" {
             args.push("--no-sequence-packing".into());
         }
-        if self.field_value("Cut Cross-Entropy") == "Enabled" {
+        if self.form.value("Cut Cross-Entropy") == "Enabled" {
             args.push("--cut-cross-entropy".into());
         }
-        if self.field_value("ANE") == "Enabled" {
+        if self.form.value("ANE") == "Enabled" {
             args.push("--ane".into());
         }
 
         args
-    }
-
-    fn field_value(&self, label: &str) -> String {
-        self.fields
-            .iter()
-            .find(|f| f.label == label)
-            .map(|f| f.value.clone())
-            .unwrap_or_default()
     }
 }
 
@@ -547,56 +457,38 @@ impl TrainingTab {
     }
 
     fn render_config(&mut self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default()
-            .title(" Configuration ")
-            .title_style(THEME.block_title)
-            .borders(Borders::ALL)
-            .border_style(THEME.block);
+        // Reserve space for optional dataset info / seq-len warning lines
+        // at the bottom of the config panel. `render_list` paints the
+        // form above them.
+        let footer_lines =
+            self.dataset_info.is_some() as u16 + self.seq_len_warning.is_some() as u16;
+        let [form_area, footer_area] = if footer_lines > 0 {
+            Layout::vertical([Constraint::Min(0), Constraint::Length(footer_lines)]).areas(area)
+        } else {
+            [area, Rect::default()]
+        };
 
-        let key_width = self
-            .fields
-            .iter()
-            .map(|f| f.label.len())
-            .max()
-            .unwrap_or(10);
+        self.form
+            .render_list(form_area, buf, "Configuration", |_| true);
 
-        let mut current_section: Option<&str> = None;
-        let mut items: Vec<ListItem> = Vec::new();
-        let mut _flat_to_field: Vec<Option<usize>> = Vec::new();
-
-        for (i, field) in self.fields.iter().enumerate() {
-            if current_section != Some(&field.section) {
-                current_section = Some(&field.section);
-                items.push(ListItem::new(Line::from(Span::styled(
-                    format!("  --- {} ---", field.section),
-                    THEME.text_muted,
-                ))));
-                _flat_to_field.push(None);
+        if footer_lines > 0 {
+            let mut lines: Vec<Line> = Vec::new();
+            if let Some(ref info) = self.dataset_info {
+                lines.push(Line::from(Span::styled(
+                    format!("  {info}"),
+                    THEME.text_dim,
+                )));
             }
-            let selected = i == self.field_idx;
-            items.push(ListItem::new(field.render_line(key_width, selected)));
-            _flat_to_field.push(Some(i));
+            if let Some(ref warn) = self.seq_len_warning {
+                lines.push(Line::from(Span::styled(
+                    format!("  {warn}"),
+                    THEME.text_warning,
+                )));
+            }
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .render(footer_area, buf);
         }
-
-        // Dataset info and seq len warnings
-        if let Some(ref info) = self.dataset_info {
-            items.push(ListItem::new(Line::from(Span::styled(
-                format!("  {info}"),
-                THEME.text_dim,
-            ))));
-        }
-        if let Some(ref warn) = self.seq_len_warning {
-            items.push(ListItem::new(Line::from(Span::styled(
-                format!("  {warn}"),
-                THEME.text_warning,
-            ))));
-        }
-
-        let list = List::new(items)
-            .block(block)
-            .highlight_style(THEME.table_selected);
-
-        ratatui::widgets::StatefulWidget::render(list, area, buf, &mut self.list_state);
     }
 }
 

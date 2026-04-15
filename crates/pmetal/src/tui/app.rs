@@ -21,7 +21,7 @@ use crate::tui::tabs::ModelSource;
 use crate::tui::tabs::dashboard::MetricSample;
 use crate::tui::tabs::*;
 use crate::tui::theme::THEME;
-use crate::tui::widgets::{Footer, Header};
+use crate::tui::widgets::{Footer, FormAction, Header};
 
 /// Top-level application state.
 pub struct App {
@@ -44,6 +44,11 @@ pub struct App {
     pub jobs: JobsTab,
     pub distillation: DistillationTab,
     pub grpo: GrpoTab,
+    pub serve: ServeTab,
+    pub quantize: QuantizeTab,
+    pub bench: BenchTab,
+    pub eval: EvalTab,
+    pub merge: MergeTab,
 
     /// Tick counter for periodic updates.
     tick_count: u64,
@@ -68,6 +73,23 @@ pub struct App {
 
     /// Currently active inference job ID (if any).
     active_inference_job: Option<String>,
+
+    /// Currently active serve job ID (if any). Long-lived; stays until the
+    /// user presses `x` on the Serve tab.
+    active_serve_job: Option<String>,
+
+    /// Currently active quantize job ID (if any). One-shot — cleared on
+    /// process exit.
+    active_quantize_job: Option<String>,
+
+    /// Currently active bench job ID (if any). One-shot.
+    active_bench_job: Option<String>,
+
+    /// Currently active eval job ID (if any). One-shot.
+    active_eval_job: Option<String>,
+
+    /// Currently active merge job ID (if any). One-shot.
+    active_merge_job: Option<String>,
 
     /// Header area for mouse hit-testing.
     header_area: ratatui::layout::Rect,
@@ -94,6 +116,19 @@ enum PendingModalTarget {
     GrpoModel,
     GrpoDataset,
     GrpoStart,
+    ServeModel,
+    ServeStart,
+    QuantizeModel,
+    QuantizeStart,
+    BenchModel,
+    BenchStart,
+    EvalModel,
+    EvalDataset,
+    EvalStart,
+    MergeModelA,
+    MergeModelB,
+    MergeBaseModel,
+    MergeStart,
     DownloadModel,
     HfSearch,
     AddModelDir,
@@ -119,6 +154,11 @@ impl App {
             jobs: JobsTab::new(),
             distillation: DistillationTab::new(),
             grpo: GrpoTab::new(),
+            serve: ServeTab::new(),
+            quantize: QuantizeTab::new(),
+            bench: BenchTab::new(),
+            eval: EvalTab::new(),
+            merge: MergeTab::new(),
             tick_count: 0,
             modal_stack: Vec::new(),
             pending_modal_context: None,
@@ -127,6 +167,11 @@ impl App {
             active_job_type: None,
             active_training_output_dir: None,
             active_inference_job: None,
+            active_serve_job: None,
+            active_quantize_job: None,
+            active_bench_job: None,
+            active_eval_job: None,
+            active_merge_job: None,
             header_area: ratatui::layout::Rect::default(),
         }
     }
@@ -444,6 +489,11 @@ impl App {
             Tab::Jobs => self.handle_jobs_key(key),
             Tab::Distillation => self.handle_distillation_key(key),
             Tab::Grpo => self.handle_grpo_key(key),
+            Tab::Serve => self.handle_serve_key(key),
+            Tab::Quantize => self.handle_quantize_key(key),
+            Tab::Bench => self.handle_bench_key(key),
+            Tab::Eval => self.handle_eval_key(key),
+            Tab::Merge => self.handle_merge_key(key),
         }
     }
 
@@ -471,17 +521,17 @@ impl App {
             KeyCode::Enter => {
                 if let Some(action) = self.training.handle_enter() {
                     match action {
-                        TrainingAction::OpenModelPicker => {
+                        FormAction::OpenModelPicker { .. } => {
                             self.pending_modal_context = Some(PendingModalTarget::TrainingModel);
                             let entries = self.model_picker_entries();
                             self.modal_stack.push(Modal::model_picker(entries));
                         }
-                        TrainingAction::OpenDatasetPicker => {
+                        FormAction::OpenDatasetPicker { .. } => {
                             self.pending_modal_context = Some(PendingModalTarget::TrainingDataset);
                             let entries = self.dataset_picker_entries();
                             self.modal_stack.push(Modal::dataset_picker(entries));
                         }
-                        TrainingAction::StartEdit => {} // Handled internally
+                        FormAction::StartEdit => {} // Handled internally
                     }
                 }
             }
@@ -649,22 +699,23 @@ impl App {
             KeyCode::Enter => {
                 if let Some(action) = self.distillation.handle_enter() {
                     match action {
-                        DistillAction::OpenTeacherPicker => {
-                            self.pending_modal_context = Some(PendingModalTarget::DistillTeacher);
+                        FormAction::OpenModelPicker { field_label } => {
+                            let target = match field_label.as_str() {
+                                "Teacher Model" => PendingModalTarget::DistillTeacher,
+                                "Student Model" => PendingModalTarget::DistillStudent,
+                                _ => return,
+                            };
+                            self.pending_modal_context = Some(target);
                             let entries = self.model_picker_entries();
                             self.modal_stack.push(Modal::model_picker(entries));
                         }
-                        DistillAction::OpenStudentPicker => {
-                            self.pending_modal_context = Some(PendingModalTarget::DistillStudent);
-                            let entries = self.model_picker_entries();
-                            self.modal_stack.push(Modal::model_picker(entries));
-                        }
-                        DistillAction::OpenDatasetPicker => {
-                            self.pending_modal_context = Some(PendingModalTarget::DistillDataset);
+                        FormAction::OpenDatasetPicker { .. } => {
+                            self.pending_modal_context =
+                                Some(PendingModalTarget::DistillDataset);
                             let entries = self.dataset_picker_entries();
                             self.modal_stack.push(Modal::dataset_picker(entries));
                         }
-                        DistillAction::StartEdit => {}
+                        FormAction::StartEdit => {}
                     }
                 }
             }
@@ -673,6 +724,261 @@ impl App {
             }
             KeyCode::Char('L') => {
                 self.open_lr_override_modal();
+            }
+            _ => {}
+        }
+    }
+
+    // --- Merge tab key handler ---
+    fn handle_merge_key(&mut self, key: crossterm::event::KeyEvent) {
+        if self.merge.is_editing() {
+            match key.code {
+                KeyCode::Enter => self.merge.confirm_edit(),
+                KeyCode::Esc => self.merge.cancel_edit(),
+                _ => self.merge.handle_edit_key(key),
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.merge.next_param(),
+            KeyCode::Up | KeyCode::Char('k') => self.merge.prev_param(),
+            KeyCode::Enter => {
+                if let Some(action) = self.merge.handle_enter() {
+                    match action {
+                        FormAction::OpenModelPicker { field_label } => {
+                            let target = match field_label.as_str() {
+                                "Model A" => PendingModalTarget::MergeModelA,
+                                "Model B" => PendingModalTarget::MergeModelB,
+                                "Base Model" => PendingModalTarget::MergeBaseModel,
+                                _ => return,
+                            };
+                            self.pending_modal_context = Some(target);
+                            let entries = self.model_picker_entries();
+                            self.modal_stack.push(Modal::model_picker(entries));
+                        }
+                        FormAction::OpenDatasetPicker { .. } => {}
+                        FormAction::StartEdit => {}
+                    }
+                }
+            }
+            KeyCode::Char('S') => {
+                if self.merge.is_running() {
+                    self.modal_stack.push(Modal::error(
+                        "Already Running",
+                        "A merge job is already in progress. Cancel it first (x).",
+                    ));
+                } else {
+                    self.start_merge_prompt();
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(ref job_id) = self.active_merge_job.clone() {
+                    if let Some(runner) = &mut self.runner {
+                        runner.cancel(job_id);
+                    }
+                    self.merge.mark_failed("cancelled by user");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // --- Eval tab key handler ---
+    fn handle_eval_key(&mut self, key: crossterm::event::KeyEvent) {
+        if self.eval.is_editing() {
+            match key.code {
+                KeyCode::Enter => self.eval.confirm_edit(),
+                KeyCode::Esc => self.eval.cancel_edit(),
+                _ => self.eval.handle_edit_key(key),
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.eval.next_param(),
+            KeyCode::Up | KeyCode::Char('k') => self.eval.prev_param(),
+            KeyCode::Enter => {
+                if let Some(action) = self.eval.handle_enter() {
+                    match action {
+                        FormAction::OpenModelPicker { .. } => {
+                            self.pending_modal_context = Some(PendingModalTarget::EvalModel);
+                            let entries = self.model_picker_entries();
+                            self.modal_stack.push(Modal::model_picker(entries));
+                        }
+                        FormAction::OpenDatasetPicker { .. } => {
+                            self.pending_modal_context = Some(PendingModalTarget::EvalDataset);
+                            let entries = self.dataset_picker_entries();
+                            self.modal_stack.push(Modal::dataset_picker(entries));
+                        }
+                        FormAction::StartEdit => {}
+                    }
+                }
+            }
+            KeyCode::Char('S') => {
+                if self.eval.is_running() {
+                    self.modal_stack.push(Modal::error(
+                        "Already Running",
+                        "An eval job is already in progress. Cancel it first (x).",
+                    ));
+                } else {
+                    self.start_eval_prompt();
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(ref job_id) = self.active_eval_job.clone() {
+                    if let Some(runner) = &mut self.runner {
+                        runner.cancel(job_id);
+                    }
+                    self.eval.mark_failed("cancelled by user");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // --- Bench tab key handler ---
+    fn handle_bench_key(&mut self, key: crossterm::event::KeyEvent) {
+        if self.bench.is_editing() {
+            match key.code {
+                KeyCode::Enter => self.bench.confirm_edit(),
+                KeyCode::Esc => self.bench.cancel_edit(),
+                _ => self.bench.handle_edit_key(key),
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.bench.next_param(),
+            KeyCode::Up | KeyCode::Char('k') => self.bench.prev_param(),
+            KeyCode::Enter => {
+                if let Some(action) = self.bench.handle_enter() {
+                    match action {
+                        FormAction::OpenModelPicker { .. } => {
+                            self.pending_modal_context = Some(PendingModalTarget::BenchModel);
+                            let entries = self.model_picker_entries();
+                            self.modal_stack.push(Modal::model_picker(entries));
+                        }
+                        FormAction::OpenDatasetPicker { .. } => {}
+                        FormAction::StartEdit => {}
+                    }
+                }
+            }
+            KeyCode::Char('S') => {
+                if self.bench.is_running() {
+                    self.modal_stack.push(Modal::error(
+                        "Already Running",
+                        "A benchmark is already in progress. Cancel it first (x).",
+                    ));
+                } else {
+                    self.start_bench_prompt();
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(ref job_id) = self.active_bench_job.clone() {
+                    if let Some(runner) = &mut self.runner {
+                        runner.cancel(job_id);
+                    }
+                    self.bench.mark_failed("cancelled by user");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // --- Quantize tab key handler ---
+    fn handle_quantize_key(&mut self, key: crossterm::event::KeyEvent) {
+        if self.quantize.is_editing() {
+            match key.code {
+                KeyCode::Enter => self.quantize.confirm_edit(),
+                KeyCode::Esc => self.quantize.cancel_edit(),
+                _ => self.quantize.handle_edit_key(key),
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.quantize.next_param(),
+            KeyCode::Up | KeyCode::Char('k') => self.quantize.prev_param(),
+            KeyCode::Enter => {
+                if let Some(action) = self.quantize.handle_enter() {
+                    match action {
+                        FormAction::OpenModelPicker { .. } => {
+                            self.pending_modal_context = Some(PendingModalTarget::QuantizeModel);
+                            let entries = self.model_picker_entries();
+                            self.modal_stack.push(Modal::model_picker(entries));
+                        }
+                        FormAction::OpenDatasetPicker { .. } => {}
+                        FormAction::StartEdit => {}
+                    }
+                }
+            }
+            KeyCode::Char('S') => {
+                if self.quantize.is_running() {
+                    self.modal_stack.push(Modal::error(
+                        "Already Running",
+                        "A quantization job is already in progress. Cancel it first (x).",
+                    ));
+                } else {
+                    self.start_quantize_prompt();
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(ref job_id) = self.active_quantize_job.clone() {
+                    if let Some(runner) = &mut self.runner {
+                        runner.cancel(job_id);
+                    }
+                    self.quantize.mark_failed("cancelled by user");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // --- Serve tab key handler ---
+    fn handle_serve_key(&mut self, key: crossterm::event::KeyEvent) {
+        if self.serve.is_editing() {
+            match key.code {
+                KeyCode::Enter => self.serve.confirm_edit(),
+                KeyCode::Esc => self.serve.cancel_edit(),
+                _ => self.serve.handle_edit_key(key),
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.serve.next_param(),
+            KeyCode::Up | KeyCode::Char('k') => self.serve.prev_param(),
+            KeyCode::Enter => {
+                if let Some(action) = self.serve.handle_enter() {
+                    match action {
+                        FormAction::OpenModelPicker { .. } => {
+                            self.pending_modal_context = Some(PendingModalTarget::ServeModel);
+                            let entries = self.model_picker_entries();
+                            self.modal_stack.push(Modal::model_picker(entries));
+                        }
+                        FormAction::OpenDatasetPicker { .. } => {}
+                        FormAction::StartEdit => {}
+                    }
+                }
+            }
+            KeyCode::Char('S') => {
+                if self.serve.is_running() {
+                    self.modal_stack.push(Modal::error(
+                        "Already Running",
+                        "Stop the running server (x) before starting a new one.",
+                    ));
+                } else {
+                    self.start_serve_prompt();
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(ref job_id) = self.active_serve_job.clone() {
+                    if let Some(runner) = &mut self.runner {
+                        runner.cancel(job_id);
+                    }
+                    self.serve.set_stopped("user cancelled");
+                }
             }
             _ => {}
         }
@@ -701,17 +1007,17 @@ impl App {
             KeyCode::Enter => {
                 if let Some(action) = self.grpo.handle_enter() {
                     match action {
-                        GrpoAction::OpenModelPicker => {
+                        FormAction::OpenModelPicker { .. } => {
                             self.pending_modal_context = Some(PendingModalTarget::GrpoModel);
                             let entries = self.model_picker_entries();
                             self.modal_stack.push(Modal::model_picker(entries));
                         }
-                        GrpoAction::OpenDatasetPicker => {
+                        FormAction::OpenDatasetPicker { .. } => {
                             self.pending_modal_context = Some(PendingModalTarget::GrpoDataset);
                             let entries = self.dataset_picker_entries();
                             self.modal_stack.push(Modal::dataset_picker(entries));
                         }
-                        GrpoAction::StartEdit => {}
+                        FormAction::StartEdit => {}
                     }
                 }
             }
@@ -765,6 +1071,11 @@ impl App {
                     Tab::Jobs => self.jobs.prev_row(),
                     Tab::Distillation => self.distillation.prev_param(),
                     Tab::Grpo => self.grpo.prev_param(),
+                    Tab::Serve => self.serve.prev_param(),
+                    Tab::Quantize => self.quantize.prev_param(),
+                    Tab::Bench => self.bench.prev_param(),
+                    Tab::Eval => self.eval.prev_param(),
+                    Tab::Merge => self.merge.prev_param(),
                     _ => {}
                 }
             }
@@ -775,6 +1086,11 @@ impl App {
                 Tab::Jobs => self.jobs.next_row(),
                 Tab::Distillation => self.distillation.next_param(),
                 Tab::Grpo => self.grpo.next_param(),
+                Tab::Serve => self.serve.next_param(),
+                Tab::Quantize => self.quantize.next_param(),
+                Tab::Bench => self.bench.next_param(),
+                Tab::Eval => self.eval.next_param(),
+                Tab::Merge => self.merge.next_param(),
                 _ => {}
             },
             _ => {}
@@ -871,6 +1187,26 @@ impl App {
             AppMsg::JobOutput { job_id, line } => {
                 // Route to jobs tab live log
                 self.jobs.append_live_output(&job_id, &line);
+                // Also mirror serve output into the Serve tab's log panel.
+                if self.active_serve_job.as_deref() == Some(&job_id) {
+                    self.serve.append_log(&line);
+                }
+                // And quantize output into the Quantize tab's panel.
+                if self.active_quantize_job.as_deref() == Some(&job_id) {
+                    self.quantize.append_log(&line);
+                }
+                // Bench trial rows live in the Bench tab.
+                if self.active_bench_job.as_deref() == Some(&job_id) {
+                    self.bench.append_log(&line);
+                }
+                // Eval metrics live in the Eval tab.
+                if self.active_eval_job.as_deref() == Some(&job_id) {
+                    self.eval.append_log(&line);
+                }
+                // Merge output lives in the Merge tab.
+                if self.active_merge_job.as_deref() == Some(&job_id) {
+                    self.merge.append_log(&line);
+                }
             }
             AppMsg::JobFinished {
                 job_id,
@@ -977,6 +1313,49 @@ impl App {
                 }
                 if self.active_inference_job.as_deref() == Some(&job_id) {
                     self.active_inference_job = None;
+                }
+                if self.active_serve_job.as_deref() == Some(&job_id) {
+                    self.active_serve_job = None;
+                    if success {
+                        self.serve.set_stopped("server exited cleanly");
+                    } else {
+                        self.serve.set_failed(&message);
+                    }
+                }
+                if self.active_quantize_job.as_deref() == Some(&job_id) {
+                    self.active_quantize_job = None;
+                    if success {
+                        self.quantize.mark_completed();
+                        // Rescan models so the quantized output shows up.
+                        self.models.scan_models();
+                    } else {
+                        self.quantize.mark_failed(&message);
+                    }
+                }
+                if self.active_bench_job.as_deref() == Some(&job_id) {
+                    self.active_bench_job = None;
+                    if success {
+                        self.bench.mark_completed();
+                    } else {
+                        self.bench.mark_failed(&message);
+                    }
+                }
+                if self.active_eval_job.as_deref() == Some(&job_id) {
+                    self.active_eval_job = None;
+                    if success {
+                        self.eval.mark_completed();
+                    } else {
+                        self.eval.mark_failed(&message);
+                    }
+                }
+                if self.active_merge_job.as_deref() == Some(&job_id) {
+                    self.active_merge_job = None;
+                    if success {
+                        self.merge.mark_completed();
+                        self.models.scan_models();
+                    } else {
+                        self.merge.mark_failed(&message);
+                    }
                 }
                 // Pop progress modal if one is showing (for convert/download jobs)
                 if matches!(self.modal_stack.last(), Some(Modal::Progress { .. })) {
@@ -1127,6 +1506,21 @@ impl App {
                     Some(PendingModalTarget::GrpoStart) => {
                         self.start_grpo();
                     }
+                    Some(PendingModalTarget::ServeStart) => {
+                        self.start_serve();
+                    }
+                    Some(PendingModalTarget::QuantizeStart) => {
+                        self.start_quantize();
+                    }
+                    Some(PendingModalTarget::BenchStart) => {
+                        self.start_bench();
+                    }
+                    Some(PendingModalTarget::EvalStart) => {
+                        self.start_eval();
+                    }
+                    Some(PendingModalTarget::MergeStart) => {
+                        self.start_merge();
+                    }
                     Some(PendingModalTarget::FuseStart) => {
                         self.start_fuse();
                     }
@@ -1196,6 +1590,27 @@ impl App {
                 Some(PendingModalTarget::GrpoModel) => {
                     self.grpo.set_model(&id);
                 }
+                Some(PendingModalTarget::ServeModel) => {
+                    self.serve.set_model(&id);
+                }
+                Some(PendingModalTarget::QuantizeModel) => {
+                    self.quantize.set_model(&id);
+                }
+                Some(PendingModalTarget::BenchModel) => {
+                    self.bench.set_model(&id);
+                }
+                Some(PendingModalTarget::EvalModel) => {
+                    self.eval.set_model(&id);
+                }
+                Some(PendingModalTarget::MergeModelA) => {
+                    self.merge.set_model("Model A", &id);
+                }
+                Some(PendingModalTarget::MergeModelB) => {
+                    self.merge.set_model("Model B", &id);
+                }
+                Some(PendingModalTarget::MergeBaseModel) => {
+                    self.merge.set_model("Base Model", &id);
+                }
                 Some(PendingModalTarget::FuseBaseModel(adapter_id)) => {
                     // User picked a base model for fusing — store it and confirm
                     let model_path = self.resolve_model_path(&id);
@@ -1231,6 +1646,9 @@ impl App {
                 }
                 Some(PendingModalTarget::DistillDataset) => {
                     self.distillation.set_dataset(&path);
+                }
+                Some(PendingModalTarget::EvalDataset) => {
+                    self.eval.set_dataset(&path);
                 }
                 Some(PendingModalTarget::GrpoDataset) => {
                     self.grpo.set_dataset(&path);
@@ -1503,6 +1921,161 @@ impl App {
         }
     }
 
+    fn start_serve_prompt(&mut self) {
+        if let Err(msg) = self.serve.validate_config() {
+            self.modal_stack.push(Modal::error("Invalid Config", msg));
+            return;
+        }
+        let summary = self.serve.config_summary();
+        self.pending_modal_context = Some(PendingModalTarget::ServeStart);
+        self.modal_stack
+            .push(Modal::confirm("Start Serve?", summary));
+    }
+
+    fn start_serve(&mut self) {
+        let args = self.serve.build_cli_args();
+        let bind_url = self.serve.bind_url();
+
+        let spec = CommandSpec {
+            job_type: JobType::Serve,
+            args,
+            metrics_file: None,
+            output_dir: None,
+        };
+
+        if let Some(runner) = &mut self.runner {
+            let job_id = runner.spawn(spec);
+            self.active_serve_job = Some(job_id);
+            self.serve.mark_starting(bind_url);
+        }
+    }
+
+    fn start_quantize_prompt(&mut self) {
+        if let Err(msg) = self.quantize.validate_config() {
+            self.modal_stack.push(Modal::error("Invalid Config", msg));
+            return;
+        }
+        let summary = self.quantize.config_summary();
+        self.pending_modal_context = Some(PendingModalTarget::QuantizeStart);
+        self.modal_stack
+            .push(Modal::confirm("Start Quantize?", summary));
+    }
+
+    fn start_quantize(&mut self) {
+        let args = self.quantize.build_cli_args();
+        let output_dir = self
+            .quantize
+            .output_path()
+            .parent()
+            .map(|p| p.to_path_buf());
+        if let Some(ref dir) = output_dir {
+            let _ = std::fs::create_dir_all(dir);
+        }
+
+        let spec = CommandSpec {
+            job_type: JobType::Quantize,
+            args,
+            metrics_file: None,
+            output_dir: None,
+        };
+
+        if let Some(runner) = &mut self.runner {
+            let job_id = runner.spawn(spec);
+            self.active_quantize_job = Some(job_id);
+            self.quantize.mark_running();
+        }
+    }
+
+    fn start_bench_prompt(&mut self) {
+        if let Err(msg) = self.bench.validate_config() {
+            self.modal_stack.push(Modal::error("Invalid Config", msg));
+            return;
+        }
+        let summary = self.bench.config_summary();
+        self.pending_modal_context = Some(PendingModalTarget::BenchStart);
+        self.modal_stack
+            .push(Modal::confirm("Run Benchmark?", summary));
+    }
+
+    fn start_bench(&mut self) {
+        let args = self.bench.build_cli_args();
+        if let Some(ref json_path) = self.bench.json_output_path() {
+            if let Some(parent) = json_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+
+        let spec = CommandSpec {
+            job_type: JobType::Bench,
+            args,
+            metrics_file: None,
+            output_dir: None,
+        };
+
+        if let Some(runner) = &mut self.runner {
+            let job_id = runner.spawn(spec);
+            self.active_bench_job = Some(job_id);
+            self.bench.mark_running();
+        }
+    }
+
+    fn start_eval_prompt(&mut self) {
+        if let Err(msg) = self.eval.validate_config() {
+            self.modal_stack.push(Modal::error("Invalid Config", msg));
+            return;
+        }
+        let summary = self.eval.config_summary();
+        self.pending_modal_context = Some(PendingModalTarget::EvalStart);
+        self.modal_stack
+            .push(Modal::confirm("Run Eval?", summary));
+    }
+
+    fn start_eval(&mut self) {
+        let args = self.eval.build_cli_args();
+        let spec = CommandSpec {
+            job_type: JobType::Eval,
+            args,
+            metrics_file: None,
+            output_dir: None,
+        };
+
+        if let Some(runner) = &mut self.runner {
+            let job_id = runner.spawn(spec);
+            self.active_eval_job = Some(job_id);
+            self.eval.mark_running();
+        }
+    }
+
+    fn start_merge_prompt(&mut self) {
+        if let Err(msg) = self.merge.validate_config() {
+            self.modal_stack.push(Modal::error("Invalid Config", msg));
+            return;
+        }
+        let summary = self.merge.config_summary();
+        self.pending_modal_context = Some(PendingModalTarget::MergeStart);
+        self.modal_stack
+            .push(Modal::confirm("Start Merge?", summary));
+    }
+
+    fn start_merge(&mut self) {
+        let args = self.merge.build_cli_args();
+        let output_dir = self.merge.output_dir();
+        let _ = std::fs::create_dir_all(&output_dir);
+
+        let spec = CommandSpec {
+            job_type: JobType::Merge,
+            args,
+            metrics_file: None,
+            output_dir: None,
+        };
+
+        if let Some(runner) = &mut self.runner {
+            let job_id = runner.spawn(spec);
+            self.active_merge_job = Some(job_id);
+            self.merge.mark_running();
+        }
+    }
+
     /// Open a text-input modal to let the user override the learning rate of the active job.
     fn open_lr_override_modal(&mut self) {
         // Check that there's an active job with an existing output directory
@@ -1735,6 +2308,16 @@ impl App {
         if self.inference.no_thinking {
             args.push("--no-thinking".to_string());
         }
+        // Backend selection. Auto is the CLI default, so we only emit the
+        // flag when the user has pinned a specific path.
+        if self.inference.backend
+            != pmetal_data::inference_config::InferenceBackend::Auto
+        {
+            args.extend([
+                "--backend".to_string(),
+                self.inference.backend.as_str().to_string(),
+            ]);
+        }
         // Always use chat mode in TUI
         args.push("--chat".to_string());
         if let Some(ref experts_dir) = self.inference.experts_dir {
@@ -1910,6 +2493,11 @@ impl App {
                 self.grpo
                     .render_with_metrics(content_area, buf, &dash_samples, &dash_throughput);
             }
+            Tab::Serve => (&mut self.serve).render(content_area, buf),
+            Tab::Quantize => (&mut self.quantize).render(content_area, buf),
+            Tab::Bench => (&mut self.bench).render(content_area, buf),
+            Tab::Eval => (&mut self.eval).render(content_area, buf),
+            Tab::Merge => (&mut self.merge).render(content_area, buf),
         }
 
         // Footer with keybindings

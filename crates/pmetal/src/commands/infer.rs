@@ -283,6 +283,8 @@ pub(crate) async fn run_inference(
     system: Option<&str>,
     no_thinking: bool,
     mode: pmetal_data::inference_config::SamplingMode,
+    backend: pmetal_data::inference_config::InferenceBackend,
+    draft_model: Option<&str>,
     metal_sampler: bool,
     compiled: bool,
     _stream: bool,
@@ -314,8 +316,53 @@ pub(crate) async fn run_inference(
     if ane {
         anyhow::bail!("ANE inference requires the 'ane' feature: cargo build --features ane");
     }
+    use pmetal_data::inference_config::InferenceBackend;
     use pmetal_models::{
         GenerationOutput, generate_cached_compiled, generate_cached_metal, generate_minimal_async,
+    };
+
+    // ── Resolve --backend into the legacy boolean path selectors ──────────
+    //
+    // Legacy flags (`--metal-sampler`, `--compiled`, `--minimal`, `--ane`) still
+    // work as before when `--backend` is left at `auto`. Any other variant
+    // takes precedence and clears the legacy flags, reasserting only the one
+    // that matches. `auto` defers to the runner's existing behavior — today
+    // that's "streaming path when no legacy flag is set"; Phase 2 will add a
+    // device-aware heuristic here.
+    let (metal_sampler, compiled, minimal, ane) = match backend {
+        InferenceBackend::Auto => (metal_sampler, compiled, minimal, ane),
+        InferenceBackend::Standard => (false, false, false, false),
+        InferenceBackend::Compiled => (false, true, false, false),
+        InferenceBackend::MetalSampler => (true, false, false, false),
+        InferenceBackend::Minimal => (false, false, true, false),
+        InferenceBackend::Ane => {
+            #[cfg(not(feature = "ane"))]
+            {
+                anyhow::bail!(
+                    "--backend ane requires the 'ane' feature: cargo build --features ane"
+                );
+            }
+            #[cfg(feature = "ane")]
+            {
+                (false, false, false, true)
+            }
+        }
+        InferenceBackend::Dflash => {
+            // DFlash owns its own target+draft loop and isn't yet wired into
+            // this dispatch. The dedicated `pmetal dflash` subcommand is the
+            // supported path; Phase 2 will fold it in behind `--backend dflash`.
+            let draft = draft_model.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--backend dflash requires --draft-model <hf-id-or-path>. \
+                     For the full DFlash pipeline (tree-verify, metrics), use \
+                     `pmetal dflash` directly."
+                )
+            })?;
+            anyhow::bail!(
+                "--backend dflash is not yet wired into `pmetal infer`; \
+                 run `pmetal dflash --target {model_id} --draft {draft}` instead."
+            );
+        }
     };
 
     tracing::info!(model = %model_id, "Loading model for inference");

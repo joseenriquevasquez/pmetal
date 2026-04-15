@@ -471,13 +471,28 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         mode: pmetal_data::inference_config::SamplingMode,
 
+        /// Execution backend: auto | standard | compiled | metal-sampler | ane | minimal | dflash.
+        /// `auto` picks the best path for the current device + model (default). Explicit
+        /// variants pin a backend. `dflash` also requires `--draft-model`.
+        /// Takes precedence over the legacy `--compiled` / `--metal-sampler` / `--minimal`
+        /// / `--ane` flags when set to anything other than `auto`.
+        #[arg(long, default_value = "auto")]
+        backend: pmetal_data::inference_config::InferenceBackend,
+
+        /// Draft model for speculative decoding (HF id or local path).
+        /// Required when `--backend dflash`; ignored otherwise.
+        #[arg(long)]
+        draft_model: Option<String>,
+
         /// Use fused Metal sampling kernel for better battery performance
-        /// (bypasses mlx-rs sampling, uses single GPU kernel launch)
+        /// (bypasses mlx-rs sampling, uses single GPU kernel launch).
+        /// Legacy alias — prefer `--backend metal-sampler`.
         #[arg(long)]
         metal_sampler: bool,
 
         /// Use JIT-compiled sampling for better performance
-        /// (matches mlx_lm's @mx.compile approach for kernel fusion)
+        /// (matches mlx_lm's @mx.compile approach for kernel fusion).
+        /// Legacy alias — prefer `--backend compiled`.
         #[arg(long)]
         compiled: bool,
 
@@ -2686,6 +2701,8 @@ async fn tokio_main() -> anyhow::Result<()> {
             system,
             no_thinking,
             mode,
+            backend,
+            draft_model,
             metal_sampler,
             compiled,
             stream,
@@ -2752,6 +2769,8 @@ async fn tokio_main() -> anyhow::Result<()> {
                 system.as_deref(),
                 no_thinking,
                 mode,
+                backend,
+                draft_model.as_deref(),
                 metal_sampler,
                 compiled,
                 stream,

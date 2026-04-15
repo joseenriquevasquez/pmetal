@@ -207,6 +207,114 @@ impl std::str::FromStr for SamplingMode {
     }
 }
 
+// =============================================================================
+// Inference backend selection
+// =============================================================================
+
+/// Execution backend used to run a forward/decode step.
+///
+/// `Auto` asks the runner to pick the fastest backend that still produces
+/// correct output for the current device + model. Explicit variants let the
+/// user pin a path (for benchmarking, debugging, or when the heuristic is
+/// wrong). See `commands/infer.rs::resolve_backend` for the selection rules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InferenceBackend {
+    /// Heuristic auto-select: best backend for current device + model.
+    #[default]
+    Auto,
+    /// Default streaming MLX path (the current no-flag behavior).
+    Standard,
+    /// JIT-compiled sampling (mlx.compile) — matches `--compiled`.
+    Compiled,
+    /// Fused Metal sampling kernel — matches `--metal-sampler`.
+    MetalSampler,
+    /// Apple Neural Engine hybrid path — matches `--ane` (requires `ane` feature).
+    Ane,
+    /// Minimal async generation (debug path) — matches `--minimal`.
+    Minimal,
+    /// DFlash block-diffusion speculative decoding. Requires a draft model
+    /// path. Auto resolves to this only when a draft is explicitly provided.
+    Dflash,
+}
+
+impl InferenceBackend {
+    /// Stable string id used on CLI (`--backend`) and in the TUI dropdown.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Standard => "standard",
+            Self::Compiled => "compiled",
+            Self::MetalSampler => "metal-sampler",
+            Self::Ane => "ane",
+            Self::Minimal => "minimal",
+            Self::Dflash => "dflash",
+        }
+    }
+
+    /// Short human-facing label for UI surfaces.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Standard => "Standard",
+            Self::Compiled => "Compiled",
+            Self::MetalSampler => "Metal",
+            Self::Ane => "ANE",
+            Self::Minimal => "Minimal",
+            Self::Dflash => "DFlash",
+        }
+    }
+
+    /// One-line description shown next to the dropdown in the TUI.
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Auto => "pick best for this device + model",
+            Self::Standard => "streaming MLX path (token-by-token)",
+            Self::Compiled => "JIT-compiled sampling (mlx.compile)",
+            Self::MetalSampler => "fused Metal sampling kernel",
+            Self::Ane => "Apple Neural Engine hybrid (experimental)",
+            Self::Minimal => "minimal async loop (debug only)",
+            Self::Dflash => "block-diffusion speculative (needs draft)",
+        }
+    }
+
+    /// All variants in UI cycle order. Used by the TUI dropdown and the
+    /// `--backend` clap value-parser.
+    pub const ALL: &'static [InferenceBackend] = &[
+        Self::Auto,
+        Self::Standard,
+        Self::Compiled,
+        Self::MetalSampler,
+        Self::Ane,
+        Self::Minimal,
+        Self::Dflash,
+    ];
+}
+
+impl std::fmt::Display for InferenceBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for InferenceBackend {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "standard" | "default" => Ok(Self::Standard),
+            "compiled" | "jit" => Ok(Self::Compiled),
+            "metal-sampler" | "metal_sampler" | "metal" => Ok(Self::MetalSampler),
+            "ane" => Ok(Self::Ane),
+            "minimal" => Ok(Self::Minimal),
+            "dflash" => Ok(Self::Dflash),
+            _ => Err(format!(
+                "unknown backend '{s}': expected auto, standard, compiled, \
+                 metal-sampler, ane, minimal, or dflash"
+            )),
+        }
+    }
+}
+
 /// Return the available sampling modes for a model family.
 ///
 /// Models without specific recommendations return an empty slice.
