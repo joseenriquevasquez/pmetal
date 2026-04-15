@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::state::{
-    AppConfig, AppEvent, AppState, CachedModel, DistillationRun, DistillationStatus, GrpoRun,
-    GrpoStatus, TrainingConfigSummary, TrainingRun, TrainingStatus, format_downloads, format_size,
+    AppConfig, AppEvent, AppState, BenchRun, CachedModel, DistillationRun, DistillationStatus,
+    EvalRun, GrpoRun, GrpoStatus, JobStatus, ServeInstance, ServeStatus, TrainingConfigSummary,
+    TrainingRun, TrainingStatus, format_downloads, format_size,
 };
 
 // ---------------------------------------------------------------------------
@@ -1291,6 +1292,7 @@ pub async fn start_training(
             dispatch: pmetal::trainer::DispatchConfig {
                 flash_attention: config.flash_attention.unwrap_or(true),
                 sequence_packing: config.sequence_packing.unwrap_or(true),
+                pack_max_seq_len: None,
                 jit_compilation: config.jit_compilation.unwrap_or(true),
                 fused: true,
                 metal_fused_optimizer: config.fused_optimizer.unwrap_or(true),
@@ -1635,6 +1637,649 @@ pub async fn stop_grpo(state: State<'_, AppState>, run_id: String) -> Result<()>
 }
 
 // ---------------------------------------------------------------------------
+// Serve — long-running HTTP inference server
+//
+// Spawns `pmetal serve` as a child process, tails its stdout/stderr into the
+// ServeInstance log buffer, and broadcasts status transitions through
+// AppEvent. Matches the TUI Serve tab behavior exactly so config built in
+// either surface produces the same running server.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServeConfigDto {
+    pub model: String,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub max_seq_len: Option<usize>,
+    pub fp8: Option<bool>,
+    /// One of: `auto | fp16 | q8 | q4 | tq8 | tq4 | tq2_5 | tq3_5`.
+    pub kv_cache: Option<String>,
+    pub kv_group_size: Option<usize>,
+    pub lora: Option<String>,
+    pub experts_dir: Option<String>,
+}
+
+#[tauri::command]
+pub async fn list_serve_instances(state: State<'_, AppState>) -> Result<Vec<ServeInstance>> {
+    Ok(state.list_serve_instances().await)
+}
+
+#[tauri::command]
+pub async fn stop_serve(state: State<'_, AppState>, instance_id: String) -> Result<()> {
+    state.stop_serve_instance(&instance_id).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn start_serve(
+    state: State<'_, AppState>,
+    _app_handle: AppHandle,
+    config: ServeConfigDto,
+) -> Result<String> {
+    let host = config.host.clone().unwrap_or_else(|| "0.0.0.0".to_string());
+    let port = config.port.unwrap_or(8080);
+    let max_seq_len = config.max_seq_len.unwrap_or(4096);
+    let fp8 = config.fp8.unwrap_or(false);
+    let kv_cache = config.kv_cache.clone().unwrap_or_else(|| "auto".to_string());
+    let kv_group_size = config.kv_group_size.unwrap_or(64);
+
+    // Refuse to start if something is already bound to the same port, so
+    // the operator sees a clean error instead of a mysterious crash loop
+    // from the child process's bind() failure.
+    {
+        let instances = state.serve_instances.read().await;
+        if instances.iter().any(|i| {
+            matches!(i.status, ServeStatus::Starting | ServeStatus::Running) && i.port == port
+        }) {
+            return Err(AppError(format!(
+                "A serve instance is already running on port {port}. Stop it first."
+            )));
+        }
+    }
+
+    let instance = ServeInstance::new(
+        &config.model,
+        &host,
+        port,
+        max_seq_len,
+        fp8,
+        &kv_cache,
+    );
+    let instance_id = instance.id.clone();
+    state.create_serve_instance(instance).await;
+
+    // Build the `pmetal serve` argv. Mirrors the TUI's Serve tab
+    // `build_cli_args` so the two surfaces stay in lockstep.
+    let mut args: Vec<String> = vec!["serve".into()];
+    args.extend(["--model".into(), config.model.clone()]);
+    if let Some(ref lora) = config.lora {
+        if !lora.is_empty() {
+            args.extend(["--lora".into(), lora.clone()]);
+        }
+    }
+    if let Some(ref experts) = config.experts_dir {
+        if !experts.is_empty() {
+            args.extend(["--experts-dir".into(), experts.clone()]);
+        }
+    }
+    args.extend(["--host".into(), host.clone()]);
+    args.extend(["--port".into(), port.to_string()]);
+    args.extend(["--max-seq-len".into(), max_seq_len.to_string()]);
+    args.extend(["--kv-group-size".into(), kv_group_size.to_string()]);
+    if fp8 {
+        args.push("--fp8".into());
+    }
+    match kv_cache.as_str() {
+        "auto" => {}
+        "fp16" => args.push("--no-kv-quant".into()),
+        "q8" => args.extend(["--kv-quant".into(), "8".into()]),
+        "q4" => args.extend(["--kv-quant".into(), "4".into()]),
+        "tq8" => {
+            args.push("--kv-turboquant".into());
+            args.extend(["--kv-quant".into(), "8".into()]);
+        }
+        "tq4" => {
+            args.push("--kv-turboquant".into());
+            args.extend(["--kv-quant".into(), "4".into()]);
+        }
+        "tq2_5" => args.extend(["--kv-turboquant-preset".into(), "q2_5".into()]),
+        "tq3_5" => args.extend(["--kv-turboquant-preset".into(), "q3_5".into()]),
+        other => {
+            return Err(AppError(format!(
+                "Unknown kv_cache preset '{other}' (expected auto/fp16/q8/q4/tq8/tq4/tq2_5/tq3_5)"
+            )));
+        }
+    }
+
+    let binary = pmetal_binary();
+    let mut cmd = tokio::process::Command::new(&binary);
+    cmd.args(&args);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    // Put the child in its own process group so `child.kill()` also
+    // reaches any grandchildren the serve binary may have spawned.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = cmd.spawn().map_err(|e| {
+        AppError(format!(
+            "Failed to spawn `{}`: {e}",
+            binary.display()
+        ))
+    })?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    state
+        .active_processes
+        .write()
+        .await
+        .insert(instance_id.clone(), child);
+
+    // Stream stdout + stderr into the ServeInstance log tail and
+    // broadcast each line so the frontend can update the log panel
+    // live. A dedicated task per stream avoids blocking the command
+    // handler.
+    spawn_serve_output_reader(
+        state.serve_instances.clone(),
+        state.event_tx.clone(),
+        instance_id.clone(),
+        stdout,
+        stderr,
+    );
+    spawn_serve_exit_watcher(
+        state.serve_instances.clone(),
+        state.active_processes.clone(),
+        state.event_tx.clone(),
+        instance_id.clone(),
+    );
+
+    Ok(instance_id)
+}
+
+fn spawn_serve_output_reader(
+    instances: Arc<tokio::sync::RwLock<Vec<ServeInstance>>>,
+    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
+    instance_id: String,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // Merge stdout + stderr into one push loop keyed by instance_id.
+    let merge = |maybe_stream: Option<
+        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    >,
+                 instances: Arc<tokio::sync::RwLock<Vec<ServeInstance>>>,
+                 event_tx: tokio::sync::broadcast::Sender<AppEvent>,
+                 instance_id: String| async move {
+        let Some(stream) = maybe_stream else { return };
+        let mut reader = BufReader::new(stream).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let mut instances_w = instances.write().await;
+            if let Some(inst) = instances_w.iter_mut().find(|i| i.id == instance_id) {
+                inst.append_log(&line);
+                let _ = event_tx.send(AppEvent::ServeUpdate { instance: inst.clone() });
+            } else {
+                break;
+            }
+        }
+    };
+
+    if let Some(s) = stdout {
+        let boxed: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(s);
+        let instances_cl = instances.clone();
+        let event_tx_cl = event_tx.clone();
+        let id_cl = instance_id.clone();
+        tokio::spawn(merge(Some(boxed), instances_cl, event_tx_cl, id_cl));
+    }
+    if let Some(s) = stderr {
+        let boxed: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(s);
+        tokio::spawn(merge(Some(boxed), instances, event_tx, instance_id));
+    }
+}
+
+fn spawn_serve_exit_watcher(
+    instances: Arc<tokio::sync::RwLock<Vec<ServeInstance>>>,
+    active_processes: Arc<tokio::sync::RwLock<std::collections::HashMap<String, tokio::process::Child>>>,
+    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
+    instance_id: String,
+) {
+    tokio::spawn(async move {
+        // Poll the child every 250ms until it exits. We keep the child in
+        // `active_processes` so stop_serve can still kill it directly; we
+        // take ownership here only when it has actually exited.
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+            let mut procs = active_processes.write().await;
+            let Some(child) = procs.get_mut(&instance_id) else {
+                // Someone else removed it (stop_serve called). Done.
+                return;
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // Exited. Remove from the registry and mark the
+                    // instance as Stopped (success) or Failed.
+                    procs.remove(&instance_id);
+                    drop(procs);
+                    let mut instances_w = instances.write().await;
+                    if let Some(inst) =
+                        instances_w.iter_mut().find(|i| i.id == instance_id)
+                    {
+                        if matches!(inst.status, ServeStatus::Starting | ServeStatus::Running) {
+                            if status.success() {
+                                inst.status = ServeStatus::Stopped;
+                                inst.status_message = Some("Exited cleanly".to_string());
+                            } else {
+                                inst.status = ServeStatus::Failed;
+                                inst.status_message =
+                                    Some(format!("Process exited with status {status}"));
+                                inst.error_message = Some(inst.status_message.clone().unwrap());
+                            }
+                            inst.stopped_at = Some(Utc::now());
+                            let _ = event_tx
+                                .send(AppEvent::ServeUpdate { instance: inst.clone() });
+                            let _ = event_tx.send(AppEvent::ServeStopped {
+                                instance_id: instance_id.clone(),
+                            });
+                        }
+                    }
+                    return;
+                }
+                Ok(None) => continue,
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Bench — one-shot benchmark subprocess, trial rows parsed into BenchRun
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BenchConfigDto {
+    /// `workload` or `basic`.
+    pub mode: Option<String>,
+    pub model: String,
+    pub preset: Option<String>,
+    pub prompt_samples: Option<usize>,
+    pub max_prompt_tokens: Option<usize>,
+    pub decode_steps: Option<usize>,
+    pub inference_warmup: Option<usize>,
+    pub inference_repeats: Option<usize>,
+    pub inference_context: Option<String>,
+    pub batch_size: Option<usize>,
+    pub seq_len: Option<usize>,
+    pub json_output: Option<String>,
+}
+
+#[tauri::command]
+pub async fn list_bench_runs(state: State<'_, AppState>) -> Result<Vec<BenchRun>> {
+    Ok(state.list_bench_runs().await)
+}
+
+#[tauri::command]
+pub async fn stop_bench(state: State<'_, AppState>, run_id: String) -> Result<()> {
+    state.cancel_bench_run(&run_id).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn start_bench(
+    state: State<'_, AppState>,
+    _app_handle: AppHandle,
+    config: BenchConfigDto,
+) -> Result<String> {
+    let mode = config.mode.clone().unwrap_or_else(|| "workload".to_string());
+    if !matches!(mode.as_str(), "workload" | "basic") {
+        return Err(AppError(format!(
+            "Unknown bench mode '{mode}' (expected workload or basic)"
+        )));
+    }
+
+    let run = BenchRun::new(&mode, &config.model, config.preset.as_deref());
+    let run_id = run.id.clone();
+    state.create_bench_run(run).await;
+
+    // Build the subprocess argv. Mirrors the TUI Bench tab exactly so the
+    // same config run from either surface produces identical measurements.
+    let mut args: Vec<String> = Vec::new();
+    if mode == "workload" {
+        args.push("bench-workload".into());
+        args.extend(["--model".into(), config.model.clone()]);
+        if let Some(ref preset) = config.preset {
+            if preset != "custom" {
+                args.extend(["--preset".into(), preset.clone()]);
+            }
+        }
+        if let Some(ref ctx) = config.inference_context {
+            args.extend(["--inference-context".into(), ctx.clone()]);
+        }
+        args.extend([
+            "--prompt-samples".into(),
+            config.prompt_samples.unwrap_or(8).to_string(),
+        ]);
+        args.extend([
+            "--max-prompt-tokens".into(),
+            config.max_prompt_tokens.unwrap_or(0).to_string(),
+        ]);
+        args.extend([
+            "--decode-steps".into(),
+            config.decode_steps.unwrap_or(32).to_string(),
+        ]);
+        args.extend([
+            "--inference-warmup-passes".into(),
+            config.inference_warmup.unwrap_or(2).to_string(),
+        ]);
+        args.extend([
+            "--inference-repeats".into(),
+            config.inference_repeats.unwrap_or(1).to_string(),
+        ]);
+    } else {
+        args.push("bench".into());
+        args.extend(["--model".into(), config.model.clone()]);
+        args.extend([
+            "--batch-size".into(),
+            config.batch_size.unwrap_or(1).to_string(),
+        ]);
+        args.extend([
+            "--seq-len".into(),
+            config.seq_len.unwrap_or(512).to_string(),
+        ]);
+    }
+    if let Some(ref out) = config.json_output {
+        if !out.is_empty() {
+            args.push("--json".into());
+            args.extend(["--output".into(), out.clone()]);
+        }
+    }
+
+    spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Bench).await?;
+    Ok(run_id)
+}
+
+// ---------------------------------------------------------------------------
+// Eval — one-shot evaluation subprocess, metrics parsed into EvalRun
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EvalConfigDto {
+    pub model: String,
+    pub dataset: String,
+    pub lora: Option<String>,
+    pub max_seq_len: Option<usize>,
+    pub num_samples: Option<usize>,
+    pub json_output: Option<bool>,
+}
+
+#[tauri::command]
+pub async fn list_eval_runs(state: State<'_, AppState>) -> Result<Vec<EvalRun>> {
+    Ok(state.list_eval_runs().await)
+}
+
+#[tauri::command]
+pub async fn stop_eval(state: State<'_, AppState>, run_id: String) -> Result<()> {
+    state.cancel_eval_run(&run_id).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn start_eval(
+    state: State<'_, AppState>,
+    _app_handle: AppHandle,
+    config: EvalConfigDto,
+) -> Result<String> {
+    if config.model.is_empty() {
+        return Err(AppError("Model is required".into()));
+    }
+    if config.dataset.is_empty() {
+        return Err(AppError("Dataset is required".into()));
+    }
+
+    let run = EvalRun::new(&config.model, &config.dataset);
+    let run_id = run.id.clone();
+    state.create_eval_run(run).await;
+
+    let mut args: Vec<String> = vec!["eval".into()];
+    args.extend(["--model".into(), config.model.clone()]);
+    args.extend(["--dataset".into(), config.dataset.clone()]);
+    args.extend([
+        "--max-seq-len".into(),
+        config.max_seq_len.unwrap_or(1024).to_string(),
+    ]);
+    args.extend([
+        "--num-samples".into(),
+        config.num_samples.unwrap_or(0).to_string(),
+    ]);
+    if let Some(ref lora) = config.lora {
+        if !lora.is_empty() {
+            args.extend(["--lora".into(), lora.clone()]);
+        }
+    }
+    if config.json_output.unwrap_or(false) {
+        args.push("--json".into());
+    }
+
+    spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Eval).await?;
+    Ok(run_id)
+}
+
+/// Kind of one-shot measurement job — discriminates which state helpers
+/// to call from the shared `spawn_job_subprocess` driver.
+#[derive(Debug, Clone, Copy)]
+enum JobKind {
+    Bench,
+    Eval,
+}
+
+/// Spawn a `pmetal <subcommand>` child for a one-shot job and wire up
+/// stdout/stderr tailing + exit watching. Shared between Bench and Eval
+/// so they can't drift — any change to the subprocess lifecycle lands
+/// in both surfaces at once.
+async fn spawn_job_subprocess(
+    state: &AppState,
+    run_id: String,
+    args: Vec<String>,
+    kind: JobKind,
+) -> Result<()> {
+    let binary = pmetal_binary();
+    let mut cmd = tokio::process::Command::new(&binary);
+    cmd.args(&args);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| AppError(format!("Failed to spawn `{}`: {e}", binary.display())))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    state
+        .active_processes
+        .write()
+        .await
+        .insert(run_id.clone(), child);
+
+    // Stream output into the appropriate run record.
+    let bench_runs = state.bench_runs.clone();
+    let eval_runs = state.eval_runs.clone();
+    let event_tx = state.event_tx.clone();
+
+    spawn_job_reader(kind, bench_runs.clone(), eval_runs.clone(), event_tx.clone(), run_id.clone(), stdout, stderr);
+    spawn_job_exit_watcher(
+        kind,
+        bench_runs,
+        eval_runs,
+        state.active_processes.clone(),
+        event_tx,
+        run_id,
+    );
+
+    Ok(())
+}
+
+fn spawn_job_reader(
+    kind: JobKind,
+    bench_runs: Arc<tokio::sync::RwLock<Vec<BenchRun>>>,
+    eval_runs: Arc<tokio::sync::RwLock<Vec<EvalRun>>>,
+    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
+    run_id: String,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    async fn drain<R: tokio::io::AsyncRead + Unpin>(
+        kind: JobKind,
+        bench_runs: Arc<tokio::sync::RwLock<Vec<BenchRun>>>,
+        eval_runs: Arc<tokio::sync::RwLock<Vec<EvalRun>>>,
+        event_tx: tokio::sync::broadcast::Sender<AppEvent>,
+        run_id: String,
+        stream: R,
+    ) {
+        let mut reader = BufReader::new(stream).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            match kind {
+                JobKind::Bench => {
+                    let mut runs = bench_runs.write().await;
+                    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+                        run.append_log(&line);
+                        let _ = event_tx.send(AppEvent::BenchUpdate { run: run.clone() });
+                    } else {
+                        break;
+                    }
+                }
+                JobKind::Eval => {
+                    let mut runs = eval_runs.write().await;
+                    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+                        run.append_log(&line);
+                        let _ = event_tx.send(AppEvent::EvalUpdate { run: run.clone() });
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(s) = stdout {
+        let bench_runs = bench_runs.clone();
+        let eval_runs = eval_runs.clone();
+        let event_tx = event_tx.clone();
+        let run_id = run_id.clone();
+        tokio::spawn(async move {
+            drain(kind, bench_runs, eval_runs, event_tx, run_id, s).await;
+        });
+    }
+    if let Some(s) = stderr {
+        tokio::spawn(async move {
+            drain(kind, bench_runs, eval_runs, event_tx, run_id, s).await;
+        });
+    }
+}
+
+fn spawn_job_exit_watcher(
+    kind: JobKind,
+    bench_runs: Arc<tokio::sync::RwLock<Vec<BenchRun>>>,
+    eval_runs: Arc<tokio::sync::RwLock<Vec<EvalRun>>>,
+    active_processes: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, tokio::process::Child>>,
+    >,
+    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
+    run_id: String,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+            let mut procs = active_processes.write().await;
+            let Some(child) = procs.get_mut(&run_id) else {
+                return;
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    procs.remove(&run_id);
+                    drop(procs);
+                    let success = status.success();
+                    let msg = if success {
+                        None
+                    } else {
+                        Some(format!("Process exited with status {status}"))
+                    };
+                    match kind {
+                        JobKind::Bench => {
+                            let mut runs = bench_runs.write().await;
+                            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+                                if matches!(run.status, JobStatus::Running | JobStatus::Pending) {
+                                    run.status = if success {
+                                        JobStatus::Completed
+                                    } else {
+                                        JobStatus::Failed
+                                    };
+                                    run.ended_at = Some(Utc::now());
+                                    run.error_message = msg.clone();
+                                    let _ = event_tx
+                                        .send(AppEvent::BenchUpdate { run: run.clone() });
+                                    let _ = event_tx.send(AppEvent::BenchStopped {
+                                        run_id: run_id.clone(),
+                                    });
+                                }
+                            }
+                        }
+                        JobKind::Eval => {
+                            let mut runs = eval_runs.write().await;
+                            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+                                if matches!(run.status, JobStatus::Running | JobStatus::Pending) {
+                                    run.status = if success {
+                                        JobStatus::Completed
+                                    } else {
+                                        JobStatus::Failed
+                                    };
+                                    run.ended_at = Some(Utc::now());
+                                    run.error_message = msg.clone();
+                                    let _ = event_tx
+                                        .send(AppEvent::EvalUpdate { run: run.clone() });
+                                    let _ = event_tx.send(AppEvent::EvalStopped {
+                                        run_id: run_id.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                Ok(None) => continue,
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+/// Resolve the `pmetal` CLI binary used to spawn long-running subprocesses
+/// (serve / bench / eval). In dev mode the sibling `target/{debug,release}`
+/// is checked; in a packaged GUI the binary should sit next to the app
+/// executable. Falls back to PATH lookup.
+fn pmetal_binary() -> PathBuf {
+    // Try sibling paths relative to the GUI executable first (works for
+    // both dev builds and bundled apps).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for candidate in [
+                parent.join("pmetal"),
+                parent.join("../pmetal/pmetal"),
+                parent.join("../../debug/pmetal"),
+                parent.join("../../release/pmetal"),
+            ] {
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    PathBuf::from("pmetal")
+}
+
+// ---------------------------------------------------------------------------
 // Inference helpers
 // ---------------------------------------------------------------------------
 
@@ -1706,6 +2351,8 @@ async fn run_inference_streaming(
         kv_quant_preset: config.kv_quant_preset.clone(),
         no_kv_quant: config.no_kv_quant.unwrap_or(false),
         kv_qjl: config.kv_qjl.unwrap_or(false),
+        mode: pmetal::data::inference_config::SamplingMode::Auto,
+        detect_repetition: false,
     };
 
     let prompt_tokens = runner_config.prompt.len(); // rough pre-tokenize hint
@@ -3187,6 +3834,42 @@ pub fn start_event_forwarder(app_handle: AppHandle, state: &AppState) {
                         AppEvent::GrpoUpdate { run } => {
                             ("grpo-update", serde_json::to_value(run).unwrap_or_default())
                         }
+                        AppEvent::ServeStarted { instance } => (
+                            "serve-started",
+                            serde_json::to_value(instance).unwrap_or_default(),
+                        ),
+                        AppEvent::ServeStopped { instance_id } => (
+                            "serve-stopped",
+                            serde_json::Value::String(instance_id.clone()),
+                        ),
+                        AppEvent::ServeUpdate { instance } => (
+                            "serve-update",
+                            serde_json::to_value(instance).unwrap_or_default(),
+                        ),
+                        AppEvent::BenchStarted { run } => (
+                            "bench-started",
+                            serde_json::to_value(run).unwrap_or_default(),
+                        ),
+                        AppEvent::BenchStopped { run_id } => (
+                            "bench-stopped",
+                            serde_json::Value::String(run_id.clone()),
+                        ),
+                        AppEvent::BenchUpdate { run } => (
+                            "bench-update",
+                            serde_json::to_value(run).unwrap_or_default(),
+                        ),
+                        AppEvent::EvalStarted { run } => (
+                            "eval-started",
+                            serde_json::to_value(run).unwrap_or_default(),
+                        ),
+                        AppEvent::EvalStopped { run_id } => (
+                            "eval-stopped",
+                            serde_json::Value::String(run_id.clone()),
+                        ),
+                        AppEvent::EvalUpdate { run } => (
+                            "eval-update",
+                            serde_json::to_value(run).unwrap_or_default(),
+                        ),
                         AppEvent::ModelCached { model } => (
                             "model-cached",
                             serde_json::to_value(model).unwrap_or_default(),

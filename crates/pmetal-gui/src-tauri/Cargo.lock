@@ -4527,6 +4527,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a64a92489e2744ce060c349162be1c5f33c6969234104dbd99ddb5feb08b8c15"
 
 [[package]]
+name = "memo-map"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38d1115007560874e373613744c6fba374c17688327a71c1476d1a5954cc857b"
+
+[[package]]
 name = "memoffset"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4549,6 +4555,27 @@ checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
 dependencies = [
  "mime",
  "unicase",
+]
+
+[[package]]
+name = "minijinja"
+version = "2.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "805bfd7352166bae857ee569628b52bcd85a1cecf7810861ebceb1686b72b75d"
+dependencies = [
+ "memo-map",
+ "serde",
+]
+
+[[package]]
+name = "minijinja-contrib"
+version = "2.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45092d80391870622fcf3bd82f5d2af18f99533ea60debb4bc9db0c76f0e809a"
+dependencies = [
+ "minijinja",
+ "serde",
+ "time",
 ]
 
 [[package]]
@@ -5731,7 +5758,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -5781,7 +5808,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-bridge"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "cc",
  "cmake",
@@ -5796,7 +5823,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "secrecy",
  "serde",
@@ -5808,10 +5835,12 @@ dependencies = [
 
 [[package]]
 name = "pmetal-data"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "image",
+ "minijinja",
+ "minijinja-contrib",
  "parquet",
  "pmetal-bridge",
  "pmetal-core",
@@ -5820,13 +5849,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "time",
  "tokenizers",
  "tracing",
 ]
 
 [[package]]
 name = "pmetal-distill"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bitcode",
  "half",
@@ -5847,7 +5877,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-distributed"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5873,7 +5903,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-gguf"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "byteorder",
  "half",
@@ -5886,7 +5916,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-gui"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -5908,7 +5938,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-hub"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -5929,7 +5959,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-lora"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "half",
  "pmetal-bridge",
@@ -5945,7 +5975,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-merge"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "half",
  "hf-hub",
@@ -5968,7 +5998,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-metal"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "block2",
  "cc",
@@ -5993,7 +6023,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mhc"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ndarray",
  "num-traits",
@@ -6013,7 +6043,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mlx"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "dirs",
  "half",
@@ -6031,7 +6061,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-models"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "json5",
  "objc2",
@@ -6050,7 +6080,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-trainer"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6080,7 +6110,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-vocoder"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "half",
  "hf-hub",

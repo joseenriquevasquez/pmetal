@@ -89,6 +89,18 @@ pub fn run() {
             get_grpo_status,
             list_grpo_runs,
             stop_grpo,
+            // Serve
+            start_serve,
+            stop_serve,
+            list_serve_instances,
+            // Bench
+            start_bench,
+            stop_bench,
+            list_bench_runs,
+            // Eval
+            start_eval,
+            stop_eval,
+            list_eval_runs,
             // Inference
             start_inference,
             stop_inference,

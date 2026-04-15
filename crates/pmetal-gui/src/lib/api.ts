@@ -543,6 +543,210 @@ export function onTrainingUpdate(callback: (run: TrainingRun) => void): Promise<
 }
 
 // =============================================================================
+// Serve API
+// =============================================================================
+
+export type ServeStatus = 'starting' | 'running' | 'stopped' | 'failed';
+
+export interface ServeInstance {
+  id: string;
+  status: ServeStatus;
+  model: string;
+  host: string;
+  port: number;
+  bind_url: string;
+  max_seq_len: number;
+  fp8: boolean;
+  kv_cache: string;
+  started_at: string;
+  ready_at: string | null;
+  stopped_at: string | null;
+  error_message: string | null;
+  status_message: string | null;
+  log_tail: string[];
+}
+
+export interface ServeConfigDto {
+  model: string;
+  host?: string | null;
+  port?: number | null;
+  max_seq_len?: number | null;
+  fp8?: boolean | null;
+  kv_cache?: string | null;
+  kv_group_size?: number | null;
+  lora?: string | null;
+  experts_dir?: string | null;
+}
+
+export async function startServe(config: ServeConfigDto): Promise<string> {
+  return await invoke('start_serve', { config });
+}
+
+export async function stopServe(instanceId: string): Promise<void> {
+  return await invoke('stop_serve', { instanceId });
+}
+
+export async function listServeInstances(): Promise<ServeInstance[]> {
+  return await invoke('list_serve_instances');
+}
+
+export function onServeStarted(
+  callback: (instance: ServeInstance) => void,
+): Promise<UnlistenFn> {
+  return listen<ServeInstance>('serve-started', (event) => {
+    callback(event.payload);
+  });
+}
+
+export function onServeUpdate(
+  callback: (instance: ServeInstance) => void,
+): Promise<UnlistenFn> {
+  return listen<ServeInstance>('serve-update', (event) => {
+    callback(event.payload);
+  });
+}
+
+export function onServeStopped(callback: (instanceId: string) => void): Promise<UnlistenFn> {
+  return listen<string>('serve-stopped', (event) => {
+    callback(event.payload);
+  });
+}
+
+// =============================================================================
+// Bench API
+// =============================================================================
+
+export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+export interface BenchTrial {
+  index: number;
+  prompt_tps: number;
+  generation_tps: number;
+  peak_memory_gb: number;
+}
+
+export interface BenchRun {
+  id: string;
+  status: JobStatus;
+  mode: string;
+  model: string;
+  preset: string | null;
+  started_at: string;
+  ended_at: string | null;
+  trials: BenchTrial[];
+  error_message: string | null;
+  log_tail: string[];
+}
+
+export interface BenchConfigDto {
+  mode?: string;
+  model: string;
+  preset?: string | null;
+  prompt_samples?: number | null;
+  max_prompt_tokens?: number | null;
+  decode_steps?: number | null;
+  inference_warmup?: number | null;
+  inference_repeats?: number | null;
+  inference_context?: string | null;
+  batch_size?: number | null;
+  seq_len?: number | null;
+  json_output?: string | null;
+}
+
+export async function startBench(config: BenchConfigDto): Promise<string> {
+  return await invoke('start_bench', { config });
+}
+
+export async function stopBench(runId: string): Promise<void> {
+  return await invoke('stop_bench', { runId });
+}
+
+export async function listBenchRuns(): Promise<BenchRun[]> {
+  return await invoke('list_bench_runs');
+}
+
+export function onBenchStarted(callback: (run: BenchRun) => void): Promise<UnlistenFn> {
+  return listen<BenchRun>('bench-started', (event) => {
+    callback(event.payload);
+  });
+}
+
+export function onBenchUpdate(callback: (run: BenchRun) => void): Promise<UnlistenFn> {
+  return listen<BenchRun>('bench-update', (event) => {
+    callback(event.payload);
+  });
+}
+
+export function onBenchStopped(callback: (runId: string) => void): Promise<UnlistenFn> {
+  return listen<string>('bench-stopped', (event) => {
+    callback(event.payload);
+  });
+}
+
+// =============================================================================
+// Eval API
+// =============================================================================
+
+export interface EvalMetrics {
+  samples_done: number;
+  samples_total: number;
+  perplexity: number | null;
+  accuracy: number | null;
+  loss: number | null;
+}
+
+export interface EvalRun {
+  id: string;
+  status: JobStatus;
+  model: string;
+  dataset: string;
+  started_at: string;
+  ended_at: string | null;
+  metrics: EvalMetrics;
+  error_message: string | null;
+  log_tail: string[];
+}
+
+export interface EvalConfigDto {
+  model: string;
+  dataset: string;
+  lora?: string | null;
+  max_seq_len?: number | null;
+  num_samples?: number | null;
+  json_output?: boolean | null;
+}
+
+export async function startEval(config: EvalConfigDto): Promise<string> {
+  return await invoke('start_eval', { config });
+}
+
+export async function stopEval(runId: string): Promise<void> {
+  return await invoke('stop_eval', { runId });
+}
+
+export async function listEvalRuns(): Promise<EvalRun[]> {
+  return await invoke('list_eval_runs');
+}
+
+export function onEvalStarted(callback: (run: EvalRun) => void): Promise<UnlistenFn> {
+  return listen<EvalRun>('eval-started', (event) => {
+    callback(event.payload);
+  });
+}
+
+export function onEvalUpdate(callback: (run: EvalRun) => void): Promise<UnlistenFn> {
+  return listen<EvalRun>('eval-update', (event) => {
+    callback(event.payload);
+  });
+}
+
+export function onEvalStopped(callback: (runId: string) => void): Promise<UnlistenFn> {
+  return listen<string>('eval-stopped', (event) => {
+    callback(event.payload);
+  });
+}
+
+// =============================================================================
 // GRPO API
 // =============================================================================
 

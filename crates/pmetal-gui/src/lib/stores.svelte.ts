@@ -242,6 +242,199 @@ class TrainingStore {
 export const trainingStore = new TrainingStore();
 
 // =============================================================================
+// Serve Store — tracks running `pmetal serve` HTTP instances.
+// =============================================================================
+
+class ServeStore {
+  instances = $state<api.ServeInstance[]>([]);
+  selectedId = $state<string | null>(null);
+  loading = $state(false);
+  error = $state<string | null>(null);
+
+  get selected() {
+    return this.instances.find(i => i.id === this.selectedId) ?? null;
+  }
+
+  get running() {
+    return this.instances.filter(
+      i => i.status === 'running' || i.status === 'starting',
+    );
+  }
+
+  async refresh() {
+    this.loading = true;
+    this.error = null;
+    try {
+      this.instances = await api.listServeInstances();
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  async start(config: api.ServeConfigDto) {
+    this.loading = true;
+    this.error = null;
+    try {
+      const id = await api.startServe(config);
+      this.selectedId = id;
+      await this.refresh();
+      return id;
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+      throw e;
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  async stop(instanceId: string) {
+    try {
+      await api.stopServe(instanceId);
+      await this.refresh();
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+      throw e;
+    }
+  }
+
+  addInstance(instance: api.ServeInstance) {
+    this.instances = [...this.instances, instance];
+  }
+
+  updateInstance(updated: api.ServeInstance) {
+    this.instances = this.instances.map(i => (i.id === updated.id ? updated : i));
+  }
+}
+
+export const serveStore = new ServeStore();
+
+// =============================================================================
+// Bench Store — tracks one-shot `pmetal bench` runs.
+// =============================================================================
+
+class BenchStore {
+  runs = $state<api.BenchRun[]>([]);
+  selectedId = $state<string | null>(null);
+  loading = $state(false);
+  error = $state<string | null>(null);
+
+  get selected() {
+    return this.runs.find(r => r.id === this.selectedId) ?? null;
+  }
+
+  get activeRuns() {
+    return this.runs.filter(r => r.status === 'running' || r.status === 'pending');
+  }
+
+  async refresh() {
+    this.loading = true;
+    this.error = null;
+    try {
+      this.runs = await api.listBenchRuns();
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  async start(config: api.BenchConfigDto) {
+    this.loading = true;
+    this.error = null;
+    try {
+      const id = await api.startBench(config);
+      this.selectedId = id;
+      await this.refresh();
+      return id;
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+      throw e;
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  async stop(runId: string) {
+    await api.stopBench(runId);
+    await this.refresh();
+  }
+
+  addRun(run: api.BenchRun) {
+    this.runs = [...this.runs, run];
+  }
+
+  updateRun(updated: api.BenchRun) {
+    this.runs = this.runs.map(r => (r.id === updated.id ? updated : r));
+  }
+}
+
+export const benchStore = new BenchStore();
+
+// =============================================================================
+// Eval Store — tracks one-shot `pmetal eval` runs.
+// =============================================================================
+
+class EvalStore {
+  runs = $state<api.EvalRun[]>([]);
+  selectedId = $state<string | null>(null);
+  loading = $state(false);
+  error = $state<string | null>(null);
+
+  get selected() {
+    return this.runs.find(r => r.id === this.selectedId) ?? null;
+  }
+
+  get activeRuns() {
+    return this.runs.filter(r => r.status === 'running' || r.status === 'pending');
+  }
+
+  async refresh() {
+    this.loading = true;
+    this.error = null;
+    try {
+      this.runs = await api.listEvalRuns();
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  async start(config: api.EvalConfigDto) {
+    this.loading = true;
+    this.error = null;
+    try {
+      const id = await api.startEval(config);
+      this.selectedId = id;
+      await this.refresh();
+      return id;
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+      throw e;
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  async stop(runId: string) {
+    await api.stopEval(runId);
+    await this.refresh();
+  }
+
+  addRun(run: api.EvalRun) {
+    this.runs = [...this.runs, run];
+  }
+
+  updateRun(updated: api.EvalRun) {
+    this.runs = this.runs.map(r => (r.id === updated.id ? updated : r));
+  }
+}
+
+export const evalStore = new EvalStore();
+
+// =============================================================================
 // GRPO Store
 // =============================================================================
 
@@ -494,6 +687,9 @@ export async function initializeStores() {
     trainingStore.refresh(),
     grpoStore.refresh(),
     distillationStore.refresh(),
+    serveStore.refresh(),
+    benchStore.refresh(),
+    evalStore.refresh(),
     dashboardStore.refresh(),
     deviceStore.refresh(),
   ]);
@@ -540,6 +736,45 @@ export async function initializeStores() {
 
   unlistenFns.push(await api.onDistillationStopped(() => {
     distillationStore.refresh();
+    dashboardStore.refresh();
+  }));
+
+  // Set up event listeners for serve instances. Each `serve-update` event
+  // carries the full instance (with refreshed log_tail) so the store
+  // replaces the entry rather than mutating in place.
+  unlistenFns.push(await api.onServeStarted((instance) => {
+    serveStore.addInstance(instance);
+    dashboardStore.refresh();
+  }));
+
+  unlistenFns.push(await api.onServeUpdate((instance) => {
+    serveStore.updateInstance(instance);
+  }));
+
+  unlistenFns.push(await api.onServeStopped(() => {
+    serveStore.refresh();
+    dashboardStore.refresh();
+  }));
+
+  // Bench
+  unlistenFns.push(await api.onBenchStarted((run) => {
+    benchStore.addRun(run);
+    dashboardStore.refresh();
+  }));
+  unlistenFns.push(await api.onBenchUpdate((run) => benchStore.updateRun(run)));
+  unlistenFns.push(await api.onBenchStopped(() => {
+    benchStore.refresh();
+    dashboardStore.refresh();
+  }));
+
+  // Eval
+  unlistenFns.push(await api.onEvalStarted((run) => {
+    evalStore.addRun(run);
+    dashboardStore.refresh();
+  }));
+  unlistenFns.push(await api.onEvalUpdate((run) => evalStore.updateRun(run)));
+  unlistenFns.push(await api.onEvalStopped(() => {
+    evalStore.refresh();
     dashboardStore.refresh();
   }));
 }
