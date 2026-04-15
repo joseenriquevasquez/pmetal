@@ -2525,8 +2525,12 @@ pub fn compact_tree_cache(
     let idx_arr = InlineArray::from_i32_slice(&kept_indices);
 
     for kv in cache.kv_caches.iter_mut() {
-        let Some(k_buf) = kv.keys.take() else { continue };
-        let Some(v_buf) = kv.values.take() else { continue };
+        let Some(k_buf) = kv.keys.take() else {
+            continue;
+        };
+        let Some(v_buf) = kv.values.take() else {
+            continue;
+        };
         let shape = k_buf.shape().to_vec();
         let n_kv = shape[1];
         let head_dim = shape[3];
@@ -2588,7 +2592,6 @@ fn dense_mlp_forward(lw: &LayerWeights, mlp_in: &InlineArray) -> InlineArray {
     let activated = InlineArray::fused_swiglu(&gate, &up);
     lw.mlp_down_w.as_ref().unwrap().matmul_from(&activated)
 }
-
 
 // ============================================================================
 // MoE forward
@@ -2965,7 +2968,17 @@ fn attn_forward(
     dtype: i32,
     qjl_matrix: Option<&InlineArray>,
 ) -> InlineArray {
-    attn_forward_with_tree_ctx(lw, normed, b, s, cache, rope_offset, dtype, qjl_matrix, None)
+    attn_forward_with_tree_ctx(
+        lw,
+        normed,
+        b,
+        s,
+        cache,
+        rope_offset,
+        dtype,
+        qjl_matrix,
+        None,
+    )
 }
 
 fn attn_forward_with_tree_ctx(

@@ -102,8 +102,7 @@ struct ModelReport {
 
 fn run_audit_on(dir: &Path) -> ModelReport {
     let expected: Value =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("expected.json")).unwrap())
-            .unwrap();
+        serde_json::from_str(&std::fs::read_to_string(dir.join("expected.json")).unwrap()).unwrap();
     let model_id = expected["model_id"].as_str().unwrap().to_string();
     let expected_tag = expected["arch_tag"].as_str().unwrap().to_string();
 
@@ -223,8 +222,7 @@ fn run_audit_on(dir: &Path) -> ModelReport {
                 .collect()
         })
         .unwrap_or_default();
-    let pmetal_stops =
-        collect_all_stop_tokens(dir, &tokenizer, Some(template.template_type));
+    let pmetal_stops = collect_all_stop_tokens(dir, &tokenizer, Some(template.template_type));
     let stop_set: HashSet<u32> = pmetal_stops.iter().copied().collect();
     for id in &ref_eos {
         if !stop_set.contains(id) {
@@ -244,9 +242,8 @@ fn run_audit_on(dir: &Path) -> ModelReport {
     if let Some(obj) = gc_obj {
         let check_f32 = |want: f32, got: f32, name: &str, rpt: &mut ModelReport| {
             if (want - got).abs() > 1e-6 {
-                rpt.notes.push(format!(
-                    "{name} mismatch: expected={want} got={got}"
-                ));
+                rpt.notes
+                    .push(format!("{name} mismatch: expected={want} got={got}"));
                 false
             } else {
                 true
@@ -310,7 +307,11 @@ fn fmt_row(r: &ModelReport) -> String {
     } else {
         format!("MISS:{:?}", r.stop_missing)
     };
-    let sampling = if r.sampling_defaults_set { "OK" } else { "FAIL" };
+    let sampling = if r.sampling_defaults_set {
+        "OK"
+    } else {
+        "FAIL"
+    };
     format!(
         "{:50} | {:10} | {:18} | {:10} | {}",
         r.model_id, template, ids, stops, sampling
@@ -391,6 +392,10 @@ fn chat_template_audit() {
 
     if !failed.is_empty() {
         let names: Vec<&str> = failed.iter().map(|r| r.model_id.as_str()).collect();
-        panic!("chat_template_audit: {} models failing: {:?}", failed.len(), names);
+        panic!(
+            "chat_template_audit: {} models failing: {:?}",
+            failed.len(),
+            names
+        );
     }
 }

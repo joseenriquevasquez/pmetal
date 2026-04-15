@@ -70,7 +70,10 @@ impl EvalTab {
             FormField::new(
                 "Num Samples",
                 "0",
-                FieldKind::Integer { min: 0, max: 1_000_000 },
+                FieldKind::Integer {
+                    min: 0,
+                    max: 1_000_000,
+                },
                 "Data",
             ),
             FormField::new(
@@ -283,7 +286,9 @@ impl EvalTab {
             ]));
         }
 
-        Paragraph::new(lines).wrap(Wrap { trim: false }).render(inner, buf);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(inner, buf);
     }
 }
 
@@ -346,10 +351,7 @@ mod tests {
 
     #[test]
     fn parses_bracket_sample_progress() {
-        assert_eq!(
-            parse_sample_progress("[42/500] evaluated"),
-            Some((42, 500))
-        );
+        assert_eq!(parse_sample_progress("[42/500] evaluated"), Some((42, 500)));
     }
 
     #[test]
@@ -362,7 +364,9 @@ mod tests {
 
     #[test]
     fn parses_perplexity_equals() {
-        assert!((parse_metric("Final perplexity = 7.42", "perplexity").unwrap() - 7.42).abs() < 1e-3);
+        assert!(
+            (parse_metric("Final perplexity = 7.42", "perplexity").unwrap() - 7.42).abs() < 1e-3
+        );
     }
 
     #[test]

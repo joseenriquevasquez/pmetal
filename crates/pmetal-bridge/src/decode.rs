@@ -274,10 +274,7 @@ pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
 /// `presence_penalty`) handling lives in [`PenaltyBuffer::apply`] which
 /// must run BEFORE this call — penalties operate on raw logits, not
 /// log-probs, and depend on per-token counts the sampler does not track.
-pub fn sample_token_with_params(
-    logits_2d: &InlineArray,
-    params: &SamplingParams,
-) -> InlineArray {
+pub fn sample_token_with_params(logits_2d: &InlineArray, params: &SamplingParams) -> InlineArray {
     if params.temperature <= 0.0 {
         return logits_2d.argmax(-1);
     }

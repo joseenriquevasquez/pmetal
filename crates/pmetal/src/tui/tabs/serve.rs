@@ -61,7 +61,10 @@ impl ServeTab {
             FormField::new(
                 "Port",
                 "8080",
-                FieldKind::Integer { min: 1, max: 65_535 },
+                FieldKind::Integer {
+                    min: 1,
+                    max: 65_535,
+                },
                 "Network",
             ),
             FormField::new(
@@ -299,10 +302,7 @@ impl ServeTab {
                     Span::styled(format_duration(started_at.elapsed()), THEME.kv_value),
                 ]));
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "  [x] Stop",
-                    THEME.text_muted,
-                )));
+                lines.push(Line::from(Span::styled("  [x] Stop", THEME.text_muted)));
             }
             ServeStatus::Stopped { reason } => {
                 lines.push(status_line(StatusTone::Idle, "Stopped", Some(reason)));
@@ -312,7 +312,9 @@ impl ServeTab {
             }
         }
 
-        Paragraph::new(lines).wrap(Wrap { trim: false }).render(inner, buf);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(inner, buf);
     }
 }
 

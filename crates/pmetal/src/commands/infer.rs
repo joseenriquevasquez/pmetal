@@ -644,10 +644,8 @@ pub(crate) async fn run_inference(
             already_streamed = true;
             let tokenizer = &runner.tokenizer;
             let show_thinking = use_chat && !hide_thinking && !no_thinking;
-            let mut formatter = pmetal_data::stream_format::StreamFormatter::new(
-                tokenizer,
-                show_thinking,
-            );
+            let mut formatter =
+                pmetal_data::stream_format::StreamFormatter::new(tokenizer, show_thinking);
             runner.state.generate_streaming(|token_id| {
                 use std::io::Write;
                 let delta = formatter.push_token(tokenizer, token_id);

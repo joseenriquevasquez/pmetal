@@ -298,9 +298,11 @@ impl DFlashAttention {
             .with_mask_type(AttentionMaskType::None);
         let output = fused_sdpa(&queries, &keys, &values, &attn_config, None)?;
 
-        let output = output
-            .transpose_axes(&[0, 2, 1, 3])
-            .reshape(&[batch, query_len, self.n_heads * self.head_dim]);
+        let output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[
+            batch,
+            query_len,
+            self.n_heads * self.head_dim,
+        ]);
         Ok(self.o_proj.forward(&output))
     }
 }

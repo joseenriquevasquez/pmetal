@@ -346,10 +346,7 @@ impl GrpoTab {
         }
         if self.form.value("VLM Mode") == "Enabled" {
             args.push("--vlm".into());
-            args.extend([
-                "--max-image-size".into(),
-                self.form.value("Max Image Size"),
-            ]);
+            args.extend(["--max-image-size".into(), self.form.value("Max Image Size")]);
         }
 
         let rm_path = self.form.value("Reward Model");
@@ -359,10 +356,7 @@ impl GrpoTab {
                 "--reward-model-max-length".into(),
                 self.form.value("RM Max Length"),
             ]);
-            args.extend([
-                "--reward-model-weight".into(),
-                self.form.value("RM Weight"),
-            ]);
+            args.extend(["--reward-model-weight".into(), self.form.value("RM Weight")]);
             let rm_template = self.form.value("RM Template");
             if !rm_template.is_empty() {
                 args.extend(["--reward-model-template".into(), rm_template]);
@@ -388,7 +382,6 @@ impl GrpoTab {
 
         args
     }
-
 }
 
 impl GrpoTab {

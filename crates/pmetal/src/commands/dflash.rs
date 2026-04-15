@@ -156,9 +156,7 @@ pub async fn run_dflash(
                 if use_tree {
                     decoder
                         .generate_ddtree(&prompt_arr, &config, tree_budget)
-                        .map_err(|e| {
-                            anyhow::anyhow!("dflash generate_ddtree (native): {e}")
-                        })?
+                        .map_err(|e| anyhow::anyhow!("dflash generate_ddtree (native): {e}"))?
                 } else {
                     decoder
                         .generate(&prompt_arr, &config)
@@ -252,4 +250,3 @@ fn is_hf_like(s: &str) -> bool {
     // side of treating anything starting with `.` or `/` as a local path.
     !(s.starts_with('.') || s.starts_with('/')) && s.contains('/')
 }
-

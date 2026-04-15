@@ -1,7 +1,7 @@
 //! Tab definitions and implementations for the PMetal TUI.
 
-pub mod dashboard;
 mod bench;
+pub mod dashboard;
 mod datasets;
 mod device;
 mod distillation;

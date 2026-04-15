@@ -3386,9 +3386,7 @@ impl Qwen3NextModel {
             // layers do not need the capture and just reuse `forward`.
             hidden = if let Some(buf) = capture.as_deref_mut() {
                 if layer.is_linear {
-                    layer.forward_with_capture(
-                        &hidden, layer_mask, kv, mamba, layer_idx, buf,
-                    )?
+                    layer.forward_with_capture(&hidden, layer_mask, kv, mamba, layer_idx, buf)?
                 } else {
                     layer.forward(&hidden, layer_mask, kv, mamba)?
                 }

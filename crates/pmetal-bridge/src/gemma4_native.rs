@@ -184,12 +184,16 @@ impl Gemma4Config {
 
     fn validate_supported(&self) -> Result<(), String> {
         if self.hidden_size_per_layer_input.unwrap_or(0) != 0 {
-            return Err("Gemma 4 native: per-layer-input gating (2B/4B models) is not ported yet"
-                .to_string());
+            return Err(
+                "Gemma 4 native: per-layer-input gating (2B/4B models) is not ported yet"
+                    .to_string(),
+            );
         }
         if self.num_kv_shared_layers.unwrap_or(0) != 0 {
-            return Err("Gemma 4 native: KV sharing (num_kv_shared_layers != 0) is not ported yet"
-                .to_string());
+            return Err(
+                "Gemma 4 native: KV sharing (num_kv_shared_layers != 0) is not ported yet"
+                    .to_string(),
+            );
         }
         if self.enable_moe_block.unwrap_or(false) {
             return Err("Gemma 4 native: MoE block is not ported yet".to_string());
@@ -428,9 +432,7 @@ pub fn load_model(
         .collect();
     shard_files.sort();
     if shard_files.is_empty() {
-        return Err(format!(
-            "no .safetensors shards found in {model_path_str}"
-        ));
+        return Err(format!("no .safetensors shards found in {model_path_str}"));
     }
 
     // Collect every `(key, array)` pair across shards. Stripping the
@@ -498,8 +500,7 @@ pub fn load_model(
         let input_norm_w = take(&mut raw, &format!("{p}.input_layernorm.weight"))?;
         let post_attn_norm_w = take(&mut raw, &format!("{p}.post_attention_layernorm.weight"))?;
         let pre_ffn_norm_w = take(&mut raw, &format!("{p}.pre_feedforward_layernorm.weight"))?;
-        let post_ffn_norm_w =
-            take(&mut raw, &format!("{p}.post_feedforward_layernorm.weight"))?;
+        let post_ffn_norm_w = take(&mut raw, &format!("{p}.post_feedforward_layernorm.weight"))?;
         let q_norm_w = take(&mut raw, &format!("{p}.self_attn.q_norm.weight"))?;
         let k_norm_w = take(&mut raw, &format!("{p}.self_attn.k_norm.weight"))?;
 
@@ -608,7 +609,9 @@ fn ensure_cache_capacity(
     let shape = [1, n_kv, alloc, head_dim];
     let new_k = InlineArray::zeros(&shape, dtype.as_i32());
     let new_v = InlineArray::zeros(&shape, dtype.as_i32());
-    if let (Some(existing_k), Some(existing_v)) = (layer_cache.keys.take(), layer_cache.values.take()) {
+    if let (Some(existing_k), Some(existing_v)) =
+        (layer_cache.keys.take(), layer_cache.values.take())
+    {
         layer_cache.keys = Some(existing_k.kv_cache_append(&new_k, 2));
         layer_cache.values = Some(existing_v.kv_cache_append(&new_v, 2));
     } else {
@@ -761,10 +764,7 @@ pub fn forward_step(
     if profile {
         let _ = hidden.eval();
         let t_layers_end = std::time::Instant::now();
-        let layers_elapsed = t_layers_end
-            .duration_since(t_embed.unwrap())
-            .as_secs_f64()
-            * 1000.0;
+        let layers_elapsed = t_layers_end.duration_since(t_embed.unwrap()).as_secs_f64() * 1000.0;
         let embed_elapsed = t_embed
             .unwrap()
             .duration_since(t_start.unwrap())

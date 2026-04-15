@@ -790,7 +790,14 @@ pub fn gated_delta_state_advance(
     // Dk <= 256. These match every Qwen3.5 GDN layer today.
     let dk = k.dim(3) as usize;
     if g.ndim() == 3 && dk > 0 && dk % 32 == 0 && dk <= 256 {
-        return Ok(Array::gdn_metal_state_update(k, v, g, beta, initial_state, t));
+        return Ok(Array::gdn_metal_state_update(
+            k,
+            v,
+            g,
+            beta,
+            initial_state,
+            t,
+        ));
     }
     // Fallback: reuse the full ops-based recurrence and discard `y`. This
     // keeps GQA-expansion, vector gating, and the non-power-of-2 Dk edge

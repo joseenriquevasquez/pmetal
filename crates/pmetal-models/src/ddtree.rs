@@ -218,8 +218,8 @@ pub fn build_tree(draft_logits: &Array, budget: usize) -> TreeBuildResult {
         if rank + 1 < k {
             let mut sibling_ranks = entry.ranks.clone();
             *sibling_ranks.last_mut().unwrap() = (rank + 1) as i16;
-            let sibling_logw = entry.logw - top_logp[depth - 1][rank]
-                + top_logp[depth - 1][rank + 1];
+            let sibling_logw =
+                entry.logw - top_logp[depth - 1][rank] + top_logp[depth - 1][rank + 1];
             heap.push(HeapEntry {
                 neg_logw: -sibling_logw,
                 order: order_counter,
@@ -326,8 +326,7 @@ pub fn compile_tree(
     for &d in &tree.node_depths {
         pos_vec.push(start + d);
     }
-    let verify_position_ids =
-        Array::from_i32_slice_shaped(&pos_vec, &[1, current_length as i32]);
+    let verify_position_ids = Array::from_i32_slice_shaped(&pos_vec, &[1, current_length as i32]);
 
     // ── attention mask: [1, 1, N, past + N], 0 where visible, -inf else ──
     // Allocate as f32 (fast to fill), then cast to target dtype at the
@@ -344,10 +343,7 @@ pub fn compile_tree(
             }
         }
     }
-    let mask_f32 = Array::from_slice(
-        &mask_vec,
-        &[1, 1, current_length as i32, total_k as i32],
-    );
+    let mask_f32 = Array::from_slice(&mask_vec, &[1, 1, current_length as i32, total_k as i32]);
     let attention_mask = mask_f32.as_dtype(mask_dtype);
 
     CompiledTree {
@@ -432,10 +428,7 @@ mod tests {
         // top-1 = token 1, logit 20) has cumulative logw > any depth-1
         // sibling. So budget=2 should give node_0=depth1-rank0 and
         // node_1=depth2-rank0 under node_0.
-        let logits = make_logits(&[
-            &[10.0, -100.0, -100.0],
-            &[-100.0, 20.0, -100.0],
-        ]);
+        let logits = make_logits(&[&[10.0, -100.0, -100.0], &[-100.0, 20.0, -100.0]]);
         let tree = build_tree(&logits, 2);
         assert_eq!(tree.node_token_ids, vec![0, 1]);
         assert_eq!(tree.node_depths, vec![1, 2]);

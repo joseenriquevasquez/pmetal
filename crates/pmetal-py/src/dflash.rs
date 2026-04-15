@@ -190,6 +190,9 @@ fn metrics_to_py<'py>(
         output.metrics.avg_acceptance_length(),
     )?;
     dict.set_item("acceptance_rate", output.metrics.acceptance_rate())?;
-    dict.set_item("acceptance_lengths", output.metrics.acceptance_lengths.clone())?;
+    dict.set_item(
+        "acceptance_lengths",
+        output.metrics.acceptance_lengths.clone(),
+    )?;
     Ok(dict)
 }

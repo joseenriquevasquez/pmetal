@@ -142,12 +142,8 @@ pub fn dflash_train_step(
     let mut kv_cache = target.make_kv_cache(seq);
     let target_layer_ids: Vec<usize> = draft.config.target_layer_ids();
     let mut capture = SpecCapture::with_layers(target_layer_ids.clone());
-    let _target_logits = target.forward_with_capture(
-        &masked_ids,
-        None,
-        Some(&mut kv_cache),
-        &mut capture,
-    )?;
+    let _target_logits =
+        target.forward_with_capture(&masked_ids, None, Some(&mut kv_cache), &mut capture)?;
 
     // Slice the captured `[B, T, L*hidden]` tensor to the block span —
     // the draft only conditions on the positions it is predicting.
@@ -155,10 +151,8 @@ pub fn dflash_train_step(
     let block_start_i32 = cfg.block_start as i32;
     let block_end_i32 = suffix_start;
     let last_dim = target_hidden_full.dim(2);
-    let target_hidden_block = target_hidden_full.slice(
-        &[0, block_start_i32, 0],
-        &[batch, block_end_i32, last_dim],
-    );
+    let target_hidden_block =
+        target_hidden_full.slice(&[0, block_start_i32, 0], &[batch, block_end_i32, last_dim]);
 
     // Draft forward: the mask-token embeddings go through the target's
     // embedding table (identical to inference), and the draft predicts
@@ -186,19 +180,13 @@ pub fn dflash_train_step(
     let draft_logits = target.lm_head_project(&pred_hidden)?;
 
     // Labels are `input_ids[:, block_start+1 .. block_start+block_size]`.
-    let labels = input_ids.slice(
-        &[0, block_start_i32 + 1],
-        &[batch, block_end_i32],
-    );
+    let labels = input_ids.slice(&[0, block_start_i32 + 1], &[batch, block_end_i32]);
 
     // Cross entropy: -sum(labels * log_softmax(logits)) / (B * (block_size-1)).
     // We materialize `log_softmax` via logsumexp for numerical stability.
     let loss = masked_cross_entropy(&draft_logits, &labels)?;
 
-    Ok(DFlashTrainStepOutput {
-        loss,
-        draft_logits,
-    })
+    Ok(DFlashTrainStepOutput { loss, draft_logits })
 }
 
 /// Token-level masked cross-entropy matching what pmetal's other trainers

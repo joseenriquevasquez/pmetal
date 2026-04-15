@@ -47,14 +47,19 @@ impl MergeTab {
 
     fn default_fields() -> Vec<FormField> {
         vec![
-            FormField::new("Model A", "(not selected)", FieldKind::ModelPicker, "Sources"),
-            FormField::new("Model B", "(not selected)", FieldKind::ModelPicker, "Sources"),
             FormField::new(
-                "Base Model",
-                "",
+                "Model A",
+                "(not selected)",
                 FieldKind::ModelPicker,
                 "Sources",
             ),
+            FormField::new(
+                "Model B",
+                "(not selected)",
+                FieldKind::ModelPicker,
+                "Sources",
+            ),
+            FormField::new("Base Model", "", FieldKind::ModelPicker, "Sources"),
             FormField::new(
                 "Method",
                 "slerp",
@@ -103,20 +108,11 @@ impl MergeTab {
                 "Output Dtype",
                 "bfloat16",
                 FieldKind::Enum {
-                    options: vec![
-                        "bfloat16".into(),
-                        "float16".into(),
-                        "float32".into(),
-                    ],
+                    options: vec!["bfloat16".into(), "float16".into(), "float32".into()],
                 },
                 "Output",
             ),
-            FormField::new(
-                "Output Dir",
-                "./output/merged",
-                FieldKind::Text,
-                "Output",
-            ),
+            FormField::new("Output Dir", "./output/merged", FieldKind::Text, "Output"),
         ]
     }
 
@@ -125,8 +121,10 @@ impl MergeTab {
     fn field_visible(method: &str, f: &FormField) -> bool {
         let uses_t = matches!(method, "slerp");
         let uses_weights = matches!(method, "linear" | "ties" | "dare_linear" | "dare_ties");
-        let uses_density =
-            matches!(method, "ties" | "dare_ties" | "dare_linear" | "della" | "breadcrumbs");
+        let uses_density = matches!(
+            method,
+            "ties" | "dare_ties" | "dare_linear" | "della" | "breadcrumbs"
+        );
         let uses_base = matches!(
             method,
             "ties" | "dare_ties" | "dare_linear" | "task_arithmetic" | "della"
@@ -284,7 +282,10 @@ impl MergeTab {
         if method == "slerp" {
             args.extend(["--t".into(), self.form.value("Interpolation t")]);
         }
-        if matches!(method.as_str(), "linear" | "ties" | "dare_linear" | "dare_ties") {
+        if matches!(
+            method.as_str(),
+            "linear" | "ties" | "dare_linear" | "dare_ties"
+        ) {
             args.extend(["--weight-a".into(), self.form.value("Weight A")]);
             args.extend(["--weight-b".into(), self.form.value("Weight B")]);
         }
@@ -308,12 +309,10 @@ impl MergeTab {
                 .areas(area);
 
         let method = self.method_snapshot();
-        self.form.render_list(
-            config_area,
-            buf,
-            "Merge Configuration",
-            move |f| Self::field_visible(&method, f),
-        );
+        self.form
+            .render_list(config_area, buf, "Merge Configuration", move |f| {
+                Self::field_visible(&method, f)
+            });
 
         let [status_area, log_area] =
             Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).areas(right_area);
@@ -355,6 +354,8 @@ impl MergeTab {
             }
         }
 
-        Paragraph::new(lines).wrap(Wrap { trim: false }).render(inner, buf);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(inner, buf);
     }
 }

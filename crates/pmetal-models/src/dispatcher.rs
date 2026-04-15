@@ -181,10 +181,7 @@ impl ModelArchitecture {
             if lower.contains("granite") {
                 return Some(Self::Granite);
             }
-            if lower.contains("gptoss")
-                || lower.contains("gpt_oss")
-                || lower.contains("gpt-oss")
-            {
+            if lower.contains("gptoss") || lower.contains("gpt_oss") || lower.contains("gpt-oss") {
                 return Some(Self::GptOss);
             }
             if lower.contains("gemma4") {
@@ -475,8 +472,8 @@ impl DynamicModel {
                 } else {
                     config_content.clone()
                 };
-                let mut config: GemmaConfig = json5::from_str(&effective)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let mut config: GemmaConfig =
+                    json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
                 // Set the Gemma3 flag based on model_type to enable the
                 // correct sliding window pattern (every 6th layer global,
                 // rest local). Gemma 4 inherits the same interleave.
@@ -701,8 +698,7 @@ impl DynamicModel {
                 };
                 let config: crate::architectures::gemma4::Gemma4Config =
                     json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model =
-                    crate::architectures::gemma4::Gemma4ForCausalLM::new(config)?;
+                let mut model = crate::architectures::gemma4::Gemma4ForCausalLM::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 let report =

@@ -720,8 +720,7 @@ impl App {
                             self.modal_stack.push(Modal::model_picker(entries));
                         }
                         FormAction::OpenDatasetPicker { .. } => {
-                            self.pending_modal_context =
-                                Some(PendingModalTarget::DistillDataset);
+                            self.pending_modal_context = Some(PendingModalTarget::DistillDataset);
                             let entries = self.dataset_picker_entries();
                             self.modal_stack.push(Modal::dataset_picker(entries));
                         }
@@ -2054,8 +2053,7 @@ impl App {
         }
         let summary = self.eval.config_summary();
         self.pending_modal_context = Some(PendingModalTarget::EvalStart);
-        self.modal_stack
-            .push(Modal::confirm("Run Eval?", summary));
+        self.modal_stack.push(Modal::confirm("Run Eval?", summary));
     }
 
     fn start_eval(&mut self) {
@@ -2338,9 +2336,7 @@ impl App {
         }
         // Backend selection. Auto is the CLI default, so we only emit the
         // flag when the user has pinned a specific path.
-        if self.inference.backend
-            != pmetal_data::inference_config::InferenceBackend::Auto
-        {
+        if self.inference.backend != pmetal_data::inference_config::InferenceBackend::Auto {
             args.extend([
                 "--backend".to_string(),
                 self.inference.backend.as_str().to_string(),

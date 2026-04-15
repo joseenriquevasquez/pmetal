@@ -124,9 +124,7 @@ impl FormTabState {
         if field.is_picker() {
             let label = field.label.clone();
             return match field.kind {
-                FieldKind::ModelPicker => {
-                    Some(FormAction::OpenModelPicker { field_label: label })
-                }
+                FieldKind::ModelPicker => Some(FormAction::OpenModelPicker { field_label: label }),
                 FieldKind::DatasetPicker => {
                     Some(FormAction::OpenDatasetPicker { field_label: label })
                 }

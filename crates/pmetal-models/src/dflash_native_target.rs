@@ -58,7 +58,9 @@ impl NativeQwen3Target {
         let num_kv_heads = config
             .num_key_value_heads
             .unwrap_or(config.num_attention_heads);
-        let head_dim = config.head_dim.unwrap_or(config.hidden_size / config.num_attention_heads);
+        let head_dim = config
+            .head_dim
+            .unwrap_or(config.hidden_size / config.num_attention_heads);
         Ok(Self {
             weights,
             cache,
@@ -148,7 +150,10 @@ impl DFlashTarget for NativeQwen3Target {
                     let l2: f32 = data.iter().map(|x| x * x).sum::<f32>().sqrt();
                     eprintln!(
                         "[pmetal tap] layer_{idx:02} pos={pos:02} [:4]={:?} ||.||={:.4}",
-                        first4.iter().map(|x| (x * 10000.0).round() / 10000.0).collect::<Vec<_>>(),
+                        first4
+                            .iter()
+                            .map(|x| (x * 10000.0).round() / 10000.0)
+                            .collect::<Vec<_>>(),
                         l2
                     );
                 }

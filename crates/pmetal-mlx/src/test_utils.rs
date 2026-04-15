@@ -98,11 +98,7 @@ pub fn argmax_last_axis(arr: &Array) -> Vec<i32> {
     let argmax = ops::argmax_axis(arr, -1);
     let evaled = argmax.clone();
     let _ = evaled.eval();
-    evaled
-        .as_slice::<u32>()
-        .iter()
-        .map(|&u| u as i32)
-        .collect()
+    evaled.as_slice::<u32>().iter().map(|&u| u as i32).collect()
 }
 
 /// Counts the positions where the argmax along the last axis matches.
@@ -218,15 +214,12 @@ pub struct ParityReport {
 
 impl ParityReport {
     /// Compute a parity report for a single (rust, reference) pair.
-    pub fn compute(
-        name: &str,
-        rust: &Array,
-        reference: &Array,
-        tol: Tolerance,
-    ) -> Self {
+    pub fn compute(name: &str, rust: &Array, reference: &Array, tol: Tolerance) -> Self {
         let shape_rust = rust.shape().to_vec();
         let shape_ref = reference.shape().to_vec();
-        let n_compared = to_f32_vec_eval(rust).len().min(to_f32_vec_eval(reference).len());
+        let n_compared = to_f32_vec_eval(rust)
+            .len()
+            .min(to_f32_vec_eval(reference).len());
         Self {
             name: name.to_string(),
             shape_rust,

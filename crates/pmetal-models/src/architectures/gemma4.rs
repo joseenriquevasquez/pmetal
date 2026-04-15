@@ -55,9 +55,7 @@ use pmetal_bridge::compat::{
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
-use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope,
-};
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 
 /// Apply Gemma 4 partial rotary embedding to a `[B, H, L, head_dim]` tensor.
@@ -190,11 +188,7 @@ fn apply_gemma4_partial_rope(
 /// frequency means `angle = pos * inf = inf`, which mlx's kernel special-
 /// cases to the identity rotation (cos=1, sin=0) — leaving those
 /// dimensions untouched.
-fn build_gemma4_partial_rope_freqs(
-    head_dim: i32,
-    rotated_dims: i32,
-    base: f32,
-) -> Option<Array> {
+fn build_gemma4_partial_rope_freqs(head_dim: i32, rotated_dims: i32, base: f32) -> Option<Array> {
     if rotated_dims == 0 || rotated_dims == head_dim {
         return None;
     }
@@ -402,9 +396,7 @@ impl Gemma4Config {
             ));
         }
         if self.enable_moe_block.unwrap_or(false) {
-            return Err(Exception::custom(
-                "Gemma 4 MoE block is not ported yet.",
-            ));
+            return Err(Exception::custom("Gemma 4 MoE block is not ported yet."));
         }
         if self.use_double_wide_mlp.unwrap_or(false) {
             return Err(Exception::custom(
@@ -448,7 +440,6 @@ impl Gemma4RmsNorm {
 fn rms_norm_noscale(x: &Array, eps: f32) -> Array {
     pmetal_bridge::compat::fast::rms_norm_opt(x, None, eps)
 }
-
 
 // ----------------------------------------------------------------------------
 // MLP
@@ -679,9 +670,10 @@ impl Gemma4Attention {
             .with_mask_type(mask_type);
         let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
 
-        let output = output
-            .transpose_axes(&[0, 2, 1, 3])
-            .reshape(&[b, l, self.n_heads * self.head_dim]);
+        let output =
+            output
+                .transpose_axes(&[0, 2, 1, 3])
+                .reshape(&[b, l, self.n_heads * self.head_dim]);
         Ok(self.o_proj.forward(&output))
     }
 }

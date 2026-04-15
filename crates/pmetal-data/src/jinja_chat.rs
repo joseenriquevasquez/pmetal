@@ -124,24 +124,18 @@ pub fn render_chat_template(
     // HF templates call `raise_exception(...)` to signal invalid input.
     // minijinja's built-in `raise_exception` isn't available, so install a
     // tiny shim that turns it into a template error.
-    env.add_function(
-        "raise_exception",
-        |msg: String| -> Result<String, Error> {
-            Err(Error::new(ErrorKind::InvalidOperation, msg))
-        },
-    );
+    env.add_function("raise_exception", |msg: String| -> Result<String, Error> {
+        Err(Error::new(ErrorKind::InvalidOperation, msg))
+    });
 
     // Some templates call `strftime_now(fmt)` without any date argument.
     // minijinja-contrib exposes it as `now().strftime(fmt)`, so add the
     // upstream-HF shim that matches `transformers`' default handler.
-    env.add_function(
-        "strftime_now",
-        |fmt: String| -> Result<String, Error> {
-            let now = chrono_now_strftime(&fmt)
-                .map_err(|e| Error::new(ErrorKind::InvalidOperation, e))?;
-            Ok(now)
-        },
-    );
+    env.add_function("strftime_now", |fmt: String| -> Result<String, Error> {
+        let now =
+            chrono_now_strftime(&fmt).map_err(|e| Error::new(ErrorKind::InvalidOperation, e))?;
+        Ok(now)
+    });
 
     // Register the template under a stable name. minijinja requires the
     // source to live for the lifetime of the environment, so clone it.

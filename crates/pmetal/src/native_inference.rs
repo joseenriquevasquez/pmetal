@@ -395,13 +395,7 @@ pub fn run_native_inference_ext(
             quant_config,
             &mut on_token,
         ),
-        NativeArch::Gemma4 => run_gemma4(
-            model_path,
-            input_ids,
-            max_tokens,
-            params,
-            &mut on_token,
-        ),
+        NativeArch::Gemma4 => run_gemma4(model_path, input_ids, max_tokens, params, &mut on_token),
     }
 }
 
@@ -658,7 +652,9 @@ fn run_gemma4(
         |weights, config| gemma4_native::build_cache(weights, config),
         gemma4_native::prefill_first_token,
         |weights, config, cache, first_tok, remaining, params, on_token| {
-            gemma4_native::generate(weights, config, cache, first_tok, remaining, params, on_token)
+            gemma4_native::generate(
+                weights, config, cache, first_tok, remaining, params, on_token,
+            )
         },
     )
 }

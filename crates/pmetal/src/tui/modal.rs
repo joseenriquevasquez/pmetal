@@ -388,10 +388,9 @@ impl Modal {
             },
 
             Modal::Help { .. } => match key.code {
-                KeyCode::Esc
-                | KeyCode::Enter
-                | KeyCode::Char('q')
-                | KeyCode::Char('?') => Some(ModalAction::None),
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
+                    Some(ModalAction::None)
+                }
                 _ => None,
             },
         }

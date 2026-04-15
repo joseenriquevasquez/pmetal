@@ -1497,7 +1497,11 @@ fn test_gdn_rollback_matches_never_went_there() {
 
     // Simulate verify advancing through all K tokens
     let post_verify = crate::kernels::gated_delta_state_advance(
-        &initial_state, &k_full, &v_full, &g_full, &beta_full,
+        &initial_state,
+        &k_full,
+        &v_full,
+        &g_full,
+        &beta_full,
     )
     .unwrap();
     entry.ssm_state = Some(post_verify);
@@ -1512,7 +1516,9 @@ fn test_gdn_rollback_matches_never_went_there() {
         conv_kernel_size: 1, // no conv rewind path (we're testing SSM only)
     };
 
-    entry.rewind(&snapshot, Some(&verify_inputs), accepted).unwrap();
+    entry
+        .rewind(&snapshot, Some(&verify_inputs), accepted)
+        .unwrap();
 
     let rolled_back = entry.ssm_state.as_ref().unwrap();
     let diff = max_abs_diff(rolled_back, &expected_state);
@@ -1549,5 +1555,8 @@ fn test_gdn_rollback_zero_accepted_equals_snapshot() {
     entry.rewind(&snapshot, Some(&inputs), 0).unwrap();
 
     let diff = max_abs_diff(entry.ssm_state.as_ref().unwrap(), &state);
-    assert!(diff < 1e-6, "zero-accepted rewind must be verbatim snapshot");
+    assert!(
+        diff < 1e-6,
+        "zero-accepted rewind must be verbatim snapshot"
+    );
 }

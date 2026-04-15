@@ -104,7 +104,10 @@ impl BenchTab {
             FormField::new(
                 "Max Prompt Tokens",
                 "0",
-                FieldKind::Integer { min: 0, max: 16_384 },
+                FieldKind::Integer {
+                    min: 0,
+                    max: 16_384,
+                },
                 "Workload",
             ),
             FormField::new(
@@ -266,10 +269,7 @@ impl BenchTab {
                 "--inference-context".into(),
                 self.form.value("Inference Context"),
             ]);
-            args.extend([
-                "--prompt-samples".into(),
-                self.form.value("Prompt Samples"),
-            ]);
+            args.extend(["--prompt-samples".into(), self.form.value("Prompt Samples")]);
             args.extend([
                 "--max-prompt-tokens".into(),
                 self.form.value("Max Prompt Tokens"),
@@ -350,12 +350,10 @@ impl BenchTab {
                 .areas(area);
 
         let mode = self.form.value("Mode");
-        self.form.render_list(
-            config_area,
-            buf,
-            "Bench Configuration",
-            move |f| section_visible(&mode, &f.section),
-        );
+        self.form
+            .render_list(config_area, buf, "Bench Configuration", move |f| {
+                section_visible(&mode, &f.section)
+            });
 
         let [trials_area, log_area] =
             Layout::vertical([Constraint::Min(10), Constraint::Length(10)]).areas(right_area);
@@ -430,9 +428,7 @@ impl BenchTab {
         let [table_area, summary_area] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(rest);
 
-        let table = Table::new(rows, widths)
-            .header(header)
-            .column_spacing(2);
+        let table = Table::new(rows, widths).header(header).column_spacing(2);
         Widget::render(table, table_area, buf);
 
         if let (Some(pp), Some(gg)) = (self.avg_prompt_tps(), self.avg_generation_tps()) {
@@ -491,10 +487,9 @@ mod tests {
 
     #[test]
     fn parses_trial_line() {
-        let t = parse_trial_line(
-            "Trial 3:  prompt_tps=512.4, generation_tps=102.1, peak_memory=9.23",
-        )
-        .unwrap();
+        let t =
+            parse_trial_line("Trial 3:  prompt_tps=512.4, generation_tps=102.1, peak_memory=9.23")
+                .unwrap();
         assert_eq!(t.index, 3);
         assert!((t.prompt_tps - 512.4).abs() < 1e-3);
         assert!((t.generation_tps - 102.1).abs() < 1e-3);

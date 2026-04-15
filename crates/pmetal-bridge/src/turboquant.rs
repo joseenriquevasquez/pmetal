@@ -726,10 +726,7 @@ impl TurboQuantCore {
     /// wasn't built at construction (falls back to separate paths in
     /// the caller), or if the FWHT fast path is enabled (that path
     /// stays unchanged).
-    fn rotate_and_project_array(
-        &self,
-        input: &InlineArray,
-    ) -> Option<(InlineArray, InlineArray)> {
+    fn rotate_and_project_array(&self, input: &InlineArray) -> Option<(InlineArray, InlineArray)> {
         if turboquant_wht_enabled() && self.dim == 256 {
             return None;
         }

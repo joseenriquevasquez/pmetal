@@ -104,7 +104,9 @@ impl SpecCapture {
 
     /// Returns true if `layer_idx` is one of the requested hidden-state taps.
     pub fn wants_hidden_for(&self, layer_idx: usize) -> bool {
-        self.requested_hidden_layers.binary_search(&layer_idx).is_ok()
+        self.requested_hidden_layers
+            .binary_search(&layer_idx)
+            .is_ok()
     }
 
     /// Returns true if the caller wants the post-embedding tap populated.

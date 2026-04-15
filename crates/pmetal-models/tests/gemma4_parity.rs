@@ -23,9 +23,7 @@ use pmetal_mlx::test_utils::{
     ParityReport, Tolerance, argmax_last_axis, print_report_table, to_f32_vec_eval,
 };
 
-use pmetal_models::architectures::gemma4::{
-    Gemma4Config, Gemma4ForCausalLM, load_gemma4_weights,
-};
+use pmetal_models::architectures::gemma4::{Gemma4Config, Gemma4ForCausalLM, load_gemma4_weights};
 
 /// Load a safetensors file into a `HashMap<String, Array>` using the same
 /// bridge loader the production weight-loading path uses.
@@ -130,12 +128,11 @@ fn fixture_path(name: &str) -> PathBuf {
 /// Build the Rust Gemma4 model from the synthetic config + synthetic weight
 /// fixture and return it ready for forward passes.
 fn build_synthetic_model() -> Gemma4ForCausalLM {
-    let config: Gemma4Config = json5::from_str(synthetic_config_json())
-        .expect("synthetic config parses");
+    let config: Gemma4Config =
+        json5::from_str(synthetic_config_json()).expect("synthetic config parses");
     let mut model = Gemma4ForCausalLM::new(config).expect("synthetic model builds");
     let weights = load_shard(&fixture_path("gemma4_synth_weights.safetensors"));
-    let report = load_gemma4_weights(&mut model, &weights)
-        .expect("synthetic weight loader runs");
+    let report = load_gemma4_weights(&mut model, &weights).expect("synthetic weight loader runs");
     assert!(
         report.loaded > 0,
         "synthetic weight loader loaded 0 tensors (skipped={:?})",
@@ -340,9 +337,7 @@ fn gemma4_31b_parity() {
         }
     };
     if !ref_path.exists() {
-        panic!(
-            "PMETAL_GEMMA4_REFERENCE points at {ref_path:?} but the file does not exist"
-        );
+        panic!("PMETAL_GEMMA4_REFERENCE points at {ref_path:?} but the file does not exist");
     }
     let meta_path = {
         let mut p = ref_path.clone();
@@ -479,4 +474,3 @@ fn gemma4_31b_parity() {
          (rust={argmax_rust:?}, ref={argmax_ref:?})"
     );
 }
-

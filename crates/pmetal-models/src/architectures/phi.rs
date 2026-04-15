@@ -789,9 +789,9 @@ impl PhiForCausalLM {
         cache: Option<&mut KVCache>,
         capture: &mut pmetal_mlx::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
-        let hidden =
-            self.model
-                .forward_with_capture(input_ids, mask, cache, Some(capture))?;
+        let hidden = self
+            .model
+            .forward_with_capture(input_ids, mask, cache, Some(capture))?;
         Ok(self.lm_head.forward(&hidden))
     }
 

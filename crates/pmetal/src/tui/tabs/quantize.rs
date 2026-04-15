@@ -378,12 +378,10 @@ impl QuantizeTab {
                 .areas(area);
 
         let (is_mlx, kl_on) = self.vis_snapshot();
-        self.form.render_list(
-            config_area,
-            buf,
-            "Quantize Configuration",
-            move |f| Self::field_visible(is_mlx, kl_on, f),
-        );
+        self.form
+            .render_list(config_area, buf, "Quantize Configuration", move |f| {
+                Self::field_visible(is_mlx, kl_on, f)
+            });
 
         let [status_area, log_area] =
             Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).areas(right_area);
@@ -449,7 +447,9 @@ impl QuantizeTab {
             }
         }
 
-        Paragraph::new(lines).wrap(Wrap { trim: false }).render(inner, buf);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(inner, buf);
     }
 }
 
@@ -464,7 +464,9 @@ fn parse_tensor_progress(line: &str) -> Option<(usize, usize)> {
     for (i, ch) in line.char_indices() {
         if ch.is_ascii_digit() {
             let tail = &line[i..];
-            let end = tail.find(|c: char| c == ' ' || c == ',').unwrap_or(tail.len());
+            let end = tail
+                .find(|c: char| c == ' ' || c == ',')
+                .unwrap_or(tail.len());
             let slice = &tail[..end];
             if let Some((a, b)) = slice.split_once('/') {
                 if let (Ok(done), Ok(total)) = (a.parse::<usize>(), b.parse::<usize>()) {
@@ -510,12 +512,18 @@ mod tests {
 
     #[test]
     fn parses_bracket_progress() {
-        assert_eq!(parse_tensor_progress("[42/287] blk.3.attn_q.weight"), Some((42, 287)));
+        assert_eq!(
+            parse_tensor_progress("[42/287] blk.3.attn_q.weight"),
+            Some((42, 287))
+        );
     }
 
     #[test]
     fn parses_narrative_progress() {
-        assert_eq!(parse_tensor_progress("Quantized 10/20 tensors so far"), Some((10, 20)));
+        assert_eq!(
+            parse_tensor_progress("Quantized 10/20 tensors so far"),
+            Some((10, 20))
+        );
     }
 
     #[test]

@@ -1103,7 +1103,8 @@ mod tests {
             .unwrap();
 
         // Request hidden states for layer 0 and the final layer
-        let mut capture = pmetal_mlx::speculative::SpecCapture::with_layers(vec![0, num_layers - 1]);
+        let mut capture =
+            pmetal_mlx::speculative::SpecCapture::with_layers(vec![0, num_layers - 1]);
         let captured_logits = model_capture
             .forward_with_capture(&input_ids, None, None, &mut capture)
             .unwrap();

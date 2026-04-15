@@ -10,9 +10,7 @@ use std::path::PathBuf;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Gauge, Paragraph, Sparkline, Widget, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Sparkline, Widget, Wrap};
 
 use crate::tui::tabs::dashboard::MetricSample;
 use crate::tui::tabs::model_short_name;

@@ -185,8 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|s| s.shape().to_vec());
         println!("[smoke]   pre-rewind layer-0 ssm shape: {:?}", pre_rewind);
 
-        mamba_mut
-            .rewind_from_snapshots(&snaps, &per_layer, (seq_len / 2) as usize)?;
+        mamba_mut.rewind_from_snapshots(&snaps, &per_layer, (seq_len / 2) as usize)?;
 
         let post_rewind = mamba_mut
             .get(0)
@@ -198,10 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("layer-0 SSM state missing before/after rewind".into());
         }
         if pre_rewind != post_rewind {
-            return Err(format!(
-                "rewind changed shape: {pre_rewind:?} -> {post_rewind:?}"
-            )
-            .into());
+            return Err(format!("rewind changed shape: {pre_rewind:?} -> {post_rewind:?}").into());
         }
         println!("[smoke]   rollback shape-preserving: OK");
     }

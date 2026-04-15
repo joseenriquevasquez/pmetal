@@ -151,7 +151,11 @@ impl MambaCache {
             )));
         }
         for (idx, entry) in self.layers.iter_mut().enumerate() {
-            entry.rewind(&snapshots[idx], per_layer_inputs[idx].as_ref(), accepted_tokens)?;
+            entry.rewind(
+                &snapshots[idx],
+                per_layer_inputs[idx].as_ref(),
+                accepted_tokens,
+            )?;
         }
         Ok(())
     }

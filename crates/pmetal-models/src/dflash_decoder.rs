@@ -419,7 +419,8 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             let verifier_hidden_all = capture.stack_hidden()?;
 
             // Accept longest matching prefix + one bonus token.
-            let matched = longest_prefix_match(&block_tokens[1..], &verifier_tokens[..block_size - 1]);
+            let matched =
+                longest_prefix_match(&block_tokens[1..], &verifier_tokens[..block_size - 1]);
             let accepted_inputs = matched + 1;
             let bonus_token = verifier_tokens[matched];
 
@@ -668,15 +669,12 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             let noise_embedding = self.target.embed_tokens(&block_input)?;
             let draft_hidden = self.draft.forward(&noise_embedding, &target_hidden, None)?;
             // [1, draft_horizon, hidden] — slice away the root position.
-            let draft_suffix =
-                slice_axis_1(&draft_hidden, 1, (1 + draft_horizon) as i32);
+            let draft_suffix = slice_axis_1(&draft_hidden, 1, (1 + draft_horizon) as i32);
             // [1, draft_horizon, vocab]
             let draft_logits = self.target.lm_head_project(&draft_suffix)?;
             // [draft_horizon, vocab]
-            let draft_logits_2d = draft_logits.reshape(&[
-                draft_horizon as i32,
-                draft_logits.dim(2),
-            ]);
+            let draft_logits_2d =
+                draft_logits.reshape(&[draft_horizon as i32, draft_logits.dim(2)]);
 
             // ── Tree build + compile ────────────────────────────────
             let tree = crate::ddtree::build_tree(&draft_logits_2d, effective_budget);
@@ -749,18 +747,14 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             output_tokens.push(bonus_token);
 
             // ── Compact the cache to keep only accepted positions ──
-            self.target.compact_tree_cache(
-                past_length,
-                tree_length,
-                &accepted_indices,
-            );
+            self.target
+                .compact_tree_cache(past_length, tree_length, &accepted_indices);
             past_length += accepted_count;
 
             // ── Next round's target_hidden = selected rows ─────────
             // `verifier_hidden_all` is [1, tree_length, hidden*taps].
             // Gather the accepted rows via take_axis on the seq dim.
-            let accepted_i32: Vec<i32> =
-                accepted_indices.iter().map(|&i| i as i32).collect();
+            let accepted_i32: Vec<i32> = accepted_indices.iter().map(|&i| i as i32).collect();
             let idx_arr = Array::from_slice(&accepted_i32, &[accepted_count as i32]);
             target_hidden = verifier_hidden_all.take_axis(&idx_arr, 1);
 
@@ -1123,10 +1117,20 @@ impl DFlashTarget for DynamicModel {
     ) -> Result<Array, Exception> {
         match self {
             Self::Qwen3(m) => <Qwen3ForCausalLM as DFlashTarget>::forward_with_capture(
-                m, input_ids, mask, kv_cache, mamba_cache, capture,
+                m,
+                input_ids,
+                mask,
+                kv_cache,
+                mamba_cache,
+                capture,
             ),
             Self::Qwen3Next(m) => <Qwen3NextForCausalLM as DFlashTarget>::forward_with_capture(
-                m, input_ids, mask, kv_cache, mamba_cache, capture,
+                m,
+                input_ids,
+                mask,
+                kv_cache,
+                mamba_cache,
+                capture,
             ),
             Self::Llama(m) => {
                 // Pure attention — mamba_cache is unused.
@@ -1219,7 +1223,10 @@ impl DFlashTarget for DynamicModel {
             Self::Gemma4(m) => {
                 // Gemma 4 ties embeddings + applies final-logit softcap.
                 let logits = m.model.embed_tokens.as_linear(hidden);
-                Ok(apply_logit_softcap(&logits, m.config.final_logit_softcapping))
+                Ok(apply_logit_softcap(
+                    &logits,
+                    m.config.final_logit_softcapping,
+                ))
             }
             _ => Err(dflash_architecture_unsupported("lm_head_project")),
         }
@@ -1327,7 +1334,7 @@ impl DFlashTarget for Qwen3NextForCausalLM {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::architectures::dflash_draft::{DFlashDraftConfig, DFlashExtras, DFlashDraftModel};
+    use crate::architectures::dflash_draft::{DFlashDraftConfig, DFlashDraftModel, DFlashExtras};
     use crate::architectures::qwen3::Qwen3Config;
     use serial_test::serial;
 
@@ -1394,13 +1401,20 @@ mod tests {
         };
         let output = decoder.generate(&prompt, &config).unwrap();
 
-        assert_eq!(output.tokens.len(), 5 + 12, "should produce max_new_tokens after prompt");
+        assert_eq!(
+            output.tokens.len(),
+            5 + 12,
+            "should produce max_new_tokens after prompt"
+        );
         assert_eq!(output.metrics.num_generated, 12);
         assert!(
             output.metrics.acceptance_lengths.iter().all(|&a| a >= 1),
             "every speculative step must accept at least the bonus token"
         );
-        assert!(output.metrics.total_drafted >= 4, "at least one draft block");
+        assert!(
+            output.metrics.total_drafted >= 4,
+            "at least one draft block"
+        );
     }
 
     #[test]
