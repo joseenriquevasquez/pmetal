@@ -635,36 +635,40 @@ impl GptOssMoE {
     }
 
     fn current_signature(&self) -> Vec<usize> {
+        // Use `Array::id()` (MLX array_desc pointer) as a stable change-
+        // detection key. It is valid on unevaluated lazy arrays, unlike
+        // `data_ptr()` which segfaults when the buffer has not been
+        // materialised.
         let mut signature = Vec::with_capacity(self.experts.len() * 6);
         for expert in &self.experts {
-            signature.push(expert.gate_proj.weight.as_ref().data_ptr() as usize);
+            signature.push(expert.gate_proj.weight.as_ref().id());
             signature.push(
                 expert
                     .gate_proj
                     .bias
                     .as_ref()
                     .as_ref()
-                    .map(|bias| bias.data_ptr() as usize)
+                    .map(|bias| bias.id())
                     .unwrap_or(0),
             );
-            signature.push(expert.up_proj.weight.as_ref().data_ptr() as usize);
+            signature.push(expert.up_proj.weight.as_ref().id());
             signature.push(
                 expert
                     .up_proj
                     .bias
                     .as_ref()
                     .as_ref()
-                    .map(|bias| bias.data_ptr() as usize)
+                    .map(|bias| bias.id())
                     .unwrap_or(0),
             );
-            signature.push(expert.down_proj.weight.as_ref().data_ptr() as usize);
+            signature.push(expert.down_proj.weight.as_ref().id());
             signature.push(
                 expert
                     .down_proj
                     .bias
                     .as_ref()
                     .as_ref()
-                    .map(|bias| bias.data_ptr() as usize)
+                    .map(|bias| bias.id())
                     .unwrap_or(0),
             );
         }

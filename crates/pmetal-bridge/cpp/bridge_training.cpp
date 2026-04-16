@@ -260,6 +260,13 @@ int mlx_inline_data_ptr(const mlx_inline_array* a, const void** out_ptr) {
     return 0;
 }
 
+uintptr_t mlx_inline_array_id(const mlx_inline_array* a) {
+    // array::id() returns `uintptr_t(array_desc_.get())` — stable for the
+    // lifetime of the underlying ArrayDesc, valid on lazy (unevaluated)
+    // arrays. Used as a cheap identity for change-detection caches.
+    return as_arr(a).id();
+}
+
 void mlx_inline_stop_gradient(mlx_inline_array* dst, const mlx_inline_array* a) {
     new (dst->buf) array(mlx::core::stop_gradient(as_arr(a)));
 }

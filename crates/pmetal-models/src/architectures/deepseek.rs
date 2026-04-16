@@ -757,19 +757,15 @@ impl DeepSeekMoE {
     }
 
     fn current_stacked_weight_signature(&self) -> Vec<usize> {
-        // SAFETY: `data_ptr()` calls `array.data<void>()` which accesses
-        // `array_desc_->data->buffer`.  For lazy (unevaluated) arrays the
-        // `data` shared_ptr is null, causing a null-dereference.  Evaluate
-        // each weight first so that the buffer is materialised before we read
+        // Use `Array::id()` (MLX array_desc pointer) as the change-detection
+        // key. Unlike `data_ptr()`, it is safe on lazy (unevaluated) weights,
+        // so we do not have to materialise every expert tensor just to take
         // its address.
         let mut signature = Vec::with_capacity(self.moe.experts.len() * 3);
         for expert in &self.moe.experts {
-            expert.w1.weight.as_ref().eval();
-            expert.w3.weight.as_ref().eval();
-            expert.w2.weight.as_ref().eval();
-            signature.push(expert.w1.weight.as_ref().data_ptr() as usize);
-            signature.push(expert.w3.weight.as_ref().data_ptr() as usize);
-            signature.push(expert.w2.weight.as_ref().data_ptr() as usize);
+            signature.push(expert.w1.weight.as_ref().id());
+            signature.push(expert.w3.weight.as_ref().id());
+            signature.push(expert.w2.weight.as_ref().id());
         }
         signature
     }

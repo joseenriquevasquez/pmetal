@@ -1167,6 +1167,9 @@ void mlx_inline_mean_axes(mlx_inline_array* dst, const mlx_inline_array* a, cons
 size_t mlx_inline_size(const mlx_inline_array* a);
 size_t mlx_inline_nbytes(const mlx_inline_array* a);
 int mlx_inline_data_ptr(const mlx_inline_array* a, const void** out_ptr);
+// Stable identity for the underlying lazy array desc. Safe on unevaluated
+// arrays — returns `uintptr_t(array_desc_.get())` without materialization.
+uintptr_t mlx_inline_array_id(const mlx_inline_array* a);
 void mlx_inline_stop_gradient(mlx_inline_array* dst, const mlx_inline_array* a);
 
 // ── Triangular inverse (CPU stream for WY factorization) ──

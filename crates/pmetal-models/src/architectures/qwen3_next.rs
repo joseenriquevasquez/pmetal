@@ -1044,20 +1044,14 @@ impl Qwen3NextGatedDeltaNet {
     }
 
     fn current_input_proj_signature(&self) -> Vec<usize> {
-        // SAFETY: `data_ptr()` calls `array.data<void>()` which accesses
-        // `array_desc_->data->buffer`. For lazy (unevaluated) arrays the
-        // `data` shared_ptr is null, causing a null-dereference. Evaluate
-        // each weight first so that the buffer is materialised before we read
-        // its address.
-        self.in_proj_qkv.weight.as_ref().eval();
-        self.in_proj_z.weight.as_ref().eval();
-        self.in_proj_b.weight.as_ref().eval();
-        self.in_proj_a.weight.as_ref().eval();
+        // Use `Array::id()` — stable across the array's lifetime and safe on
+        // lazy (unevaluated) weights. `data_ptr()` would dereference a null
+        // buffer on an unmaterialised array.
         vec![
-            self.in_proj_qkv.weight.as_ref().data_ptr() as usize,
-            self.in_proj_z.weight.as_ref().data_ptr() as usize,
-            self.in_proj_b.weight.as_ref().data_ptr() as usize,
-            self.in_proj_a.weight.as_ref().data_ptr() as usize,
+            self.in_proj_qkv.weight.as_ref().id(),
+            self.in_proj_z.weight.as_ref().id(),
+            self.in_proj_b.weight.as_ref().id(),
+            self.in_proj_a.weight.as_ref().id(),
         ]
     }
 
@@ -2126,14 +2120,11 @@ impl Qwen3NextSparseMoeBlock {
     }
 
     fn current_shared_input_proj_signature(&self) -> Vec<usize> {
-        // SAFETY: same as current_input_proj_signature — evaluate before data_ptr().
-        self.shared_expert.gate_proj.weight.as_ref().eval();
-        self.shared_expert.up_proj.weight.as_ref().eval();
-        self.shared_expert_gate.weight.as_ref().eval();
+        // Use `Array::id()` — same rationale as current_input_proj_signature.
         vec![
-            self.shared_expert.gate_proj.weight.as_ref().data_ptr() as usize,
-            self.shared_expert.up_proj.weight.as_ref().data_ptr() as usize,
-            self.shared_expert_gate.weight.as_ref().data_ptr() as usize,
+            self.shared_expert.gate_proj.weight.as_ref().id(),
+            self.shared_expert.up_proj.weight.as_ref().id(),
+            self.shared_expert_gate.weight.as_ref().id(),
         ]
     }
 

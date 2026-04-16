@@ -986,6 +986,7 @@ unsafe extern "C" {
     fn mlx_inline_size(a: *const RawBuf) -> usize;
     fn mlx_inline_nbytes(a: *const RawBuf) -> usize;
     fn mlx_inline_data_ptr(a: *const RawBuf, out_ptr: *mut *const std::ffi::c_void) -> i32;
+    fn mlx_inline_array_id(a: *const RawBuf) -> usize;
     fn mlx_inline_stop_gradient(dst: *mut RawBuf, a: *const RawBuf);
     fn mlx_inline_tri_inv(dst: *mut RawBuf, a: *const RawBuf, upper: bool, use_cpu: bool);
 
@@ -4799,6 +4800,17 @@ impl InlineArray {
         let mut ptr: *const std::ffi::c_void = std::ptr::null();
         unsafe { mlx_inline_data_ptr(&self.raw, &mut ptr) };
         ptr
+    }
+
+    /// Stable identity of the underlying MLX array desc.
+    ///
+    /// Returns `uintptr_t(array_desc_.get())` from MLX — unique per array
+    /// over its lifetime, cheap, and — critically — valid on unevaluated
+    /// (lazy) arrays. Use this as a change-detection handle for caches
+    /// keyed on weight tensors; **do not** dereference it.
+    #[inline]
+    pub fn id(&self) -> usize {
+        unsafe { mlx_inline_array_id(&self.raw) }
     }
 
     // ── FFT ───────────────────────────────────────────────────────────────

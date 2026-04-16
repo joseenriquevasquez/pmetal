@@ -439,11 +439,13 @@ impl Qwen3MoEBlock {
     }
 
     fn current_stacked_weight_signature(&self) -> Vec<usize> {
+        // Use `Array::id()` — stable on lazy arrays. `data_ptr()` would
+        // segfault on unevaluated expert weights (null data buffer).
         let mut signature = Vec::with_capacity(self.experts.len() * 3);
         for expert in &self.experts {
-            signature.push(expert.w1.weight.as_ref().data_ptr() as usize);
-            signature.push(expert.w3.weight.as_ref().data_ptr() as usize);
-            signature.push(expert.w2.weight.as_ref().data_ptr() as usize);
+            signature.push(expert.w1.weight.as_ref().id());
+            signature.push(expert.w3.weight.as_ref().id());
+            signature.push(expert.w2.weight.as_ref().id());
         }
         signature
     }
