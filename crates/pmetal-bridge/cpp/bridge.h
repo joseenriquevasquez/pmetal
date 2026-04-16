@@ -1196,6 +1196,30 @@ typedef void (*mlx_rust_forward_fn)(
     void* ctx
 );
 
+// ── Gradient checkpointing ──
+// Callback type for the checkpointed inner function.
+// Writes output arrays into outputs_out[0..*n_outputs_out-1].
+typedef void (*mlx_rust_checkpoint_fn)(
+    const mlx_inline_array* const* all_arrays,
+    int n_total,
+    mlx_inline_array* outputs_out,
+    int* n_outputs_out,
+    void* ctx
+);
+
+// Apply gradient checkpointing to a forward function over the given inputs.
+// The inner function may produce multiple output arrays (n_outputs_max capacity).
+// On return, dst_outputs[0..*n_outputs_written-1] hold the output arrays.
+void mlx_inline_checkpoint(
+    mlx_rust_checkpoint_fn forward_fn,
+    void* ctx,
+    const mlx_inline_array* const* all_arrays,
+    int n_total,
+    int n_outputs_max,
+    mlx_inline_array* dst_outputs,
+    int* n_outputs_written
+);
+
 // ── FFT ops ──────────────────────────────────────────────────────────────────
 // rfft: real-valued FFT along the given axis. n_fft=-1 means use full axis size.
 void mlx_inline_rfft(mlx_inline_array* dst, const mlx_inline_array* a, int n_fft, int axis);

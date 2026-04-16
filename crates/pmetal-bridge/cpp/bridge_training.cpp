@@ -542,4 +542,109 @@ void mlx_inline_conv2d(mlx_inline_array* dst, const mlx_inline_array* input,
     } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
+// ── Gradient checkpointing ───────────────────────────────────────────────────
+//
+// Wraps a Rust forward function with mlx::core::checkpoint() so that
+// intermediate activations are discarded after the forward pass and
+// recomputed on-demand during the backward pass.  This reduces peak
+// activation memory from O(layers × batch × seq × hidden) to O(1 layer)
+// at the cost of one extra forward pass per backward pass.
+//
+// Signature mirrors mlx_rust_forward_fn but with a vector of outputs:
+//
+//   forward_fn(all_arrays, n_total, outputs_out, n_outputs_out, ctx)
+//
+// where `outputs_out` is a caller-allocated array of mlx_inline_array
+// with capacity n_outputs_max, and `*n_outputs_out` is set by the callback
+// to the actual number of output arrays it produced.
+//
+// The bridge:
+//   1. Snapshots inputs into a std::vector<array>.
+//   2. Builds a cpp_forward lambda that invokes forward_fn via InlineArray bufs.
+//   3. Wraps that lambda with checkpoint().
+//   4. Calls the wrapped function with the inputs.
+//   5. Writes outputs via placement-new into dst_outputs[0..n_outputs-1].
+//
+// n_outputs_max must equal the number of outputs the forward_fn will produce.
+
+typedef void (*mlx_rust_checkpoint_fn)(
+    const mlx_inline_array* const* all_arrays,
+    int n_total,
+    mlx_inline_array* outputs_out,
+    int* n_outputs_out,
+    void* ctx
+);
+
+void mlx_inline_checkpoint(
+    mlx_rust_checkpoint_fn forward_fn,
+    void* ctx,
+    const mlx_inline_array* const* all_arrays,
+    int n_total,
+    int n_outputs_max,
+    mlx_inline_array* dst_outputs,
+    int* n_outputs_written
+) {
+    // Snapshot inputs so the lambda can capture by value.
+    std::vector<array> inputs;
+    inputs.reserve(n_total);
+    for (int i = 0; i < n_total; i++) {
+        inputs.push_back(as_arr(all_arrays[i]));
+    }
+
+    // Lambda that calls back into Rust to build the forward graph.
+    // Returns a std::vector<array> matching the outputs the callback emits.
+    auto cpp_forward = [&](const std::vector<array>& args) -> std::vector<array> {
+        // Wrap each array as a temporary InlineArray for the Rust callback.
+        std::vector<mlx_inline_array> bufs(args.size());
+        std::vector<const mlx_inline_array*> ptrs(args.size());
+        for (size_t i = 0; i < args.size(); i++) {
+            new (bufs[i].buf) array(args[i]);
+            ptrs[i] = &bufs[i];
+        }
+
+        // Allocate output buffer for the Rust callback.
+        std::vector<mlx_inline_array> out_bufs(n_outputs_max);
+        for (int i = 0; i < n_outputs_max; i++) {
+            mlx_inline_init_empty(&out_bufs[i]);
+        }
+        int n_out = 0;
+        forward_fn(ptrs.data(), (int)ptrs.size(), out_bufs.data(), &n_out, ctx);
+
+        // Collect outputs before destroying the bufs.
+        std::vector<array> results;
+        results.reserve(n_out);
+        for (int i = 0; i < n_out; i++) {
+            results.push_back(as_arr(&out_bufs[i]));
+            as_arr(&out_bufs[i]).~array();
+        }
+        // Remaining output slots that were never initialised are still
+        // default-initialised (mlx_inline_init_empty) — destroy them too.
+        for (int i = n_out; i < n_outputs_max; i++) {
+            as_arr(&out_bufs[i]).~array();
+        }
+
+        // Destroy input wrappers.
+        for (auto& b : bufs) {
+            as_arr(&b).~array();
+        }
+
+        return results;
+    };
+
+    try {
+        auto checkpointed = mlx::core::checkpoint(
+            std::function<std::vector<array>(const std::vector<array>&)>(cpp_forward));
+        auto results = checkpointed(inputs);
+
+        int n = (int)results.size();
+        for (int i = 0; i < n && i < n_outputs_max; i++) {
+            new (dst_outputs[i].buf) array(std::move(results[i]));
+        }
+        *n_outputs_written = n;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[C++ EXCEPTION mlx_inline_checkpoint] %s\n", e.what());
+        *n_outputs_written = 0;
+    }
+}
+
 } // extern "C"
