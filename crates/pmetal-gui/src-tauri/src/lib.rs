@@ -101,6 +101,10 @@ pub fn run() {
             start_eval,
             stop_eval,
             list_eval_runs,
+            // Pretrain
+            start_pretrain,
+            stop_pretrain,
+            list_pretrain_runs,
             // Inference
             start_inference,
             stop_inference,

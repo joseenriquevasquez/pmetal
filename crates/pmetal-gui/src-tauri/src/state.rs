@@ -534,6 +534,106 @@ fn parse_eval_metric(line: &str, key: &str) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
+// Pretrain — long-running subprocess spawned by `pmetal pretrain`
+// ---------------------------------------------------------------------------
+
+/// Step-level metrics parsed from `pmetal pretrain` stdout.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PretrainMetrics {
+    pub step: usize,
+    pub total_steps: usize,
+    pub loss: Option<f64>,
+    pub best_loss: Option<f64>,
+    pub tokens_per_second: Option<f64>,
+    pub learning_rate: Option<f64>,
+    pub eta_seconds: Option<u64>,
+}
+
+/// A pretrain run tracked by the GUI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PretrainRun {
+    pub id: String,
+    pub status: JobStatus,
+    pub arch: String,
+    pub output_dir: String,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub metrics: PretrainMetrics,
+    pub error_message: Option<String>,
+    #[serde(default)]
+    pub log_tail: Vec<String>,
+}
+
+impl PretrainRun {
+    pub fn new(arch: &str, output_dir: &str) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            status: JobStatus::Running,
+            arch: arch.to_string(),
+            output_dir: output_dir.to_string(),
+            started_at: Utc::now(),
+            ended_at: None,
+            metrics: PretrainMetrics::default(),
+            error_message: None,
+            log_tail: Vec::new(),
+        }
+    }
+
+    pub fn append_log(&mut self, line: &str) {
+        // Parse step-level metrics from pretrain stdout lines.
+        // Expected format: `step=N/Total loss=X.XXXX lr=X.Xe-X tok/s=XXX eta=Xs`
+        if let Some(step) = extract_kv_usize(line, "step") {
+            self.metrics.step = step;
+        }
+        if let Some(total) = parse_pretrain_total_steps(line) {
+            self.metrics.total_steps = total;
+        }
+        if let Some(v) = extract_kv_f64(line, "loss") {
+            if self.metrics.best_loss.map_or(true, |b| v < b) {
+                self.metrics.best_loss = Some(v);
+            }
+            self.metrics.loss = Some(v);
+        }
+        if let Some(v) = extract_kv_f64(line, "lr") {
+            self.metrics.learning_rate = Some(v);
+        }
+        if let Some(v) = extract_kv_f64(line, "tok/s") {
+            self.metrics.tokens_per_second = Some(v);
+        }
+        if let Some(v) = extract_kv_usize(line, "eta") {
+            self.metrics.eta_seconds = Some(v as u64);
+        }
+        self.log_tail.push(line.to_string());
+        if self.log_tail.len() > 300 {
+            let drop = self.log_tail.len() - 300;
+            self.log_tail.drain(..drop);
+        }
+    }
+}
+
+fn extract_kv_usize(hay: &str, key: &str) -> Option<usize> {
+    let pos = hay.find(key)?;
+    let after = &hay[pos + key.len()..];
+    let after = after.trim_start().strip_prefix('=')?.trim_start();
+    let end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    after[..end].parse::<usize>().ok()
+}
+
+/// Parse `step=N/Total` — the total steps embedded after `/`.
+fn parse_pretrain_total_steps(line: &str) -> Option<usize> {
+    let pos = line.find("step=")?;
+    let after = &line[pos + 5..];
+    let slash = after.find('/')?;
+    let rest = &after[slash + 1..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse::<usize>().ok()
+}
+
+// ---------------------------------------------------------------------------
 // Serve
 // ---------------------------------------------------------------------------
 
@@ -689,6 +789,15 @@ pub enum AppEvent {
     EvalUpdate {
         run: EvalRun,
     },
+    PretrainStarted {
+        run: PretrainRun,
+    },
+    PretrainStopped {
+        run_id: String,
+    },
+    PretrainUpdate {
+        run: PretrainRun,
+    },
     ModelCached {
         model: CachedModel,
     },
@@ -713,6 +822,7 @@ pub struct AppState {
     pub serve_instances: Arc<RwLock<Vec<ServeInstance>>>,
     pub bench_runs: Arc<RwLock<Vec<BenchRun>>>,
     pub eval_runs: Arc<RwLock<Vec<EvalRun>>>,
+    pub pretrain_runs: Arc<RwLock<Vec<PretrainRun>>>,
     pub cached_models: Arc<RwLock<Vec<CachedModel>>>,
     pub event_tx: broadcast::Sender<AppEvent>,
     pub active_processes: Arc<RwLock<HashMap<String, tokio::process::Child>>>,
@@ -735,6 +845,7 @@ impl AppState {
             serve_instances: Arc::new(RwLock::new(Vec::new())),
             bench_runs: Arc::new(RwLock::new(Vec::new())),
             eval_runs: Arc::new(RwLock::new(Vec::new())),
+            pretrain_runs: Arc::new(RwLock::new(Vec::new())),
             cached_models: Arc::new(RwLock::new(Vec::new())),
             event_tx,
             active_processes: Arc::new(RwLock::new(HashMap::new())),
@@ -1117,6 +1228,42 @@ impl AppState {
                 run.ended_at = Some(Utc::now());
                 let _ = self.event_tx.send(AppEvent::EvalUpdate { run: run.clone() });
                 let _ = self.event_tx.send(AppEvent::EvalStopped {
+                    run_id: id.to_string(),
+                });
+            }
+            found = true;
+        }
+        found
+    }
+
+    pub async fn create_pretrain_run(&self, run: PretrainRun) {
+        let _ = self
+            .event_tx
+            .send(AppEvent::PretrainStarted { run: run.clone() });
+        self.pretrain_runs.write().await.push(run);
+    }
+
+    pub async fn list_pretrain_runs(&self) -> Vec<PretrainRun> {
+        self.pretrain_runs.read().await.clone()
+    }
+
+    pub async fn cancel_pretrain_run(&self, id: &str) -> bool {
+        {
+            let mut procs = self.active_processes.write().await;
+            if let Some(mut child) = procs.remove(id) {
+                let _ = child.kill().await;
+            }
+        }
+        let mut found = false;
+        let mut runs = self.pretrain_runs.write().await;
+        if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
+            if run.status == JobStatus::Running || run.status == JobStatus::Pending {
+                run.status = JobStatus::Cancelled;
+                run.ended_at = Some(Utc::now());
+                let _ = self
+                    .event_tx
+                    .send(AppEvent::PretrainUpdate { run: run.clone() });
+                let _ = self.event_tx.send(AppEvent::PretrainStopped {
                     run_id: id.to_string(),
                 });
             }

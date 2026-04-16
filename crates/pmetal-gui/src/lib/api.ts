@@ -918,3 +918,80 @@ export async function quantizeModel(
 export async function getDashboardStats(): Promise<DashboardStats> {
   return await invoke('get_dashboard_stats');
 }
+
+// =============================================================================
+// Pretrain API
+// =============================================================================
+
+export interface PretrainMetrics {
+  step: number;
+  total_steps: number;
+  loss: number | null;
+  best_loss: number | null;
+  tokens_per_second: number | null;
+  learning_rate: number | null;
+  eta_seconds: number | null;
+}
+
+export interface PretrainRun {
+  id: string;
+  status: JobStatus;
+  arch: string;
+  output_dir: string;
+  started_at: string;
+  ended_at: string | null;
+  metrics: PretrainMetrics;
+  error_message: string | null;
+  log_tail: string[];
+}
+
+export interface PretrainConfigDto {
+  arch: string;
+  model_config?: string | null;
+  shard_paths?: string | null;
+  seq_len?: number | null;
+  batch_size?: number | null;
+  grad_accum?: number | null;
+  steps?: number | null;
+  learning_rate?: number | null;
+  min_lr?: number | null;
+  warmup_steps?: number | null;
+  lr_schedule?: string | null;
+  weight_decay?: number | null;
+  max_grad_norm?: number | null;
+  z_loss?: number | null;
+  eos_token_id?: number | null;
+  checkpoint_every?: number | null;
+  output_dir?: string | null;
+  seed?: number | null;
+}
+
+export async function startPretrain(config: PretrainConfigDto): Promise<string> {
+  return await invoke('start_pretrain', { config });
+}
+
+export async function listPretrainRuns(): Promise<PretrainRun[]> {
+  return await invoke('list_pretrain_runs');
+}
+
+export async function stopPretrain(runId: string): Promise<void> {
+  return await invoke('stop_pretrain', { runId });
+}
+
+export function onPretrainStarted(callback: (run: PretrainRun) => void): Promise<UnlistenFn> {
+  return listen<PretrainRun>('pretrain-started', (event) => {
+    callback(event.payload);
+  });
+}
+
+export function onPretrainUpdate(callback: (run: PretrainRun) => void): Promise<UnlistenFn> {
+  return listen<PretrainRun>('pretrain-update', (event) => {
+    callback(event.payload);
+  });
+}
+
+export function onPretrainStopped(callback: (runId: string) => void): Promise<UnlistenFn> {
+  return listen<string>('pretrain-stopped', (event) => {
+    callback(event.payload);
+  });
+}

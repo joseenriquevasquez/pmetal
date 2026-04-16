@@ -10,8 +10,8 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::state::{
     AppConfig, AppEvent, AppState, BenchRun, CachedModel, DistillationRun, DistillationStatus,
-    EvalRun, GrpoRun, GrpoStatus, JobStatus, ServeInstance, ServeStatus, TrainingConfigSummary,
-    TrainingRun, TrainingStatus, format_downloads, format_size,
+    EvalRun, GrpoRun, GrpoStatus, JobStatus, PretrainRun, ServeInstance, ServeStatus,
+    TrainingConfigSummary, TrainingRun, TrainingStatus, format_downloads, format_size,
 };
 
 // ---------------------------------------------------------------------------
@@ -2070,12 +2070,13 @@ pub async fn start_eval(
 enum JobKind {
     Bench,
     Eval,
+    Pretrain,
 }
 
 /// Spawn a `pmetal <subcommand>` child for a one-shot job and wire up
-/// stdout/stderr tailing + exit watching. Shared between Bench and Eval
-/// so they can't drift — any change to the subprocess lifecycle lands
-/// in both surfaces at once.
+/// stdout/stderr tailing + exit watching. Shared between Bench, Eval, and
+/// Pretrain so they can't drift — any change to the subprocess lifecycle
+/// lands in all surfaces at once.
 async fn spawn_job_subprocess(
     state: &AppState,
     run_id: String,
@@ -2104,13 +2105,24 @@ async fn spawn_job_subprocess(
     // Stream output into the appropriate run record.
     let bench_runs = state.bench_runs.clone();
     let eval_runs = state.eval_runs.clone();
+    let pretrain_runs = state.pretrain_runs.clone();
     let event_tx = state.event_tx.clone();
 
-    spawn_job_reader(kind, bench_runs.clone(), eval_runs.clone(), event_tx.clone(), run_id.clone(), stdout, stderr);
+    spawn_job_reader(
+        kind,
+        bench_runs.clone(),
+        eval_runs.clone(),
+        pretrain_runs.clone(),
+        event_tx.clone(),
+        run_id.clone(),
+        stdout,
+        stderr,
+    );
     spawn_job_exit_watcher(
         kind,
         bench_runs,
         eval_runs,
+        pretrain_runs,
         state.active_processes.clone(),
         event_tx,
         run_id,
@@ -2123,6 +2135,7 @@ fn spawn_job_reader(
     kind: JobKind,
     bench_runs: Arc<tokio::sync::RwLock<Vec<BenchRun>>>,
     eval_runs: Arc<tokio::sync::RwLock<Vec<EvalRun>>>,
+    pretrain_runs: Arc<tokio::sync::RwLock<Vec<PretrainRun>>>,
     event_tx: tokio::sync::broadcast::Sender<AppEvent>,
     run_id: String,
     stdout: Option<tokio::process::ChildStdout>,
@@ -2134,6 +2147,7 @@ fn spawn_job_reader(
         kind: JobKind,
         bench_runs: Arc<tokio::sync::RwLock<Vec<BenchRun>>>,
         eval_runs: Arc<tokio::sync::RwLock<Vec<EvalRun>>>,
+        pretrain_runs: Arc<tokio::sync::RwLock<Vec<PretrainRun>>>,
         event_tx: tokio::sync::broadcast::Sender<AppEvent>,
         run_id: String,
         stream: R,
@@ -2159,6 +2173,15 @@ fn spawn_job_reader(
                         break;
                     }
                 }
+                JobKind::Pretrain => {
+                    let mut runs = pretrain_runs.write().await;
+                    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+                        run.append_log(&line);
+                        let _ = event_tx.send(AppEvent::PretrainUpdate { run: run.clone() });
+                    } else {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -2166,15 +2189,16 @@ fn spawn_job_reader(
     if let Some(s) = stdout {
         let bench_runs = bench_runs.clone();
         let eval_runs = eval_runs.clone();
+        let pretrain_runs = pretrain_runs.clone();
         let event_tx = event_tx.clone();
         let run_id = run_id.clone();
         tokio::spawn(async move {
-            drain(kind, bench_runs, eval_runs, event_tx, run_id, s).await;
+            drain(kind, bench_runs, eval_runs, pretrain_runs, event_tx, run_id, s).await;
         });
     }
     if let Some(s) = stderr {
         tokio::spawn(async move {
-            drain(kind, bench_runs, eval_runs, event_tx, run_id, s).await;
+            drain(kind, bench_runs, eval_runs, pretrain_runs, event_tx, run_id, s).await;
         });
     }
 }
@@ -2183,6 +2207,7 @@ fn spawn_job_exit_watcher(
     kind: JobKind,
     bench_runs: Arc<tokio::sync::RwLock<Vec<BenchRun>>>,
     eval_runs: Arc<tokio::sync::RwLock<Vec<EvalRun>>>,
+    pretrain_runs: Arc<tokio::sync::RwLock<Vec<PretrainRun>>>,
     active_processes: Arc<
         tokio::sync::RwLock<std::collections::HashMap<String, tokio::process::Child>>,
     >,
@@ -2245,6 +2270,25 @@ fn spawn_job_exit_watcher(
                                 }
                             }
                         }
+                        JobKind::Pretrain => {
+                            let mut runs = pretrain_runs.write().await;
+                            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+                                if matches!(run.status, JobStatus::Running | JobStatus::Pending) {
+                                    run.status = if success {
+                                        JobStatus::Completed
+                                    } else {
+                                        JobStatus::Failed
+                                    };
+                                    run.ended_at = Some(Utc::now());
+                                    run.error_message = msg.clone();
+                                    let _ = event_tx
+                                        .send(AppEvent::PretrainUpdate { run: run.clone() });
+                                    let _ = event_tx.send(AppEvent::PretrainStopped {
+                                        run_id: run_id.clone(),
+                                    });
+                                }
+                            }
+                        }
                     }
                     return;
                 }
@@ -2253,6 +2297,141 @@ fn spawn_job_exit_watcher(
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Pretrain commands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PretrainConfigDto {
+    pub arch: String,
+    pub model_config: Option<String>,
+    pub shard_paths: Option<String>,
+    pub seq_len: Option<usize>,
+    pub batch_size: Option<usize>,
+    pub grad_accum: Option<usize>,
+    pub steps: Option<usize>,
+    pub learning_rate: Option<f64>,
+    pub min_lr: Option<f64>,
+    pub warmup_steps: Option<usize>,
+    pub lr_schedule: Option<String>,
+    pub weight_decay: Option<f64>,
+    pub max_grad_norm: Option<f64>,
+    pub z_loss: Option<f64>,
+    pub eos_token_id: Option<usize>,
+    pub checkpoint_every: Option<usize>,
+    pub output_dir: Option<String>,
+    pub seed: Option<usize>,
+}
+
+#[tauri::command]
+pub async fn start_pretrain(
+    state: State<'_, AppState>,
+    _app_handle: AppHandle,
+    config: PretrainConfigDto,
+) -> Result<String> {
+    if config.arch.is_empty() {
+        return Err(AppError("Architecture is required".into()));
+    }
+
+    let output_dir = config
+        .output_dir
+        .as_deref()
+        .unwrap_or("./pretrain-output")
+        .to_string();
+
+    let run = PretrainRun::new(&config.arch, &output_dir);
+    let run_id = run.id.clone();
+    state.create_pretrain_run(run).await;
+
+    let mut args: Vec<String> = vec!["pretrain".into()];
+    args.extend(["--arch".into(), config.arch.clone()]);
+    if let Some(ref p) = config.model_config {
+        if !p.is_empty() {
+            args.extend(["--model-config".into(), p.clone()]);
+        }
+    }
+    if let Some(ref p) = config.shard_paths {
+        if !p.is_empty() {
+            args.extend(["--shards".into(), p.clone()]);
+        }
+    }
+    args.extend([
+        "--seq-len".into(),
+        config.seq_len.unwrap_or(2048).to_string(),
+    ]);
+    args.extend([
+        "--batch-size".into(),
+        config.batch_size.unwrap_or(4).to_string(),
+    ]);
+    args.extend([
+        "--grad-accum".into(),
+        config.grad_accum.unwrap_or(1).to_string(),
+    ]);
+    args.extend([
+        "--steps".into(),
+        config.steps.unwrap_or(10000).to_string(),
+    ]);
+    args.extend([
+        "--learning-rate".into(),
+        config.learning_rate.unwrap_or(3e-4).to_string(),
+    ]);
+    args.extend([
+        "--min-lr".into(),
+        config.min_lr.unwrap_or(1e-5).to_string(),
+    ]);
+    args.extend([
+        "--warmup-steps".into(),
+        config.warmup_steps.unwrap_or(1000).to_string(),
+    ]);
+    args.extend([
+        "--lr-schedule".into(),
+        config
+            .lr_schedule
+            .as_deref()
+            .unwrap_or("cosine")
+            .to_string(),
+    ]);
+    args.extend([
+        "--weight-decay".into(),
+        config.weight_decay.unwrap_or(0.1).to_string(),
+    ]);
+    args.extend([
+        "--max-grad-norm".into(),
+        config.max_grad_norm.unwrap_or(1.0).to_string(),
+    ]);
+    let z_loss = config.z_loss.unwrap_or(0.0);
+    if z_loss > 0.0 {
+        args.extend(["--z-loss".into(), z_loss.to_string()]);
+    }
+    let eos = config.eos_token_id.unwrap_or(0);
+    if eos > 0 {
+        args.extend(["--eos-token-id".into(), eos.to_string()]);
+    }
+    args.extend([
+        "--checkpoint-every".into(),
+        config.checkpoint_every.unwrap_or(1000).to_string(),
+    ]);
+    args.extend(["--output-dir".into(), output_dir]);
+    args.extend([
+        "--seed".into(),
+        config.seed.unwrap_or(42).to_string(),
+    ]);
+
+    spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Pretrain).await?;
+    Ok(run_id)
+}
+
+#[tauri::command]
+pub async fn list_pretrain_runs(state: State<'_, AppState>) -> Result<Vec<PretrainRun>> {
+    Ok(state.list_pretrain_runs().await)
+}
+
+#[tauri::command]
+pub async fn stop_pretrain(state: State<'_, AppState>, run_id: String) -> Result<()> {
+    state.cancel_pretrain_run(&run_id).await;
+    Ok(())
 }
 
 /// Resolve the `pmetal` CLI binary used to spawn long-running subprocesses
@@ -3868,6 +4047,18 @@ pub fn start_event_forwarder(app_handle: AppHandle, state: &AppState) {
                         ),
                         AppEvent::EvalUpdate { run } => (
                             "eval-update",
+                            serde_json::to_value(run).unwrap_or_default(),
+                        ),
+                        AppEvent::PretrainStarted { run } => (
+                            "pretrain-started",
+                            serde_json::to_value(run).unwrap_or_default(),
+                        ),
+                        AppEvent::PretrainStopped { run_id } => (
+                            "pretrain-stopped",
+                            serde_json::Value::String(run_id.clone()),
+                        ),
+                        AppEvent::PretrainUpdate { run } => (
+                            "pretrain-update",
                             serde_json::to_value(run).unwrap_or_default(),
                         ),
                         AppEvent::ModelCached { model } => (

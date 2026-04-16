@@ -435,6 +435,68 @@ class EvalStore {
 export const evalStore = new EvalStore();
 
 // =============================================================================
+// Pretrain Store — tracks long-running `pmetal pretrain` runs.
+// =============================================================================
+
+class PretrainStore {
+  runs = $state<api.PretrainRun[]>([]);
+  selectedId = $state<string | null>(null);
+  loading = $state(false);
+  error = $state<string | null>(null);
+
+  get selected() {
+    return this.runs.find(r => r.id === this.selectedId) ?? null;
+  }
+
+  get activeRuns() {
+    return this.runs.filter(r => r.status === 'running' || r.status === 'pending');
+  }
+
+  async refresh() {
+    this.loading = true;
+    this.error = null;
+    try {
+      this.runs = await api.listPretrainRuns();
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  async start(config: api.PretrainConfigDto) {
+    this.loading = true;
+    this.error = null;
+    try {
+      const id = await api.startPretrain(config);
+      this.selectedId = id;
+      await this.refresh();
+      return id;
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+      throw e;
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  async stop(runId: string) {
+    await api.stopPretrain(runId);
+    await this.refresh();
+  }
+
+  addRun(run: api.PretrainRun) {
+    this.runs = [...this.runs, run];
+  }
+
+  updateRun(updated: api.PretrainRun) {
+    this.runs = this.runs.map(r => (r.id === updated.id ? updated : r));
+  }
+}
+
+export const pretrainStore = new PretrainStore();
+
+// =============================================================================
 // GRPO Store
 // =============================================================================
 
@@ -690,6 +752,7 @@ export async function initializeStores() {
     serveStore.refresh(),
     benchStore.refresh(),
     evalStore.refresh(),
+    pretrainStore.refresh(),
     dashboardStore.refresh(),
     deviceStore.refresh(),
   ]);
@@ -776,6 +839,15 @@ export async function initializeStores() {
   unlistenFns.push(await api.onEvalStopped(() => {
     evalStore.refresh();
     dashboardStore.refresh();
+  }));
+
+  // Pretrain
+  unlistenFns.push(await api.onPretrainStarted((run) => {
+    pretrainStore.addRun(run);
+  }));
+  unlistenFns.push(await api.onPretrainUpdate((run) => pretrainStore.updateRun(run)));
+  unlistenFns.push(await api.onPretrainStopped(() => {
+    pretrainStore.refresh();
   }));
 }
 
