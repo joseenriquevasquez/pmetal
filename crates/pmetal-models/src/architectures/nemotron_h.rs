@@ -811,7 +811,7 @@ impl MoELayer {
             // For larger batches, use lazy evaluation with masking
             // Build the entire computation graph first, then let MLX optimize
             for k in 0..self.top_k {
-                let expert_indices = pmetal_bridge::compat::ops::select_axis(&indices, -1, k);
+                let expert_indices = pmetal_bridge::compat::ops::select_axis(&indices, k, -1);
                 let expert_weights = pmetal_bridge::compat::ops::slice_axis(&weights, -1, k, k + 1);
 
                 // Process each expert with masking

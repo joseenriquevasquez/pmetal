@@ -344,7 +344,7 @@ impl BatchedRlGenerator {
                 logits.eval();
 
                 // Sample first token
-                let last_logits = pmetal_bridge::compat::ops::select_axis(&logits, 1, -1);
+                let last_logits = pmetal_bridge::compat::ops::select_axis(&logits, -1, 1);
                 let token = self.sample(&last_logits)?;
                 current_tokens[seq_idx] = token;
                 sequences[seq_idx].push(token);
@@ -506,7 +506,7 @@ impl BatchedRlGenerator {
             logits.eval();
 
             // Sample or take greedy first token
-            let last_logits = pmetal_bridge::compat::ops::select_axis(&logits, 1, -1);
+            let last_logits = pmetal_bridge::compat::ops::select_axis(&logits, -1, 1);
             let token = self.sample(&last_logits)?;
             last_tokens[seq_idx] = token;
             sequences[seq_idx].push(token);

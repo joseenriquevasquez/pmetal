@@ -416,7 +416,12 @@ pub fn tile(a: &Array, reps: &[i32]) -> Array {
 ///
 /// Equivalent to `np.split(a, num_sections, axis=axis)` or `mx.split(a, num_sections, axis)`.
 pub fn split(a: &Array, num_sections: i32, axis: i32) -> Vec<Array> {
-    let dim = a.shape()[axis as usize];
+    let ax = if axis < 0 {
+        (a.ndim() + axis) as usize
+    } else {
+        axis as usize
+    };
+    let dim = a.shape()[ax];
     let section_size = dim / num_sections;
     // Build split indices: [section_size, 2*section_size, ..., (n-1)*section_size]
     let indices: Vec<i32> = (1..num_sections).map(|i| i * section_size).collect();

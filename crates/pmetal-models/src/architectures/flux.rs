@@ -296,7 +296,7 @@ impl FluxRoPE {
         let n_axes = ids.dim(-1);
         let mut embs = Vec::new();
         for i in 0..n_axes {
-            let axis_ids = pmetal_bridge::compat::ops::select_axis(ids, -1, i);
+            let axis_ids = pmetal_bridge::compat::ops::select_axis(ids, i, -1);
             embs.push(self.rope(&axis_ids, self.axes_dim[i as usize], self.theta)?);
         }
 
@@ -363,11 +363,11 @@ impl FluxJointAttention {
         let shape = x.shape();
         let x_complex = x.reshape(&[shape[0], shape[1], shape[2], -1, 2]);
 
-        let cos = pmetal_bridge::compat::ops::select_axis(&x_complex, -1, 0);
-        let sin = pmetal_bridge::compat::ops::select_axis(&x_complex, -1, 1);
+        let cos = pmetal_bridge::compat::ops::select_axis(&x_complex, 0, -1);
+        let sin = pmetal_bridge::compat::ops::select_axis(&x_complex, 1, -1);
 
-        let freq_cos = pmetal_bridge::compat::ops::select_axis(freqs_cis, -1, 0);
-        let freq_sin = pmetal_bridge::compat::ops::select_axis(freqs_cis, -1, 1);
+        let freq_cos = pmetal_bridge::compat::ops::select_axis(freqs_cis, 0, -1);
+        let freq_sin = pmetal_bridge::compat::ops::select_axis(freqs_cis, 1, -1);
 
         let out_real = cos.multiply(&freq_cos).subtract(&sin.multiply(&freq_sin));
         let out_imag = cos.multiply(&freq_sin).add(&sin.multiply(&freq_cos));
@@ -400,9 +400,9 @@ impl FluxJointAttention {
                 self.head_dim as i32,
             ])
             .transpose_axes(&[0, 3, 1, 2, 4]);
-        let q_a = pmetal_bridge::compat::ops::select_axis(&qkv_a, 3, 0);
-        let k_a = pmetal_bridge::compat::ops::select_axis(&qkv_a, 3, 1);
-        let v_a = pmetal_bridge::compat::ops::select_axis(&qkv_a, 3, 2);
+        let q_a = pmetal_bridge::compat::ops::select_axis(&qkv_a, 0, 3);
+        let k_a = pmetal_bridge::compat::ops::select_axis(&qkv_a, 1, 3);
+        let v_a = pmetal_bridge::compat::ops::select_axis(&qkv_a, 2, 3);
         let q_a = self.norm_q_a.forward(&q_a);
         let k_a = self.norm_k_a.forward(&k_a);
 
@@ -416,9 +416,9 @@ impl FluxJointAttention {
                 self.head_dim as i32,
             ])
             .transpose_axes(&[0, 3, 1, 2, 4]);
-        let q_b = pmetal_bridge::compat::ops::select_axis(&qkv_b, 3, 0);
-        let k_b = pmetal_bridge::compat::ops::select_axis(&qkv_b, 3, 1);
-        let v_b = pmetal_bridge::compat::ops::select_axis(&qkv_b, 3, 2);
+        let q_b = pmetal_bridge::compat::ops::select_axis(&qkv_b, 0, 3);
+        let k_b = pmetal_bridge::compat::ops::select_axis(&qkv_b, 1, 3);
+        let v_b = pmetal_bridge::compat::ops::select_axis(&qkv_b, 2, 3);
         let q_b = self.norm_q_b.forward(&q_b);
         let k_b = self.norm_k_b.forward(&k_b);
 
@@ -592,11 +592,11 @@ impl FluxSingleTransformerBlock {
         let shape = x.shape();
         let x_complex = x.reshape(&[shape[0], shape[1], shape[2], -1, 2]);
 
-        let cos = pmetal_bridge::compat::ops::select_axis(&x_complex, -1, 0);
-        let sin = pmetal_bridge::compat::ops::select_axis(&x_complex, -1, 1);
+        let cos = pmetal_bridge::compat::ops::select_axis(&x_complex, 0, -1);
+        let sin = pmetal_bridge::compat::ops::select_axis(&x_complex, 1, -1);
 
-        let freq_cos = pmetal_bridge::compat::ops::select_axis(freqs_cis, -1, 0);
-        let freq_sin = pmetal_bridge::compat::ops::select_axis(freqs_cis, -1, 1);
+        let freq_cos = pmetal_bridge::compat::ops::select_axis(freqs_cis, 0, -1);
+        let freq_sin = pmetal_bridge::compat::ops::select_axis(freqs_cis, 1, -1);
 
         let out_real = cos.multiply(&freq_cos).subtract(&sin.multiply(&freq_sin));
         let out_imag = cos.multiply(&freq_sin).add(&sin.multiply(&freq_cos));
@@ -635,9 +635,9 @@ impl FluxSingleTransformerBlock {
                 self.head_dim as i32,
             ])
             .transpose_axes(&[0, 3, 1, 2, 4]);
-        let q = pmetal_bridge::compat::ops::select_axis(&qkv, 3, 0);
-        let k = pmetal_bridge::compat::ops::select_axis(&qkv, 3, 1);
-        let v = pmetal_bridge::compat::ops::select_axis(&qkv, 3, 2);
+        let q = pmetal_bridge::compat::ops::select_axis(&qkv, 0, 3);
+        let k = pmetal_bridge::compat::ops::select_axis(&qkv, 1, 3);
+        let v = pmetal_bridge::compat::ops::select_axis(&qkv, 2, 3);
 
         let q = self.norm_q_a.forward(&q);
         let k = self.norm_k_a.forward(&k);
