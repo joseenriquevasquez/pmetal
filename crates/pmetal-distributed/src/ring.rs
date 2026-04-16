@@ -132,11 +132,15 @@ impl DistributedBackend for RingBackend {
         }
 
         // 2. All-Gather — each node sends its own fully-reduced chunk rightward.
-        // After scatter-reduce, node r holds fully-reduced chunk r.
-        // Step 0: send chunk r (own), receive chunk (r-1) from left neighbor.
-        // Step k: send what was received in step k-1.
-        send_chunk_idx = self.rank;
-        recv_chunk_idx = (self.rank + self.world_size - 1) % self.world_size;
+        //
+        // After scatter-reduce with world_size N, node r has accumulated into
+        // chunks (r+N-1)%N, (r+N-2)%N, ..., ending at (r+1)%N.  That is, the
+        // fully-reduced chunk lives at index (r+1)%N, NOT at index r.
+        //
+        // Step 0: send the fully-reduced chunk (r+1)%N, receive into slot r.
+        // Step k: send what was received in step k-1 (slot advances leftward).
+        send_chunk_idx = (self.rank + 1) % self.world_size;
+        recv_chunk_idx = self.rank;
 
         for _ in 0..self.world_size - 1 {
             let (s_start, s_end) = get_chunk_range(send_chunk_idx);
