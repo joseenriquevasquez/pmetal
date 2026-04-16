@@ -19,6 +19,7 @@ pub mod inference_config;
 pub mod jinja_chat;
 pub mod packing;
 pub mod stream_format;
+pub mod streaming;
 pub mod tokenizer;
 pub mod vocab_compact;
 
