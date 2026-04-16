@@ -4932,6 +4932,7 @@ version = "0.5.0"
 dependencies = [
  "arrow",
  "image 0.25.10",
+ "memmap2",
  "minijinja",
  "minijinja-contrib",
  "parquet",
