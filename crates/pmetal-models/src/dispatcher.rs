@@ -793,6 +793,10 @@ impl DynamicModel {
     ) -> Result<Array, Exception> {
         match self {
             Self::Llama(m) => m.model.forward(input_ids, mask),
+            // Llama4TextModel takes position_ids in the 3rd slot; None
+            // lets the forward derive positions internally. MoD routing
+            // in the decoder layers runs fine without a cache.
+            Self::Llama4(m) => m.model.forward(input_ids, mask, None),
             Self::Qwen2(m) => m.model.forward(input_ids, mask),
             Self::Qwen3(m) => m.model.forward(input_ids, mask, None),
             Self::Qwen3MoE(m) => m.model.forward(input_ids, mask, None),
@@ -815,8 +819,9 @@ impl DynamicModel {
             Self::Bert(m) => BertForEmbedding::forward(m, input_ids, mask),
             other => Err(Exception::custom(format!(
                 "forward_hidden not implemented for {:?} — supported archs: \
-                 Llama, Qwen2, Qwen3, Qwen3MoE, Mistral, Gemma, Gemma4, \
-                 Phi, Phi4, DeepSeek, Cohere, Granite, GptOss, StarCoder2, BERT",
+                 Llama, Llama4, Qwen2, Qwen3, Qwen3MoE, Mistral, Gemma, \
+                 Gemma4, Phi, Phi4, DeepSeek, Cohere, Granite, GptOss, \
+                 StarCoder2, BERT",
                 other
             ))),
         }
