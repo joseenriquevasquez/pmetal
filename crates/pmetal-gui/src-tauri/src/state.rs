@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -507,7 +507,7 @@ fn parse_eval_sample_progress(line: &str) -> Option<(usize, usize)> {
     for (i, ch) in line.char_indices() {
         if ch.is_ascii_digit() {
             let tail = &line[i..];
-            let end = tail.find(|c: char| c == ' ' || c == ',').unwrap_or(tail.len());
+            let end = tail.find([' ', ',']).unwrap_or(tail.len());
             let slice = &tail[..end];
             if let Some((a, b)) = slice.split_once('/') {
                 if let (Ok(done), Ok(total)) = (a.parse::<usize>(), b.parse::<usize>()) {
@@ -526,7 +526,7 @@ fn parse_eval_metric(line: &str, key: &str) -> Option<f64> {
     let lower = line.to_lowercase();
     let idx = lower.find(key)?;
     let tail = &line[idx + key.len()..];
-    let tail = tail.trim_start_matches(|c: char| c == ' ' || c == '=' || c == ':');
+    let tail = tail.trim_start_matches([' ', '=', ':']);
     let end = tail
         .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e'))
         .unwrap_or(tail.len());
@@ -589,7 +589,7 @@ impl PretrainRun {
             self.metrics.total_steps = total;
         }
         if let Some(v) = extract_kv_f64(line, "loss") {
-            if self.metrics.best_loss.map_or(true, |b| v < b) {
+            if self.metrics.best_loss.is_none_or(|b| v < b) {
                 self.metrics.best_loss = Some(v);
             }
             self.metrics.loss = Some(v);
@@ -710,9 +710,7 @@ impl ServeInstance {
     pub fn append_log(&mut self, line: &str) {
         if matches!(self.status, ServeStatus::Starting) {
             let lower = line.to_lowercase();
-            if lower.contains("listening")
-                || lower.contains("serving")
-                || lower.contains(" ready")
+            if lower.contains("listening") || lower.contains("serving") || lower.contains(" ready")
             {
                 self.status = ServeStatus::Running;
                 self.ready_at = Some(Utc::now());
@@ -735,79 +733,30 @@ impl ServeInstance {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppEvent {
-    TrainingStarted {
-        run: TrainingRun,
-    },
-    TrainingStopped {
-        run_id: String,
-    },
-    TrainingUpdate {
-        run: TrainingRun,
-    },
-    DistillationStarted {
-        run: DistillationRun,
-    },
-    DistillationStopped {
-        run_id: String,
-    },
-    DistillationUpdate {
-        run: DistillationRun,
-    },
-    GrpoStarted {
-        run: GrpoRun,
-    },
-    GrpoStopped {
-        run_id: String,
-    },
-    GrpoUpdate {
-        run: GrpoRun,
-    },
-    ServeStarted {
-        instance: ServeInstance,
-    },
-    ServeStopped {
-        instance_id: String,
-    },
-    ServeUpdate {
-        instance: ServeInstance,
-    },
-    BenchStarted {
-        run: BenchRun,
-    },
-    BenchStopped {
-        run_id: String,
-    },
-    BenchUpdate {
-        run: BenchRun,
-    },
-    EvalStarted {
-        run: EvalRun,
-    },
-    EvalStopped {
-        run_id: String,
-    },
-    EvalUpdate {
-        run: EvalRun,
-    },
-    PretrainStarted {
-        run: PretrainRun,
-    },
-    PretrainStopped {
-        run_id: String,
-    },
-    PretrainUpdate {
-        run: PretrainRun,
-    },
-    ModelCached {
-        model: CachedModel,
-    },
-    ModelRemoved {
-        model_id: String,
-    },
-    ProcessLog {
-        run_id: String,
-        line: String,
-    },
+    TrainingStarted { run: TrainingRun },
+    TrainingStopped { run_id: String },
+    TrainingUpdate { run: TrainingRun },
+    DistillationStarted { run: DistillationRun },
+    DistillationStopped { run_id: String },
+    DistillationUpdate { run: DistillationRun },
+    GrpoStarted { run: GrpoRun },
+    GrpoStopped { run_id: String },
+    GrpoUpdate { run: GrpoRun },
+    ServeStarted { instance: ServeInstance },
+    ServeStopped { instance_id: String },
+    ServeUpdate { instance: ServeInstance },
+    BenchStarted { run: BenchRun },
+    BenchStopped { run_id: String },
+    BenchUpdate { run: BenchRun },
+    EvalStarted { run: EvalRun },
+    EvalStopped { run_id: String },
+    EvalUpdate { run: EvalRun },
+    PretrainStarted { run: PretrainRun },
+    PretrainStopped { run_id: String },
+    PretrainUpdate { run: PretrainRun },
+    ModelCached { model: CachedModel },
+    ModelRemoved { model_id: String },
+    ProcessLog { run_id: String, line: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -829,8 +778,7 @@ pub struct AppState {
     /// Per-run cancellation flags (run_id → cancelled).
     pub cancel_flags: Arc<RwLock<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Active inference sessions (session_id → cancelled).
-    pub inference_cancel_flags:
-        Arc<RwLock<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    pub inference_cancel_flags: Arc<RwLock<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
 }
 
 #[allow(dead_code)]
@@ -907,10 +855,7 @@ impl AppState {
     pub async fn refresh_cached_models(&self) {
         let (cache_root, custom_dirs) = {
             let cfg = self.config.read().await;
-            (
-                PathBuf::from(&cfg.cache_dir),
-                cfg.custom_model_dirs.clone(),
-            )
+            (PathBuf::from(&cfg.cache_dir), cfg.custom_model_dirs.clone())
         };
 
         let mut models = Vec::new();
@@ -945,7 +890,9 @@ impl AppState {
     // -----------------------------------------------------------------------
 
     pub async fn create_training_run(&self, run: TrainingRun) {
-        let _ = self.event_tx.send(AppEvent::TrainingStarted { run: run.clone() });
+        let _ = self
+            .event_tx
+            .send(AppEvent::TrainingStarted { run: run.clone() });
         self.training_runs.write().await.push(run);
     }
 
@@ -956,12 +903,19 @@ impl AppState {
         let mut runs = self.training_runs.write().await;
         if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
             f(run);
-            let _ = self.event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
+            let _ = self
+                .event_tx
+                .send(AppEvent::TrainingUpdate { run: run.clone() });
         }
     }
 
     pub async fn get_training_run(&self, id: &str) -> Option<TrainingRun> {
-        self.training_runs.read().await.iter().find(|r| r.id == id).cloned()
+        self.training_runs
+            .read()
+            .await
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
     }
 
     pub async fn list_training_runs(&self) -> Vec<TrainingRun> {
@@ -990,8 +944,12 @@ impl AppState {
             if run.status == TrainingStatus::Running || run.status == TrainingStatus::Pending {
                 run.status = TrainingStatus::Cancelled;
                 run.ended_at = Some(Utc::now());
-                let _ = self.event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
-                let _ = self.event_tx.send(AppEvent::TrainingStopped { run_id: id.to_string() });
+                let _ = self
+                    .event_tx
+                    .send(AppEvent::TrainingUpdate { run: run.clone() });
+                let _ = self.event_tx.send(AppEvent::TrainingStopped {
+                    run_id: id.to_string(),
+                });
             }
             found = true;
         }
@@ -1003,7 +961,9 @@ impl AppState {
     // -----------------------------------------------------------------------
 
     pub async fn create_distillation_run(&self, run: DistillationRun) {
-        let _ = self.event_tx.send(AppEvent::DistillationStarted { run: run.clone() });
+        let _ = self
+            .event_tx
+            .send(AppEvent::DistillationStarted { run: run.clone() });
         self.distillation_runs.write().await.push(run);
     }
 
@@ -1014,12 +974,19 @@ impl AppState {
         let mut runs = self.distillation_runs.write().await;
         if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
             f(run);
-            let _ = self.event_tx.send(AppEvent::DistillationUpdate { run: run.clone() });
+            let _ = self
+                .event_tx
+                .send(AppEvent::DistillationUpdate { run: run.clone() });
         }
     }
 
     pub async fn get_distillation_run(&self, id: &str) -> Option<DistillationRun> {
-        self.distillation_runs.read().await.iter().find(|r| r.id == id).cloned()
+        self.distillation_runs
+            .read()
+            .await
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
     }
 
     pub async fn list_distillation_runs(&self) -> Vec<DistillationRun> {
@@ -1047,8 +1014,12 @@ impl AppState {
             {
                 run.status = DistillationStatus::Cancelled;
                 run.ended_at = Some(Utc::now());
-                let _ = self.event_tx.send(AppEvent::DistillationUpdate { run: run.clone() });
-                let _ = self.event_tx.send(AppEvent::DistillationStopped { run_id: id.to_string() });
+                let _ = self
+                    .event_tx
+                    .send(AppEvent::DistillationUpdate { run: run.clone() });
+                let _ = self.event_tx.send(AppEvent::DistillationStopped {
+                    run_id: id.to_string(),
+                });
             }
             found = true;
         }
@@ -1060,7 +1031,9 @@ impl AppState {
     // -----------------------------------------------------------------------
 
     pub async fn create_grpo_run(&self, run: GrpoRun) {
-        let _ = self.event_tx.send(AppEvent::GrpoStarted { run: run.clone() });
+        let _ = self
+            .event_tx
+            .send(AppEvent::GrpoStarted { run: run.clone() });
         self.grpo_runs.write().await.push(run);
     }
 
@@ -1071,12 +1044,19 @@ impl AppState {
         let mut runs = self.grpo_runs.write().await;
         if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
             f(run);
-            let _ = self.event_tx.send(AppEvent::GrpoUpdate { run: run.clone() });
+            let _ = self
+                .event_tx
+                .send(AppEvent::GrpoUpdate { run: run.clone() });
         }
     }
 
     pub async fn get_grpo_run(&self, id: &str) -> Option<GrpoRun> {
-        self.grpo_runs.read().await.iter().find(|r| r.id == id).cloned()
+        self.grpo_runs
+            .read()
+            .await
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
     }
 
     pub async fn list_grpo_runs(&self) -> Vec<GrpoRun> {
@@ -1102,8 +1082,12 @@ impl AppState {
             if run.status == GrpoStatus::Running || run.status == GrpoStatus::Pending {
                 run.status = GrpoStatus::Cancelled;
                 run.ended_at = Some(Utc::now());
-                let _ = self.event_tx.send(AppEvent::GrpoUpdate { run: run.clone() });
-                let _ = self.event_tx.send(AppEvent::GrpoStopped { run_id: id.to_string() });
+                let _ = self
+                    .event_tx
+                    .send(AppEvent::GrpoUpdate { run: run.clone() });
+                let _ = self.event_tx.send(AppEvent::GrpoStopped {
+                    run_id: id.to_string(),
+                });
             }
             found = true;
         }
@@ -1115,9 +1099,9 @@ impl AppState {
     // -----------------------------------------------------------------------
 
     pub async fn create_serve_instance(&self, instance: ServeInstance) {
-        let _ = self
-            .event_tx
-            .send(AppEvent::ServeStarted { instance: instance.clone() });
+        let _ = self.event_tx.send(AppEvent::ServeStarted {
+            instance: instance.clone(),
+        });
         self.serve_instances.write().await.push(instance);
     }
 
@@ -1128,9 +1112,9 @@ impl AppState {
         let mut instances = self.serve_instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
             f(inst);
-            let _ = self
-                .event_tx
-                .send(AppEvent::ServeUpdate { instance: inst.clone() });
+            let _ = self.event_tx.send(AppEvent::ServeUpdate {
+                instance: inst.clone(),
+            });
         }
     }
 
@@ -1205,7 +1189,9 @@ impl AppState {
         let mut runs = self.eval_runs.write().await;
         if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
             f(run);
-            let _ = self.event_tx.send(AppEvent::EvalUpdate { run: run.clone() });
+            let _ = self
+                .event_tx
+                .send(AppEvent::EvalUpdate { run: run.clone() });
         }
     }
 
@@ -1226,7 +1212,9 @@ impl AppState {
             if run.status == JobStatus::Running || run.status == JobStatus::Pending {
                 run.status = JobStatus::Cancelled;
                 run.ended_at = Some(Utc::now());
-                let _ = self.event_tx.send(AppEvent::EvalUpdate { run: run.clone() });
+                let _ = self
+                    .event_tx
+                    .send(AppEvent::EvalUpdate { run: run.clone() });
                 let _ = self.event_tx.send(AppEvent::EvalStopped {
                     run_id: id.to_string(),
                 });
@@ -1288,9 +1276,9 @@ impl AppState {
                 inst.status = ServeStatus::Stopped;
                 inst.stopped_at = Some(Utc::now());
                 inst.status_message = Some("Stopped by user".to_string());
-                let _ = self
-                    .event_tx
-                    .send(AppEvent::ServeUpdate { instance: inst.clone() });
+                let _ = self.event_tx.send(AppEvent::ServeUpdate {
+                    instance: inst.clone(),
+                });
                 let _ = self.event_tx.send(AppEvent::ServeStopped {
                     instance_id: id.to_string(),
                 });
@@ -1473,7 +1461,13 @@ async fn scan_model_subdir(
             }
         } else if max_depth > 1 {
             // Recurse into subdirectories
-            Box::pin(scan_model_subdir(&path, default_source.clone(), models, max_depth - 1)).await;
+            Box::pin(scan_model_subdir(
+                &path,
+                default_source.clone(),
+                models,
+                max_depth - 1,
+            ))
+            .await;
         }
     }
 }
@@ -1502,7 +1496,7 @@ async fn is_model_dir(dir: &PathBuf) -> bool {
 }
 
 /// Check if a directory is a trained/fine-tuned model output.
-async fn is_trained_dir(dir: &PathBuf) -> bool {
+async fn is_trained_dir(dir: &Path) -> bool {
     dir.join("adapter_config.json").exists()
         || dir.join("lora_weights.safetensors").exists()
         || dir.join("training_state.json").exists()
@@ -1513,20 +1507,20 @@ async fn build_model_from_dir(dir: &PathBuf, source: ModelSource) -> Option<Cach
     let dir_name = dir.file_name()?.to_string_lossy().to_string();
 
     // Try to get a better model ID from config.json
-    let mut model_id =
-        if let Ok(content) = tokio::fs::read_to_string(dir.join("config.json")).await {
-            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
-                cfg["_name_or_path"]
-                    .as_str()
-                    .filter(|s| !s.is_empty() && !s.starts_with('/'))
-                    .map(str::to_string)
-                    .unwrap_or_else(|| dir_name.clone())
-            } else {
-                dir_name.clone()
-            }
+    let mut model_id = if let Ok(content) = tokio::fs::read_to_string(dir.join("config.json")).await
+    {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
+            cfg["_name_or_path"]
+                .as_str()
+                .filter(|s| !s.is_empty() && !s.starts_with('/'))
+                .map(str::to_string)
+                .unwrap_or_else(|| dir_name.clone())
         } else {
             dir_name.clone()
-        };
+        }
+    } else {
+        dir_name.clone()
+    };
 
     // For GGUF-only directories without config.json: try extracting model name
     // from GGUF metadata and generate config.json for downstream consumers.
@@ -1581,9 +1575,9 @@ async fn find_first_gguf(dir: &PathBuf) -> Option<PathBuf> {
 
 /// Recursively compute directory size, following symlinks so that HF hub
 /// snapshot symlinks resolve to the actual blob sizes.
-async fn dir_size_follow_symlinks(path: &PathBuf) -> u64 {
+async fn dir_size_follow_symlinks(path: &Path) -> u64 {
     let mut total: u64 = 0;
-    let mut stack = vec![path.clone()];
+    let mut stack = vec![path.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
         let mut rd = match tokio::fs::read_dir(&dir).await {
@@ -1625,7 +1619,8 @@ fn infer_model_type(model_id: &str) -> String {
         "embedding".to_string()
     } else if lower.contains("whisper") || lower.contains("wav2vec") || lower.contains("parakeet") {
         "audio".to_string()
-    } else if lower.contains("flux") || lower.contains("stable-diffusion") || lower.contains("sdxl") {
+    } else if lower.contains("flux") || lower.contains("stable-diffusion") || lower.contains("sdxl")
+    {
         "image".to_string()
     } else {
         "text-generation".to_string()

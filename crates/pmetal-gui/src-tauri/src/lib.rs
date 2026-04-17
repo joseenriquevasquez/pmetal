@@ -22,8 +22,7 @@ pub fn run() {
                 // Auto-updater disabled — requires signing key in CI.
                 // app.handle()
                 //     .plugin(tauri_plugin_updater::Builder::new().build())?;
-                app.handle()
-                    .plugin(tauri_plugin_process::init())?;
+                app.handle().plugin(tauri_plugin_process::init())?;
             }
 
             let state = app.state::<AppState>();

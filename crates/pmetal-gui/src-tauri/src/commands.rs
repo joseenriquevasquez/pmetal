@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::state::{
-    AppConfig, AppEvent, AppState, BenchRun, CachedModel, DistillationRun, DistillationStatus,
-    EvalRun, GrpoRun, GrpoStatus, JobStatus, PretrainRun, ServeInstance, ServeStatus,
-    TrainingConfigSummary, TrainingRun, TrainingStatus, format_downloads, format_size,
+    format_downloads, format_size, AppConfig, AppEvent, AppState, BenchRun, CachedModel,
+    DistillationRun, DistillationStatus, EvalRun, GrpoRun, GrpoStatus, JobStatus, PretrainRun,
+    ServeInstance, ServeStatus, TrainingConfigSummary, TrainingRun, TrainingStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -76,7 +76,7 @@ impl TrainingCallback for ChannelMetricsCallback {
     }
 
     fn on_step_end_with_metrics(&mut self, metrics: &pmetal::core::StepMetrics) {
-        if self.best_loss.map_or(true, |b| metrics.loss < b) {
+        if self.best_loss.is_none_or(|b| metrics.loss < b) {
             self.best_loss = Some(metrics.loss);
         }
         let elapsed = (chrono::Utc::now() - self.started_at).num_seconds().max(1) as f64;
@@ -102,7 +102,7 @@ impl TrainingCallback for ChannelMetricsCallback {
     }
 
     fn on_step_end(&mut self, step: usize, loss: f64) {
-        if self.best_loss.map_or(true, |b| loss < b) {
+        if self.best_loss.is_none_or(|b| loss < b) {
             self.best_loss = Some(loss);
         }
         let _ = self.channel.send(serde_json::json!({
@@ -1009,23 +1009,21 @@ pub async fn peek_dataset_columns(path: String, limit: Option<usize>) -> Result<
         } else {
             Box::new(reader.lines()) // scan all
         };
-        for line in iter {
-            if let Ok(line) = line {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                // Sum all string-valued fields as a rough content length
-                if let Ok(obj) =
-                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(trimmed)
-                {
-                    let total_chars: usize = obj
-                        .values()
-                        .filter_map(|v| v.as_str())
-                        .map(|s| s.len())
-                        .sum();
-                    char_lengths.push(total_chars);
-                }
+        for line in iter.flatten() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Sum all string-valued fields as a rough content length
+            if let Ok(obj) =
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(trimmed)
+            {
+                let total_chars: usize = obj
+                    .values()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.len())
+                    .sum();
+                char_lengths.push(total_chars);
             }
         }
     }
@@ -1048,7 +1046,7 @@ pub async fn peek_dataset_columns(path: String, limit: Option<usize>) -> Result<
         .copied()
         .unwrap_or(avg);
     // Round up to next multiple of 64 (practical for GPU alignment)
-    let suggested = if p95 > 0 { (p95 + 63) / 64 * 64 } else { 2048 };
+    let suggested = if p95 > 0 { p95.div_ceil(64) * 64 } else { 2048 };
 
     Ok(DatasetPeek {
         columns,
@@ -1285,7 +1283,7 @@ pub async fn start_training(
                     _ => pmetal::core::LrSchedulerType::Cosine,
                 },
                 output_dir: output_dir.clone(),
-                embedding_learning_rate: config.embedding_lr.map(|v| v as f64),
+                embedding_learning_rate: config.embedding_lr,
                 ..Default::default()
             },
             columns,
@@ -1680,7 +1678,10 @@ pub async fn start_serve(
     let port = config.port.unwrap_or(8080);
     let max_seq_len = config.max_seq_len.unwrap_or(4096);
     let fp8 = config.fp8.unwrap_or(false);
-    let kv_cache = config.kv_cache.clone().unwrap_or_else(|| "auto".to_string());
+    let kv_cache = config
+        .kv_cache
+        .clone()
+        .unwrap_or_else(|| "auto".to_string());
     let kv_group_size = config.kv_group_size.unwrap_or(64);
 
     // Refuse to start if something is already bound to the same port, so
@@ -1697,14 +1698,7 @@ pub async fn start_serve(
         }
     }
 
-    let instance = ServeInstance::new(
-        &config.model,
-        &host,
-        port,
-        max_seq_len,
-        fp8,
-        &kv_cache,
-    );
+    let instance = ServeInstance::new(&config.model, &host, port, max_seq_len, fp8, &kv_cache);
     let instance_id = instance.id.clone();
     state.create_serve_instance(instance).await;
 
@@ -1761,12 +1755,9 @@ pub async fn start_serve(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let mut child = cmd.spawn().map_err(|e| {
-        AppError(format!(
-            "Failed to spawn `{}`: {e}",
-            binary.display()
-        ))
-    })?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| AppError(format!("Failed to spawn `{}`: {e}", binary.display())))?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     state
@@ -1806,9 +1797,7 @@ fn spawn_serve_output_reader(
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     // Merge stdout + stderr into one push loop keyed by instance_id.
-    let merge = |maybe_stream: Option<
-        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-    >,
+    let merge = |maybe_stream: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
                  instances: Arc<tokio::sync::RwLock<Vec<ServeInstance>>>,
                  event_tx: tokio::sync::broadcast::Sender<AppEvent>,
                  instance_id: String| async move {
@@ -1818,7 +1807,9 @@ fn spawn_serve_output_reader(
             let mut instances_w = instances.write().await;
             if let Some(inst) = instances_w.iter_mut().find(|i| i.id == instance_id) {
                 inst.append_log(&line);
-                let _ = event_tx.send(AppEvent::ServeUpdate { instance: inst.clone() });
+                let _ = event_tx.send(AppEvent::ServeUpdate {
+                    instance: inst.clone(),
+                });
             } else {
                 break;
             }
@@ -1840,7 +1831,9 @@ fn spawn_serve_output_reader(
 
 fn spawn_serve_exit_watcher(
     instances: Arc<tokio::sync::RwLock<Vec<ServeInstance>>>,
-    active_processes: Arc<tokio::sync::RwLock<std::collections::HashMap<String, tokio::process::Child>>>,
+    active_processes: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, tokio::process::Child>>,
+    >,
     event_tx: tokio::sync::broadcast::Sender<AppEvent>,
     instance_id: String,
 ) {
@@ -1862,9 +1855,7 @@ fn spawn_serve_exit_watcher(
                     procs.remove(&instance_id);
                     drop(procs);
                     let mut instances_w = instances.write().await;
-                    if let Some(inst) =
-                        instances_w.iter_mut().find(|i| i.id == instance_id)
-                    {
+                    if let Some(inst) = instances_w.iter_mut().find(|i| i.id == instance_id) {
                         if matches!(inst.status, ServeStatus::Starting | ServeStatus::Running) {
                             if status.success() {
                                 inst.status = ServeStatus::Stopped;
@@ -1876,8 +1867,9 @@ fn spawn_serve_exit_watcher(
                                 inst.error_message = Some(inst.status_message.clone().unwrap());
                             }
                             inst.stopped_at = Some(Utc::now());
-                            let _ = event_tx
-                                .send(AppEvent::ServeUpdate { instance: inst.clone() });
+                            let _ = event_tx.send(AppEvent::ServeUpdate {
+                                instance: inst.clone(),
+                            });
                             let _ = event_tx.send(AppEvent::ServeStopped {
                                 instance_id: instance_id.clone(),
                             });
@@ -1930,7 +1922,10 @@ pub async fn start_bench(
     _app_handle: AppHandle,
     config: BenchConfigDto,
 ) -> Result<String> {
-    let mode = config.mode.clone().unwrap_or_else(|| "workload".to_string());
+    let mode = config
+        .mode
+        .clone()
+        .unwrap_or_else(|| "workload".to_string());
     if !matches!(mode.as_str(), "workload" | "basic") {
         return Err(AppError(format!(
             "Unknown bench mode '{mode}' (expected workload or basic)"
@@ -2131,6 +2126,7 @@ async fn spawn_job_subprocess(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_job_reader(
     kind: JobKind,
     bench_runs: Arc<tokio::sync::RwLock<Vec<BenchRun>>>,
@@ -2193,12 +2189,30 @@ fn spawn_job_reader(
         let event_tx = event_tx.clone();
         let run_id = run_id.clone();
         tokio::spawn(async move {
-            drain(kind, bench_runs, eval_runs, pretrain_runs, event_tx, run_id, s).await;
+            drain(
+                kind,
+                bench_runs,
+                eval_runs,
+                pretrain_runs,
+                event_tx,
+                run_id,
+                s,
+            )
+            .await;
         });
     }
     if let Some(s) = stderr {
         tokio::spawn(async move {
-            drain(kind, bench_runs, eval_runs, pretrain_runs, event_tx, run_id, s).await;
+            drain(
+                kind,
+                bench_runs,
+                eval_runs,
+                pretrain_runs,
+                event_tx,
+                run_id,
+                s,
+            )
+            .await;
         });
     }
 }
@@ -2243,8 +2257,8 @@ fn spawn_job_exit_watcher(
                                     };
                                     run.ended_at = Some(Utc::now());
                                     run.error_message = msg.clone();
-                                    let _ = event_tx
-                                        .send(AppEvent::BenchUpdate { run: run.clone() });
+                                    let _ =
+                                        event_tx.send(AppEvent::BenchUpdate { run: run.clone() });
                                     let _ = event_tx.send(AppEvent::BenchStopped {
                                         run_id: run_id.clone(),
                                     });
@@ -2262,8 +2276,8 @@ fn spawn_job_exit_watcher(
                                     };
                                     run.ended_at = Some(Utc::now());
                                     run.error_message = msg.clone();
-                                    let _ = event_tx
-                                        .send(AppEvent::EvalUpdate { run: run.clone() });
+                                    let _ =
+                                        event_tx.send(AppEvent::EvalUpdate { run: run.clone() });
                                     let _ = event_tx.send(AppEvent::EvalStopped {
                                         run_id: run_id.clone(),
                                     });
@@ -2369,18 +2383,12 @@ pub async fn start_pretrain(
         "--grad-accum".into(),
         config.grad_accum.unwrap_or(1).to_string(),
     ]);
-    args.extend([
-        "--steps".into(),
-        config.steps.unwrap_or(10000).to_string(),
-    ]);
+    args.extend(["--steps".into(), config.steps.unwrap_or(10000).to_string()]);
     args.extend([
         "--learning-rate".into(),
         config.learning_rate.unwrap_or(3e-4).to_string(),
     ]);
-    args.extend([
-        "--min-lr".into(),
-        config.min_lr.unwrap_or(1e-5).to_string(),
-    ]);
+    args.extend(["--min-lr".into(), config.min_lr.unwrap_or(1e-5).to_string()]);
     args.extend([
         "--warmup-steps".into(),
         config.warmup_steps.unwrap_or(1000).to_string(),
@@ -2414,10 +2422,7 @@ pub async fn start_pretrain(
         config.checkpoint_every.unwrap_or(1000).to_string(),
     ]);
     args.extend(["--output-dir".into(), output_dir]);
-    args.extend([
-        "--seed".into(),
-        config.seed.unwrap_or(42).to_string(),
-    ]);
+    args.extend(["--seed".into(), config.seed.unwrap_or(42).to_string()]);
 
     spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Pretrain).await?;
     Ok(run_id)
@@ -2581,22 +2586,26 @@ async fn run_inference_streaming(
     // For native paths, prefer the bridge's own decode metrics (measured inside the decode loop,
     // skipping the first 10 steps and excluding stop-token overhead) over wall-clock estimation.
     // Fall back to wall-clock calculation for non-native paths.
-    let (tok_per_sec, avg_step_ms, p50_step_ms) =
-        if let Some(m) = runner.state.last_decode_metrics {
-            (Some(m.tok_per_sec), Some(m.avg_step_ms), Some(m.p50_step_ms))
-        } else {
-            // Token 1 is the prefill output (counted in TTFT); tokens 2..N are decode steps.
-            let tps = if let Some(dm) = decode_ms {
-                if dm > 0.0 && generated_tokens > 1 {
-                    Some((generated_tokens - 1) as f64 / (dm / 1000.0))
-                } else {
-                    None
-                }
+    let (tok_per_sec, avg_step_ms, p50_step_ms) = if let Some(m) = runner.state.last_decode_metrics
+    {
+        (
+            Some(m.tok_per_sec),
+            Some(m.avg_step_ms),
+            Some(m.p50_step_ms),
+        )
+    } else {
+        // Token 1 is the prefill output (counted in TTFT); tokens 2..N are decode steps.
+        let tps = if let Some(dm) = decode_ms {
+            if dm > 0.0 && generated_tokens > 1 {
+                Some((generated_tokens - 1) as f64 / (dm / 1000.0))
             } else {
                 None
-            };
-            (tps, None, None)
+            }
+        } else {
+            None
         };
+        (tps, None, None)
+    };
 
     let parsed_response = pmetal::response_parser::parse_assistant_response(&streamed_text);
 
@@ -3068,7 +3077,7 @@ fn apply_metrics_to_distillation(
     }
     if let Some(v) = metrics["loss"].as_f64() {
         run.loss = Some(v);
-        if run.best_loss.map_or(true, |best| v < best) {
+        if run.best_loss.is_none_or(|best| v < best) {
             run.best_loss = Some(v);
         }
     }
@@ -3213,7 +3222,7 @@ fn apply_metrics_to_grpo(
     }
     if let Some(v) = metrics["loss"].as_f64() {
         run.loss = Some(v);
-        if run.best_loss.map_or(true, |best| v < best) {
+        if run.best_loss.is_none_or(|best| v < best) {
             run.best_loss = Some(v);
         }
     }
@@ -3894,9 +3903,9 @@ fn run_quantize_in_process(
     output_path: &str,
 ) -> std::result::Result<(), AppError> {
     use pmetal::gguf::{
-        GgmlType, GgufBuilder,
         dynamic::{DynamicQuantizationConfig, DynamicQuantizer},
         quantize::quantize,
+        GgmlType, GgufBuilder,
     };
 
     let resolved_model_path = PathBuf::from(model_path);
@@ -4029,10 +4038,9 @@ pub fn start_event_forwarder(app_handle: AppHandle, state: &AppState) {
                             "bench-started",
                             serde_json::to_value(run).unwrap_or_default(),
                         ),
-                        AppEvent::BenchStopped { run_id } => (
-                            "bench-stopped",
-                            serde_json::Value::String(run_id.clone()),
-                        ),
+                        AppEvent::BenchStopped { run_id } => {
+                            ("bench-stopped", serde_json::Value::String(run_id.clone()))
+                        }
                         AppEvent::BenchUpdate { run } => (
                             "bench-update",
                             serde_json::to_value(run).unwrap_or_default(),
@@ -4041,14 +4049,12 @@ pub fn start_event_forwarder(app_handle: AppHandle, state: &AppState) {
                             "eval-started",
                             serde_json::to_value(run).unwrap_or_default(),
                         ),
-                        AppEvent::EvalStopped { run_id } => (
-                            "eval-stopped",
-                            serde_json::Value::String(run_id.clone()),
-                        ),
-                        AppEvent::EvalUpdate { run } => (
-                            "eval-update",
-                            serde_json::to_value(run).unwrap_or_default(),
-                        ),
+                        AppEvent::EvalStopped { run_id } => {
+                            ("eval-stopped", serde_json::Value::String(run_id.clone()))
+                        }
+                        AppEvent::EvalUpdate { run } => {
+                            ("eval-update", serde_json::to_value(run).unwrap_or_default())
+                        }
                         AppEvent::PretrainStarted { run } => (
                             "pretrain-started",
                             serde_json::to_value(run).unwrap_or_default(),
@@ -4290,9 +4296,9 @@ fn estimate_params_b(model_id: &str) -> f64 {
 }
 
 /// Simple non-symlink-aware dir size (for output directories we just created).
-async fn dir_size_simple(path: &PathBuf) -> u64 {
+async fn dir_size_simple(path: &Path) -> u64 {
     let mut total: u64 = 0;
-    let mut stack = vec![path.clone()];
+    let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let mut rd = match tokio::fs::read_dir(&dir).await {
             Ok(rd) => rd,
@@ -4351,7 +4357,7 @@ async fn read_model_config_json(repo_path: &str) -> Option<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InferenceMessage, chat_message_from_inference_message};
+    use super::{chat_message_from_inference_message, InferenceMessage};
 
     #[test]
     fn inference_message_mapping_preserves_supported_roles() {
