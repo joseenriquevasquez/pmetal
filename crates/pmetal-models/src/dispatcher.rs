@@ -795,6 +795,13 @@ impl DynamicModel {
             Self::Llama(m) => m.model.forward(input_ids, mask),
             Self::Qwen2(m) => m.model.forward(input_ids, mask),
             Self::Qwen3(m) => m.model.forward(input_ids, mask, None),
+            Self::Qwen3MoE(m) => m.model.forward(input_ids, mask, None),
+            Self::DeepSeek(m) => m.model.forward(input_ids, mask, None),
+            // Cohere / Granite inner models take position_ids in the
+            // 3rd slot (not cache); `None` is fine for embeddings.
+            Self::Cohere(m) => m.model.forward(input_ids, mask, None),
+            Self::Granite(m) => m.model.forward(input_ids, mask, None),
+            Self::GptOss(m) => m.model.forward(input_ids, mask, None),
             Self::Mistral(m) => m.model.forward(input_ids, mask),
             Self::Gemma(m) => m.model.forward(input_ids, mask),
             // Gemma4 / Phi / Phi4 inner models expose only forward_with_cache;
@@ -805,7 +812,8 @@ impl DynamicModel {
             Self::Bert(m) => BertForEmbedding::forward(m, input_ids, mask),
             other => Err(Exception::custom(format!(
                 "forward_hidden not implemented for {:?} — supported archs: \
-                 Llama, Qwen2, Qwen3, Mistral, Gemma, Gemma4, Phi, Phi4, BERT",
+                 Llama, Qwen2, Qwen3, Qwen3MoE, Mistral, Gemma, Gemma4, \
+                 Phi, Phi4, DeepSeek, Cohere, Granite, GptOss, BERT",
                 other
             ))),
         }
