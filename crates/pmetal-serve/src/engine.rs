@@ -578,16 +578,30 @@ impl InferenceEngine {
 
     /// Format chat messages using the detected template.
     pub fn format_chat(&self, messages: &[ChatMessage]) -> String {
+        self.format_chat_with_tools(messages, None)
+    }
+
+    /// Format chat messages with optional tool definitions. The chat template
+    /// injects tool definitions into the system prompt using the model-specific
+    /// format — Qwen, Llama 3.1+, Mistral v3+, and ChatML support this natively;
+    /// other templates fall through to a generic ChatML-style injection.
+    pub fn format_chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[pmetal_data::chat_templates::ToolDefinition]>,
+    ) -> String {
         let msgs: Vec<pmetal_data::chat_templates::Message> = messages
             .iter()
             .map(|m| pmetal_data::chat_templates::Message {
                 role: m.role.clone(),
                 content: m.content.clone(),
-                tool_calls: None,
+                tool_calls: m.tool_calls.clone(),
                 tool_call_id: None,
             })
             .collect();
-        let formatted = self.chat_template.apply(&msgs);
+        // apply_inference prefers the upstream Jinja template when present, so
+        // tool definitions land in the exact shape the model was trained on.
+        let formatted = self.chat_template.apply_inference(&msgs, false, tools);
         formatted.text
     }
 

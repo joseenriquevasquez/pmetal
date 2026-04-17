@@ -145,10 +145,13 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, ServeError> {
-    // Format messages using chat template.
-    let prompt = state.engine.format_chat(&req.messages);
+    // Format messages using chat template, optionally including tool definitions.
+    let prompt = state
+        .engine
+        .format_chat_with_tools(&req.messages, req.tools.as_deref());
     let input_ids = state.engine.tokenize(&prompt)?;
     let prompt_tokens = input_ids.len();
+    let tools_requested = req.tools.is_some();
 
     // Resolve stop strings to token IDs.
     let extra_stop_ids = resolve_stop_ids(&req.stop, &state.engine);
@@ -186,8 +189,15 @@ pub async fn chat_completions(
         let tokenizer = state.engine.tokenizer_arc();
         let metrics_handle = Arc::clone(&state);
 
-        let sse_stream =
-            chat_sse_stream(rx, tokenizer, request_id, model_id, created, metrics_handle);
+        let sse_stream = chat_sse_stream(
+            rx,
+            tokenizer,
+            request_id,
+            model_id,
+            created,
+            metrics_handle,
+            tools_requested,
+        );
 
         return Ok(Sse::new(sse_stream)
             .keep_alive(axum::response::sse::KeepAlive::default())
@@ -202,6 +212,17 @@ pub async fn chat_completions(
     let completion_tokens = tokens.len();
     let text = state.engine.decode(&tokens)?;
 
+    // Best-effort tool-call detection: only attempted when the caller declared
+    // `tools` in the request. Falls back to plain content otherwise.
+    let (content, tool_calls, reason) = if tools_requested {
+        match try_parse_tool_calls(&text) {
+            Some(calls) => (String::new(), Some(calls), "tool_calls".to_string()),
+            None => (text, None, finish_reason),
+        }
+    } else {
+        (text, None, finish_reason)
+    };
+
     Ok(Json(ChatCompletionResponse {
         id: request_id,
         object: "chat.completion".to_string(),
@@ -211,9 +232,10 @@ pub async fn chat_completions(
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_string(),
-                content: text,
+                content,
+                tool_calls,
             },
-            finish_reason: Some(finish_reason),
+            finish_reason: Some(reason),
         }],
         usage: Usage {
             prompt_tokens,
@@ -315,6 +337,7 @@ fn chat_sse_stream(
     model_id: String,
     created: i64,
     state: Arc<AppState>,
+    tools_requested: bool,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> + Send + 'static {
     // Pre-build the opening event once.
     let opening = {
@@ -328,6 +351,7 @@ fn chat_sse_stream(
                 delta: ChatDelta {
                     role: Some("assistant".to_string()),
                     content: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -368,6 +392,7 @@ fn chat_sse_stream(
                             delta: ChatDelta {
                                 role: None,
                                 content: Some(new_text),
+                                tool_calls: None,
                             },
                             finish_reason: None,
                         }],
@@ -391,6 +416,7 @@ fn chat_sse_stream(
                             delta: ChatDelta {
                                 role: None,
                                 content: Some(remaining),
+                                tool_calls: None,
                             },
                             finish_reason: None,
                         }],
@@ -402,7 +428,20 @@ fn chat_sse_stream(
                 // Record request metrics now that generation is complete.
                 state.metrics.record(&metrics);
 
-                // Closing chunk: empty delta, finish_reason set.
+                // Best-effort tool-call detection on the accumulated response.
+                let (tool_calls, reason) = if tools_requested {
+                    let full_text = tokenizer.decode(&token_buffer).unwrap_or_default();
+                    match try_parse_tool_calls(&full_text) {
+                        Some(calls) => (Some(calls), "tool_calls".to_string()),
+                        None => (None, finish_reason),
+                    }
+                } else {
+                    (None, finish_reason)
+                };
+
+                // Closing chunk: empty delta, finish_reason set. When a tool
+                // call was detected, attach structured tool_calls so tool-aware
+                // clients can use the parsed form without re-parsing content.
                 let closing = ChatCompletionChunk {
                     id: request_id.clone(),
                     object: "chat.completion.chunk".to_string(),
@@ -413,8 +452,9 @@ fn chat_sse_stream(
                         delta: ChatDelta {
                             role: None,
                             content: None,
+                            tool_calls,
                         },
-                        finish_reason: Some(finish_reason),
+                        finish_reason: Some(reason),
                     }],
                 };
                 events.push(Ok(Event::default()
