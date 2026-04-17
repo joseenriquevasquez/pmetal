@@ -32,19 +32,28 @@ use std::sync::Arc;
 /// // For tool-call detection post-Done:
 /// let full = dec.decoded_text();
 /// ```
-pub struct IncrementalDecoder {
+///
+/// Streaming logprobs use `push_with_aux` / `flush_aux` to keep an arbitrary
+/// per-token payload aligned with the text deltas: tokens that don't yet
+/// emit text (mid-codepoint) park their payload in the pending queue;
+/// when a later token confirms the codepoint, the drained queue is
+/// returned alongside the new text.
+pub struct IncrementalDecoder<Aux = ()> {
     tokenizer: Arc<pmetal_data::Tokenizer>,
     buffer: Vec<u32>,
     emitted: usize,
+    /// Per-token aux payloads waiting for their emission boundary.
+    pending_aux: Vec<Aux>,
 }
 
-impl IncrementalDecoder {
+impl<Aux> IncrementalDecoder<Aux> {
     /// Create a new decoder that decodes tokens against `tokenizer`.
     pub fn new(tokenizer: Arc<pmetal_data::Tokenizer>) -> Self {
         Self {
             tokenizer,
             buffer: Vec::new(),
             emitted: 0,
+            pending_aux: Vec::new(),
         }
     }
 
@@ -56,10 +65,36 @@ impl IncrementalDecoder {
         self.consume_newly_decoded()
     }
 
+    /// Push a token with an associated aux payload. Returns the newly
+    /// confirmed text prefix and the per-token aux payloads aligned with
+    /// the tokens that contributed to that text. When the decoder is still
+    /// mid-codepoint, returns an empty string + empty Vec — the aux is
+    /// queued and will drain on a later boundary.
+    pub fn push_with_aux(&mut self, token_id: u32, aux: Aux) -> (String, Vec<Aux>) {
+        self.buffer.push(token_id);
+        self.pending_aux.push(aux);
+        let text = self.consume_newly_decoded();
+        if text.is_empty() {
+            (text, Vec::new())
+        } else {
+            (text, std::mem::take(&mut self.pending_aux))
+        }
+    }
+
     /// Flush any remaining buffered tokens at end-of-stream. Returns an
     /// empty string when every decoded byte has already been emitted.
     pub fn flush(&mut self) -> String {
         self.consume_newly_decoded()
+    }
+
+    /// Same as [`flush`] but also returns any pending aux payloads that
+    /// never got drained because their tokens never produced a complete
+    /// codepoint. Callers using [`push_with_aux`] should prefer this on
+    /// the terminal Done event so no payload is silently dropped.
+    pub fn flush_aux(&mut self) -> (String, Vec<Aux>) {
+        let text = self.consume_newly_decoded();
+        let aux = std::mem::take(&mut self.pending_aux);
+        (text, aux)
     }
 
     /// The full decoded text accumulated so far. Used by the chat /

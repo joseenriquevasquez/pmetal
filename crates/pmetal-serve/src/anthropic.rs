@@ -404,12 +404,16 @@ fn anthropic_sse_stream(
     ]);
 
     // Shared UTF-8 boundary buffering — see crate::sse::IncrementalDecoder.
-    let mut decoder = IncrementalDecoder::new(tokenizer);
+    // Anthropic stream doesn't surface OpenAI logprobs, aux is `()`.
+    let mut decoder: IncrementalDecoder<()> = IncrementalDecoder::new(tokenizer);
 
     let mapped = ReceiverStream::new(rx).flat_map(move |event| {
         let mut events: Vec<Result<Event, Infallible>> = Vec::new();
         match event {
-            TokenEvent::Token(tok) => {
+            TokenEvent::Token {
+                id: tok,
+                logprob: _,
+            } => {
                 let new_text = decoder.push(tok);
                 if !new_text.is_empty() {
                     let delta = MessageEvent::ContentBlockDelta {

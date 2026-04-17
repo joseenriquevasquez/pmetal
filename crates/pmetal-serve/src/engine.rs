@@ -80,8 +80,13 @@ pub struct RequestMetrics {
 
 /// A single event emitted during token-by-token streaming generation.
 pub enum TokenEvent {
-    /// A generated token.
-    Token(u32),
+    /// A generated token. `logprob` is `Some` only when the request set
+    /// `SamplingParams::logprobs_top_n`; otherwise it stays `None` so the
+    /// hot path is unchanged for callers that don't care.
+    Token {
+        id: u32,
+        logprob: Option<TokenLogprobEntry>,
+    },
     /// Generation is complete — carries finish reason and final metrics.
     Done(String, RequestMetrics),
     /// Generation failed.
@@ -836,7 +841,13 @@ impl InferenceEngine {
                         first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
                     }
                     completion_tokens += 1;
-                    if tx.blocking_send(TokenEvent::Token(token)).is_err() {
+                    if tx
+                        .blocking_send(TokenEvent::Token {
+                            id: token,
+                            logprob: None,
+                        })
+                        .is_err()
+                    {
                         receiver_dropped = true;
                         return false;
                     }
@@ -849,7 +860,13 @@ impl InferenceEngine {
                         first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
                     }
                     completion_tokens += 1;
-                    if tx.blocking_send(TokenEvent::Token(token)).is_err() {
+                    if tx
+                        .blocking_send(TokenEvent::Token {
+                            id: token,
+                            logprob: None,
+                        })
+                        .is_err()
+                    {
                         receiver_dropped = true;
                         return false;
                     }
@@ -1172,6 +1189,10 @@ impl InferenceEngine {
         let ane_max_seq_len = self.ane_max_seq_len;
         let backend = Arc::clone(&self.backend);
         let cache_mode_override = self.cache_mode_override;
+        // Captured per-token logprobs flag for the GPU streaming loop. The
+        // accelerated paths cannot collect logprobs, so they always emit
+        // TokenEvent::Token { logprob: None } regardless of this value.
+        let logprobs_top_n = params.logprobs_top_n;
 
         // Spawn generation on a dedicated blocking thread.
         tokio::task::spawn_blocking(move || {
@@ -1274,10 +1295,38 @@ impl InferenceEngine {
                     break;
                 }
 
+                // Compute logprobs *before* the next forward pass — last_logits
+                // is still in scope and we have the chosen token id. Cheap when
+                // top_n is small; bypassed entirely when caller didn't opt in.
+                let logprob_entry = match logprobs_top_n {
+                    Some(top_n) => {
+                        match pmetal_models::generation::token_logprobs(
+                            &last_logits,
+                            next_token,
+                            top_n + 1,
+                        ) {
+                            Ok((lp, mut top)) => {
+                                top.retain(|(tok, _)| *tok != next_token);
+                                top.truncate(top_n);
+                                Some(TokenLogprobEntry {
+                                    token: next_token,
+                                    logprob: lp,
+                                    top_logprobs: top,
+                                })
+                            }
+                            Err(_) => None,
+                        }
+                    }
+                    None => None,
+                };
+
                 // Emit token before running the next forward pass so the
                 // route handler can begin decoding and sending it to the
                 // client while the GPU works on the next token.
-                send!(TokenEvent::Token(next_token));
+                send!(TokenEvent::Token {
+                    id: next_token,
+                    logprob: logprob_entry,
+                });
                 completion_tokens += 1;
                 all_tokens.push(next_token);
 

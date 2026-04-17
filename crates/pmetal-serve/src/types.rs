@@ -454,6 +454,12 @@ pub struct ChatDelta {
     /// as a function call. Mid-stream token deltas leave this `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Per-delta logprobs payload — one `TokenLogprobContent` per token that
+    /// contributed to this delta's `content`. Populated only when the request
+    /// set `logprobs: true`. The default omit-when-None rule keeps the wire
+    /// shape unchanged for callers that don't opt in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChatLogprobs>,
 }
 
 /// Best-effort parser that converts a raw assistant response into a tool call

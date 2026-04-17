@@ -164,10 +164,10 @@ pub async fn chat_completions(
     // Use request-time timestamp per OpenAI spec — not model creation time.
     let created = Utc::now().timestamp();
 
-    // Chat completions: honour the request's logprobs/top_logprobs fields.
-    // Streaming logprobs aren't wired yet — deliberately skipped here so
-    // the streaming path preserves its current wire shape.
-    let logprobs_top_n = if req.logprobs.unwrap_or(false) && !req.stream.unwrap_or(false) {
+    // Chat completions: honour the request's logprobs/top_logprobs fields
+    // for both streaming and non-streaming. Streaming attaches logprobs to
+    // each ChatDelta as deltas cross codepoint boundaries.
+    let logprobs_top_n = if req.logprobs.unwrap_or(false) {
         Some(req.top_logprobs.unwrap_or(0) as usize)
     } else {
         None
@@ -413,6 +413,45 @@ pub async fn completions(
 // SSE stream builders
 // ────────────────────────────────────────────────────────────────────────────
 
+/// Build the per-delta `ChatLogprobs` payload from a drained aux batch.
+///
+/// Returns `None` when none of the drained tokens carried a logprob (e.g.
+/// the request didn't set `logprobs: true`) — that lets the
+/// `skip_serializing_if = Option::is_none` annotation on `ChatDelta.logprobs`
+/// keep the wire shape unchanged for the default streaming path.
+fn delta_logprobs_from_aux(
+    tokenizer: &Arc<pmetal_data::Tokenizer>,
+    aux: Vec<Option<crate::engine::TokenLogprobEntry>>,
+) -> Option<ChatLogprobs> {
+    let any_present = aux.iter().any(Option::is_some);
+    if !any_present {
+        return None;
+    }
+    let content = aux
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            let token_str = tokenizer.decode(&[entry.token]).unwrap_or_default();
+            let top = entry
+                .top_logprobs
+                .into_iter()
+                .map(|(tok, lp)| TopLogprob {
+                    token: tokenizer.decode(&[tok]).unwrap_or_default(),
+                    logprob: lp,
+                    bytes: None,
+                })
+                .collect();
+            TokenLogprobContent {
+                token: token_str,
+                logprob: entry.logprob,
+                bytes: None,
+                top_logprobs: top,
+            }
+        })
+        .collect();
+    Some(ChatLogprobs { content })
+}
+
 /// Convert an mpsc token stream into an SSE event stream for chat completions.
 ///
 /// Emits:
@@ -444,6 +483,7 @@ fn chat_sse_stream(
                     role: Some("assistant".to_string()),
                     content: None,
                     tool_calls: None,
+                    logprobs: None,
                 },
                 finish_reason: None,
             }],
@@ -454,19 +494,30 @@ fn chat_sse_stream(
     // BPE boundaries can split multi-byte codepoints across tokens — the
     // decoder buffers the full sequence and exposes only the confirmed
     // prefix, so clients never see half-codepoint byte sequences.
-    let mut decoder = IncrementalDecoder::new(tokenizer);
+    //
+    // The aux payload is the per-token logprob (None when caller didn't
+    // opt in). On boundary-flush, drained aux entries align 1:1 with the
+    // tokens that contributed to the new text — we attach them to the
+    // outgoing ChatDelta as `logprobs.content`.
+    let mut decoder: IncrementalDecoder<Option<crate::engine::TokenLogprobEntry>> =
+        IncrementalDecoder::new(Arc::clone(&tokenizer));
 
     // Prepend the opening event to the token-event stream.
     let token_stream = ReceiverStream::new(rx);
+    let tokenizer_for_aux = Arc::clone(&tokenizer);
 
     // Map each TokenEvent to a Vec of SSE events (flat_map expands the vec).
     let mapped = token_stream.flat_map(move |event| {
         let mut events: Vec<Result<Event, Infallible>> = Vec::new();
 
         match event {
-            TokenEvent::Token(token_id) => {
-                let new_text = decoder.push(token_id);
+            TokenEvent::Token { id: token_id, logprob } => {
+                let (new_text, drained_aux) = decoder.push_with_aux(token_id, logprob);
                 if !new_text.is_empty() {
+                    // Build the per-delta logprobs payload from any aux that
+                    // crossed the codepoint boundary in this emit.
+                    let logprobs =
+                        delta_logprobs_from_aux(&tokenizer_for_aux, drained_aux);
                     let chunk = ChatCompletionChunk {
                         id: request_id.clone(),
                         object: "chat.completion.chunk".to_string(),
@@ -478,6 +529,7 @@ fn chat_sse_stream(
                                 role: None,
                                 content: Some(new_text),
                                 tool_calls: None,
+                                logprobs,
                             },
                             finish_reason: None,
                         }],
@@ -487,7 +539,7 @@ fn chat_sse_stream(
                 }
             }
             TokenEvent::Done(finish_reason, metrics) => {
-                let remaining = decoder.flush();
+                let (remaining, _drained_aux) = decoder.flush_aux();
                 if !remaining.is_empty() {
                     let chunk = ChatCompletionChunk {
                         id: request_id.clone(),
@@ -500,6 +552,7 @@ fn chat_sse_stream(
                                 role: None,
                                 content: Some(remaining),
                                 tool_calls: None,
+                                logprobs: None,
                             },
                             finish_reason: None,
                         }],
@@ -535,6 +588,7 @@ fn chat_sse_stream(
                             role: None,
                             content: None,
                             tool_calls,
+                            logprobs: None,
                         },
                         finish_reason: Some(reason),
                     }],
@@ -576,14 +630,15 @@ fn completion_sse_stream(
     let token_stream = ReceiverStream::new(rx);
 
     // BPE boundaries can split multi-byte codepoints across tokens — see
-    // crate::sse::IncrementalDecoder for the buffering rationale.
-    let mut decoder = IncrementalDecoder::new(tokenizer);
+    // crate::sse::IncrementalDecoder for the buffering rationale. Streaming
+    // logprobs aren't exposed on /v1/completions yet, so the aux type is `()`.
+    let mut decoder: IncrementalDecoder<()> = IncrementalDecoder::new(tokenizer);
 
     token_stream.flat_map(move |event| {
         let mut events: Vec<Result<Event, Infallible>> = Vec::new();
 
         match event {
-            TokenEvent::Token(token_id) => {
+            TokenEvent::Token { id: token_id, logprob: _ } => {
                 let new_text = decoder.push(token_id);
                 if !new_text.is_empty() {
                     let chunk = json!({
