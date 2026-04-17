@@ -86,6 +86,52 @@ pub fn selective_log_softmax_with_temperature(
     Ok((log_probs, valid_mask))
 }
 
+/// Next-token-shifted sum of selective log-probs — the shared canonical shape
+/// for DPO / KTO / ORPO / OnlineDPO / GRPO.
+///
+/// Performs the 3-step pattern every preference trainer was open-coding:
+/// 1. Shift: `pred_logits = logits[:, :-1, :]`, `target_labels = labels[:, 1:]`
+/// 2. `selective_log_softmax(pred_logits, target_labels)` → per-token logps
+/// 3. Sum over the sequence axis → `[B]`
+///
+/// Masked positions (label == -100) contribute 0 to the sum.
+///
+/// # Arguments
+/// * `logits` - Model output logits `[B, S, V]`. `S` must be > 1.
+/// * `labels` - Target labels `[B, S]`, `-100` for ignored positions.
+pub fn compute_log_probs(logits: &Array, labels: &Array) -> Result<Array, Exception> {
+    let seq_len = logits.dim(1);
+    let pred_logits = logits.index((.., ..seq_len - 1, ..));
+    let target_labels = labels.index((.., 1..));
+    let (per_token_logps, _valid_mask) = selective_log_softmax(&pred_logits, &target_labels)?;
+    Ok(per_token_logps.sum_axes(&[1i32], false))
+}
+
+/// Same shift + selective-log-softmax as [`compute_log_probs`], returning both
+/// the summed log-probs and a length-normalized average.
+///
+/// The average divides by `max(valid_count, 1.0)` per sample to avoid NaN when
+/// every label at a row is `-100`. Used by SimPO and ORPO.
+///
+/// # Returns
+/// `(sum_log_probs, avg_log_probs)` — both `[B]` as `Float32`.
+pub fn compute_log_probs_with_avg(
+    logits: &Array,
+    labels: &Array,
+) -> Result<(Array, Array), Exception> {
+    let seq_len = logits.dim(1);
+    let pred_logits = logits.index((.., ..seq_len - 1, ..));
+    let target_labels = labels.index((.., 1..));
+    let (per_token_logps, valid_mask) = selective_log_softmax(&pred_logits, &target_labels)?;
+    let token_sum = per_token_logps.sum_axes(&[1i32], false);
+    let valid_count_raw = valid_mask
+        .as_dtype(Dtype::Float32 as i32)
+        .sum_axes(&[1i32], false);
+    let valid_count = ops::maximum(&valid_count_raw, &Array::from_f32(1.0));
+    let avg = token_sum.divide(&valid_count);
+    Ok((token_sum, avg))
+}
+
 /// Memory-efficient entropy: `H = -sum(p * log(p))` over the vocab axis.
 ///
 /// Uses the identity `H = logsumexp(x) - sum(softmax(x) * x, axis=-1)` to
@@ -475,6 +521,98 @@ mod tests {
             ent_vals[0]
         );
         assert!(ent_vals[0] >= 0.0, "entropy must be non-negative");
+    }
+
+    #[test]
+    fn test_compute_log_probs_matches_manual_shift() {
+        // logits [1, 3, 4], labels [1, 3]. After shift: pred_logits [1, 2, 4],
+        // target_labels [1, 2].
+        let logits = Array::from_slice(
+            &[
+                1.0f32, 2.0, 3.0, 4.0, // pos 0 (dropped after shift)
+                5.0, 6.0, 7.0, 8.0, // pos 1 (pred for pos 2)
+                9.0, 10.0, 11.0, 12.0, // pos 2 (pred for pos 3)
+                13.0, 14.0, 15.0, 16.0, // pos 3 (dropped — no next label)
+            ],
+            &[1, 4, 4],
+        );
+        let labels = Array::from_slice(&[0i32, 2, 3, 1], &[1, 4]);
+
+        let summed = super::compute_log_probs(&logits, &labels).unwrap();
+        summed.eval();
+        assert_eq!(summed.shape(), &[1]);
+
+        // Manual path
+        let pred_logits = logits.index((.., ..3, ..));
+        let target_labels = labels.index((.., 1..));
+        let (per_token, _) = super::selective_log_softmax(&pred_logits, &target_labels).unwrap();
+        let expected = per_token.sum_axes(&[1i32], false);
+        expected.eval();
+
+        let s: &[f32] = summed.as_slice();
+        let e: &[f32] = expected.as_slice();
+        assert!((s[0] - e[0]).abs() < 1e-5, "{} vs {}", s[0], e[0]);
+    }
+
+    #[test]
+    fn test_compute_log_probs_with_avg_normalizes() {
+        // 2-sample batch: first has 2 valid tokens, second has 1 (rest masked).
+        let logits = Array::from_slice(
+            &[
+                // batch 0
+                1.0f32, 2.0, 3.0, //
+                4.0, 5.0, 6.0, //
+                7.0, 8.0, 9.0, //
+                // batch 1
+                1.0, 1.0, 1.0, //
+                2.0, 2.0, 2.0, //
+                3.0, 3.0, 3.0, //
+            ],
+            &[2, 3, 3],
+        );
+        // After shift, target_labels = labels[:, 1..]  -> shape [2, 2]
+        // batch 0 labels -> [1, 2] (both valid)
+        // batch 1 labels -> [0, -100] (one valid)
+        let labels = Array::from_slice(&[0i32, 1, 2, 0, 0, -100], &[2, 3]);
+
+        let (sum, avg) = super::compute_log_probs_with_avg(&logits, &labels).unwrap();
+        sum.eval();
+        avg.eval();
+        assert_eq!(sum.shape(), &[2]);
+        assert_eq!(avg.shape(), &[2]);
+
+        let s: &[f32] = sum.as_slice();
+        let a: &[f32] = avg.as_slice();
+        // batch 0: 2 valid → avg = sum / 2
+        assert!(
+            (a[0] - s[0] / 2.0).abs() < 1e-5,
+            "batch0 avg mismatch: sum={} avg={}",
+            s[0],
+            a[0]
+        );
+        // batch 1: 1 valid → avg == sum
+        assert!(
+            (a[1] - s[1]).abs() < 1e-5,
+            "batch1 avg mismatch: sum={} avg={}",
+            s[1],
+            a[1]
+        );
+    }
+
+    #[test]
+    fn test_compute_log_probs_with_avg_all_masked_no_nan() {
+        // Entire sample masked after shift — denominator must clamp to 1.0.
+        let logits = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
+        let labels = Array::from_slice(&[-100i32, -100], &[1, 2]);
+
+        let (sum, avg) = super::compute_log_probs_with_avg(&logits, &labels).unwrap();
+        sum.eval();
+        avg.eval();
+        let s: &[f32] = sum.as_slice();
+        let a: &[f32] = avg.as_slice();
+        assert_eq!(s[0], 0.0);
+        assert_eq!(a[0], 0.0);
+        assert!(a[0].is_finite(), "avg must not be NaN when all masked");
     }
 
     #[test]

@@ -287,24 +287,7 @@ impl DpoTrainer {
     /// # Returns
     /// Sum of log probabilities for non-ignored tokens [batch]
     pub fn compute_log_probs(&self, logits: &Array, labels: &Array) -> DpoResult<Array> {
-        // Shift logits and labels for next-token prediction
-        let seq_len = logits.dim(1);
-
-        // logits[:, :-1, :] -> predict next token
-        let pred_logits = logits.index((.., ..seq_len - 1, ..));
-
-        // labels[:, 1:] -> target is next token
-        let target_labels = labels.index((.., 1..));
-
-        // Selective log softmax: gather logit first, subtract logsumexp
-        // Never materializes full [B, S, V] log_softmax tensor
-        let (per_token_logps, _valid_mask) =
-            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
-
-        // Sum over sequence dimension -> [B] (masked positions are already 0)
-        let total_log_probs = per_token_logps.sum_axes(&[1i32], false);
-
-        Ok(total_log_probs)
+        Ok(crate::logprob_utils::compute_log_probs(logits, labels)?)
     }
 
     /// Compute length-normalized log probabilities for SimPO.
@@ -320,24 +303,8 @@ impl DpoTrainer {
     /// # Returns
     /// Mean of log probabilities for non-ignored tokens [batch]
     pub fn compute_log_probs_normalized(&self, logits: &Array, labels: &Array) -> DpoResult<Array> {
-        // Shift logits and labels for next-token prediction
-        let seq_len = logits.dim(1);
-
-        let pred_logits = logits.index((.., ..seq_len - 1, ..));
-        let target_labels = labels.index((.., 1..));
-
-        let (per_token_logps, valid_mask) =
-            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
-
-        // Length-normalize: divide sum by number of valid (non-ignored) tokens.
-        // This prevents bias toward longer sequences in SimPO.
-        let token_sum = per_token_logps.sum_axes(&[1i32], false);
-        let valid_count_raw = valid_mask
-            .as_dtype(Dtype::Float32.as_i32())
-            .sum_axes(&[1i32], false);
-        let valid_count = ops::maximum(&valid_count_raw, &Array::from_f32(1.0));
-
-        Ok(token_sum.divide(&valid_count))
+        let (_sum, avg) = crate::logprob_utils::compute_log_probs_with_avg(logits, labels)?;
+        Ok(avg)
     }
 
     /// Compute both policy and reference log probabilities in a single pass.
@@ -827,21 +794,12 @@ impl DpoTrainer {
         labels: &Array,
         normalized: bool,
     ) -> Result<Array, Exception> {
-        let seq_len = logits.dim(1);
-        let pred_logits = logits.index((.., ..seq_len - 1, ..));
-        let target_labels = labels.index((.., 1..));
-        let (per_token_logps, valid_mask) =
-            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
-        let token_sum = per_token_logps.sum_axes(&[1i32], false);
-        if !normalized {
-            return Ok(token_sum);
+        if normalized {
+            let (_sum, avg) = crate::logprob_utils::compute_log_probs_with_avg(logits, labels)?;
+            Ok(avg)
+        } else {
+            crate::logprob_utils::compute_log_probs(logits, labels)
         }
-
-        let valid_count_raw = valid_mask
-            .as_dtype(Dtype::Float32.as_i32())
-            .sum_axes(&[1i32], false);
-        let valid_count = ops::maximum(&valid_count_raw, &Array::from_f32(1.0));
-        Ok(token_sum.divide(&valid_count))
     }
 
     fn compute_dpo_loss_static(
