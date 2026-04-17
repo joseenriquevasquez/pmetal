@@ -278,6 +278,8 @@ pub async fn messages(
         presence_penalty: None,
         seed: None,
         extra_stop_token_ids: extra_stop_ids,
+        // Anthropic /v1/messages does not expose OpenAI-style logprobs.
+        logprobs_top_n: None,
     };
 
     if req.stream.unwrap_or(false) {
@@ -298,8 +300,9 @@ pub async fn messages(
             .into_response());
     }
 
-    // Non-streaming path.
-    let (tokens, finish_reason, metrics) = state.engine.generate(&input_ids, params).await?;
+    // Non-streaming path — ignore OpenAI-style logprobs slot.
+    let (tokens, _logprobs, finish_reason, metrics) =
+        state.engine.generate(&input_ids, params).await?;
     state.metrics.record(&metrics);
     let text = state.engine.decode(&tokens)?;
     let output_tokens = tokens.len();

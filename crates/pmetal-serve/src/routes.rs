@@ -164,6 +164,15 @@ pub async fn chat_completions(
     // Use request-time timestamp per OpenAI spec — not model creation time.
     let created = Utc::now().timestamp();
 
+    // Chat completions: honour the request's logprobs/top_logprobs fields.
+    // Streaming logprobs aren't wired yet — deliberately skipped here so
+    // the streaming path preserves its current wire shape.
+    let logprobs_top_n = if req.logprobs.unwrap_or(false) && !req.stream.unwrap_or(false) {
+        Some(req.top_logprobs.unwrap_or(0) as usize)
+    } else {
+        None
+    };
+
     let params = SamplingParams {
         max_tokens: req.max_tokens,
         temperature,
@@ -175,6 +184,7 @@ pub async fn chat_completions(
         presence_penalty: req.presence_penalty,
         seed: req.seed,
         extra_stop_token_ids: extra_stop_ids,
+        logprobs_top_n,
     };
 
     if req.stream.unwrap_or(false) {
@@ -206,7 +216,8 @@ pub async fn chat_completions(
     }
 
     // ── Non-streaming path ───────────────────────────────────────────────────
-    let (tokens, finish_reason, metrics) = state.engine.generate(&input_ids, params).await?;
+    let (tokens, logprob_entries, finish_reason, metrics) =
+        state.engine.generate(&input_ids, params).await?;
 
     state.metrics.record(&metrics);
 
@@ -224,6 +235,35 @@ pub async fn chat_completions(
         (text, None, finish_reason)
     };
 
+    // Convert engine logprob entries to the wire shape. Per-token byte
+    // decode uses the tokenizer so clients can reconstruct exact bytes
+    // even when a token lands mid-codepoint.
+    let logprobs = logprob_entries.map(|entries| {
+        let tokenizer = state.engine.tokenizer_arc();
+        let content = entries
+            .into_iter()
+            .map(|e| {
+                let token_str = tokenizer.decode(&[e.token]).unwrap_or_default();
+                let top = e
+                    .top_logprobs
+                    .into_iter()
+                    .map(|(tok, lp)| TopLogprob {
+                        token: tokenizer.decode(&[tok]).unwrap_or_default(),
+                        logprob: lp,
+                        bytes: None,
+                    })
+                    .collect();
+                TokenLogprobContent {
+                    token: token_str,
+                    logprob: e.logprob,
+                    bytes: None,
+                    top_logprobs: top,
+                }
+            })
+            .collect();
+        ChatLogprobs { content }
+    });
+
     Ok(Json(ChatCompletionResponse {
         id: request_id,
         object: "chat.completion".to_string(),
@@ -237,6 +277,7 @@ pub async fn chat_completions(
                 tool_calls,
             },
             finish_reason: Some(reason),
+            logprobs,
         }],
         usage: Usage {
             prompt_tokens,
@@ -274,6 +315,8 @@ pub async fn completions(
         presence_penalty: req.presence_penalty,
         seed: req.seed,
         extra_stop_token_ids: extra_stop_ids,
+        // /v1/completions does not expose logprobs in this phase.
+        logprobs_top_n: None,
     };
 
     if req.stream.unwrap_or(false) {
@@ -291,7 +334,9 @@ pub async fn completions(
     }
 
     // ── Non-streaming completions ────────────────────────────────────────────
-    let (tokens, finish_reason, metrics) = state.engine.generate(&input_ids, params).await?;
+    // /v1/completions doesn't expose logprobs — discard the slot.
+    let (tokens, _logprobs, finish_reason, metrics) =
+        state.engine.generate(&input_ids, params).await?;
 
     state.metrics.record(&metrics);
 

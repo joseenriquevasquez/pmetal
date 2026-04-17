@@ -35,6 +35,24 @@ pub struct SamplingParams {
     pub presence_penalty: Option<f32>,
     pub seed: Option<u64>,
     pub extra_stop_token_ids: Vec<u32>,
+    /// When `Some(n)`, emit per-token log-probabilities alongside generated
+    /// tokens. `n == 0` means chosen-token logprob only; `n > 0` also
+    /// includes the top-`n` alternative logprobs. `None` (default) skips
+    /// logprob computation entirely to keep the hot path unchanged.
+    pub logprobs_top_n: Option<usize>,
+}
+
+/// Per-token logprob data returned from [`InferenceEngine::generate`] when
+/// [`SamplingParams::logprobs_top_n`] is set.
+///
+/// The `token` field matches the corresponding entry in the returned tokens
+/// vec at the same index. `top_logprobs` is sorted descending by logprob
+/// and excludes the chosen token itself (OpenAI's wire convention).
+#[derive(Debug, Clone)]
+pub struct TokenLogprobEntry {
+    pub token: u32,
+    pub logprob: f32,
+    pub top_logprobs: Vec<(u32, f32)>,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -888,12 +906,22 @@ impl InferenceEngine {
 
     /// Generate tokens from input IDs (non-streaming).
     ///
-    /// Returns `(generated_tokens, finish_reason, metrics)`.
+    /// Returns `(generated_tokens, logprobs, finish_reason, metrics)`.
+    ///
+    /// `logprobs` is `Some(vec_with_one_entry_per_token)` when the caller
+    /// set `params.logprobs_top_n` to `Some(n)` — the accelerated ANE/CPU
+    /// paths cannot collect logprobs, so that path is bypassed whenever
+    /// logprobs are requested.
     pub async fn generate(
         &self,
         input_ids: &[u32],
         params: SamplingParams,
-    ) -> ServeResult<(Vec<u32>, String, RequestMetrics)> {
+    ) -> ServeResult<(
+        Vec<u32>,
+        Option<Vec<TokenLogprobEntry>>,
+        String,
+        RequestMetrics,
+    )> {
         // Validate before dispatching to the blocking thread.
         Self::validate_params(&params, self.max_seq_len)?;
 
@@ -907,20 +935,28 @@ impl InferenceEngine {
         let backend = Arc::clone(&self.backend);
         let cache_mode_override = self.cache_mode_override;
 
+        let logprobs_top_n = params.logprobs_top_n;
+
         // Generation is synchronous/blocking; run it on a dedicated blocking
         // thread so we don't stall the async executor.
         //
         // DynamicModel is !Send — ModelState wraps it with an unsafe Send impl
         // guarded by the Mutex. The Mutex is cloned (Arc) into the closure.
         let result = tokio::task::spawn_blocking(move || {
-            if let Some(result) = Self::try_accelerated_generate_blocking(
-                &backend,
-                &model_path,
-                &input_ids,
-                &gen_config,
-                ane_max_seq_len,
-            )? {
-                return Ok(result);
+            // Accelerated ANE / CPU-hybrid paths can't collect logprobs (they
+            // run outside the MLX logits pipeline). Skip them when logprobs
+            // are requested so the standard GPU loop handles the request.
+            if logprobs_top_n.is_none() {
+                if let Some(result) = Self::try_accelerated_generate_blocking(
+                    &backend,
+                    &model_path,
+                    &input_ids,
+                    &gen_config,
+                    ane_max_seq_len,
+                )? {
+                    let (tokens, reason, metrics) = result;
+                    return Ok((tokens, None, reason, metrics));
+                }
             }
 
             let max_tokens = gen_config.max_new_tokens;
@@ -954,6 +990,10 @@ impl InferenceEngine {
             let mut first_token_time: Option<f64> = None;
             // Track all tokens seen (prompt + generated) for repetition penalty.
             let mut all_tokens: Vec<u32> = input_ids.clone();
+            // Pre-allocate the logprobs vector when requested so we avoid
+            // re-sizing during generation. `None` when the caller didn't opt in.
+            let mut logprobs_out: Option<Vec<TokenLogprobEntry>> =
+                logprobs_top_n.map(|_| Vec::with_capacity(max_tokens));
 
             for i in 0..max_tokens {
                 // Sample from current logits (prefill logits on i=0, decode logits thereafter).
@@ -971,6 +1011,25 @@ impl InferenceEngine {
                 if stop_tokens.contains(&next_token) {
                     finish_reason = "stop".to_string();
                     break;
+                }
+
+                // Collect logprobs *before* consuming logits for the next
+                // decode step. Only fires when caller opted in.
+                if let (Some(top_n), Some(out)) = (logprobs_top_n, logprobs_out.as_mut()) {
+                    let (logprob, mut top) = pmetal_models::generation::token_logprobs(
+                        &last_logits,
+                        next_token,
+                        top_n + 1, // +1 so we can strip the chosen token if present
+                    )
+                    .map_err(ServeError::Model)?;
+                    // OpenAI convention: top_logprobs excludes the chosen token itself.
+                    top.retain(|(tok, _)| *tok != next_token);
+                    top.truncate(top_n);
+                    out.push(TokenLogprobEntry {
+                        token: next_token,
+                        logprob,
+                        top_logprobs: top,
+                    });
                 }
 
                 generated.push(next_token);
@@ -998,7 +1057,7 @@ impl InferenceEngine {
             let metrics =
                 Self::build_metrics(start, prompt_tokens, completion_tokens, first_token_time);
 
-            Ok::<_, ServeError>((generated, finish_reason, metrics))
+            Ok::<_, ServeError>((generated, logprobs_out, finish_reason, metrics))
         })
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))??;
@@ -1379,6 +1438,7 @@ mod tests {
             presence_penalty: None,
             seed: Some(7),
             extra_stop_token_ids: vec![99],
+            logprobs_top_n: None,
         };
 
         let config = build_generation_config_from_parts(&[1, 2], 32, true, &params);

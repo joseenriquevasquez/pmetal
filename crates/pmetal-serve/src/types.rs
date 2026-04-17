@@ -99,6 +99,51 @@ pub struct ChatCompletionRequest {
     /// generation decides whether `tool_calls` or `content` is returned.
     #[serde(default)]
     pub tools: Option<Vec<ToolDefinition>>,
+    /// When `true`, include per-generated-token log-probabilities in the
+    /// response. Defaults to `false` — enabling adds one log-softmax
+    /// reduction per decode step, so the hot path stays unchanged for
+    /// callers that don't care about confidences.
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    /// Number of top alternative logprobs to return per token when
+    /// `logprobs = true`. OpenAI caps this at 20 in their docs; we accept
+    /// any `u8` value and clamp on the generation side. `None` / `Some(0)`
+    /// means chosen-token logprob only.
+    #[serde(default)]
+    pub top_logprobs: Option<u8>,
+}
+
+/// Per-token logprob entry as it appears on the wire under
+/// `ChatChoice.logprobs.content`. Matches OpenAI's shape exactly:
+/// `{token, logprob, bytes?, top_logprobs: [{token, logprob, bytes?}]}`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenLogprobContent {
+    /// The decoded token string.
+    pub token: String,
+    /// Natural-log probability of this token under the model's distribution.
+    pub logprob: f32,
+    /// UTF-8 byte representation. Present so clients can reconstruct the
+    /// byte stream even when `token` contains a replacement character.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+    /// Alternative tokens considered at this position, sorted descending
+    /// by logprob. Excludes the chosen token itself.
+    pub top_logprobs: Vec<TopLogprob>,
+}
+
+/// A single alternative in `TokenLogprobContent::top_logprobs`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TopLogprob {
+    pub token: String,
+    pub logprob: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+}
+
+/// Wrapper object attached to `ChatChoice.logprobs` when requested.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatLogprobs {
+    pub content: Vec<TokenLogprobContent>,
 }
 
 fn default_max_tokens() -> usize {
@@ -199,6 +244,65 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_parses_logprobs_fields() {
+        let req: ChatCompletionRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[],"logprobs":true,"top_logprobs":5}"#)
+                .unwrap();
+        assert_eq!(req.logprobs, Some(true));
+        assert_eq!(req.top_logprobs, Some(5));
+    }
+
+    #[test]
+    fn chat_logprobs_absent_serializes_without_field() {
+        // When logprobs is None on ChatChoice, the JSON must not include
+        // "logprobs": null — legacy clients would reject it.
+        let choice = ChatChoice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: "hi".into(),
+                tool_calls: None,
+            },
+            finish_reason: Some("stop".into()),
+            logprobs: None,
+        };
+        let json = serde_json::to_string(&choice).unwrap();
+        assert!(
+            !json.contains("logprobs"),
+            "logprobs field should be omitted when None, got: {json}"
+        );
+    }
+
+    #[test]
+    fn chat_logprobs_serializes_when_present() {
+        let choice = ChatChoice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: "hi".into(),
+                tool_calls: None,
+            },
+            finish_reason: Some("stop".into()),
+            logprobs: Some(ChatLogprobs {
+                content: vec![TokenLogprobContent {
+                    token: "hi".into(),
+                    logprob: -0.5,
+                    bytes: None,
+                    top_logprobs: vec![TopLogprob {
+                        token: "hello".into(),
+                        logprob: -1.2,
+                        bytes: None,
+                    }],
+                }],
+            }),
+        };
+        let json = serde_json::to_string(&choice).unwrap();
+        assert!(json.contains(r#""logprobs""#));
+        assert!(json.contains(r#""token":"hi""#));
+        assert!(json.contains(r#""logprob":-0.5"#));
+    }
+
+    #[test]
     fn tool_parse_allows_whitespace() {
         let text = "  \n\t{\n  \"name\": \"f\"\n}\n ";
         let calls = try_parse_tool_calls(text).expect("should parse");
@@ -225,6 +329,11 @@ pub struct ChatChoice {
     pub index: usize,
     pub message: ChatMessage,
     pub finish_reason: Option<String>,
+    /// Populated only when the request had `logprobs: true`. The field is
+    /// omitted from the response body in the default case so the wire shape
+    /// stays byte-compatible with legacy clients that don't expect it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChatLogprobs>,
 }
 
 /// Text completion response.
