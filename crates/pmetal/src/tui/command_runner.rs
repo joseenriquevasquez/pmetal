@@ -150,6 +150,41 @@ impl pmetal_core::TrainingCallback for CancelOnToken {
     }
 }
 
+/// In-process training metrics callback.
+///
+/// When a training job runs in the same process as the TUI (via
+/// `run_direct_command`), the trainer's `on_step_end_with_metrics` hook is
+/// called directly on each step — we forward the `StepMetrics` to the UI
+/// event loop through `AppMsg::JobMetrics`, eliminating the 500ms JSONL
+/// polling latency used by the subprocess fallback.
+struct ChannelMetricsCallback {
+    tx: mpsc::Sender<AppMsg>,
+    job_id: String,
+}
+
+impl pmetal_core::TrainingCallback for ChannelMetricsCallback {
+    fn on_step_end_with_metrics(&mut self, metrics: &pmetal_core::StepMetrics) {
+        // try_send so a slow UI thread can't back-pressure the trainer —
+        // the oldest metric will be dropped rather than stalling training.
+        let _ = self.tx.try_send(AppMsg::JobMetrics {
+            job_id: self.job_id.clone(),
+            step: metrics.step,
+            epoch: metrics.epoch,
+            total_epochs: metrics.total_epochs,
+            total_steps: metrics.total_steps,
+            loss: metrics.loss,
+            lr: metrics.lr,
+            tok_sec: metrics.tok_sec,
+            ane_fwd_ms: metrics.ane_fwd_ms,
+            ane_bwd_ms: metrics.ane_bwd_ms,
+            rmsnorm_ms: metrics.rmsnorm_ms,
+            cblas_ms: metrics.cblas_ms,
+            adam_ms: metrics.adam_ms,
+            total_ms: metrics.total_ms,
+        });
+    }
+}
+
 /// Run a command spec as a child process, streaming output back to the TUI.
 #[allow(unsafe_code)]
 async fn run_command(
@@ -179,17 +214,6 @@ async fn run_command(
         })
         .await;
 
-    // Poll metrics file for training jobs
-    if let Some(ref metrics_path) = spec.metrics_file {
-        let tx_metrics = tx.clone();
-        let jid = job_id.to_string();
-        let path = metrics_path.clone();
-        let cancel_metrics = cancel.clone();
-        tokio::spawn(async move {
-            poll_metrics_file(&path, &jid, tx_metrics, cancel_metrics).await;
-        });
-    }
-
     // Emit phase status for training-type jobs so the dashboard shows setup progress.
     if matches!(
         spec.job_type,
@@ -203,9 +227,24 @@ async fn run_command(
             .await;
     }
 
-    if let Some(result) = run_direct_command(&spec, cancel.clone()).await {
+    // Direct in-process path: for train/distill/grpo the callbacks stream
+    // metrics through ChannelMetricsCallback, so no JSONL polling is needed.
+    if let Some(result) = run_direct_command(&spec, job_id, tx.clone(), cancel.clone()).await {
         cleanup_running_file(&spec).await;
         return result;
+    }
+
+    // Subprocess fallback path: the child writes a JSONL metrics file and we
+    // tail it from here. The 500ms polling latency is the price for being
+    // out-of-process; direct-command jobs above don't pay it.
+    if let Some(ref metrics_path) = spec.metrics_file {
+        let tx_metrics = tx.clone();
+        let jid = job_id.to_string();
+        let path = metrics_path.clone();
+        let cancel_metrics = cancel.clone();
+        tokio::spawn(async move {
+            poll_metrics_file(&path, &jid, tx_metrics, cancel_metrics).await;
+        });
     }
 
     let binary = pmetal_binary();
@@ -488,20 +527,41 @@ async fn cleanup_running_file(spec: &CommandSpec) {
 
 async fn run_direct_command(
     spec: &CommandSpec,
+    job_id: &str,
+    tx: mpsc::Sender<AppMsg>,
     cancel: CancellationToken,
 ) -> Option<Result<(), anyhow::Error>> {
     let subcommand = spec.args.first()?.as_str();
 
     match subcommand {
-        "train" => Some(run_training_direct(spec, cancel).await),
-        "distill" => Some(run_distillation_direct(spec, cancel).await),
-        "grpo" => Some(run_grpo_direct(spec, cancel).await),
+        "train" => Some(run_training_direct(spec, job_id, tx, cancel).await),
+        "distill" => Some(run_distillation_direct(spec, job_id, tx, cancel).await),
+        "grpo" => Some(run_grpo_direct(spec, job_id, tx, cancel).await),
         _ => None,
     }
 }
 
+/// Build the two-callback vec used by every direct-path training entry point:
+/// one for cancellation, one for metrics streaming. Centralised so the three
+/// trainers (train / distill / grpo) stay in lockstep when new callbacks land.
+fn direct_training_callbacks(
+    job_id: &str,
+    tx: mpsc::Sender<AppMsg>,
+    cancel: CancellationToken,
+) -> Vec<Box<dyn pmetal_core::TrainingCallback>> {
+    vec![
+        Box::new(CancelOnToken { token: cancel }),
+        Box::new(ChannelMetricsCallback {
+            tx,
+            job_id: job_id.to_string(),
+        }),
+    ]
+}
+
 async fn run_training_direct(
     spec: &CommandSpec,
+    job_id: &str,
+    tx: mpsc::Sender<AppMsg>,
     cancel: CancellationToken,
 ) -> Result<(), anyhow::Error> {
     use pmetal_trainer::orchestrator;
@@ -543,9 +603,7 @@ async fn run_training_direct(
         optional_arg(&spec.args, "--response-column"),
     );
 
-    let callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>> = vec![Box::new(CancelOnToken {
-        token: cancel.clone(),
-    })];
+    let callbacks = direct_training_callbacks(job_id, tx, cancel);
 
     let job_config = orchestrator::TrainingJobConfig {
         model_id: model,
@@ -606,7 +664,8 @@ async fn run_training_direct(
             distributed: None,
         },
         config_path: None,
-        log_metrics: spec.metrics_file.as_ref().map(|p| p.display().to_string()),
+        // In-process: metrics stream through ChannelMetricsCallback — skip JSONL.
+        log_metrics: None,
         resume: false,
         seed: parse_arg(&spec.args, "--seed", 42u64)?,
         emit_console_output: false,
@@ -618,6 +677,8 @@ async fn run_training_direct(
 
 async fn run_distillation_direct(
     spec: &CommandSpec,
+    job_id: &str,
+    tx: mpsc::Sender<AppMsg>,
     cancel: CancellationToken,
 ) -> Result<(), anyhow::Error> {
     let teacher = required_arg(&spec.args, "--teacher")?;
@@ -627,9 +688,7 @@ async fn run_distillation_direct(
     let method = optional_arg(&spec.args, "--method").unwrap_or_else(|| "online".to_string());
     let loss_type =
         optional_arg(&spec.args, "--loss-type").unwrap_or_else(|| "kl_divergence".to_string());
-    let callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>> = vec![Box::new(CancelOnToken {
-        token: cancel.clone(),
-    })];
+    let callbacks = direct_training_callbacks(job_id, tx, cancel);
 
     crate::commands::distill::run_distillation_cli(
         &teacher,
@@ -664,14 +723,14 @@ async fn run_distillation_direct(
 
 async fn run_grpo_direct(
     spec: &CommandSpec,
+    job_id: &str,
+    tx: mpsc::Sender<AppMsg>,
     cancel: CancellationToken,
 ) -> Result<(), anyhow::Error> {
     let model = required_arg(&spec.args, "--model")?;
     let dataset = required_arg(&spec.args, "--dataset")?;
     let output = required_arg(&spec.args, "--output")?;
-    let callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>> = vec![Box::new(CancelOnToken {
-        token: cancel.clone(),
-    })];
+    let callbacks = direct_training_callbacks(job_id, tx, cancel);
 
     let grpo_type = optional_arg(&spec.args, "--grpo-type").unwrap_or_else(|| "bnpo".to_string());
 
