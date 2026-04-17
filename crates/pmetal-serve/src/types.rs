@@ -164,6 +164,41 @@ mod tests {
     }
 
     #[test]
+    fn embeddings_input_single_string_deserializes() {
+        let req: EmbeddingsRequest =
+            serde_json::from_str(r#"{"model":"m","input":"hello"}"#).unwrap();
+        assert_eq!(req.input.into_batch(), vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn embeddings_input_array_deserializes() {
+        let req: EmbeddingsRequest =
+            serde_json::from_str(r#"{"model":"m","input":["a","b","c"]}"#).unwrap();
+        assert_eq!(req.input.into_batch().len(), 3);
+    }
+
+    #[test]
+    fn pooling_mode_parse_accepts_common_spellings() {
+        use pmetal_models::pooling::PoolingMode;
+        assert_eq!(parse_pooling_mode(None), Some(PoolingMode::Mean));
+        assert_eq!(parse_pooling_mode(Some("mean")), Some(PoolingMode::Mean));
+        assert_eq!(parse_pooling_mode(Some("CLS")), Some(PoolingMode::Cls));
+        assert_eq!(
+            parse_pooling_mode(Some("last")),
+            Some(PoolingMode::LastToken)
+        );
+        assert_eq!(
+            parse_pooling_mode(Some("last_token")),
+            Some(PoolingMode::LastToken)
+        );
+        assert_eq!(
+            parse_pooling_mode(Some("weighted")),
+            Some(PoolingMode::WeightedMean)
+        );
+        assert_eq!(parse_pooling_mode(Some("unknown")), None);
+    }
+
+    #[test]
     fn tool_parse_allows_whitespace() {
         let text = "  \n\t{\n  \"name\": \"f\"\n}\n ";
         let calls = try_parse_tool_calls(text).expect("should parse");
@@ -306,6 +341,88 @@ pub fn try_parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
             arguments,
         },
     }])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Embeddings (OpenAI /v1/embeddings)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// OpenAI `/v1/embeddings` accepts `input` as either a single string or an
+/// array of strings — the response shape is always a list, one entry per
+/// input item in order.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingsInput {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+impl EmbeddingsInput {
+    /// Flatten to a single `Vec<String>` regardless of wire shape.
+    pub fn into_batch(self) -> Vec<String> {
+        match self {
+            Self::Single(s) => vec![s],
+            Self::Batch(v) => v,
+        }
+    }
+}
+
+/// `POST /v1/embeddings` request body.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingsRequest {
+    pub model: String,
+    pub input: EmbeddingsInput,
+    /// Optional pooling strategy. When absent, defaults to `mean` pooling —
+    /// the most common choice for sentence embeddings. Accepted values:
+    /// `"mean"`, `"cls"`, `"max"`, `"last_token"`, `"weighted_mean"`.
+    #[serde(default)]
+    pub pooling: Option<String>,
+    /// OpenAI compatibility fields — currently ignored but accepted so
+    /// drop-in clients don't 400. `encoding_format` other than `"float"`
+    /// would require output rewriting that's out of scope for Phase S3.
+    #[serde(default)]
+    pub encoding_format: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+/// Single embedding entry in the response list.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingData {
+    pub index: usize,
+    pub object: &'static str,
+    pub embedding: Vec<f32>,
+}
+
+/// Token counts for an embeddings response. No completion tokens — embeddings
+/// don't generate.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingsUsage {
+    pub prompt_tokens: usize,
+    pub total_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingsResponse {
+    pub object: &'static str,
+    pub data: Vec<EmbeddingData>,
+    pub model: String,
+    pub usage: EmbeddingsUsage,
+}
+
+/// Parse the wire `pooling` field into a [`PoolingMode`] with sensible
+/// defaults. Unknown modes yield `None` so the handler can 400 rather than
+/// silently applying a fallback.
+pub fn parse_pooling_mode(s: Option<&str>) -> Option<pmetal_models::pooling::PoolingMode> {
+    use pmetal_models::pooling::PoolingMode;
+    match s.unwrap_or("mean").to_ascii_lowercase().as_str() {
+        "mean" => Some(PoolingMode::Mean),
+        "cls" => Some(PoolingMode::Cls),
+        "max" => Some(PoolingMode::Max),
+        "last_token" | "last" => Some(PoolingMode::LastToken),
+        "weighted_mean" | "weighted" => Some(PoolingMode::WeightedMean),
+        _ => None,
+    }
 }
 
 /// Model info for /v1/models.

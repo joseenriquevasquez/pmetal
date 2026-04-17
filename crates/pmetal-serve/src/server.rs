@@ -49,6 +49,7 @@ pub fn build_router(engine: InferenceEngine) -> Router {
             axum::routing::post(routes::chat_completions),
         )
         .route("/v1/completions", axum::routing::post(routes::completions))
+        .route("/v1/embeddings", axum::routing::post(routes::embeddings))
         .route("/v1/messages", axum::routing::post(anthropic::messages))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())

@@ -774,6 +774,43 @@ impl DynamicModel {
         }
     }
 
+    /// Forward pass returning last-layer hidden states `[batch, seq, hidden]`
+    /// — the pre-lm-head representation used for sentence embeddings and
+    /// `/v1/embeddings`-style pooling endpoints.
+    ///
+    /// Coverage: every dense decoder arch whose `ForCausalLM` wraps a
+    /// `pub model: *Model` field routes through that inner trunk. BERT's
+    /// canonical `forward` already returns hidden states so it's a
+    /// pass-through. Architectures not listed here (Flux, Qwen3MoE, hybrid
+    /// attn+mamba variants, etc.) return a typed error — each has a
+    /// non-trivial trunk exit point (MoE routing, image conditioning,
+    /// dual-cache hybrid state) that the caller needs to opt into
+    /// explicitly rather than silently pool over.
+    pub fn forward_hidden(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Llama(m) => m.model.forward(input_ids, mask),
+            Self::Qwen2(m) => m.model.forward(input_ids, mask),
+            Self::Qwen3(m) => m.model.forward(input_ids, mask, None),
+            Self::Mistral(m) => m.model.forward(input_ids, mask),
+            Self::Gemma(m) => m.model.forward(input_ids, mask),
+            // Gemma4 / Phi / Phi4 inner models expose only forward_with_cache;
+            // pass None for the cache — embeddings don't need incremental decode.
+            Self::Gemma4(m) => m.model.forward_with_cache(input_ids, mask, None),
+            Self::Phi(m) => m.model.forward_with_cache(input_ids, mask, None),
+            Self::Phi4(m) => m.model.forward_with_cache(input_ids, mask, None),
+            Self::Bert(m) => BertForEmbedding::forward(m, input_ids, mask),
+            other => Err(Exception::custom(format!(
+                "forward_hidden not implemented for {:?} — supported archs: \
+                 Llama, Qwen2, Qwen3, Mistral, Gemma, Gemma4, Phi, Phi4, BERT",
+                other
+            ))),
+        }
+    }
+
     pub fn forward_with_cache(
         &mut self,
         input_ids: &Array,

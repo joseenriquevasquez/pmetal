@@ -556,6 +556,56 @@ fn completion_sse_stream(
     })
 }
 
+/// `POST /v1/embeddings` — OpenAI-compatible sentence embeddings.
+///
+/// Accepts a single string or an array via [`EmbeddingsInput`]; returns one
+/// embedding entry per input. Uses mean pooling by default. The model's
+/// pre-lm-head trunk is pulled through [`InferenceEngine::embed`], which
+/// errors cleanly for architectures that don't expose hidden states
+/// (Flux, Qwen3MoE, hybrid attn+mamba variants — see
+/// `DynamicModel::forward_hidden` for the supported set).
+pub async fn embeddings(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EmbeddingsRequest>,
+) -> Result<Json<EmbeddingsResponse>, ServeError> {
+    let mode = parse_pooling_mode(req.pooling.as_deref())
+        .ok_or_else(|| ServeError::BadRequest("unknown pooling mode".into()))?;
+    let inputs = req.input.into_batch();
+    if inputs.is_empty() {
+        return Err(ServeError::BadRequest("input must be non-empty".into()));
+    }
+
+    // Count prompt tokens once (tokenisation is fast + deterministic).
+    let prompt_tokens: usize = inputs
+        .iter()
+        .map(|s| state.engine.tokenize(s).map(|ids| ids.len()))
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .sum();
+
+    let vectors = state.engine.embed(&inputs, mode).await?;
+
+    let data = vectors
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| EmbeddingData {
+            index,
+            object: "embedding",
+            embedding,
+        })
+        .collect();
+
+    Ok(Json(EmbeddingsResponse {
+        object: "list",
+        data,
+        model: state.engine.model_id().to_string(),
+        usage: EmbeddingsUsage {
+            prompt_tokens,
+            total_tokens: prompt_tokens,
+        },
+    }))
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────

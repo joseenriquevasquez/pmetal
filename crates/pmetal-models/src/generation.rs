@@ -1093,6 +1093,87 @@ fn logits_to_log_probs(logits: &Array) -> Result<Array, Exception> {
     Ok(logits.subtract(&lse))
 }
 
+/// Compute the log-probability of a specific token under the given logits
+/// distribution, plus the top-N highest-logprob alternatives.
+///
+/// Used by the `/v1/chat/completions` `logprobs` feature — the sampler
+/// returns only the chosen token ID, but OpenAI clients can request the
+/// model's confidence in that token and the next-best alternatives.
+///
+/// * `logits` — raw next-token logits, shape `[..., vocab]`. Any batch/seq
+///   dimensions are squeezed to the last axis internally.
+/// * `token` — the token ID whose log-prob is requested.
+/// * `top_n` — when > 0, also returns the `top_n` highest-logprob tokens
+///   (id + logprob). When 0, the returned alternative list is empty.
+///
+/// Returns `(chosen_logprob, top_alternatives)` — both ready for wire
+/// serialisation. `chosen_logprob` is log-softmax at `token`; the
+/// alternative list is sorted descending by logprob.
+pub fn token_logprobs(
+    logits: &Array,
+    token: u32,
+    top_n: usize,
+) -> Result<(f32, Vec<(u32, f32)>), Exception> {
+    let log_probs = logits_to_log_probs(logits)?;
+    // Flatten every leading dim so single-row and batched callers both land
+    // on a 1-D [vocab] view. The sampler path only ever has one active
+    // prediction per step so this is safe.
+    let vocab = *log_probs
+        .shape()
+        .last()
+        .ok_or_else(|| Exception::custom("token_logprobs: empty logits shape"))?;
+    let flat = log_probs.reshape(&[vocab]);
+    // Force evaluation before reading raw bytes — lazy MLX arrays segfault
+    // on `.as_slice()` without a prior `.eval()`.
+    flat.eval();
+    let values: Vec<f32> = flat.as_slice().to_vec();
+
+    let idx = token as usize;
+    let chosen = values
+        .get(idx)
+        .copied()
+        .ok_or_else(|| Exception::custom(format!("token_logprobs: token {token} out of range")))?;
+
+    let mut top = Vec::new();
+    if top_n > 0 {
+        // O(V log top_n) partial sort via a min-heap of size top_n. Cheaper
+        // than a full sort for realistic vocab/top_n ratios (128k / 5).
+        use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
+        #[derive(PartialEq)]
+        struct Entry(f32, u32);
+        impl Eq for Entry {}
+        impl PartialOrd for Entry {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Entry {
+            fn cmp(&self, other: &Self) -> Ordering {
+                // Min-heap on logprob — reverse the natural order.
+                other.0.partial_cmp(&self.0).unwrap_or(Ordering::Equal)
+            }
+        }
+        let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(top_n + 1);
+        for (i, &v) in values.iter().enumerate() {
+            if heap.len() < top_n {
+                heap.push(Entry(v, i as u32));
+            } else if let Some(min) = heap.peek() {
+                if v > min.0 {
+                    heap.pop();
+                    heap.push(Entry(v, i as u32));
+                }
+            }
+        }
+        let mut collected: Vec<(u32, f32)> = heap.into_iter().map(|e| (e.1, e.0)).collect();
+        // Sort descending by logprob.
+        collected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        top = collected;
+    }
+
+    Ok((chosen, top))
+}
+
 /// GPU-native repetition penalty matching mlx_lm.
 ///
 /// For positive logits: divide by penalty (reduces probability)
@@ -2721,6 +2802,54 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_logprobs_chosen_matches_log_softmax() {
+        // [1, 5] logits — uniform vocabulary size 5.
+        let logits = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0], &[1, 5]);
+        let (chosen, top) = token_logprobs(&logits, 3, 0).unwrap();
+
+        // Manual log-softmax at index 3
+        let max = 4.0f32;
+        let sum_exp: f32 = [0.0, 1.0, 2.0, 3.0, 4.0]
+            .iter()
+            .map(|x| (x - max).exp())
+            .sum();
+        let expected = 3.0 - max - sum_exp.ln();
+        assert!(
+            (chosen - expected).abs() < 1e-5,
+            "chosen {chosen} vs expected {expected}"
+        );
+        assert!(top.is_empty(), "top_n = 0 should return empty list");
+    }
+
+    #[test]
+    fn token_logprobs_top_n_is_sorted_descending() {
+        // Known-ordering logits: [0, 1, 2, 3, 4] → biggest logprob is idx 4.
+        let logits = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0], &[1, 5]);
+        let (_, top) = token_logprobs(&logits, 0, 3).unwrap();
+        assert_eq!(top.len(), 3);
+        // Highest-logprob first: tokens 4, 3, 2.
+        assert_eq!(top[0].0, 4);
+        assert_eq!(top[1].0, 3);
+        assert_eq!(top[2].0, 2);
+        // Descending logprobs.
+        assert!(top[0].1 >= top[1].1);
+        assert!(top[1].1 >= top[2].1);
+    }
+
+    #[test]
+    fn token_logprobs_rejects_out_of_range_token() {
+        let logits = Array::from_slice(&[0.0f32, 1.0, 2.0], &[1, 3]);
+        assert!(token_logprobs(&logits, 3, 0).is_err());
+    }
+
+    #[test]
+    fn token_logprobs_handles_top_n_larger_than_vocab() {
+        let logits = Array::from_slice(&[0.0f32, 1.0, 2.0], &[1, 3]);
+        let (_, top) = token_logprobs(&logits, 0, 10).unwrap();
+        assert_eq!(top.len(), 3, "top_n is capped by vocab size");
+    }
 
     #[test]
     fn test_generation_config_default() {

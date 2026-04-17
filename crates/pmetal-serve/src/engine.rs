@@ -1006,6 +1006,74 @@ impl InferenceEngine {
         Ok(result)
     }
 
+    /// Compute pooled sentence embeddings for a batch of texts.
+    ///
+    /// Tokenises each input, forwards through the model's pre-lm-head trunk
+    /// via [`DynamicModel::forward_hidden`], and applies the requested
+    /// pooling strategy. Inputs are padded to the batch max length with a
+    /// right-padding attention mask so the pooler ignores padding positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ServeError::Model` when the architecture doesn't support
+    /// pre-lm-head hidden states — see `DynamicModel::forward_hidden` for
+    /// the supported set.
+    pub async fn embed(
+        &self,
+        inputs: &[String],
+        mode: pmetal_models::pooling::PoolingMode,
+    ) -> ServeResult<Vec<Vec<f32>>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Tokenise every input on the async side (pure CPU, no MLX state).
+        let tokenized: Vec<Vec<u32>> = inputs
+            .iter()
+            .map(|s| self.tokenize(s))
+            .collect::<ServeResult<_>>()?;
+        let batch = tokenized.len();
+        let seq_max = tokenized.iter().map(Vec::len).max().unwrap_or(0).max(1);
+
+        // Build padded [batch, seq_max] token + mask arrays up front — the
+        // blocking closure receives them by value so !Send DynamicModel never
+        // crosses an await point.
+        let mut ids_flat: Vec<i32> = vec![0; batch * seq_max];
+        let mut mask_flat: Vec<f32> = vec![0.0; batch * seq_max];
+        for (b, row) in tokenized.iter().enumerate() {
+            for (j, &tok) in row.iter().enumerate() {
+                ids_flat[b * seq_max + j] = tok as i32;
+                mask_flat[b * seq_max + j] = 1.0;
+            }
+        }
+
+        let model_arc = Arc::clone(&self.model);
+        tokio::task::spawn_blocking(move || -> ServeResult<Vec<Vec<f32>>> {
+            let mut state = model_arc.lock().map_err(|_| ServeError::Busy)?;
+            let model = &mut state.model;
+
+            let ids = Array::from_slice(&ids_flat, &[batch as i32, seq_max as i32]);
+            let mask = Array::from_slice(&mask_flat, &[batch as i32, seq_max as i32]);
+
+            let hidden = model
+                .forward_hidden(&ids, None)
+                .map_err(ServeError::Model)?;
+            let pooled =
+                pmetal_models::pooling::pool(&hidden, &mask, mode).map_err(ServeError::Model)?;
+            let pooled_eval = pooled;
+            pooled_eval.eval();
+
+            let hidden_dim = pooled_eval.dim(1) as usize;
+            let flat: Vec<f32> = pooled_eval.as_slice::<f32>().to_vec();
+            let out = (0..batch)
+                .map(|b| flat[b * hidden_dim..(b + 1) * hidden_dim].to_vec())
+                .collect();
+            Ok(out)
+        })
+        .await
+        .map_err(|e| ServeError::Model(pmetal_bridge::compat::Exception::custom(e.to_string())))?
+    }
+
     /// Begin token-by-token streaming generation.
     ///
     /// Validates `params` before spawning. If validation fails, sends a single
