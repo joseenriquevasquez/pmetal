@@ -809,6 +809,18 @@ impl DynamicModel {
             // StarCoder2 bakes lm_head into its trunk forward, so it
             // carries a dedicated pre-norm entry point.
             Self::StarCoder2(m) => m.forward_hidden(input_ids, mask),
+            // Hybrid attn+mamba / linear-attn archs — forward runs with
+            // caches elided (None). Mask support varies; RecurrentGemma
+            // and Jamba don't take masks at all, so padded embedding
+            // batches rely on the pooling step to mask pad positions.
+            Self::NemotronH(m) => m.backbone.forward(input_ids, mask),
+            Self::FalconH1(m) => m.model.forward_with_cache(input_ids, mask, None, None),
+            Self::RecurrentGemma(m) => m.forward(input_ids),
+            // Jamba bakes lm_head into its trunk forward — dedicated entry.
+            Self::Jamba(m) => m.forward_hidden(input_ids),
+            // Qwen3Next linear-attn + Mamba hybrid — cacheless forward
+            // wraps the standard dispatch with None/None caches.
+            Self::Qwen3Next(m) => m.model.forward(input_ids, mask),
             Self::Mistral(m) => m.model.forward(input_ids, mask),
             Self::Gemma(m) => m.model.forward(input_ids, mask),
             // Gemma4 / Phi / Phi4 inner models expose only forward_with_cache;
@@ -821,7 +833,8 @@ impl DynamicModel {
                 "forward_hidden not implemented for {:?} — supported archs: \
                  Llama, Llama4, Qwen2, Qwen3, Qwen3MoE, Mistral, Gemma, \
                  Gemma4, Phi, Phi4, DeepSeek, Cohere, Granite, GptOss, \
-                 StarCoder2, BERT",
+                 StarCoder2, NemotronH, FalconH1, RecurrentGemma, Jamba, \
+                 Qwen3Next, BERT",
                 other
             ))),
         }

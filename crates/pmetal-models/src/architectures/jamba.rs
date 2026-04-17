@@ -367,6 +367,20 @@ impl JambaModel {
         h = self.norm.forward(&h);
         Ok(self.lm_head.forward(&h))
     }
+
+    /// Forward pass returning post-norm hidden states (pre-lm_head).
+    ///
+    /// Used by `DynamicModel::forward_hidden` for embeddings — Jamba
+    /// bakes `lm_head` into its trunk `forward`, so a dedicated entry
+    /// point is needed to stop at `self.norm`.
+    pub fn forward_hidden(&mut self, x: &Array) -> Result<Array, Exception> {
+        let mut h = self.embed.forward(x);
+        for layer in self.layers.iter_mut() {
+            h = layer.forward(&h)?;
+        }
+        Ok(self.norm.forward(&h))
+    }
+
     pub fn eval(&self) -> Result<(), Exception> {
         ModuleParametersExt::eval(self)
     }
