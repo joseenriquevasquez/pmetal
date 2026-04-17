@@ -23,6 +23,9 @@ use pmetal_lora::TrainableModel;
 use tracing::{debug, info};
 
 use crate::dpo::{DpoConfig, DpoLossType};
+use crate::paired_preference::{
+    DpoLoss, PairedPreferenceTrainer, PreferenceLoss, ReferenceStrategy,
+};
 
 /// Configuration for Online DPO / SPPO.
 #[derive(Debug, Clone)]
@@ -397,107 +400,42 @@ impl OnlineDpoTrainer {
         let rejected_labels_arr =
             Array::from_slice(&rejected_labels, &[1, rejected_labels.len() as i32]);
 
-        // Reference model forward (no grad)
-        let ref_chosen_logits = ref_model
-            .forward(&chosen_ids, None)
-            .map_err(|e| Exception::custom(e.to_string()))?;
-        let ref_rejected_logits = ref_model
-            .forward(&rejected_ids, None)
-            .map_err(|e| Exception::custom(e.to_string()))?;
-
-        let ref_chosen_logps =
-            Self::compute_log_probs_static(&ref_chosen_logits, &chosen_labels_arr)?;
-        let ref_rejected_logps =
-            Self::compute_log_probs_static(&ref_rejected_logits, &rejected_labels_arr)?;
-
-        // Extract DPO config for the closure
-        let dpo_config = self.config.dpo_config.clone();
-
-        // Policy model forward with grad
-        let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
-            let policy_chosen_logits = model
-                .forward(&chosen_ids, None)
-                .map_err(|e| Exception::custom(e.to_string()))?;
-            let policy_rejected_logits = model
-                .forward(&rejected_ids, None)
-                .map_err(|e| Exception::custom(e.to_string()))?;
-
-            let policy_chosen_logps =
-                Self::compute_log_probs_static(&policy_chosen_logits, &chosen_labels_arr)?;
-            let policy_rejected_logps =
-                Self::compute_log_probs_static(&policy_rejected_logits, &rejected_labels_arr)?;
-
-            let (loss, _, _) = Self::compute_dpo_loss_static(
-                &dpo_config,
-                &policy_chosen_logps,
-                &policy_rejected_logps,
-                &ref_chosen_logps,
-                &ref_rejected_logps,
-            )?;
-
-            Ok(loss)
+        // Delegate the grad/optimizer step to the shared
+        // PairedPreferenceTrainer<DpoLoss>. Reference log-probs come from
+        // an external ref_model forward only when the DPO config actually
+        // calls for them (Precomputed strategy); stop-gradient and
+        // reference-free paths skip the ref forward entirely.
+        let loss_kernel = DpoLoss::new(self.config.dpo_config.clone());
+        let precomputed_ref = match loss_kernel.reference_strategy() {
+            ReferenceStrategy::Precomputed => {
+                let ref_chosen_logits = ref_model
+                    .forward(&chosen_ids, None)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let ref_rejected_logits = ref_model
+                    .forward(&rejected_ids, None)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let ref_chosen_logps =
+                    loss_kernel.reduce_log_probs(&ref_chosen_logits, &chosen_labels_arr)?;
+                let ref_rejected_logps =
+                    loss_kernel.reduce_log_probs(&ref_rejected_logits, &rejected_labels_arr)?;
+                Some((ref_chosen_logps, ref_rejected_logps))
+            }
+            _ => None,
         };
 
-        // Compute loss and gradients
-        let mut value_and_grad = nn::value_and_grad(loss_fn);
-        let (mut loss, grads) = value_and_grad(policy_model, ())?;
-
-        loss.eval();
-        let loss_val = loss.item_f32();
-
-        // Update
-        optimizer.update(policy_model, grads)?;
+        let inner = PairedPreferenceTrainer::new(loss_kernel, TrainingConfig::default());
+        let (loss_val, _metrics) = inner.step(
+            policy_model,
+            optimizer,
+            &chosen_ids,
+            &chosen_labels_arr,
+            &rejected_ids,
+            &rejected_labels_arr,
+            precomputed_ref,
+        )?;
 
         self.step += 1;
         Ok(loss_val)
-    }
-
-    /// Static version of compute_log_probs for use in closures.
-    fn compute_log_probs_static(logits: &Array, labels: &Array) -> Result<Array, Exception> {
-        crate::logprob_utils::compute_log_probs(logits, labels)
-    }
-
-    /// Static version of compute_dpo_loss for use in closures.
-    fn compute_dpo_loss_static(
-        config: &DpoConfig,
-        policy_chosen_logps: &Array,
-        policy_rejected_logps: &Array,
-        ref_chosen_logps: &Array,
-        ref_rejected_logps: &Array,
-    ) -> Result<(Array, Array, Array), Exception> {
-        let is_simpo = matches!(config.loss_type, DpoLossType::SimPo);
-        let reference_free = config.reference_free || is_simpo;
-
-        let chosen_rewards = if reference_free {
-            policy_chosen_logps.clone()
-        } else {
-            policy_chosen_logps.subtract(ref_chosen_logps)
-        };
-
-        let rejected_rewards = if reference_free {
-            policy_rejected_logps.clone()
-        } else {
-            policy_rejected_logps.subtract(ref_rejected_logps)
-        };
-
-        let reward_diff = chosen_rewards.subtract(&rejected_rewards);
-        let beta = Array::from_f32(config.beta as f32);
-        let mut logits = reward_diff.multiply(&beta);
-
-        if is_simpo {
-            let gamma = Array::from_f32(config.simpo_gamma as f32);
-            logits = logits.subtract(&gamma);
-        }
-
-        let neg_logits = logits.negative();
-        let loss = nn::softplus(&neg_logits);
-        let loss = loss.mean(None);
-
-        Ok((
-            loss,
-            chosen_rewards.multiply(&beta),
-            rejected_rewards.multiply(&beta),
-        ))
     }
 
     /// Run the full online training loop.
