@@ -384,7 +384,6 @@ impl KtoTrainer {
             )));
         }
 
-        let batch_size = logits_shape[0];
         let seq_len = logits_shape[1];
 
         if seq_len <= 1 {
@@ -393,19 +392,7 @@ impl KtoTrainer {
             ));
         }
 
-        // Shift logits and labels for next-token prediction
-        let pred_logits = logits.index((.., ..seq_len - 1, ..));
-        let target_labels = labels.index((.., 1..));
-
-        // Selective log softmax: gather logit first, subtract logsumexp
-        // Never materializes full [B, S, V] log_softmax tensor
-        let (per_token_logps, valid_mask) =
-            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
-
-        // Sum over sequence dimension -> [B] (masked positions are already 0)
-        let total_log_probs = per_token_logps.sum_axes(&[1i32], false);
-
-        Ok(total_log_probs)
+        Ok(crate::logprob_utils::compute_log_probs(logits, labels)?)
     }
 
     /// Compute KTO loss for a batch of samples.
@@ -694,12 +681,7 @@ impl KtoTrainer {
     }
 
     fn compute_log_probs_static(logits: &Array, labels: &Array) -> Result<Array, Exception> {
-        let seq_len = logits.dim(1);
-        let pred_logits = logits.index((.., ..seq_len - 1, ..));
-        let target_labels = labels.index((.., 1..));
-        let (per_token_logps, _valid_mask) =
-            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
-        Ok(per_token_logps.sum_axes(&[1i32], false))
+        crate::logprob_utils::compute_log_probs(logits, labels)
     }
 
     fn compute_kto_loss_arrays(

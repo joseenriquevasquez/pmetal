@@ -86,24 +86,43 @@ pub fn selective_log_softmax_with_temperature(
     Ok((log_probs, valid_mask))
 }
 
-/// Next-token-shifted sum of selective log-probs — the shared canonical shape
-/// for DPO / KTO / ORPO / OnlineDPO / GRPO.
+/// Shift-then-selective-log-softmax primitive shared by DPO / KTO / ORPO /
+/// OnlineDPO / GRPO.
 ///
-/// Performs the 3-step pattern every preference trainer was open-coding:
+/// Every preference/RL trainer open-coded this same 2-step pattern:
 /// 1. Shift: `pred_logits = logits[:, :-1, :]`, `target_labels = labels[:, 1:]`
-/// 2. `selective_log_softmax(pred_logits, target_labels)` → per-token logps
-/// 3. Sum over the sequence axis → `[B]`
+///    (next-token prediction — drop the final logit, drop the first label).
+/// 2. [`selective_log_softmax_with_temperature`] on the shifted arrays.
 ///
-/// Masked positions (label == -100) contribute 0 to the sum.
+/// # Arguments
+/// * `logits` - Model output logits `[B, S, V]`. `S` must be > 1.
+/// * `labels` - Target labels `[B, S]`, `-100` for ignored positions.
+/// * `temperature` - Optional temperature scaling (used by GRPO).
+///
+/// # Returns
+/// `(per_token_logps, valid_mask)` — both `[B, S-1]` as `Float32`.
+pub fn shifted_selective_log_softmax(
+    logits: &Array,
+    labels: &Array,
+    temperature: Option<f32>,
+) -> Result<(Array, Array), Exception> {
+    let seq_len = logits.dim(1);
+    let pred_logits = logits.index((.., ..seq_len - 1, ..));
+    let target_labels = labels.index((.., 1..));
+    selective_log_softmax_with_temperature(&pred_logits, &target_labels, temperature)
+}
+
+/// Next-token-shifted sum of selective log-probs — the shared canonical shape
+/// for DPO / KTO / ORPO / OnlineDPO.
+///
+/// Sum over the sequence axis after [`shifted_selective_log_softmax`]. Masked
+/// positions (label == -100) contribute 0.
 ///
 /// # Arguments
 /// * `logits` - Model output logits `[B, S, V]`. `S` must be > 1.
 /// * `labels` - Target labels `[B, S]`, `-100` for ignored positions.
 pub fn compute_log_probs(logits: &Array, labels: &Array) -> Result<Array, Exception> {
-    let seq_len = logits.dim(1);
-    let pred_logits = logits.index((.., ..seq_len - 1, ..));
-    let target_labels = labels.index((.., 1..));
-    let (per_token_logps, _valid_mask) = selective_log_softmax(&pred_logits, &target_labels)?;
+    let (per_token_logps, _valid_mask) = shifted_selective_log_softmax(logits, labels, None)?;
     Ok(per_token_logps.sum_axes(&[1i32], false))
 }
 
@@ -119,10 +138,7 @@ pub fn compute_log_probs_with_avg(
     logits: &Array,
     labels: &Array,
 ) -> Result<(Array, Array), Exception> {
-    let seq_len = logits.dim(1);
-    let pred_logits = logits.index((.., ..seq_len - 1, ..));
-    let target_labels = labels.index((.., 1..));
-    let (per_token_logps, valid_mask) = selective_log_softmax(&pred_logits, &target_labels)?;
+    let (per_token_logps, valid_mask) = shifted_selective_log_softmax(logits, labels, None)?;
     let token_sum = per_token_logps.sum_axes(&[1i32], false);
     let valid_count_raw = valid_mask
         .as_dtype(Dtype::Float32 as i32)

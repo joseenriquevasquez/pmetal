@@ -184,19 +184,7 @@ impl OnlineDpoTrainer {
 
     /// Compute log probabilities for sequences.
     fn compute_log_probs(&self, logits: &Array, labels: &Array) -> Result<Array, Exception> {
-        let seq_len = logits.dim(1);
-
-        // Shift for next-token prediction
-        let pred_logits = logits.index((.., ..seq_len - 1, ..));
-        let target_labels = labels.index((.., 1..));
-
-        // Selective log softmax: gather logit first, subtract logsumexp
-        // Never materializes full [B, S, V] log_softmax tensor
-        let (per_token_logps, _valid_mask) =
-            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
-
-        // Sum over sequence dimension -> [B] (masked positions are already 0)
-        Ok(per_token_logps.sum_axes(&[1i32], false))
+        crate::logprob_utils::compute_log_probs(logits, labels)
     }
 
     /// Compute DPO loss for a batch of pairs.
@@ -466,18 +454,7 @@ impl OnlineDpoTrainer {
 
     /// Static version of compute_log_probs for use in closures.
     fn compute_log_probs_static(logits: &Array, labels: &Array) -> Result<Array, Exception> {
-        let seq_len = logits.dim(1);
-
-        let pred_logits = logits.index((.., ..seq_len - 1, ..));
-        let target_labels = labels.index((.., 1..));
-
-        // Selective log softmax: gather logit first, subtract logsumexp
-        // Never materializes full [B, S, V] log_softmax tensor
-        let (per_token_logps, _valid_mask) =
-            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
-
-        // Sum over sequence dimension -> [B] (masked positions are already 0)
-        Ok(per_token_logps.sum_axes(&[1i32], false))
+        crate::logprob_utils::compute_log_probs(logits, labels)
     }
 
     /// Static version of compute_dpo_loss for use in closures.

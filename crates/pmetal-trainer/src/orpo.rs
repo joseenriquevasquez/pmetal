@@ -124,30 +124,9 @@ impl OrpoTrainer {
     /// - total_log_probs: Sum of log probs [batch] (for NLL/SFT loss)
     /// - average_log_probs: Mean of log probs [batch] (for Odds Ratio)
     pub fn compute_log_probs(&self, logits: &Array, labels: &Array) -> OrpoResult<(Array, Array)> {
-        // Shift logits and labels for next-token prediction
-        let seq_len = logits.dim(1);
-
-        // logits[:, :-1, :] -> predict next token
-        let pred_logits = logits.index((.., ..seq_len - 1, ..));
-
-        // labels[:, 1:] -> target is next token
-        let target_labels = labels.index((.., 1..));
-
-        // Selective log softmax: gather logit first, subtract logsumexp
-        // Never materializes full [B, S, V] log_softmax tensor
-        let (per_token_logps, valid_mask) =
-            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
-
-        // Sum over sequence dimension -> [B] (masked positions are already 0)
-        let total_log_probs = per_token_logps.sum_axes(&[1i32], false);
-
-        // Count valid tokens per sequence for averaging
-        let valid_counts = valid_mask.sum_axes(&[1i32], false);
-
-        // Compute average log probs
-        let average_log_probs = total_log_probs.divide(&valid_counts);
-
-        Ok((total_log_probs, average_log_probs))
+        Ok(crate::logprob_utils::compute_log_probs_with_avg(
+            logits, labels,
+        )?)
     }
 
     /// Compute ORPO loss for a batch.
@@ -347,15 +326,7 @@ impl OrpoTrainer {
         logits: &Array,
         labels: &Array,
     ) -> Result<(Array, Array), Exception> {
-        let seq_len = logits.dim(1);
-        let pred_logits = logits.index((.., ..seq_len - 1, ..));
-        let target_labels = labels.index((.., 1..));
-        let (per_token_logps, valid_mask) =
-            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
-        let total_log_probs = per_token_logps.sum_axes(&[1i32], false);
-        let valid_counts = valid_mask.sum_axes(&[1i32], false);
-        let average_log_probs = total_log_probs.divide(&valid_counts);
-        Ok((total_log_probs, average_log_probs))
+        crate::logprob_utils::compute_log_probs_with_avg(logits, labels)
     }
 
     fn compute_orpo_loss_static(

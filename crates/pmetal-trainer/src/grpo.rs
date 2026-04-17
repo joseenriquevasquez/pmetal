@@ -500,22 +500,13 @@ impl GrpoTrainer {
         labels: &Array,
         temperature: Option<f32>,
     ) -> GrpoResult<(Array, Array)> {
-        let l = logits.dim(1);
-
-        // Shift logits and labels for next-token prediction
-        let shift_logits = logits.index((.., ..l - 1, ..));
-        let shift_labels = labels.index((.., 1..));
-
         // Memory-efficient: gathers single logit per position via take_along_axis,
         // never materializes [B, S, V] log_softmax.
-        let (per_token_logps, valid_mask) =
-            crate::logprob_utils::selective_log_softmax_with_temperature(
-                &shift_logits,
-                &shift_labels,
-                temperature,
-            )?;
-
-        Ok((per_token_logps, valid_mask))
+        Ok(crate::logprob_utils::shifted_selective_log_softmax(
+            logits,
+            labels,
+            temperature,
+        )?)
     }
 
     /// Compute advantages using group-relative normalization.
