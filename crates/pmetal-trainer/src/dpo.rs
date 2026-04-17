@@ -593,67 +593,23 @@ impl DpoTrainer {
                 let (chosen_inputs, chosen_labels, rejected_inputs, rejected_labels) =
                     Self::batch_preference_pairs(batch)?;
 
-                let (loss_value, metrics) = if self.config.use_stop_gradient_reference {
-                    let config = self.config.clone();
-                    let metrics_cell: std::cell::RefCell<Option<(Array, Array)>> =
-                        std::cell::RefCell::new(None);
-                    let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
-                        let chosen_logits = model
-                            .forward(&chosen_inputs, None)
-                            .map_err(|e| Exception::custom(e.to_string()))?;
-                        let rejected_logits = model
-                            .forward(&rejected_inputs, None)
-                            .map_err(|e| Exception::custom(e.to_string()))?;
-
-                        let chosen_policy_logps = Self::compute_log_probs_static(
-                            &chosen_logits,
-                            &chosen_labels,
-                            matches!(config.loss_type, DpoLossType::SimPo),
-                        )?;
-                        let rejected_policy_logps = Self::compute_log_probs_static(
-                            &rejected_logits,
-                            &rejected_labels,
-                            matches!(config.loss_type, DpoLossType::SimPo),
-                        )?;
-                        let chosen_ref_logps = ops::stop_gradient(&chosen_policy_logps);
-                        let rejected_ref_logps = ops::stop_gradient(&rejected_policy_logps);
-                        let (loss, chosen_rewards, rejected_rewards) =
-                            Self::compute_dpo_loss_static(
-                                &config,
-                                &chosen_policy_logps,
-                                &rejected_policy_logps,
-                                &chosen_ref_logps,
-                                &rejected_ref_logps,
-                            )?;
-                        *metrics_cell.borrow_mut() = Some((chosen_rewards, rejected_rewards));
-                        Ok(loss)
-                    };
-
-                    let (mut loss, grads) = {
-                        let mut loss_and_grad = nn::value_and_grad(loss_fn);
-                        loss_and_grad(policy_model, ())?
-                    };
-                    optimizer.update(policy_model, grads)?;
-                    loss.eval();
-
-                    let (mut chosen_rewards, mut rejected_rewards) = metrics_cell
-                        .into_inner()
-                        .expect("loss_fn must have been called");
-                    chosen_rewards.eval();
-                    rejected_rewards.eval();
-                    let chosen_rewards_vec = chosen_rewards.as_slice::<f32>().to_vec();
-                    let rejected_rewards_vec = rejected_rewards.as_slice::<f32>().to_vec();
-                    let metrics = DpoMetrics::compute(
-                        loss.item_f32(),
-                        &chosen_rewards_vec,
-                        &rejected_rewards_vec,
-                    );
-                    (loss.item_f32(), metrics)
-                } else {
-                    let (ref_chosen_logps, ref_rejected_logps) = if self.config.reference_free {
-                        (Array::from_f32(0.0), Array::from_f32(0.0))
+                // Resolve reference log-probs once per step. Three sources:
+                //   - `use_stop_gradient_reference`: `None` — the loss closure
+                //     derives ref logps via `stop_gradient(policy_logps)` so
+                //     no separate reference-model forward is needed.
+                //   - `reference_free`: zero-filled — DPO degenerates to the
+                //     unconstrained chosen/rejected margin.
+                //   - otherwise: forward the frozen reference model once.
+                //
+                // `None` ⇒ derive-inside-closure. `Some((chosen, rejected))` ⇒
+                // precomputed, captured by reference in the closure.
+                let precomputed_ref: Option<(Array, Array)> =
+                    if self.config.use_stop_gradient_reference {
+                        None
+                    } else if self.config.reference_free {
+                        Some((Array::from_f32(0.0), Array::from_f32(0.0)))
                     } else {
-                        self.precompute_reference_log_probs(
+                        Some(self.precompute_reference_log_probs(
                             reference_model.as_deref_mut().ok_or_else(|| {
                                 DpoError::Config("Reference model missing".into())
                             })?,
@@ -661,63 +617,72 @@ impl DpoTrainer {
                             &chosen_labels,
                             &rejected_inputs,
                             &rejected_labels,
-                        )?
+                        )?)
                     };
 
-                    let config = self.config.clone();
-                    let metrics_cell: std::cell::RefCell<Option<(Array, Array)>> =
-                        std::cell::RefCell::new(None);
-                    let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
-                        let chosen_logits = model
-                            .forward(&chosen_inputs, None)
-                            .map_err(|e| Exception::custom(e.to_string()))?;
-                        let rejected_logits = model
-                            .forward(&rejected_inputs, None)
-                            .map_err(|e| Exception::custom(e.to_string()))?;
+                let config = self.config.clone();
+                let metrics_cell: std::cell::RefCell<Option<(Array, Array)>> =
+                    std::cell::RefCell::new(None);
+                let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
+                    let chosen_logits = model
+                        .forward(&chosen_inputs, None)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    let rejected_logits = model
+                        .forward(&rejected_inputs, None)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
 
-                        let chosen_policy_logps = Self::compute_log_probs_static(
-                            &chosen_logits,
-                            &chosen_labels,
-                            matches!(config.loss_type, DpoLossType::SimPo),
-                        )?;
-                        let rejected_policy_logps = Self::compute_log_probs_static(
-                            &rejected_logits,
-                            &rejected_labels,
-                            matches!(config.loss_type, DpoLossType::SimPo),
-                        )?;
-                        let (loss, chosen_rewards, rejected_rewards) =
-                            Self::compute_dpo_loss_static(
-                                &config,
-                                &chosen_policy_logps,
-                                &rejected_policy_logps,
-                                &ref_chosen_logps,
-                                &ref_rejected_logps,
-                            )?;
-                        *metrics_cell.borrow_mut() = Some((chosen_rewards, rejected_rewards));
-                        Ok(loss)
+                    let chosen_policy_logps = Self::compute_log_probs_static(
+                        &chosen_logits,
+                        &chosen_labels,
+                        matches!(config.loss_type, DpoLossType::SimPo),
+                    )?;
+                    let rejected_policy_logps = Self::compute_log_probs_static(
+                        &rejected_logits,
+                        &rejected_labels,
+                        matches!(config.loss_type, DpoLossType::SimPo),
+                    )?;
+
+                    // Derive ref logps when stop-gradient is selected; otherwise
+                    // reuse the precomputed arrays from the enclosing scope.
+                    let (chosen_ref_logps, rejected_ref_logps) = match &precomputed_ref {
+                        None => (
+                            ops::stop_gradient(&chosen_policy_logps),
+                            ops::stop_gradient(&rejected_policy_logps),
+                        ),
+                        Some((c, r)) => (c.clone(), r.clone()),
                     };
 
-                    let (mut loss, grads) = {
-                        let mut loss_and_grad = nn::value_and_grad(loss_fn);
-                        loss_and_grad(policy_model, ())?
-                    };
-                    optimizer.update(policy_model, grads)?;
-                    loss.eval();
-
-                    let (mut chosen_rewards, mut rejected_rewards) = metrics_cell
-                        .into_inner()
-                        .expect("loss_fn must have been called");
-                    chosen_rewards.eval();
-                    rejected_rewards.eval();
-                    let chosen_rewards_vec = chosen_rewards.as_slice::<f32>().to_vec();
-                    let rejected_rewards_vec = rejected_rewards.as_slice::<f32>().to_vec();
-                    let metrics = DpoMetrics::compute(
-                        loss.item_f32(),
-                        &chosen_rewards_vec,
-                        &rejected_rewards_vec,
-                    );
-                    (loss.item_f32(), metrics)
+                    let (loss, chosen_rewards, rejected_rewards) = Self::compute_dpo_loss_static(
+                        &config,
+                        &chosen_policy_logps,
+                        &rejected_policy_logps,
+                        &chosen_ref_logps,
+                        &rejected_ref_logps,
+                    )?;
+                    *metrics_cell.borrow_mut() = Some((chosen_rewards, rejected_rewards));
+                    Ok(loss)
                 };
+
+                let (mut loss, grads) = {
+                    let mut loss_and_grad = nn::value_and_grad(loss_fn);
+                    loss_and_grad(policy_model, ())?
+                };
+                optimizer.update(policy_model, grads)?;
+                loss.eval();
+
+                let (mut chosen_rewards, mut rejected_rewards) = metrics_cell
+                    .into_inner()
+                    .expect("loss_fn must have been called");
+                chosen_rewards.eval();
+                rejected_rewards.eval();
+                let chosen_rewards_vec = chosen_rewards.as_slice::<f32>().to_vec();
+                let rejected_rewards_vec = rejected_rewards.as_slice::<f32>().to_vec();
+                let metrics = DpoMetrics::compute(
+                    loss.item_f32(),
+                    &chosen_rewards_vec,
+                    &rejected_rewards_vec,
+                );
+                let loss_value = loss.item_f32();
 
                 self.step += 1;
                 let elapsed = step_start.elapsed().as_secs_f64();
