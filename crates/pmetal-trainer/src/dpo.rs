@@ -28,6 +28,7 @@ use pmetal_lora::TrainableModel;
 use std::time::Instant;
 use tracing;
 
+use crate::paired_preference::{DpoLoss, PairedPreferenceTrainer};
 use crate::preference_batch::{pad_i64_sequences, pad_u32_sequences};
 
 /// Error type for DPO training.
@@ -578,6 +579,15 @@ impl DpoTrainer {
 
         let mut history = Vec::with_capacity(total_steps);
 
+        // Delegate the per-step gradient/optimizer body to the shared
+        // PairedPreferenceTrainer<DpoLoss>. Reference-model precompute
+        // and DPO-specific bookkeeping (callbacks, cancellation, history)
+        // stay here; the closure-heavy grad step lives in one place now.
+        let inner = PairedPreferenceTrainer::new(
+            DpoLoss::new(self.config.clone()),
+            self.training_config.clone(),
+        );
+
         for epoch in 0..num_epochs {
             for callback in &mut self.callbacks {
                 callback.on_epoch_start(epoch);
@@ -593,21 +603,17 @@ impl DpoTrainer {
                 let (chosen_inputs, chosen_labels, rejected_inputs, rejected_labels) =
                     Self::batch_preference_pairs(batch)?;
 
-                // Resolve reference log-probs once per step. Three sources:
-                //   - `use_stop_gradient_reference`: `None` — the loss closure
-                //     derives ref logps via `stop_gradient(policy_logps)` so
-                //     no separate reference-model forward is needed.
-                //   - `reference_free`: zero-filled — DPO degenerates to the
-                //     unconstrained chosen/rejected margin.
-                //   - otherwise: forward the frozen reference model once.
-                //
-                // `None` ⇒ derive-inside-closure. `Some((chosen, rejected))` ⇒
-                // precomputed, captured by reference in the closure.
+                // Resolve reference log-probs once per step. Mirrors the
+                // precedence in DpoLoss::reference_strategy:
+                //   - use_stop_gradient_reference → None (loss derives via stop_gradient)
+                //   - reference_free OR SimPO      → None (loss uses Zero strategy)
+                //   - otherwise                    → precompute from frozen ref model
                 let precomputed_ref: Option<(Array, Array)> =
-                    if self.config.use_stop_gradient_reference {
+                    if self.config.use_stop_gradient_reference
+                        || self.config.reference_free
+                        || matches!(self.config.loss_type, DpoLossType::SimPo)
+                    {
                         None
-                    } else if self.config.reference_free {
-                        Some((Array::from_f32(0.0), Array::from_f32(0.0)))
                     } else {
                         Some(self.precompute_reference_log_probs(
                             reference_model.as_deref_mut().ok_or_else(|| {
@@ -620,69 +626,15 @@ impl DpoTrainer {
                         )?)
                     };
 
-                let config = self.config.clone();
-                let metrics_cell: std::cell::RefCell<Option<(Array, Array)>> =
-                    std::cell::RefCell::new(None);
-                let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
-                    let chosen_logits = model
-                        .forward(&chosen_inputs, None)
-                        .map_err(|e| Exception::custom(e.to_string()))?;
-                    let rejected_logits = model
-                        .forward(&rejected_inputs, None)
-                        .map_err(|e| Exception::custom(e.to_string()))?;
-
-                    let chosen_policy_logps = Self::compute_log_probs_static(
-                        &chosen_logits,
-                        &chosen_labels,
-                        matches!(config.loss_type, DpoLossType::SimPo),
-                    )?;
-                    let rejected_policy_logps = Self::compute_log_probs_static(
-                        &rejected_logits,
-                        &rejected_labels,
-                        matches!(config.loss_type, DpoLossType::SimPo),
-                    )?;
-
-                    // Derive ref logps when stop-gradient is selected; otherwise
-                    // reuse the precomputed arrays from the enclosing scope.
-                    let (chosen_ref_logps, rejected_ref_logps) = match &precomputed_ref {
-                        None => (
-                            ops::stop_gradient(&chosen_policy_logps),
-                            ops::stop_gradient(&rejected_policy_logps),
-                        ),
-                        Some((c, r)) => (c.clone(), r.clone()),
-                    };
-
-                    let (loss, chosen_rewards, rejected_rewards) = Self::compute_dpo_loss_static(
-                        &config,
-                        &chosen_policy_logps,
-                        &rejected_policy_logps,
-                        &chosen_ref_logps,
-                        &rejected_ref_logps,
-                    )?;
-                    *metrics_cell.borrow_mut() = Some((chosen_rewards, rejected_rewards));
-                    Ok(loss)
-                };
-
-                let (mut loss, grads) = {
-                    let mut loss_and_grad = nn::value_and_grad(loss_fn);
-                    loss_and_grad(policy_model, ())?
-                };
-                optimizer.update(policy_model, grads)?;
-                loss.eval();
-
-                let (mut chosen_rewards, mut rejected_rewards) = metrics_cell
-                    .into_inner()
-                    .expect("loss_fn must have been called");
-                chosen_rewards.eval();
-                rejected_rewards.eval();
-                let chosen_rewards_vec = chosen_rewards.as_slice::<f32>().to_vec();
-                let rejected_rewards_vec = rejected_rewards.as_slice::<f32>().to_vec();
-                let metrics = DpoMetrics::compute(
-                    loss.item_f32(),
-                    &chosen_rewards_vec,
-                    &rejected_rewards_vec,
-                );
-                let loss_value = loss.item_f32();
+                let (loss_value, metrics) = inner.step(
+                    policy_model,
+                    optimizer,
+                    &chosen_inputs,
+                    &chosen_labels,
+                    &rejected_inputs,
+                    &rejected_labels,
+                    precomputed_ref,
+                )?;
 
                 self.step += 1;
                 let elapsed = step_start.elapsed().as_secs_f64();
@@ -752,19 +704,6 @@ impl DpoTrainer {
             pad_u32_sequences(&rejected_inputs, 0)?,
             pad_i64_sequences(&rejected_labels, -100)?,
         ))
-    }
-
-    fn compute_log_probs_static(
-        logits: &Array,
-        labels: &Array,
-        normalized: bool,
-    ) -> Result<Array, Exception> {
-        if normalized {
-            let (_sum, avg) = crate::logprob_utils::compute_log_probs_with_avg(logits, labels)?;
-            Ok(avg)
-        } else {
-            crate::logprob_utils::compute_log_probs(logits, labels)
-        }
     }
 
     /// Public surface over the DPO loss math so [`crate::paired_preference::DpoLoss`]
