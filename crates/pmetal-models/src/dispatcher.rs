@@ -802,6 +802,9 @@ impl DynamicModel {
             Self::Cohere(m) => m.model.forward(input_ids, mask, None),
             Self::Granite(m) => m.model.forward(input_ids, mask, None),
             Self::GptOss(m) => m.model.forward(input_ids, mask, None),
+            // StarCoder2 bakes lm_head into its trunk forward, so it
+            // carries a dedicated pre-norm entry point.
+            Self::StarCoder2(m) => m.forward_hidden(input_ids, mask),
             Self::Mistral(m) => m.model.forward(input_ids, mask),
             Self::Gemma(m) => m.model.forward(input_ids, mask),
             // Gemma4 / Phi / Phi4 inner models expose only forward_with_cache;
@@ -813,7 +816,7 @@ impl DynamicModel {
             other => Err(Exception::custom(format!(
                 "forward_hidden not implemented for {:?} — supported archs: \
                  Llama, Qwen2, Qwen3, Qwen3MoE, Mistral, Gemma, Gemma4, \
-                 Phi, Phi4, DeepSeek, Cohere, Granite, GptOss, BERT",
+                 Phi, Phi4, DeepSeek, Cohere, Granite, GptOss, StarCoder2, BERT",
                 other
             ))),
         }

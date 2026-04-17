@@ -227,4 +227,22 @@ impl StarCoder2Model {
     ) -> Result<Array, Exception> {
         self.forward(input_ids, mask, cache)
     }
+
+    /// Forward pass returning post-norm hidden states (pre-lm_head).
+    ///
+    /// Used by `DynamicModel::forward_hidden` for embeddings — StarCoder2
+    /// uniquely bakes `lm_head` into `forward`'s trunk, so a separate
+    /// entry point is needed to stop at `self.norm` without running the
+    /// vocabulary projection.
+    pub fn forward_hidden(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let mut x = self.embed_tokens.forward(input_ids);
+        for layer in self.layers.iter_mut() {
+            x = layer.forward_with_cache(&x, mask, None)?;
+        }
+        Ok(self.norm.forward(&x))
+    }
 }
