@@ -200,6 +200,47 @@ mod tests {
     }
 
     #[test]
+    fn sign_flipped_argpartition_is_anti_topk() {
+        // Documents why Qwen3-Next's pre-migration pattern
+        // `argpartition(-scores, -k, -1)[..., -k:]` was a latent bug:
+        // it selects the k LARGEST of `-scores` = k SMALLEST of scores.
+        //
+        // The correct sign-flip pattern (mlx-lm hunyuan/llama4 style) uses
+        // a positive kth and slices from the front:
+        //   argpartition(-scores, k-1, -1)[..., :k]
+        //
+        // This test exists to guard against accidentally reintroducing the
+        // buggy combination — if argpartition semantics ever changed such
+        // that the bug became a correct form, this test would flag it.
+        use pmetal_bridge::compat::ops;
+
+        let scores = Array::from_slice(&[0.2f32, 0.3, 0.1, 0.4], &[1, 4]);
+        let neg_k = -2_i32;
+
+        // Buggy pattern (what Qwen3-Next used to have):
+        let part = ops::argpartition_axis(&scores.negative(), neg_k, -1);
+        let top = ops::slice_last_from(&part, neg_k).as_type::<i32>();
+        let w = scores.take_along_axis(&top, -1);
+        let mut w_copy = w.clone();
+        let vals = w_copy.to_f32_vec(2).unwrap();
+        let sum: f32 = vals.iter().sum();
+        // Buggy form picks the 2 SMALLEST: 0.1 + 0.2 = 0.3.
+        assert!(
+            (sum - 0.3).abs() < 1e-5,
+            "sign-flipped form is anti-top-k: selected sum = {sum} (expected 0.3 = 0.1+0.2)"
+        );
+
+        // Correct forms via topk_normalize: 0.4 + 0.3 = 0.7.
+        let (_, weights) = topk_normalize(&scores, 2, false).unwrap();
+        let mut wc = weights.clone();
+        let correct: f32 = wc.to_f32_vec(2).unwrap().iter().sum();
+        assert!(
+            (correct - 0.7).abs() < 1e-5,
+            "correct top-k sum = {correct} (expected 0.7 = 0.4+0.3)"
+        );
+    }
+
+    #[test]
     fn rejects_nonpositive_top_k() {
         let scores = Array::from_slice(&[0.1, 0.2], &[1, 2]);
         assert!(topk_normalize(&scores, 0, false).is_err());

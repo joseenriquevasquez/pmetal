@@ -2234,21 +2234,15 @@ impl Qwen3NextSparseMoeBlock {
             -1,
         );
 
-        // Top-k selection via argpartition: O(E) vs O(E log E) argsort.
-        // argpartition(-gates, -k, -1) places the k largest at the end.
+        // Top-k selection + optional renormalisation via the shared helper.
+        // The earlier hand-rolled version here used the sign-flipped form
+        // `argpartition(-gates, -k, -1)[..., -k:]` which selects the k SMALLEST
+        // experts — an anti-top-k bug (see moe_routing::tests::
+        // sign_flipped_argpartition_is_anti_topk). Matches the mlx-lm
+        // reference (qwen3_next.py:338) which uses the positive form.
         let k = self.top_k;
-        let neg_k = -k;
-        let part_indices = ops::argpartition_axis(&gates.negative(), neg_k, -1);
-        let top_indices = slice_last_from(&part_indices, neg_k);
-        let top_weights = gates.take_along_axis(&top_indices, -1);
-
-        let top_weights = if self.norm_topk_prob {
-            let weight_sum = top_weights.sum_axis(-1, true);
-            let safe_sum = ops::maximum(&weight_sum, &Array::from_f32(1e-8));
-            top_weights.divide(&safe_sum)
-        } else {
-            top_weights
-        };
+        let (top_indices, top_weights) =
+            crate::moe_routing::topk_normalize(&gates, k, self.norm_topk_prob)?;
 
         // SwitchGLU forward using gather_mm — matches mlx-lm switch_layers.py
         // x_flat: [N, D], indices: [N, k]
@@ -2320,20 +2314,11 @@ impl Qwen3NextSparseMoeBlock {
             -1,
         );
 
+        // Shared top-k helper — see the note on the canonical `forward()` path
+        // for why the previous `argpartition(-gates, -k, -1)` form was wrong.
         let k = self.top_k;
-        let neg_gates = gates.negative();
-        let neg_k = -k;
-        let part_indices = ops::argpartition_axis(&neg_gates, neg_k, -1);
-        let top_indices = slice_last_from(&part_indices, neg_k);
-        let top_weights = gates.take_along_axis(&top_indices, -1);
-
-        let top_weights = if self.norm_topk_prob {
-            let weight_sum = top_weights.sum_axis(-1, true);
-            let safe_sum = ops::maximum(&weight_sum, &Array::from_f32(1e-8));
-            top_weights.divide(&safe_sum)
-        } else {
-            top_weights
-        };
+        let (top_indices, top_weights) =
+            crate::moe_routing::topk_normalize(&gates, k, self.norm_topk_prob)?;
 
         let top_indices_u32 = top_indices.cast(pmetal_bridge::compat::Dtype::Uint32);
         top_indices_u32.eval();
