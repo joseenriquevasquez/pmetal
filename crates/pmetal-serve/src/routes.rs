@@ -2,6 +2,7 @@
 
 use crate::engine::{InferenceEngine, RequestMetrics, SamplingParams, TokenEvent};
 use crate::error::ServeError;
+use crate::sse::IncrementalDecoder;
 use crate::types::*;
 use axum::extract::State;
 use axum::response::sse::{Event, Sse};
@@ -359,12 +360,10 @@ fn chat_sse_stream(
         Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
     };
 
-    // UTF-8 decode state: buffer accumulated token IDs and the length of text
-    // already emitted. BPE boundaries can split multi-byte codepoints across
-    // tokens, so we decode the growing buffer together and emit only the
-    // confirmed prefix — i.e. text whose byte length we have already seen.
-    let mut token_buffer: Vec<u32> = Vec::new();
-    let mut emitted_text_len: usize = 0;
+    // BPE boundaries can split multi-byte codepoints across tokens — the
+    // decoder buffers the full sequence and exposes only the confirmed
+    // prefix, so clients never see half-codepoint byte sequences.
+    let mut decoder = IncrementalDecoder::new(tokenizer);
 
     // Prepend the opening event to the token-event stream.
     let token_stream = ReceiverStream::new(rx);
@@ -375,13 +374,8 @@ fn chat_sse_stream(
 
         match event {
             TokenEvent::Token(token_id) => {
-                // Buffer and decode together to handle multi-byte UTF-8 at BPE
-                // boundaries. Emit only the newly confirmed text prefix.
-                token_buffer.push(token_id);
-                let decoded = tokenizer.decode(&token_buffer).unwrap_or_default();
-                if decoded.len() > emitted_text_len {
-                    let new_text = decoded[emitted_text_len..].to_owned();
-                    emitted_text_len = decoded.len();
+                let new_text = decoder.push(token_id);
+                if !new_text.is_empty() {
                     let chunk = ChatCompletionChunk {
                         id: request_id.clone(),
                         object: "chat.completion.chunk".to_string(),
@@ -402,10 +396,8 @@ fn chat_sse_stream(
                 }
             }
             TokenEvent::Done(finish_reason, metrics) => {
-                // Flush any remaining buffered tokens not yet emitted.
-                let decoded = tokenizer.decode(&token_buffer).unwrap_or_default();
-                if decoded.len() > emitted_text_len {
-                    let remaining = decoded[emitted_text_len..].to_owned();
+                let remaining = decoder.flush();
+                if !remaining.is_empty() {
                     let chunk = ChatCompletionChunk {
                         id: request_id.clone(),
                         object: "chat.completion.chunk".to_string(),
@@ -430,8 +422,7 @@ fn chat_sse_stream(
 
                 // Best-effort tool-call detection on the accumulated response.
                 let (tool_calls, reason) = if tools_requested {
-                    let full_text = tokenizer.decode(&token_buffer).unwrap_or_default();
-                    match try_parse_tool_calls(&full_text) {
+                    match try_parse_tool_calls(&decoder.decoded_text()) {
                         Some(calls) => (Some(calls), "tool_calls".to_string()),
                         None => (None, finish_reason),
                     }
@@ -493,22 +484,17 @@ fn completion_sse_stream(
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> + Send + 'static {
     let token_stream = ReceiverStream::new(rx);
 
-    // UTF-8 decode state shared across flat_map closures via captured mut vars.
-    let mut token_buffer: Vec<u32> = Vec::new();
-    let mut emitted_text_len: usize = 0;
+    // BPE boundaries can split multi-byte codepoints across tokens — see
+    // crate::sse::IncrementalDecoder for the buffering rationale.
+    let mut decoder = IncrementalDecoder::new(tokenizer);
 
     token_stream.flat_map(move |event| {
         let mut events: Vec<Result<Event, Infallible>> = Vec::new();
 
         match event {
             TokenEvent::Token(token_id) => {
-                // Buffer and decode together to handle multi-byte UTF-8 at BPE
-                // boundaries. Emit only the newly confirmed text prefix.
-                token_buffer.push(token_id);
-                let decoded = tokenizer.decode(&token_buffer).unwrap_or_default();
-                if decoded.len() > emitted_text_len {
-                    let new_text = decoded[emitted_text_len..].to_owned();
-                    emitted_text_len = decoded.len();
+                let new_text = decoder.push(token_id);
+                if !new_text.is_empty() {
                     let chunk = json!({
                         "id": request_id,
                         "object": "text_completion",
@@ -524,10 +510,8 @@ fn completion_sse_stream(
                 }
             }
             TokenEvent::Done(finish_reason, metrics) => {
-                // Flush any remaining buffered tokens not yet emitted.
-                let decoded = tokenizer.decode(&token_buffer).unwrap_or_default();
-                if decoded.len() > emitted_text_len {
-                    let remaining = decoded[emitted_text_len..].to_owned();
+                let remaining = decoder.flush();
+                if !remaining.is_empty() {
                     let flush = json!({
                         "id": request_id,
                         "object": "text_completion",

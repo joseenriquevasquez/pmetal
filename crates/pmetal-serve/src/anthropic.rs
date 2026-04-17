@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::engine::{SamplingParams, TokenEvent};
+use crate::sse::IncrementalDecoder;
 use crate::types::ChatMessage;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -399,20 +400,15 @@ fn anthropic_sse_stream(
         Ok(encode_event(&opening_block_start)),
     ]);
 
-    // UTF-8 boundary buffering — mirrors chat_sse_stream's approach so
-    // multi-byte codepoints at BPE boundaries don't leak partial bytes.
-    let mut token_buffer: Vec<u32> = Vec::new();
-    let mut emitted_text_len: usize = 0;
+    // Shared UTF-8 boundary buffering — see crate::sse::IncrementalDecoder.
+    let mut decoder = IncrementalDecoder::new(tokenizer);
 
     let mapped = ReceiverStream::new(rx).flat_map(move |event| {
         let mut events: Vec<Result<Event, Infallible>> = Vec::new();
         match event {
             TokenEvent::Token(tok) => {
-                token_buffer.push(tok);
-                let decoded = tokenizer.decode(&token_buffer).unwrap_or_default();
-                if decoded.len() > emitted_text_len {
-                    let new_text = decoded[emitted_text_len..].to_owned();
-                    emitted_text_len = decoded.len();
+                let new_text = decoder.push(tok);
+                if !new_text.is_empty() {
                     let delta = MessageEvent::ContentBlockDelta {
                         index: 0,
                         delta: DeltaBlock::TextDelta { text: new_text },
@@ -421,10 +417,8 @@ fn anthropic_sse_stream(
                 }
             }
             TokenEvent::Done(finish_reason, metrics) => {
-                // Flush any residual buffered text.
-                let decoded = tokenizer.decode(&token_buffer).unwrap_or_default();
-                if decoded.len() > emitted_text_len {
-                    let remaining = decoded[emitted_text_len..].to_owned();
+                let remaining = decoder.flush();
+                if !remaining.is_empty() {
                     let delta = MessageEvent::ContentBlockDelta {
                         index: 0,
                         delta: DeltaBlock::TextDelta { text: remaining },
@@ -433,10 +427,9 @@ fn anthropic_sse_stream(
                 }
                 state.metrics.record(&metrics);
 
-                let output_tokens = token_buffer.len();
+                let output_tokens = decoder.token_count();
                 let stop_reason = if tools_requested {
-                    let full = tokenizer.decode(&token_buffer).unwrap_or_default();
-                    if try_parse_tool_calls(&full).is_some() {
+                    if try_parse_tool_calls(&decoder.decoded_text()).is_some() {
                         "tool_use".to_string()
                     } else {
                         to_stop_reason(&finish_reason)

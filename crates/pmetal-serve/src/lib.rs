@@ -19,6 +19,7 @@ pub mod engine;
 pub mod error;
 pub mod routes;
 pub mod server;
+pub(crate) mod sse;
 pub mod types;
 
 pub use engine::{InferenceEngine, RequestMetrics};
