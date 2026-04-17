@@ -304,6 +304,15 @@ pub async fn completions(
     // Use request-time timestamp per OpenAI spec — not model creation time.
     let created = Utc::now().timestamp();
 
+    // /v1/completions: logprobs is a numeric field (number of top
+    // alternatives). Streaming logprobs are out of scope here — the
+    // streaming SSE payload shape stays unchanged.
+    let logprobs_top_n = if !req.stream.unwrap_or(false) {
+        req.logprobs.map(|n| n as usize)
+    } else {
+        None
+    };
+
     let params = SamplingParams {
         max_tokens: req.max_tokens,
         temperature,
@@ -315,8 +324,7 @@ pub async fn completions(
         presence_penalty: req.presence_penalty,
         seed: req.seed,
         extra_stop_token_ids: extra_stop_ids,
-        // /v1/completions does not expose logprobs in this phase.
-        logprobs_top_n: None,
+        logprobs_top_n,
     };
 
     if req.stream.unwrap_or(false) {
@@ -334,14 +342,51 @@ pub async fn completions(
     }
 
     // ── Non-streaming completions ────────────────────────────────────────────
-    // /v1/completions doesn't expose logprobs — discard the slot.
-    let (tokens, _logprobs, finish_reason, metrics) =
+    let (tokens, logprob_entries, finish_reason, metrics) =
         state.engine.generate(&input_ids, params).await?;
 
     state.metrics.record(&metrics);
 
     let completion_tokens = tokens.len();
     let text = state.engine.decode(&tokens)?;
+
+    // Build OpenAI's 4-parallel-array logprobs object when the caller
+    // opted in. text_offset gets recomputed by decoding incrementally so
+    // each token's start position aligns with the returned `text`.
+    let logprobs = logprob_entries.map(|entries| {
+        let tokenizer = state.engine.tokenizer_arc();
+        let n = entries.len();
+        let mut out_tokens = Vec::with_capacity(n);
+        let mut token_logprobs = Vec::with_capacity(n);
+        let mut top_logprobs = Vec::with_capacity(n);
+        let mut text_offset = Vec::with_capacity(n);
+
+        // Re-emit text incrementally to track byte offsets — single-token
+        // decode can produce different boundaries than batched decode for
+        // BPE tokenisers, so this matches exactly what `text` contains
+        // when the offsets are summed.
+        let mut running = 0usize;
+        for entry in entries {
+            let tok_str = tokenizer.decode(&[entry.token]).unwrap_or_default();
+            let mut top = std::collections::HashMap::with_capacity(entry.top_logprobs.len());
+            for (alt_id, lp) in entry.top_logprobs {
+                let alt_str = tokenizer.decode(&[alt_id]).unwrap_or_default();
+                top.insert(alt_str, lp);
+            }
+            text_offset.push(running);
+            running += tok_str.len();
+            out_tokens.push(tok_str);
+            token_logprobs.push(entry.logprob);
+            top_logprobs.push(top);
+        }
+
+        CompletionLogprobs {
+            tokens: out_tokens,
+            token_logprobs,
+            top_logprobs,
+            text_offset,
+        }
+    });
 
     Ok(Json(CompletionResponse {
         id: request_id,
@@ -352,6 +397,7 @@ pub async fn completions(
             index: 0,
             text,
             finish_reason: Some(finish_reason),
+            logprobs,
         }],
         usage: Usage {
             prompt_tokens,

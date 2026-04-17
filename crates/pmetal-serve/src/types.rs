@@ -178,6 +178,31 @@ pub struct CompletionRequest {
     pub presence_penalty: Option<f32>,
     #[serde(default)]
     pub seed: Option<u64>,
+    /// OpenAI `/v1/completions` uses a single numeric field for logprobs:
+    /// the number of top alternative tokens to include, per token. `0` means
+    /// only the chosen token's logprob. `None` disables logprob collection.
+    ///
+    /// Note this is distinct from `/v1/chat/completions` which uses a
+    /// boolean `logprobs` + integer `top_logprobs` pair.
+    #[serde(default)]
+    pub logprobs: Option<u8>,
+}
+
+/// OpenAI `/v1/completions` logprobs object — four parallel arrays, one
+/// entry per generated token, plus a `text_offset` so clients can align
+/// logprobs against the substring positions in the returned `text`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionLogprobs {
+    /// Decoded token strings, in generation order.
+    pub tokens: Vec<String>,
+    /// Per-token log-probabilities, aligned 1:1 with `tokens`.
+    pub token_logprobs: Vec<f32>,
+    /// Per-token alternative maps: `{token_string: logprob}` for the top-N
+    /// alternatives at each position. Empty map when the caller requested
+    /// `logprobs: 0` (chosen-token logprob only).
+    pub top_logprobs: Vec<std::collections::HashMap<String, f32>>,
+    /// Byte offset into the returned `text` where each token starts.
+    pub text_offset: Vec<usize>,
 }
 
 #[cfg(test)]
@@ -303,6 +328,37 @@ mod tests {
     }
 
     #[test]
+    fn completion_request_parses_numeric_logprobs() {
+        // /v1/completions uses a numeric logprobs field, not a bool.
+        let req: CompletionRequest =
+            serde_json::from_str(r#"{"model":"m","prompt":"p","logprobs":3}"#).unwrap();
+        assert_eq!(req.logprobs, Some(3));
+    }
+
+    #[test]
+    fn completion_request_logprobs_optional() {
+        let req: CompletionRequest = serde_json::from_str(r#"{"model":"m","prompt":"p"}"#).unwrap();
+        assert!(req.logprobs.is_none());
+    }
+
+    #[test]
+    fn completion_logprobs_serializes_parallel_arrays() {
+        use std::collections::HashMap;
+        let mut top0 = HashMap::new();
+        top0.insert("Hi".into(), -1.2_f32);
+        let lp = CompletionLogprobs {
+            tokens: vec!["Hello".into(), " world".into()],
+            token_logprobs: vec![-0.5, -0.3],
+            top_logprobs: vec![top0, HashMap::new()],
+            text_offset: vec![0, 5],
+        };
+        let json = serde_json::to_string(&lp).unwrap();
+        assert!(json.contains(r#""tokens":["Hello"," world"]"#));
+        assert!(json.contains(r#""token_logprobs":[-0.5,-0.3]"#));
+        assert!(json.contains(r#""text_offset":[0,5]"#));
+    }
+
+    #[test]
     fn tool_parse_allows_whitespace() {
         let text = "  \n\t{\n  \"name\": \"f\"\n}\n ";
         let calls = try_parse_tool_calls(text).expect("should parse");
@@ -355,6 +411,10 @@ pub struct CompletionChoice {
     pub index: usize,
     pub text: String,
     pub finish_reason: Option<String>,
+    /// Populated only when the request set `logprobs`. Same omit-when-None
+    /// rule as `ChatChoice.logprobs` — legacy clients stay byte-compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<CompletionLogprobs>,
 }
 
 /// Token usage statistics.
