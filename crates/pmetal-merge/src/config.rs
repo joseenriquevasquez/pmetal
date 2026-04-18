@@ -552,12 +552,12 @@ impl MergeConfig {
             | MergeMethodConfig::Breadcrumbs
             | MergeMethodConfig::ModelStock
             | MergeMethodConfig::Ram
-            | MergeMethodConfig::RamPlus => {
-                if self.base_model.is_none() {
-                    return Err(crate::MergeError::BaseModelRequired {
-                        method: format!("{:?}", self.merge_method),
-                    });
-                }
+            | MergeMethodConfig::RamPlus
+                if self.base_model.is_none() =>
+            {
+                return Err(crate::MergeError::BaseModelRequired {
+                    method: format!("{:?}", self.merge_method),
+                });
             }
             _ => {}
         }
