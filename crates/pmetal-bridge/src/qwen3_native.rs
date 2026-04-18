@@ -300,9 +300,7 @@ impl Qwen3Config {
 
 /// Parse `config.json` from a model directory.
 pub fn load_config(model_dir: &std::path::Path) -> Result<Qwen3Config, String> {
-    let path = model_dir.join("config.json");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let text = crate::native_loader::read_config_json(model_dir)?;
     parse_config_text(&text)
 }
 
@@ -1265,7 +1263,7 @@ pub fn apply_qjl_matrix(weights: &mut NativeWeights) {
     let s_f32 = InlineArray::from_f32_slice(&s_data, &[head_dim, head_dim]);
     let s = s_f32.as_dtype(weights.model_dtype);
     // Eval and detach into a fresh Metal buffer.
-    let zero = InlineArray::from_f32(0.0).as_dtype(weights.model_dtype);
+    let zero = InlineArray::scalar_with_dtype(0.0, weights.model_dtype);
     let mut s = s.add(&zero);
     s.eval();
     s.detach();
@@ -1441,59 +1439,9 @@ pub fn load_model(
     model_dir: &std::path::Path,
     config: &Qwen3Config,
 ) -> Result<NativeWeights, String> {
-    // ── Step 1: Shard discovery ─────────────────────────────────────────────
-    let single_path = model_dir.join("model.safetensors");
-    let index_path = model_dir.join("model.safetensors.index.json");
-
-    let shard_paths: Vec<std::path::PathBuf> = if single_path.exists() {
-        vec![single_path]
-    } else if index_path.exists() {
-        let content = std::fs::read_to_string(&index_path)
-            .map_err(|e| format!("failed to read index JSON: {e}"))?;
-        let index: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| format!("failed to parse index JSON: {e}"))?;
-        let weight_map = index
-            .get("weight_map")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| "index JSON missing weight_map".to_string())?;
-        let mut seen = std::collections::HashSet::new();
-        let mut paths = Vec::new();
-        for shard_file in weight_map.values() {
-            let name = shard_file
-                .as_str()
-                .ok_or_else(|| "shard filename is not a string".to_string())?;
-            if seen.insert(name.to_string()) {
-                if name.contains("..") || name.starts_with('/') {
-                    return Err(format!("shard filename contains path traversal: {name}"));
-                }
-                paths.push(model_dir.join(name));
-            }
-        }
-        paths
-    } else {
-        return Err(format!(
-            "no model.safetensors or model.safetensors.index.json in {}",
-            model_dir.display()
-        ));
-    };
-
-    // ── Step 2: Load all tensors from all shards ────────────────────────────
-    let mut raw: std::collections::HashMap<String, InlineArray> = std::collections::HashMap::new();
-
-    for shard_path in &shard_paths {
-        let path_str = shard_path
-            .to_str()
-            .ok_or_else(|| format!("non-UTF-8 shard path: {:?}", shard_path))?;
-        let entries = bridge::load_safetensors_shard(path_str)
-            .ok_or_else(|| format!("failed to load shard: {path_str}"))?;
-        for (key, arr) in entries {
-            raw.insert(key, arr);
-        }
-    }
-
-    if raw.is_empty() {
-        return Err(format!("no weights loaded from {}", model_dir.display()));
-    }
+    // ── Step 1+2: Shard discovery and bulk-load ─────────────────────────────
+    let shard_paths = crate::native_loader::discover_safetensors_shards(model_dir)?;
+    let mut raw = crate::native_loader::load_shards_into_map(&shard_paths, model_dir)?;
 
     // ── Step 3: Sanitization ────────────────────────────────────────────────
 
@@ -1553,7 +1501,7 @@ pub fn load_model(
         .get("model.embed_tokens.weight")
         .map(|w| w.dtype_raw())
         .unwrap_or(11); // 11 = bfloat16 fallback
-    let one = InlineArray::from_f32(1.0).as_dtype(detected_model_dtype);
+    let one = InlineArray::scalar_with_dtype(1.0, detected_model_dtype);
 
     // GDN-specific f32 weights that must be cast to model dtype to prevent f32
     // dtype propagation through the residual stream.
@@ -1968,12 +1916,12 @@ pub fn load_model(
             let inv_scale = (dk as f32).sqrt().recip();
             let q_scale_arr = {
                 let a = InlineArray::ones(&[dk], model_dtype);
-                let scale = InlineArray::from_f32(inv_scale * inv_scale).as_dtype(model_dtype);
+                let scale = InlineArray::scalar_with_dtype(inv_scale * inv_scale, model_dtype);
                 a.multiply(&scale)
             };
             let k_scale_arr = {
                 let a = InlineArray::ones(&[dk], model_dtype);
-                let scale = InlineArray::from_f32(inv_scale).as_dtype(model_dtype);
+                let scale = InlineArray::scalar_with_dtype(inv_scale, model_dtype);
                 a.multiply(&scale)
             };
             lw.gdn_q_nw = Some(
@@ -2041,7 +1989,7 @@ pub fn load_model(
     // weights live through the entire pass, needlessly spiking load-time peak
     // memory and causing benchmark/process kills under pressure.
     drop(raw);
-    let zero = InlineArray::from_f32(0.0).as_dtype(model_dtype);
+    let zero = InlineArray::scalar_with_dtype(0.0, model_dtype);
     let cf_arr = |w: &InlineArray| -> InlineArray { copy_fresh_arr(w, &zero) };
     let cf_lw = |w: &LayerWeight| -> LayerWeight { w.copy_fresh(&zero) };
 
@@ -3739,17 +3687,6 @@ fn attn_forward_with_tree_ctx(
     }
 }
 
-// ============================================================================
-// Sampling
-// ============================================================================
-
-/// Sample one token from `logits_2d` of shape `[B, vocab]`.
-///
-/// `temperature <= 0.0` → greedy argmax. Otherwise categorical sampling.
-pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
-    crate::decode::sample_token(logits_2d, temperature)
-}
-
 /// Run prompt prefill and return the first sampled token.
 pub fn prefill_first_token(
     weights: &NativeWeights,
@@ -4102,7 +4039,7 @@ fn begin_cpp_generation_session<'a>(
     let mut session = start_cpp_decode_session(weights, cache, config);
     let logits = session.step(first_token);
     let logits_2d = logits.squeeze(1);
-    let current_y = sample_token(&logits_2d, temperature);
+    let current_y = crate::decode::sample_token(&logits_2d, temperature);
     current_y.async_eval_ref();
     (session, current_y)
 }
@@ -4135,7 +4072,7 @@ fn generate_from_primed_cpp_session(
         let t_step = std::time::Instant::now();
         let next_logits = session.step(token_val);
         let next_logits_2d = next_logits.squeeze(1);
-        current_y = sample_token(&next_logits_2d, temperature);
+        current_y = crate::decode::sample_token(&next_logits_2d, temperature);
         current_y.async_eval_ref();
 
         step_times.push(t_step.elapsed().as_secs_f64() * 1000.0);

@@ -181,9 +181,7 @@ impl Llama4Config {
 /// Handles both the flat text-only layout and the multi-modal layout where
 /// `text_config` is nested.
 pub fn load_config(model_dir: &std::path::Path) -> Result<Llama4Config, String> {
-    let path = model_dir.join("config.json");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let text = crate::native_loader::read_config_json(model_dir)?;
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
 
@@ -433,59 +431,9 @@ pub fn load_model(
 ) -> Result<NativeWeights, String> {
     let tc = config.text();
 
-    // ── Step 1: Shard discovery ─────────────────────────────────────────────
-    let single_path = model_dir.join("model.safetensors");
-    let index_path = model_dir.join("model.safetensors.index.json");
-
-    let shard_paths: Vec<std::path::PathBuf> = if single_path.exists() {
-        vec![single_path]
-    } else if index_path.exists() {
-        let content = std::fs::read_to_string(&index_path)
-            .map_err(|e| format!("failed to read index JSON: {e}"))?;
-        let index: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| format!("failed to parse index JSON: {e}"))?;
-        let weight_map = index
-            .get("weight_map")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| "index JSON missing weight_map".to_string())?;
-        let mut seen = std::collections::HashSet::new();
-        let mut paths = Vec::new();
-        for shard_file in weight_map.values() {
-            let name = shard_file
-                .as_str()
-                .ok_or_else(|| "shard filename is not a string".to_string())?;
-            if seen.insert(name.to_string()) {
-                if name.contains("..") || name.starts_with('/') {
-                    return Err(format!("shard filename contains path traversal: {name}"));
-                }
-                paths.push(model_dir.join(name));
-            }
-        }
-        paths
-    } else {
-        return Err(format!(
-            "no model.safetensors or model.safetensors.index.json in {}",
-            model_dir.display()
-        ));
-    };
-
-    // ── Step 2: Load all tensors from all shards ────────────────────────────
-    let mut raw: std::collections::HashMap<String, InlineArray> = std::collections::HashMap::new();
-
-    for shard_path in &shard_paths {
-        let path_str = shard_path
-            .to_str()
-            .ok_or_else(|| format!("non-UTF-8 shard path: {:?}", shard_path))?;
-        let entries = bridge::load_safetensors_shard(path_str)
-            .ok_or_else(|| format!("failed to load shard: {path_str}"))?;
-        for (key, arr) in entries {
-            raw.insert(key, arr);
-        }
-    }
-
-    if raw.is_empty() {
-        return Err(format!("no weights loaded from {}", model_dir.display()));
-    }
+    // ── Step 1+2: Shard discovery and bulk-load ─────────────────────────────
+    let shard_paths = crate::native_loader::discover_safetensors_shards(model_dir)?;
+    let mut raw = crate::native_loader::load_shards_into_map(&shard_paths, model_dir)?;
 
     // ── Step 3: Sanitization ────────────────────────────────────────────────
 
@@ -767,7 +715,7 @@ pub fn load_model(
     }
 
     // ── Step 5: copy_fresh — force all weights into fresh Metal buffers ─────
-    let zero = InlineArray::from_f32(0.0).as_dtype(detected_dtype);
+    let zero = InlineArray::scalar_with_dtype(0.0, detected_dtype);
     let copy_fresh = |w: &InlineArray| -> InlineArray {
         let mut fresh = w.add(&zero);
         fresh.eval();
@@ -975,8 +923,8 @@ fn build_chunk_mask(offset: i32, s: i32, end: i32, chunk_size: i32) -> InlineArr
 /// 0 → -1e9 (masked), 1 → 0.0 (unmasked).
 fn make_additive_mask(bool_mask: &InlineArray, dtype: i32) -> InlineArray {
     // large negative value in the model dtype
-    let neg_inf = InlineArray::from_f32(-1e9).as_dtype(dtype);
-    let zero = InlineArray::from_f32(0.0).as_dtype(dtype);
+    let neg_inf = InlineArray::scalar_with_dtype(-1e9, dtype);
+    let zero = InlineArray::scalar_with_dtype(0.0, dtype);
     // where(bool_mask != 0, 0.0, -1e9)
     // bool_mask contains 0 or 1 as int32; `where_cond` treats nonzero as true.
     bool_mask
@@ -1364,16 +1312,14 @@ fn apply_temperature_tuning(
         // We create the scale array from individual f32 scalars and concatenate.
         // For S=1 (decode) this is trivial.
         if s == 1 {
-            InlineArray::from_f32(scales[0])
-                .as_dtype(dtype)
-                .reshape(&[1, 1, 1, 1])
+            InlineArray::scalar_with_dtype(scales[0], dtype).reshape(&[1, 1, 1, 1])
         } else {
             // Build as i32 array trick won't work for f32. Instead: create each
             // element, concatenate along axis 0, then reshape.
             // For prefill this only runs once so perf is not critical.
-            let mut arr = InlineArray::from_f32(scales[0]).as_dtype(dtype);
+            let mut arr = InlineArray::scalar_with_dtype(scales[0], dtype);
             for &sv in scales[1..].iter() {
-                let elem = InlineArray::from_f32(sv).as_dtype(dtype);
+                let elem = InlineArray::scalar_with_dtype(sv, dtype);
                 arr = arr.concatenate_2(&elem, 0);
             }
             arr.reshape(&[1, 1, s, 1])
@@ -1462,17 +1408,6 @@ fn moe_forward(moe: &MoeWeights, x: &InlineArray, b: i32, s: i32) -> InlineArray
     let shared_out = sh_act.matmul(&moe.shared_down_w);
 
     routed_out.add(&shared_out)
-}
-
-// ============================================================================
-// Sampling
-// ============================================================================
-
-/// Sample one token from `logits_2d` of shape `[B, vocab]`.
-///
-/// `temperature <= 0.0` → greedy argmax. Otherwise categorical sampling.
-pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
-    crate::decode::sample_token(logits_2d, temperature)
 }
 
 /// Run prompt prefill and return the first sampled token.

@@ -20,10 +20,13 @@
 //!
 //! ## The fix in this module
 //!
-//! Two ergonomic additions that make the correct thing the easy thing:
+//! Ergonomic additions that make the correct thing the easy thing:
 //!
 //! * [`InlineArray::scalar_like`] — one-shot scalar construction with the
 //!   dtype copied from a peer array. Replaces `from_f32(v).as_dtype(d)`.
+//! * [`InlineArray::scalar_with_dtype`] — same idea when only the raw
+//!   dtype id (i32) is in scope (e.g. a cached `weights.model_dtype`), not
+//!   a peer array.
 //! * `[*]_scalar` methods (`mul_scalar`, `add_scalar`, `sub_scalar`,
 //!   `div_scalar`) — compose `scalar_like` with the binary op so callers
 //!   never touch dtype plumbing for one-off scalar ops.
@@ -68,6 +71,19 @@ impl InlineArray {
     #[inline]
     pub fn scalar_like(value: f32, peer: &Self) -> Self {
         InlineArray::from_f32(value).as_dtype(peer.dtype_raw())
+    }
+
+    /// Creates a 0-D scalar array carrying `value` cast to the raw dtype
+    /// id `dtype` (as produced by [`InlineArray::dtype_raw`] or carried on
+    /// a weights struct).
+    ///
+    /// Preferred over `InlineArray::from_f32(value).as_dtype(dtype)`
+    /// because the signature makes the dtype argument impossible to
+    /// forget. Use [`InlineArray::scalar_like`] when a peer array is in
+    /// scope; use this variant when only the raw dtype id is available.
+    #[inline]
+    pub fn scalar_with_dtype(value: f32, dtype: i32) -> Self {
+        InlineArray::from_f32(value).as_dtype(dtype)
     }
 
     /// `self * value`, with the scalar cast to `self`'s dtype before the

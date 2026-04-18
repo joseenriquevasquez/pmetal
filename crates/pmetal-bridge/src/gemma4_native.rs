@@ -204,9 +204,7 @@ impl Gemma4Config {
 }
 
 pub fn load_config(model_dir: &std::path::Path) -> Result<Gemma4Config, String> {
-    let path = model_dir.join("config.json");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let text = crate::native_loader::read_config_json(model_dir)?;
     parse_config_text(&text)
 }
 
@@ -553,10 +551,10 @@ pub fn load_model(
 
     // Pre-cast scalars once so the forward step never constructs an
     // f32 broadcast and quietly promotes the bf16 residual stream.
-    let embed_scale_scalar = InlineArray::from_f32(config.embed_scale()).as_dtype(model_dtype);
+    let embed_scale_scalar = InlineArray::scalar_with_dtype(config.embed_scale(), model_dtype);
     let softcap_scalar = config
         .final_logit_softcapping
-        .map(|cap| InlineArray::from_f32(cap).as_dtype(model_dtype));
+        .map(|cap| InlineArray::scalar_with_dtype(cap, model_dtype));
 
     let weights = NativeWeights {
         embed_w,

@@ -188,9 +188,7 @@ impl GptOssConfig {
 
 /// Parse `config.json` from a model directory.
 pub fn load_config(model_dir: &std::path::Path) -> Result<GptOssConfig, String> {
-    let path = model_dir.join("config.json");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let text = crate::native_loader::read_config_json(model_dir)?;
     // Some checkpoints nest config under "text_config"
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
@@ -422,59 +420,9 @@ pub fn load_model(
     model_dir: &std::path::Path,
     config: &GptOssConfig,
 ) -> Result<NativeWeights, String> {
-    // ── Step 1: Shard discovery ─────────────────────────────────────────────
-    let single_path = model_dir.join("model.safetensors");
-    let index_path = model_dir.join("model.safetensors.index.json");
-
-    let shard_paths: Vec<std::path::PathBuf> = if single_path.exists() {
-        vec![single_path]
-    } else if index_path.exists() {
-        let content = std::fs::read_to_string(&index_path)
-            .map_err(|e| format!("failed to read index JSON: {e}"))?;
-        let index: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| format!("failed to parse index JSON: {e}"))?;
-        let weight_map = index
-            .get("weight_map")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| "index JSON missing weight_map".to_string())?;
-        let mut seen = std::collections::HashSet::new();
-        let mut paths = Vec::new();
-        for shard_file in weight_map.values() {
-            let name = shard_file
-                .as_str()
-                .ok_or_else(|| "shard filename is not a string".to_string())?;
-            if seen.insert(name.to_string()) {
-                if name.contains("..") || name.starts_with('/') {
-                    return Err(format!("shard filename contains path traversal: {name}"));
-                }
-                paths.push(model_dir.join(name));
-            }
-        }
-        paths
-    } else {
-        return Err(format!(
-            "no model.safetensors or model.safetensors.index.json in {}",
-            model_dir.display()
-        ));
-    };
-
-    // ── Step 2: Load all tensors from all shards ────────────────────────────
-    let mut raw: std::collections::HashMap<String, InlineArray> = std::collections::HashMap::new();
-
-    for shard_path in &shard_paths {
-        let path_str = shard_path
-            .to_str()
-            .ok_or_else(|| format!("non-UTF-8 shard path: {:?}", shard_path))?;
-        let entries = bridge::load_safetensors_shard(path_str)
-            .ok_or_else(|| format!("failed to load shard: {path_str}"))?;
-        for (key, arr) in entries {
-            raw.insert(key, arr);
-        }
-    }
-
-    if raw.is_empty() {
-        return Err(format!("no weights loaded from {}", model_dir.display()));
-    }
+    // ── Step 1+2: Shard discovery and bulk-load ─────────────────────────────
+    let shard_paths = crate::native_loader::discover_safetensors_shards(model_dir)?;
+    let mut raw = crate::native_loader::load_shards_into_map(&shard_paths, model_dir)?;
 
     // ── Step 3: Sanitization — mirror Python's Model.sanitize() ────────────
     //
@@ -705,7 +653,7 @@ pub fn load_model(
     }
 
     // ── Step 5: copy_fresh — force all weights into fresh Metal buffers ─────
-    let zero = InlineArray::from_f32(0.0).as_dtype(model_dtype);
+    let zero = InlineArray::scalar_with_dtype(0.0, model_dtype);
     let copy_fresh = |w: &InlineArray| -> InlineArray {
         let mut fresh = w.add(&zero);
         fresh.eval();
@@ -1306,7 +1254,7 @@ fn moe_forward(lw: &LayerWeights, normed: &InlineArray, b: i32, s: i32) -> Inlin
 
     // Normalize: weights = scores / max(sum, 1e-8)
     let sum_scores = top_k_scores.sum_axis(-1, true); // [B*T, 1]
-    let eps = InlineArray::from_f32(1e-8).as_dtype(sum_scores.dtype_raw());
+    let eps = InlineArray::scalar_like(1e-8, &sum_scores);
     let safe_sum = sum_scores.maximum(&eps);
     let expert_weights = top_k_scores.divide(&safe_sum); // [B*T, top_k]
 
@@ -1378,9 +1326,9 @@ fn gpt_oss_swiglu(
     alpha: f32,
     limit: f32,
 ) -> InlineArray {
-    let neg_limit_arr = InlineArray::from_f32(-limit).as_dtype(x_glu.dtype_raw());
-    let alpha_arr = InlineArray::from_f32(alpha).as_dtype(x_glu.dtype_raw());
-    let one_arr = InlineArray::from_f32(1.0).as_dtype(x_linear.dtype_raw());
+    let neg_limit_arr = InlineArray::scalar_like(-limit, x_glu);
+    let alpha_arr = InlineArray::scalar_like(alpha, x_glu);
+    let one_arr = InlineArray::scalar_like(1.0, x_linear);
 
     // clip(x_glu, a_max=limit) = -maximum(-x_glu, -limit)
     let x_glu_clamped = x_glu.negative().maximum(&neg_limit_arr).negative();
@@ -1402,17 +1350,6 @@ fn gpt_oss_swiglu(
 
     // out = out_glu * (x_linear + 1)
     out_glu.multiply(&lin_biased)
-}
-
-// ============================================================================
-// Sampling
-// ============================================================================
-
-/// Sample one token from `logits_2d` of shape `[B, vocab]`.
-///
-/// `temperature <= 0.0` → greedy argmax; otherwise categorical sampling.
-pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
-    crate::decode::sample_token(logits_2d, temperature)
 }
 
 // ============================================================================

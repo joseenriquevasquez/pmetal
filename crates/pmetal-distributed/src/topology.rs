@@ -309,7 +309,7 @@ impl ClusterTopology {
     /// across all cluster members.
     pub fn ring_order(&self) -> Vec<&NodeInfo> {
         let mut nodes: Vec<_> = self.graph.node_weights().collect();
-        nodes.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+        nodes.sort_by_key(|a| a.peer_id);
         nodes
     }
 

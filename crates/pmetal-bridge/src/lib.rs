@@ -30,6 +30,8 @@ pub mod mlx_quant;
 pub mod training;
 pub mod turboquant;
 
+pub mod native_loader;
+
 pub mod deepseek_native;
 pub mod gemma4_native;
 pub mod gpt_oss_native;

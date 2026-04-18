@@ -170,9 +170,7 @@ impl DeepSeekConfig {
 
 /// Parse `config.json` from a model directory.
 pub fn load_config(model_dir: &std::path::Path) -> Result<DeepSeekConfig, String> {
-    let path = model_dir.join("config.json");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let text = crate::native_loader::read_config_json(model_dir)?;
     let cfg: DeepSeekConfig =
         serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
     Ok(cfg)
@@ -423,59 +421,9 @@ pub fn load_model(
     model_dir: &std::path::Path,
     config: &DeepSeekConfig,
 ) -> Result<NativeWeights, String> {
-    // ── Step 1: Shard discovery ─────────────────────────────────────────────
-    let single_path = model_dir.join("model.safetensors");
-    let index_path = model_dir.join("model.safetensors.index.json");
-
-    let shard_paths: Vec<std::path::PathBuf> = if single_path.exists() {
-        vec![single_path]
-    } else if index_path.exists() {
-        let content = std::fs::read_to_string(&index_path)
-            .map_err(|e| format!("failed to read index JSON: {e}"))?;
-        let index: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| format!("failed to parse index JSON: {e}"))?;
-        let weight_map = index
-            .get("weight_map")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| "index JSON missing weight_map".to_string())?;
-        let mut seen = std::collections::HashSet::new();
-        let mut paths = Vec::new();
-        for shard_file in weight_map.values() {
-            let name = shard_file
-                .as_str()
-                .ok_or_else(|| "shard filename is not a string".to_string())?;
-            if seen.insert(name.to_string()) {
-                if name.contains("..") || name.starts_with('/') {
-                    return Err(format!("shard filename contains path traversal: {name}"));
-                }
-                paths.push(model_dir.join(name));
-            }
-        }
-        paths
-    } else {
-        return Err(format!(
-            "no model.safetensors or model.safetensors.index.json in {}",
-            model_dir.display()
-        ));
-    };
-
-    // ── Step 2: Load all tensors ───────────────────────────────────────────
-    let mut raw: std::collections::HashMap<String, InlineArray> = std::collections::HashMap::new();
-
-    for shard_path in &shard_paths {
-        let path_str = shard_path
-            .to_str()
-            .ok_or_else(|| format!("non-UTF-8 shard path: {:?}", shard_path))?;
-        let entries = bridge::load_safetensors_shard(path_str)
-            .ok_or_else(|| format!("failed to load shard: {path_str}"))?;
-        for (key, arr) in entries {
-            raw.insert(key, arr);
-        }
-    }
-
-    if raw.is_empty() {
-        return Err(format!("no weights loaded from {}", model_dir.display()));
-    }
+    // ── Step 1+2: Shard discovery and bulk-load ─────────────────────────────
+    let shard_paths = crate::native_loader::discover_safetensors_shards(model_dir)?;
+    let mut raw = crate::native_loader::load_shards_into_map(&shard_paths, model_dir)?;
 
     // ── Step 3: Sanitization ────────────────────────────────────────────────
 
@@ -772,7 +720,7 @@ pub fn load_model(
 
     // ── Step 5: copy_fresh ──────────────────────────────────────────────────
     // Force all weights into fresh Metal buffers (use_count=1).
-    let zero = InlineArray::from_f32(0.0).as_dtype(model_dtype);
+    let zero = InlineArray::scalar_with_dtype(0.0, model_dtype);
     let copy_fresh = |w: &InlineArray| -> InlineArray {
         let mut fresh = w.add(&zero);
         fresh.eval();
@@ -1524,11 +1472,10 @@ fn group_topk(
     let final_scores = if top_k > 1 && norm_topk_prob {
         let denom = sel_scores.sum_axis(-1, true); // [T, 1]
         let normed = sel_scores.divide(&denom);
-        let scale_arr = InlineArray::from_f32(routed_scaling_factor).as_dtype(normed.dtype_raw());
+        let scale_arr = InlineArray::scalar_like(routed_scaling_factor, &normed);
         normed.multiply(&scale_arr)
     } else {
-        let scale_arr =
-            InlineArray::from_f32(routed_scaling_factor).as_dtype(sel_scores.dtype_raw());
+        let scale_arr = InlineArray::scalar_like(routed_scaling_factor, &sel_scores);
         sel_scores.multiply(&scale_arr)
     };
 
@@ -1588,17 +1535,6 @@ fn apply_group_mask(
     //
     // TODO: add put_along_axis to bridge.h for full group masking.
     s_grouped.clone()
-}
-
-// ============================================================================
-// Sampling
-// ============================================================================
-
-/// Sample one token from `logits_2d` of shape `[B, vocab]`.
-///
-/// `temperature <= 0.0` → greedy argmax. Otherwise categorical sampling.
-pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
-    crate::decode::sample_token(logits_2d, temperature)
 }
 
 // ============================================================================
