@@ -217,10 +217,16 @@ fn build_and_link() {
     let bridge_sources = [
         "bridge.cpp",
         "bridge_inference.cpp",
-        "bridge_turboquant.cpp",
+        "bridge_turboquant_encode.cpp",
+        "bridge_turboquant_score.cpp",
+        "bridge_turboquant_pack.cpp",
+        "bridge_turboquant_weighted.cpp",
+        "bridge_turboquant_attn_d256.cpp",
+        "bridge_turboquant_attn_d128.cpp",
         "bridge_compiled.cpp",
         "bridge_native.cpp",
         "bridge_training.cpp",
+        "bridge_gdn.cpp",
     ];
 
     let mut build = cc::Build::new();
