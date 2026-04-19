@@ -17,10 +17,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Persistent MLX prefix. build.rs reuses a matching pre-built MLX here and
+  # skips cmake entirely; if the cache miss happens, the fresh build is
+  # copied back in and uploaded by actions/cache at job end.
+  PMETAL_MLX_PREFIX: ${{ github.workspace }}/.mlx-cache
 
 jobs:
-  lint:
-    name: Lint
+  check:
+    name: Check
     runs-on: macos-latest
 
     steps:
@@ -30,27 +34,39 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # Extract the pinned MLX tag from build.rs so the cache key tracks it.
+      - name: Resolve MLX tag
+        id: mlx
+        run: |
+          tag=$(grep -E '^const BUNDLED_MLX_GIT_TAG' \
+            crates/pmetal-bridge/build.rs | sed -E 's/.*"(v[^"]+)".*/\1/')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved MLX tag: $tag"
+
+      # Per-tag MLX cache, shared across all runners on the repo. The key is
+      # keyed on the tag plus the files that drive MLX's cmake configure so
+      # any edit to them triggers a rebuild, but Cargo.lock churn does not.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.PMETAL_MLX_PREFIX }}
+          key: mlx-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx.outputs.tag }}-${{ hashFiles('crates/pmetal-bridge/build.rs', 'crates/pmetal-bridge/cmake/**', 'crates/pmetal-bridge/patches/**') }}
+          restore-keys: |
+            mlx-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx.outputs.tag }}-
+
+      # Standard Rust target/ cache (separate from the MLX prefix above).
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-mlx
+          cache-all-crates: true
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # Clippy first — triggers the bridge build. If the MLX prefix cache
+      # hit, cmake is skipped and only the bridge C++ sources compile.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --exclude pmetal-py -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude pmetal-py --profile ci -- -D warnings
 
-  test:
-    name: Test
-    runs-on: macos-latest
-    needs: lint
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      # Single-threaded tests to avoid Metal/GPU conflicts
-      # Exclude pmetal-py (needs Python dev libs not available on CI runner)
+      # Single-threaded to avoid Metal/GPU conflicts.
       - name: Run tests
         run: cargo test --workspace --exclude pmetal-py --profile ci -- --test-threads=1

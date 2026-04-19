@@ -368,7 +368,7 @@ impl JobManager {
                 elapsed_seconds: elapsed,
             });
         }
-        summaries.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        summaries.sort_by_key(|s| std::cmp::Reverse(s.started_at));
         summaries
     }
 

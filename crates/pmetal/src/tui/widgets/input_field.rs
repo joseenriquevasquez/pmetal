@@ -171,25 +171,21 @@ impl FormField {
                     self.edit_buffer.remove(self.cursor);
                 }
             }
-            KeyCode::Left => {
-                if self.cursor > 0 {
-                    let prev = self.edit_buffer[..self.cursor]
-                        .chars()
-                        .last()
-                        .map(|c| c.len_utf8())
-                        .unwrap_or(0);
-                    self.cursor -= prev;
-                }
+            KeyCode::Left if self.cursor > 0 => {
+                let prev = self.edit_buffer[..self.cursor]
+                    .chars()
+                    .last()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(0);
+                self.cursor -= prev;
             }
-            KeyCode::Right => {
-                if self.cursor < self.edit_buffer.len() {
-                    let next = self.edit_buffer[self.cursor..]
-                        .chars()
-                        .next()
-                        .map(|c| c.len_utf8())
-                        .unwrap_or(0);
-                    self.cursor += next;
-                }
+            KeyCode::Right if self.cursor < self.edit_buffer.len() => {
+                let next = self.edit_buffer[self.cursor..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(0);
+                self.cursor += next;
             }
             _ => {}
         }

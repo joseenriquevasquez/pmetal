@@ -102,17 +102,120 @@ fn prepare_cmake_source() -> PathBuf {
     staged
 }
 
-// ── Main build ────────────────────────────────────────────────────────────
+// ── PMETAL_MLX_PREFIX: per-tag persistent MLX build cache ─────────────────
+//
+// When PMETAL_MLX_PREFIX is set to a directory, a fingerprint-matched
+// pre-built MLX in that directory is reused and cmake is skipped entirely.
+// Otherwise MLX is built as usual, and the result is copied into the
+// prefix for reuse on the next invocation (intended for CI where the
+// prefix is mounted via actions/cache keyed on BUNDLED_MLX_GIT_TAG).
+//
+// Layout inside the prefix:
+//   .mlx-version         — fingerprint string (tag + feature flags)
+//   lib/libmlx.dylib     — MLX dynamic library (or libmlx.so elsewhere)
+//   lib/mlx.metallib     — compiled Metal kernels (when metal feature on)
+//   include/mlx/**/*.h   — MLX public + internal headers
+//
+// The fingerprint bakes in feature flags and debug/release so a
+// (metal+release) build never aliases a (no-metal+debug) build.
 
-fn build_and_link() {
-    // Enforce macOS deployment target >= 14.0 before cmake or cc see CFLAGS
-    #[cfg(target_os = "macos")]
-    {
-        let target = resolve_deployment_target();
-        // SAFETY: build scripts are single-threaded; no other threads exist yet.
-        unsafe { env::set_var("MACOSX_DEPLOYMENT_TARGET", &target) };
+fn mlx_fingerprint() -> String {
+    let metal = cfg!(feature = "metal") as u8;
+    let accelerate = cfg!(feature = "accelerate") as u8;
+    let debug = cfg!(debug_assertions) as u8;
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "other"
+    };
+    format!(
+        "{tag};metal={metal};accelerate={accelerate};debug={debug};os={os}",
+        tag = BUNDLED_MLX_GIT_TAG
+    )
+}
+
+fn mlx_dylib_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "libmlx.dylib"
+    } else {
+        "libmlx.so"
+    }
+}
+
+fn try_reuse_cached_mlx(prefix: &std::path::Path) -> Option<(PathBuf, PathBuf)> {
+    let marker = std::fs::read_to_string(prefix.join(".mlx-version")).ok()?;
+    if marker.trim() != mlx_fingerprint() {
+        return None;
+    }
+    let lib_dir = prefix.join("lib");
+    let include_dir = prefix.join("include");
+    // Accept either the shared build (libmlx.dylib, release) or the static
+    // build (libmlx.a, debug). Profile is baked into the fingerprint above,
+    // so whichever shows up here matches what this build expects.
+    let has_lib = lib_dir.join(mlx_dylib_name()).exists() || lib_dir.join("libmlx.a").exists();
+    if !has_lib {
+        return None;
+    }
+    #[cfg(feature = "metal")]
+    if !lib_dir.join("mlx.metallib").exists() {
+        return None;
+    }
+    if !include_dir.join("mlx").join("mlx.h").exists() {
+        return None;
+    }
+    Some((lib_dir, include_dir))
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if ty.is_file() {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+fn populate_mlx_prefix(dst: &std::path::Path, prefix: &std::path::Path) -> std::io::Result<()> {
+    let lib_dir = prefix.join("lib");
+    let include_dir = prefix.join("include");
+    std::fs::create_dir_all(&lib_dir)?;
+    std::fs::create_dir_all(&include_dir)?;
+
+    // Copy whichever MLX library artifact exists for this profile.
+    for name in [mlx_dylib_name(), "libmlx.a"] {
+        let src = dst.join("build/lib").join(name);
+        if src.exists() {
+            std::fs::copy(&src, lib_dir.join(name))?;
+        }
     }
 
+    #[cfg(feature = "metal")]
+    {
+        let src_metallib = dst.join("build/lib/mlx.metallib");
+        if src_metallib.exists() {
+            std::fs::copy(&src_metallib, lib_dir.join("mlx.metallib"))?;
+        }
+    }
+
+    let src_headers = dst.join("build/_deps/mlx-src/mlx");
+    let dst_headers = include_dir.join("mlx");
+    if dst_headers.exists() {
+        std::fs::remove_dir_all(&dst_headers)?;
+    }
+    copy_dir_recursive(&src_headers, &dst_headers)?;
+
+    std::fs::write(prefix.join(".mlx-version"), mlx_fingerprint())?;
+    Ok(())
+}
+
+fn run_cmake_build() -> PathBuf {
     let cmake_src = prepare_cmake_source();
 
     let mut config = Config::new(&cmake_src);
@@ -166,18 +269,61 @@ fn build_and_link() {
         config.define("CMAKE_INTERPROCEDURAL_OPTIMIZATION", "ON");
     }
 
-    let dst = config.build();
+    config.build()
+}
 
-    // ── Link libmlx.a ──
-    // cmake installs libmlx.a into <dst>/build/lib (cmake crate convention)
-    println!("cargo:rustc-link-search=native={}/build/lib", dst.display());
-    // The fetched MLX target also produces libmlx.a; cmake may put it in _deps
-    // or build/lib depending on build system; add both search paths.
+// ── Main build ────────────────────────────────────────────────────────────
+
+fn build_and_link() {
+    // Enforce macOS deployment target >= 14.0 before cmake or cc see CFLAGS
+    #[cfg(target_os = "macos")]
+    {
+        let target = resolve_deployment_target();
+        // SAFETY: build scripts are single-threaded; no other threads exist yet.
+        unsafe { env::set_var("MACOSX_DEPLOYMENT_TARGET", &target) };
+    }
+
+    let mlx_prefix = env::var("PMETAL_MLX_PREFIX").ok().map(PathBuf::from);
+
+    // Resolve MLX artifacts: prefer a matching cache, otherwise build and
+    // (if a prefix is configured) populate the cache for next time.
+    let (mlx_lib_dir_built, mlx_include): (PathBuf, PathBuf) =
+        match mlx_prefix.as_deref().and_then(try_reuse_cached_mlx) {
+            Some((lib, inc)) => {
+                println!(
+                    "cargo:warning=Reusing cached MLX build from {} (tag {BUNDLED_MLX_GIT_TAG})",
+                    mlx_prefix.as_ref().unwrap().display()
+                );
+                (lib, inc)
+            }
+            None => {
+                let dst = run_cmake_build();
+                // Legacy search path — cmake puts the fetched target's libs in _deps too.
+                println!(
+                    "cargo:rustc-link-search=native={}/build/_deps/mlx-build",
+                    dst.display()
+                );
+                if let Some(prefix) = &mlx_prefix {
+                    match populate_mlx_prefix(&dst, prefix) {
+                        Ok(()) => println!(
+                            "cargo:warning=Populated MLX cache at {} (tag {BUNDLED_MLX_GIT_TAG})",
+                            prefix.display()
+                        ),
+                        Err(e) => println!(
+                            "cargo:warning=Failed to populate PMETAL_MLX_PREFIX cache: {e}"
+                        ),
+                    }
+                }
+                (dst.join("build/lib"), dst.join("build/_deps/mlx-src"))
+            }
+        };
+
+    // ── Link libmlx ──
     println!(
-        "cargo:rustc-link-search=native={}/build/_deps/mlx-build",
-        dst.display()
+        "cargo:rustc-link-search=native={}",
+        mlx_lib_dir_built.display()
     );
-    // Link MLX — use PMETAL_MLX_LIB_DIR to override with Python's libmlx.dylib
+    // Link MLX — use PMETAL_MLX_LIB_DIR to override with an external libmlx.dylib.
     let mlx_lib_dir = if let Ok(mlx_dir) = env::var("PMETAL_MLX_LIB_DIR") {
         println!("cargo:rustc-link-search=native={mlx_dir}");
         println!("cargo:rustc-link-lib=dylib=mlx");
@@ -188,18 +334,16 @@ fn build_and_link() {
         PathBuf::from(mlx_dir)
     } else {
         println!("cargo:rustc-link-lib=dylib=mlx");
-        println!("cargo:rustc-link-search={}/build/lib", dst.display());
         #[cfg(target_os = "macos")]
-        emit_mlx_rpath(&format!("{}/build/lib", dst.display()));
+        emit_mlx_rpath(&mlx_lib_dir_built.display().to_string());
         println!("cargo:rustc-env=PMETAL_BRIDGE_MLX_KIND=bundled-upstream");
-        dst.join("build/lib")
+        mlx_lib_dir_built.clone()
     };
     println!("cargo:rustc-env=PMETAL_BRIDGE_MLX_GIT_TAG={BUNDLED_MLX_GIT_TAG}");
     emit_bridge_metadata("mlx_lib_dir", mlx_lib_dir.display().to_string());
 
     // ── Compile bridge C++ sources via cc::Build ──
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let mlx_include = dst.join("build/_deps/mlx-src");
 
     #[cfg(target_os = "macos")]
     let deploy_target = resolve_deployment_target();
@@ -277,8 +421,8 @@ fn build_and_link() {
     // ── Cache mlx.metallib ──
     #[cfg(feature = "metal")]
     {
-        // CMake installs it to build/lib/mlx.metallib
-        let metallib = dst.join("build/lib/mlx.metallib");
+        // Either the freshly built tree or the reused cache has it at <lib>/mlx.metallib
+        let metallib = mlx_lib_dir_built.join("mlx.metallib");
         if metallib.exists() {
             emit_bridge_metadata("mlx_metallib", metallib.display().to_string());
         }
@@ -321,6 +465,8 @@ fn build_and_link() {
     println!("cargo:rerun-if-changed=cpp/bridge_internal.h");
     println!("cargo:rerun-if-changed=cmake/CMakeLists.txt");
     println!("cargo:rerun-if-changed=patches/metallib-search-path.patch");
+    println!("cargo:rerun-if-env-changed=PMETAL_MLX_PREFIX");
+    println!("cargo:rerun-if-env-changed=PMETAL_MLX_LIB_DIR");
 }
 
 fn main() {

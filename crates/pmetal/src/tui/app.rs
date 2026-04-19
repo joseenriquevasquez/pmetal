@@ -655,15 +655,13 @@ impl App {
             KeyCode::Down if self.inference.input_focused() => {
                 self.inference.scroll_down();
             }
-            KeyCode::Esc => {
-                if self.inference.generating {
-                    if let Some(ref job_id) = self.active_inference_job.clone() {
-                        if let Some(runner) = &mut self.runner {
-                            runner.cancel(job_id);
-                        }
+            KeyCode::Esc if self.inference.generating => {
+                if let Some(ref job_id) = self.active_inference_job.clone() {
+                    if let Some(runner) = &mut self.runner {
+                        runner.cancel(job_id);
                     }
-                    self.inference.generating = false;
                 }
+                self.inference.generating = false;
             }
             KeyCode::Char(c) if self.inference.input_focused() => {
                 self.inference.insert_char(c);
@@ -1799,12 +1797,10 @@ impl App {
         self.tick_count += 1;
 
         match self.active_tab {
-            Tab::Dashboard => {
-                // Only poll the file directly when no active job is pushing
-                // metrics via AppMsg::JobMetrics (avoids duplicate samples).
-                if self.active_training_job.is_none() {
-                    self.dashboard.poll_metrics();
-                }
+            // Only poll the file directly when no active job is pushing
+            // metrics via AppMsg::JobMetrics (avoids duplicate samples).
+            Tab::Dashboard if self.active_training_job.is_none() => {
+                self.dashboard.poll_metrics();
             }
             Tab::Device => {
                 // Refresh memory every 5 ticks (1 second)
