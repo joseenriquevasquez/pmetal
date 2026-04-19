@@ -8,7 +8,6 @@ use super::cache::{KvLayerCache, QuantizedTuple};
 use super::trace_turboquant_qwen;
 use super::weights::{LayerWeight, LayerWeights};
 
-
 // ============================================================================
 // Attention layer forward
 // ============================================================================

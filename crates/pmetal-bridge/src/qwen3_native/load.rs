@@ -2,8 +2,8 @@
 
 use crate::InlineArray;
 
-use super::{Qwen3Config, validate_quantization_runtime_support};
 use super::weights::{LayerWeight, LayerWeights, NativeWeights, copy_fresh_arr};
+use super::{Qwen3Config, validate_quantization_runtime_support};
 
 // ============================================================================
 // Weight loading

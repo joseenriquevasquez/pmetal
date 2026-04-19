@@ -20,13 +20,13 @@ pub(super) struct LayerWeights {
     pub(super) post_ln_eps: f32,
 
     // Attention projections (pre-transposed [in, out] for direct matmul)
-    pub(super) attn_q_w: InlineArray,         // [hidden, n_heads * head_dim]
+    pub(super) attn_q_w: InlineArray, // [hidden, n_heads * head_dim]
     pub(super) attn_q_b: Option<InlineArray>, // [n_heads * head_dim]
-    pub(super) attn_k_w: InlineArray,         // [hidden, n_kv_heads * head_dim]
+    pub(super) attn_k_w: InlineArray, // [hidden, n_kv_heads * head_dim]
     pub(super) attn_k_b: Option<InlineArray>, // [n_kv_heads * head_dim]
-    pub(super) attn_v_w: InlineArray,         // [hidden, n_kv_heads * head_dim]
+    pub(super) attn_v_w: InlineArray, // [hidden, n_kv_heads * head_dim]
     pub(super) attn_v_b: Option<InlineArray>, // [n_kv_heads * head_dim]
-    pub(super) attn_o_w: InlineArray,         // [n_heads * head_dim, hidden]
+    pub(super) attn_o_w: InlineArray, // [n_heads * head_dim, hidden]
     pub(super) attn_o_b: Option<InlineArray>, // [hidden]
 
     // Attention dims

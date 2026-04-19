@@ -6,7 +6,6 @@ use crate::InlineArray;
 use super::cache::GdnCache;
 use super::weights::{LayerWeight, LayerWeights};
 
-
 // ============================================================================
 // Dense MLP forward
 // ============================================================================
