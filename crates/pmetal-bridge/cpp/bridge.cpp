@@ -487,7 +487,6 @@ size_t mlx_inline_array_align(void) { return alignof(array); }
 void mlx_inline_enable_compile(void) { mlx::core::enable_compile(); }
 void mlx_inline_disable_compile(void) { mlx::core::disable_compile(); }
 void mlx_inline_clear_cache(void) { mlx::core::clear_cache(); }
-size_t mlx_inline_set_cache_limit(size_t limit) { return mlx::core::set_cache_limit(limit); }
 
 static mlx::core::Stream* generation_stream_ = nullptr;
 

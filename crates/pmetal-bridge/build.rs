@@ -59,10 +59,6 @@ fn emit_bridge_metadata(key: &str, value: impl AsRef<str>) {
 /// and ~/.cache/pmetal/lib/ user-cache lookups to MLX's Metal device loader.
 const METALLIB_SEARCH_PATH_PATCH: &str = include_str!("patches/metallib-search-path.patch");
 
-/// The slice-output-shapes patch: adds Slice::output_shapes() and
-/// CustomKernel::set_output_shapes() so MLX compile() works with our kernels.
-const SLICE_OUTPUT_SHAPES_PATCH: &str = include_str!("patches/slice-output-shapes.patch");
-
 // ── Staging + CMake build ─────────────────────────────────────────────────
 
 /// Stage the minimal CMakeLists.txt into OUT_DIR, inject the patch commands,
@@ -88,8 +84,7 @@ fn prepare_cmake_source() -> PathBuf {
         "GIT_TAG v0.31.1)",
         concat!(
             "GIT_TAG v0.31.1\n",
-            "  PATCH_COMMAND git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/metallib-search-path.patch || true",
-            " && git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/slice-output-shapes.patch || true)"
+            "  PATCH_COMMAND git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/metallib-search-path.patch || true)"
         ),
     );
     std::fs::write(staged.join("CMakeLists.txt"), patched)
@@ -103,11 +98,6 @@ fn prepare_cmake_source() -> PathBuf {
         METALLIB_SEARCH_PATH_PATCH,
     )
     .expect("Failed to write metallib patch");
-    std::fs::write(
-        patches_dir.join("slice-output-shapes.patch"),
-        SLICE_OUTPUT_SHAPES_PATCH,
-    )
-    .expect("Failed to write slice-output-shapes patch");
 
     staged
 }
@@ -331,7 +321,6 @@ fn build_and_link() {
     println!("cargo:rerun-if-changed=cpp/bridge_internal.h");
     println!("cargo:rerun-if-changed=cmake/CMakeLists.txt");
     println!("cargo:rerun-if-changed=patches/metallib-search-path.patch");
-    println!("cargo:rerun-if-changed=patches/slice-output-shapes.patch");
 }
 
 fn main() {

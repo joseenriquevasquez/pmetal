@@ -17,7 +17,7 @@ use pmetal_core::MemoryStats;
 
 pub use pmetal_bridge::inline_array::{
     clear_cache, get_active_memory, get_cache_memory, get_peak_memory, reset_peak_memory,
-    set_cache_limit, set_wired_limit,
+    set_wired_limit,
 };
 
 /// Get the current memory limit (returns maximum recommended working set size).

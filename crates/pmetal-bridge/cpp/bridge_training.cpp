@@ -48,11 +48,6 @@ void mlx_inline_mean_all(mlx_inline_array* dst, const mlx_inline_array* a) {
         new (dst->buf) array(mlx::core::mean(as_arr(a))));
 }
 
-void mlx_inline_var_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims) {
-    BRIDGE_TRY_DST("var_axis", dst,
-        new (dst->buf) array(mlx::core::var(as_arr(a), axis, keepdims)));
-}
-
 void mlx_inline_pow(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
     BRIDGE_TRY_DST("pow", dst,
         new (dst->buf) array(mlx::core::power(as_arr(a), as_arr(b))));
