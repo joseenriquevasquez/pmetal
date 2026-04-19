@@ -1,0 +1,165 @@
+//! Quantization primitives on [`InlineArray`].
+//!
+//! - `quantize_weights` / `dequantize`: per-group int4 / int8 quantization.
+//! - `quantized_matmul` / `gather_qmm`: dense and MoE-routed quantized matmul.
+//! - `save_safetensors`: save-side of the safetensors codec (the load side
+//!   lives in [`super::safetensors`]).
+
+use std::mem::MaybeUninit;
+
+use super::InlineArray;
+use super::RawBuf;
+use super::ffi::*;
+
+impl InlineArray {
+    // ── Dequantize ──────────────────────────────────────────────────────
+
+    /// Dequantize packed integer weights using per-group scales and biases.
+    pub fn dequantize(&self, scales: &Self, biases: &Self, group_size: i32, bits: i32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_dequantize(
+                dst.as_mut_ptr(),
+                &self.raw,
+                &scales.raw,
+                &biases.raw,
+                group_size,
+                bits,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
+    // ── Quantized matmul ──────────────────────────────────────────────────
+
+    /// Quantized matmul: `x @ dequantize(w, scales, biases)`.
+    #[inline]
+    pub fn quantized_matmul(
+        &self,
+        w: &Self,
+        scales: &Self,
+        biases: Option<&Self>,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+    ) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        let b_ptr = biases
+            .map(|b| &b.raw as *const RawBuf)
+            .unwrap_or(std::ptr::null());
+        unsafe {
+            mlx_inline_quantized_matmul(
+                dst.as_mut_ptr(),
+                &self.raw,
+                &w.raw,
+                &scales.raw,
+                b_ptr,
+                transpose,
+                group_size,
+                bits,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
+    /// Gather quantized matmul (MoE expert routing).
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_qmm(
+        &self,
+        w: &Self,
+        scales: &Self,
+        biases: Option<&Self>,
+        lhs_indices: Option<&Self>,
+        rhs_indices: Option<&Self>,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        sorted: bool,
+    ) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        let b_ptr = biases
+            .map(|b| &b.raw as *const RawBuf)
+            .unwrap_or(std::ptr::null());
+        let l_ptr = lhs_indices
+            .map(|l| &l.raw as *const RawBuf)
+            .unwrap_or(std::ptr::null());
+        let r_ptr = rhs_indices
+            .map(|r| &r.raw as *const RawBuf)
+            .unwrap_or(std::ptr::null());
+        unsafe {
+            mlx_inline_gather_qmm(
+                dst.as_mut_ptr(),
+                &self.raw,
+                &w.raw,
+                &scales.raw,
+                b_ptr,
+                l_ptr,
+                r_ptr,
+                transpose,
+                group_size,
+                bits,
+                sorted,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
+    // ── Quantize ──────────────────────────────────────────────────────
+
+    /// Quantize: returns (packed_weights, scales, biases).
+    pub fn quantize_weights(&self, group_size: i32, bits: i32) -> (Self, Self, Self) {
+        let mut w = MaybeUninit::<RawBuf>::uninit();
+        let mut s = MaybeUninit::<RawBuf>::uninit();
+        let mut b = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_quantize(
+                w.as_mut_ptr(),
+                s.as_mut_ptr(),
+                b.as_mut_ptr(),
+                &self.raw,
+                group_size,
+                bits,
+            );
+            (
+                Self {
+                    raw: w.assume_init(),
+                },
+                Self {
+                    raw: s.assume_init(),
+                },
+                Self {
+                    raw: b.assume_init(),
+                },
+            )
+        }
+    }
+
+    // ── save-side of the safetensors codec ──────────────────────────────
+
+    /// Save arrays to safetensors format.
+    pub fn save_safetensors(path: &str, entries: &[(&str, &InlineArray)]) {
+        let c_path = std::ffi::CString::new(path).expect("null byte in path");
+        let c_keys: Vec<std::ffi::CString> = entries
+            .iter()
+            .map(|(k, _)| std::ffi::CString::new(*k).expect("null byte in key"))
+            .collect();
+        let key_ptrs: Vec<*const std::ffi::c_char> = c_keys.iter().map(|k| k.as_ptr()).collect();
+        // Build a contiguous array of RawBufs (copy refs, not move)
+        let raw_arrays: Vec<RawBuf> = entries.iter().map(|(_, a)| a.raw).collect();
+        unsafe {
+            mlx_inline_save_safetensors(
+                c_path.as_ptr(),
+                key_ptrs.as_ptr(),
+                raw_arrays.as_ptr(),
+                entries.len() as i32,
+            );
+        }
+    }
+}
