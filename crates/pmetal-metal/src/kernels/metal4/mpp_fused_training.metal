@@ -195,18 +195,23 @@ kernel void mpp_gradient_norm_partial(
     // SIMD-lane reduction — no threadgroup barrier needed (MPP 2.3.1)
     float sg_sum = simd_sum(local_sum);
 
-    // One write per simdgroup
+    // Cross-simdgroup reduction via threadgroup memory.
+    // Grid config: 4 simdgroups per threadgroup (tg_sz=128 / 32 = 4).
+    // Xcode 26.4 SDK rejected the prior `threadgroup atomic<float>` pattern
+    // on this path, so use an explicit fanin through a 4-slot scratch array.
+    constexpr uint MAX_SIMDGROUPS_PER_TG = 4;
+    threadgroup float sg_sums[MAX_SIMDGROUPS_PER_TG];
     if (lane == 0u) {
-        // Accumulate simdgroup sums via atomic (multiple simdgroups per TG)
-        threadgroup atomic<float> tg_accum;
-        if (tid == 0u) atomic_store_explicit(&tg_accum, 0.0f, memory_order_relaxed);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        atomic_fetch_add_explicit(&tg_accum, sg_sum, memory_order_relaxed);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sg_sums[sg_id] = sg_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (sg_id == 0u) {
-            partial_sums[tgid] = atomic_load_explicit(&tg_accum, memory_order_relaxed);
+    if (tid == 0u) {
+        float total = 0.0f;
+        for (uint i = 0; i < MAX_SIMDGROUPS_PER_TG; ++i) {
+            total += sg_sums[i];
         }
+        partial_sums[tgid] = total;
     }
 }
 

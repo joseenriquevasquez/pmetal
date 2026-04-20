@@ -92,9 +92,13 @@ struct MppAdamWConfigMetal {
 /// Must match `MppParamInfo` in mpp_fused_training.metal.
 #[repr(C)]
 pub struct MppParamInfo {
+    /// Offset into the flat param/grad buffer at which this parameter starts.
     pub offset: u32,
+    /// Element count for this parameter.
     pub size: u32,
+    /// Offset into the flat Adam first-moment (`m`) buffer for this parameter.
     pub m_offset: u32,
+    /// Offset into the flat Adam second-moment (`v`) buffer for this parameter.
     pub v_offset: u32,
 }
 

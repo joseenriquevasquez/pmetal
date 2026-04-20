@@ -94,6 +94,21 @@ void mlx_inline_cross_entropy(mlx_inline_array* dst, const mlx_inline_array* log
     });
 }
 
+void mlx_inline_cross_entropy_sparse(mlx_inline_array* dst, const mlx_inline_array* logits,
+                                      const mlx_inline_array* indices, int axis) {
+    BRIDGE_TRY_DST("cross_entropy_sparse", dst, {
+        // NLL = logsumexp(logits, axis) - take_along_axis(logits, indices, axis)
+        // Output shape == logits.shape with `axis` removed.
+        const auto& l = as_arr(logits);
+        const auto& idx = as_arr(indices);
+        auto idx_exp = mlx::core::expand_dims(idx, axis);
+        auto gathered = mlx::core::take_along_axis(l, idx_exp, axis);
+        auto score = mlx::core::squeeze(gathered, axis);
+        auto lse = mlx::core::logsumexp(l, axis, false);
+        new (dst->buf) array(mlx::core::subtract(lse, score));
+    });
+}
+
 void mlx_inline_square(mlx_inline_array* dst, const mlx_inline_array* a) {
     BRIDGE_TRY_DST("square", dst,
         new (dst->buf) array(mlx::core::square(as_arr(a))));

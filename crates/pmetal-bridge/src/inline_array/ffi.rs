@@ -951,6 +951,12 @@ unsafe extern "C" {
         targets: *const RawBuf,
         axis: i32,
     );
+    pub(super) fn mlx_inline_cross_entropy_sparse(
+        dst: *mut RawBuf,
+        logits: *const RawBuf,
+        indices: *const RawBuf,
+        axis: i32,
+    );
     pub(super) fn mlx_inline_square(dst: *mut RawBuf, a: *const RawBuf);
 
     // ── Training ops: creation ──

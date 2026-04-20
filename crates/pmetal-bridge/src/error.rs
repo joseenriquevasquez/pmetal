@@ -37,6 +37,8 @@ unsafe extern "C" {
     fn pmetal_bridge_last_error_code() -> i32;
     fn pmetal_bridge_last_error_message() -> *const std::os::raw::c_char;
     fn pmetal_bridge_clear_error();
+    fn pmetal_bridge_set_error_log_mode(enabled: i32);
+    fn pmetal_bridge_get_error_log_mode() -> i32;
 }
 
 /// Error type for faults reported by the bridge's C++ layer.
@@ -106,6 +108,31 @@ pub fn check_last_error() -> BridgeResult<()> {
 /// must not leak into the next call's success check.
 pub fn clear_last_error() {
     unsafe { pmetal_bridge_clear_error() };
+}
+
+/// Toggle the bridge's `stderr` emission on caught C++ exceptions.
+///
+/// When enabled, every exception caught inside the bridge's BRIDGE_TRY
+/// wrappers prints a `[pmetal-bridge] exception in [op]: what()` line
+/// alongside setting the thread-local error slot. This makes the *first*
+/// failure visible even in code paths that don't call [`check_last_error`]
+/// after every op — the bridge's exception path replaces the failed op's
+/// output with a scalar-zero sentinel tensor, so without a log line the
+/// error first surfaces as a shape panic three or four ops later in
+/// unrelated code.
+///
+/// Default: enabled in debug builds, disabled in release. Can also be
+/// overridden at process start via the `PMETAL_BRIDGE_LOG_ERRORS` env var
+/// (`1`/`0`/`true`/`false`).
+pub fn set_error_log_mode(enabled: bool) {
+    unsafe { pmetal_bridge_set_error_log_mode(enabled as i32) };
+}
+
+/// Returns the current `stderr` emission mode.
+///
+/// See [`set_error_log_mode`] for the semantics.
+pub fn error_log_mode() -> bool {
+    unsafe { pmetal_bridge_get_error_log_mode() != 0 }
 }
 
 #[cfg(test)]

@@ -82,6 +82,11 @@ pub struct CommandAllocatorPool {
     slots: Mutex<Vec<AllocatorSlot>>,
 }
 
+// MTL4CommandAllocator handles are Metal-managed and thread-safe when access
+// is externally serialized. The Mutex around `slots` provides that guarantee.
+unsafe impl Send for CommandAllocatorPool {}
+unsafe impl Sync for CommandAllocatorPool {}
+
 impl CommandAllocatorPool {
     /// Create a new pool with `max_in_flight` pre-allocated command allocators.
     ///

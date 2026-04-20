@@ -98,23 +98,33 @@ fn main() {
     }
 }
 
-/// Detect Metal compiler version (__METAL_VERSION__).
-/// Returns e.g. 310 (Metal 3.1), 320 (Metal 3.2), 400 (Metal 4.0).
+/// Detect the maximum Metal language version the toolchain supports.
+///
+/// `__METAL_VERSION__` is determined by the chosen `-std=` flag. Without one,
+/// the compiler falls back to its default (e.g. `metal3.1` on many SDKs even
+/// when `metal4.0` is available), so a bare `metal -E` returns 310 on SDK 26+.
+/// We probe by requesting `-std=metal4.0` explicitly: if the compiler accepts,
+/// it preprocesses `__METAL_VERSION__` to `400`; otherwise it errors and we
+/// fall back to probing `metal3.1`. Returns 0 when nothing works (should be
+/// rare — means the toolchain is broken, not just old).
 fn detect_metal_version() -> u32 {
-    let output = Command::new("zsh")
-        .args([
-            "-c",
-            "echo '__METAL_VERSION__' | xcrun -sdk macosx metal -E -x metal -P - 2>/dev/null | tail -1 | tr -d '\\n'",
-        ])
-        .output();
-
-    match output {
-        Ok(o) if o.status.success() => {
-            let version_str = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            version_str.parse::<u32>().unwrap_or(0)
+    for std_flag in &["metal4.0", "metal3.1"] {
+        let script = format!(
+            "echo '__METAL_VERSION__' | xcrun -sdk macosx metal -std={std_flag} -E -x metal -P - 2>/dev/null | tail -1 | tr -d '\\n'",
+        );
+        let output = Command::new("zsh").args(["-c", &script]).output();
+        if let Ok(o) = output {
+            if o.status.success() {
+                let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if let Ok(n) = v.parse::<u32>() {
+                    if n > 0 {
+                        return n;
+                    }
+                }
+            }
         }
-        _ => 0,
     }
+    0
 }
 
 /// Detect macOS SDK version (e.g. 14.5, 26.2).

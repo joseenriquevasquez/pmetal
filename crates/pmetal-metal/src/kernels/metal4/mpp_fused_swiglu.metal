@@ -260,9 +260,12 @@ kernel void mpp_fused_swiglu_lora_forward_f16(
     if (tile_b >= B || tile_i >= I) return;
 
     // --- Step 1 & 2: MPP base projections (same as no-LoRA kernel) ----------
-    auto tX  = tensor(input,       dextents<int, 2>{H, B}, array<int, 2>{1, H});
-    auto tGW = tensor(gate_weight, dextents<int, 2>{H, I}, array<int, 2>{1, H});
-    auto tUW = tensor(up_weight,   dextents<int, 2>{H, I}, array<int, 2>{1, H});
+    // Xcode 26.4 SDK's MPP static_assert doesn't strip cv on cooperative-tensor
+    // source dtype, so `device const half` fails `is_same_v<const half, half>`.
+    // Cast away const at the wrap — reads only, no aliasing hazard.
+    auto tX  = tensor((device half*)input,       dextents<int, 2>{H, B}, array<int, 2>{1, H});
+    auto tGW = tensor((device half*)gate_weight, dextents<int, 2>{H, I}, array<int, 2>{1, H});
+    auto tUW = tensor((device half*)up_weight,   dextents<int, 2>{H, I}, array<int, 2>{1, H});
     auto tOut = tensor(output, dextents<int, 2>{I, B}, array<int, 2>{1, I});
 
     auto sliceX  = tX.slice(0, tile_b);
@@ -406,9 +409,10 @@ kernel void mpp_fused_swiglu_lora_forward_f32(
     const int tile_i = (int)(tgid.x * BN);
     if (tile_b >= B || tile_i >= I) return;
 
-    auto tX   = tensor(input,       dextents<int, 2>{H, B}, array<int, 2>{1, H});
-    auto tGW  = tensor(gate_weight, dextents<int, 2>{H, I}, array<int, 2>{1, H});
-    auto tUW  = tensor(up_weight,   dextents<int, 2>{H, I}, array<int, 2>{1, H});
+    // SDK 26.4 MPP const-strip workaround — see f16 LoRA kernel above.
+    auto tX   = tensor((device float*)input,       dextents<int, 2>{H, B}, array<int, 2>{1, H});
+    auto tGW  = tensor((device float*)gate_weight, dextents<int, 2>{H, I}, array<int, 2>{1, H});
+    auto tUW  = tensor((device float*)up_weight,   dextents<int, 2>{H, I}, array<int, 2>{1, H});
     auto tOut = tensor(output,      dextents<int, 2>{I, B}, array<int, 2>{1, I});
 
     auto sliceX  = tX.slice(0, tile_b);
@@ -544,7 +548,8 @@ kernel void mpp_fused_mlp_forward_f16(
     threadgroup half act_stage[BM * BN];
 
     // Tensor descriptors for input and output.
-    auto tX   = tensor(input,  dextents<int, 2>{H, B}, array<int, 2>{1, H});
+    // SDK 26.4 MPP const-strip workaround — see f16 LoRA kernel above.
+    auto tX   = tensor((device half*)input,  dextents<int, 2>{H, B}, array<int, 2>{1, H});
     auto tOut = tensor(output, dextents<int, 2>{H, B}, array<int, 2>{1, H});
     auto sliceX   = tX.slice(0, tile_b);
     auto sliceOut = tOut.slice(tile_h, tile_b);
@@ -576,7 +581,7 @@ kernel void mpp_fused_mlp_forward_f16(
     // down_weight: [H, I] row-major; for matmul we treat it as [I, H] transposed.
     // Slicing: for each I-tile at offset tile_i, the [BN, H] slab is
     //   down_weight + tile_i * H  as a [H, BN] tensor → [BN, H] transposed.
-    auto tDW_h = tensor(down_weight, dextents<int, 2>{I, H}, array<int, 2>{1, I});
+    auto tDW_h = tensor((device half*)down_weight, dextents<int, 2>{I, H}, array<int, 2>{1, I});
     auto sliceDW_h = tDW_h.slice(0, tile_h);  // columns [tile_h..+BN] of [I, H]
 
     auto rOut = out_op.template get_destination_cooperative_tensor<
@@ -588,8 +593,8 @@ kernel void mpp_fused_mlp_forward_f16(
         int tile_i = ti * BN;
 
         // Gate weight slab for this I-tile: gate_weight[I, H] columns tile_i..+BN
-        auto tGW = tensor(gate_weight, dextents<int, 2>{H, I}, array<int, 2>{1, H});
-        auto tUW = tensor(up_weight,   dextents<int, 2>{H, I}, array<int, 2>{1, H});
+        auto tGW = tensor((device half*)gate_weight, dextents<int, 2>{H, I}, array<int, 2>{1, H});
+        auto tUW = tensor((device half*)up_weight,   dextents<int, 2>{H, I}, array<int, 2>{1, H});
         auto sliceGW = tGW.slice(0, tile_i);
         auto sliceUW = tUW.slice(0, tile_i);
 
@@ -619,7 +624,7 @@ kernel void mpp_fused_mlp_forward_f16(
 
         // Down GEMM tile: down_weight rows tile_i..+BN, columns tile_h..+BN.
         // down_weight layout: [H, I] row-major → pointer at tile_i-th row.
-        auto tDW_i = tensor(down_weight + tile_i * H,
+        auto tDW_i = tensor((device half*)(down_weight + tile_i * H),
                             dextents<int, 2>{H, BN},
                             array<int, 2>{1, H});
         auto sliceDW_i = tDW_i.slice(0, tile_h);

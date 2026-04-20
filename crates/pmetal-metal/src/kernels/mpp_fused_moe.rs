@@ -713,7 +713,7 @@ impl MppGroupedGemmTileCount {
         }
 
         // Read the single u32 result — 4 bytes, trivial CPU cost.
-        let contents = tile_count_buf.contents();
+        let contents = tile_count_buf.as_slice();
         let total_tiles = contents[0] as usize;
         Ok(total_tiles)
     }

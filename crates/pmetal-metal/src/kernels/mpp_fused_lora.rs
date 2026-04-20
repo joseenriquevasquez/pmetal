@@ -273,7 +273,7 @@ impl MppFusedLora {
 
         encode_mpp_kernel(
             &self.ctx,
-            "mpp_fused_lora_forward_f16",
+            kernel_name(&self.config),
             grid,
             tg_size,
             |encoder| unsafe {
@@ -338,7 +338,7 @@ impl MppFusedLora {
 
         encode_mpp_kernel(
             &self.ctx,
-            "mpp_lora_forward_inference_f16",
+            kernel_name(&self.config),
             grid,
             tg_size,
             |encoder| unsafe {

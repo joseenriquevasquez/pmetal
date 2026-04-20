@@ -4,6 +4,24 @@
 //!
 //! These wrap high-throughput Metal kernels that encode full sub-graphs in a
 //! single dispatch, avoiding op-by-op FFI overhead.
+//!
+//! ## Error handling
+//!
+//! All methods in this module have infallible-looking signatures for ABI
+//! stability, but every wrapped op can fail on the C++ side — an unsupported
+//! dtype, shape mismatch, or an `eps` the kernel rejects will set the
+//! thread-local error slot and return a scalar-zero sentinel tensor. The
+//! error then silently propagates through subsequent shape-indexed ops
+//! until something blows up with a confusing panic.
+//!
+//! Two paths keep this debuggable:
+//!
+//! 1. Call [`crate::check_last_error`] (or the [`crate::try_ops`] variants
+//!    like [`crate::InlineArray::try_rms_norm`]) after each fast op to surface
+//!    the failure at the site where it actually happened.
+//! 2. Leave [`crate::set_error_log_mode`] at its default (on in debug builds)
+//!    so the first caught exception prints to stderr — useful during bring-up
+//!    when callers haven't wired up explicit checks yet.
 
 use std::mem::MaybeUninit;
 
@@ -252,6 +270,25 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_cross_entropy(dst.as_mut_ptr(), &self.raw, &targets.raw, axis);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
+    /// Sparse cross-entropy for integer class-index targets.
+    ///
+    /// `self` holds logits of shape `[..., V, ...]`. `indices` holds int class
+    /// indices whose shape equals `self.shape` with `axis` removed. Returns
+    /// per-position NLL in nats with that same reduced shape.
+    ///
+    /// Computes `logsumexp(logits, axis) - logits[indices]` inside a single
+    /// bridge call — the full `[..., V]` log-softmax tensor never materializes,
+    /// so memory scales with `logits.size() / V` rather than `logits.size()`.
+    pub fn cross_entropy_sparse(&self, indices: &Self, axis: i32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_cross_entropy_sparse(dst.as_mut_ptr(), &self.raw, &indices.raw, axis);
             Self {
                 raw: dst.assume_init(),
             }

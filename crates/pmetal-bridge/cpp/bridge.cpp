@@ -11,6 +11,9 @@
 
 #include "bridge_internal.h"
 #include "mlx/primitives.h"  // for typeid on Primitive subclasses
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <typeinfo>
 #include <limits>
 #include <numeric>
@@ -33,6 +36,32 @@ static_assert(alignof(array) <= MLX_ARRAY_ALIGN, "MLX_ARRAY_ALIGN too small");
 namespace {
     thread_local int32_t g_bridge_error_code = 0;
     thread_local std::string g_bridge_error_message;
+
+    // Process-wide toggle for stderr emission when an exception is caught
+    // inside a BRIDGE_TRY_{DST,VOID} wrapper. Writing to stderr on every
+    // failure makes the *first* exception visible to the user even when
+    // they haven't peppered their code with check_last_error() calls —
+    // critical for bring-up work, since the silent scalar-zero sentinel
+    // tensor would otherwise flow 3–4 ops downstream before a cryptic
+    // shape panic shows up in an unrelated place.
+    //
+    // Default: on in debug builds, off in release. Override at runtime via
+    // the PMETAL_BRIDGE_LOG_ERRORS env var ("1"/"0"/"true"/"false") or
+    // pmetal_bridge_set_error_log_mode() from Rust.
+    std::atomic<bool>& bridge_error_log_flag() {
+        static std::atomic<bool> enabled{[]() -> bool {
+            const char* env = std::getenv("PMETAL_BRIDGE_LOG_ERRORS");
+            if (env && env[0] != '\0') {
+                return env[0] == '1' || env[0] == 't' || env[0] == 'T';
+            }
+#ifdef NDEBUG
+            return false;
+#else
+            return true;
+#endif
+        }()};
+        return enabled;
+    }
 }
 
 void pmetal_bridge_set_last_error(const char* op, const char* what) noexcept {
@@ -48,6 +77,15 @@ void pmetal_bridge_set_last_error(const char* op, const char* what) noexcept {
         // Even message formatting can OOM; keep the code set so Rust
         // still detects failure, just with an empty message.
         g_bridge_error_message.clear();
+    }
+
+    if (bridge_error_log_flag().load(std::memory_order_relaxed)) {
+        // fprintf is signal-safe enough for this use and avoids pulling in
+        // iostream on the bridge's hot path. Single call to keep the line
+        // atomic with respect to other threads' stderr writes.
+        std::fprintf(stderr, "[pmetal-bridge] exception in [%s]: %s\n",
+                     op ? op : "(unknown op)",
+                     what ? what : "(no message)");
     }
 }
 
@@ -68,6 +106,14 @@ const char* pmetal_bridge_last_error_message(void) {
 
 void pmetal_bridge_clear_error(void) {
     pmetal_bridge_clear_error_internal();
+}
+
+void pmetal_bridge_set_error_log_mode(int32_t enabled) {
+    bridge_error_log_flag().store(enabled != 0, std::memory_order_relaxed);
+}
+
+int32_t pmetal_bridge_get_error_log_mode(void) {
+    return bridge_error_log_flag().load(std::memory_order_relaxed) ? 1 : 0;
 }
 
 void mlx_inline_init_empty(mlx_inline_array* dst) {

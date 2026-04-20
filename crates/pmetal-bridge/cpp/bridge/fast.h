@@ -65,6 +65,12 @@ void mlx_inline_svd(
 void mlx_inline_clip(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* lo, const mlx_inline_array* hi);
 void mlx_inline_log_softmax(mlx_inline_array* dst, const mlx_inline_array* a, int axis);
 void mlx_inline_cross_entropy(mlx_inline_array* dst, const mlx_inline_array* logits, const mlx_inline_array* targets, int axis);
+// Sparse cross-entropy: `targets` is an integer array of class indices whose
+// shape equals `logits.shape` with `axis` removed. Output is per-position NLL
+// in nats with that same reduced shape. Composes `logsumexp(logits, axis) -
+// take_along_axis(logits, targets_expanded, axis).squeeze(axis)` inside a
+// single bridge call so the `[..., V]` log-softmax tensor never materializes.
+void mlx_inline_cross_entropy_sparse(mlx_inline_array* dst, const mlx_inline_array* logits, const mlx_inline_array* indices, int axis);
 void mlx_inline_addmm(mlx_inline_array* dst, const mlx_inline_array* c, const mlx_inline_array* a, const mlx_inline_array* b);
 
 // ── Pad ──────────────────────────────────────────────────────────────────

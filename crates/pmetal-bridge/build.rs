@@ -49,6 +49,39 @@ fn emit_mlx_rpath(path: &str) {
     println!("cargo:rustc-link-arg=-Wl,-rpath,{path}");
 }
 
+/// Rewrite the `LC_ID_DYLIB` install name of a Mach-O dylib to an absolute
+/// path so downstream binaries record that absolute path in their
+/// `LC_LOAD_DYLIB` and dyld resolves without any `@rpath` / `DYLD_*` help.
+///
+/// Cargo's `cargo:rustc-link-arg=-Wl,-rpath,…` applies only to this crate's
+/// own artifacts — it does not propagate to downstream bins. Rewriting the
+/// dylib's own install name is the one setting that every dependent binary
+/// inherits.
+#[cfg(target_os = "macos")]
+fn set_dylib_install_name(dylib: &std::path::Path) {
+    if !dylib.exists() {
+        return;
+    }
+    let status = Command::new("install_name_tool")
+        .args([
+            "-id",
+            &dylib.display().to_string(),
+            &dylib.display().to_string(),
+        ])
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => println!(
+            "cargo:warning=install_name_tool -id {} failed: {s}",
+            dylib.display()
+        ),
+        Err(e) => println!(
+            "cargo:warning=install_name_tool -id {} errored: {e}",
+            dylib.display()
+        ),
+    }
+}
+
 fn emit_bridge_metadata(key: &str, value: impl AsRef<str>) {
     println!("cargo:metadata={key}={}", value.as_ref());
 }
@@ -294,6 +327,10 @@ fn build_and_link() {
                     "cargo:warning=Reusing cached MLX build from {} (tag {BUNDLED_MLX_GIT_TAG})",
                     mlx_prefix.as_ref().unwrap().display()
                 );
+                // Re-stamp the install name against the current cache path
+                // — safe if the cache was moved since the last build.
+                #[cfg(target_os = "macos")]
+                set_dylib_install_name(&lib.join(mlx_dylib_name()));
                 (lib, inc)
             }
             None => {
@@ -303,6 +340,23 @@ fn build_and_link() {
                     "cargo:rustc-link-search=native={}/build/_deps/mlx-build",
                     dst.display()
                 );
+
+                // Rewrite LC_ID_DYLIB on both copies of libmlx.dylib that live
+                // in this build tree. CMake emits the dylib into
+                // `build/lib/` (canonical) and — via FetchContent — also into
+                // `build/_deps/mlx-build/`. The linker picks whichever it
+                // finds first in the search path; if we miss one, downstream
+                // bins get an @rpath install name and fail to load without
+                // DYLD_LIBRARY_PATH. Do this BEFORE cache population so the
+                // archived copy has the final install name baked in.
+                #[cfg(target_os = "macos")]
+                {
+                    let built = dst.join("build/lib").join(mlx_dylib_name());
+                    let deps = dst.join("build/_deps/mlx-build").join(mlx_dylib_name());
+                    set_dylib_install_name(&built);
+                    set_dylib_install_name(&deps);
+                }
+
                 if let Some(prefix) = &mlx_prefix {
                     match populate_mlx_prefix(&dst, prefix) {
                         Ok(()) => println!(
@@ -313,6 +367,11 @@ fn build_and_link() {
                             "cargo:warning=Failed to populate PMETAL_MLX_PREFIX cache: {e}"
                         ),
                     }
+                    // The cache copy has the build-tree install name baked in.
+                    // Rewrite it to point at the cache location so downstream
+                    // bins built against the cache also load without DYLD help.
+                    #[cfg(target_os = "macos")]
+                    set_dylib_install_name(&prefix.join("lib").join(mlx_dylib_name()));
                 }
                 (dst.join("build/lib"), dst.join("build/_deps/mlx-src"))
             }

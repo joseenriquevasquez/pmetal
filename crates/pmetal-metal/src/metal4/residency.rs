@@ -51,6 +51,12 @@ pub struct ResidencyManager {
     inner: RwLock<ManagerInner>,
 }
 
+// MTLResidencySet operations are documented as thread-safe; the RwLock
+// additionally serializes Rust-side mutation, so sharing the manager across
+// threads is sound.
+unsafe impl Send for ResidencyManager {}
+unsafe impl Sync for ResidencyManager {}
+
 struct ManagerInner {
     /// The underlying Metal residency set.
     set: Retained<ProtocolObject<dyn MTLResidencySet>>,

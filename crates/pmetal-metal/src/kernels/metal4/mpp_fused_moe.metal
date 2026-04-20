@@ -74,10 +74,14 @@ kernel void mpp_fused_moe_gate_up_f16(
     if (tile_b >= B || tile_i >= I) return;
 
     // Input:       [B, H] row-major → columns-first tensor
-    auto tX  = tensor(input,       dextents<int, 2>{H, B}, array<int, 2>{1, H});
+    // NB: Xcode 26.4 SDK's MPP static_assert doesn't strip cv-qualifiers before
+    // type-matching the cooperative tensor source dtype, so `device const half`
+    // fails `is_same_v<const half, half>`. Cast away const at the wrap site;
+    // only reads happen through these tensors so no aliasing hazard.
+    auto tX  = tensor((device half*)input,       dextents<int, 2>{H, B}, array<int, 2>{1, H});
     // Weights:     [I, H] row-major → accessed as [H, I] transposed
-    auto tGW = tensor(gate_weight, dextents<int, 2>{H, I}, array<int, 2>{1, H});
-    auto tUW = tensor(up_weight,   dextents<int, 2>{H, I}, array<int, 2>{1, H});
+    auto tGW = tensor((device half*)gate_weight, dextents<int, 2>{H, I}, array<int, 2>{1, H});
+    auto tUW = tensor((device half*)up_weight,   dextents<int, 2>{H, I}, array<int, 2>{1, H});
     // Output:      [I, B] columns-first
     auto tOut = tensor(act_out,    dextents<int, 2>{I, B}, array<int, 2>{1, I});
 
@@ -145,9 +149,9 @@ kernel void mpp_fused_moe_down_f16(
     if (tile_b >= B || tile_h >= H) return;
 
     // act_in: [B, I] row-major → [I, B] columns-first
-    auto tA   = tensor(act_in,     dextents<int, 2>{I, B}, array<int, 2>{1, I});
+    auto tA   = tensor((device half*)act_in,     dextents<int, 2>{I, B}, array<int, 2>{1, I});
     // down_weight: [H, I] row-major → accessed as [I, H] transposed
-    auto tDW  = tensor(down_weight, dextents<int, 2>{I, H}, array<int, 2>{1, I});
+    auto tDW  = tensor((device half*)down_weight, dextents<int, 2>{I, H}, array<int, 2>{1, I});
     // out: [B, H] row-major → [H, B] columns-first
     auto tOut = tensor(out,         dextents<int, 2>{H, B}, array<int, 2>{1, H});
 
@@ -285,7 +289,7 @@ kernel void mpp_fused_moe_gate_up_quant_f16(
     const uint linear_tid = simd_group_id * 32 + simd_lane_id;
     const uint packed_cols = (uint)H / 8u;   // 8 nibbles per uint32
 
-    auto tX   = tensor(input,   dextents<int, 2>{H, B}, array<int, 2>{1, H});
+    auto tX   = tensor((device half*)input,   dextents<int, 2>{H, B}, array<int, 2>{1, H});
     auto tOut = tensor(act_out, dextents<int, 2>{I, B}, array<int, 2>{1, I});
     auto sliceX   = tX.slice(0, tile_b);
     auto sliceOut = tOut.slice(tile_i, tile_b);
@@ -399,7 +403,7 @@ kernel void mpp_fused_moe_down_quant_f16(
     const uint linear_tid = simd_group_id * 32 + simd_lane_id;
     const uint packed_cols = (uint)I / 8u;
 
-    auto tA   = tensor(act_in, dextents<int, 2>{I, B}, array<int, 2>{1, I});
+    auto tA   = tensor((device half*)act_in, dextents<int, 2>{I, B}, array<int, 2>{1, I});
     auto tOut = tensor(out,    dextents<int, 2>{H, B}, array<int, 2>{1, H});
     auto sliceA   = tA.slice(0, tile_b);
     auto sliceOut = tOut.slice(tile_h, tile_b);

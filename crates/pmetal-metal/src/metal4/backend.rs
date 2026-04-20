@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use half::f16;
+use objc2_metal::MTLCommandBuffer;
 
 use crate::{
     backend::{

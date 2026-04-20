@@ -12,7 +12,12 @@ pub mod inline_array;
 pub use inline_array::InlineArray;
 
 pub mod error;
-pub use error::{BridgeError, BridgeResult, check_last_error, clear_last_error};
+pub use error::{
+    BridgeError, BridgeResult, check_last_error, clear_last_error, error_log_mode,
+    set_error_log_mode,
+};
+
+pub mod dtype;
 
 pub mod compile;
 pub use compile::CompiledFn;

@@ -57,6 +57,20 @@ const char* pmetal_bridge_last_error_message(void);
 // every successful bridge op clears it automatically.
 void pmetal_bridge_clear_error(void);
 
+// Process-wide toggle for stderr logging on caught C++ exceptions.
+// When enabled, every exception caught inside a BRIDGE_TRY_{DST,VOID}
+// wrapper prints a `[pmetal-bridge] exception in [op]: what()` line to
+// stderr in addition to setting the thread-local error slot. Makes the
+// first failure visible without requiring a check_last_error() call at
+// every op site — critical for debugging, since the silent scalar-zero
+// sentinel tensor otherwise propagates several ops downstream before
+// showing up as an unrelated shape panic.
+//
+// Default: on in debug builds, off in release. Overridable at process
+// start via the PMETAL_BRIDGE_LOG_ERRORS env var ("1"/"0"/"true"/"false").
+void pmetal_bridge_set_error_log_mode(int32_t enabled);
+int32_t pmetal_bridge_get_error_log_mode(void);
+
 #ifdef __cplusplus
 }
 #endif
