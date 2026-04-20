@@ -222,7 +222,7 @@ impl CommandAllocatorPool {
 
     /// Poll all in-flight slots and reset any whose GPU work has completed.
     /// Must be called with the slot lock held.
-    fn poll_completed_locked(slots: &mut Vec<AllocatorSlot>) {
+    fn poll_completed_locked(slots: &mut [AllocatorSlot]) {
         for slot in slots.iter_mut() {
             let completed = match &slot.state {
                 AllocatorState::InFlight { event, value } => event.signaledValue() >= *value,

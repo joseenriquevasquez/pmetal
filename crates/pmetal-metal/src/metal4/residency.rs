@@ -147,6 +147,6 @@ impl ResidencyManager {
     /// uncommitted additions).
     pub fn allocation_count(&self) -> usize {
         let inner = self.inner.read();
-        inner.set.allocationCount() as usize
+        inner.set.allocationCount()
     }
 }
