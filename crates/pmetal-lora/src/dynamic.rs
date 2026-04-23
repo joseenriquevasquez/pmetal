@@ -239,7 +239,10 @@ impl DynamicLoraModel {
                 tracing::info!("Loaded Gemma LoRA model");
                 Ok(DynamicLoraModel::Gemma(model))
             }
-            ModelArchitecture::Phi => {
+            ModelArchitecture::Phi | ModelArchitecture::Phi4 => {
+                // Phi4 is the same architecture as Phi3 — just a different config
+                // preset (larger hidden size, qkv_bias=true). PhiLoraForCausalLM
+                // already honors those flags.
                 let phi_config: pmetal_models::architectures::phi::PhiConfig =
                     serde_json::from_str(&config_content)?;
 
@@ -247,7 +250,7 @@ impl DynamicLoraModel {
                 model.load_base_weights_from_dir(model_dir)?;
                 model.eval_all()?;
 
-                tracing::info!("Loaded Phi LoRA model");
+                tracing::info!("Loaded Phi LoRA model (dispatched from {arch:?})");
                 Ok(DynamicLoraModel::Phi(model))
             }
             ModelArchitecture::Qwen3Next => {
@@ -390,6 +393,7 @@ impl DynamicLoraModel {
             "mistral" => ModelArchitecture::Mistral,
             "gemma" => ModelArchitecture::Gemma,
             "phi" => ModelArchitecture::Phi,
+            "phi3" | "phi4" => ModelArchitecture::Phi4,
             _ => {
                 return Err(DynamicLoraError::Mlx(Exception::custom(format!(
                     "Unsupported architecture for LoRA: {}",
@@ -440,7 +444,7 @@ impl DynamicLoraModel {
                 model.eval_all()?;
                 Ok(DynamicLoraModel::Gemma(model))
             }
-            ModelArchitecture::Phi => {
+            ModelArchitecture::Phi | ModelArchitecture::Phi4 => {
                 let config = gguf_config.to_phi_config();
                 let mut model = PhiLoraForCausalLM::new(config, lora_config)?;
                 model.load_base_weights(&weights)?;
