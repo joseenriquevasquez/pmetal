@@ -33,6 +33,16 @@ impl TrainingLoop {
         let base_lr = self.config.training.learning_rate as f32;
         let weight_decay = self.config.training.weight_decay as f32;
 
+        // LoRA+ requires per-group LR scaling; the Metal fused optimizer
+        // operates on a flat parameter buffer and cannot express groups.
+        if self.config.loraplus_lr_ratio.is_some() {
+            tracing::warn!(
+                "LoRA+ (loraplus_lr_ratio) is not supported by the Metal fused optimizer; \
+                 all LoRA B matrices will use the base learning rate. Use the standard or \
+                 packed training loop for LoRA+."
+            );
+        }
+
         let mut metal_optimizer = MlxMetalOptimizerBuilder::new(base_lr)
             .weight_decay(weight_decay)
             .build()

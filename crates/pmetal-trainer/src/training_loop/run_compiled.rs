@@ -74,6 +74,11 @@ impl TrainingLoop {
             );
         }
 
+        // Wire LoRA+ differential learning rates for B vs A matrices
+        if let Some(ratio) = self.config.loraplus_lr_ratio {
+            optimizer_builder = optimizer_builder.with_loraplus_lr_ratio(ratio);
+        }
+
         let optimizer = optimizer_builder
             .build()
             .map_err(|_| SftError::Mlx(Exception::custom("Failed to build optimizer")))?;

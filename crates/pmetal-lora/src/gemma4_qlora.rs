@@ -9,6 +9,7 @@ use pmetal_bridge::compat::{
     nn, ops,
 };
 use pmetal_core::LoraConfig;
+use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::gemma4::{Gemma4Config, Gemma4RmsNorm};
 
 use crate::{
@@ -384,6 +385,24 @@ impl Gemma4QLoraAttention {
         Ok((q, k, v))
     }
 
+    fn forward(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        mut cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, LoraError> {
+        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let (q, k, v) = self.project_qkv(x, offset)?;
+        let (k, v) = if let Some((cache_ref, layer_idx)) = cache.as_mut() {
+            (*cache_ref)
+                .update_and_fetch(*layer_idx, &k, &v)
+                .map_err(LoraError::Mlx)?
+        } else {
+            (k, v)
+        };
+        self.attend(&q, &k, &v, mask)
+    }
+
     fn forward_collect_kv(
         &mut self,
         x: &Array,
@@ -483,6 +502,19 @@ impl Gemma4QLoraDecoderLayer {
         Ok(h.multiply(self.layer_scalar.as_ref()))
     }
 
+    fn forward(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+        layer_input: Option<&Array>,
+    ) -> Result<Array, LoraError> {
+        let residual = x.clone();
+        let h = self.input_layernorm.forward(x);
+        let h = self.self_attn.forward(&h, mask, cache)?;
+        self.finish_forward(&residual, &h, layer_input)
+    }
+
     fn forward_collect_kv(
         &mut self,
         x: &Array,
@@ -565,7 +597,12 @@ impl Gemma4QLoraModel {
         })
     }
 
-    fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
+    fn forward(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, LoraError> {
         let mut h = self.embed_tokens.forward(input_ids);
         h = h.multiply(&Array::from_f32(self.embed_scale));
         let per_layer_inputs = if let Some(inputs) = self.per_layer_inputs.as_mut() {
@@ -573,7 +610,8 @@ impl Gemma4QLoraModel {
         } else {
             None
         };
-        let mut local_shared_kv = if self.config.num_kv_shared_layers() > 0 {
+        let mut cache = cache;
+        let mut local_shared_kv = if cache.is_none() && self.config.num_kv_shared_layers() > 0 {
             Some((0..self.layers.len()).map(|_| None).collect::<Vec<_>>())
         } else {
             None
@@ -584,32 +622,51 @@ impl Gemma4QLoraModel {
                 .as_ref()
                 .map(|inputs| layer_per_input(inputs, i));
             let layer_input_ref = layer_input.as_ref();
+
             if let Some(shared_source) = layer.kv_shared_source_layer {
-                let (source_keys, source_values) = local_shared_kv
-                    .as_ref()
-                    .and_then(|entries| entries.get(shared_source))
-                    .and_then(|entry| entry.as_ref())
-                    .ok_or_else(|| {
-                        LoraError::Mlx(Exception::custom(format!(
-                            "Gemma 4 shared-KV layer {i} missing source layer {shared_source} activations"
-                        )))
-                    })?;
-                h = layer.forward_with_shared_kv(
-                    &h,
-                    mask,
-                    source_keys,
-                    source_values,
-                    0,
-                    layer_input_ref,
-                )?;
+                let rope_offset = cache.as_ref().map(|c| c.rope_offset()).unwrap_or(0);
+                if let Some(cache_ref) = cache.as_ref() {
+                    let (source_keys, source_values) =
+                        cache_ref.get(shared_source).ok_or_else(|| {
+                            LoraError::Mlx(Exception::custom(format!(
+                                "Gemma 4 shared-KV layer {i} missing source layer {shared_source} cache"
+                            )))
+                        })?;
+                    h = layer.forward_with_shared_kv(
+                        &h,
+                        mask,
+                        &source_keys,
+                        &source_values,
+                        rope_offset,
+                        layer_input_ref,
+                    )?;
+                } else {
+                    let (source_keys, source_values) = local_shared_kv
+                        .as_ref()
+                        .and_then(|entries| entries.get(shared_source))
+                        .and_then(|entry| entry.as_ref())
+                        .ok_or_else(|| {
+                            LoraError::Mlx(Exception::custom(format!(
+                                "Gemma 4 shared-KV layer {i} missing source layer {shared_source} activations"
+                            )))
+                        })?;
+                    h = layer.forward_with_shared_kv(
+                        &h,
+                        mask,
+                        source_keys,
+                        source_values,
+                        rope_offset,
+                        layer_input_ref,
+                    )?;
+                }
             } else if let Some(ref mut shared_kv) = local_shared_kv {
                 let (next_h, keys, values) =
                     layer.forward_collect_kv(&h, mask, 0, layer_input_ref)?;
                 shared_kv[i] = Some((keys, values));
                 h = next_h;
             } else {
-                let (next_h, _, _) = layer.forward_collect_kv(&h, mask, 0, layer_input_ref)?;
-                h = next_h;
+                let c = cache.as_deref_mut().map(|c| (c, i));
+                h = layer.forward(&h, mask, c, layer_input_ref)?;
             }
         }
         Ok(self.norm.forward(&h))
@@ -678,7 +735,16 @@ impl Gemma4QloraForCausalLM {
     }
 
     pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
-        let hidden = self.model.forward(input_ids, mask)?;
+        self.forward_with_cache(input_ids, mask, None)
+    }
+
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, LoraError> {
+        let hidden = self.model.forward(input_ids, mask, cache)?;
         let logits = self.model.embed_tokens.as_linear(&hidden);
         Ok(self.logit_softcap(&logits))
     }
@@ -688,7 +754,16 @@ impl Gemma4QloraForCausalLM {
         input_ids: &Array,
         mask: Option<&Array>,
     ) -> Result<Array, LoraError> {
-        self.model.forward(input_ids, mask)
+        self.model.forward(input_ids, mask, None)
+    }
+
+    pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
+        KVCache::new(KVCacheConfig::new(
+            self.model.config.num_hidden_layers as usize,
+            max_seq_len,
+            self.model.config.num_key_value_heads as usize,
+            self.model.config.head_dim as usize,
+        ))
     }
 
     pub fn num_trainable_params(&self) -> usize {
@@ -1102,6 +1177,23 @@ impl TrainableModel for Gemma4QloraForCausalLM {
         Gemma4QloraForCausalLM::forward(self, input_ids, mask)
     }
 
+    fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, LoraError> {
+        Gemma4QloraForCausalLM::forward_with_cache(self, input_ids, mask, cache)
+    }
+
+    fn create_cache(&self, max_seq_len: usize) -> Option<KVCache> {
+        Some(Gemma4QloraForCausalLM::create_cache(self, max_seq_len))
+    }
+
+    fn supports_kv_cache(&self) -> bool {
+        true
+    }
+
     fn num_trainable_params(&self) -> usize {
         Gemma4QloraForCausalLM::num_trainable_params(self)
     }
@@ -1181,5 +1273,29 @@ mod tests {
             Gemma4QloraForCausalLM::with_qlora_config(tiny_config(), QLoraConfig::default())
                 .unwrap();
         assert!(model.num_trainable_params() > 0);
+    }
+
+    #[test]
+    fn gemma4_qlora_forward_with_cache_matches_forward_for_full_prompt() {
+        let mut model =
+            Gemma4QloraForCausalLM::with_qlora_config(tiny_config(), QLoraConfig::default())
+                .unwrap();
+        let ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+
+        let no_cache = model.forward(&ids, None).unwrap();
+        let mut cache = model.create_cache(16);
+        let with_cache = model.forward_with_cache(&ids, None, Some(&mut cache)).unwrap();
+        assert_eq!(no_cache.shape(), with_cache.shape());
+        // rope_offset advances by prompt length after the call
+        assert_eq!(cache.rope_offset(), 4);
+    }
+
+    #[test]
+    fn gemma4_qlora_supports_kv_cache_trait() {
+        let model =
+            Gemma4QloraForCausalLM::with_qlora_config(tiny_config(), QLoraConfig::default())
+                .unwrap();
+        assert!(TrainableModel::supports_kv_cache(&model));
+        assert!(TrainableModel::create_cache(&model, 8).is_some());
     }
 }
