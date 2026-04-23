@@ -47,6 +47,8 @@ pub struct TrainingBatch {
     pub batch_size: usize,
     /// Sequence length.
     pub seq_len: usize,
+    /// Original dataset indices for each sample in the batch.
+    pub sample_indices: Vec<usize>,
 }
 
 /// Configuration for the DataLoader.
@@ -331,6 +333,7 @@ impl DataLoader {
             pixel_values,
             batch_size: components.batch_size,
             seq_len: components.seq_len,
+            sample_indices: indices.to_vec(),
         })
     }
 }
@@ -468,6 +471,25 @@ mod tests {
         assert_eq!(batch.batch_size, 2);
         assert_eq!(batch.input_ids_flat, vec![1, 2, 3, 4, 5, 0]);
         assert_eq!(batch.attention_mask_flat, vec![1, 1, 1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn test_batch_preserves_sample_indices() {
+        let samples: Vec<Sample> = (0..4).map(|i| Sample::new(vec![i as u32 + 1])).collect();
+        let dataset = TrainingDataset::from_samples(samples);
+
+        let loader = DataLoader::new(
+            dataset,
+            DataLoaderConfig {
+                batch_size: 2,
+                shuffle: false,
+                ..Default::default()
+            },
+            None,
+        );
+
+        let batch = loader.create_batch(&[3, 1]).unwrap();
+        assert_eq!(batch.sample_indices, vec![3, 1]);
     }
 
     #[test]

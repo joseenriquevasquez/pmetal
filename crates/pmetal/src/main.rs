@@ -283,7 +283,10 @@ enum Commands {
         #[arg(long)]
         pack_max_seq_len: Option<usize>,
 
-        /// Disable JIT compilation (enabled by default for up to 50% throughput improvement)
+        /// Disable the experimental compiled-training dispatch.
+        ///
+        /// The current Rust bridge falls back to fused eager execution when
+        /// compile-with-state is unavailable.
         #[arg(long)]
         no_jit_compilation: bool,
 
@@ -1106,6 +1109,26 @@ enum Commands {
         /// Distillation method (online, offline, progressive)
         #[arg(long, default_value = "online")]
         method: String,
+
+        /// Shortcut for `--method offline`.
+        #[arg(long)]
+        offline: bool,
+
+        /// Directory used to store or load cached teacher logits for offline distillation.
+        #[arg(long)]
+        offline_cache: Option<String>,
+
+        /// Force generation of missing teacher logits for offline distillation.
+        #[arg(long)]
+        offline_generate: bool,
+
+        /// Compression used for newly created offline logit caches.
+        #[arg(long, default_value = "top_k")]
+        offline_compression: String,
+
+        /// Top-k width for newly created offline logit caches.
+        #[arg(long, default_value_t = 128)]
+        offline_top_k: usize,
 
         /// Loss type (kl_divergence, jensen_shannon, soft_cross_entropy, mse_loss)
         #[arg(long, default_value = "kl_divergence")]
@@ -3229,6 +3252,11 @@ async fn tokio_main() -> anyhow::Result<()> {
             dataset,
             output,
             method,
+            offline,
+            offline_cache,
+            offline_generate,
+            offline_compression,
+            offline_top_k,
             loss_type,
             temperature,
             alpha,
@@ -3274,6 +3302,13 @@ async fn tokio_main() -> anyhow::Result<()> {
                 column_separator,
                 prompt_column,
                 response_column,
+                commands::distill::OfflineCliOptions {
+                    enabled: offline,
+                    cache_path: offline_cache,
+                    generate: offline_generate,
+                    compression: offline_compression,
+                    top_k: offline_top_k,
+                },
             )
             .await?;
         }

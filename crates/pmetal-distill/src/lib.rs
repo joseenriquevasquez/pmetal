@@ -39,10 +39,11 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use pmetal_distill::{DistillConfig, run_distillation};
+//! use pmetal_distill::{DistillConfig, Distiller};
 //!
 //! let config = DistillConfig::from_yaml_file("distill_config.yaml")?;
-//! run_distillation(&config).await?;
+//! let distiller = Distiller::new(config)?;
+//! // Use `distiller.compute_loss(...)` inside your own training loop.
 //! ```
 
 // Crate-level lint configuration for ML/GPU code patterns

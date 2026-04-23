@@ -1,5 +1,172 @@
 use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OfflineCliOptions {
+    pub enabled: bool,
+    pub cache_path: Option<String>,
+    pub generate: bool,
+    pub compression: String,
+    pub top_k: usize,
+}
+
+fn parse_method(method_str: &str) -> anyhow::Result<pmetal_distill::DistillMethod> {
+    use pmetal_distill::DistillMethod;
+
+    match method_str.to_lowercase().as_str() {
+        "online" => Ok(DistillMethod::Online),
+        "offline" => Ok(DistillMethod::Offline),
+        "progressive" => Ok(DistillMethod::Progressive),
+        other => anyhow::bail!(
+            "Unknown distillation method '{}'. Valid options: online, offline, progressive",
+            other
+        ),
+    }
+}
+
+fn resolve_method(
+    method_str: &str,
+    offline: &OfflineCliOptions,
+) -> anyhow::Result<pmetal_distill::DistillMethod> {
+    let requested = parse_method(method_str)?;
+    if offline.enabled {
+        if requested != pmetal_distill::DistillMethod::Online
+            && requested != pmetal_distill::DistillMethod::Offline
+        {
+            anyhow::bail!("--offline conflicts with --method {method_str}");
+        }
+        Ok(pmetal_distill::DistillMethod::Offline)
+    } else {
+        Ok(requested)
+    }
+}
+
+fn parse_loss_type(loss_type_str: &str) -> anyhow::Result<pmetal_distill::LossType> {
+    use pmetal_distill::LossType;
+
+    match loss_type_str.to_lowercase().as_str() {
+        "kl_divergence" => Ok(LossType::KlDivergence),
+        "jensen_shannon" => Ok(LossType::JensenShannon),
+        "soft_cross_entropy" => Ok(LossType::SoftCrossEntropy),
+        "mse_loss" => Ok(LossType::MseLoss),
+        other => anyhow::bail!(
+            "Unknown loss type '{}'. Valid options: kl_divergence, jensen_shannon, soft_cross_entropy, mse_loss",
+            other
+        ),
+    }
+}
+
+fn parse_compression_method(
+    compression: &str,
+) -> anyhow::Result<pmetal_distill::CompressionMethod> {
+    use pmetal_distill::CompressionMethod;
+
+    match compression.to_lowercase().as_str() {
+        "none" => Ok(CompressionMethod::None),
+        "top_k" | "top-k" => Ok(CompressionMethod::TopK),
+        "int8" => Ok(CompressionMethod::Int8),
+        "int4" => Ok(CompressionMethod::Int4),
+        other => anyhow::bail!(
+            "Unknown offline compression '{}'. Valid options: none, top_k, int8, int4",
+            other
+        ),
+    }
+}
+
+fn resolve_offline_config(
+    method: pmetal_distill::DistillMethod,
+    offline: &OfflineCliOptions,
+    output_dir: &std::path::Path,
+) -> anyhow::Result<Option<pmetal_distill::OfflineConfig>> {
+    if method != pmetal_distill::DistillMethod::Offline {
+        if offline.cache_path.is_some() || offline.generate {
+            anyhow::bail!("offline-specific flags require --offline or --method offline");
+        }
+        return Ok(None);
+    }
+
+    let compression = parse_compression_method(&offline.compression)?;
+    let logits_path = offline
+        .cache_path
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| output_dir.join("teacher_logits"));
+
+    Ok(Some(pmetal_distill::OfflineConfig {
+        logits_path,
+        compression,
+        top_k: offline.top_k,
+        generate: offline.generate,
+    }))
+}
+
+fn validate_offline_cache(
+    cache: &pmetal_distill::LogitCache,
+    teacher_id: &str,
+    max_seq_len: usize,
+    dataset_len: usize,
+) -> anyhow::Result<()> {
+    let metadata = cache.metadata();
+    if metadata.model != teacher_id {
+        anyhow::bail!(
+            "offline cache {:?} was generated for teacher '{}', but this run uses '{}'",
+            cache.cache_dir(),
+            metadata.model,
+            teacher_id
+        );
+    }
+    if metadata.max_seq_len != max_seq_len {
+        anyhow::bail!(
+            "offline cache {:?} was generated with max_seq_len={}, but this run uses {}",
+            cache.cache_dir(),
+            metadata.max_seq_len,
+            max_seq_len
+        );
+    }
+    if metadata.num_sequences < dataset_len {
+        anyhow::bail!(
+            "offline cache {:?} is incomplete: contains {} sequences, expected at least {}",
+            cache.cache_dir(),
+            metadata.num_sequences,
+            dataset_len
+        );
+    }
+    if metadata.vocab_size == 0 {
+        anyhow::bail!(
+            "offline cache {:?} is missing vocab metadata",
+            cache.cache_dir()
+        );
+    }
+    Ok(())
+}
+
+fn validate_cache_for_generation(
+    cache: &pmetal_distill::LogitCache,
+    teacher_id: &str,
+    max_seq_len: usize,
+) -> anyhow::Result<()> {
+    let metadata = cache.metadata();
+    if metadata.num_sequences == 0 {
+        return Ok(());
+    }
+    if metadata.model != teacher_id {
+        anyhow::bail!(
+            "offline cache {:?} already contains logits for teacher '{}'; choose a different --offline-cache path for '{}'",
+            cache.cache_dir(),
+            metadata.model,
+            teacher_id
+        );
+    }
+    if metadata.max_seq_len != 0 && metadata.max_seq_len != max_seq_len {
+        anyhow::bail!(
+            "offline cache {:?} was created with max_seq_len={}, but this run uses {}",
+            cache.cache_dir(),
+            metadata.max_seq_len,
+            max_seq_len
+        );
+    }
+    Ok(())
+}
+
 /// Run knowledge distillation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_distillation_cli(
@@ -28,11 +195,12 @@ pub(crate) async fn run_distillation_cli(
     column_separator: String,
     prompt_column: Option<String>,
     response_column: Option<String>,
+    offline: OfflineCliOptions,
 ) -> anyhow::Result<()> {
     use pmetal_core::LoraConfig;
-    use pmetal_distill::{DistillConfig, DistillMethod, Distiller, LossConfig, LossType};
+    use pmetal_distill::{DistillConfig, Distiller, LogitCache, LossConfig};
     use pmetal_lora::DynamicLoraModel;
-    use pmetal_trainer::{DistillationTrainer, TrainingLoopConfig};
+    use pmetal_trainer::{DistillationTrainer, TrainingLoopConfig, generate_teacher_logit_cache};
     use std::path::{Path, PathBuf};
 
     let column_cfg = crate::commands::build_column_config(
@@ -43,6 +211,12 @@ pub(crate) async fn run_distillation_cli(
         response_column,
     );
 
+    let validated_distill_output = crate::validate_output_path(output_dir, "distillation output")?;
+    let method = resolve_method(method_str, &offline)?;
+    let loss_type = parse_loss_type(loss_type_str)?;
+    let offline_config =
+        resolve_offline_config(method.clone(), &offline, &validated_distill_output)?;
+
     if emit_console_output {
         println!("========================================");
         println!("  PMetal Knowledge Distillation");
@@ -51,12 +225,16 @@ pub(crate) async fn run_distillation_cli(
         println!("Student:       {}", student_id);
         println!("Dataset:       {}", dataset_path);
         println!("Output:        {}", output_dir);
-        println!("Method:        {}", method_str);
+        println!("Method:        {:?}", method);
         println!("Loss Type:     {}", loss_type_str);
         println!("Temperature:   {}", temperature);
         println!("Alpha:         {}", alpha);
         if rationale {
             println!("Rationale:     enabled (weight: {})", rationale_weight);
+        }
+        if let Some(ref offline_cfg) = offline_config {
+            println!("Offline Cache: {}", offline_cfg.logits_path.display());
+            println!("Compression:   {:?}", offline_cfg.compression);
         }
         println!("LoRA Rank:     {}", lora_r);
         println!("LR:            {:.2e}", learning_rate);
@@ -66,7 +244,6 @@ pub(crate) async fn run_distillation_cli(
         println!("========================================\n");
     }
 
-    // 1. Resolve and Download Models
     tracing::info!("Resolving teacher model: {}", teacher_id);
     let teacher_path = if teacher_id.contains('/') && !Path::new(teacher_id).exists() {
         pmetal_hub::download_model(teacher_id, None, None).await?
@@ -81,15 +258,11 @@ pub(crate) async fn run_distillation_cli(
         PathBuf::from(student_id)
     };
 
-    // 2. Load Tokenizer (from student, with config-aware special token resolution)
     tracing::info!("Loading tokenizer...");
     let tokenizer = Tokenizer::from_model_dir(&student_path)?;
-
-    // 2b. Detect chat template from student model
     let chat_template =
         pmetal_data::chat_templates::detect_chat_template(&student_path, student_id);
 
-    // 3. Load Dataset (supports both JSONL and Parquet)
     tracing::info!("Loading dataset: {}", dataset_path);
     let is_parquet = Path::new(dataset_path)
         .extension()
@@ -141,51 +314,19 @@ pub(crate) async fn run_distillation_cli(
         }
     }
 
-    // 4. Load Teacher Model (Frozen)
-    tracing::info!("Loading teacher model...");
-    let teacher_lora_config = LoraConfig {
-        r: 0,
-        ..Default::default()
-    };
-    let mut teacher_model = DynamicLoraModel::from_pretrained(&teacher_path, teacher_lora_config)?;
-
-    // 5. Load Student Model (Trainable LoRA)
     tracing::info!("Loading student model...");
     let student_lora_config = LoraConfig {
         r: lora_r,
-        alpha: lora_alpha as f32,
+        alpha: lora_alpha,
         ..Default::default()
     };
     let mut student_model =
         DynamicLoraModel::from_pretrained(&student_path, student_lora_config.clone())?;
 
-    // 6. Setup Distillation Engine
-    let method = match method_str.to_lowercase().as_str() {
-        "online" => DistillMethod::Online,
-        "offline" => DistillMethod::Offline,
-        "progressive" => DistillMethod::Progressive,
-        other => anyhow::bail!(
-            "Unknown distillation method '{}'. Valid options: online, offline, progressive",
-            other
-        ),
-    };
-
-    let loss_type = match loss_type_str.to_lowercase().as_str() {
-        "kl_divergence" => LossType::KlDivergence,
-        "jensen_shannon" => LossType::JensenShannon,
-        "soft_cross_entropy" => LossType::SoftCrossEntropy,
-        "mse_loss" => LossType::MseLoss,
-        other => anyhow::bail!(
-            "Unknown loss type '{}'. Valid options: kl_divergence, jensen_shannon, soft_cross_entropy, mse_loss",
-            other
-        ),
-    };
-
-    let validated_distill_output = crate::validate_output_path(output_dir, "distillation output")?;
     let distill_config = DistillConfig {
         teacher: teacher_id.to_string(),
         student: student_id.to_string(),
-        method,
+        method: method.clone(),
         loss: LossConfig {
             loss_type,
             temperature,
@@ -194,7 +335,7 @@ pub(crate) async fn run_distillation_cli(
             rationale_weight,
             ..Default::default()
         },
-        offline: None,
+        offline: offline_config.clone(),
         output_path: Some(validated_distill_output.clone()),
         training: pmetal_distill::TrainingConfig {
             batch_size,
@@ -207,8 +348,7 @@ pub(crate) async fn run_distillation_cli(
 
     let distiller = Distiller::new(distill_config)?;
 
-    // 7. Setup Trainer
-    #[allow(clippy::needless_update)] // ..Default covers cfg-gated fields (distributed)
+    #[allow(clippy::needless_update)]
     let training_loop_config = TrainingLoopConfig {
         training: pmetal_core::TrainingConfig {
             learning_rate: learning_rate as f64,
@@ -231,7 +371,7 @@ pub(crate) async fn run_distillation_cli(
         log_every: 1,
         checkpoint_every: 100,
         eval_every: 0,
-        use_jit_compilation: true,
+        use_jit_compilation: false,
         use_sequence_packing: true,
         gradient_checkpointing: true,
         gradient_checkpointing_layers: 4,
@@ -246,7 +386,6 @@ pub(crate) async fn run_distillation_cli(
 
     let mut trainer = DistillationTrainer::new(distiller, training_loop_config);
 
-    // 7b. Enable adaptive LR for distillation (more conservative config)
     {
         let adaptive_config = pmetal_trainer::AdaptiveLrConfig::for_distillation();
         let control_file = validated_distill_output.join(".lr_control.json");
@@ -254,11 +393,10 @@ pub(crate) async fn run_distillation_cli(
         tracing::info!("Adaptive LR enabled (spike/plateau/divergence detection)");
     }
 
-    // 7c. Add metrics callback if requested (TUI dashboard)
     if let Some(ref metrics_path) = log_metrics {
         use pmetal_trainer::callbacks::MetricsJsonCallback;
         let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
-            std::path::PathBuf::from(metrics_path)
+            PathBuf::from(metrics_path)
         } else {
             validated_distill_output.join(metrics_path)
         };
@@ -270,24 +408,75 @@ pub(crate) async fn run_distillation_cli(
         trainer.add_callback(callback);
     }
 
-    // 8. Run Distillation
-    trainer
-        .run(
-            &mut student_model,
-            &mut teacher_model,
-            train_dataset,
-            None,
-            None,
-        )
-        .map_err(|e| anyhow::anyhow!("Distillation failed: {}", e))?;
+    match method {
+        pmetal_distill::DistillMethod::Online | pmetal_distill::DistillMethod::Progressive => {
+            tracing::info!("Loading teacher model...");
+            let teacher_lora_config = LoraConfig {
+                r: 0,
+                ..Default::default()
+            };
+            let mut teacher_model =
+                DynamicLoraModel::from_pretrained(&teacher_path, teacher_lora_config)?;
+            trainer
+                .run(
+                    &mut student_model,
+                    &mut teacher_model,
+                    train_dataset,
+                    None,
+                    None,
+                )
+                .map_err(|e| anyhow::anyhow!("Distillation failed: {}", e))?;
+        }
+        pmetal_distill::DistillMethod::Offline => {
+            let offline_cfg = offline_config.expect("offline config required for offline mode");
+            let metadata_path = offline_cfg.logits_path.join("metadata.json");
+            let mut cache = if metadata_path.exists() {
+                LogitCache::load(&offline_cfg.logits_path)?
+            } else {
+                LogitCache::new(
+                    &offline_cfg.logits_path,
+                    offline_cfg.compression.clone(),
+                    offline_cfg.top_k,
+                )?
+            };
 
-    // 9. Save Student Adapters
+            let cache_complete = metadata_path.exists()
+                && validate_offline_cache(&cache, teacher_id, max_seq_len, train_dataset.len())
+                    .is_ok();
+            if !cache_complete {
+                validate_cache_for_generation(&cache, teacher_id, max_seq_len)?;
+                tracing::info!(
+                    "Generating teacher logits for offline distillation into {:?}",
+                    offline_cfg.logits_path
+                );
+                let teacher_lora_config = LoraConfig {
+                    r: 0,
+                    ..Default::default()
+                };
+                let mut teacher_model =
+                    DynamicLoraModel::from_pretrained(&teacher_path, teacher_lora_config)?;
+                generate_teacher_logit_cache(
+                    &mut teacher_model,
+                    &train_dataset,
+                    &mut cache,
+                    teacher_id,
+                    max_seq_len,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to generate teacher logits: {}", e))?;
+            }
+
+            validate_offline_cache(&cache, teacher_id, max_seq_len, train_dataset.len())?;
+            trainer
+                .run_offline(&mut student_model, &cache, train_dataset, None, None)
+                .map_err(|e| anyhow::anyhow!("Offline distillation failed: {}", e))?;
+        }
+    }
+
     let lora_output = validated_distill_output.join("lora_weights.safetensors");
     tracing::info!("Saving distilled student adapters to {:?}", lora_output);
     std::fs::create_dir_all(&validated_distill_output)?;
     use pmetal_lora::TrainableModel;
     student_model.save_lora_weights(&lora_output)?;
-    // Save adapter config so inference knows r/alpha/target_modules without guessing
     crate::save_adapter_config(
         &lora_output,
         student_lora_config.r,
@@ -307,10 +496,48 @@ pub(crate) async fn run_distillation_cli(
         println!("========================================");
         println!("\nNext steps:");
         println!(
-            "  Inference:  pmetal run {} --lora {}",
+            "  Inference:  pmetal infer --model {} --lora {} --prompt \"Your prompt\"",
             student_id,
             lora_output.display()
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_method_rejects_conflicts() {
+        let err = resolve_method(
+            "progressive",
+            &OfflineCliOptions {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--offline conflicts"));
+    }
+
+    #[test]
+    fn resolve_offline_config_defaults_to_output_cache_dir() {
+        let cfg = resolve_offline_config(
+            pmetal_distill::DistillMethod::Offline,
+            &OfflineCliOptions {
+                enabled: true,
+                compression: "top_k".to_string(),
+                top_k: 128,
+                ..Default::default()
+            },
+            std::path::Path::new("./output/distilled"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cfg.logits_path,
+            std::path::PathBuf::from("./output/distilled/teacher_logits")
+        );
+    }
 }

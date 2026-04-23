@@ -149,81 +149,32 @@ impl Distiller {
         }
     }
 
+    fn unsupported_orchestration(&self) -> Result<PathBuf> {
+        Err(DistillError::InvalidConfig(
+            "end-to-end distillation orchestration is not available in `pmetal-distill` alone; \
+             use the `pmetal distill` CLI or `pmetal_trainer::DistillationTrainer` with \
+             model, dataset, and adapter configuration"
+                .to_string(),
+        ))
+    }
+
     /// Run online distillation.
     ///
     /// Both teacher and student are loaded and run during training.
     fn run_online(&self) -> Result<PathBuf> {
-        info!("Running online distillation");
-
-        // This would integrate with pmetal-trainer for actual training
-        // For now, we provide the infrastructure for the training loop
-
-        let output_path = self
-            .config
-            .output_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("./distilled_model"));
-
-        info!("Online distillation configured");
-        info!("  Loss: {}", self.loss.name());
-        info!("  Temperature: {}", self.config.loss.temperature);
-        info!("  Alpha: {}", self.config.loss.alpha);
-        info!("  Output: {:?}", output_path);
-
-        // The actual training loop would:
-        // 1. Load teacher and student models
-        // 2. For each batch:
-        //    a. Forward through teacher (no grad)
-        //    b. Forward through student (with grad)
-        //    c. Compute distillation loss
-        //    d. Backward through student
-        //    e. Update student weights
-
-        Ok(output_path)
+        self.unsupported_orchestration()
     }
 
     /// Run offline distillation.
     ///
     /// Uses pre-computed teacher logits from cache.
     fn run_offline(&self) -> Result<PathBuf> {
-        info!("Running offline distillation");
-
-        let offline_config = self.config.offline.as_ref().ok_or_else(|| {
-            DistillError::InvalidConfig(
-                "Offline config required for offline distillation".to_string(),
-            )
-        })?;
-
-        let output_path = self
-            .config
-            .output_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("./distilled_model"));
-
-        if offline_config.generate {
-            // Generate and cache teacher logits
-            info!("Generating teacher logits...");
-            self.generate_logits(offline_config)?;
+        if self.config.offline.is_none() {
+            return Err(DistillError::InvalidConfig(
+                "offline config required for offline distillation".to_string(),
+            ));
         }
-
-        // Load cached logits
-        let cache = LogitCache::load(&offline_config.logits_path)?;
-        info!(
-            "Loaded logit cache with {} sequences",
-            cache.metadata().num_sequences
-        );
-        info!("  Compression: {}", cache.metadata().compression);
-        info!("  Vocab size: {}", cache.metadata().vocab_size);
-
-        // The actual training loop would:
-        // 1. Load student model
-        // 2. For each batch:
-        //    a. Load cached teacher logits
-        //    b. Forward through student
-        //    c. Compute distillation loss
-        //    d. Backward and update
-
-        Ok(output_path)
+        self.unsupported_orchestration()
     }
 
     /// Generate and cache teacher logits.
@@ -261,30 +212,7 @@ impl Distiller {
     ///
     /// Gradually reduces temperature and teacher influence over training.
     fn run_progressive(&self) -> Result<PathBuf> {
-        info!("Running progressive distillation");
-
-        let output_path = self
-            .config
-            .output_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("./distilled_model"));
-
-        let total_steps = self.config.training.epochs * 1000; // Approximate
-        let initial_temp = self.config.loss.temperature;
-        let initial_alpha = self.config.loss.alpha;
-
-        info!("Progressive schedule:");
-        info!("  Initial temperature: {}", initial_temp);
-        info!("  Final temperature: 1.0");
-        info!("  Initial alpha: {}", initial_alpha);
-        info!("  Final alpha: 0.0");
-        info!("  Total steps: ~{}", total_steps);
-
-        // Progressive distillation schedule:
-        // - Temperature: gradually decrease from T to 1
-        // - Alpha: gradually decrease from alpha to 0 (shift to hard labels)
-
-        Ok(output_path)
+        self.unsupported_orchestration()
     }
 
     /// Compute distillation loss for a batch.
@@ -555,5 +483,14 @@ mod tests {
         config.loss.loss_type = LossType::MseLoss;
         let d = Distiller::new(config.clone()).unwrap();
         assert_eq!(d.loss.name(), "mse");
+    }
+
+    #[test]
+    fn test_run_distillation_requires_external_orchestration() {
+        let err = run_distillation(&test_config()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("end-to-end distillation orchestration is not available")
+        );
     }
 }

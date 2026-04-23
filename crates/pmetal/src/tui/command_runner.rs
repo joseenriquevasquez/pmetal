@@ -717,6 +717,14 @@ async fn run_distillation_direct(
         optional_arg(&spec.args, "--column-separator").unwrap_or_else(|| "\n\n".to_string()),
         optional_arg(&spec.args, "--prompt-column"),
         optional_arg(&spec.args, "--response-column"),
+        crate::commands::distill::OfflineCliOptions {
+            enabled: has_flag(&spec.args, "--offline"),
+            cache_path: optional_arg(&spec.args, "--offline-cache"),
+            generate: has_flag(&spec.args, "--offline-generate"),
+            compression: optional_arg(&spec.args, "--offline-compression")
+                .unwrap_or_else(|| "top_k".to_string()),
+            top_k: parse_arg(&spec.args, "--offline-top-k", 128usize)?,
+        },
     )
     .await
 }

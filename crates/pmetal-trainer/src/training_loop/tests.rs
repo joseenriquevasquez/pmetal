@@ -229,6 +229,7 @@ fn test_single_train_step() {
         pixel_values: None,
         batch_size: 1,
         seq_len: 4,
+        sample_indices: vec![0],
     };
 
     let stats = training_loop
