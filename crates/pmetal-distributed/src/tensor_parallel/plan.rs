@@ -8,7 +8,7 @@
 //!
 //! - Standard multi-head attention (Llama, Mistral, Gemma, etc.)
 //! - SwiGLU FFN blocks
-//! - GDN (gated delta net) blocks (Qwen 3.5, FalconH1)
+//! - GDN (gated delta net) blocks (Qwen 3.5)
 //! - MoE (shared expert + routed experts)
 //!
 //! # Reference
@@ -231,8 +231,7 @@ pub fn build_plan(
     let is_hybrid_gdn = config.get("gdn_heads").is_some()
         || config.get("mixer_pattern").is_some()
         || arch.contains("qwen3_next")
-        || arch.contains("Qwen3Next")
-        || arch.contains("FalconH1");
+        || arch.contains("Qwen3Next");
 
     // Detect attention interval for hybrid models (every Nth layer is attention)
     let attn_interval = config

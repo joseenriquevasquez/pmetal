@@ -1076,7 +1076,6 @@ impl DFlashTarget for DynamicModel {
             Self::Phi4(m) => Module::forward(&mut m.model.embed_tokens, input_ids),
             Self::DeepSeek(m) => Module::forward(&mut m.model.embed_tokens, input_ids),
             Self::Qwen3MoE(m) => Module::forward(&mut m.model.embed_tokens, input_ids),
-            Self::StarCoder2(m) => Ok(m.embed_tokens.forward(input_ids)),
             Self::Gemma4(m) => Ok(m.model.embed_tokens.forward(input_ids)),
             Self::GptOss(m) => {
                 // GptOss's `Embedding` forward is `&self` only; use the
@@ -1088,9 +1087,6 @@ impl DFlashTarget for DynamicModel {
             Self::Cohere(_) => Err(dflash_architecture_unsupported("Cohere")),
             Self::Granite(_) => Err(dflash_architecture_unsupported("Granite")),
             Self::NemotronH(_) => Err(dflash_architecture_unsupported("NemotronH")),
-            Self::RecurrentGemma(_) => Err(dflash_architecture_unsupported("RecurrentGemma")),
-            Self::Jamba(_) => Err(dflash_architecture_unsupported("Jamba")),
-            Self::FalconH1(_) => Err(dflash_architecture_unsupported("FalconH1")),
             Self::Flux(_) | Self::Bert(_) => Err(Exception::custom(
                 "DFlashTarget: Flux / BERT are not causal LMs and cannot serve as DFlash targets",
             )),
@@ -1155,10 +1151,6 @@ impl DFlashTarget for DynamicModel {
                 let _ = mamba_cache;
                 m.forward_with_capture(input_ids, mask, kv_cache, capture)
             }
-            Self::StarCoder2(m) => {
-                let _ = mamba_cache;
-                m.forward_with_capture(input_ids, mask, kv_cache, Some(capture))
-            }
             Self::Gemma4(m) => {
                 let _ = mamba_cache;
                 m.forward_with_capture(input_ids, mask, kv_cache, capture)
@@ -1171,9 +1163,6 @@ impl DFlashTarget for DynamicModel {
             Self::Cohere(_) => Err(dflash_architecture_unsupported("Cohere")),
             Self::Granite(_) => Err(dflash_architecture_unsupported("Granite")),
             Self::NemotronH(_) => Err(dflash_architecture_unsupported("NemotronH")),
-            Self::RecurrentGemma(_) => Err(dflash_architecture_unsupported("RecurrentGemma")),
-            Self::Jamba(_) => Err(dflash_architecture_unsupported("Jamba")),
-            Self::FalconH1(_) => Err(dflash_architecture_unsupported("FalconH1")),
             Self::Flux(_) | Self::Bert(_) => Err(Exception::custom(
                 "DFlashTarget: Flux / BERT are not causal LMs",
             )),
@@ -1209,7 +1198,6 @@ impl DFlashTarget for DynamicModel {
                     Ok(hidden.matmul(&embed_w.t()))
                 }
             },
-            Self::StarCoder2(m) => Ok(Module::forward(&mut m.lm_head, hidden)?),
             Self::Gemma4(m) => {
                 // Gemma 4 ties embeddings + applies final-logit softcap.
                 let logits = m.model.embed_tokens.as_linear(hidden);
@@ -1243,7 +1231,7 @@ impl DFlashTarget for DynamicModel {
     fn target_needs_mamba_cache(&self) -> bool {
         matches!(
             self,
-            Self::Qwen3Next(_) | Self::NemotronH(_) | Self::FalconH1(_) | Self::Jamba(_)
+            Self::Qwen3Next(_) | Self::NemotronH(_)
         )
     }
 

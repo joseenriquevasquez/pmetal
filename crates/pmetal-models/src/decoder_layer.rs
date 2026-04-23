@@ -133,7 +133,7 @@ pub trait DecoderLayer: std::fmt::Debug {
 ///
 /// 4/5 dense transformers in the pmetal tree match this exactly
 /// (Llama, Mistral, Qwen2, Qwen3, Phi / Phi4, Cohere, Granite,
-/// StarCoder2, DFlash draft). Gemma plugs in here with a custom
+/// DFlash draft). Gemma plugs in here with a custom
 /// `NormModule` impl for `GemmaRmsNorm`. Gemma2 / Gemma4 keep their
 /// own forward body because they add peri-norms that break the shape.
 ///

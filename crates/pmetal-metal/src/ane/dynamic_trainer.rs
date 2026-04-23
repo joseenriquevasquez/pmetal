@@ -232,11 +232,9 @@ impl DynamicAneTrainerConfig {
         const INCOMPATIBLE: &[&str] = &[
             "qwen3_5",
             "qwen3_5_text",
-            "qwen3_next",     // GDN hybrid
-            "nemotron_h",     // Mamba hybrid
-            "recurrentgemma", // RG-LRU hybrid
-            "jamba",          // Mamba hybrid
-            "gemma4",         // extra per-layer norms / KV-sharing / PLI blocks
+            "qwen3_next", // GDN hybrid
+            "nemotron_h", // Mamba hybrid
+            "gemma4",     // extra per-layer norms / KV-sharing / PLI blocks
             "gemma4_text",
         ];
         if INCOMPATIBLE.contains(&model_type) {
@@ -3060,15 +3058,6 @@ mod tests {
     fn test_ane_incompatible_nemotron_h() {
         let config = serde_json::json!({
             "model_type": "nemotron_h",
-            "hidden_size": 768,
-        });
-        assert!(DynamicAneTrainerConfig::is_ane_compatible(&config).is_err());
-    }
-
-    #[test]
-    fn test_ane_incompatible_jamba() {
-        let config = serde_json::json!({
-            "model_type": "jamba",
             "hidden_size": 768,
         });
         assert!(DynamicAneTrainerConfig::is_ane_compatible(&config).is_err());

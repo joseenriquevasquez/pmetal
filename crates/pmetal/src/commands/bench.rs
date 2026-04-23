@@ -22,7 +22,6 @@ use pmetal_metal::{
 use pmetal_mlx::kernels::gated_delta_update_with_chunk_size_override;
 use pmetal_mlx::kv_cache::CacheMode;
 use pmetal_models::architectures::deepseek::{DeepSeekConfig, DeepSeekMoE};
-use pmetal_models::architectures::jamba::{JambaConfig, JambaLayer};
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::architectures::llama4::{Llama4MoE, Llama4TextConfig};
 use pmetal_models::architectures::qwen3_moe::{Qwen3MoEBlock, Qwen3MoEConfig};
@@ -504,7 +503,6 @@ enum KernelBenchmarkCase {
     FusedLinearCrossEntropy(FusedLinearCrossEntropyCase),
     FusedMerge(FusedMergeCase),
     ModelMoe(ModelMoeCase),
-    ModelHybrid(ModelHybridCase),
     MppGemm(MppGemmCase),
 }
 
@@ -579,23 +577,6 @@ struct ModelMoeCase {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ModelHybridFamily {
-    Jamba,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ModelHybridCase {
-    name: &'static str,
-    family: ModelHybridFamily,
-    batch_size: usize,
-    seq_len: usize,
-    hidden_size: usize,
-    intermediate_size: usize,
-    num_experts: usize,
-    top_k: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
 struct MppGemmCase {
     name: &'static str,
     m: usize,
@@ -614,7 +595,6 @@ struct KernelBenchmarkTierProfile {
     llama4_moe: ModelMoeCase,
     qwen3_moe: ModelMoeCase,
     deepseek_moe: ModelMoeCase,
-    jamba_hybrid: ModelHybridCase,
     mpp_gemm: MppGemmCase,
 }
 
@@ -3565,61 +3545,6 @@ fn run_kernel_benchmark_case(
                 outcome,
             )
         }
-        KernelBenchmarkCase::ModelHybrid(case) => {
-            let parameters = model_hybrid_parameters(*case);
-            let tuning = btree_map([
-                ("dispatch", "causal_depthwise_conv".to_string()),
-                ("feed_forward", "moe_argpartition".to_string()),
-            ]);
-
-            let outcome = (|| -> anyhow::Result<KernelBenchmarkOutcome> {
-                let input = pmetal_bridge::compat::random::normal(
-                    &[
-                        case.batch_size as i32,
-                        case.seq_len as i32,
-                        case.hidden_size as i32,
-                    ],
-                    pmetal_bridge::compat::Dtype::Float32,
-                );
-
-                match case.family {
-                    ModelHybridFamily::Jamba => {
-                        let num_attention_heads = (case.hidden_size / 64).max(1) as i32;
-                        let config = JambaConfig {
-                            hidden_size: case.hidden_size as i32,
-                            intermediate_size: case.intermediate_size as i32,
-                            num_hidden_layers: 2,
-                            num_attention_heads,
-                            num_key_value_heads: num_attention_heads,
-                            vocab_size: 32_768,
-                            rms_norm_eps: 1e-5,
-                            num_experts: case.num_experts as i32,
-                            num_experts_per_tok: case.top_k as i32,
-                            layers_per_block: 2,
-                            attn_layer_offset: 0,
-                            mamba_conv_kernel_size: 4,
-                        };
-                        let mut layer = JambaLayer::new(&config, 1)?;
-                        benchmark_operation(warmup_iterations, benchmark_iterations, || {
-                            let output = layer.forward(&input)?;
-                            pmetal_bridge::compat::transforms::eval([&output])?;
-                            std::hint::black_box(output);
-                            Ok(())
-                        })
-                    }
-                }
-            })();
-
-            build_case_result(
-                case.name,
-                match case.family {
-                    ModelHybridFamily::Jamba => "jamba_hybrid",
-                },
-                parameters,
-                tuning,
-                outcome,
-            )
-        }
         KernelBenchmarkCase::MppGemm(case) => {
             let parameters = mpp_gemm_parameters(*case);
             let config = MppGemmConfig::new(case.m, case.n, case.k);
@@ -3725,7 +3650,6 @@ fn build_benchmark_corpus_for_profile(
         KernelBenchmarkCase::ModelMoe(profile.llama4_moe),
         KernelBenchmarkCase::ModelMoe(profile.qwen3_moe),
         KernelBenchmarkCase::ModelMoe(profile.deepseek_moe),
-        KernelBenchmarkCase::ModelHybrid(profile.jamba_hybrid),
         KernelBenchmarkCase::MppGemm(profile.mpp_gemm),
     ]
 }
@@ -3800,16 +3724,6 @@ fn benchmark_tier_profile(tier: DeviceTier, quick: bool) -> KernelBenchmarkTierP
                 seq_len: 32 * scale,
                 hidden_size: 512,
                 intermediate_size: 768,
-                num_experts: 8,
-                top_k: 2,
-            },
-            jamba_hybrid: ModelHybridCase {
-                name: "jamba_hybrid_layer",
-                family: ModelHybridFamily::Jamba,
-                batch_size: 1,
-                seq_len: 32 * scale,
-                hidden_size: 512,
-                intermediate_size: 1536,
                 num_experts: 8,
                 top_k: 2,
             },
@@ -3890,16 +3804,6 @@ fn benchmark_tier_profile(tier: DeviceTier, quick: bool) -> KernelBenchmarkTierP
                 num_experts: 16,
                 top_k: 4,
             },
-            jamba_hybrid: ModelHybridCase {
-                name: "jamba_hybrid_layer",
-                family: ModelHybridFamily::Jamba,
-                batch_size: 1,
-                seq_len: 48 * scale,
-                hidden_size: 768,
-                intermediate_size: 2048,
-                num_experts: 16,
-                top_k: 2,
-            },
             mpp_gemm: MppGemmCase {
                 name: "mpp_gemm_prefill",
                 m: 64 * scale,
@@ -3976,16 +3880,6 @@ fn benchmark_tier_profile(tier: DeviceTier, quick: bool) -> KernelBenchmarkTierP
                 intermediate_size: 1408,
                 num_experts: 32,
                 top_k: 4,
-            },
-            jamba_hybrid: ModelHybridCase {
-                name: "jamba_hybrid_layer",
-                family: ModelHybridFamily::Jamba,
-                batch_size: 1,
-                seq_len: 64 * scale,
-                hidden_size: 1024,
-                intermediate_size: 2816,
-                num_experts: 16,
-                top_k: 2,
             },
             mpp_gemm: MppGemmCase {
                 name: "mpp_gemm_prefill",
@@ -4127,24 +4021,6 @@ fn model_moe_parameters(case: ModelMoeCase) -> BTreeMap<String, String> {
                 ModelMoeFamily::Llama4 => "llama4",
                 ModelMoeFamily::Qwen3 => "qwen3",
                 ModelMoeFamily::DeepSeek => "deepseek",
-            }
-            .to_string(),
-        ),
-        ("batch_size", case.batch_size.to_string()),
-        ("seq_len", case.seq_len.to_string()),
-        ("hidden_size", case.hidden_size.to_string()),
-        ("intermediate_size", case.intermediate_size.to_string()),
-        ("num_experts", case.num_experts.to_string()),
-        ("top_k", case.top_k.to_string()),
-    ])
-}
-
-fn model_hybrid_parameters(case: ModelHybridCase) -> BTreeMap<String, String> {
-    btree_map([
-        (
-            "family",
-            match case.family {
-                ModelHybridFamily::Jamba => "jamba",
             }
             .to_string(),
         ),
@@ -4493,14 +4369,12 @@ mod tests {
         assert!(pro.qwen3_moe.num_experts <= max.qwen3_moe.num_experts);
         assert!(base.deepseek_moe.hidden_size < pro.deepseek_moe.hidden_size);
         assert!(pro.deepseek_moe.hidden_size < max.deepseek_moe.hidden_size);
-        assert!(base.jamba_hybrid.hidden_size < pro.jamba_hybrid.hidden_size);
-        assert!(pro.jamba_hybrid.hidden_size < max.jamba_hybrid.hidden_size);
     }
 
     #[test]
     fn benchmark_corpus_has_expected_categories() {
         let cases = build_benchmark_corpus_for_profile(DeviceTier::Base, false, true);
-        assert_eq!(cases.len(), 11);
+        assert_eq!(cases.len(), 10);
         assert!(matches!(cases[0], KernelBenchmarkCase::FlashAttention(_)));
         assert!(matches!(cases[1], KernelBenchmarkCase::FusedLora(_)));
         assert!(matches!(cases[2], KernelBenchmarkCase::FusedMlp(_)));
@@ -4513,8 +4387,7 @@ mod tests {
         assert!(matches!(cases[6], KernelBenchmarkCase::ModelMoe(_)));
         assert!(matches!(cases[7], KernelBenchmarkCase::ModelMoe(_)));
         assert!(matches!(cases[8], KernelBenchmarkCase::ModelMoe(_)));
-        assert!(matches!(cases[9], KernelBenchmarkCase::ModelHybrid(_)));
-        assert!(matches!(cases[10], KernelBenchmarkCase::MppGemm(_)));
+        assert!(matches!(cases[9], KernelBenchmarkCase::MppGemm(_)));
     }
 
     #[test]

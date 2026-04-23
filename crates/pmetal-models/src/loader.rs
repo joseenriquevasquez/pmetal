@@ -11,9 +11,6 @@ use std::path::Path;
 
 use crate::architectures::bert::BertForEmbedding;
 use crate::architectures::clip::CLIPTextModel;
-use crate::architectures::falcon_h1::{
-    FalconH1ForCausalLM, load_falcon_h1_weights as load_falcon_h1,
-};
 use crate::architectures::flux::FluxDiT;
 use crate::architectures::gemma::GemmaForCausalLM;
 use crate::architectures::llama::{LlamaConfig, LlamaForCausalLM};
@@ -978,14 +975,6 @@ pub fn load_nemotron_weights(
 ) -> Result<(), LoadError> {
     let weights = load_weights(model_dir)?;
     load_nemotron(model, &weights).map_err(|e| LoadError::SafeTensors(format!("{:?}", e)))
-}
-
-/// Load weights for FalconH1 models from a HuggingFace safetensors directory.
-pub fn load_falcon_h1_weights(
-    model: &mut FalconH1ForCausalLM,
-    weights: &std::collections::HashMap<String, pmetal_bridge::compat::Array>,
-) -> Result<(), LoadError> {
-    load_falcon_h1(model, weights).map_err(|e| LoadError::SafeTensors(format!("{:?}", e)))
 }
 
 /// Load weights for Qwen3Next models with sanitization.

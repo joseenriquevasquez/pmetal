@@ -5,8 +5,8 @@
 
 use crate::architectures::*;
 use crate::loader::{
-    Qwen3NextLoadOptions, load_bert_weights, load_falcon_h1_weights, load_generic_weights,
-    load_nemotron_weights, load_qwen3_next_weights_with_options, load_weights,
+    Qwen3NextLoadOptions, load_bert_weights, load_generic_weights, load_nemotron_weights,
+    load_qwen3_next_weights_with_options, load_weights,
 };
 use crate::traits::{CausalLMModel, ModelConfig};
 use pmetal_bridge::compat::{
@@ -53,10 +53,6 @@ pub enum ModelArchitecture {
     Granite,
     NemotronH,
     Qwen3Next,
-    StarCoder2,
-    RecurrentGemma,
-    Jamba,
-    FalconH1,
     GptOss,
     Gemma4,
     Flux,
@@ -81,10 +77,6 @@ impl std::fmt::Display for ModelArchitecture {
             Self::Granite => write!(f, "Granite"),
             Self::NemotronH => write!(f, "NemotronH"),
             Self::Qwen3Next => write!(f, "Qwen 3.5"),
-            Self::StarCoder2 => write!(f, "StarCoder2"),
-            Self::RecurrentGemma => write!(f, "RecurrentGemma"),
-            Self::Jamba => write!(f, "Jamba"),
-            Self::FalconH1 => write!(f, "Falcon H1"),
             Self::GptOss => write!(f, "GPT-OSS"),
             Self::Gemma4 => write!(f, "Gemma 4"),
             Self::Flux => write!(f, "Flux"),
@@ -118,10 +110,6 @@ impl ModelArchitecture {
             "cohere" | "cohere2" | "command_r" | "command-r" => Some(Self::Cohere),
             "granite" | "granitehybrid" | "granite_moe" => Some(Self::Granite),
             "nemotron_h" | "nemotronh" | "nemotron-h" => Some(Self::NemotronH),
-            "starcoder2" | "starcoder-2" => Some(Self::StarCoder2),
-            "recurrentgemma" | "recurrent-gemma" | "griffin" => Some(Self::RecurrentGemma),
-            "jamba" | "jamba-1.5" => Some(Self::Jamba),
-            "falcon_h1" | "falconh1" | "falcon-h1" => Some(Self::FalconH1),
             "flux" | "flux-1" | "flux.1" => Some(Self::Flux),
             "bert" | "roberta" | "distilbert" | "xlm-roberta" | "xlm_roberta" => Some(Self::Bert),
             _ => None,
@@ -160,9 +148,6 @@ impl ModelArchitecture {
                 return Some(Self::Gemma4);
             }
             if lower.contains("gemma") {
-                if lower.contains("recurrent") {
-                    return Some(Self::RecurrentGemma);
-                }
                 return Some(Self::Gemma);
             }
             if lower.contains("mistral") || lower.contains("mixtral") {
@@ -189,18 +174,6 @@ impl ModelArchitecture {
             }
             if lower.contains("nemotronhforcausallm") || lower.contains("nemotron_h") {
                 return Some(Self::NemotronH);
-            }
-            if lower.contains("starcoder2") {
-                return Some(Self::StarCoder2);
-            }
-            if lower.contains("jamba") {
-                return Some(Self::Jamba);
-            }
-            if lower.contains("falconh1")
-                || lower.contains("falcon_h1")
-                || lower.contains("falcon-h1")
-            {
-                return Some(Self::FalconH1);
             }
             if lower.contains("flux") {
                 return Some(Self::Flux);
@@ -264,10 +237,6 @@ macro_rules! dispatch_uniform {
             Self::Granite(m) => m.$method($($arg),*),
             Self::NemotronH(m) => m.$method($($arg),*),
             Self::Qwen3Next(m) => m.$method($($arg),*),
-            Self::StarCoder2(m) => m.$method($($arg),*),
-            Self::RecurrentGemma(m) => m.$method($($arg),*),
-            Self::Jamba(m) => m.$method($($arg),*),
-            Self::FalconH1(m) => m.$method($($arg),*),
             Self::GptOss(m) => m.$method($($arg),*),
             Self::Gemma4(m) => m.$method($($arg),*),
             Self::Flux(m) => m.$method($($arg),*),
@@ -294,10 +263,6 @@ macro_rules! dispatch_architecture {
             Self::Granite(_) => ModelArchitecture::Granite,
             Self::NemotronH(_) => ModelArchitecture::NemotronH,
             Self::Qwen3Next(_) => ModelArchitecture::Qwen3Next,
-            Self::StarCoder2(_) => ModelArchitecture::StarCoder2,
-            Self::RecurrentGemma(_) => ModelArchitecture::RecurrentGemma,
-            Self::Jamba(_) => ModelArchitecture::Jamba,
-            Self::FalconH1(_) => ModelArchitecture::FalconH1,
             Self::GptOss(_) => ModelArchitecture::GptOss,
             Self::Gemma4(_) => ModelArchitecture::Gemma4,
             Self::Flux(_) => ModelArchitecture::Flux,
@@ -366,10 +331,6 @@ pub enum DynamicModel {
     Granite(GraniteForCausalLM),
     NemotronH(NemotronHForCausalLM),
     Qwen3Next(Qwen3NextForCausalLM),
-    StarCoder2(StarCoder2Model),
-    RecurrentGemma(RecurrentGemmaModel),
-    Jamba(JambaModel),
-    FalconH1(FalconH1ForCausalLM),
     GptOss(GptOssForCausalLM),
     Gemma4(Gemma4ForCausalLM),
     Flux(FluxDiT),
@@ -393,10 +354,6 @@ impl std::fmt::Debug for DynamicModel {
             Self::Granite(_) => write!(f, "DynamicModel::Granite"),
             Self::NemotronH(_) => write!(f, "DynamicModel::NemotronH"),
             Self::Qwen3Next(_) => write!(f, "DynamicModel::Qwen3Next"),
-            Self::StarCoder2(_) => write!(f, "DynamicModel::StarCoder2"),
-            Self::RecurrentGemma(_) => write!(f, "DynamicModel::RecurrentGemma"),
-            Self::Jamba(_) => write!(f, "DynamicModel::Jamba"),
-            Self::FalconH1(_) => write!(f, "DynamicModel::FalconH1"),
             Self::GptOss(_) => write!(f, "DynamicModel::GptOss"),
             Self::Gemma4(_) => write!(f, "DynamicModel::Gemma4"),
             Self::Flux(_) => write!(f, "DynamicModel::Flux"),
@@ -673,38 +630,6 @@ impl DynamicModel {
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Qwen3Next(model))
             }
-            ModelArchitecture::StarCoder2 => simple_load!(
-                StarCoder2Config,
-                StarCoder2Model::new,
-                &config_content,
-                model_dir,
-                StarCoder2
-            ),
-            ModelArchitecture::RecurrentGemma => simple_load!(
-                RecurrentGemmaConfig,
-                RecurrentGemmaModel::new,
-                &config_content,
-                model_dir,
-                RecurrentGemma
-            ),
-            ModelArchitecture::Jamba => simple_load!(
-                JambaConfig,
-                JambaModel::new,
-                &config_content,
-                model_dir,
-                Jamba
-            ),
-            ModelArchitecture::FalconH1 => {
-                let config: FalconH1Config = serde_json::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = FalconH1ForCausalLM::new(config)?;
-                let weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                load_falcon_h1_weights(&mut model, &weights)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                Ok(Self::FalconH1(model))
-            }
             ModelArchitecture::Flux => Err(Exception::custom(
                 "Flux models are diffusion pipelines, not causal language models. Load them via pmetal_models::pipelines::FluxPipeline instead of DynamicModel::load.",
             )),
@@ -781,10 +706,6 @@ impl DynamicModel {
             Self::Granite(m) => m.forward(input_ids, mask, None),
             Self::NemotronH(m) => m.forward(input_ids, None),
             Self::Qwen3Next(m) => m.forward(input_ids, mask),
-            Self::StarCoder2(m) => m.forward(input_ids, mask, None),
-            Self::RecurrentGemma(m) => m.forward(input_ids),
-            Self::Jamba(m) => m.forward(input_ids),
-            Self::FalconH1(m) => m.forward(input_ids, mask),
             Self::GptOss(m) => m.forward(input_ids, mask, None),
             Self::Gemma4(m) => m.forward(input_ids, mask),
             Self::Flux(_) => Err(Exception::custom(
@@ -828,18 +749,9 @@ impl DynamicModel {
             Self::Cohere(m) => m.model.forward(input_ids, mask, None),
             Self::Granite(m) => m.model.forward(input_ids, mask, None),
             Self::GptOss(m) => m.model.forward(input_ids, mask, None),
-            // StarCoder2 bakes lm_head into its trunk forward, so it
-            // carries a dedicated pre-norm entry point.
-            Self::StarCoder2(m) => m.forward_hidden(input_ids, mask),
             // Hybrid attn+mamba / linear-attn archs — forward runs with
-            // caches elided (None). Mask support varies; RecurrentGemma
-            // and Jamba don't take masks at all, so padded embedding
-            // batches rely on the pooling step to mask pad positions.
+            // caches elided (None).
             Self::NemotronH(m) => m.backbone.forward(input_ids, mask),
-            Self::FalconH1(m) => m.model.forward_with_cache(input_ids, mask, None, None),
-            Self::RecurrentGemma(m) => m.forward(input_ids),
-            // Jamba bakes lm_head into its trunk forward — dedicated entry.
-            Self::Jamba(m) => m.forward_hidden(input_ids),
             // Qwen3Next linear-attn + Mamba hybrid — cacheless forward
             // wraps the standard dispatch with None/None caches.
             Self::Qwen3Next(m) => m.model.forward(input_ids, mask),
@@ -855,8 +767,7 @@ impl DynamicModel {
                 "forward_hidden not implemented for {:?} — supported archs: \
                  Llama, Llama4, Qwen2, Qwen3, Qwen3MoE, Mistral, Gemma, \
                  Gemma4, Phi, Phi4, DeepSeek, Cohere, Granite, GptOss, \
-                 StarCoder2, NemotronH, FalconH1, RecurrentGemma, Jamba, \
-                 Qwen3Next, BERT",
+                 NemotronH, Qwen3Next, BERT",
                 other
             ))),
         }
@@ -877,7 +788,6 @@ impl DynamicModel {
             Self::Cohere(m) => m.forward_with_cache(input_ids, mask, cache),
             // Granite forward takes position_ids (not KVCache); cache ignored for now
             Self::Granite(m) => m.forward(input_ids, mask, None),
-            Self::StarCoder2(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Llama4(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Gemma(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Mistral(m) => m.forward_with_cache(input_ids, mask, cache),
@@ -887,14 +797,11 @@ impl DynamicModel {
             Self::Gemma4(m) => m.forward_with_cache(input_ids, mask, cache),
             // Hybrid recurrent+attention models require both a KV cache and a
             // Mamba/GDN state cache. Use `forward_with_hybrid_cache` instead.
-            Self::NemotronH(_) | Self::Qwen3Next(_) | Self::FalconH1(_) => Err(Exception::custom(
+            Self::NemotronH(_) | Self::Qwen3Next(_) => Err(Exception::custom(
                 "Hybrid architecture requires both KV and Mamba caches. \
                  Use DynamicModel::forward_with_hybrid_cache with both \
                  create_cache() and create_mamba_cache().",
             )),
-            // Purely recurrent models have no KV cache; use forward() directly.
-            Self::RecurrentGemma(m) => m.forward(input_ids),
-            Self::Jamba(m) => m.forward(input_ids),
             Self::Flux(_) => Err(Exception::custom(
                 "Flux is not a CausalLM and does not support forward_with_cache.",
             )),
@@ -934,10 +841,6 @@ impl DynamicModel {
             Self::Cohere(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Granite(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Qwen3Next(m) => crate::fp8_utils::quantize_model_linears(m),
-            Self::StarCoder2(m) => crate::fp8_utils::quantize_model_linears(m),
-            Self::RecurrentGemma(m) => crate::fp8_utils::quantize_model_linears(m),
-            Self::Jamba(m) => crate::fp8_utils::quantize_model_linears(m),
-            Self::FalconH1(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::GptOss(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Gemma4(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Bert(m) => crate::fp8_utils::quantize_model_linears(m),
@@ -1000,25 +903,6 @@ impl DynamicModel {
                 m.config().num_kv_heads() as usize,
                 m.config().head_dim() as usize,
             )),
-            Self::StarCoder2(m) => KVCache::new(KVCacheConfig::new(
-                m.config.num_hidden_layers as usize,
-                max_seq_len,
-                m.config.num_key_value_heads as usize,
-                (m.config.hidden_size / m.config.num_attention_heads) as usize,
-            )),
-            Self::RecurrentGemma(_) => KVCache::new(KVCacheConfig::new(0, 0, 0, 0)),
-            Self::Jamba(m) => KVCache::new(KVCacheConfig::new(
-                m.config.num_hidden_layers as usize,
-                max_seq_len,
-                m.config.num_key_value_heads as usize,
-                (m.config.hidden_size / m.config.num_attention_heads) as usize,
-            )),
-            Self::FalconH1(m) => KVCache::new(KVCacheConfig::new(
-                m.config().num_hidden_layers() as usize,
-                max_seq_len,
-                m.config().num_kv_heads() as usize,
-                m.config().head_dim() as usize,
-            )),
             Self::GptOss(m) => KVCache::new(KVCacheConfig::new(
                 m.config().num_hidden_layers as usize,
                 max_seq_len,
@@ -1064,8 +948,6 @@ impl DynamicModel {
         match self {
             Self::NemotronH(m) => Some(MambaCache::new(m.config().num_hidden_layers() as usize)),
             Self::Qwen3Next(m) => Some(MambaCache::new(m.config().num_hidden_layers() as usize)),
-            // FalconH1: every layer has Mamba, so the cache covers all layers.
-            Self::FalconH1(m) => Some(MambaCache::new(m.config().num_hidden_layers() as usize)),
             _ => None,
         }
     }
@@ -1080,7 +962,6 @@ impl DynamicModel {
         match self {
             Self::NemotronH(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
             Self::Qwen3Next(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
-            Self::FalconH1(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
             _ => self.forward_with_cache(input_ids, mask, kv_cache),
         }
     }
@@ -1113,10 +994,6 @@ impl DynamicModel {
             Self::Granite(m) => m.config.vocab_size,
             Self::NemotronH(m) => m.config().vocab_size(),
             Self::Qwen3Next(m) => m.config().vocab_size(),
-            Self::StarCoder2(m) => m.config.vocab_size,
-            Self::RecurrentGemma(m) => m.config.vocab_size,
-            Self::Jamba(m) => m.config.vocab_size,
-            Self::FalconH1(m) => m.config().vocab_size(),
             Self::GptOss(m) => m.config().vocab_size,
             Self::Gemma4(m) => m.config.vocab_size,
             Self::Flux(_) => 0,
@@ -1140,10 +1017,6 @@ impl DynamicModel {
             Self::Granite(m) => m.config.hidden_size,
             Self::NemotronH(m) => m.config().hidden_size(),
             Self::Qwen3Next(m) => m.config().hidden_size(),
-            Self::StarCoder2(m) => m.config.hidden_size,
-            Self::RecurrentGemma(m) => m.config.hidden_size,
-            Self::Jamba(m) => m.config.hidden_size,
-            Self::FalconH1(m) => m.config().hidden_size(),
             Self::GptOss(m) => m.config().hidden_size,
             Self::Gemma4(m) => m.config.hidden_size,
             Self::Flux(m) => m.pos_embedder.dim as i32,
@@ -1167,10 +1040,6 @@ impl DynamicModel {
             Self::Granite(m) => eval_module_parameters_batched(m),
             Self::NemotronH(m) => eval_module_parameters_batched(m),
             Self::Qwen3Next(m) => eval_module_parameters_batched(m),
-            Self::StarCoder2(m) => eval_module_parameters_batched(m),
-            Self::RecurrentGemma(m) => eval_module_parameters_batched(m),
-            Self::Jamba(m) => eval_module_parameters_batched(m),
-            Self::FalconH1(m) => eval_module_parameters_batched(m),
             Self::GptOss(m) => eval_module_parameters_batched(m),
             Self::Gemma4(m) => eval_module_parameters_batched(m),
             Self::Flux(m) => eval_module_parameters_batched(m),

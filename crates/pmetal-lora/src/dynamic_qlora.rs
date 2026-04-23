@@ -73,7 +73,7 @@ impl DynamicQloraModel {
     /// the appropriate QLoRA model.
     ///
     /// Returns `Err` for architectures that do not have a QLoRA implementation
-    /// (e.g., Llama4, RecurrentGemma, Phi, DeepSeek, NemotronH …).
+    /// (e.g., Llama4, Phi, DeepSeek, NemotronH …).
     pub fn from_model_dir(
         model_dir: impl AsRef<Path>,
         qlora_config: QLoraConfig,
@@ -614,19 +614,6 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("QLoRA is not supported for Llama 4 models"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn recurrent_gemma_is_rejected_until_a_real_qlora_impl_exists() {
-        let dir = write_config("recurrentgemma");
-        let err = DynamicQloraModel::from_model_dir(dir.path(), QLoraConfig::default())
-            .err()
-            .expect("recurrent gemma should not map to plain gemma qlora");
-        assert!(
-            err.to_string()
-                .contains("QLoRA is not supported for RecurrentGemma models"),
             "unexpected error: {err}"
         );
     }
