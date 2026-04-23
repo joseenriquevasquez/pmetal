@@ -10,9 +10,11 @@ use axum::response::{IntoResponse, Json};
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
 use serde_json::json;
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -100,6 +102,33 @@ impl ServingMetrics {
 pub struct AppState {
     pub engine: InferenceEngine,
     pub metrics: ServingMetrics,
+    pub request_permits: Arc<Semaphore>,
+}
+
+impl AppState {
+    pub(crate) fn try_acquire_request_permit(
+        self: &Arc<Self>,
+    ) -> Result<OwnedSemaphorePermit, ServeError> {
+        Arc::clone(&self.request_permits)
+            .try_acquire_owned()
+            .map_err(|_| ServeError::Busy)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResolvedStopSequences {
+    pub(crate) token_ids: Vec<u32>,
+    pub(crate) sequences: Vec<String>,
+}
+
+impl ResolvedStopSequences {
+    pub(crate) fn holdback_tokens(&self) -> usize {
+        self.sequences
+            .iter()
+            .map(|seq| seq.len())
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -146,6 +175,8 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, ServeError> {
+    let permit = state.try_acquire_request_permit()?;
+
     // Format messages using chat template, optionally including tool definitions.
     let prompt = state
         .engine
@@ -155,7 +186,7 @@ pub async fn chat_completions(
     let tools_requested = req.tools.is_some();
 
     // Resolve stop strings to token IDs.
-    let extra_stop_ids = resolve_stop_ids(&req.stop, &state.engine);
+    let resolved_stops = resolve_stop_sequences(&req.stop, &state.engine);
 
     // temperature == None or 0.0 → greedy decoding.
     let temperature = req.temperature.unwrap_or(0.0);
@@ -183,7 +214,8 @@ pub async fn chat_completions(
         frequency_penalty: req.frequency_penalty,
         presence_penalty: req.presence_penalty,
         seed: req.seed,
-        extra_stop_token_ids: extra_stop_ids,
+        extra_stop_token_ids: resolved_stops.token_ids.clone(),
+        stop_sequences: resolved_stops.sequences.clone(),
         logprobs_top_n,
     };
 
@@ -208,6 +240,8 @@ pub async fn chat_completions(
             created,
             metrics_handle,
             tools_requested,
+            permit,
+            resolved_stops.holdback_tokens(),
         );
 
         return Ok(Sse::new(sse_stream)
@@ -294,10 +328,12 @@ pub async fn completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<impl IntoResponse, ServeError> {
+    let permit = state.try_acquire_request_permit()?;
+
     let input_ids = state.engine.tokenize(&req.prompt)?;
     let prompt_tokens = input_ids.len();
 
-    let extra_stop_ids = resolve_stop_ids(&req.stop, &state.engine);
+    let resolved_stops = resolve_stop_sequences(&req.stop, &state.engine);
     let temperature = req.temperature.unwrap_or(0.0);
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.engine.model_id().to_string();
@@ -319,7 +355,8 @@ pub async fn completions(
         frequency_penalty: req.frequency_penalty,
         presence_penalty: req.presence_penalty,
         seed: req.seed,
-        extra_stop_token_ids: extra_stop_ids,
+        extra_stop_token_ids: resolved_stops.token_ids.clone(),
+        stop_sequences: resolved_stops.sequences.clone(),
         logprobs_top_n,
     };
 
@@ -338,6 +375,8 @@ pub async fn completions(
             created,
             metrics_handle,
             logprobs_enabled,
+            permit,
+            resolved_stops.holdback_tokens(),
         );
 
         return Ok(Sse::new(sse_stream)
@@ -473,6 +512,8 @@ fn chat_sse_stream(
     created: i64,
     state: Arc<AppState>,
     tools_requested: bool,
+    _permit: OwnedSemaphorePermit,
+    holdback_tokens: usize,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> + Send + 'static {
     // Pre-build the opening event once.
     let opening = {
@@ -509,6 +550,8 @@ fn chat_sse_stream(
     // Prepend the opening event to the token-event stream.
     let token_stream = ReceiverStream::new(rx);
     let tokenizer_for_aux = Arc::clone(&tokenizer);
+    let mut pending_tokens: VecDeque<(u32, Option<crate::engine::TokenLogprobEntry>)> =
+        VecDeque::new();
 
     // Map each TokenEvent to a Vec of SSE events (flat_map expands the vec).
     let mapped = token_stream.flat_map(move |event| {
@@ -516,34 +559,79 @@ fn chat_sse_stream(
 
         match event {
             TokenEvent::Token { id: token_id, logprob } => {
-                let (new_text, drained_aux) = decoder.push_with_aux(token_id, logprob);
-                if !new_text.is_empty() {
-                    // Build the per-delta logprobs payload from any aux that
-                    // crossed the codepoint boundary in this emit.
-                    let logprobs =
-                        delta_logprobs_from_aux(&tokenizer_for_aux, drained_aux);
-                    let chunk = ChatCompletionChunk {
-                        id: request_id.clone(),
-                        object: "chat.completion.chunk".to_string(),
-                        created,
-                        model: model_id.clone(),
-                        choices: vec![ChatChunkChoice {
-                            index: 0,
-                            delta: ChatDelta {
-                                role: None,
-                                content: Some(new_text),
-                                tool_calls: None,
-                                logprobs,
-                            },
-                            finish_reason: None,
-                        }],
+                pending_tokens.push_back((token_id, logprob));
+                while pending_tokens.len() > holdback_tokens {
+                    let Some((next_id, next_logprob)) = pending_tokens.pop_front() else {
+                        break;
                     };
-                    events.push(Ok(Event::default()
-                        .data(serde_json::to_string(&chunk).unwrap_or_default())));
+                    let (new_text, drained_aux) = decoder.push_with_aux(next_id, next_logprob);
+                    if !new_text.is_empty() {
+                        let logprobs = delta_logprobs_from_aux(&tokenizer_for_aux, drained_aux);
+                        let chunk = ChatCompletionChunk {
+                            id: request_id.clone(),
+                            object: "chat.completion.chunk".to_string(),
+                            created,
+                            model: model_id.clone(),
+                            choices: vec![ChatChunkChoice {
+                                index: 0,
+                                delta: ChatDelta {
+                                    role: None,
+                                    content: Some(new_text),
+                                    tool_calls: None,
+                                    logprobs,
+                                },
+                                finish_reason: None,
+                            }],
+                        };
+                        events.push(Ok(Event::default()
+                            .data(serde_json::to_string(&chunk).unwrap_or_default())));
+                    }
                 }
             }
-            TokenEvent::Done(finish_reason, metrics) => {
-                let (remaining, _drained_aux) = decoder.flush_aux();
+            TokenEvent::Done {
+                finish_reason,
+                metrics,
+                stripped_tokens,
+            } => {
+                if stripped_tokens > pending_tokens.len() {
+                    tracing::warn!(
+                        stripped_tokens,
+                        buffered_tokens = pending_tokens.len(),
+                        "stop-sequence suffix exceeded the streaming holdback window"
+                    );
+                    pending_tokens.clear();
+                } else {
+                    for _ in 0..stripped_tokens {
+                        pending_tokens.pop_back();
+                    }
+                }
+
+                while let Some((next_id, next_logprob)) = pending_tokens.pop_front() {
+                    let (new_text, drained_aux) = decoder.push_with_aux(next_id, next_logprob);
+                    if !new_text.is_empty() {
+                        let logprobs = delta_logprobs_from_aux(&tokenizer_for_aux, drained_aux);
+                        let chunk = ChatCompletionChunk {
+                            id: request_id.clone(),
+                            object: "chat.completion.chunk".to_string(),
+                            created,
+                            model: model_id.clone(),
+                            choices: vec![ChatChunkChoice {
+                                index: 0,
+                                delta: ChatDelta {
+                                    role: None,
+                                    content: Some(new_text),
+                                    tool_calls: None,
+                                    logprobs,
+                                },
+                                finish_reason: None,
+                            }],
+                        };
+                        events.push(Ok(Event::default()
+                            .data(serde_json::to_string(&chunk).unwrap_or_default())));
+                    }
+                }
+
+                let (remaining, drained_aux) = decoder.flush_aux();
                 if !remaining.is_empty() {
                     let chunk = ChatCompletionChunk {
                         id: request_id.clone(),
@@ -556,7 +644,7 @@ fn chat_sse_stream(
                                 role: None,
                                 content: Some(remaining),
                                 tool_calls: None,
-                                logprobs: None,
+                                logprobs: delta_logprobs_from_aux(&tokenizer_for_aux, drained_aux),
                             },
                             finish_reason: None,
                         }],
@@ -634,6 +722,8 @@ fn completion_sse_stream(
     created: i64,
     state: Arc<AppState>,
     logprobs_enabled: bool,
+    _permit: OwnedSemaphorePermit,
+    holdback_tokens: usize,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> + Send + 'static {
     let token_stream = ReceiverStream::new(rx);
 
@@ -647,54 +737,119 @@ fn completion_sse_stream(
     // `text_offset` across delta boundaries per OpenAI's shape.
     let mut running_offset: usize = 0;
     let tokenizer_for_aux = Arc::clone(&tokenizer);
+    let mut pending_tokens: VecDeque<(u32, Option<crate::engine::TokenLogprobEntry>)> =
+        VecDeque::new();
 
     token_stream.flat_map(move |event| {
         let mut events: Vec<Result<Event, Infallible>> = Vec::new();
 
         match event {
             TokenEvent::Token { id: token_id, logprob } => {
-                let (new_text, drained_aux) = decoder.push_with_aux(token_id, logprob);
-                if !new_text.is_empty() {
-                    let logprobs_payload = if logprobs_enabled {
-                        Some(build_completion_logprobs(
+                pending_tokens.push_back((token_id, logprob));
+                while pending_tokens.len() > holdback_tokens {
+                    let Some((next_id, next_logprob)) = pending_tokens.pop_front() else {
+                        break;
+                    };
+                    let (new_text, drained_aux) = decoder.push_with_aux(next_id, next_logprob);
+                    if !new_text.is_empty() {
+                        let logprobs_payload = if logprobs_enabled {
+                            Some(build_completion_logprobs(
+                                &tokenizer_for_aux,
+                                drained_aux,
+                                &mut running_offset,
+                            ))
+                        } else {
+                            None
+                        };
+                        let mut choice = json!({
+                            "index": 0,
+                            "text": new_text,
+                            "finish_reason": null,
+                        });
+                        if let Some(lp) = logprobs_payload {
+                            choice["logprobs"] = serde_json::to_value(lp).unwrap_or(json!(null));
+                        }
+                        let chunk = json!({
+                            "id": request_id,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [choice],
+                        });
+                        events.push(Ok(Event::default().data(chunk.to_string())));
+                    }
+                }
+            }
+            TokenEvent::Done {
+                finish_reason,
+                metrics,
+                stripped_tokens,
+            } => {
+                if stripped_tokens > pending_tokens.len() {
+                    tracing::warn!(
+                        stripped_tokens,
+                        buffered_tokens = pending_tokens.len(),
+                        "stop-sequence suffix exceeded the streaming holdback window"
+                    );
+                    pending_tokens.clear();
+                } else {
+                    for _ in 0..stripped_tokens {
+                        pending_tokens.pop_back();
+                    }
+                }
+
+                while let Some((next_id, next_logprob)) = pending_tokens.pop_front() {
+                    let (new_text, drained_aux) = decoder.push_with_aux(next_id, next_logprob);
+                    if !new_text.is_empty() {
+                        let logprobs_payload = if logprobs_enabled {
+                            Some(build_completion_logprobs(
+                                &tokenizer_for_aux,
+                                drained_aux,
+                                &mut running_offset,
+                            ))
+                        } else {
+                            None
+                        };
+                        let mut choice = json!({
+                            "index": 0,
+                            "text": new_text,
+                            "finish_reason": null,
+                        });
+                        if let Some(lp) = logprobs_payload {
+                            choice["logprobs"] = serde_json::to_value(lp).unwrap_or(json!(null));
+                        }
+                        let chunk = json!({
+                            "id": request_id,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [choice],
+                        });
+                        events.push(Ok(Event::default().data(chunk.to_string())));
+                    }
+                }
+
+                let (remaining, drained_aux) = decoder.flush_aux();
+                if !remaining.is_empty() {
+                    let mut choice = json!({
+                        "index": 0,
+                        "text": remaining,
+                        "finish_reason": null,
+                    });
+                    if logprobs_enabled {
+                        let lp = build_completion_logprobs(
                             &tokenizer_for_aux,
                             drained_aux,
                             &mut running_offset,
-                        ))
-                    } else {
-                        None
-                    };
-                    let mut choice = json!({
-                        "index": 0,
-                        "text": new_text,
-                        "finish_reason": null,
-                    });
-                    if let Some(lp) = logprobs_payload {
+                        );
                         choice["logprobs"] = serde_json::to_value(lp).unwrap_or(json!(null));
                     }
-                    let chunk = json!({
-                        "id": request_id,
-                        "object": "text_completion",
-                        "created": created,
-                        "model": model_id,
-                        "choices": [choice],
-                    });
-                    events.push(Ok(Event::default().data(chunk.to_string())));
-                }
-            }
-            TokenEvent::Done(finish_reason, metrics) => {
-                let (remaining, _drained_aux) = decoder.flush_aux();
-                if !remaining.is_empty() {
                     let flush = json!({
                         "id": request_id,
                         "object": "text_completion",
                         "created": created,
                         "model": model_id,
-                        "choices": [{
-                            "index": 0,
-                            "text": remaining,
-                            "finish_reason": null,
-                        }]
+                        "choices": [choice]
                     });
                     events.push(Ok(Event::default().data(flush.to_string())));
                 }
@@ -781,6 +936,8 @@ pub async fn embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbeddingsRequest>,
 ) -> Result<Json<EmbeddingsResponse>, ServeError> {
+    let _permit = state.try_acquire_request_permit()?;
+
     let mode = parse_pooling_mode(req.pooling.as_deref())
         .ok_or_else(|| ServeError::BadRequest("unknown pooling mode".into()))?;
     let inputs = req.input.into_batch();
@@ -823,27 +980,40 @@ pub async fn embeddings(
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Resolve a list of stop strings to token IDs.
+/// Resolve stop strings to a mix of fast-path token IDs and raw text sequences.
 ///
-/// Only stop strings that encode to exactly one token are accepted — multi-token
-/// stop sequences require a separate detokenization buffer not yet implemented.
-/// A warning is logged for multi-token entries so callers know they were dropped.
-fn resolve_stop_ids(stop: &Option<Vec<String>>, engine: &InferenceEngine) -> Vec<u32> {
-    stop.as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(|s| match engine.tokenize(s) {
-            Ok(ids) if ids.len() == 1 => Some(ids[0]),
-            Ok(ids) => {
-                tracing::warn!(
-                    "stop string {:?} encodes to {} tokens — \
-                         only single-token stop strings are supported, ignoring",
-                    s,
-                    ids.len()
-                );
-                None
+/// Single-token sequences are mirrored into `token_ids` so the engine can stop
+/// before accepting the token. All non-empty raw strings remain in `sequences`
+/// so the engine can detect multi-token suffixes and the streaming layer can
+/// hold back enough trailing tokens to suppress the stop text on the wire.
+pub(crate) fn resolve_stop_sequences(
+    stop: &Option<Vec<String>>,
+    engine: &InferenceEngine,
+) -> ResolvedStopSequences {
+    let mut token_ids = Vec::new();
+    let mut sequences = Vec::new();
+
+    for stop in stop.as_deref().unwrap_or(&[]) {
+        if stop.is_empty() {
+            continue;
+        }
+        sequences.push(stop.clone());
+        match engine.tokenize(stop) {
+            Ok(ids) if ids.len() == 1 => token_ids.push(ids[0]),
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(stop = %stop, error = %err, "failed to tokenize stop sequence");
             }
-            Err(_) => None,
-        })
-        .collect()
+        }
+    }
+
+    token_ids.sort_unstable();
+    token_ids.dedup();
+    sequences.sort();
+    sequences.dedup();
+
+    ResolvedStopSequences {
+        token_ids,
+        sequences,
+    }
 }

@@ -55,9 +55,8 @@ impl ServeTab {
     fn default_fields() -> Vec<FormField> {
         vec![
             FormField::new("Model", "(not selected)", FieldKind::ModelPicker, "Model"),
-            FormField::new("LoRA Adapter", "", FieldKind::Text, "Model"),
             FormField::new("Experts Dir", "", FieldKind::Text, "Model"),
-            FormField::new("Host", "0.0.0.0", FieldKind::Text, "Network"),
+            FormField::new("Host", "127.0.0.1", FieldKind::Text, "Network"),
             FormField::new(
                 "Port",
                 "8080",
@@ -181,7 +180,7 @@ impl ServeTab {
             return Err("Model is required.".into());
         }
         if self.form.value("Host").is_empty() {
-            return Err("Host is required (e.g. 0.0.0.0 or 127.0.0.1).".into());
+            return Err("Host is required (e.g. 127.0.0.1 or 0.0.0.0).".into());
         }
         Ok(())
     }
@@ -189,12 +188,7 @@ impl ServeTab {
     pub fn bind_url(&self) -> String {
         let host = self.form.value("Host");
         let port = self.form.value("Port");
-        let display_host = if host == "0.0.0.0" {
-            "localhost".to_string()
-        } else {
-            host
-        };
-        format!("http://{display_host}:{port}")
+        format!("http://{host}:{port}")
     }
 
     pub fn config_summary(&self) -> Vec<String> {
@@ -213,10 +207,6 @@ impl ServeTab {
         let mut args = vec!["serve".to_string()];
 
         args.extend(["--model".into(), self.form.value("Model")]);
-        let lora = self.form.value("LoRA Adapter");
-        if !lora.is_empty() {
-            args.extend(["--lora".into(), lora]);
-        }
         let experts = self.form.value("Experts Dir");
         if !experts.is_empty() {
             args.extend(["--experts-dir".into(), experts]);
@@ -250,6 +240,25 @@ impl ServeTab {
         }
 
         args
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServeTab;
+
+    #[test]
+    fn serve_tab_defaults_to_loopback() {
+        let tab = ServeTab::new();
+        assert_eq!(tab.form.value("Host"), "127.0.0.1");
+    }
+
+    #[test]
+    fn serve_tab_does_not_emit_removed_lora_flag() {
+        let mut tab = ServeTab::new();
+        tab.form.set_value("Model", "/tmp/model");
+        let args = tab.build_cli_args();
+        assert!(!args.iter().any(|arg| arg == "--lora"));
     }
 }
 

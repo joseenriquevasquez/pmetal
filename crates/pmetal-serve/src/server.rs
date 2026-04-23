@@ -6,7 +6,6 @@ use crate::routes::{self, AppState, ServingMetrics};
 use axum::Router;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
@@ -34,10 +33,11 @@ impl Default for ServeConfig {
 }
 
 /// Build the axum router with all routes.
-pub fn build_router(engine: InferenceEngine) -> Router {
+pub fn build_router(engine: InferenceEngine, max_concurrent: usize) -> Router {
     let state = Arc::new(AppState {
         engine,
         metrics: ServingMetrics::default(),
+        request_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
     });
 
     Router::new()
@@ -51,7 +51,6 @@ pub fn build_router(engine: InferenceEngine) -> Router {
         .route("/v1/completions", axum::routing::post(routes::completions))
         .route("/v1/embeddings", axum::routing::post(routes::embeddings))
         .route("/v1/messages", axum::routing::post(anthropic::messages))
-        .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         // Reject request bodies larger than 2 MiB to prevent memory exhaustion.
         .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
@@ -60,8 +59,15 @@ pub fn build_router(engine: InferenceEngine) -> Router {
 
 /// Start the server.
 pub async fn run_server(engine: InferenceEngine, config: ServeConfig) -> anyhow::Result<()> {
-    let router = build_router(engine);
+    let router = build_router(engine, config.max_concurrent);
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
+
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            "binding the inference server to a non-loopback address without authentication; \
+             expose this only on trusted networks"
+        );
+    }
 
     tracing::info!("Starting PMetal inference server on {}", addr);
     tracing::info!("OpenAI-compatible API available at http://{}/v1", addr);

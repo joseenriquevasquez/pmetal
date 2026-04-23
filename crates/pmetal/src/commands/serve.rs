@@ -4,7 +4,6 @@ use std::path::PathBuf;
 #[cfg(feature = "serve")]
 pub(crate) async fn run_serve(
     model_id: String,
-    lora_path: Option<String>,
     port: u16,
     host: String,
     max_seq_len: usize,
@@ -60,18 +59,6 @@ pub(crate) async fn run_serve(
     } else if model.requires_expert_offloading() {
         anyhow::bail!(
             "this model requires expert offloading; repack routed experts with `pmetal pack-experts` and pass --experts-dir <packed_dir>"
-        );
-    }
-
-    // Apply LoRA adapter if specified
-    if let Some(ref _lora) = lora_path {
-        // TODO: DynamicModel does not yet support runtime LoRA application.
-        // For now, merge the adapter into the base model first:
-        //   pmetal merge --base <model> --lora <adapter> --output <merged>
-        anyhow::bail!(
-            "Serving with a LoRA adapter requires pre-merging. \
-             Use `pmetal merge --base <model> --lora <adapter> --output <merged>` \
-             then serve the merged model."
         );
     }
 

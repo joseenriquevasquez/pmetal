@@ -1487,16 +1487,12 @@ enum Commands {
         #[arg(short, long)]
         model: String,
 
-        /// LoRA adapter path (optional)
-        #[arg(long)]
-        lora: Option<String>,
-
         /// Port to listen on
         #[arg(short, long, default_value = "8080")]
         port: u16,
 
         /// Host to bind to
-        #[arg(long, default_value = "0.0.0.0")]
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
 
         /// Maximum sequence length for KV cache
@@ -2743,7 +2739,6 @@ async fn tokio_main() -> anyhow::Result<()> {
         #[cfg(feature = "serve")]
         Commands::Serve {
             model,
-            lora,
             port,
             host,
             max_seq_len,
@@ -2777,7 +2772,6 @@ async fn tokio_main() -> anyhow::Result<()> {
 
             commands::serve::run_serve(
                 model,
-                lora,
                 port,
                 host,
                 max_seq_len,

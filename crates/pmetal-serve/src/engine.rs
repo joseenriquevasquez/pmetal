@@ -35,6 +35,7 @@ pub struct SamplingParams {
     pub presence_penalty: Option<f32>,
     pub seed: Option<u64>,
     pub extra_stop_token_ids: Vec<u32>,
+    pub stop_sequences: Vec<String>,
     /// When `Some(n)`, emit per-token log-probabilities alongside generated
     /// tokens. `n == 0` means chosen-token logprob only; `n > 0` also
     /// includes the top-`n` alternative logprobs. `None` (default) skips
@@ -88,7 +89,11 @@ pub enum TokenEvent {
         logprob: Option<TokenLogprobEntry>,
     },
     /// Generation is complete — carries finish reason and final metrics.
-    Done(String, RequestMetrics),
+    Done {
+        finish_reason: String,
+        metrics: RequestMetrics,
+        stripped_tokens: usize,
+    },
     /// Generation failed.
     Error(String),
 }
@@ -188,6 +193,33 @@ fn build_generation_config_from_parts(
     }
 
     config
+}
+
+fn detect_stop_sequence_suffix(
+    tokenizer: &pmetal_data::Tokenizer,
+    generated: &[u32],
+    stop_sequences: &[String],
+) -> Option<usize> {
+    if generated.is_empty() || stop_sequences.is_empty() {
+        return None;
+    }
+
+    let decoded = tokenizer.decode(generated).unwrap_or_default();
+    let matched = stop_sequences
+        .iter()
+        .filter(|seq| !seq.is_empty() && decoded.ends_with(seq.as_str()))
+        .max_by_key(|seq| seq.len())?;
+
+    for strip_tokens in 1..=generated.len() {
+        let suffix = tokenizer
+            .decode(&generated[generated.len() - strip_tokens..])
+            .unwrap_or_default();
+        if suffix == *matched {
+            return Some(strip_tokens);
+        }
+    }
+
+    None
 }
 
 fn estimate_parameter_count(config_json: &serde_json::Value) -> Option<u64> {
@@ -888,7 +920,11 @@ impl InferenceEngine {
                     completion_tokens,
                     first_token_time_ms,
                 );
-                let _ = tx.blocking_send(TokenEvent::Done(Self::finish_reason(&output), metrics));
+                let _ = tx.blocking_send(TokenEvent::Done {
+                    finish_reason: Self::finish_reason(&output),
+                    metrics,
+                    stripped_tokens: 0,
+                });
                 true
             }
             Err(err) => {
@@ -927,8 +963,9 @@ impl InferenceEngine {
     ///
     /// `logprobs` is `Some(vec_with_one_entry_per_token)` when the caller
     /// set `params.logprobs_top_n` to `Some(n)` — the accelerated ANE/CPU
-    /// paths cannot collect logprobs, so that path is bypassed whenever
-    /// logprobs are requested.
+    /// paths cannot collect logprobs, and they only understand token-ID stop
+    /// conditions, so they are bypassed whenever logprobs or raw text stop
+    /// sequences are requested.
     pub async fn generate(
         &self,
         input_ids: &[u32],
@@ -951,8 +988,10 @@ impl InferenceEngine {
         let ane_max_seq_len = self.ane_max_seq_len;
         let backend = Arc::clone(&self.backend);
         let cache_mode_override = self.cache_mode_override;
+        let tokenizer = Arc::clone(&self.tokenizer);
 
         let logprobs_top_n = params.logprobs_top_n;
+        let stop_sequences = params.stop_sequences.clone();
 
         // Generation is synchronous/blocking; run it on a dedicated blocking
         // thread so we don't stall the async executor.
@@ -963,7 +1002,7 @@ impl InferenceEngine {
             // Accelerated ANE / CPU-hybrid paths can't collect logprobs (they
             // run outside the MLX logits pipeline). Skip them when logprobs
             // are requested so the standard GPU loop handles the request.
-            if logprobs_top_n.is_none() {
+            if logprobs_top_n.is_none() && stop_sequences.is_empty() {
                 if let Some(result) = Self::try_accelerated_generate_blocking(
                     &backend,
                     &model_path,
@@ -1051,6 +1090,19 @@ impl InferenceEngine {
 
                 generated.push(next_token);
                 all_tokens.push(next_token);
+
+                if let Some(stripped_tokens) =
+                    detect_stop_sequence_suffix(tokenizer.as_ref(), &generated, &stop_sequences)
+                {
+                    let visible_len = generated.len().saturating_sub(stripped_tokens);
+                    generated.truncate(visible_len);
+                    all_tokens.truncate(input_ids.len() + visible_len);
+                    if let Some(out) = logprobs_out.as_mut() {
+                        out.truncate(visible_len);
+                    }
+                    finish_reason = "stop".to_string();
+                    break;
+                }
 
                 // Only run a decode forward pass when there are more iterations.
                 // This avoids the wasted forward pass after the last token.
@@ -1162,7 +1214,7 @@ impl InferenceEngine {
     ///
     /// The channel will receive:
     /// - Zero or more `TokenEvent::Token(id)` — one per generated token.
-    /// - Exactly one `TokenEvent::Done(finish_reason, metrics)` on success.
+    /// - Exactly one `TokenEvent::Done { .. }` on success.
     /// - Exactly one `TokenEvent::Error(msg)` if generation fails (no [DONE]).
     pub fn generate_streaming(
         &self,
@@ -1189,10 +1241,12 @@ impl InferenceEngine {
         let ane_max_seq_len = self.ane_max_seq_len;
         let backend = Arc::clone(&self.backend);
         let cache_mode_override = self.cache_mode_override;
+        let tokenizer = Arc::clone(&self.tokenizer);
         // Captured per-token logprobs flag for the GPU streaming loop. The
         // accelerated paths cannot collect logprobs, so they always emit
         // TokenEvent::Token { logprob: None } regardless of this value.
         let logprobs_top_n = params.logprobs_top_n;
+        let stop_sequences = params.stop_sequences.clone();
 
         // Spawn generation on a dedicated blocking thread.
         tokio::task::spawn_blocking(move || {
@@ -1206,15 +1260,17 @@ impl InferenceEngine {
                 };
             }
 
-            if Self::try_accelerated_streaming_blocking(
-                &backend,
-                &model_path,
-                &input_ids,
-                &gen_config,
-                ane_max_seq_len,
-                &tx,
-            ) {
-                return;
+            if stop_sequences.is_empty() {
+                if Self::try_accelerated_streaming_blocking(
+                    &backend,
+                    &model_path,
+                    &input_ids,
+                    &gen_config,
+                    ane_max_seq_len,
+                    &tx,
+                ) {
+                    return;
+                }
             }
 
             let max_tokens = gen_config.max_new_tokens;
@@ -1265,6 +1321,8 @@ impl InferenceEngine {
             let mut finish_reason = "length".to_string();
             let mut first_token_time: Option<f64> = None;
             let mut all_tokens: Vec<u32> = input_ids.clone();
+            let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
+            let mut stripped_tokens = 0usize;
 
             for i in 0..max_tokens {
                 // Sample from current logits (prefill logits on i=0, decode logits thereafter).
@@ -1329,6 +1387,16 @@ impl InferenceEngine {
                 });
                 completion_tokens += 1;
                 all_tokens.push(next_token);
+                generated.push(next_token);
+
+                if let Some(matched_tokens) =
+                    detect_stop_sequence_suffix(tokenizer.as_ref(), &generated, &stop_sequences)
+                {
+                    stripped_tokens = matched_tokens;
+                    completion_tokens = completion_tokens.saturating_sub(matched_tokens);
+                    finish_reason = "stop".to_string();
+                    break;
+                }
 
                 // Only run a decode forward pass when there are more iterations.
                 // This avoids the wasted forward pass after the last token.
@@ -1356,7 +1424,11 @@ impl InferenceEngine {
                 Self::build_metrics(start, prompt_tokens, completion_tokens, first_token_time);
 
             // Done — send final event (ignore send error, client may be gone).
-            let _ = tx.blocking_send(TokenEvent::Done(finish_reason, metrics));
+            let _ = tx.blocking_send(TokenEvent::Done {
+                finish_reason,
+                metrics,
+                stripped_tokens,
+            });
         });
 
         rx
@@ -1367,6 +1439,8 @@ impl InferenceEngine {
 mod tests {
     use super::*;
     use pmetal_models::architectures::nemotron_h::{NemotronHConfig, NemotronHForCausalLM};
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
 
     fn dense_config(hidden_size: u64, num_layers: u64, vocab_size: u64) -> serde_json::Value {
         serde_json::json!({
@@ -1487,6 +1561,7 @@ mod tests {
             presence_penalty: None,
             seed: Some(7),
             extra_stop_token_ids: vec![99],
+            stop_sequences: vec![],
             logprobs_top_n: None,
         };
 
@@ -1542,5 +1617,51 @@ mod tests {
 
         assert_eq!(cache.config().max_seq_len, 64);
         assert!(mamba_cache.is_some());
+    }
+
+    fn test_tokenizer() -> pmetal_data::Tokenizer {
+        let model = WordLevel::builder()
+            .vocab(
+                [
+                    ("<unk>".to_string(), 0),
+                    ("alpha".to_string(), 1),
+                    ("beta".to_string(), 2),
+                    ("gamma".to_string(), 3),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unk_token("<unk>".to_string())
+            .build()
+            .expect("wordlevel");
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        let json = tokenizer.to_string(false).expect("serialize tokenizer");
+        pmetal_data::Tokenizer::from_bytes(json.as_bytes()).expect("wrapper tokenizer")
+    }
+
+    #[test]
+    fn detect_stop_sequence_suffix_matches_multi_token_tail() {
+        let tokenizer = test_tokenizer();
+        let generated = vec![1, 2, 3];
+
+        let stripped =
+            detect_stop_sequence_suffix(&tokenizer, &generated, &["beta gamma".to_string()]);
+
+        assert_eq!(stripped, Some(2));
+    }
+
+    #[test]
+    fn detect_stop_sequence_suffix_prefers_longest_match() {
+        let tokenizer = test_tokenizer();
+        let generated = vec![1, 2, 3];
+
+        let stripped = detect_stop_sequence_suffix(
+            &tokenizer,
+            &generated,
+            &["gamma".to_string(), "beta gamma".to_string()],
+        );
+
+        assert_eq!(stripped, Some(2));
     }
 }

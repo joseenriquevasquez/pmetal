@@ -11,7 +11,7 @@
 //! scope for the first phase and live in the plan's deferred list.
 
 use crate::error::ServeError;
-use crate::routes::AppState;
+use crate::routes::{AppState, resolve_stop_sequences};
 use crate::types::try_parse_tool_calls;
 use axum::extract::State;
 use axum::response::sse::{Event, Sse};
@@ -19,8 +19,10 @@ use axum::response::{IntoResponse, Json};
 use futures::stream::{self, StreamExt};
 use pmetal_data::chat_templates::{ToolCall, ToolDefinition};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::engine::{SamplingParams, TokenEvent};
@@ -237,6 +239,8 @@ pub async fn messages(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MessagesRequest>,
 ) -> Result<axum::response::Response, ServeError> {
+    let permit = state.try_acquire_request_permit()?;
+
     // Assemble the internal chat-message list: optional system prompt first,
     // then each Anthropic message with content flattened to plain text.
     let mut messages: Vec<ChatMessage> = Vec::with_capacity(req.messages.len() + 1);
@@ -262,7 +266,7 @@ pub async fn messages(
     let prompt_tokens = input_ids.len();
     let tools_requested = req.tools.is_some();
 
-    let extra_stop_ids = resolve_stop_ids(&req.stop_sequences, state.as_ref());
+    let resolved_stops = resolve_stop_sequences(&req.stop_sequences, &state.engine);
     let temperature = req.temperature.unwrap_or(0.0);
     let request_id = format!("msg_{}", uuid::Uuid::new_v4());
     let model_id = state.engine.model_id().to_string();
@@ -277,7 +281,8 @@ pub async fn messages(
         frequency_penalty: None,
         presence_penalty: None,
         seed: None,
-        extra_stop_token_ids: extra_stop_ids,
+        extra_stop_token_ids: resolved_stops.token_ids.clone(),
+        stop_sequences: resolved_stops.sequences.clone(),
         // Anthropic /v1/messages does not expose OpenAI-style logprobs.
         logprobs_top_n: None,
     };
@@ -294,6 +299,8 @@ pub async fn messages(
             prompt_tokens,
             tools_requested,
             metrics_handle,
+            permit,
+            resolved_stops.holdback_tokens(),
         );
         return Ok(Sse::new(sse)
             .keep_alive(axum::response::sse::KeepAlive::default())
@@ -373,6 +380,8 @@ fn anthropic_sse_stream(
     prompt_tokens: usize,
     tools_requested: bool,
     state: Arc<AppState>,
+    _permit: OwnedSemaphorePermit,
+    holdback_tokens: usize,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> + Send + 'static {
     // Opening events — pre-built so the first token arrival doesn't pay the
     // cost of serialising three SSE frames in a row.
@@ -406,6 +415,7 @@ fn anthropic_sse_stream(
     // Shared UTF-8 boundary buffering — see crate::sse::IncrementalDecoder.
     // Anthropic stream doesn't surface OpenAI logprobs, aux is `()`.
     let mut decoder: IncrementalDecoder<()> = IncrementalDecoder::new(tokenizer);
+    let mut pending_tokens: VecDeque<u32> = VecDeque::new();
 
     let mapped = ReceiverStream::new(rx).flat_map(move |event| {
         let mut events: Vec<Result<Event, Infallible>> = Vec::new();
@@ -414,16 +424,50 @@ fn anthropic_sse_stream(
                 id: tok,
                 logprob: _,
             } => {
-                let new_text = decoder.push(tok);
-                if !new_text.is_empty() {
-                    let delta = MessageEvent::ContentBlockDelta {
-                        index: 0,
-                        delta: DeltaBlock::TextDelta { text: new_text },
+                pending_tokens.push_back(tok);
+                while pending_tokens.len() > holdback_tokens {
+                    let Some(next_tok) = pending_tokens.pop_front() else {
+                        break;
                     };
-                    events.push(Ok(encode_event(&delta)));
+                    let new_text = decoder.push(next_tok);
+                    if !new_text.is_empty() {
+                        let delta = MessageEvent::ContentBlockDelta {
+                            index: 0,
+                            delta: DeltaBlock::TextDelta { text: new_text },
+                        };
+                        events.push(Ok(encode_event(&delta)));
+                    }
                 }
             }
-            TokenEvent::Done(finish_reason, metrics) => {
+            TokenEvent::Done {
+                finish_reason,
+                metrics,
+                stripped_tokens,
+            } => {
+                if stripped_tokens > pending_tokens.len() {
+                    tracing::warn!(
+                        stripped_tokens,
+                        buffered_tokens = pending_tokens.len(),
+                        "stop-sequence suffix exceeded the streaming holdback window"
+                    );
+                    pending_tokens.clear();
+                } else {
+                    for _ in 0..stripped_tokens {
+                        pending_tokens.pop_back();
+                    }
+                }
+
+                while let Some(next_tok) = pending_tokens.pop_front() {
+                    let new_text = decoder.push(next_tok);
+                    if !new_text.is_empty() {
+                        let delta = MessageEvent::ContentBlockDelta {
+                            index: 0,
+                            delta: DeltaBlock::TextDelta { text: new_text },
+                        };
+                        events.push(Ok(encode_event(&delta)));
+                    }
+                }
+
                 let remaining = decoder.flush();
                 if !remaining.is_empty() {
                     let delta = MessageEvent::ContentBlockDelta {
@@ -492,21 +536,6 @@ fn encode_event(ev: &MessageEvent) -> Event {
     Event::default()
         .event(ty)
         .data(serde_json::to_string(ev).unwrap_or_default())
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ────────────────────────────────────────────────────────────────────────────
-
-fn resolve_stop_ids(stop: &Option<Vec<String>>, state: &AppState) -> Vec<u32> {
-    stop.as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(|s| match state.engine.tokenize(s) {
-            Ok(ids) if ids.len() == 1 => Some(ids[0]),
-            _ => None,
-        })
-        .collect()
 }
 
 // ────────────────────────────────────────────────────────────────────────────
