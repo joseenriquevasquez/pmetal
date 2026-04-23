@@ -67,11 +67,10 @@ use pmetal_bridge::compat::{
     optimizers::{AdamW, AdamWBuilder, Optimizer, Updatable},
     transforms,
 };
-// Local no-op compile shim (bridge doesn't need JIT compilation)
-// Accepts Option<bool> to match the mlx-rs call site: compile_with_state(f, None)
-fn compile_with_state<F: FnMut(S, I) -> O, S, I, O>(f: F, _shapeless: Option<bool>) -> F {
-    f
-}
+// The Rust bridge does not currently expose a working compile-with-state path
+// for training. Callers that request JIT dispatch are routed back to the fused
+// eager path with an explicit warning instead of silently pretending that
+// compilation happened.
 use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
 use pmetal_data::{
     DataLoader, DataLoaderConfig, PackedDataLoader, PackedTrainingBatch, PackerConfig,
@@ -117,9 +116,9 @@ pub struct TrainingLoopConfig {
     pub checkpoint_every: usize,
     /// Evaluate every N steps (0 to disable).
     pub eval_every: usize,
-    /// Whether to use JIT compilation for training step.
-    /// This can provide significant speedups (up to 8x) by fusing operations.
-    /// Requires gradient_accumulation_steps=1 for now.
+    /// Whether to request compiled training for the step function.
+    /// The current Rust bridge falls back to fused eager execution when a
+    /// working compile-with-state path is unavailable.
     pub use_jit_compilation: bool,
     /// Enable sequence packing for 2-5x throughput on variable-length data.
     /// Packs multiple shorter sequences into single batches with block-diagonal

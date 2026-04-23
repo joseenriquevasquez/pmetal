@@ -33,6 +33,7 @@ fn clip_grads(grads: &mut FlattenedModuleParam, max_norm: f32) {
 ///
 /// When `neftune_alpha` is `Some(alpha)`, NEFTune embedding noise is applied via
 /// `model.forward_noised()` instead of the regular `model.forward()`.
+#[allow(dead_code)]
 pub(crate) fn jit_training_step<M: TrainableModel, O: Optimizer>(
     state: &mut (M, O),
     (input_ids, labels): (&Array, &Array),

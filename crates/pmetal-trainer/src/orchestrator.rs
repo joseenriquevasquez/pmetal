@@ -92,7 +92,7 @@ impl Default for DispatchConfig {
             flash_attention: true,
             sequence_packing: true,
             pack_max_seq_len: None,
-            jit_compilation: true,
+            jit_compilation: false,
             fused: true,
             metal_fused_optimizer: true,
             gradient_checkpointing: true,
