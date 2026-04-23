@@ -2,7 +2,7 @@
 
 Knowledge distillation — transfer knowledge from a teacher model to a smaller student.
 
-Distill knowledge from a larger teacher model into a smaller student model. Supports online, offline, progressive, and cross-vocabulary methods.
+Distill knowledge from a larger teacher model into a smaller student model. Supports online, offline, and progressive methods.
 
 ## Usage
 
@@ -28,14 +28,8 @@ pmetal distill \
   --teacher Qwen/Qwen3-4B \
   --student Qwen/Qwen3.5-0.8B-Base \
   --dataset train.jsonl \
-  --offline
-
-# Cross-vocabulary distillation
-pmetal distill \
-  --teacher meta-llama/Llama-3.3-70B \
-  --student Qwen/Qwen3-0.6B \
-  --dataset train.jsonl \
-  --cross-vocab
+  --offline \
+  --offline-cache ./output/distilled/teacher_logits
 ```
 
 ## Methods
@@ -45,7 +39,6 @@ pmetal distill \
 | Online | Live teacher inference during training — highest quality, slowest |
 | Offline | Pre-cached logits with compression — faster, uses more disk |
 | Progressive | Gradually increase distillation difficulty |
-| Cross-vocabulary | Distill between models with different tokenizers |
 
 ## Loss Functions
 

@@ -41,7 +41,7 @@ pmetal tui
 | **Models** | Browse cached models, HuggingFace Hub search (`S`), memory fit estimation, download |
 | **Datasets** | Scan and preview local datasets (JSONL, Parquet, CSV) with line counts |
 | **Training** | Configure and launch SFT/LoRA/QLoRA training runs with sectioned parameter forms |
-| **Distillation** | Configure knowledge distillation (online, offline, progressive, cross-vocab) |
+| **Distillation** | Configure knowledge distillation (online, offline, progressive) |
 | **GRPO** | Configure GRPO/DAPO reasoning training with reward functions and sampling params |
 | **Inference** | Interactive chat interface with markdown rendering and generation settings sidebar |
 | **Jobs** | Training run history with log viewer, status tracking, and metadata |
@@ -283,7 +283,7 @@ pmetal/
 ├── pmetal-trainer      # Training loops (SFT, DPO, SimPO, ORPO, KTO, GRPO, etc.)
 ├── pmetal-data         # Dataset loading, chat templates, tokenization
 ├── pmetal-hub          # HuggingFace Hub integration + model fit estimation
-├── pmetal-distill      # Knowledge distillation (online, offline, cross-vocab, TAID)
+├── pmetal-distill      # Knowledge distillation losses, offline caches, and TAID
 ├── pmetal-merge        # Model merging (14 strategies)
 ├── pmetal-gguf         # GGUF format with imatrix quantization
 ├── pmetal-mhc          # Manifold-Constrained Hyper-Connections

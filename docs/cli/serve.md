@@ -16,8 +16,12 @@ pmetal serve --model <MODEL> [OPTIONS]
 # Start server
 pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 
-# With LoRA adapter
-pmetal serve --model Qwen/Qwen3-0.6B --lora ./output/lora_weights.safetensors --port 8080
+# Serve a pre-fused adapter model
+pmetal fuse \
+  --model Qwen/Qwen3-0.6B \
+  --lora ./output/lora_weights.safetensors \
+  --output ./output/fused
+pmetal serve --model ./output/fused --port 8080
 ```
 
 ## API Compatibility

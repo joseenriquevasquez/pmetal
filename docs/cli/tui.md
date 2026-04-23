@@ -19,7 +19,7 @@ pmetal tui
 | **Models** | Browse cached models, HuggingFace Hub search (`S`), memory fit estimation, download |
 | **Datasets** | Scan and preview local datasets (JSONL, Parquet, CSV) with line counts |
 | **Training** | Configure and launch SFT/LoRA/QLoRA training runs with sectioned parameter forms |
-| **Distillation** | Configure knowledge distillation (online, offline, progressive, cross-vocab) |
+| **Distillation** | Configure knowledge distillation (online, offline, progressive) |
 | **GRPO** | Configure GRPO/DAPO reasoning training with reward functions and sampling params |
 | **Inference** | Interactive chat interface with markdown rendering and generation settings sidebar |
 | **Jobs** | Training run history with log viewer, status tracking, and metadata |

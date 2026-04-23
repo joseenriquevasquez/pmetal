@@ -48,7 +48,7 @@ let engine = InferenceEngine::new(
 )?;
 let config = ServeConfig {
     port: 8080,
-    host: "0.0.0.0".to_string(),
+    host: "127.0.0.1".to_string(),
     max_concurrent: 16,
 };
 
@@ -60,7 +60,7 @@ run_server(engine, config).await?;
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `port` | Port to listen on | 8080 |
-| `host` | Host to bind to | `0.0.0.0` |
+| `host` | Host to bind to | `127.0.0.1` |
 | `max_concurrent` | Maximum concurrent requests | 16 |
 
 ## Modules

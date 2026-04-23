@@ -33,50 +33,21 @@ This crate provides knowledge distillation utilities for training smaller studen
 
 ## Usage
 
-### Basic Distillation
+`pmetal-distill` is the low-level loss/cache crate. It provides `Distiller`,
+`TaidDistiller`, `LogitCache`, and `LogitCompressor` for use inside a higher-level
+training loop.
 
 ```rust
-use pmetal_distill::{Distiller, DistillConfig, KLDivergenceLoss};
+use pmetal_distill::{DistillConfig, Distiller};
 
-let config = DistillConfig {
-    temperature: 2.0,
-    alpha: 0.5,  // Balance between soft and hard labels
-    ..Default::default()
-};
+let config = DistillConfig::from_yaml_file("distill_config.yaml")?;
+let distiller = Distiller::new(config)?;
 
-let distiller = Distiller::new(teacher, student, config)?;
-
-// Distillation training loop
-for batch in dataloader {
-    let loss = distiller.step(&batch)?;
-}
+// Call `distiller.compute_loss(...)` inside your training loop.
 ```
 
-### With Hidden State Alignment
-
-```rust
-use pmetal_distill::{DistillConfig, HiddenStateLoss};
-
-let config = DistillConfig {
-    temperature: 2.0,
-    alpha: 0.5,
-    hidden_loss: Some(HiddenStateLoss::Cosine),
-    hidden_layers: vec![6, 12, 18, 24],  // Layers to align
-    ..Default::default()
-};
-```
-
-### Progressive Temperature
-
-```rust
-use pmetal_distill::TemperatureSchedule;
-
-let schedule = TemperatureSchedule::linear(
-    start: 4.0,
-    end: 1.0,
-    steps: 1000,
-);
-```
+For end-to-end model training, use the `pmetal distill` CLI or
+`pmetal_trainer::DistillationTrainer`.
 
 ## Metal Optimizations
 
@@ -93,7 +64,7 @@ The distillation losses are optimized for Apple Silicon:
 | `losses` | Loss function implementations (KL, JS, Soft CE, MSE, Cosine, L1, TVD, Hinge, Logistic) |
 | `taid` | Temporally Adaptive Interpolated Distillation (ICLR 2025 SOTA) |
 | `reasoning` | Rationale distillation for reasoning models |
-| Config/Builder | `DistillConfig`, `DistillerBuilder`, distillation method types |
+| Config/Builder | `DistillConfig`, `OfflineConfig`, `DistillerBuilder`, distillation method types |
 
 ## Configuration
 

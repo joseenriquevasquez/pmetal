@@ -20,7 +20,12 @@ pmetal distill \
 Pre-cache teacher logits to disk with compression. Faster training at the cost of disk space.
 
 ```bash
-pmetal distill --teacher Qwen/Qwen3-4B --student Qwen/Qwen3-0.6B --dataset train.jsonl --offline
+pmetal distill \
+  --teacher Qwen/Qwen3-4B \
+  --student Qwen/Qwen3-0.6B \
+  --dataset train.jsonl \
+  --offline \
+  --offline-cache ./output/distilled/teacher_logits
 ```
 
 ### Progressive Distillation
@@ -28,9 +33,6 @@ Gradually increase task difficulty during distillation for curriculum-style know
 
 ### TAID (Temporally Adaptive Interpolated Distillation)
 ICLR 2025 SOTA method. Available via `TaidDistiller` in the library API.
-
-### Cross-Vocabulary Distillation
-Distill between models with different tokenizers. PMetal handles vocabulary alignment automatically.
 
 ## Loss Functions
 
