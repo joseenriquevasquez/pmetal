@@ -19,6 +19,7 @@ use pmetal_bridge::compat::{
 };
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gather_mm;
+use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, differentiable_attention,
     gated_delta::gated_delta_update,
@@ -698,6 +699,8 @@ impl Qwen3NextQloraModel {
 pub struct Qwen3NextQloraForCausalLM {
     pub model: Qwen3NextQloraModel,
     pub lm_head: Option<nn::Linear>,
+    /// Interface-only gradient checkpointing parity.
+    pub checkpoint_config: Option<CheckpointConfig>,
 }
 
 impl Qwen3NextQloraForCausalLM {
@@ -717,7 +720,20 @@ impl Qwen3NextQloraForCausalLM {
         Ok(Self {
             model: Qwen3NextQloraModel::from_lora(lora.model, &qcfg)?,
             lm_head: lora.lm_head,
+            checkpoint_config: None,
         })
+    }
+
+    pub fn enable_gradient_checkpointing(&mut self, layers_per_block: usize) {
+        self.checkpoint_config = Some(CheckpointConfig {
+            enabled: true,
+            layers_per_block,
+            eval_at_boundaries: true,
+        });
+    }
+
+    pub fn disable_gradient_checkpointing(&mut self) {
+        self.checkpoint_config = None;
     }
 
     pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
@@ -1207,6 +1223,14 @@ impl TrainableModel for Qwen3NextQloraForCausalLM {
 
     fn supports_gradient_checkpointing(&self) -> bool {
         false
+    }
+
+    fn enable_gradient_checkpointing(&mut self, layers_per_block: usize) {
+        Qwen3NextQloraForCausalLM::enable_gradient_checkpointing(self, layers_per_block)
+    }
+
+    fn disable_gradient_checkpointing(&mut self) {
+        Qwen3NextQloraForCausalLM::disable_gradient_checkpointing(self)
     }
 
     fn forward_hidden(

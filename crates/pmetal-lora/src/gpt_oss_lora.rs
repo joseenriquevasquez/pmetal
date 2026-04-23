@@ -13,6 +13,7 @@ use pmetal_bridge::compat::{
     Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
 };
 use pmetal_core::LoraConfig;
+use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::gpt_oss::{
     GptOssConfig, GptOssForCausalLM as BaseGptOssForCausalLM,
@@ -27,6 +28,9 @@ use crate::LoraError;
 pub struct GptOssLoraForCausalLM {
     pub(crate) inner: InnerGptOssLoraForCausalLM,
     lora_config: LoraConfig,
+    /// Interface-only gradient checkpointing parity. `supports_gradient_checkpointing`
+    /// returns `false` until mlx-rs exposes `custom_vjp`.
+    pub checkpoint_config: Option<CheckpointConfig>,
 }
 
 impl GptOssLoraForCausalLM {
@@ -42,7 +46,23 @@ impl GptOssLoraForCausalLM {
         lora_config: LoraConfig,
     ) -> Result<Self, LoraError> {
         let inner = base.into_lora(&lora_config).map_err(LoraError::Mlx)?;
-        Ok(Self { inner, lora_config })
+        Ok(Self {
+            inner,
+            lora_config,
+            checkpoint_config: None,
+        })
+    }
+
+    pub fn enable_gradient_checkpointing(&mut self, layers_per_block: usize) {
+        self.checkpoint_config = Some(CheckpointConfig {
+            enabled: true,
+            layers_per_block,
+            eval_at_boundaries: true,
+        });
+    }
+
+    pub fn disable_gradient_checkpointing(&mut self) {
+        self.checkpoint_config = None;
     }
 
     /// Forward pass producing logits.
@@ -392,6 +412,14 @@ impl crate::TrainableModel for GptOssLoraForCausalLM {
 
     fn supports_gradient_checkpointing(&self) -> bool {
         false
+    }
+
+    fn enable_gradient_checkpointing(&mut self, layers_per_block: usize) {
+        GptOssLoraForCausalLM::enable_gradient_checkpointing(self, layers_per_block)
+    }
+
+    fn disable_gradient_checkpointing(&mut self) {
+        GptOssLoraForCausalLM::disable_gradient_checkpointing(self)
     }
 
     fn forward_noised(

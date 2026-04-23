@@ -16,6 +16,7 @@ use pmetal_bridge::compat::{
     nn, ops,
 };
 use pmetal_core::LoraConfig;
+use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::gemma4::{
@@ -733,6 +734,10 @@ impl Gemma4LoraModel {
 pub struct Gemma4LoraForCausalLM {
     pub model: Gemma4LoraModel,
     lora_config: LoraConfig,
+    /// Gradient checkpointing configuration. Interface-only parity with other
+    /// adapters; real save/recompute needs `custom_vjp` which mlx-rs does not
+    /// yet expose, so `supports_gradient_checkpointing` returns `false`.
+    pub checkpoint_config: Option<CheckpointConfig>,
 }
 
 impl Gemma4LoraForCausalLM {
@@ -748,7 +753,20 @@ impl Gemma4LoraForCausalLM {
         Ok(Self {
             model: Gemma4LoraModel::from_model(base.model, &lora_config)?,
             lora_config,
+            checkpoint_config: None,
         })
+    }
+
+    pub fn enable_gradient_checkpointing(&mut self, layers_per_block: usize) {
+        self.checkpoint_config = Some(CheckpointConfig {
+            enabled: true,
+            layers_per_block,
+            eval_at_boundaries: true,
+        });
+    }
+
+    pub fn disable_gradient_checkpointing(&mut self) {
+        self.checkpoint_config = None;
     }
 
     fn logit_softcap(&self, logits: &Array) -> Array {
@@ -1350,6 +1368,14 @@ impl crate::TrainableModel for Gemma4LoraForCausalLM {
 
     fn supports_gradient_checkpointing(&self) -> bool {
         false
+    }
+
+    fn enable_gradient_checkpointing(&mut self, layers_per_block: usize) {
+        Gemma4LoraForCausalLM::enable_gradient_checkpointing(self, layers_per_block)
+    }
+
+    fn disable_gradient_checkpointing(&mut self) {
+        Gemma4LoraForCausalLM::disable_gradient_checkpointing(self)
     }
 
     fn forward_noised(
