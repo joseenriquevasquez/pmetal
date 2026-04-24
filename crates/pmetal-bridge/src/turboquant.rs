@@ -45,6 +45,13 @@ use crate::compat::Dtype;
 const TURBOQUANT_SEED: u64 = 0x5442_5155_414e_544d;
 /// Vectors with L2 norm below this are treated as zero.
 const ZERO_EPSILON: f32 = 1e-12;
+/// Defensive upper bound on encoded residual L2 norms, used to prevent Inf/NaN
+/// from upstream fp16 corruption from reaching the QJL term in the score and
+/// attention kernels. Derived from `||k_rot||=1` + triangle inequality plus a
+/// conservative margin over the Beta-codebook reconstruction norm; realistic
+/// values are below 1.0 for any bit-width b≥2. Any residual norm above this
+/// cap would already violate Theorem 2's distortion bound — clipping is safe.
+const MAX_RESIDUAL_NORM: f32 = 4.0;
 /// Lloyd-Max iteration cap.
 const LLOYD_MAX_ITERS: usize = 64;
 /// Lloyd-Max convergence threshold.
@@ -2911,8 +2918,16 @@ fn gpu_quantize_kv(
 
     // 6. Residual norms: rotation-invariant, so compute directly in rotated space.
     //    residual_rot = k_rot - k_mse_recon_rot  →  norm_l2  [B, H, S, 1]
+    //    Defensive clip to [0, MAX_RESIDUAL_NORM]: IEEE fmax/fmin sanitize NaN
+    //    to 0 (via maximum with 0) and cap Inf to the bound. Real residual
+    //    norms sit well below this range.
     let k_residual_rot = k_rot.subtract(&k_mse_recon_rot);
-    let k_residual_norms = k_residual_rot.norm_l2(-1, true);
+    let k_residual_norms_raw = k_residual_rot.norm_l2(-1, true);
+    let zero_bound = InlineArray::from_f32(0.0f32);
+    let upper_bound = InlineArray::from_f32(MAX_RESIDUAL_NORM);
+    let k_residual_norms = k_residual_norms_raw
+        .maximum(&zero_bound)
+        .minimum(&upper_bound);
 
     // 7. QJL: project the residual in the **unrotated** space.
     //    residual_unrot = k_mse_recon_rot @ rotation_arr  (inverse-rotate the rotated reconstruction)
@@ -3294,15 +3309,21 @@ fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key_bits: u8) 
     let mut norms = vec![0.0f32; num_rows];
     let mut normalized = vec![0.0f32; rows.len()];
 
-    // Step 1: Normalise onto unit sphere.
+    // Step 1: Normalise onto unit sphere. Non-finite inputs (NaN/Inf) or
+    // degenerate zero rows are zeroed out — the MSE quantizer's binary
+    // search does not tolerate NaN.
     for (row_idx, row) in rows.chunks(core.dim).enumerate() {
         let norm = l2_norm(row);
+        if !norm.is_finite() || norm <= ZERO_EPSILON {
+            norms[row_idx] = 0.0;
+            // `normalized` already initialised to zero.
+            continue;
+        }
         norms[row_idx] = norm;
-        if norm > ZERO_EPSILON {
-            let dst = &mut normalized[row_idx * core.dim..(row_idx + 1) * core.dim];
-            for (dst, &src) in dst.iter_mut().zip(row.iter()) {
-                *dst = src / norm;
-            }
+        let dst = &mut normalized[row_idx * core.dim..(row_idx + 1) * core.dim];
+        for (dst, &src) in dst.iter_mut().zip(row.iter()) {
+            let n = src / norm;
+            *dst = if n.is_finite() { n } else { 0.0 };
         }
     }
 
@@ -3335,7 +3356,12 @@ fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key_bits: u8) 
         {
             *dst = lhs - rhs;
         }
-        residual_norms[row_idx] = l2_norm(res_row);
+        let raw_norm = l2_norm(res_row);
+        residual_norms[row_idx] = if raw_norm.is_finite() {
+            raw_norm.clamp(0.0, MAX_RESIDUAL_NORM)
+        } else {
+            0.0
+        };
     }
 
     // Step 5: QJL — project residual and take signs.
@@ -3375,12 +3401,15 @@ fn encode_value_component_rows(
 
     for (row_idx, row) in rows.chunks(core.dim).enumerate() {
         let norm = l2_norm(row);
+        if !norm.is_finite() || norm <= ZERO_EPSILON {
+            norms[row_idx] = 0.0;
+            continue;
+        }
         norms[row_idx] = norm;
-        if norm > ZERO_EPSILON {
-            let dst = &mut normalized[row_idx * core.dim..(row_idx + 1) * core.dim];
-            for (dst, &src) in dst.iter_mut().zip(row.iter()) {
-                *dst = src / norm;
-            }
+        let dst = &mut normalized[row_idx * core.dim..(row_idx + 1) * core.dim];
+        for (dst, &src) in dst.iter_mut().zip(row.iter()) {
+            let n = src / norm;
+            *dst = if n.is_finite() { n } else { 0.0 };
         }
     }
 
@@ -4864,5 +4893,221 @@ mod tests {
         let dk = cache.dequantize_keys().expect("dequantize_keys");
         // Shape should be [B, H, 3, D].
         assert_eq!(dk.shape(), &[b, h, 3, d]);
+    }
+
+    // ─── Defensive residual-norm clamp (A1 from audit) ───────────────────────
+    //
+    // Pathological inputs (NaN / ±Inf from upstream fp16 corruption) must not
+    // propagate into the QJL term. The CPU encode path uses an explicit
+    // `is_finite` + `clamp` guard; the GPU path composes `maximum(0).minimum(MAX)`.
+    //
+    // These tests exercise the CPU path directly since the GPU op graph
+    // requires a live Metal device and is covered by the broader GPU integration
+    // tests above.
+
+    #[test]
+    fn residual_norm_clamp_sanitizes_nan_input() {
+        // One row of NaN should produce finite residual norm (0) — the row is
+        // treated as zero by the upstream `norm <= ZERO_EPSILON` check, but if
+        // it slipped past that the clamp still catches it.
+        let core = TurboQuantCore::new(16, 4);
+        let mut row = vec![0.1f32; 16];
+        row[0] = f32::NAN;
+        let encoded = encode_key_component_rows(&core, &row, 4);
+        assert_eq!(encoded.residual_norms.len(), 1);
+        assert!(
+            encoded.residual_norms[0].is_finite(),
+            "residual_norm must be finite even with NaN input, got {}",
+            encoded.residual_norms[0]
+        );
+        assert!(
+            (0.0..=MAX_RESIDUAL_NORM).contains(&encoded.residual_norms[0]),
+            "residual_norm must be in [0, MAX], got {}",
+            encoded.residual_norms[0]
+        );
+    }
+
+    #[test]
+    fn residual_norm_clamp_caps_inf_input() {
+        let core = TurboQuantCore::new(16, 4);
+        let mut row = vec![1.0f32; 16];
+        row[5] = f32::INFINITY;
+        let encoded = encode_key_component_rows(&core, &row, 4);
+        assert!(
+            encoded.residual_norms[0].is_finite(),
+            "Inf input must not leak into residual_norm"
+        );
+        assert!(encoded.residual_norms[0] <= MAX_RESIDUAL_NORM);
+    }
+
+    // ─── Round-trip correctness (T1 from audit) ──────────────────────────────
+    //
+    // Verify the key invariants from turboquant.pdf Theorem 1 + Theorem 2 on
+    // the deterministic CPU encode/decode path:
+    //
+    //   1. Round-trip reconstruction error has per-row MSE bounded by a
+    //      constant that shrinks with bit-width (distortion bound).
+    //   2. The inner product <q, decode(encode(k))> is approximately unbiased
+    //      for <q, k> averaged across many random q, k pairs.
+
+    fn seeded_gaussian_rows(num_rows: usize, dim: usize, seed: u64) -> Vec<f32> {
+        // Box-Muller over a xorshift stream — deterministic, no external crate.
+        fn xorshift64(state: &mut u64) -> u64 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            x
+        }
+        let mut state = seed.max(1);
+        let mut u = || -> f32 {
+            // Uniform (0, 1).
+            let raw = xorshift64(&mut state);
+            ((raw >> 40) as f32 + 1.0) / ((1u64 << 24) as f32)
+        };
+        let total = num_rows * dim;
+        let mut out = Vec::with_capacity(total);
+        while out.len() < total {
+            let u1 = u();
+            let u2 = u();
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f32::consts::PI * u2;
+            out.push(r * theta.cos());
+            if out.len() < total {
+                out.push(r * theta.sin());
+            }
+        }
+        out.truncate(total);
+        out
+    }
+
+    fn decode_cpu_key(
+        core: &TurboQuantCore,
+        encoded: &EncodedKeyRows,
+        bits: u8,
+        _num_rows: usize,
+    ) -> Vec<f32> {
+        // Delegate to the production CPU decode path so the test exercises the
+        // same arithmetic as live inference.
+        decode_key_component_rows_raw(
+            core,
+            &encoded.mse_indices,
+            &encoded.qjl_signs,
+            &encoded.norms,
+            &encoded.residual_norms,
+            bits,
+        )
+    }
+
+    #[test]
+    fn turboquant_cpu_round_trip_error_bound_shrinks_with_bits() {
+        // Distortion bound from Theorem 1: per-row MSE scales like 1/2^(2*(b-1))
+        // for the MSE stage, with QJL residual correction adding an unbiased
+        // zero-mean term. Across enough random rows, the average squared error
+        // should be strictly smaller at higher bit widths.
+        let dim = 64;
+        let num_rows = 128;
+        let data = seeded_gaussian_rows(num_rows, dim, 0xA1B2_C3D4_E5F6_0789);
+
+        let mut errors = Vec::new();
+        for &bits in &[3u8, 5u8, 7u8] {
+            let core = TurboQuantCore::new(dim, bits);
+            let encoded = encode_key_component_rows(&core, &data, bits);
+            let decoded = decode_cpu_key(&core, &encoded, bits, num_rows);
+            // Per-element MSE, averaged across all rows.
+            let mse: f32 = data
+                .iter()
+                .zip(decoded.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f32>()
+                / (num_rows * dim) as f32;
+            assert!(
+                mse.is_finite(),
+                "MSE must be finite for bits={}, got {}",
+                bits,
+                mse
+            );
+            errors.push((bits, mse));
+        }
+
+        // Monotonicity: more bits ⇒ less error. This is the concrete form of
+        // the distortion bound at the statistical level.
+        for window in errors.windows(2) {
+            let (b_lo, mse_lo) = window[0];
+            let (b_hi, mse_hi) = window[1];
+            assert!(
+                mse_hi < mse_lo,
+                "Error at {} bits ({}) should beat {} bits ({})",
+                b_hi,
+                mse_hi,
+                b_lo,
+                mse_lo
+            );
+        }
+
+        // Sanity floor: highest bit-width should reconstruct to a small
+        // absolute error — Gaussian data normalized to unit sphere with 7-bit
+        // MSE + QJL should land well below 0.5 per-element MSE.
+        let (_, worst_case_at_7_bits) = errors.last().copied().unwrap();
+        assert!(
+            worst_case_at_7_bits < 0.5,
+            "7-bit TurboQuant MSE {} is unexpectedly high",
+            worst_case_at_7_bits
+        );
+    }
+
+    #[test]
+    fn turboquant_cpu_inner_product_is_approximately_unbiased() {
+        // Paper Theorem 2: E[<q, k̂>] = <q, k> for keys encoded via the 2-stage
+        // MSE + QJL path. With enough independent (q, k) pairs, the mean
+        // reconstructed inner product should track the ground-truth mean.
+        let dim = 128;
+        let num_rows = 256;
+        let bits = 5u8;
+        let core = TurboQuantCore::new(dim, bits);
+
+        let keys = seeded_gaussian_rows(num_rows, dim, 0x1111_2222_3333_4444);
+        let queries = seeded_gaussian_rows(num_rows, dim, 0x5555_6666_7777_8888);
+
+        let encoded = encode_key_component_rows(&core, &keys, bits);
+        let decoded = decode_cpu_key(&core, &encoded, bits, num_rows);
+
+        let mut sum_gt = 0.0f64;
+        let mut sum_est = 0.0f64;
+        let mut sum_abs_rel_err = 0.0f64;
+        let mut valid = 0usize;
+        for row_idx in 0..num_rows {
+            let start = row_idx * dim;
+            let k_row = &keys[start..start + dim];
+            let q_row = &queries[start..start + dim];
+            let k_hat = &decoded[start..start + dim];
+            let gt: f32 = q_row.iter().zip(k_row.iter()).map(|(a, b)| a * b).sum();
+            let est: f32 = q_row.iter().zip(k_hat.iter()).map(|(a, b)| a * b).sum();
+            sum_gt += gt as f64;
+            sum_est += est as f64;
+            if gt.abs() > 1e-3 {
+                sum_abs_rel_err += ((est - gt) / gt).abs() as f64;
+                valid += 1;
+            }
+        }
+        let mean_gt = sum_gt / num_rows as f64;
+        let mean_est = sum_est / num_rows as f64;
+        let _ = (sum_abs_rel_err, valid); // per-row rel err is high-variance at low bits
+
+        // Unbiasedness: the sample mean of the reconstructed inner product
+        // should match the ground-truth mean to within the CLT-expected
+        // standard error. For 256 rows of 128-dim Gaussian vectors the
+        // per-row variance is O(1), so the standard error of the mean is
+        // O(1/sqrt(256)) = 0.0625. We allow 4x headroom to keep the test
+        // stable across platforms.
+        let diff = (mean_est - mean_gt).abs();
+        assert!(
+            diff < 0.25,
+            "Mean reconstructed inner product {} diverges from ground truth {} (diff {})",
+            mean_est,
+            mean_gt,
+            diff
+        );
     }
 }
