@@ -773,7 +773,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3(_) => true,
             Self::Gemma(_) => true,
             Self::Phi(_) => true,
-            Self::Qwen3Next(_) => true,
+            Self::Qwen3Next(_) => false,
             Self::Qwen3MoE(_) => true,
             Self::Gemma4(_) => true,
             Self::GptOss(_) => true,

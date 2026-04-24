@@ -131,9 +131,8 @@ impl DistillationTrainer {
             })?;
 
             let copy_seq_len = seq_len.min(batch.seq_len);
-            let base_src = if shape.len() == 3 { 0 } else { 0 };
             for token_idx in 0..copy_seq_len {
-                let src_offset = base_src + token_idx * vocab_size;
+                let src_offset = token_idx * vocab_size;
                 let dst_offset = (batch_row * batch.seq_len + token_idx) * vocab_size;
                 batch_logits[dst_offset..dst_offset + vocab_size]
                     .copy_from_slice(&flat[src_offset..src_offset + vocab_size]);
