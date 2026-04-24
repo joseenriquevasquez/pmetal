@@ -32,13 +32,14 @@ use pmetal_models::{
 };
 
 use crate::{
-    LoraError, TrainableModel, deepseek_lora::DeepSeekLoraForCausalLM,
-    gemma_lora::GemmaLoraForCausalLM, gemma4_lora::Gemma4LoraForCausalLM,
-    gpt_oss_lora::GptOssLoraForCausalLM, granite_lora::GraniteLoraForCausalLM,
-    llama_lora::LlamaLoraForCausalLM, llama4_lora::Llama4LoraForCausalLM,
-    mistral_lora::MistralLoraForCausalLM, nemotron_h_lora::NemotronHLoraForCausalLM,
-    phi_lora::PhiLoraForCausalLM, qwen3_lora::Qwen3LoraForCausalLM,
-    qwen3_moe_lora::Qwen3MoELoraForCausalLM, qwen3_next_lora::Qwen3NextLoraForCausalLM,
+    LoraError, TrainableModel, cohere_lora::CohereLoraForCausalLM,
+    deepseek_lora::DeepSeekLoraForCausalLM, gemma_lora::GemmaLoraForCausalLM,
+    gemma4_lora::Gemma4LoraForCausalLM, gpt_oss_lora::GptOssLoraForCausalLM,
+    granite_lora::GraniteLoraForCausalLM, llama_lora::LlamaLoraForCausalLM,
+    llama4_lora::Llama4LoraForCausalLM, mistral_lora::MistralLoraForCausalLM,
+    nemotron_h_lora::NemotronHLoraForCausalLM, phi_lora::PhiLoraForCausalLM,
+    qwen3_lora::Qwen3LoraForCausalLM, qwen3_moe_lora::Qwen3MoELoraForCausalLM,
+    qwen3_next_lora::Qwen3NextLoraForCausalLM,
 };
 
 /// Dispatch a method call uniformly across all `DynamicLoraModel` variants.
@@ -61,6 +62,7 @@ macro_rules! dispatch_lora_uniform {
             Self::Llama4(m) => m.$method($($arg),*),
             Self::DeepSeek(m) => m.$method($($arg),*),
             Self::NemotronH(m) => m.$method($($arg),*),
+            Self::Cohere(m) => m.$method($($arg),*),
         }
     };
 }
@@ -82,6 +84,7 @@ macro_rules! dispatch_lora_architecture {
             Self::Llama4(_) => ModelArchitecture::Llama4,
             Self::DeepSeek(_) => ModelArchitecture::DeepSeek,
             Self::NemotronH(_) => ModelArchitecture::NemotronH,
+            Self::Cohere(_) => ModelArchitecture::Cohere,
         }
     };
 }
@@ -146,6 +149,8 @@ pub enum DynamicLoraModel {
     DeepSeek(DeepSeekLoraForCausalLM),
     /// NemotronH hybrid family (Mamba + attention) with attention adapters.
     NemotronH(NemotronHLoraForCausalLM),
+    /// Cohere / Cohere2 / Command-R family with attention adapters.
+    Cohere(CohereLoraForCausalLM),
 }
 
 impl std::fmt::Debug for DynamicLoraModel {
@@ -164,6 +169,7 @@ impl std::fmt::Debug for DynamicLoraModel {
             Self::Llama4(_) => write!(f, "DynamicLoraModel::Llama4"),
             Self::DeepSeek(_) => write!(f, "DynamicLoraModel::DeepSeek"),
             Self::NemotronH(_) => write!(f, "DynamicLoraModel::NemotronH"),
+            Self::Cohere(_) => write!(f, "DynamicLoraModel::Cohere"),
         }
     }
 }
@@ -389,6 +395,17 @@ impl DynamicLoraModel {
                 tracing::info!("Loaded NemotronH LoRA model");
                 Ok(DynamicLoraModel::NemotronH(model))
             }
+            ModelArchitecture::Cohere => {
+                let cohere_config: pmetal_models::architectures::cohere::CohereConfig =
+                    serde_json::from_str(&config_content)?;
+
+                let mut model = CohereLoraForCausalLM::new(cohere_config, lora_config)?;
+                model.load_base_weights_from_dir(model_dir)?;
+                model.eval_all()?;
+
+                tracing::info!("Loaded Cohere LoRA model");
+                Ok(DynamicLoraModel::Cohere(model))
+            }
             // Other architectures not yet supported for LoRA training
             arch => Err(DynamicLoraError::NotImplemented(arch)),
         }
@@ -550,6 +567,7 @@ impl DynamicLoraModel {
             Self::Llama4(_) => "Llama4",
             Self::DeepSeek(_) => "DeepSeek",
             Self::NemotronH(_) => "NemotronH",
+            Self::Cohere(_) => "Cohere",
         }
     }
 
@@ -569,6 +587,7 @@ impl DynamicLoraModel {
             Self::Llama4(m) => m.merge_lora(),
             Self::NemotronH(m) => m.merge_lora(),
             Self::DeepSeek(m) => m.merge_lora(),
+            Self::Cohere(m) => m.merge_lora(),
         }
     }
 
@@ -588,6 +607,7 @@ impl DynamicLoraModel {
             Self::Llama4(m) => m.unmerge_lora(),
             Self::NemotronH(m) => m.unmerge_lora(),
             Self::DeepSeek(m) => m.unmerge_lora(),
+            Self::Cohere(m) => m.unmerge_lora(),
         }
     }
 }
@@ -643,6 +663,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Llama4(m) => TrainableModel::forward(m, input_ids, mask),
             Self::DeepSeek(m) => TrainableModel::forward(m, input_ids, mask),
             Self::NemotronH(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::Cohere(m) => TrainableModel::forward(m, input_ids, mask),
         }
     }
 
@@ -666,6 +687,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Llama4(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
             Self::DeepSeek(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
             Self::NemotronH(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
+            Self::Cohere(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
         }
     }
 
@@ -690,6 +712,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Llama4(m) => TrainableModel::forward(m, input_ids, mask),
             Self::DeepSeek(m) => TrainableModel::forward(m, input_ids, mask),
             Self::NemotronH(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::Cohere(m) => TrainableModel::forward(m, input_ids, mask),
         }
     }
 
@@ -745,6 +768,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Llama4(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
             Self::DeepSeek(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
             Self::NemotronH(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::Cohere(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
         }
     }
 
@@ -763,6 +787,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Llama4(m) => TrainableModel::create_cache(m, max_seq_len),
             Self::DeepSeek(m) => TrainableModel::create_cache(m, max_seq_len),
             Self::NemotronH(_) => None,
+            Self::Cohere(m) => TrainableModel::create_cache(m, max_seq_len),
         }
     }
 
@@ -781,6 +806,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Llama4(_) => true,
             Self::DeepSeek(_) => true,
             Self::NemotronH(_) => false,
+            Self::Cohere(_) => true,
         }
     }
 
@@ -841,6 +867,7 @@ impl DynamicLoraModel {
             Self::Llama4(m) => m.eval_all(),
             Self::NemotronH(m) => m.eval_all(),
             Self::DeepSeek(m) => m.eval_all(),
+            Self::Cohere(m) => m.eval_all(),
         }
     }
 

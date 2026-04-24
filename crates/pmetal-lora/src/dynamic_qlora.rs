@@ -26,11 +26,12 @@ use pmetal_models::architectures::{
 };
 
 use crate::{
-    LoraError, QLoraConfig, TrainableModel, deepseek_qlora::DeepSeekQloraForCausalLM,
-    gemma_qlora::GemmaQloraForCausalLM, gemma4_qlora::Gemma4QloraForCausalLM,
-    gpt_oss_qlora::GptOssQloraForCausalLM, granite_qlora::GraniteQloraForCausalLM,
-    llama_qlora::LlamaQloraForCausalLM, llama4_qlora::Llama4QloraForCausalLM,
-    mistral_qlora::MistralQloraForCausalLM, nemotron_h_qlora::NemotronHQloraForCausalLM,
+    LoraError, QLoraConfig, TrainableModel, cohere_qlora::CohereQloraForCausalLM,
+    deepseek_qlora::DeepSeekQloraForCausalLM, gemma_qlora::GemmaQloraForCausalLM,
+    gemma4_qlora::Gemma4QloraForCausalLM, gpt_oss_qlora::GptOssQloraForCausalLM,
+    granite_qlora::GraniteQloraForCausalLM, llama_qlora::LlamaQloraForCausalLM,
+    llama4_qlora::Llama4QloraForCausalLM, mistral_qlora::MistralQloraForCausalLM,
+    nemotron_h_qlora::NemotronHQloraForCausalLM, phi_qlora::PhiQloraForCausalLM,
     qwen3_moe_qlora::Qwen3MoEQLoraForCausalLM, qwen3_next_qlora::Qwen3NextQloraForCausalLM,
     qwen3_qlora::Qwen3QloraForCausalLM,
 };
@@ -51,6 +52,8 @@ macro_rules! dispatch_qlora {
             Self::Llama4(m) => m.$method($($arg),*),
             Self::DeepSeek(m) => m.$method($($arg),*),
             Self::NemotronH(m) => m.$method($($arg),*),
+            Self::Phi(m) => m.$method($($arg),*),
+            Self::Cohere(m) => m.$method($($arg),*),
         }
     };
 }
@@ -76,6 +79,8 @@ pub enum DynamicQloraModel {
     Llama4(Llama4QloraForCausalLM),
     DeepSeek(DeepSeekQloraForCausalLM),
     NemotronH(NemotronHQloraForCausalLM),
+    Phi(PhiQloraForCausalLM),
+    Cohere(CohereQloraForCausalLM),
 }
 
 impl DynamicQloraModel {
@@ -240,11 +245,27 @@ impl DynamicQloraModel {
                 let model = NemotronHQloraForCausalLM::with_qlora_config(cfg, qlora_config)?;
                 Ok(Self::NemotronH(model))
             }
+            ModelArchitecture::Phi | ModelArchitecture::Phi4 => {
+                let cfg: pmetal_models::architectures::phi::PhiConfig =
+                    serde_json::from_str(&config_content).map_err(|e| {
+                        LoraError::InvalidState(format!("Failed to parse Phi config: {}", e))
+                    })?;
+                let model = PhiQloraForCausalLM::with_qlora_config(cfg, qlora_config)?;
+                Ok(Self::Phi(model))
+            }
+            ModelArchitecture::Cohere => {
+                let cfg: pmetal_models::architectures::cohere::CohereConfig =
+                    serde_json::from_str(&config_content).map_err(|e| {
+                        LoraError::InvalidState(format!("Failed to parse Cohere config: {}", e))
+                    })?;
+                let model = CohereQloraForCausalLM::with_qlora_config(cfg, qlora_config)?;
+                Ok(Self::Cohere(model))
+            }
             unsupported => Err(LoraError::InvalidState(format!(
                 "QLoRA is not supported for {} models. \
-                 QLoRA is available for: Llama, Mistral, Qwen3, Gemma, Qwen3Next, Qwen3MoE, \
-                 Gemma4, GptOss, Granite, Llama4, DeepSeek, NemotronH. \
-                 For other architectures use standard LoRA (`--lora`) instead.",
+                 QLoRA is available for: Llama, Mistral, Qwen3, Qwen2, Gemma, Qwen3Next, \
+                 Qwen3MoE, Gemma4, GptOss, Granite, Llama4, DeepSeek, NemotronH, Phi, Phi4, Cohere. \
+                 For unsupported architectures use standard LoRA (`--lora`) instead.",
                 unsupported
             ))),
         }
@@ -270,6 +291,8 @@ impl DynamicQloraModel {
             Self::Llama4(m) => m.load_base_weights_from_dir(path),
             Self::DeepSeek(m) => m.load_base_weights_from_dir(path),
             Self::NemotronH(m) => m.load_base_weights_from_dir(path),
+            Self::Phi(m) => m.load_and_quantize_from_dir(path),
+            Self::Cohere(m) => m.load_and_quantize_from_dir(path),
         }
     }
 
@@ -293,6 +316,8 @@ impl DynamicQloraModel {
                 let total = quantized + lora;
                 if total == 0 { 1.0 } else { (quantized + lora) as f32 / (total * 2) as f32 }
             }
+            Self::Phi(m) => m.memory_savings(),
+            Self::Cohere(m) => m.memory_savings(),
         }
     }
 
@@ -316,6 +341,8 @@ impl DynamicQloraModel {
             Self::Llama4(_) => "Llama4",
             Self::DeepSeek(_) => "DeepSeek",
             Self::NemotronH(_) => "NemotronH",
+            Self::Phi(_) => "Phi",
+            Self::Cohere(_) => "Cohere",
         }
     }
 }
@@ -341,6 +368,8 @@ impl TrainableModel for DynamicQloraModel {
             Self::Llama4(m) => TrainableModel::forward(m, input_ids, mask),
             Self::DeepSeek(m) => TrainableModel::forward(m, input_ids, mask),
             Self::NemotronH(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::Phi(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::Cohere(m) => TrainableModel::forward(m, input_ids, mask),
         }
     }
 
@@ -387,6 +416,12 @@ impl TrainableModel for DynamicQloraModel {
             Self::NemotronH(m) => {
                 TrainableModel::forward_with_positions(m, input_ids, mask, position_ids)
             }
+            Self::Phi(m) => {
+                TrainableModel::forward_with_positions(m, input_ids, mask, position_ids)
+            }
+            Self::Cohere(m) => {
+                TrainableModel::forward_with_positions(m, input_ids, mask, position_ids)
+            }
         }
     }
 
@@ -409,6 +444,8 @@ impl TrainableModel for DynamicQloraModel {
             Self::Llama4(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
             Self::DeepSeek(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
             Self::NemotronH(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::Phi(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::Cohere(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
         }
     }
 
@@ -426,6 +463,8 @@ impl TrainableModel for DynamicQloraModel {
             Self::Llama4(m) => TrainableModel::create_cache(m, max_seq_len),
             Self::DeepSeek(m) => TrainableModel::create_cache(m, max_seq_len),
             Self::NemotronH(_) => None,
+            Self::Phi(m) => TrainableModel::create_cache(m, max_seq_len),
+            Self::Cohere(m) => TrainableModel::create_cache(m, max_seq_len),
         }
     }
 
@@ -443,6 +482,8 @@ impl TrainableModel for DynamicQloraModel {
             Self::Llama4(_) => true,
             Self::DeepSeek(_) => true,
             Self::NemotronH(_) => false,
+            Self::Phi(m) => TrainableModel::supports_kv_cache(m),
+            Self::Cohere(m) => TrainableModel::supports_kv_cache(m),
         }
     }
 
@@ -464,6 +505,8 @@ impl TrainableModel for DynamicQloraModel {
             Self::Llama4(m) => TrainableModel::forward_hidden(m, input_ids, mask),
             Self::DeepSeek(m) => TrainableModel::forward_hidden(m, input_ids, mask),
             Self::NemotronH(m) => TrainableModel::forward_hidden(m, input_ids, mask),
+            Self::Phi(m) => TrainableModel::forward_hidden(m, input_ids, mask),
+            Self::Cohere(m) => TrainableModel::forward_hidden(m, input_ids, mask),
         }
     }
 
@@ -510,6 +553,12 @@ impl TrainableModel for DynamicQloraModel {
             Self::NemotronH(m) => {
                 TrainableModel::forward_hidden_with_positions(m, input_ids, mask, position_ids)
             }
+            Self::Phi(m) => {
+                TrainableModel::forward_hidden_with_positions(m, input_ids, mask, position_ids)
+            }
+            Self::Cohere(m) => {
+                TrainableModel::forward_hidden_with_positions(m, input_ids, mask, position_ids)
+            }
         }
     }
 
@@ -527,6 +576,8 @@ impl TrainableModel for DynamicQloraModel {
             Self::Llama4(m) => TrainableModel::lm_head_weight(m),
             Self::DeepSeek(m) => TrainableModel::lm_head_weight(m),
             Self::NemotronH(m) => TrainableModel::lm_head_weight(m),
+            Self::Phi(m) => TrainableModel::lm_head_weight(m),
+            Self::Cohere(m) => TrainableModel::lm_head_weight(m),
         }
     }
 
