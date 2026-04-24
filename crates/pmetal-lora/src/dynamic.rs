@@ -32,9 +32,11 @@ use pmetal_models::{
 };
 
 use crate::{
-    LoraError, TrainableModel, gemma_lora::GemmaLoraForCausalLM,
-    gemma4_lora::Gemma4LoraForCausalLM, gpt_oss_lora::GptOssLoraForCausalLM,
-    llama_lora::LlamaLoraForCausalLM, mistral_lora::MistralLoraForCausalLM,
+    LoraError, TrainableModel, deepseek_lora::DeepSeekLoraForCausalLM,
+    gemma_lora::GemmaLoraForCausalLM, gemma4_lora::Gemma4LoraForCausalLM,
+    gpt_oss_lora::GptOssLoraForCausalLM, granite_lora::GraniteLoraForCausalLM,
+    llama_lora::LlamaLoraForCausalLM, llama4_lora::Llama4LoraForCausalLM,
+    mistral_lora::MistralLoraForCausalLM, nemotron_h_lora::NemotronHLoraForCausalLM,
     phi_lora::PhiLoraForCausalLM, qwen3_lora::Qwen3LoraForCausalLM,
     qwen3_moe_lora::Qwen3MoELoraForCausalLM, qwen3_next_lora::Qwen3NextLoraForCausalLM,
 };
@@ -55,6 +57,10 @@ macro_rules! dispatch_lora_uniform {
             Self::Qwen3MoE(m) => m.$method($($arg),*),
             Self::Gemma4(m) => m.$method($($arg),*),
             Self::GptOss(m) => m.$method($($arg),*),
+            Self::Granite(m) => m.$method($($arg),*),
+            Self::Llama4(m) => m.$method($($arg),*),
+            Self::DeepSeek(m) => m.$method($($arg),*),
+            Self::NemotronH(m) => m.$method($($arg),*),
         }
     };
 }
@@ -72,6 +78,10 @@ macro_rules! dispatch_lora_architecture {
             Self::Qwen3MoE(_) => ModelArchitecture::Qwen3MoE,
             Self::Gemma4(_) => ModelArchitecture::Gemma4,
             Self::GptOss(_) => ModelArchitecture::GptOss,
+            Self::Granite(_) => ModelArchitecture::Granite,
+            Self::Llama4(_) => ModelArchitecture::Llama4,
+            Self::DeepSeek(_) => ModelArchitecture::DeepSeek,
+            Self::NemotronH(_) => ModelArchitecture::NemotronH,
         }
     };
 }
@@ -128,6 +138,14 @@ pub enum DynamicLoraModel {
     Gemma4(Gemma4LoraForCausalLM),
     /// GPT-OSS family with attention adapters.
     GptOss(GptOssLoraForCausalLM),
+    /// Granite family with attention adapters.
+    Granite(GraniteLoraForCausalLM),
+    /// Llama 4 family (dense + MoE) with attention adapters.
+    Llama4(Llama4LoraForCausalLM),
+    /// DeepSeek family (MLA + MoE) with attention adapters.
+    DeepSeek(DeepSeekLoraForCausalLM),
+    /// NemotronH hybrid family (Mamba + attention) with attention adapters.
+    NemotronH(NemotronHLoraForCausalLM),
 }
 
 impl std::fmt::Debug for DynamicLoraModel {
@@ -142,6 +160,10 @@ impl std::fmt::Debug for DynamicLoraModel {
             Self::Qwen3MoE(_) => write!(f, "DynamicLoraModel::Qwen3MoE"),
             Self::Gemma4(_) => write!(f, "DynamicLoraModel::Gemma4"),
             Self::GptOss(_) => write!(f, "DynamicLoraModel::GptOss"),
+            Self::Granite(_) => write!(f, "DynamicLoraModel::Granite"),
+            Self::Llama4(_) => write!(f, "DynamicLoraModel::Llama4"),
+            Self::DeepSeek(_) => write!(f, "DynamicLoraModel::DeepSeek"),
+            Self::NemotronH(_) => write!(f, "DynamicLoraModel::NemotronH"),
         }
     }
 }
@@ -315,6 +337,58 @@ impl DynamicLoraModel {
                 tracing::info!("Loaded GPT-OSS LoRA model");
                 Ok(DynamicLoraModel::GptOss(model))
             }
+            ModelArchitecture::Granite => {
+                let granite_config: pmetal_models::architectures::granite::GraniteConfig =
+                    serde_json::from_str(&config_content)?;
+
+                let mut model = GraniteLoraForCausalLM::new(granite_config, lora_config)?;
+                model.load_base_weights_from_dir(model_dir)?;
+                model.eval_all()?;
+
+                tracing::info!("Loaded Granite LoRA model");
+                Ok(DynamicLoraModel::Granite(model))
+            }
+            ModelArchitecture::Llama4 => {
+                let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
+                let effective = if config_json.get("text_config").is_some()
+                    && config_json.get("hidden_size").is_none()
+                {
+                    serde_json::to_string(&config_json["text_config"])?
+                } else {
+                    config_content.clone()
+                };
+                let llama4_config: pmetal_models::architectures::llama4::Llama4TextConfig =
+                    serde_json::from_str(&effective)?;
+
+                let mut model = Llama4LoraForCausalLM::new(llama4_config, lora_config)?;
+                model.load_base_weights_from_dir(model_dir)?;
+                model.eval_lora_params()?;
+
+                tracing::info!("Loaded Llama 4 LoRA model");
+                Ok(DynamicLoraModel::Llama4(model))
+            }
+            ModelArchitecture::DeepSeek => {
+                let deepseek_config: pmetal_models::architectures::deepseek::DeepSeekConfig =
+                    serde_json::from_str(&config_content)?;
+
+                let mut model = DeepSeekLoraForCausalLM::new(deepseek_config, lora_config)?;
+                model.load_base_weights_from_dir(model_dir)?;
+                model.eval_all()?;
+
+                tracing::info!("Loaded DeepSeek LoRA model");
+                Ok(DynamicLoraModel::DeepSeek(model))
+            }
+            ModelArchitecture::NemotronH => {
+                let nemotron_config: pmetal_models::architectures::nemotron_h::NemotronHConfig =
+                    serde_json::from_str(&config_content)?;
+
+                let mut model = NemotronHLoraForCausalLM::new(nemotron_config, lora_config)?;
+                model.load_base_weights_from_dir(model_dir)?;
+                model.eval_all()?;
+
+                tracing::info!("Loaded NemotronH LoRA model");
+                Ok(DynamicLoraModel::NemotronH(model))
+            }
             // Other architectures not yet supported for LoRA training
             arch => Err(DynamicLoraError::NotImplemented(arch)),
         }
@@ -472,17 +546,49 @@ impl DynamicLoraModel {
             Self::Qwen3MoE(_) => "Qwen3MoE",
             Self::Gemma4(_) => "Gemma4",
             Self::GptOss(_) => "GptOss",
+            Self::Granite(_) => "Granite",
+            Self::Llama4(_) => "Llama4",
+            Self::DeepSeek(_) => "DeepSeek",
+            Self::NemotronH(_) => "NemotronH",
         }
     }
 
     /// Merge LoRA weights into base weights.
     pub fn merge_lora(&mut self) -> Result<(), LoraError> {
-        dispatch_lora_uniform!(self, merge_lora)
+        match self {
+            Self::Llama(m) => m.merge_lora(),
+            Self::Mistral(m) => m.merge_lora(),
+            Self::Qwen3(m) => m.merge_lora(),
+            Self::Gemma(m) => m.merge_lora(),
+            Self::Phi(m) => m.merge_lora(),
+            Self::Qwen3Next(m) => m.merge_lora(),
+            Self::Qwen3MoE(m) => m.merge_lora(),
+            Self::Gemma4(m) => m.merge_lora(),
+            Self::GptOss(m) => m.merge_lora(),
+            Self::Granite(m) => m.merge_lora(),
+            Self::Llama4(m) => m.merge_lora(),
+            Self::NemotronH(m) => m.merge_lora(),
+            Self::DeepSeek(m) => m.merge_lora(),
+        }
     }
 
     /// Unmerge is not supported.
     pub fn unmerge_lora(&mut self) -> Result<(), LoraError> {
-        dispatch_lora_uniform!(self, unmerge_lora)
+        match self {
+            Self::Llama(m) => m.unmerge_lora(),
+            Self::Mistral(m) => m.unmerge_lora(),
+            Self::Qwen3(m) => m.unmerge_lora(),
+            Self::Gemma(m) => m.unmerge_lora(),
+            Self::Phi(m) => m.unmerge_lora(),
+            Self::Qwen3Next(m) => m.unmerge_lora(),
+            Self::Qwen3MoE(m) => m.unmerge_lora(),
+            Self::Gemma4(m) => m.unmerge_lora(),
+            Self::GptOss(m) => m.unmerge_lora(),
+            Self::Granite(m) => m.unmerge_lora(),
+            Self::Llama4(m) => m.unmerge_lora(),
+            Self::NemotronH(m) => m.unmerge_lora(),
+            Self::DeepSeek(m) => m.unmerge_lora(),
+        }
     }
 }
 
@@ -533,6 +639,10 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3MoE(m) => TrainableModel::forward(m, input_ids, mask),
             Self::Gemma4(m) => TrainableModel::forward(m, input_ids, mask),
             Self::GptOss(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::Granite(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::Llama4(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::DeepSeek(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::NemotronH(m) => TrainableModel::forward(m, input_ids, mask),
         }
     }
 
@@ -552,6 +662,10 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3MoE(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
             Self::Gemma4(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
             Self::GptOss(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
+            Self::Granite(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
+            Self::Llama4(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
+            Self::DeepSeek(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
+            Self::NemotronH(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
         }
     }
 
@@ -572,6 +686,10 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3MoE(m) => TrainableModel::forward(m, input_ids, mask),
             Self::Gemma4(m) => TrainableModel::forward(m, input_ids, mask),
             Self::GptOss(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::Granite(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::Llama4(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::DeepSeek(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::NemotronH(m) => TrainableModel::forward(m, input_ids, mask),
         }
     }
 
@@ -623,6 +741,10 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3MoE(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
             Self::Gemma4(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
             Self::GptOss(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::Granite(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::Llama4(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::DeepSeek(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::NemotronH(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
         }
     }
 
@@ -637,6 +759,10 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3MoE(m) => TrainableModel::create_cache(m, max_seq_len),
             Self::Gemma4(m) => TrainableModel::create_cache(m, max_seq_len),
             Self::GptOss(m) => TrainableModel::create_cache(m, max_seq_len),
+            Self::Granite(m) => TrainableModel::create_cache(m, max_seq_len),
+            Self::Llama4(m) => TrainableModel::create_cache(m, max_seq_len),
+            Self::DeepSeek(m) => TrainableModel::create_cache(m, max_seq_len),
+            Self::NemotronH(_) => None,
         }
     }
 
@@ -651,6 +777,10 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3MoE(_) => true,
             Self::Gemma4(_) => true,
             Self::GptOss(_) => true,
+            Self::Granite(_) => true,
+            Self::Llama4(_) => true,
+            Self::DeepSeek(_) => true,
+            Self::NemotronH(_) => false,
         }
     }
 
@@ -696,7 +826,22 @@ impl DynamicLoraModel {
     /// Call this after loading LoRA weights to ensure the adapter parameters
     /// are materialized on the device before running inference.
     pub fn eval_all(&mut self) -> Result<(), LoraError> {
-        dispatch_lora_uniform!(self, eval_all)
+        match self {
+            Self::Llama(m) => m.eval_all(),
+            Self::Mistral(m) => m.eval_all(),
+            Self::Qwen3(m) => m.eval_all(),
+            Self::Gemma(m) => m.eval_all(),
+            Self::Phi(m) => m.eval_all(),
+            Self::Qwen3Next(m) => m.eval_all(),
+            Self::Qwen3MoE(m) => m.eval_all(),
+            Self::Gemma4(m) => m.eval_all(),
+            Self::GptOss(m) => m.eval_all(),
+            Self::Granite(m) => m.eval_all(),
+            // Llama4 calls eval_lora_params rather than eval_all
+            Self::Llama4(m) => m.eval_all(),
+            Self::NemotronH(m) => m.eval_all(),
+            Self::DeepSeek(m) => m.eval_all(),
+        }
     }
 
     /// Forward with hybrid cache support (KV cache + Mamba cache).
