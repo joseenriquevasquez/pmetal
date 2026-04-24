@@ -1570,20 +1570,47 @@ impl DeepSeekLoraForCausalLM {
         Ok(())
     }
 
-    /// Stub: merge is a per-adapter operation; returns `Ok(())` without modification.
-    ///
-    /// Real weight merging (W_base += scale * B @ A) must be performed by the
-    /// calling code once the LoRA adapter is finalised.
+    /// Merge LoRA weights into base weights across all adapted projections
+    /// (MLA q-path, kv_a/kv_b, o_proj, and shared-expert MLP when present).
     pub fn merge_lora(&mut self) -> Result<(), LoraError> {
+        for layer in &mut self.model.layers {
+            match &mut layer.self_attn.q {
+                DeepSeekLoraQProj::LoRa {
+                    q_a_proj, q_b_proj, ..
+                } => {
+                    q_a_proj.merge()?;
+                    q_b_proj.merge()?;
+                }
+                DeepSeekLoraQProj::Direct { .. } => {}
+            }
+            layer.self_attn.kv_a_proj_with_mqa.merge()?;
+            layer.self_attn.kv_b_proj.merge()?;
+            layer.self_attn.o_proj.merge()?;
+
+            match &mut layer.mlp {
+                DeepSeekLoraMlpType::Dense(mlp) => {
+                    mlp.gate_proj.merge()?;
+                    mlp.up_proj.merge()?;
+                    mlp.down_proj.merge()?;
+                }
+                DeepSeekLoraMlpType::MoE(moe) => {
+                    if let Some(shared) = moe.shared_experts.as_mut() {
+                        shared.gate_proj.merge()?;
+                        shared.up_proj.merge()?;
+                        shared.down_proj.merge()?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
-    /// Stub: unmerge is not supported on this model.
-    ///
-    /// Returns `Ok(())` for interface compatibility. To restore unmerged base weights,
-    /// reload them from disk via [`load_base_weights_from_dir`][Self::load_base_weights_from_dir].
+    /// Unmerge is not supported. Reload base weights via
+    /// [`load_base_weights_from_dir`][Self::load_base_weights_from_dir] to undo a merge.
     pub fn unmerge_lora(&mut self) -> Result<(), LoraError> {
-        Ok(())
+        Err(LoraError::InvalidState(
+            "unmerge_lora is not supported: reload base model weights to undo a merge".to_string(),
+        ))
     }
 }
 
