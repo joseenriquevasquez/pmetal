@@ -65,14 +65,16 @@ pub mod reasoning;
 pub mod taid;
 
 pub use config::{
-    AttentionConfig, CompressionMethod, DistillConfig, DistillMethod, HiddenStateConfig,
-    HiddenStateLossType, LossConfig, LossType, OfflineConfig, TrainingConfig,
+    AttentionConfig, AttentionHeadReduction, AttentionLossType, CompressionMethod, DistillConfig,
+    DistillMethod, HiddenStateConfig, HiddenStateLossType, LossConfig, LossType, OfflineConfig,
+    TrainingConfig,
 };
 pub use distill::{DistillLossOutput, Distiller, DistillerBuilder, run_distillation};
 pub use error::{DistillError, Result};
 pub use losses::{
-    DistillLoss, HiddenStateLoss, HingeRankingLoss, JensenShannonLoss, KlDivergenceLoss,
-    LogisticRankingLoss, MseLoss, SoftCrossEntropyLoss, TvdLoss, is_gpu_available,
+    AttentionTransferLoss, DistillLoss, HiddenStateLoss, HingeRankingLoss, JensenShannonLoss,
+    KlDivergenceLoss, LogisticRankingLoss, MseLoss, SoftCrossEntropyLoss, TvdLoss,
+    is_gpu_available,
 };
 pub use offline::{LogitCache, LogitCompressor};
 pub use reasoning::RationaleLoss;

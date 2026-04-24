@@ -118,12 +118,18 @@ impl KlDivergenceLoss {
     /// Uses zero-copy bridging to pass MLX array data directly to Metal kernels
     /// without copying. This is possible because MLX and Metal share unified
     /// memory on Apple Silicon.
+    ///
+    /// When `weights` is `Some`, the per-token losses produced by the fused
+    /// kernel are combined on the CPU as `sum(loss * w) / max(sum(w), eps)`.
+    /// Weights are expected to have a total element count equal to the number
+    /// of tokens (typically shape `[batch, seq]`).
     #[cfg(feature = "metal")]
     fn compute_gpu(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
         temperature: f32,
+        weights: Option<&Array>,
     ) -> Result<Array> {
         let ctx = self
             .ctx
@@ -198,10 +204,7 @@ impl KlDivergenceLoss {
             .forward(&teacher_view, &student_view, loss_type)
             .map_err(|e| crate::DistillError::Metal(format!("Execution error: {}", e)))?;
 
-        // Return mean loss
-        let mean_loss = output.mean_loss();
-
-        Ok(Array::from_f32(mean_loss))
+        super::reduce_per_token_with_weights(&output.losses, weights, num_tokens)
     }
 }
 
@@ -226,13 +229,14 @@ impl DistillLoss for KlDivergenceLoss {
         let teacher_logits = &teacher_logits;
         let student_logits = &student_logits;
 
-        // GPU-first: try Metal if no weights and no vocab mismatch.
-        // (Metal kernels for weighted distillation are planned for Q2 2026)
-        if weights.is_none() && !vocab_mismatched {
+        // GPU-first: fused Metal kernel supports both unweighted and per-token
+        // weighted reductions. Cross-vocab sparse-top-k alignment is the only
+        // case that requires the MLX path (the kernel assumes equal vocab).
+        if !vocab_mismatched {
             #[cfg(feature = "metal")]
             {
                 if self.ctx.is_some() {
-                    return self.compute_gpu(teacher_logits, student_logits, temperature);
+                    return self.compute_gpu(teacher_logits, student_logits, temperature, weights);
                 }
             }
         }
@@ -598,5 +602,109 @@ mod tests {
         let result = loss.compute(&teacher, &student, 2.0).unwrap();
         let value: f32 = result.item();
         assert!(value.is_finite(), "reverse KL cross-vocab must be finite");
+    }
+
+    // -----------------------------------------------------------------
+    // Weighted Metal-path tests
+    // -----------------------------------------------------------------
+
+    /// Weighted reduction with uniform weights must match the unweighted mean
+    /// within floating-point tolerance. Exercises the fused Metal path end to
+    /// end (compute_weighted → compute_gpu → reduce_per_token_with_weights).
+    #[test]
+    #[serial]
+    fn weighted_uniform_matches_unweighted_mean() {
+        let batch = 2_i32;
+        let seq = 4_i32;
+        let vocab = 64_i32;
+
+        let teacher_data: Vec<f32> = (0..(batch * seq * vocab))
+            .map(|i| ((i % 50) as f32 - 25.0) / 5.0)
+            .collect();
+        let student_data: Vec<f32> = (0..(batch * seq * vocab))
+            .map(|i| ((i * 7 % 50) as f32 - 25.0) / 5.0)
+            .collect();
+        let teacher = Array::from_f32_slice(&teacher_data, &[batch, seq, vocab]);
+        let student = Array::from_f32_slice(&student_data, &[batch, seq, vocab]);
+
+        let loss = KlDivergenceLoss::new();
+        let unweighted: f32 = loss.compute(&teacher, &student, 2.0).unwrap().item();
+
+        let num_tokens = (batch * seq) as usize;
+        let ones = Array::from_f32_slice(&vec![1.0_f32; num_tokens], &[batch, seq]);
+        let weighted: f32 = loss
+            .compute_weighted(&teacher, &student, 2.0, Some(&ones))
+            .unwrap()
+            .item();
+
+        assert!(
+            (weighted - unweighted).abs() < 1e-4,
+            "weighted(uniform)={} should equal unweighted={}",
+            weighted,
+            unweighted
+        );
+    }
+
+    /// Weighting with a 0/1 mask must match the mean over the selected
+    /// positions only — i.e. padding tokens (weight=0) should not dilute the
+    /// loss signal.
+    #[test]
+    #[serial]
+    fn weighted_mask_ignores_zero_positions() {
+        // Small deterministic input.
+        let teacher = Array::from_f32_slice(
+            &[
+                1.0, 2.0, 3.0, // token 0
+                5.0, 4.0, 3.0, // token 1 (padded)
+                0.5, 1.5, 2.5, // token 2
+                7.0, 8.0, 9.0, // token 3 (padded)
+            ],
+            &[1, 4, 3],
+        );
+        let student = Array::from_f32_slice(
+            &[3.0, 2.0, 1.0, 4.0, 3.0, 5.0, 2.0, 2.5, 1.5, 9.0, 7.0, 8.0],
+            &[1, 4, 3],
+        );
+
+        let loss = KlDivergenceLoss::new();
+
+        // Ground truth: mean over tokens 0 and 2 only. Build a teacher/student
+        // containing just those rows and compare to the masked result.
+        let teacher_kept = Array::from_f32_slice(
+            &[1.0, 2.0, 3.0, 0.5, 1.5, 2.5],
+            &[1, 2, 3],
+        );
+        let student_kept = Array::from_f32_slice(
+            &[3.0, 2.0, 1.0, 2.0, 2.5, 1.5],
+            &[1, 2, 3],
+        );
+        let kept_mean: f32 = loss.compute(&teacher_kept, &student_kept, 2.0).unwrap().item();
+
+        let mask = Array::from_f32_slice(&[1.0_f32, 0.0, 1.0, 0.0], &[1, 4]);
+        let masked: f32 = loss
+            .compute_weighted(&teacher, &student, 2.0, Some(&mask))
+            .unwrap()
+            .item();
+
+        assert!(
+            (masked - kept_mean).abs() < 1e-4,
+            "masked weighted loss={} should equal mean over unmasked tokens={}",
+            masked,
+            kept_mean
+        );
+    }
+
+    /// Mismatched weight shape must produce an error rather than silently
+    /// corrupting the loss.
+    #[test]
+    #[serial]
+    fn weighted_size_mismatch_is_error() {
+        let teacher = Array::from_f32_slice(&[1.0_f32; 12], &[1, 4, 3]);
+        let student = Array::from_f32_slice(&[2.0_f32; 12], &[1, 4, 3]);
+        let bad_weights = Array::from_f32_slice(&[1.0_f32, 1.0], &[2]); // expected 4
+
+        let loss = KlDivergenceLoss::new();
+        let result = loss.compute_weighted(&teacher, &student, 1.0, Some(&bad_weights));
+        assert!(result.is_err(), "expected error on weight-size mismatch");
     }
 }

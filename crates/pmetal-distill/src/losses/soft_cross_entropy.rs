@@ -105,6 +105,7 @@ impl SoftCrossEntropyLoss {
         teacher_logits: &Array,
         student_logits: &Array,
         temperature: f32,
+        weights: Option<&Array>,
     ) -> Result<Array> {
         let ctx = self
             .ctx
@@ -175,10 +176,7 @@ impl SoftCrossEntropyLoss {
             )
             .map_err(|e| crate::DistillError::Metal(format!("Execution error: {}", e)))?;
 
-        // Return mean loss
-        let mean_loss = output.mean_loss();
-
-        Ok(Array::from_f32(mean_loss))
+        super::reduce_per_token_with_weights(&output.losses, weights, num_tokens)
     }
 }
 
@@ -203,12 +201,13 @@ impl DistillLoss for SoftCrossEntropyLoss {
         let teacher_logits = &teacher_logits;
         let student_logits = &student_logits;
 
-        // GPU-first: try Metal if no weights and no vocab mismatch.
-        if weights.is_none() && !vocab_mismatched {
+        // GPU-first: fused kernel supports both unweighted and per-token
+        // weighted reductions; only the sparse-vocab path has to stay on MLX.
+        if !vocab_mismatched {
             #[cfg(feature = "metal")]
             {
                 if self.ctx.is_some() {
-                    return self.compute_gpu(teacher_logits, student_logits, temperature);
+                    return self.compute_gpu(teacher_logits, student_logits, temperature, weights);
                 }
             }
         }

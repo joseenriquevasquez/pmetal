@@ -4,10 +4,56 @@
 //! It coordinates loading models, applying merge algorithms, and saving results.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use pmetal_bridge::compat::Array;
 use regex::Regex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// Tensor-name pattern that identifies MoE routed-expert weights.
+///
+/// Matches the `experts.{idx}.` segment that appears in every supported MoE
+/// architecture (DeepSeek, Qwen3MoE, Qwen3Next, GPT-OSS, Llama 4, Granite MoE).
+///
+/// See [`moe_merge_caveat`] for the limitation this is used to detect.
+fn moe_expert_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\.experts\.\d+\.").expect("MoE expert regex compiles"))
+}
+
+/// Returns true if any tensor name matches the MoE routed-expert pattern.
+///
+/// Used by [`run_merge`] to surface the expert-permutation caveat at runtime.
+pub fn contains_moe_experts<'a, I>(names: I) -> bool
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let re = moe_expert_re();
+    names.into_iter().any(|n| re.is_match(n))
+}
+
+/// Canonical documentation text for the MoE expert-permutation caveat.
+///
+/// **Known limitation:** full-model merging (TIES / DARE / linear / SLERP /
+/// task-arithmetic / …) operates on tensor names only. For MoE routed experts
+/// (`…experts.{i}.…`) this means expert `i` in checkpoint A is always merged
+/// with expert `i` in checkpoint B — even if the training runs specialised
+/// those slots to semantically different experts. If the two checkpoints did
+/// not share a common base model or share the same expert routing order, the
+/// merged expert bank can be incoherent. Adapter / LoRA merging is unaffected
+/// because PMetal's LoRA path targets the shared expert only (see
+/// `pmetal-lora`).
+///
+/// Mitigations:
+/// * Use `base_model` (TIES / DARE) — task vectors relative to a shared base
+///   are far more robust than raw-weight mixing.
+/// * Only merge MoE checkpoints that branched from a single pretrained base.
+/// * Prefer LoRA/adapter merging (`lora_merge`) for cross-run MoE combination.
+pub fn moe_merge_caveat() -> &'static str {
+    "MoE routed experts are merged by index; different expert specialisations \
+     across checkpoints may produce an incoherent expert bank. See \
+     `crate::merge::moe_merge_caveat` docs for mitigations."
+}
 
 use crate::{
     BreadcrumbsMerge, DareMerge, DellaMerge, LinearMerge, MergeConfig, MergeError, MergeMethod,
@@ -45,6 +91,14 @@ pub fn run_merge(config: &MergeConfig) -> Result<std::path::PathBuf> {
     // Get all tensor names (union across all models)
     let tensor_names = collect_tensor_names(&loaders, &base_loader)?;
     info!("Found {} tensors to merge", tensor_names.len());
+
+    if contains_moe_experts(&tensor_names) {
+        warn!(
+            method = method.name(),
+            "MoE routed experts detected in merge set — {}",
+            moe_merge_caveat()
+        );
+    }
 
     // Determine output path
     let output_path = config
@@ -116,6 +170,14 @@ pub fn run_merge_batched(
     // Get all tensor names (union across all models)
     let tensor_names = collect_tensor_names(&loaders, &base_loader)?;
     info!("Found {} tensors to merge", tensor_names.len());
+
+    if contains_moe_experts(&tensor_names) {
+        warn!(
+            method = method.name(),
+            "MoE routed experts detected in merge set — {}",
+            moe_merge_caveat()
+        );
+    }
 
     // Determine output path
     let output_path = config

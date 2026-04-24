@@ -29,6 +29,7 @@
 //! let result = loss.compute(&teacher_logits, &student_logits, 2.0)?;
 //! ```
 
+mod attention_transfer;
 pub mod hidden_state;
 mod hinge_ranking;
 mod jensen_shannon;
@@ -38,6 +39,7 @@ mod mse;
 mod soft_cross_entropy;
 mod tvd;
 
+pub use attention_transfer::AttentionTransferLoss;
 pub use hidden_state::HiddenStateLoss;
 pub use hinge_ranking::HingeRankingLoss;
 pub use jensen_shannon::JensenShannonLoss;
@@ -356,6 +358,57 @@ fn gather_at_indices(values: &Array, indices: &Array) -> Result<Array> {
     let gathered = values_flat.take_axis(&flat_indices, 0);
 
     Ok(gathered)
+}
+
+/// Combine per-token losses produced by a fused Metal kernel with an optional
+/// per-token weight tensor and return a scalar reduction.
+///
+/// When `weights` is `None`, returns the unweighted mean.
+/// When `weights` is `Some`, returns `sum(loss * w) / max(sum(w), 1e-8)`; the
+/// weight tensor must have `num_tokens` total elements (typically shape
+/// `[batch, seq]`).
+///
+/// This is the shared path used by `KlDivergenceLoss`, `JensenShannonLoss`,
+/// `SoftCrossEntropyLoss` etc. to consume the per-token output of
+/// `FusedDistill::forward`. Weighted reduction runs on the CPU (≤ a few KB of
+/// f32 data per step), which is negligible next to the O(N·V) kernel work that
+/// already stayed on the GPU.
+#[cfg(feature = "metal")]
+pub(crate) fn reduce_per_token_with_weights(
+    per_token_losses: &pmetal_metal::buffer::MetalBuffer<f32>,
+    weights: Option<&Array>,
+    num_tokens: usize,
+) -> Result<Array> {
+    let losses = per_token_losses.as_slice();
+    if losses.is_empty() {
+        return Ok(Array::from_f32(0.0));
+    }
+
+    let Some(w) = weights else {
+        let sum: f32 = losses.iter().sum();
+        return Ok(Array::from_f32(sum / losses.len() as f32));
+    };
+
+    let w_size: usize = w.shape().iter().map(|&d| d as usize).product();
+    if w_size != num_tokens {
+        return Err(crate::DistillError::Other(format!(
+            "weight tensor has {} elements but expected {} (one per token)",
+            w_size, num_tokens
+        )));
+    }
+
+    let w_flat = w.reshape(&[num_tokens as i32]);
+    w_flat.eval();
+    let w_slice = w_flat.as_slice::<f32>();
+
+    let mut weighted_sum = 0.0_f32;
+    let mut total_weight = 0.0_f32;
+    for (loss, weight) in losses.iter().zip(w_slice.iter()) {
+        weighted_sum += loss * weight;
+        total_weight += weight;
+    }
+    let safe_weight = total_weight.abs().max(1e-8);
+    Ok(Array::from_f32(weighted_sum / safe_weight))
 }
 
 #[cfg(test)]

@@ -190,9 +190,53 @@ pub struct AttentionConfig {
     #[serde(default)]
     pub layer_mapping: Vec<(usize, usize)>,
 
+    /// Loss type for attention maps.
+    #[serde(default)]
+    pub loss_type: AttentionLossType,
+
     /// Weight for attention loss.
     #[serde(default = "default_attention_weight")]
     pub weight: f32,
+
+    /// Head-reduction strategy when teacher/student have different head counts
+    /// or when normalising per-head maps before comparison.
+    #[serde(default)]
+    pub head_reduction: AttentionHeadReduction,
+}
+
+/// Attention transfer loss variants.
+///
+/// `Mse` and `Kl` compare teacher/student softmaxed attention matrices
+/// (post-softmax probabilities, shape `[batch, heads, q_len, k_len]`).
+/// `AttentionTransfer` implements the Zagoruyko & Komodakis 2017 attention-map
+/// formulation (sum-of-squares across heads → L2-normalised → MSE).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionLossType {
+    /// Mean Squared Error between attention probability matrices.
+    #[default]
+    Mse,
+
+    /// Forward KL divergence between per-row attention distributions.
+    /// Treats each query row as a distribution over keys.
+    Kl,
+
+    /// Zagoruyko & Komodakis attention-map distillation:
+    /// sum across heads, L2-normalise per (batch, query), MSE.
+    AttentionTransfer,
+}
+
+/// How to handle mismatched head counts between teacher and student.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionHeadReduction {
+    /// Require identical head counts (fail otherwise). Default.
+    #[default]
+    Exact,
+
+    /// Average attention maps across the head axis before comparison.
+    /// Works for any teacher/student head count combination.
+    MeanOverHeads,
 }
 
 fn default_attention_weight() -> f32 {
