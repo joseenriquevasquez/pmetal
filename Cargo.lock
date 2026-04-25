@@ -5215,6 +5215,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "criterion",
  "futures",
  "pmetal-bridge",
  "pmetal-core",

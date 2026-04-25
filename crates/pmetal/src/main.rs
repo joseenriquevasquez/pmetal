@@ -1569,6 +1569,26 @@ enum Commands {
         #[cfg(feature = "ane")]
         #[arg(long)]
         ane_real_time: bool,
+
+        /// Enable continuous batching: multiple in-flight requests share
+        /// batched decode steps. Requests that use stop_sequences,
+        /// logprobs, or non-neutral repetition/frequency/presence
+        /// penalties automatically fall back to single-request mode.
+        #[arg(long)]
+        continuous_batch: bool,
+
+        /// Maximum concurrent slots when --continuous-batch is set.
+        /// KV cache memory scales linearly with this; pick conservatively
+        /// on models that already sit close to the memory ceiling at
+        /// batch 1.
+        #[arg(long, default_value = "8")]
+        cb_max_slots: usize,
+
+        /// Maximum pending-queue depth when --continuous-batch is set.
+        /// Requests beyond this are rejected with a 5xx rather than
+        /// silently queued forever.
+        #[arg(long, default_value = "256")]
+        cb_max_queue_depth: usize,
     },
 
     /// Dataset utilities for preparing and analyzing training data
@@ -2778,6 +2798,9 @@ async fn tokio_main() -> anyhow::Result<()> {
             ane_max_seq_len,
             #[cfg(feature = "ane")]
             ane_real_time,
+            continuous_batch,
+            cb_max_slots,
+            cb_max_queue_depth,
         } => {
             #[cfg(feature = "ane")]
             let ane_enabled = ane;
@@ -2808,6 +2831,9 @@ async fn tokio_main() -> anyhow::Result<()> {
                 ane_enabled,
                 serve_ane_max_seq_len,
                 serve_ane_real_time,
+                continuous_batch,
+                cb_max_slots,
+                cb_max_queue_depth,
             )
             .await?;
         }

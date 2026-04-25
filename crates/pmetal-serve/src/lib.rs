@@ -15,13 +15,27 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod anthropic;
+pub mod continuous_batch;
+pub mod continuous_driver;
+pub mod continuous_pump;
 pub mod engine;
 pub mod error;
+pub mod prefix_cache;
 pub mod routes;
 pub mod server;
 pub(crate) mod sse;
 pub mod types;
 
+pub use continuous_batch::{
+    BatcherConfig, ContinuousBatcher, EnqueueError, FinishReason, SlotId, SlotParams, SlotState,
+    StepInstruction,
+};
+pub use continuous_driver::{
+    ContinuousEngineState, SlotForward, SlotIdxMap, SlotStepOutput, drive_decode_step,
+    drive_prefill_step,
+};
+pub use continuous_pump::{ContinuousPump, Tick};
 pub use engine::{InferenceEngine, RequestMetrics};
+pub use prefix_cache::ServePrefixCache;
 pub use routes::ServingMetrics;
 pub use server::ServeConfig;

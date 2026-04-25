@@ -17,12 +17,15 @@ pub(crate) async fn run_serve(
     ane_enabled: bool,
     ane_max_seq_len: usize,
     ane_real_time: bool,
+    continuous_batch: bool,
+    cb_max_slots: usize,
+    cb_max_queue_depth: usize,
 ) -> anyhow::Result<()> {
     use pmetal::inference_runner::{
         CacheModeRequest, TurboQuantPreset, explicit_cache_mode_override,
     };
     use pmetal_models::dispatcher::DynamicModel;
-    use pmetal_serve::{InferenceEngine, ServeConfig};
+    use pmetal_serve::{BatcherConfig, InferenceEngine, ServeConfig};
 
     // Resolve model path
     let model_path = if model_id.contains('/') && !PathBuf::from(&model_id).exists() {
@@ -107,9 +110,19 @@ pub(crate) async fn run_serve(
     )?;
 
     // Start server
+    let continuous_batching = if continuous_batch {
+        Some(BatcherConfig {
+            max_slots: cb_max_slots.max(1),
+            max_queue_depth: cb_max_queue_depth.max(1),
+        })
+    } else {
+        None
+    };
+
     let config = ServeConfig {
         port,
         host,
+        continuous_batching,
         ..Default::default()
     };
 

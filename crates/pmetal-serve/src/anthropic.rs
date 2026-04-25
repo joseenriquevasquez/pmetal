@@ -288,7 +288,7 @@ pub async fn messages(
     };
 
     if req.stream.unwrap_or(false) {
-        let rx = state.engine.generate_streaming(&input_ids, params);
+        let rx = crate::routes::stream_tokens(&state.engine, &input_ids, params);
         let tokenizer = state.engine.tokenizer_arc();
         let metrics_handle = Arc::clone(&state);
         let sse = anthropic_sse_stream(

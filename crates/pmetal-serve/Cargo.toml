@@ -35,6 +35,13 @@ chrono = "0.4"
 futures = "0.3"
 tokio-stream = "0.1"
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "continuous_batch"
+harness = false
+
 # Inherit workspace lints (including `unsafe_code = "deny"`); the single
 # `unsafe impl Send for ModelState` in engine.rs is annotated with
 # `#[allow(unsafe_code)]` + a SAFETY comment, which overrides the deny at

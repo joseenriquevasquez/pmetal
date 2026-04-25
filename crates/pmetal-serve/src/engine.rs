@@ -98,6 +98,33 @@ pub enum TokenEvent {
     Error(String),
 }
 
+/// Per-token signal returned by the decode emit callback.
+///
+/// `Cancel` is used by the streaming path when the client has dropped the
+/// receiver — the loop then returns with a "cancelled" finish reason so the
+/// caller can shut down cleanly.
+enum StepOutcome {
+    Continue,
+    Cancel,
+}
+
+/// Aggregated result of a single async decode run.
+struct DecodeRun {
+    /// Generated token IDs (already truncated when a stop-sequence matched).
+    generated: Vec<u32>,
+    /// Per-token logprobs when the request opted in; `None` otherwise.
+    logprobs: Option<Vec<TokenLogprobEntry>>,
+    /// Finish reason: `"length"`, `"stop"`, or `"cancelled"`.
+    finish_reason: &'static str,
+    /// Number of tokens stripped from the tail due to stop-sequence match
+    /// (used by the streaming path to tell the client how many to discard).
+    stripped_tokens: usize,
+    /// Milliseconds to first generated token (TTFT).
+    first_token_time_ms: Option<f64>,
+    /// Final token count (after stop-sequence truncation).
+    completion_tokens: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreferredGenerationBackend {
     Gpu,
@@ -195,7 +222,7 @@ fn build_generation_config_from_parts(
     config
 }
 
-fn detect_stop_sequence_suffix(
+pub(crate) fn detect_stop_sequence_suffix(
     tokenizer: &pmetal_data::Tokenizer,
     generated: &[u32],
     stop_sequences: &[String],
@@ -448,7 +475,139 @@ pub struct InferenceEngine {
     created_at: i64,
     /// Explicit cache mode override (bypasses auto-selection when set).
     cache_mode_override: Option<CacheMode>,
+    /// Cross-request KV prefix cache. Consulted at the start of every
+    /// request to skip the prefill of any prompt prefix we've already
+    /// processed. Empty for hybrid/recurrent models (they can't be
+    /// safely snapshot-truncated) and for every request where the
+    /// engine is also running an accelerated ANE/CPU-hybrid backend.
+    prefix_cache: Arc<Mutex<crate::prefix_cache::ServePrefixCache>>,
+    /// Optional continuous-batching runtime. `None` by default — an
+    /// opt-in alternative to the single-request `generate` /
+    /// `generate_streaming` paths. Enabled by calling
+    /// [`enable_continuous_batching`](Self::enable_continuous_batching).
+    continuous: Arc<Mutex<Option<ContinuousRuntime>>>,
 }
+
+/// Runtime state for the continuous-batching driver. Dropping the
+/// `InferenceEngine` (or explicitly calling `disable_continuous_batching`)
+/// signals `shutdown`, and the driver thread joins.
+struct ContinuousRuntime {
+    pump: Arc<Mutex<crate::continuous_pump::ContinuousPump>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    driver: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ContinuousRuntime {
+    fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = self.driver.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Continuous-batching driver loop.
+///
+/// Parked in a dedicated OS thread (not a tokio task — forward passes
+/// are synchronous and hold the model lock). Each iteration:
+///
+/// 1. Checks the shutdown flag.
+/// 2. Locks the model, then the pump.
+/// 3. Hands the pump a forward closure that drives
+///    `DynamicModel::forward_with_hybrid_cache` on the current slot's
+///    KV cache.
+/// 4. Advances the slot state based on the returned `Tick`.
+/// 5. Releases both locks so single-request paths can run between
+///    ticks, and parks briefly on `Tick::Idle`.
+///
+/// The loop exits when `shutdown` flips to `true` — either because the
+/// `ContinuousRuntime` was dropped or `disable_continuous_batching()`
+/// was called.
+fn run_continuous_driver(
+    model_arc: Arc<Mutex<ModelState>>,
+    pump_arc: Arc<Mutex<crate::continuous_pump::ContinuousPump>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use crate::continuous_pump::Tick;
+    use pmetal_bridge::compat::{Array as _Array, Dtype as _Dtype};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    // Park briefly on idle instead of hot-spinning. 10 ms is short
+    // enough that an incoming enqueue is picked up quickly and long
+    // enough to avoid burning a core when no requests are in flight.
+    const IDLE_SLEEP: Duration = Duration::from_millis(10);
+    // After an error, back off a bit longer before retrying so we
+    // don't drown the logs.
+    const ERROR_SLEEP: Duration = Duration::from_millis(100);
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Lock model + pump in a fixed order (model → pump) to avoid
+        // deadlocking against `generate_batched`, which only ever
+        // takes the pump lock.
+        let tick_result = {
+            let mut state = match model_arc.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    // Model mutex poisoned — the engine is in an
+                    // unrecoverable state. Exit cleanly.
+                    tracing::error!(target: "pmetal_serve::continuous_batch", "model mutex poisoned; stopping driver");
+                    return;
+                }
+            };
+            let model = &mut state.model;
+
+            let mut forward = |tokens: &[u32],
+                               cache: &mut KVCache|
+             -> Result<_Array, pmetal_bridge::compat::Exception> {
+                // Build a [1, S] Int32 input from the u32 tokens. Every
+                // architecture's `forward_with_hybrid_cache` accepts
+                // Int32 inputs in this shape.
+                let shape = [1i32, tokens.len() as i32];
+                let arr = _Array::from_u32_slice(tokens, &shape);
+                let arr = arr.as_dtype(_Dtype::Int32.as_i32());
+                model.forward_with_hybrid_cache(&arr, None, Some(cache), None)
+            };
+
+            let mut pump = match pump_arc.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    tracing::error!(target: "pmetal_serve::continuous_batch", "pump mutex poisoned; stopping driver");
+                    return;
+                }
+            };
+            pump.tick(&mut forward)
+        };
+
+        match tick_result {
+            Ok(Tick::Ran) => {
+                // Yield the thread briefly so the tokio runtime gets a
+                // chance to schedule token-channel readers.
+                std::thread::yield_now();
+            }
+            Ok(Tick::Idle) => std::thread::sleep(IDLE_SLEEP),
+            Err(e) => {
+                tracing::warn!(
+                    target: "pmetal_serve::continuous_batch",
+                    "driver tick error: {e:?}; backing off"
+                );
+                std::thread::sleep(ERROR_SLEEP);
+            }
+        }
+    }
+
+    tracing::info!(target: "pmetal_serve::continuous_batch", "driver stopped");
+}
+
+// Default prefix-cache budgets. Generous on entries since each one is
+// just a token sequence + a KV snapshot; the byte budget is the hard cap.
+const DEFAULT_PREFIX_CACHE_ENTRIES: usize = 16;
+const DEFAULT_PREFIX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 /// Model + cache state that must be accessed sequentially.
 struct ModelState {
@@ -609,7 +768,186 @@ impl InferenceEngine {
             stop_token_ids,
             created_at,
             cache_mode_override,
+            prefix_cache: Arc::new(Mutex::new(crate::prefix_cache::ServePrefixCache::new(
+                DEFAULT_PREFIX_CACHE_ENTRIES,
+                DEFAULT_PREFIX_CACHE_BYTES,
+            ))),
+            continuous: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Override the default prefix-cache budgets. `max_entries = 0` or
+    /// `max_bytes = 0` is a valid way to express "unbounded on that
+    /// axis"; for the engine's purposes, setting both to zero disables
+    /// the cache (all entries would be evicted before use).
+    pub fn set_prefix_cache_limits(&self, max_entries: usize, max_bytes: usize) {
+        if let Ok(mut pc) = self.prefix_cache.lock() {
+            *pc = crate::prefix_cache::ServePrefixCache::new(max_entries, max_bytes);
+        }
+    }
+
+    /// Snapshot of prefix-cache stats: `(entries, bytes, hits, misses, hit_rate)`.
+    pub fn prefix_cache_stats(&self) -> (usize, usize, u64, u64, f64) {
+        match self.prefix_cache.lock() {
+            Ok(pc) => (pc.len(), pc.bytes(), pc.hits(), pc.misses(), pc.hit_rate()),
+            Err(_) => (0, 0, 0, 0, 0.0),
+        }
+    }
+
+    /// Enable continuous batching with the given capacity. Spawns a
+    /// dedicated driver thread that holds the model lock each tick,
+    /// processes one scheduler instruction, and parks briefly on idle.
+    ///
+    /// While enabled, callers dispatch requests through
+    /// [`generate_batched`](Self::generate_batched). The single-request
+    /// `generate` / `generate_streaming` paths continue to work but
+    /// will contend with the driver for the model lock.
+    ///
+    /// Calling this twice is a no-op that returns `Ok` — the first
+    /// configuration wins. Use
+    /// [`disable_continuous_batching`](Self::disable_continuous_batching)
+    /// first if you need to reconfigure.
+    ///
+    /// `cache_config` must match the model (num_layers, n_kv_heads,
+    /// head_dim, max_seq_len). A mismatch will surface as a shape
+    /// error on the first forward pass.
+    pub fn enable_continuous_batching(
+        &self,
+        batcher_config: crate::continuous_batch::BatcherConfig,
+        cache_config: KVCacheConfig,
+    ) -> ServeResult<()> {
+        use std::sync::atomic::AtomicBool;
+
+        let mut guard = self
+            .continuous
+            .lock()
+            .map_err(|_| ServeError::Busy)?;
+        if guard.is_some() {
+            return Ok(());
+        }
+
+        let pump = Arc::new(Mutex::new(crate::continuous_pump::ContinuousPump::new(
+            batcher_config,
+            cache_config,
+            Some(Arc::clone(&self.tokenizer)),
+        )));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let model_arc = Arc::clone(&self.model);
+        let pump_arc = Arc::clone(&pump);
+        let shutdown_arc = Arc::clone(&shutdown);
+
+        let driver = std::thread::Builder::new()
+            .name("pmetal-cb-driver".into())
+            .spawn(move || {
+                run_continuous_driver(model_arc, pump_arc, shutdown_arc);
+            })
+            .map_err(|e| {
+                ServeError::Internal(format!("failed to spawn continuous-batching driver: {e}"))
+            })?;
+
+        *guard = Some(ContinuousRuntime {
+            pump,
+            shutdown,
+            driver: Some(driver),
+        });
+        Ok(())
+    }
+
+    /// Stop the continuous-batching driver and drop the pump. Any
+    /// in-flight requests will see their receivers closed.
+    pub fn disable_continuous_batching(&self) {
+        if let Ok(mut guard) = self.continuous.lock() {
+            *guard = None; // Drop impl handles shutdown + join.
+        }
+    }
+
+    /// Dispatch a request through the continuous-batching pump.
+    ///
+    /// Returns an mpsc receiver that emits one `TokenEvent::Token` per
+    /// generated token and exactly one `TokenEvent::Done` /
+    /// `TokenEvent::Error` terminator — mirroring the streaming
+    /// contract of `generate_streaming`.
+    ///
+    /// Errors if continuous batching is not enabled (call
+    /// [`enable_continuous_batching`](Self::enable_continuous_batching)
+    /// first) or if the pump's pending queue is saturated.
+    pub fn generate_batched(
+        &self,
+        input_ids: &[u32],
+        params: SamplingParams,
+    ) -> ServeResult<tokio::sync::mpsc::Receiver<TokenEvent>> {
+        Self::validate_params(&params, self.max_seq_len)?;
+
+        let gen_config = self.build_generation_config(&params);
+        let slot_params = crate::continuous_batch::SlotParams {
+            max_new_tokens: gen_config.max_new_tokens,
+            stop_tokens: gen_config.stop_tokens.clone(),
+            stop_sequences: params.stop_sequences.clone(),
+            prefill_step_size: gen_config.prefill_step_size,
+            logprobs_top_n: params.logprobs_top_n,
+        };
+
+        let runtime_guard = self
+            .continuous
+            .lock()
+            .map_err(|_| ServeError::Busy)?;
+        let runtime = runtime_guard
+            .as_ref()
+            .ok_or_else(|| {
+                ServeError::Internal(
+                    "continuous batching not enabled; call enable_continuous_batching first"
+                        .into(),
+                )
+            })?;
+
+        let mut pump = runtime.pump.lock().map_err(|_| ServeError::Busy)?;
+        let (_slot, rx) = pump
+            .enqueue(input_ids.to_vec(), slot_params, gen_config, 64)
+            .map_err(|e| ServeError::Internal(format!("enqueue failed: {e}")))?;
+        Ok(rx)
+    }
+
+    /// Whether continuous batching has been enabled on this engine.
+    pub fn continuous_batching_enabled(&self) -> bool {
+        self.continuous
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Convenience wrapper that derives the KV-cache config from the
+    /// loaded model and calls
+    /// [`enable_continuous_batching`](Self::enable_continuous_batching).
+    ///
+    /// The cache config comes from `DynamicModel::create_cache(max_seq_len)`
+    /// so it matches exactly what `create_request_caches` hands out for
+    /// single-request generation. Requires a short lock on the model.
+    pub fn enable_continuous_batching_auto(
+        &self,
+        batcher_config: crate::continuous_batch::BatcherConfig,
+    ) -> ServeResult<()> {
+        let cache_config = {
+            let state = self.model.lock().map_err(|_| ServeError::Busy)?;
+            state.model.create_cache(self.max_seq_len).config().clone()
+        };
+        self.enable_continuous_batching(batcher_config, cache_config)
+    }
+
+    /// Inspect pump depth: `(active_slots, pending_depth)`. Returns
+    /// `(0, 0)` when continuous batching is not enabled.
+    pub fn continuous_batching_depth(&self) -> (usize, usize) {
+        let guard = match self.continuous.lock() {
+            Ok(g) => g,
+            Err(_) => return (0, 0),
+        };
+        let Some(runtime) = guard.as_ref() else {
+            return (0, 0);
+        };
+        match runtime.pump.lock() {
+            Ok(pump) => (pump.active_slots(), pump.pending_depth()),
+            Err(_) => (0, 0),
+        }
     }
 
     /// Model ID for API responses.
@@ -957,6 +1295,288 @@ impl InferenceEngine {
         Ok(last.reshape(&[vocab_size]))
     }
 
+    /// Run a single GPU decode request with 1-step look-ahead async
+    /// pipelining, chunked prefill, and wired-memory management.
+    ///
+    /// Shared between [`generate`](Self::generate) and
+    /// [`generate_streaming`](Self::generate_streaming). `on_token` is
+    /// invoked once per generated token (after the stop-token check, before
+    /// the stop-sequence check). For non-streaming the callback is a no-op;
+    /// for streaming it pushes a `TokenEvent::Token` into the mpsc channel.
+    ///
+    /// # Pipelining contract
+    ///
+    /// - `forward(N+1)` is scheduled under a generation-stream context
+    ///   before the host extracts `token(N)`.
+    /// - `async_eval` is called outside the stream context so the GPU is
+    ///   free to advance while the host samples / extracts.
+    /// - The loop is driven by `.item::<u32>()` on the current token
+    ///   array — this is the ONLY synchronous host sync per step.
+    /// - Wired-memory limit and generation stream are installed once per
+    ///   request via RAII guards.
+    ///
+    /// # Penalty lag
+    ///
+    /// Because the next forward is scheduled before `token(N)` is
+    /// extracted, the repetition / frequency / presence penalty context
+    /// at step `N+1` is missing exactly one token (the one that will be
+    /// emitted as `token(N)`). This is the same tradeoff mlx_lm makes in
+    /// its async decode — the alternative (sync-per-step) destroys the
+    /// pipeline. In practice the lag is inaudible for soft penalties
+    /// because the missing token is one of `prompt_len + N` history
+    /// tokens feeding the scatter.
+    #[allow(clippy::too_many_arguments)]
+    fn run_async_decode<E>(
+        model: &mut DynamicModel,
+        cache: &mut KVCache,
+        mamba_cache: &mut Option<MambaCache>,
+        sampler: &mut Sampler,
+        tokenizer: &pmetal_data::Tokenizer,
+        input_ids: &[u32],
+        max_tokens: usize,
+        stop_tokens: &[u32],
+        stop_sequences: &[String],
+        logprobs_top_n: Option<usize>,
+        prefill_step_size: usize,
+        prefix_cache: Option<&Arc<Mutex<crate::prefix_cache::ServePrefixCache>>>,
+        start: Instant,
+        mut on_token: E,
+    ) -> ServeResult<DecodeRun>
+    where
+        E: FnMut(u32, Option<TokenLogprobEntry>) -> StepOutcome,
+    {
+        use pmetal_bridge::compat::ops::async_eval;
+        use pmetal_models::generation::{
+            StreamContext, WiredLimitGuard, clear_generation_caches, create_generation_stream,
+            run_cached_prefill_chunks, token_logprobs,
+        };
+
+        let _wired_guard = WiredLimitGuard::new();
+        let stream = create_generation_stream();
+
+        let mut all_tokens: Vec<u32> = input_ids.to_vec();
+        let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
+        let mut logprobs_out: Option<Vec<TokenLogprobEntry>> =
+            logprobs_top_n.map(|_| Vec::with_capacity(max_tokens));
+        let mut first_token_time_ms: Option<f64> = None;
+        let mut stripped_tokens: usize = 0;
+        let mut finish_reason: &'static str = "length";
+        let mut cancelled = false;
+
+        // === Prefix-cache lookup (non-hybrid only) ===
+        //
+        // If the incoming prompt is a strict extension of a cached
+        // prefix, restore the KV state and prefill only the suffix.
+        // Mamba/GDN/hybrid models can't be snapshot-truncated cleanly,
+        // so we skip the cache entirely when `mamba_cache` is populated.
+        let prefix_hit_len: usize = if let (Some(pc), true) =
+            (prefix_cache.as_ref(), mamba_cache.is_none())
+        {
+            let mut guard = match pc.lock() {
+                Ok(g) => g,
+                Err(_) => return Err(ServeError::Busy),
+            };
+            match guard
+                .find_longest_prefix(input_ids, cache.config().clone())
+                .map_err(ServeError::Model)?
+            {
+                Some(hit) => {
+                    // Replace the freshly-allocated cache with the
+                    // restored one from the snapshot.
+                    *cache = hit.restored_cache;
+                    tracing::debug!(
+                        target: "pmetal_serve::prefix_cache",
+                        "prefix cache hit: {}/{} tokens restored",
+                        hit.prefix_len,
+                        input_ids.len()
+                    );
+                    hit.prefix_len
+                }
+                None => 0,
+            }
+        } else {
+            0
+        };
+
+        let prefill_slice: &[u32] = &input_ids[prefix_hit_len..];
+
+        // === Prefill (chunked, on possibly shortened suffix) ===
+        //
+        // `run_cached_prefill_chunks` calls `forward` once per chunk; each
+        // call wraps the forward in a fresh `StreamContext` so chunked
+        // prefill also runs on the generation stream. The final chunk's
+        // logits are returned lazily so we can fold them into the async
+        // decode pipeline without a host sync.
+        let prefill_logits =
+            run_cached_prefill_chunks(prefill_slice, prefill_step_size, |chunk| {
+                let _ctx = StreamContext::new(&stream);
+                model.forward_with_hybrid_cache(chunk, None, Some(cache), mamba_cache.as_mut())
+            })
+            .map_err(ServeError::Model)?;
+
+        // === Cache the full-prompt KV state for future hits ===
+        //
+        // Only insert when we actually did work (prefill_slice non-empty)
+        // and the KV cache reflects the full prompt length. Hybrid
+        // models skip caching for the same reason they skip lookup.
+        if let (Some(pc), true, true) = (
+            prefix_cache.as_ref(),
+            mamba_cache.is_none(),
+            !prefill_slice.is_empty(),
+        ) {
+            if let Ok(mut guard) = pc.lock() {
+                guard.insert(input_ids, cache);
+            }
+        }
+
+        let mut current_last = Self::extract_last_logits(&prefill_logits)?;
+        let (mut current_y, _filtered) = sampler
+            .sample_array_with_penalties(&current_last, &all_tokens)
+            .map_err(ServeError::Model)?;
+        // Schedule the first-token pair async so the GPU starts working
+        // before we enter the loop.
+        async_eval([&current_y, &current_last]);
+
+        // === Decode loop with 1-step look-ahead ===
+        let mut i = 0usize;
+        while i < max_tokens {
+            // 1. Schedule NEXT forward BEFORE extracting current token.
+            let next = if i + 1 < max_tokens {
+                let pair = {
+                    let _ctx = StreamContext::new(&stream);
+                    let next_input = current_y
+                        .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32())
+                        .reshape(&[1, -1]);
+                    let next_full = model
+                        .forward_with_hybrid_cache(
+                            &next_input,
+                            None,
+                            Some(cache),
+                            mamba_cache.as_mut(),
+                        )
+                        .map_err(ServeError::Model)?;
+                    let next_last = Self::extract_last_logits(&next_full)?;
+                    let (ny, _) = sampler
+                        .sample_array_with_penalties(&next_last, &all_tokens)
+                        .map_err(ServeError::Model)?;
+                    (ny, next_last)
+                };
+                async_eval([&pair.0, &pair.1]);
+                Some(pair)
+            } else {
+                None
+            };
+
+            // 2. First iteration: force-eval the token so .item() below
+            //    gets data (matches the mlx_lm n==0 special-case).
+            if i == 0 {
+                current_y.eval();
+            }
+
+            // 3. Extract token from GPU — blocks until current_y is ready.
+            //    GPU is already computing token(i+1) in parallel.
+            let token = current_y.item::<u32>();
+
+            if first_token_time_ms.is_none() {
+                first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+            }
+
+            // 4. Stop-token check (before any side-effects).
+            if stop_tokens.contains(&token) {
+                finish_reason = "stop";
+                break;
+            }
+
+            // 5. Update frequency-penalty history.
+            sampler.update_counts(token);
+
+            // 6. Optional logprobs: compute from RAW last-position logits
+            //    (the sampler's filtered log-probs aren't suitable for
+            //    OpenAI-style reporting). Cheap when top_n is small.
+            let logprob_entry = match logprobs_top_n {
+                Some(top_n) => match token_logprobs(&current_last, token, top_n + 1) {
+                    Ok((lp, mut top)) => {
+                        top.retain(|(tok, _)| *tok != token);
+                        top.truncate(top_n);
+                        Some(TokenLogprobEntry {
+                            token,
+                            logprob: lp,
+                            top_logprobs: top,
+                        })
+                    }
+                    Err(_) => None,
+                },
+                None => None,
+            };
+
+            generated.push(token);
+            all_tokens.push(token);
+
+            // 7. Accumulate logprob for non-streaming return value. We
+            //    clone so the owned value can still be handed to the
+            //    streaming callback below.
+            if let (Some(entry), Some(out)) = (logprob_entry.as_ref(), logprobs_out.as_mut()) {
+                out.push(entry.clone());
+            }
+
+            // 8. Emit to caller (moves logprob entry into TokenEvent for
+            //    streaming; ignored by non-streaming).
+            match on_token(token, logprob_entry) {
+                StepOutcome::Continue => {}
+                StepOutcome::Cancel => {
+                    cancelled = true;
+                    break;
+                }
+            }
+
+            // 9. Stop-sequence detection on decoded text (multi-token
+            //    suffix match via tokenizer).
+            if let Some(n_strip) =
+                detect_stop_sequence_suffix(tokenizer, &generated, stop_sequences)
+            {
+                stripped_tokens = n_strip;
+                finish_reason = "stop";
+                break;
+            }
+
+            // 10. Periodic allocation-cache sweep (matches mlx_lm).
+            if i > 0 && i % 256 == 0 {
+                clear_generation_caches();
+            }
+
+            // 11. Swap current ← next.
+            if let Some((ny, nl)) = next {
+                current_y = ny;
+                current_last = nl;
+            }
+
+            i += 1;
+        }
+
+        // Truncate tail if a stop-sequence was matched. Non-streaming
+        // callers see the truncated vec; streaming callers use
+        // `stripped_tokens` in the Done event to tell the client how many
+        // tokens to drop from the visible stream.
+        let visible_len = generated.len().saturating_sub(stripped_tokens);
+        if let Some(out) = logprobs_out.as_mut() {
+            out.truncate(visible_len);
+        }
+        generated.truncate(visible_len);
+
+        if cancelled {
+            finish_reason = "cancelled";
+        }
+
+        Ok(DecodeRun {
+            generated,
+            logprobs: logprobs_out,
+            finish_reason,
+            stripped_tokens,
+            first_token_time_ms,
+            completion_tokens: visible_len,
+        })
+    }
+
     /// Generate tokens from input IDs (non-streaming).
     ///
     /// Returns `(generated_tokens, logprobs, finish_reason, metrics)`.
@@ -989,6 +1609,7 @@ impl InferenceEngine {
         let backend = Arc::clone(&self.backend);
         let cache_mode_override = self.cache_mode_override;
         let tokenizer = Arc::clone(&self.tokenizer);
+        let prefix_cache = Arc::clone(&self.prefix_cache);
 
         let logprobs_top_n = params.logprobs_top_n;
         let stop_sequences = params.stop_sequences.clone();
@@ -1017,116 +1638,49 @@ impl InferenceEngine {
 
             let max_tokens = gen_config.max_new_tokens;
             let stop_tokens = gen_config.stop_tokens.clone();
+            let prefill_step_size = gen_config.prefill_step_size;
             let mut state = model_arc.lock().map_err(|_| ServeError::Busy)?;
             let model = &mut state.model;
             let (mut cache, mut mamba_cache) =
                 Self::create_request_caches(model, &model_path, max_seq_len, cache_mode_override);
 
-            // Build input array [1, seq_len] for prefill.
-            let i32_ids: Vec<i32> = input_ids.iter().map(|&t| t as i32).collect();
-            let seq_len = input_ids.len() as i32;
-            let input_arr = Array::from_slice(&i32_ids, &[1, seq_len]);
-
+            // Sampler holds MLX Arrays and is !Send — must live inside the
+            // blocking thread.
+            let mut sampler = Sampler::new(gen_config);
             let start = Instant::now();
 
-            // Prefill forward pass — produces logits for the first sample step.
-            let mut logits = model
-                .forward_with_hybrid_cache(&input_arr, None, Some(&mut cache), mamba_cache.as_mut())
-                .map_err(ServeError::Model)?;
-            // Blocked on mlx_rs::eval_async — would allow GPU pipeline overlap
-            // between eval and the next decode step for higher throughput.
-            logits.eval();
+            let run = Self::run_async_decode(
+                model,
+                &mut cache,
+                &mut mamba_cache,
+                &mut sampler,
+                tokenizer.as_ref(),
+                &input_ids,
+                max_tokens,
+                &stop_tokens,
+                &stop_sequences,
+                logprobs_top_n,
+                prefill_step_size,
+                Some(&prefix_cache),
+                start,
+                // Non-streaming: no side-effect callback; helper accumulates
+                // tokens + logprobs internally.
+                |_token, _logprob| StepOutcome::Continue,
+            )?;
 
-            // Sampler must be created inside spawn_blocking — it holds
-            // MLX Arrays and is !Send.
-            let mut sampler = Sampler::new(gen_config);
+            let metrics = Self::build_metrics(
+                start,
+                prompt_tokens,
+                run.completion_tokens,
+                run.first_token_time_ms,
+            );
 
-            let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-            let mut finish_reason = "length".to_string();
-            let mut first_token_time: Option<f64> = None;
-            // Track all tokens seen (prompt + generated) for repetition penalty.
-            let mut all_tokens: Vec<u32> = input_ids.clone();
-            // Pre-allocate the logprobs vector when requested so we avoid
-            // re-sizing during generation. `None` when the caller didn't opt in.
-            let mut logprobs_out: Option<Vec<TokenLogprobEntry>> =
-                logprobs_top_n.map(|_| Vec::with_capacity(max_tokens));
-
-            for i in 0..max_tokens {
-                // Sample from current logits (prefill logits on i=0, decode logits thereafter).
-                let last_logits = Self::extract_last_logits(&logits)?;
-                let next_token = sampler
-                    .sample(&last_logits, &all_tokens)
-                    .map_err(ServeError::Model)?;
-
-                // Record TTFT on first sampled token.
-                if first_token_time.is_none() {
-                    first_token_time = Some(start.elapsed().as_secs_f64() * 1000.0);
-                }
-
-                // Check stop condition before accepting the token.
-                if stop_tokens.contains(&next_token) {
-                    finish_reason = "stop".to_string();
-                    break;
-                }
-
-                // Collect logprobs *before* consuming logits for the next
-                // decode step. Only fires when caller opted in.
-                if let (Some(top_n), Some(out)) = (logprobs_top_n, logprobs_out.as_mut()) {
-                    let (logprob, mut top) = pmetal_models::generation::token_logprobs(
-                        &last_logits,
-                        next_token,
-                        top_n + 1, // +1 so we can strip the chosen token if present
-                    )
-                    .map_err(ServeError::Model)?;
-                    // OpenAI convention: top_logprobs excludes the chosen token itself.
-                    top.retain(|(tok, _)| *tok != next_token);
-                    top.truncate(top_n);
-                    out.push(TokenLogprobEntry {
-                        token: next_token,
-                        logprob,
-                        top_logprobs: top,
-                    });
-                }
-
-                generated.push(next_token);
-                all_tokens.push(next_token);
-
-                if let Some(stripped_tokens) =
-                    detect_stop_sequence_suffix(tokenizer.as_ref(), &generated, &stop_sequences)
-                {
-                    let visible_len = generated.len().saturating_sub(stripped_tokens);
-                    generated.truncate(visible_len);
-                    all_tokens.truncate(input_ids.len() + visible_len);
-                    if let Some(out) = logprobs_out.as_mut() {
-                        out.truncate(visible_len);
-                    }
-                    finish_reason = "stop".to_string();
-                    break;
-                }
-
-                // Only run a decode forward pass when there are more iterations.
-                // This avoids the wasted forward pass after the last token.
-                if i + 1 < max_tokens {
-                    let next_input = Array::from_slice(&[next_token as i32], &[1, 1]);
-                    logits = model
-                        .forward_with_hybrid_cache(
-                            &next_input,
-                            None,
-                            Some(&mut cache),
-                            mamba_cache.as_mut(),
-                        )
-                        .map_err(ServeError::Model)?;
-                    // Sync eval required — lazy graph grows unbounded without it.
-                    // Blocked on mlx_rs::eval_async for pipeline overlap.
-                    logits.eval();
-                }
-            }
-
-            let completion_tokens = generated.len();
-            let metrics =
-                Self::build_metrics(start, prompt_tokens, completion_tokens, first_token_time);
-
-            Ok::<_, ServeError>((generated, logprobs_out, finish_reason, metrics))
+            Ok::<_, ServeError>((
+                run.generated,
+                run.logprobs,
+                run.finish_reason.to_string(),
+                metrics,
+            ))
         })
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))??;
@@ -1242,6 +1796,7 @@ impl InferenceEngine {
         let backend = Arc::clone(&self.backend);
         let cache_mode_override = self.cache_mode_override;
         let tokenizer = Arc::clone(&self.tokenizer);
+        let prefix_cache = Arc::clone(&self.prefix_cache);
         // Captured per-token logprobs flag for the GPU streaming loop. The
         // accelerated paths cannot collect logprobs, so they always emit
         // TokenEvent::Token { logprob: None } regardless of this value.
@@ -1275,6 +1830,7 @@ impl InferenceEngine {
 
             let max_tokens = gen_config.max_new_tokens;
             let stop_tokens = gen_config.stop_tokens.clone();
+            let prefill_step_size = gen_config.prefill_step_size;
 
             let state_guard = match model_arc.lock() {
                 Ok(g) => g,
@@ -1290,144 +1846,71 @@ impl InferenceEngine {
             let (mut cache, mut mamba_cache) =
                 Self::create_request_caches(model, &model_path, max_seq_len, cache_mode_override);
 
-            // Build prefill input array.
-            let i32_ids: Vec<i32> = input_ids.iter().map(|&t| t as i32).collect();
-            let seq_len = input_ids.len() as i32;
-            let input_arr = Array::from_slice(&i32_ids, &[1, seq_len]);
-
+            // Sampler created inside spawn_blocking — it holds MLX Arrays.
+            let mut sampler = Sampler::new(gen_config);
             let start = Instant::now();
 
-            // Prefill forward pass — produces logits for the first sample step.
-            let mut logits = match model.forward_with_hybrid_cache(
-                &input_arr,
-                None,
-                Some(&mut cache),
-                mamba_cache.as_mut(),
-            ) {
-                Ok(l) => l,
+            // Stream each generated token through the channel. When the
+            // receiver has been dropped (client disconnected), propagate
+            // `Cancel` so the decode loop returns with `finish_reason =
+            // "cancelled"`. The closure only touches `tx`; model state is
+            // borrowed by `run_async_decode` via the other arguments.
+            let tx_inner = tx.clone();
+            let run_result = Self::run_async_decode(
+                model,
+                &mut cache,
+                &mut mamba_cache,
+                &mut sampler,
+                tokenizer.as_ref(),
+                &input_ids,
+                max_tokens,
+                &stop_tokens,
+                &stop_sequences,
+                logprobs_top_n,
+                prefill_step_size,
+                Some(&prefix_cache),
+                start,
+                |token, logprob| {
+                    if tx_inner
+                        .blocking_send(TokenEvent::Token {
+                            id: token,
+                            logprob,
+                        })
+                        .is_err()
+                    {
+                        StepOutcome::Cancel
+                    } else {
+                        StepOutcome::Continue
+                    }
+                },
+            );
+
+            let run = match run_result {
+                Ok(r) => r,
                 Err(e) => {
-                    send!(TokenEvent::Error(e.to_string()));
+                    let _ = tx.blocking_send(TokenEvent::Error(e.to_string()));
                     return;
                 }
             };
-            // Sync eval required — lazy graph grows unbounded without it.
-            // Blocked on mlx_rs::eval_async for pipeline overlap.
-            logits.eval();
 
-            // Sampler created inside spawn_blocking — it holds MLX Arrays.
-            let mut sampler = Sampler::new(gen_config);
-
-            let mut completion_tokens = 0usize;
-            let mut finish_reason = "length".to_string();
-            let mut first_token_time: Option<f64> = None;
-            let mut all_tokens: Vec<u32> = input_ids.clone();
-            let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-            let mut stripped_tokens = 0usize;
-
-            for i in 0..max_tokens {
-                // Sample from current logits (prefill logits on i=0, decode logits thereafter).
-                let last_logits = match Self::extract_last_logits(&logits) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        send!(TokenEvent::Error(e.to_string()));
-                        return;
-                    }
-                };
-
-                let next_token = match sampler.sample(&last_logits, &all_tokens) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        send!(TokenEvent::Error(e.to_string()));
-                        return;
-                    }
-                };
-
-                // Record TTFT on first sampled token.
-                if first_token_time.is_none() {
-                    first_token_time = Some(start.elapsed().as_secs_f64() * 1000.0);
-                }
-
-                // Check stop condition before emitting the token.
-                if stop_tokens.contains(&next_token) {
-                    finish_reason = "stop".to_string();
-                    break;
-                }
-
-                // Compute logprobs *before* the next forward pass — last_logits
-                // is still in scope and we have the chosen token id. Cheap when
-                // top_n is small; bypassed entirely when caller didn't opt in.
-                let logprob_entry = match logprobs_top_n {
-                    Some(top_n) => {
-                        match pmetal_models::generation::token_logprobs(
-                            &last_logits,
-                            next_token,
-                            top_n + 1,
-                        ) {
-                            Ok((lp, mut top)) => {
-                                top.retain(|(tok, _)| *tok != next_token);
-                                top.truncate(top_n);
-                                Some(TokenLogprobEntry {
-                                    token: next_token,
-                                    logprob: lp,
-                                    top_logprobs: top,
-                                })
-                            }
-                            Err(_) => None,
-                        }
-                    }
-                    None => None,
-                };
-
-                // Emit token before running the next forward pass so the
-                // route handler can begin decoding and sending it to the
-                // client while the GPU works on the next token.
-                send!(TokenEvent::Token {
-                    id: next_token,
-                    logprob: logprob_entry,
-                });
-                completion_tokens += 1;
-                all_tokens.push(next_token);
-                generated.push(next_token);
-
-                if let Some(matched_tokens) =
-                    detect_stop_sequence_suffix(tokenizer.as_ref(), &generated, &stop_sequences)
-                {
-                    stripped_tokens = matched_tokens;
-                    completion_tokens = completion_tokens.saturating_sub(matched_tokens);
-                    finish_reason = "stop".to_string();
-                    break;
-                }
-
-                // Only run a decode forward pass when there are more iterations.
-                // This avoids the wasted forward pass after the last token.
-                if i + 1 < max_tokens {
-                    let next_input = Array::from_slice(&[next_token as i32], &[1, 1]);
-                    logits = match model.forward_with_hybrid_cache(
-                        &next_input,
-                        None,
-                        Some(&mut cache),
-                        mamba_cache.as_mut(),
-                    ) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            send!(TokenEvent::Error(e.to_string()));
-                            return;
-                        }
-                    };
-                    // Sync eval required — prevents unbounded lazy graph growth.
-                    // Blocked on mlx_rs::eval_async for pipeline overlap.
-                    logits.eval();
-                }
+            // If the client dropped mid-stream, drop the Done event too —
+            // nothing is listening.
+            if run.finish_reason == "cancelled" {
+                return;
             }
 
-            let metrics =
-                Self::build_metrics(start, prompt_tokens, completion_tokens, first_token_time);
+            let metrics = Self::build_metrics(
+                start,
+                prompt_tokens,
+                run.completion_tokens,
+                run.first_token_time_ms,
+            );
 
             // Done — send final event (ignore send error, client may be gone).
             let _ = tx.blocking_send(TokenEvent::Done {
-                finish_reason,
+                finish_reason: run.finish_reason.to_string(),
                 metrics,
-                stripped_tokens,
+                stripped_tokens: run.stripped_tokens,
             });
         });
 

@@ -1,6 +1,7 @@
 //! Server setup and configuration.
 
 use crate::anthropic;
+use crate::continuous_batch::BatcherConfig;
 use crate::engine::InferenceEngine;
 use crate::routes::{self, AppState, ServingMetrics};
 use axum::Router;
@@ -18,6 +19,10 @@ pub struct ServeConfig {
     pub host: String,
     /// Maximum concurrent requests.
     pub max_concurrent: usize,
+    /// When set, enable the continuous-batching engine at startup with
+    /// the given slot-pool configuration. `None` (default) keeps the
+    /// engine on the single-request `generate_streaming` path.
+    pub continuous_batching: Option<BatcherConfig>,
 }
 
 impl Default for ServeConfig {
@@ -28,6 +33,7 @@ impl Default for ServeConfig {
             // explicitly set host to "0.0.0.0" or a specific interface address.
             host: "127.0.0.1".to_string(),
             max_concurrent: 16,
+            continuous_batching: None,
         }
     }
 }
@@ -59,6 +65,19 @@ pub fn build_router(engine: InferenceEngine, max_concurrent: usize) -> Router {
 
 /// Start the server.
 pub async fn run_server(engine: InferenceEngine, config: ServeConfig) -> anyhow::Result<()> {
+    // Opt-in continuous batching. Enabled here (before building the
+    // router) so the driver thread is up and the route handler can
+    // rely on `continuous_batching_enabled()` returning a stable
+    // answer for the lifetime of the server.
+    if let Some(batcher_config) = config.continuous_batching.clone() {
+        tracing::info!(
+            max_slots = batcher_config.max_slots,
+            max_queue_depth = batcher_config.max_queue_depth,
+            "Enabling continuous batching"
+        );
+        engine.enable_continuous_batching_auto(batcher_config)?;
+    }
+
     let router = build_router(engine, config.max_concurrent);
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 

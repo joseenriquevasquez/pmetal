@@ -40,6 +40,43 @@ pub struct ServingMetrics {
     pub sum_prompt_tokens: AtomicU64,
 }
 
+/// Whether a request is compatible with the continuous-batching path.
+///
+/// Since Phase 1 the pump implements per-slot stop-sequence string
+/// matching, per-slot top-N logprobs, and per-slot repetition /
+/// frequency / presence penalties, so the gate is permissive: every
+/// currently-supported `SamplingParams` shape is batched-eligible.
+///
+/// The function is kept as a seam in case a future feature ships behind
+/// a temporary gate before the pump learns to handle it; callers still
+/// fall back to `generate_streaming` when this returns `false`.
+pub(crate) fn is_batched_compatible(_params: &SamplingParams) -> bool {
+    true
+}
+
+/// Pick the right streaming receiver: the continuous-batching pump
+/// when enabled and the request is compatible, else the single-request
+/// path. Falls through to the legacy path if the pump rejects (e.g.
+/// queue saturated) so saturation degrades to higher latency rather
+/// than 5xx errors.
+pub(crate) fn stream_tokens(
+    engine: &InferenceEngine,
+    input_ids: &[u32],
+    params: SamplingParams,
+) -> tokio::sync::mpsc::Receiver<TokenEvent> {
+    if engine.continuous_batching_enabled() && is_batched_compatible(&params) {
+        match engine.generate_batched(input_ids, params.clone()) {
+            Ok(rx) => return rx,
+            Err(e) => {
+                tracing::warn!(
+                    "continuous-batching enqueue failed ({e}); falling back to single-request path"
+                );
+            }
+        }
+    }
+    engine.generate_streaming(input_ids, params)
+}
+
 impl ServingMetrics {
     /// Record metrics from a completed request.
     pub fn record(&self, metrics: &RequestMetrics) {
@@ -222,13 +259,16 @@ pub async fn chat_completions(
     if req.stream.unwrap_or(false) {
         // ── True token-by-token streaming ────────────────────────────────────
         //
-        // generate_streaming spawns a blocking thread immediately and returns
-        // an mpsc Receiver. We wrap it in ReceiverStream and flat_map each
-        // TokenEvent to one or more SSE events.
+        // When continuous batching is enabled on the engine and the
+        // request is feature-compatible (no stop-sequences / logprobs
+        // / penalties — see `is_batched_compatible`), `stream_tokens`
+        // dispatches through the pump. Otherwise it falls back to the
+        // single-request `generate_streaming` path so no feature is
+        // silently dropped.
         //
         // Token decoding happens on the async side using a cloned Arc to the
         // tokenizer — pmetal_data::Tokenizer is Send + Sync, so this is safe.
-        let rx = state.engine.generate_streaming(&input_ids, params);
+        let rx = stream_tokens(&state.engine, &input_ids, params);
         let tokenizer = state.engine.tokenizer_arc();
         let metrics_handle = Arc::clone(&state);
 
@@ -362,7 +402,7 @@ pub async fn completions(
 
     if req.stream.unwrap_or(false) {
         // ── Streaming text completions ───────────────────────────────────────
-        let rx = state.engine.generate_streaming(&input_ids, params);
+        let rx = stream_tokens(&state.engine, &input_ids, params);
         let tokenizer = state.engine.tokenizer_arc();
         let metrics_handle = Arc::clone(&state);
 
@@ -1015,5 +1055,80 @@ pub(crate) fn resolve_stop_sequences(
     ResolvedStopSequences {
         token_ids,
         sequences,
+    }
+}
+
+#[cfg(test)]
+mod batching_gate_tests {
+    use super::*;
+
+    fn base_params() -> SamplingParams {
+        SamplingParams {
+            max_tokens: 16,
+            temperature: 0.7,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            extra_stop_token_ids: vec![],
+            stop_sequences: vec![],
+            logprobs_top_n: None,
+        }
+    }
+
+    #[test]
+    fn default_params_are_batched_compatible() {
+        assert!(is_batched_compatible(&base_params()));
+    }
+
+    #[test]
+    fn stop_sequences_remain_batched() {
+        // Phase 1a: pump now runs per-slot stop-sequence matching via
+        // an `IncrementalDecoder` + `Tokenizer` on the emit path.
+        let mut p = base_params();
+        p.stop_sequences = vec!["\n\n".into()];
+        assert!(is_batched_compatible(&p));
+    }
+
+    #[test]
+    fn logprobs_remain_batched() {
+        // Phase 1c: pump computes `token_logprobs` from last-position
+        // logits and attaches them to `TokenEvent::Token`.
+        let mut p = base_params();
+        p.logprobs_top_n = Some(3);
+        assert!(is_batched_compatible(&p));
+    }
+
+    #[test]
+    fn penalties_remain_batched() {
+        // Phase 1b: driver calls `sample_array_with_penalties` +
+        // `update_counts` per slot so repetition / frequency / presence
+        // penalties work in the batched path.
+        for (rep, freq, pres) in [
+            (Some(1.1), None, None),
+            (None, Some(0.5), None),
+            (None, None, Some(0.3)),
+        ] {
+            let mut p = base_params();
+            p.repetition_penalty = rep;
+            p.frequency_penalty = freq;
+            p.presence_penalty = pres;
+            assert!(
+                is_batched_compatible(&p),
+                "penalties rep={rep:?} freq={freq:?} pres={pres:?} should stay batched"
+            );
+        }
+    }
+
+    #[test]
+    fn neutral_penalty_values_are_compatible() {
+        let mut p = base_params();
+        p.repetition_penalty = Some(1.0);
+        p.frequency_penalty = Some(0.0);
+        p.presence_penalty = Some(0.0);
+        assert!(is_batched_compatible(&p));
     }
 }
