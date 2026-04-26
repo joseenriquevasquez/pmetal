@@ -359,19 +359,24 @@ int mlx_inline_dim(const mlx_inline_array* a, int axis) {
 }
 const int* mlx_inline_shape(const mlx_inline_array* a) { return as_arr(a).shape().data(); }
 int mlx_inline_dtype(const mlx_inline_array* a) {
+    // Reverse of dtype_from_int in bridge_internal.h. Returns -1 for any
+    // dtype not in the enumeration so callers can detect "unknown" instead
+    // of silently treating it as Float32.
     auto dt = as_arr(a).dtype();
-    if (dt == mlx::core::bool_) return 0;
-    if (dt == mlx::core::uint8) return 1;
-    if (dt == mlx::core::uint16) return 2;
-    if (dt == mlx::core::uint32) return 3;
-    if (dt == mlx::core::int8) return 5;
-    if (dt == mlx::core::int16) return 6;
-    if (dt == mlx::core::int32) return 7;
-    if (dt == mlx::core::int64) return 8;
-    if (dt == mlx::core::float16) return 9;
-    if (dt == mlx::core::float32) return 10;
-    if (dt == mlx::core::bfloat16) return 11;
-    return 10; // fallback
+    if (dt == mlx::core::bool_)     return 0;
+    if (dt == mlx::core::uint8)     return 1;
+    if (dt == mlx::core::uint16)    return 2;
+    if (dt == mlx::core::uint32)    return 3;
+    if (dt == mlx::core::uint64)    return 4;
+    if (dt == mlx::core::int8)      return 5;
+    if (dt == mlx::core::int16)     return 6;
+    if (dt == mlx::core::int32)     return 7;
+    if (dt == mlx::core::int64)     return 8;
+    if (dt == mlx::core::float16)   return 9;
+    if (dt == mlx::core::float32)   return 10;
+    if (dt == mlx::core::bfloat16)  return 11;
+    if (dt == mlx::core::complex64) return 12;
+    return -1; // sentinel: unknown dtype
 }
 
 // Item extraction. Scalar returns mean we can't use BRIDGE_TRY_DST; use a

@@ -70,16 +70,20 @@ void mlx_inline_cos(mlx_inline_array* dst, const mlx_inline_array* a) {
 
 void mlx_inline_clip(mlx_inline_array* dst, const mlx_inline_array* a,
                      const mlx_inline_array* lo, const mlx_inline_array* hi) {
-    auto low_opt  = lo ? std::optional<array>(as_arr(lo)) : std::nullopt;
-    auto high_opt = hi ? std::optional<array>(as_arr(hi)) : std::nullopt;
-    new (dst->buf) array(mlx::core::clip(as_arr(a), low_opt, high_opt));
+    BRIDGE_TRY_DST("clip", dst, {
+        auto low_opt  = lo ? std::optional<array>(as_arr(lo)) : std::nullopt;
+        auto high_opt = hi ? std::optional<array>(as_arr(hi)) : std::nullopt;
+        new (dst->buf) array(mlx::core::clip(as_arr(a), low_opt, high_opt));
+    });
 }
 
 void mlx_inline_log_softmax(mlx_inline_array* dst, const mlx_inline_array* a, int axis) {
     // log_softmax(x) = x - logsumexp(x, axis, keepdims=true)
-    const auto& x = as_arr(a);
-    auto lse = mlx::core::logsumexp(x, axis, true);
-    new (dst->buf) array(mlx::core::subtract(x, lse));
+    BRIDGE_TRY_DST("log_softmax", dst, {
+        const auto& x = as_arr(a);
+        auto lse = mlx::core::logsumexp(x, axis, true);
+        new (dst->buf) array(mlx::core::subtract(x, lse));
+    });
 }
 
 void mlx_inline_cross_entropy(mlx_inline_array* dst, const mlx_inline_array* logits,
@@ -230,12 +234,14 @@ void mlx_inline_less_equal(mlx_inline_array* dst, const mlx_inline_array* a, con
 
 void mlx_inline_save_safetensors(const char* path, const char** keys,
                                   const mlx_inline_array* arrays, int count) {
-    std::unordered_map<std::string, array> map;
-    map.reserve(count);
-    for (int i = 0; i < count; i++) {
-        map.emplace(std::string(keys[i]), as_arr(&arrays[i]));
-    }
-    mlx::core::save_safetensors(std::string(path), std::move(map));
+    BRIDGE_TRY_VOID("save_safetensors", {
+        std::unordered_map<std::string, array> map;
+        map.reserve(count);
+        for (int i = 0; i < count; i++) {
+            map.emplace(std::string(keys[i]), as_arr(&arrays[i]));
+        }
+        mlx::core::save_safetensors(std::string(path), std::move(map));
+    });
 }
 
 // ── Training ops: quantize ───────────────────────────────────────────────────
@@ -243,10 +249,26 @@ void mlx_inline_save_safetensors(const char* path, const char** keys,
 void mlx_inline_quantize(mlx_inline_array* dst_w, mlx_inline_array* dst_scales,
                           mlx_inline_array* dst_biases,
                           const mlx_inline_array* a, int group_size, int bits) {
-    auto result = mlx::core::quantize(as_arr(a), group_size, bits);
-    new (dst_w->buf)      array(std::move(result[0]));
-    new (dst_scales->buf) array(std::move(result[1]));
-    new (dst_biases->buf) array(std::move(result[2]));
+    // Multi-output: BRIDGE_TRY_DST targets a single dst, so use manual try/catch
+    // and placement-new scalar-zero sentinels into all three slots on failure
+    // so Rust drops never call ~array() on uninit memory.
+    try {
+        auto result = mlx::core::quantize(as_arr(a), group_size, bits);
+        new (dst_w->buf)      array(std::move(result[0]));
+        new (dst_scales->buf) array(std::move(result[1]));
+        new (dst_biases->buf) array(std::move(result[2]));
+        pmetal_bridge_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_bridge_set_last_error("quantize", e.what());
+        new (dst_w->buf)      array(0.0f);
+        new (dst_scales->buf) array(0.0f);
+        new (dst_biases->buf) array(0.0f);
+    } catch (...) {
+        pmetal_bridge_set_last_error("quantize", "unknown C++ exception");
+        new (dst_w->buf)      array(0.0f);
+        new (dst_scales->buf) array(0.0f);
+        new (dst_biases->buf) array(0.0f);
+    }
 }
 
 // ── Training ops: multi-axis sum/mean ────────────────────────────────────────
@@ -295,10 +317,12 @@ void mlx_inline_stop_gradient(mlx_inline_array* dst, const mlx_inline_array* a) 
 void mlx_inline_tri_inv(mlx_inline_array* dst, const mlx_inline_array* a, bool upper, bool use_cpu) {
     // tri_inv has no VJP in MLX — used in WY factorization as a fixed preconditioner.
     // use_cpu=true routes execution to the CPU device (matching mlx-lm's StreamOrDevice::cpu()).
-    mlx::core::StreamOrDevice stream = use_cpu
-        ? mlx::core::StreamOrDevice{mlx::core::Device(mlx::core::Device::cpu)}
-        : mlx::core::StreamOrDevice{};
-    new (dst->buf) array(mlx::core::linalg::tri_inv(as_arr(a), upper, stream));
+    BRIDGE_TRY_DST("tri_inv", dst, {
+        mlx::core::StreamOrDevice stream = use_cpu
+            ? mlx::core::StreamOrDevice{mlx::core::Device(mlx::core::Device::cpu)}
+            : mlx::core::StreamOrDevice{};
+        new (dst->buf) array(mlx::core::linalg::tri_inv(as_arr(a), upper, stream));
+    });
 }
 
 void mlx_inline_svd(
@@ -309,12 +333,25 @@ void mlx_inline_svd(
 {
     // SVD always runs on CPU (GPU SVD not available in MLX).
     // Returns economy / thin SVD: U[m,k], S[k], Vt[k,n] where k=min(m,n).
-    mlx::core::StreamOrDevice cpu_stream{mlx::core::Device(mlx::core::Device::cpu)};
-    auto result = mlx::core::linalg::svd(as_arr(a), /* compute_uv */ true, cpu_stream);
-    // result = {U, S, Vt}
-    new (dst_u->buf)  array(result[0]);
-    new (dst_s->buf)  array(result[1]);
-    new (dst_vt->buf) array(result[2]);
+    // Multi-output: manual try/catch with sentinel-zero on failure.
+    try {
+        mlx::core::StreamOrDevice cpu_stream{mlx::core::Device(mlx::core::Device::cpu)};
+        auto result = mlx::core::linalg::svd(as_arr(a), /* compute_uv */ true, cpu_stream);
+        new (dst_u->buf)  array(result[0]);
+        new (dst_s->buf)  array(result[1]);
+        new (dst_vt->buf) array(result[2]);
+        pmetal_bridge_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_bridge_set_last_error("svd", e.what());
+        new (dst_u->buf)  array(0.0f);
+        new (dst_s->buf)  array(0.0f);
+        new (dst_vt->buf) array(0.0f);
+    } catch (...) {
+        pmetal_bridge_set_last_error("svd", "unknown C++ exception");
+        new (dst_u->buf)  array(0.0f);
+        new (dst_s->buf)  array(0.0f);
+        new (dst_vt->buf) array(0.0f);
+    }
 }
 
 // ── Autograd: value_and_grad ─────────────────────────────────────────────────
