@@ -153,7 +153,34 @@ pub(super) fn attn_forward(
     let num_new = keys.dim(2); // T for prefill, 1 for decode
     let next = prev + num_new;
 
-    let output = if let Some(qcfg) = cache.quant_config {
+    let output = if let Some(ref mut tq_cache) = cache.turboquant {
+        // ── TurboQuant compressed KV cache path ────────────────────────────
+        // Decode + NoPE prefill: shared dispatch helper handles
+        // append_and_compute_attention (with hot/cold split) and falls back
+        // to dequantize + standard SDPA on error or for prefill-with-history.
+        //
+        // Local-layer prefill with chunk_mask: TurboQuant's direct-attention
+        // path doesn't accept a custom additive mask, so we mirror the affine
+        // prefill — append, dequantize the full cache, run sdpa_with_mask.
+        if let (true, Some(mask_int)) = (lw.use_rope, chunk_mask) {
+            let dtype = queries.dtype_raw();
+            tq_cache.append(&keys, &values).ok();
+            cache.offset = next;
+            let valid_keys = tq_cache.dequantize_keys().unwrap_or_else(|| keys.clone());
+            let valid_values = tq_cache
+                .dequantize_values()
+                .unwrap_or_else(|| values.clone());
+            let mask_full = make_additive_mask(&mask_int.slice(&[0, 0], &[s, next]), dtype);
+            let mask_4d = mask_full.reshape(&[1, 1, s, next]);
+            queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(&mask_4d))
+        } else {
+            let out = crate::turboquant_dispatch::turboquant_attention_step(
+                tq_cache, &queries, &keys, &values, scale, prev, "LLAMA4",
+            );
+            cache.offset = next;
+            out
+        }
+    } else if let Some(qcfg) = cache.quant_config {
         // ── Zero-overhead affine-quantized KV cache path ──────────────────
         // Matches mlx-lm's QuantizedKVCache: quantize K/V immediately after
         // RoPE/QK-norm, store as (packed_uint32, scales, biases), pass to
@@ -322,24 +349,32 @@ pub(super) fn attn_forward(
         }
     } else {
         // ── Standard bf16 path ────────────────────────────────────────────
-        if cache.keys.is_none() {
-            let alloc = 256i32;
-            let dtype = keys.dtype_raw();
-            cache.keys = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
-            cache.values = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
-        } else {
-            // Grow if needed
-            let allocated = cache.keys.as_ref().unwrap().dim(2);
-            if next > allocated {
-                let dtype = cache.keys.as_ref().unwrap().dtype_raw();
-                let old_k = cache.keys.take().unwrap();
-                let old_v = cache.values.take().unwrap();
-                let ext_k = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
-                let ext_v = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
-                cache.keys = Some(old_k.kv_cache_append(&ext_k, 2));
-                cache.values = Some(old_v.kv_cache_append(&ext_v, 2));
-            }
-        }
+        //
+        // Fused-decode design note (audit 2026-04-25): Qwen3's
+        // `compiled_attn_layer_fixed` does not generalise to Llama 4 because
+        // every iRoPE invariant differs — RoPE is per-layer (`use_rope` flag),
+        // q/k norm is gated on `attn_qk_norm`, NoPE layers apply temperature
+        // tuning, and the cache append shape varies with chunk-mask presence.
+        // A `compiled_llama4_attn_layer_fixed` kernel would need either two
+        // specialisations (NoPE + RoPE) or a parameterised graph — both larger
+        // than the per-op overhead they would save. Decision: keep the
+        // per-op path for now; revisit once a parity baseline with mlx-lm is
+        // measured and the kernel write is justified by tok/s data.
+        let dtype = cache
+            .keys
+            .as_ref()
+            .map(|k| k.dtype_raw())
+            .unwrap_or_else(|| keys.dtype_raw());
+        crate::native_common::kv_cache::alloc_or_grow_kv(
+            crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+            &mut cache.keys,
+            &mut cache.values,
+            b,
+            n_kv_heads,
+            next,
+            head_dim,
+            dtype,
+        );
 
         let start_coord = [0, 0, prev, 0];
         let stop_coord = [b, n_kv_heads, next, head_dim];

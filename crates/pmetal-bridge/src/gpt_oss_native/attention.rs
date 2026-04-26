@@ -156,6 +156,21 @@ pub(super) fn attn_forward(
             proj = proj.add(ob);
         }
         proj
+    } else if let Some(ref mut tq_cache) = cache.turboquant {
+        // ── Full attention, TurboQuant compressed KV cache path ────────────
+        // Sliding layers can't take this branch (turboquant is None there).
+        let out = crate::turboquant_dispatch::turboquant_attention_step(
+            tq_cache, &q, &k, &v, scale, prev, "GPT_OSS",
+        );
+        cache.offset = next;
+        let output = out
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[b, s, n_heads * head_dim]);
+        let mut proj = output.matmul(&lw.attn_o_w);
+        if let Some(ref ob) = lw.attn_o_b {
+            proj = proj.add(ob);
+        }
+        proj
     } else if let Some(qcfg) = cache.quant_config {
         // ── Full attention, zero-overhead quantized KV cache path ──────────
         // quant_config is None on sliding layers (set in new_with_quant), so
@@ -291,21 +306,29 @@ pub(super) fn attn_forward(
         proj
     } else {
         // ── Full attention: standard bf16 path ────────────────────────────
-        if cache.keys.is_none() {
-            let alloc = 256i32;
-            cache.keys = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
-            cache.values = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
-        } else {
-            let allocated = cache.keys.as_ref().unwrap().dim(2);
-            if next > allocated {
-                let old_k = cache.keys.take().unwrap();
-                let old_v = cache.values.take().unwrap();
-                let ext_k = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
-                let ext_v = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
-                cache.keys = Some(old_k.kv_cache_append(&ext_k, 2));
-                cache.values = Some(old_v.kv_cache_append(&ext_v, 2));
-            }
-        }
+        //
+        // Fused-decode design note (audit 2026-04-25): Qwen3 routes single-token
+        // decode through `compiled_attn_layer_fixed`, a single MLX-compile graph
+        // that fuses Q/K/V proj → q/k norm → RoPE → cache write → SDPA → o_proj.
+        // GPT-OSS cannot reuse that kernel because the per-layer shape differs:
+        //   * GPT-OSS has q/k/v/o **biases** (Qwen3's kernel is bias-less);
+        //   * GPT-OSS has **no** q/k norm (the kernel hardcodes both);
+        //   * GPT-OSS alternates between full attention and **sliding window**
+        //     per layer — sliding-window decode would need bounded cache reads
+        //     baked into the compiled graph.
+        // A dedicated `compiled_gptoss_attn_layer_fixed` would close the gap;
+        // it is omitted here because the per-op path below is correct today
+        // and the kernel write is a multi-day task with no parity baseline yet.
+        crate::native_common::kv_cache::alloc_or_grow_kv(
+            crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+            &mut cache.keys,
+            &mut cache.values,
+            b,
+            n_kv_heads,
+            next,
+            head_dim,
+            dtype,
+        );
 
         // In-place update: cache[..., prev:next, :] = new_kv
         let start = [0, 0, prev, 0];

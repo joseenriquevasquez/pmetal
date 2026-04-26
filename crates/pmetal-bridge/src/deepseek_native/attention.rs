@@ -227,21 +227,28 @@ pub(super) fn mla_forward(
         (all_kv_latent, all_k_pe)
     } else {
         // ── Standard bf16 path ────────────────────────────────────────────
-        if cache.kv_latent.is_none() {
-            let alloc = 256i32;
-            cache.kv_latent = Some(InlineArray::zeros(&[b, 1, alloc, lora_rank], 11));
-            cache.k_pe = Some(InlineArray::zeros(&[b, 1, alloc, rope_dim], 11));
-        } else {
-            let allocated = cache.kv_latent.as_ref().unwrap().dim(2);
-            if next > allocated {
-                let old_kv = cache.kv_latent.take().unwrap();
-                let old_kp = cache.k_pe.take().unwrap();
-                let ext_kv = InlineArray::zeros(&[b, 1, 256, lora_rank], 11);
-                let ext_kp = InlineArray::zeros(&[b, 1, 256, rope_dim], 11);
-                cache.kv_latent = Some(old_kv.kv_cache_append(&ext_kv, 2));
-                cache.k_pe = Some(old_kp.kv_cache_append(&ext_kp, 2));
-            }
-        }
+        // MLA stores `kv_latent` (B,1,T,lora_rank) and `k_pe` (B,1,T,rope_dim)
+        // — same time axis, different last dims — so each leg uses
+        // alloc_or_grow_buffer with a per-leg shape closure. dtype 11 is
+        // bfloat16 (matches mlx-lm's MLA cache layout).
+        use crate::native_common::kv_cache::{GrowthPolicy, alloc_or_grow_buffer};
+        const BF16: i32 = 11;
+        alloc_or_grow_buffer(
+            GrowthPolicy::AmortizedChunked,
+            &mut cache.kv_latent,
+            next,
+            2,
+            BF16,
+            |cap| [b, 1, cap, lora_rank],
+        );
+        alloc_or_grow_buffer(
+            GrowthPolicy::AmortizedChunked,
+            &mut cache.k_pe,
+            next,
+            2,
+            BF16,
+            |cap| [b, 1, cap, rope_dim],
+        );
 
         let start_kv = [0i32, 0, prev, 0];
         let stop_kv = [b, 1, next, lora_rank];

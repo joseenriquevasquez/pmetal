@@ -5,8 +5,39 @@
 use crate::InlineArray;
 
 use super::cache::{KvLayerCache, QuantizedTuple};
-use super::trace_turboquant_qwen;
 use super::weights::{LayerWeight, LayerWeights};
+
+// ============================================================================
+// Mixed-bit quantization helpers
+// ============================================================================
+
+/// Quantize one half of a `[B, H_kv, S, channels]` K/V slice through MLX's
+/// `quantize_weights` and reshape the (packed, scales, biases) triple back
+/// to 4-D.
+///
+/// Folds the flatten → quantize → reshape ritual that previously repeated
+/// once per (key/value × hi/lo) pair in the mixed-bit cache append path.
+/// `channels` is the slice's last-dim size (`outlier_count` for the hi
+/// half, `head_dim - outlier_count` for the lo half).
+fn quantize_kv_slice(
+    src: &InlineArray,
+    b: i32,
+    n_kv_heads: i32,
+    s: i32,
+    channels: i32,
+    group_size: i32,
+    bits: i32,
+) -> (InlineArray, InlineArray, InlineArray) {
+    let flat = src.reshape(&[b * n_kv_heads * s, channels]);
+    let (packed, scales, biases) = flat.quantize_weights(group_size, bits);
+    let packed_dim = (channels * bits + 31) / 32;
+    let scales_dim = channels / group_size;
+    (
+        packed.reshape(&[b, n_kv_heads, s, packed_dim]),
+        scales.reshape(&[b, n_kv_heads, s, scales_dim]),
+        biases.reshape(&[b, n_kv_heads, s, scales_dim]),
+    )
+}
 
 // ============================================================================
 // Attention layer forward
@@ -113,23 +144,16 @@ pub(super) fn attn_forward_with_tree_ctx(
     let scale = lw.attn_scale;
     let prev = cache.offset;
     let next = prev + s;
-    if cache.keys.is_none() {
-        let alloc = ((next + 255) / 256) * 256;
-        cache.keys = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
-        cache.values = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
-    } else {
-        let allocated = cache.keys.as_ref().unwrap().dim(2);
-        if next > allocated {
-            let grow_to = ((next + 255) / 256) * 256;
-            let extend = grow_to - allocated;
-            let old_k = cache.keys.take().unwrap();
-            let old_v = cache.values.take().unwrap();
-            let ext_k = InlineArray::zeros(&[b, n_kv_heads, extend, head_dim], dtype);
-            let ext_v = InlineArray::zeros(&[b, n_kv_heads, extend, head_dim], dtype);
-            cache.keys = Some(old_k.kv_cache_append(&ext_k, 2));
-            cache.values = Some(old_v.kv_cache_append(&ext_v, 2));
-        }
-    }
+    crate::native_common::kv_cache::alloc_or_grow_kv(
+        crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+        &mut cache.keys,
+        &mut cache.values,
+        b,
+        n_kv_heads,
+        next,
+        head_dim,
+        dtype,
+    );
 
     if s == 1 && cache.turboquant.is_none() && cache.quant_config.is_none() {
         if let (
@@ -255,51 +279,11 @@ pub(super) fn attn_forward_with_tree_ctx(
 
     // KV cache update + SDPA
     let output = if let Some(ref mut tq_cache) = cache.turboquant {
-        if s == 1 {
-            match tq_cache.append_and_compute_attention(&queries, &keys, &values, scale) {
-                Ok(output) => {
-                    cache.offset = next;
-                    output
-                }
-                Err(err) => {
-                    trace_turboquant_qwen(&format!(
-                        "decode_fallback=append_and_compute_attention_err seq={} prev={} err={}",
-                        next, prev, err
-                    ));
-                    tq_cache.append(&keys, &values).ok();
-                    let full_keys = tq_cache.dequantize_keys().unwrap_or_else(|| keys.clone());
-                    let full_values = tq_cache
-                        .dequantize_values()
-                        .unwrap_or_else(|| values.clone());
-                    cache.offset = next;
-                    crate::decode::sdpa_causal_like_mlx(
-                        &queries,
-                        &full_keys,
-                        &full_values,
-                        scale,
-                        s,
-                    )
-                }
-            }
-        } else {
-            tq_cache.append(&keys, &values).ok();
-            cache.offset = next;
-            if prev == 0 {
-                trace_turboquant_qwen(&format!("prefill_path=dense_prompt_only seq={}", next));
-                crate::decode::sdpa_causal_like_mlx(&queries, &keys, &values, scale, s)
-            } else {
-                trace_turboquant_qwen(&format!(
-                    "prefill_fallback=full_dequantized seq={} prev={}",
-                    next, prev
-                ));
-                let full_keys = tq_cache.dequantize_keys().unwrap_or_else(|| keys.clone());
-                let full_values = tq_cache
-                    .dequantize_values()
-                    .unwrap_or_else(|| values.clone());
-                cache.offset = next;
-                crate::decode::sdpa_causal_like_mlx(&queries, &full_keys, &full_values, scale, s)
-            }
-        }
+        let out = crate::turboquant_dispatch::turboquant_attention_step(
+            tq_cache, &queries, &keys, &values, scale, prev, "QWEN",
+        );
+        cache.offset = next;
+        out
     } else if let Some(qcfg) = cache.quant_config {
         let group_size = qcfg.group_size;
 
@@ -325,43 +309,16 @@ pub(super) fn attn_forward_with_tree_ctx(
             let v_hi = values.slice(&[0, 0, 0, 0], &[b, n_kv_heads, s, oc]);
             let v_lo = values.slice(&[0, 0, 0, oc], &[b, n_kv_heads, s, head_dim]);
 
-            // Quantize each half → (packed, scales, biases)
-            let (kp_hi, ks_hi, kb_hi) = {
-                let flat = k_hi.reshape(&[b * n_kv_heads * s, oc]);
-                let (p, s_, bi) = flat.quantize_weights(group_size, bits_hi);
-                (
-                    p.reshape(&[b, n_kv_heads, s, packed_dim_hi]),
-                    s_.reshape(&[b, n_kv_heads, s, scales_dim_hi]),
-                    bi.reshape(&[b, n_kv_heads, s, scales_dim_hi]),
-                )
-            };
-            let (kp_lo, ks_lo, kb_lo) = {
-                let flat = k_lo.reshape(&[b * n_kv_heads * s, rc]);
-                let (p, s_, bi) = flat.quantize_weights(group_size, bits_lo);
-                (
-                    p.reshape(&[b, n_kv_heads, s, packed_dim_lo]),
-                    s_.reshape(&[b, n_kv_heads, s, scales_dim_lo]),
-                    bi.reshape(&[b, n_kv_heads, s, scales_dim_lo]),
-                )
-            };
-            let (vp_hi, vs_hi, vb_hi) = {
-                let flat = v_hi.reshape(&[b * n_kv_heads * s, oc]);
-                let (p, s_, bi) = flat.quantize_weights(group_size, bits_hi);
-                (
-                    p.reshape(&[b, n_kv_heads, s, packed_dim_hi]),
-                    s_.reshape(&[b, n_kv_heads, s, scales_dim_hi]),
-                    bi.reshape(&[b, n_kv_heads, s, scales_dim_hi]),
-                )
-            };
-            let (vp_lo, vs_lo, vb_lo) = {
-                let flat = v_lo.reshape(&[b * n_kv_heads * s, rc]);
-                let (p, s_, bi) = flat.quantize_weights(group_size, bits_lo);
-                (
-                    p.reshape(&[b, n_kv_heads, s, packed_dim_lo]),
-                    s_.reshape(&[b, n_kv_heads, s, scales_dim_lo]),
-                    bi.reshape(&[b, n_kv_heads, s, scales_dim_lo]),
-                )
-            };
+            // Quantize each half → (packed, scales, biases). The helper folds
+            // the flatten/quantize/reshape ritual into one call per leg.
+            let (kp_hi, ks_hi, kb_hi) =
+                quantize_kv_slice(&k_hi, b, n_kv_heads, s, oc, group_size, bits_hi);
+            let (kp_lo, ks_lo, kb_lo) =
+                quantize_kv_slice(&k_lo, b, n_kv_heads, s, rc, group_size, bits_lo);
+            let (vp_hi, vs_hi, vb_hi) =
+                quantize_kv_slice(&v_hi, b, n_kv_heads, s, oc, group_size, bits_hi);
+            let (vp_lo, vs_lo, vb_lo) =
+                quantize_kv_slice(&v_lo, b, n_kv_heads, s, rc, group_size, bits_lo);
 
             // ---- Cache management: allocate or grow 4 quantized buffers ----
             let uint32_dt = crate::compat::Dtype::Uint32.as_i32();

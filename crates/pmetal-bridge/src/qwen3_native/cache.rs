@@ -217,32 +217,39 @@ impl NativeCache {
                 continue;
             }
 
-            let Some(keys) = cache.keys.take() else {
-                continue;
+            // Capture pre-state to detect whether alloc_or_grow_kv actually
+            // grew the buffers (flagging this layer for re-eval below).
+            let pre_cap = cache.keys.as_ref().map(|k| k.dim(2));
+            let target = cache.offset + additional_tokens;
+
+            // Determine the [B, H, _, D] template from whichever buffer is
+            // present so we keep the same allocation shape on growth.
+            let template = match (cache.keys.as_ref(), cache.values.as_ref()) {
+                (Some(k), Some(_)) => Some((k.dim(0), k.dim(1), k.dim(3))),
+                _ => None,
             };
-            let Some(values) = cache.values.take() else {
-                cache.keys = Some(keys);
+            let Some((b_dim, h_dim, d_dim)) = template else {
                 continue;
             };
 
-            let current_capacity = keys.dim(2);
-            let target_capacity = cache.offset + additional_tokens;
-            if target_capacity <= current_capacity {
-                cache.keys = Some(keys);
-                cache.values = Some(values);
-                continue;
-            }
-
-            let extend = target_capacity - current_capacity;
-            let ext_keys =
-                InlineArray::zeros(&[keys.dim(0), keys.dim(1), extend, keys.dim(3)], dtype);
-            let ext_values = InlineArray::zeros(
-                &[values.dim(0), values.dim(1), extend, values.dim(3)],
+            crate::native_common::kv_cache::alloc_or_grow_kv(
+                // One-shot reservation: allocate exactly what was requested
+                // rather than rounding up to a 256-token chunk (which would
+                // bloat memory for short bounded generations).
+                crate::native_common::kv_cache::GrowthPolicy::Exact,
+                &mut cache.keys,
+                &mut cache.values,
+                b_dim,
+                h_dim,
+                target,
+                d_dim,
                 dtype,
             );
-            cache.keys = Some(keys.kv_cache_append(&ext_keys, 2));
-            cache.values = Some(values.kv_cache_append(&ext_values, 2));
-            changed_indices.push(idx);
+
+            let post_cap = cache.keys.as_ref().map(|k| k.dim(2));
+            if post_cap != pre_cap {
+                changed_indices.push(idx);
+            }
         }
 
         if changed_indices.is_empty() {

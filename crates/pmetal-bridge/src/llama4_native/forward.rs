@@ -44,11 +44,11 @@ pub fn forward_step(
     // we skip the mask and use pure causal (the single query token attends to all
     // positions in its chunk, which degenerates to a simple causal window).
     let chunk_mask: Option<InlineArray> = if s > 1 {
-        // linds: [1, end] range — all key positions from start of sequence
-        // For simplicity in the native path we treat start_position = 0.
-        // Build as bool mask [s, offset+s].
-        let chunk_mask_val = build_chunk_mask(offset, s, end, chunk_size);
-        Some(chunk_mask_val)
+        // Bool mask shape [s, offset + s]. We start key positions at zero
+        // because the native path never trims the cache front (mlx-lm's
+        // ChunkedKVCache eviction is replaced here by a mask-only constraint
+        // — see KvLayerCache doc-comment).
+        Some(build_chunk_mask(offset, s, end, chunk_size))
     } else {
         None // decode: use "causal" SDPA mode for local layers (no mask needed)
     };
