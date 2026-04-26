@@ -335,6 +335,15 @@ pub(super) fn inline_array_to_bshd_rows(arr: &InlineArray) -> Result<Vec<f32>, S
 ///
 /// Uploads via `from_f32_slice` (single FFI + memcpy), then transposes in the
 /// GPU graph to produce the standard [B, H, S, D] KV layout.
+///
+/// The flatten→reshape pair after `transpose_axes` forces MLX to materialize
+/// the data contiguously in the new [B, H, S, D] order. Without it, the
+/// returned tensor is a lazy strided view: the *logical* shape is correct,
+/// but `to_f32_vec` (raw memcpy of `data<float>()`) yields the pre-transpose
+/// [B, S, H, D] memory order. Any caller that reads the buffer directly —
+/// rather than consuming it via stride-aware MLX ops — would see scrambled
+/// rows. This was a latent bug for the Mixed-precision dequantize path
+/// (Uniform paths already produce contiguous output via GPU matmul).
 pub(super) fn f32_rows_to_bhsd_array(
     rows: &[f32],
     batch: usize,
@@ -347,7 +356,9 @@ pub(super) fn f32_rows_to_bhsd_array(
         batch * seq * heads * dim,
         "f32_rows_to_bhsd_array: size mismatch"
     );
-    // Upload [B, S, H, D] then transpose → [B, H, S, D].
+    let total = (batch * seq * heads * dim) as i32;
     InlineArray::from_f32_slice(rows, &[batch as i32, seq as i32, heads as i32, dim as i32])
         .transpose_axes(&[0, 2, 1, 3])
+        .reshape(&[total])
+        .reshape(&[batch as i32, heads as i32, seq as i32, dim as i32])
 }

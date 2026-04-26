@@ -3652,6 +3652,60 @@ mod tests {
         )
     }
 
+    /// Build a Mixed-precision (`preset_q3_5`) direct-attention fixture. Matches
+    /// the Uniform helper's shape contract so the same `manual_single_token_attention`
+    /// reference can compare against both. Mixed paths currently dequantize+SDPA
+    /// inside `append_and_compute_attention`; once the fused Mixed kernel lands
+    /// (Phase 3), this fixture pins the expected numerics so the kernel must
+    /// match the dequantize+SDPA baseline at < 1e-4.
+    fn make_mixed_direct_attention_case_with(
+        dim: usize,
+        heads: i32,
+        prefill: i32,
+    ) -> (
+        QuantizedKvCache,
+        InlineArray,
+        InlineArray,
+        InlineArray,
+        f32,
+        i32,
+        i32,
+        i32,
+    ) {
+        // Cold-only path: disable the recent fp16 window so every appended token
+        // takes the Mixed-quantized cold store and exercises the full
+        // dequantize_keys/dequantize_values + SDPA fallback (the path the fused
+        // Mixed kernel will replace).
+        let config = TurboQuantConfig::preset_q3_5(dim).with_recent_window(None);
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let step_len = (b * h * d) as usize;
+        let prefill_keys =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.2), &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
+        let queries = InlineArray::from_f32_slice(&make_data(step_len, 1.3), &[b, h, 1, d]);
+        let step_keys = InlineArray::from_f32_slice(&make_data(step_len, 1.9), &[b, h, 1, d]);
+        let step_values = InlineArray::from_f32_slice(&make_data(step_len, 2.4), &[b, h, 1, d]);
+
+        let mut seed_cache = QuantizedKvCache::new(config);
+        seed_cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+
+        (seed_cache, queries, step_keys, step_values, scale, b, h, d)
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::needless_range_loop)]
     fn manual_single_token_attention(
@@ -4130,6 +4184,56 @@ mod tests {
         assert!(
             max_abs_diff < 1e-4,
             "d256 gqa direct attention diverged from dequantized sdpa: max_abs_diff={max_abs_diff}"
+        );
+    }
+
+    /// Phase 3 parity baseline. Mixed-precision (`preset_q3_5`) currently
+    /// flows through `dequantize_keys + dequantize_values + sdpa_causal_like_mlx`
+    /// — a "correctness-first" fallback. This test pins the expected output
+    /// against a from-scratch scalar reference so that when the fused Mixed
+    /// kernel lands it must produce the same numerics.
+    ///
+    /// Tolerance matches the Uniform parity tests (1e-4): both paths
+    /// dequantize the same Mixed-quantized data, so the only delta here is
+    /// MLX's fused SDPA vs scalar SDPA on identical f32 tensors.
+    #[test]
+    fn turboquant_direct_attention_matches_dequantized_sdpa_mixed() {
+        let (seed_cache, queries, step_keys, step_values, scale, b, h, d) =
+            make_mixed_direct_attention_case_with(128, 2, 31);
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+
+        ref_cache
+            .append(&step_keys, &step_values)
+            .expect("reference append");
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let reference_vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut full_keys,
+            &mut full_values,
+            b,
+            h,
+            32,
+            d,
+            scale,
+        );
+
+        let direct_vals = direct
+            .to_f32_vec((b * h * d) as usize)
+            .expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff < 1e-4,
+            "mixed direct attention diverged from dequantized sdpa: max_abs_diff={max_abs_diff}"
         );
     }
 
