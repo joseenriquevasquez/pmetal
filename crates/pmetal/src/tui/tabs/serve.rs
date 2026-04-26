@@ -2,20 +2,20 @@
 //!
 //! Mirrors the `pmetal serve` subcommand. Field navigation, inline edit,
 //! and log tailing are delegated to `FormTabState` + `JobLog` so this
-//! file only owns the tab-specific shape: the field list, the
-//! `ServeStatus` state machine, and the status-panel rendering.
+//! file only owns the tab-specific shape: the `ServeStatus` state machine
+//! and the status-panel rendering. Fields are driven by [`ServeSpec`].
 
 use std::time::{Duration, Instant};
 
+use pmetal_core::JobFields as _;
+use pmetal_core::jobs::ServeSpec;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 use crate::tui::theme::THEME;
-use crate::tui::widgets::{
-    FieldKind, FormAction, FormField, FormTabState, JobLog, StatusTone, status_line,
-};
+use crate::tui::widgets::{FormAction, FormTabState, JobLog, StatusTone, status_line};
 
 /// Runtime status of the `pmetal serve` process.
 #[derive(Debug, Clone, Default)]
@@ -46,60 +46,10 @@ pub struct ServeTab {
 impl ServeTab {
     pub fn new() -> Self {
         Self {
-            form: FormTabState::new(Self::default_fields()),
+            form: FormTabState::from_spec_default::<ServeSpec>(),
             status: ServeStatus::Idle,
             log: JobLog::with_default_cap(),
         }
-    }
-
-    fn default_fields() -> Vec<FormField> {
-        vec![
-            FormField::new("Model", "(not selected)", FieldKind::ModelPicker, "Model"),
-            FormField::new("Experts Dir", "", FieldKind::Text, "Model"),
-            FormField::new("Host", "127.0.0.1", FieldKind::Text, "Network"),
-            FormField::new(
-                "Port",
-                "8080",
-                FieldKind::Integer {
-                    min: 1,
-                    max: 65_535,
-                },
-                "Network",
-            ),
-            FormField::new(
-                "Max Seq Len",
-                "4096",
-                FieldKind::Integer {
-                    min: 256,
-                    max: 131_072,
-                },
-                "Runtime",
-            ),
-            FormField::new("FP8 Weights", "Disabled", FieldKind::Toggle, "Runtime"),
-            FormField::new(
-                "KV Cache",
-                "auto",
-                FieldKind::Enum {
-                    options: vec![
-                        "auto".into(),
-                        "fp16".into(),
-                        "q8".into(),
-                        "q4".into(),
-                        "tq8".into(),
-                        "tq4".into(),
-                        "tq2_5".into(),
-                        "tq3_5".into(),
-                    ],
-                },
-                "KV Cache",
-            ),
-            FormField::new(
-                "KV Group Size",
-                "64",
-                FieldKind::Integer { min: 8, max: 256 },
-                "KV Cache",
-            ),
-        ]
     }
 
     // ── Form delegation (all sections always visible) ──────────────────
@@ -176,7 +126,8 @@ impl ServeTab {
     // ── Config summary / CLI args ──────────────────────────────────────
 
     pub fn validate_config(&self) -> Result<(), String> {
-        if self.form.value("Model") == "(not selected)" {
+        let model = self.form.value("Model");
+        if model.is_empty() || model == "(not selected)" {
             return Err("Model is required.".into());
         }
         if self.form.value("Host").is_empty() {
@@ -196,50 +147,46 @@ impl ServeTab {
             format!("Model:       {}", self.form.value("Model")),
             format!("Bind:        {}", self.bind_url()),
             format!("Max Seq Len: {}", self.form.value("Max Seq Len")),
-            format!("KV Cache:    {}", self.form.value("KV Cache")),
+            format!("KV Cache Bits: {}", self.form.value("KV Cache Bits")),
             format!("FP8:         {}", self.form.value("FP8 Weights")),
             String::new(),
             "Start server?".into(),
         ]
     }
 
+    /// Build CLI args from the form via [`ServeSpec::to_argv`].
     pub fn build_cli_args(&self) -> Vec<String> {
+        let spec = self.spec_from_form();
         let mut args = vec!["serve".to_string()];
-
-        args.extend(["--model".into(), self.form.value("Model")]);
-        let experts = self.form.value("Experts Dir");
-        if !experts.is_empty() {
-            args.extend(["--experts-dir".into(), experts]);
-        }
-        args.extend(["--host".into(), self.form.value("Host")]);
-        args.extend(["--port".into(), self.form.value("Port")]);
-        args.extend(["--max-seq-len".into(), self.form.value("Max Seq Len")]);
-        args.extend(["--kv-group-size".into(), self.form.value("KV Group Size")]);
-
-        if self.form.value("FP8 Weights") == "Enabled" {
-            args.push("--fp8".into());
-        }
-
-        // KV cache preset → CLI flag mapping. `auto` emits nothing.
-        match self.form.value("KV Cache").as_str() {
-            "auto" => {}
-            "fp16" => args.push("--no-kv-quant".into()),
-            "q8" => args.extend(["--kv-quant".into(), "8".into()]),
-            "q4" => args.extend(["--kv-quant".into(), "4".into()]),
-            "tq8" => {
-                args.push("--kv-turboquant".into());
-                args.extend(["--kv-quant".into(), "8".into()]);
-            }
-            "tq4" => {
-                args.push("--kv-turboquant".into());
-                args.extend(["--kv-quant".into(), "4".into()]);
-            }
-            "tq2_5" => args.extend(["--kv-turboquant-preset".into(), "q2_5".into()]),
-            "tq3_5" => args.extend(["--kv-turboquant-preset".into(), "q3_5".into()]),
-            _ => {}
-        }
-
+        args.extend(spec.to_argv());
         args
+    }
+
+    fn spec_from_form(&self) -> ServeSpec {
+        let mut spec = ServeSpec::default();
+        spec.model = self.form.value("Model");
+        spec.host = {
+            let v = self.form.value("Host");
+            if v.is_empty() { spec.host } else { v }
+        };
+        spec.port = self.form.value("Port").parse().unwrap_or(spec.port);
+        spec.max_seq_len = self.form.value("Max Seq Len").parse().unwrap_or(spec.max_seq_len);
+        spec.fp8 = self.form.value("FP8 Weights") == "Enabled";
+        spec.kv_quant = self.form.value("KV Cache Bits").parse().ok();
+        spec.no_kv_quant = self.form.value("Disable KV Quant") == "Enabled";
+        spec.kv_group_size = self.form.value("KV Group Size").parse().unwrap_or(spec.kv_group_size);
+        spec.kv_turboquant = self.form.value("TurboQuant KV") == "Enabled";
+        let preset = self.form.value("TurboQuant Preset");
+        spec.kv_turboquant_preset = if preset.is_empty() { None } else { Some(preset) };
+        spec.ane = self.form.value("Use ANE") == "Enabled";
+        spec.ane_max_seq_len = self.form.value("ANE Max Seq Len").parse().unwrap_or(spec.ane_max_seq_len);
+        spec.ane_real_time = self.form.value("ANE Real-Time") == "Enabled";
+        spec.continuous_batch = self.form.value("Continuous Batch") == "Enabled";
+        spec.cb_max_slots = self.form.value("CB Max Slots").parse().unwrap_or(spec.cb_max_slots);
+        spec.cb_max_queue_depth = self.form.value("CB Queue Depth").parse().unwrap_or(spec.cb_max_queue_depth);
+        let experts = self.form.value("Experts Dir");
+        spec.experts_dir = if experts.is_empty() { None } else { Some(experts) };
+        spec
     }
 }
 
@@ -259,6 +206,15 @@ mod tests {
         tab.form.set_value("Model", "/tmp/model");
         let args = tab.build_cli_args();
         assert!(!args.iter().any(|arg| arg == "--lora"));
+    }
+
+    #[test]
+    fn serve_tab_emits_model_flag() {
+        let mut tab = ServeTab::new();
+        tab.form.set_value("Model", "/tmp/model");
+        let args = tab.build_cli_args();
+        assert!(args.contains(&"--model".to_string()));
+        assert!(args.contains(&"/tmp/model".to_string()));
     }
 }
 

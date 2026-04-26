@@ -1,22 +1,21 @@
 //! Quantize tab — GGUF / MLX quantization configuration and control.
 //!
 //! Mirrors `pmetal quantize`. Source model picker, output path, method
-//! enum (K-quants + `dynamic` + `f16`/`f32`), format enum (gguf / mlx),
-//! optional imatrix file, KL-calibration toggle, and MLX bit-width knobs
-//! (only surfaced when `format=mlx`). Spawns as a one-shot background job
-//! with stdout tailed into the status panel.
+//! enum, optional imatrix file, KL-calibration toggle, and MLX bit-width
+//! knobs. Fields driven by [`QuantizeSpec`]. Preserves conditional
+//! visibility (MLX fields only shown when format=mlx).
 
 use std::path::PathBuf;
 
+use pmetal_core::JobFields as _;
+use pmetal_core::jobs::QuantizeSpec;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 use crate::tui::theme::THEME;
-use crate::tui::widgets::{
-    FieldKind, FormAction, FormField, FormTabState, JobLog, StatusTone, status_line,
-};
+use crate::tui::widgets::{FormAction, FormField, FormTabState, JobLog, StatusTone, status_line};
 
 /// Runtime status of the `pmetal quantize` process.
 #[derive(Debug, Clone, Default)]
@@ -45,97 +44,20 @@ pub struct QuantizeTab {
 impl QuantizeTab {
     pub fn new() -> Self {
         Self {
-            form: FormTabState::new(Self::default_fields()),
+            form: FormTabState::from_spec_default::<QuantizeSpec>(),
             status: QuantizeStatus::Idle,
             log: JobLog::with_default_cap(),
         }
     }
 
-    fn default_fields() -> Vec<FormField> {
-        vec![
-            FormField::new(
-                "Source Model",
-                "(not selected)",
-                FieldKind::ModelPicker,
-                "Source",
-            ),
-            FormField::new("LoRA Adapter", "", FieldKind::Text, "Source"),
-            FormField::new(
-                "Output Path",
-                "./output/quantized.gguf",
-                FieldKind::Text,
-                "Output",
-            ),
-            FormField::new(
-                "Format",
-                "gguf",
-                FieldKind::Enum {
-                    options: vec!["gguf".into(), "mlx".into()],
-                },
-                "Output",
-            ),
-            FormField::new(
-                "Method",
-                "dynamic",
-                FieldKind::Enum {
-                    options: vec![
-                        "dynamic".into(),
-                        "q8_0".into(),
-                        "q6_k".into(),
-                        "q5_k_m".into(),
-                        "q5_k_s".into(),
-                        "q4_k_m".into(),
-                        "q4_k_s".into(),
-                        "q3_k_m".into(),
-                        "q3_k_l".into(),
-                        "q3_k_s".into(),
-                        "q2_k".into(),
-                        "f16".into(),
-                        "f32".into(),
-                    ],
-                },
-                "Method",
-            ),
-            FormField::new("IMatrix Path", "", FieldKind::Text, "Method"),
-            FormField::new(
-                "KL Calibrate",
-                "Disabled",
-                FieldKind::Toggle,
-                "KL Calibration",
-            ),
-            FormField::new("Target BPW", "", FieldKind::Text, "KL Calibration"),
-            FormField::new(
-                "KL Threshold",
-                "0.01",
-                FieldKind::Number {
-                    min: 0.0001,
-                    max: 1.0,
-                },
-                "KL Calibration",
-            ),
-            FormField::new(
-                "MLX Bits",
-                "4",
-                FieldKind::Integer { min: 2, max: 8 },
-                "MLX Format",
-            ),
-            FormField::new(
-                "MLX Group Size",
-                "64",
-                FieldKind::Integer { min: 32, max: 256 },
-                "MLX Format",
-            ),
-        ]
-    }
-
     /// Shared field-level visibility used by nav and the renderer so the
-    /// cursor never lands on a hidden row. MLX knobs hide unless Format
-    /// is `mlx`; the KL Calibrate master toggle stays visible, but its
-    /// dependent knobs hide until calibration is turned on.
+    /// cursor never lands on a hidden row. MLX knobs (group "Output" with
+    /// labels "MLX Bits"/"MLX Group Size") hide unless Format is `mlx`;
+    /// KL Calibration fields hide unless KL Calibration is enabled.
     fn field_visible(is_mlx: bool, kl_on: bool, field: &FormField) -> bool {
-        match field.section.as_str() {
-            "MLX Format" => is_mlx,
-            "KL Calibration" => kl_on || field.label == "KL Calibrate",
+        match field.label.as_str() {
+            "MLX Bits" | "MLX Group Size" => is_mlx,
+            "Target BPW" | "KL Threshold" => kl_on,
             _ => true,
         }
     }
@@ -143,7 +65,7 @@ impl QuantizeTab {
     fn vis_snapshot(&self) -> (bool, bool) {
         (
             self.form.value("Format") == "mlx",
-            self.form.value("KL Calibrate") == "Enabled",
+            self.form.value("KL Calibration") == "Enabled",
         )
     }
 
@@ -191,8 +113,8 @@ impl QuantizeTab {
     // ── Setters / derived state ─────────────────────────────────────────
 
     pub fn set_model(&mut self, model_id: &str) {
-        self.form.set_value("Source Model", model_id);
-        // Auto-derive a sensible default output path from the model name.
+        // QuantizeSpec uses "Model" (not "Source Model").
+        self.form.set_value("Model", model_id);
         let short = super::model_short_name(model_id);
         let ext = if self.form.value("Format") == "mlx" {
             "-mlx"
@@ -261,7 +183,6 @@ impl QuantizeTab {
 
     pub fn mark_completed(&mut self) {
         let output = self.form.value("Output Path");
-        // Scan recent log lines for the final BPW summary.
         let bpw = self
             .log
             .lines()
@@ -279,23 +200,12 @@ impl QuantizeTab {
     // ── Config ──────────────────────────────────────────────────────────
 
     pub fn validate_config(&self) -> Result<(), String> {
-        if self.form.value("Source Model") == "(not selected)" {
-            return Err("Source Model is required.".into());
+        let model = self.form.value("Model");
+        if model.is_empty() || model == "(not selected)" {
+            return Err("Model is required.".into());
         }
         if self.form.value("Output Path").is_empty() {
             return Err("Output Path is required.".into());
-        }
-        if self.form.value("Format") == "mlx" {
-            let bits: i32 = self.form.value("MLX Bits").parse().unwrap_or(4);
-            if !matches!(bits, 3 | 4 | 5 | 6 | 8) {
-                return Err("MLX Bits must be 3, 4, 5, 6, or 8.".into());
-            }
-        }
-        if self.form.value("KL Calibrate") == "Enabled" {
-            let bpw_raw = self.form.value("Target BPW");
-            if !bpw_raw.is_empty() && bpw_raw.parse::<f32>().is_err() {
-                return Err("Target BPW must be a number (e.g. 4.5).".into());
-            }
         }
         Ok(())
     }
@@ -306,12 +216,12 @@ impl QuantizeTab {
 
     pub fn config_summary(&self) -> Vec<String> {
         let mut summary = vec![
-            format!("Source:  {}", self.form.value("Source Model")),
+            format!("Source:  {}", self.form.value("Model")),
             format!("Output:  {}", self.form.value("Output Path")),
             format!("Format:  {}", self.form.value("Format")),
             format!("Method:  {}", self.form.value("Method")),
         ];
-        if self.form.value("KL Calibrate") == "Enabled" {
+        if self.form.value("KL Calibration") == "Enabled" {
             let bpw = self.form.value("Target BPW");
             let threshold = self.form.value("KL Threshold");
             let bpw_part = if bpw.is_empty() {
@@ -333,39 +243,37 @@ impl QuantizeTab {
         summary
     }
 
+    /// Build CLI args from the form via [`QuantizeSpec::to_argv`].
     pub fn build_cli_args(&self) -> Vec<String> {
+        let spec = self.spec_from_form();
         let mut args = vec!["quantize".to_string()];
-
-        args.extend(["--model".into(), self.form.value("Source Model")]);
-        args.extend(["--output".into(), self.form.value("Output Path")]);
-        args.extend(["--format".into(), self.form.value("Format")]);
-        args.extend(["--method".into(), self.form.value("Method")]);
-
-        let lora = self.form.value("LoRA Adapter");
-        if !lora.is_empty() {
-            args.extend(["--lora".into(), lora]);
-        }
-
-        let imatrix = self.form.value("IMatrix Path");
-        if !imatrix.is_empty() {
-            args.extend(["--imatrix".into(), imatrix]);
-        }
-
-        if self.form.value("KL Calibrate") == "Enabled" {
-            args.push("--kl-calibrate".into());
-            let bpw = self.form.value("Target BPW");
-            if !bpw.is_empty() {
-                args.extend(["--target-bpw".into(), bpw]);
-            }
-            args.extend(["--kl-threshold".into(), self.form.value("KL Threshold")]);
-        }
-
-        if self.form.value("Format") == "mlx" {
-            args.extend(["--bits".into(), self.form.value("MLX Bits")]);
-            args.extend(["--group-size".into(), self.form.value("MLX Group Size")]);
-        }
-
+        args.extend(spec.to_argv());
         args
+    }
+
+    fn spec_from_form(&self) -> QuantizeSpec {
+        let mut spec = QuantizeSpec::default();
+        spec.model = self.form.value("Model");
+        spec.output = self.form.value("Output Path");
+        spec.method = {
+            let v = self.form.value("Method");
+            if v.is_empty() { spec.method } else { v }
+        };
+        spec.format = {
+            let v = self.form.value("Format");
+            if v.is_empty() { spec.format } else { v }
+        };
+        let lora = self.form.value("LoRA Adapter");
+        spec.lora = if lora.is_empty() { None } else { Some(lora) };
+        spec.kl_calibrate = self.form.value("KL Calibration") == "Enabled";
+        let bpw = self.form.value("Target BPW");
+        spec.target_bpw = bpw.parse().ok();
+        spec.kl_threshold = self.form.value("KL Threshold").parse().unwrap_or(spec.kl_threshold);
+        spec.bits = self.form.value("MLX Bits").parse().unwrap_or(spec.bits);
+        spec.group_size = self.form.value("MLX Group Size").parse().unwrap_or(spec.group_size);
+        let imatrix = self.form.value("IMatrix");
+        spec.imatrix = if imatrix.is_empty() { None } else { Some(imatrix) };
+        spec
     }
 }
 

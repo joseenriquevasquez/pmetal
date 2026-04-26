@@ -1,21 +1,20 @@
 //! Merge tab — blend two (or more) models via SLERP / TIES / DARE /
 //! linear / task-arithmetic. Mirrors `pmetal merge`.
 //!
-//! Form has three model pickers (A, B, optional Base for task-vector
-//! methods) plus method-specific knobs (interpolation `t`, weights,
-//! density, dtype). Status panel tails the subprocess output.
+//! Fields driven by [`MergeSpec`]. Preserves conditional visibility
+//! (SLERP/Linear/TIES/DARE sections) and method-specific knobs.
 
 use std::path::PathBuf;
 
+use pmetal_core::JobFields as _;
+use pmetal_core::jobs::MergeSpec;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 use crate::tui::theme::THEME;
-use crate::tui::widgets::{
-    FieldKind, FormAction, FormField, FormTabState, JobLog, StatusTone, status_line,
-};
+use crate::tui::widgets::{FormAction, FormField, FormTabState, JobLog, StatusTone, status_line};
 
 /// Runtime status of the `pmetal merge` subprocess.
 #[derive(Debug, Clone, Default)]
@@ -39,87 +38,17 @@ pub struct MergeTab {
 impl MergeTab {
     pub fn new() -> Self {
         Self {
-            form: FormTabState::new(Self::default_fields()),
+            form: FormTabState::from_spec_default::<MergeSpec>(),
             status: MergeStatus::Idle,
             log: JobLog::with_default_cap(),
         }
     }
 
-    fn default_fields() -> Vec<FormField> {
-        vec![
-            FormField::new(
-                "Model A",
-                "(not selected)",
-                FieldKind::ModelPicker,
-                "Sources",
-            ),
-            FormField::new(
-                "Model B",
-                "(not selected)",
-                FieldKind::ModelPicker,
-                "Sources",
-            ),
-            FormField::new("Base Model", "", FieldKind::ModelPicker, "Sources"),
-            FormField::new(
-                "Method",
-                "slerp",
-                FieldKind::Enum {
-                    options: vec![
-                        "slerp".into(),
-                        "linear".into(),
-                        "ties".into(),
-                        "dare_ties".into(),
-                        "dare_linear".into(),
-                        "task_arithmetic".into(),
-                        "della".into(),
-                        "breadcrumbs".into(),
-                        "model_stock".into(),
-                        "nearswap".into(),
-                        "passthrough".into(),
-                    ],
-                },
-                "Method",
-            ),
-            FormField::new(
-                "Interpolation t",
-                "0.5",
-                FieldKind::Number { min: 0.0, max: 1.0 },
-                "SLERP",
-            ),
-            FormField::new(
-                "Weight A",
-                "0.5",
-                FieldKind::Number { min: 0.0, max: 1.0 },
-                "Linear/TIES",
-            ),
-            FormField::new(
-                "Weight B",
-                "0.5",
-                FieldKind::Number { min: 0.0, max: 1.0 },
-                "Linear/TIES",
-            ),
-            FormField::new(
-                "Density",
-                "0.5",
-                FieldKind::Number { min: 0.0, max: 1.0 },
-                "TIES/DARE",
-            ),
-            FormField::new(
-                "Output Dtype",
-                "bfloat16",
-                FieldKind::Enum {
-                    options: vec!["bfloat16".into(), "float16".into(), "float32".into()],
-                },
-                "Output",
-            ),
-            FormField::new("Output Dir", "./output/merged", FieldKind::Text, "Output"),
-        ]
-    }
-
-    /// Hide method-specific sections that don't apply to the current
-    /// choice. Keeps the form focused on the relevant knobs.
+    /// Hide method-specific fields that don't apply to the current method.
+    /// MergeSpec field labels: "SLERP t", "Weight A", "Weight B", "Density",
+    /// "Base Model". Groups: "Models", "Method", "Output".
     fn field_visible(method: &str, f: &FormField) -> bool {
-        let uses_t = matches!(method, "slerp");
+        let uses_t = method == "slerp";
         let uses_weights = matches!(method, "linear" | "ties" | "dare_linear" | "dare_ties");
         let uses_density = matches!(
             method,
@@ -129,19 +58,12 @@ impl MergeTab {
             method,
             "ties" | "dare_ties" | "dare_linear" | "task_arithmetic" | "della"
         );
-        match f.section.as_str() {
-            "SLERP" => uses_t,
-            "Linear/TIES" => uses_weights,
-            "TIES/DARE" => uses_density,
-            _ => {
-                // Hide the optional Base Model picker when the method
-                // doesn't consume it.
-                if f.label == "Base Model" {
-                    uses_base
-                } else {
-                    true
-                }
-            }
+        match f.label.as_str() {
+            "SLERP t" => uses_t,
+            "Weight A" | "Weight B" => uses_weights,
+            "Density" => uses_density,
+            "Base Model" => uses_base,
+            _ => true,
         }
     }
 
@@ -184,10 +106,11 @@ impl MergeTab {
     pub fn set_model(&mut self, label: &str, model_id: &str) {
         self.form.set_value(label, model_id);
         // Auto-derive output dir from Model A's short name when it's
-        // the first slot populated.
+        // the first slot populated. MergeSpec uses "Output Dir" field.
         if label == "Model A" {
             let short = super::model_short_name(model_id);
-            if self.form.value("Output Dir") == "./output/merged" {
+            let current = self.form.value("Output Dir");
+            if current.is_empty() || current == "./output/merged" {
                 self.form
                     .set_value("Output Dir", format!("./output/{short}--merged"));
             }
@@ -220,10 +143,12 @@ impl MergeTab {
     // ── Config ──────────────────────────────────────────────────────────
 
     pub fn validate_config(&self) -> Result<(), String> {
-        if self.form.value("Model A") == "(not selected)" {
+        let a = self.form.value("Model A");
+        if a.is_empty() || a == "(not selected)" {
             return Err("Model A is required.".into());
         }
-        if self.form.value("Model B") == "(not selected)" {
+        let b = self.form.value("Model B");
+        if b.is_empty() || b == "(not selected)" {
             return Err("Model B is required.".into());
         }
         let method = self.form.value("Method");
@@ -264,39 +189,34 @@ impl MergeTab {
         summary
     }
 
+    /// Build CLI args from the form via [`MergeSpec::to_argv`].
     pub fn build_cli_args(&self) -> Vec<String> {
+        let spec = self.spec_from_form();
         let mut args = vec!["merge".to_string()];
-
-        args.extend(["--model-a".into(), self.form.value("Model A")]);
-        args.extend(["--model-b".into(), self.form.value("Model B")]);
-        args.extend(["--output".into(), self.form.value("Output Dir")]);
-        args.extend(["--method".into(), self.form.value("Method")]);
-        args.extend(["--dtype".into(), self.form.value("Output Dtype")]);
-
-        let base = self.form.value("Base Model");
-        if !base.is_empty() && base != "(not selected)" {
-            args.extend(["--base".into(), base]);
-        }
-
-        let method = self.form.value("Method");
-        if method == "slerp" {
-            args.extend(["--t".into(), self.form.value("Interpolation t")]);
-        }
-        if matches!(
-            method.as_str(),
-            "linear" | "ties" | "dare_linear" | "dare_ties"
-        ) {
-            args.extend(["--weight-a".into(), self.form.value("Weight A")]);
-            args.extend(["--weight-b".into(), self.form.value("Weight B")]);
-        }
-        if matches!(
-            method.as_str(),
-            "ties" | "dare_ties" | "dare_linear" | "della" | "breadcrumbs"
-        ) {
-            args.extend(["--density".into(), self.form.value("Density")]);
-        }
-
+        args.extend(spec.to_argv());
         args
+    }
+
+    fn spec_from_form(&self) -> MergeSpec {
+        let mut spec = MergeSpec::default();
+        spec.model_a = self.form.value("Model A");
+        spec.model_b = self.form.value("Model B");
+        spec.output = self.form.value("Output Dir");
+        spec.method = {
+            let v = self.form.value("Method");
+            if v.is_empty() { spec.method } else { v }
+        };
+        spec.dtype = {
+            let v = self.form.value("Output Dtype");
+            if v.is_empty() { spec.dtype } else { v }
+        };
+        let base = self.form.value("Base Model");
+        spec.base = if base.is_empty() || base == "(not selected)" { None } else { Some(base) };
+        spec.t = self.form.value("SLERP t").parse().unwrap_or(spec.t);
+        spec.weight_a = self.form.value("Weight A").parse().unwrap_or(spec.weight_a);
+        spec.weight_b = self.form.value("Weight B").parse().unwrap_or(spec.weight_b);
+        spec.density = self.form.value("Density").parse().unwrap_or(spec.density);
+        spec
     }
 }
 

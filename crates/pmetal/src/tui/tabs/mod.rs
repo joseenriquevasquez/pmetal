@@ -4,6 +4,8 @@ mod bench;
 pub mod dashboard;
 mod datasets;
 mod device;
+#[allow(dead_code)]
+mod dflash;
 mod distillation;
 mod eval;
 mod grpo;

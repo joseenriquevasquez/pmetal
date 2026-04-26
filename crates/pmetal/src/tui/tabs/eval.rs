@@ -1,22 +1,18 @@
 //! Eval tab — run `pmetal eval` against a dataset and show the result.
 //!
-//! Mirrors the CLI: model picker, dataset picker, optional LoRA adapter,
-//! max sequence length, sample count, and a JSON-toggle to persist the
-//! full report. Stdout is parsed for per-sample progress and a final
-//! metric summary (`perplexity = X` / `accuracy = X`). The right-hand
-//! panel shows a compact status badge, the last-seen metrics, and a
-//! tailing log.
+//! Fields driven by [`EvalSpec`]. Stdout is parsed for per-sample progress
+//! and a final metric summary (`perplexity = X` / `accuracy = X`).
 
 use crossterm::event::KeyEvent;
+use pmetal_core::JobFields as _;
+use pmetal_core::jobs::EvalSpec;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 use crate::tui::theme::THEME;
-use crate::tui::widgets::{
-    FieldKind, FormAction, FormField, FormTabState, JobLog, StatusTone, status_line,
-};
+use crate::tui::widgets::{FormAction, FormTabState, JobLog, StatusTone, status_line};
 
 /// Metric snapshot extracted from eval stdout. Each field stays `None`
 /// until the matching key is seen in the child process output.
@@ -50,43 +46,11 @@ pub struct EvalTab {
 impl EvalTab {
     pub fn new() -> Self {
         Self {
-            form: FormTabState::new(Self::default_fields()),
+            form: FormTabState::from_spec_default::<EvalSpec>(),
             status: EvalStatus::Idle,
             metrics: EvalMetrics::default(),
             log: JobLog::with_default_cap(),
         }
-    }
-
-    fn default_fields() -> Vec<FormField> {
-        vec![
-            FormField::new("Model", "(not selected)", FieldKind::ModelPicker, "Model"),
-            FormField::new("LoRA Adapter", "", FieldKind::Text, "Model"),
-            FormField::new(
-                "Dataset",
-                "(not selected)",
-                FieldKind::DatasetPicker,
-                "Data",
-            ),
-            FormField::new(
-                "Num Samples",
-                "0",
-                FieldKind::Integer {
-                    min: 0,
-                    max: 1_000_000,
-                },
-                "Data",
-            ),
-            FormField::new(
-                "Max Seq Len",
-                "1024",
-                FieldKind::Integer {
-                    min: 64,
-                    max: 131_072,
-                },
-                "Runtime",
-            ),
-            FormField::new("JSON Report", "Disabled", FieldKind::Toggle, "Output"),
-        ]
     }
 
     // ── Form delegation ─────────────────────────────────────────────────
@@ -166,10 +130,12 @@ impl EvalTab {
     // ── Config ──────────────────────────────────────────────────────────
 
     pub fn validate_config(&self) -> Result<(), String> {
-        if self.form.value("Model") == "(not selected)" {
+        let model = self.form.value("Model");
+        if model.is_empty() || model == "(not selected)" {
             return Err("Model is required.".into());
         }
-        if self.form.value("Dataset") == "(not selected)" {
+        let dataset = self.form.value("Dataset");
+        if dataset.is_empty() || dataset == "(not selected)" {
             return Err("Dataset is required.".into());
         }
         Ok(())
@@ -187,27 +153,30 @@ impl EvalTab {
             format!("Dataset:  {}", self.form.value("Dataset")),
             format!("Samples:  {samples_label}"),
             format!("Max Seq:  {}", self.form.value("Max Seq Len")),
-            format!("JSON:     {}", self.form.value("JSON Report")),
+            format!("JSON:     {}", self.form.value("JSON Output")),
             String::new(),
             "Run eval?".into(),
         ]
     }
 
+    /// Build CLI args from the form via [`EvalSpec::to_argv`].
     pub fn build_cli_args(&self) -> Vec<String> {
+        let spec = self.spec_from_form();
         let mut args = vec!["eval".to_string()];
-        args.extend(["--model".into(), self.form.value("Model")]);
-        args.extend(["--dataset".into(), self.form.value("Dataset")]);
-        args.extend(["--max-seq-len".into(), self.form.value("Max Seq Len")]);
-        args.extend(["--num-samples".into(), self.form.value("Num Samples")]);
-
-        let lora = self.form.value("LoRA Adapter");
-        if !lora.is_empty() {
-            args.extend(["--lora".into(), lora]);
-        }
-        if self.form.value("JSON Report") == "Enabled" {
-            args.push("--json".into());
-        }
+        args.extend(spec.to_argv());
         args
+    }
+
+    fn spec_from_form(&self) -> EvalSpec {
+        let mut spec = EvalSpec::default();
+        spec.model = self.form.value("Model");
+        spec.dataset = self.form.value("Dataset");
+        spec.max_seq_len = self.form.value("Max Seq Len").parse().unwrap_or(spec.max_seq_len);
+        spec.num_samples = self.form.value("Num Samples").parse().unwrap_or(spec.num_samples);
+        spec.json = self.form.value("JSON Output") == "Enabled";
+        let lora = self.form.value("LoRA Adapter");
+        spec.lora = if lora.is_empty() { None } else { Some(lora) };
+        spec
     }
 }
 

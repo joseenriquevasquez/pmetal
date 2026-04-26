@@ -1,16 +1,19 @@
 //! Pretrain configuration and control tab.
 //!
-//! Full-parameter pretraining from scratch. Form navigation, inline edit,
-//! and rendering are delegated to `FormTabState`.
+//! Full-parameter pretraining from scratch. Fields driven by
+//! [`PretrainSpec`]. Form navigation, inline edit, and rendering are
+//! delegated to `FormTabState`.
 
 use std::path::PathBuf;
 
+use pmetal_core::JobFields as _;
+use pmetal_core::jobs::PretrainSpec;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 
 use crate::tui::tabs::dashboard::MetricSample;
 use crate::tui::tabs::training::{TrainingStatus, render_status_with_metrics};
-use crate::tui::widgets::{FieldKind, FormAction, FormField, FormTabState};
+use crate::tui::widgets::{FormAction, FormTabState};
 
 pub struct PretrainTab {
     pub form: FormTabState,
@@ -20,145 +23,9 @@ pub struct PretrainTab {
 impl PretrainTab {
     pub fn new() -> Self {
         Self {
-            form: FormTabState::new(Self::default_fields()),
+            form: FormTabState::from_spec_default::<PretrainSpec>(),
             status: TrainingStatus::Idle,
         }
-    }
-
-    fn default_fields() -> Vec<FormField> {
-        vec![
-            FormField::new(
-                "Architecture",
-                "llama",
-                FieldKind::Enum {
-                    options: vec![
-                        "llama".into(),
-                        "qwen2".into(),
-                        "qwen3".into(),
-                        "qwen3.5".into(),
-                        "qwen3_moe".into(),
-                        "gemma".into(),
-                        "mistral".into(),
-                        "phi".into(),
-                        "gpt-oss".into(),
-                    ],
-                },
-                "Model",
-            ),
-            FormField::new("Model Config", "", FieldKind::Text, "Model"),
-            FormField::new("Shard Files", "", FieldKind::Text, "Data"),
-            FormField::new(
-                "Seq Length",
-                "2048",
-                FieldKind::Integer {
-                    min: 64,
-                    max: 32768,
-                },
-                "Data",
-            ),
-            FormField::new(
-                "Batch Size",
-                "4",
-                FieldKind::Integer { min: 1, max: 256 },
-                "Data",
-            ),
-            FormField::new(
-                "EOS Token ID",
-                "0",
-                FieldKind::Integer {
-                    min: 0,
-                    max: 200000,
-                },
-                "Data",
-            ),
-            FormField::new(
-                "Steps",
-                "10000",
-                FieldKind::Integer {
-                    min: 1,
-                    max: 10_000_000,
-                },
-                "Training",
-            ),
-            FormField::new(
-                "Learning Rate",
-                "3e-4",
-                FieldKind::Number {
-                    min: 1e-8,
-                    max: 1.0,
-                },
-                "Training",
-            ),
-            FormField::new(
-                "Min LR",
-                "1e-5",
-                FieldKind::Number { min: 0.0, max: 1.0 },
-                "Training",
-            ),
-            FormField::new(
-                "Warmup Steps",
-                "1000",
-                FieldKind::Integer {
-                    min: 0,
-                    max: 100000,
-                },
-                "Training",
-            ),
-            FormField::new(
-                "LR Schedule",
-                "cosine",
-                FieldKind::Enum {
-                    options: vec!["cosine".into(), "linear".into(), "constant".into()],
-                },
-                "Training",
-            ),
-            FormField::new(
-                "Weight Decay",
-                "0.1",
-                FieldKind::Number { min: 0.0, max: 1.0 },
-                "Training",
-            ),
-            FormField::new(
-                "Max Grad Norm",
-                "1.0",
-                FieldKind::Number {
-                    min: 0.0,
-                    max: 100.0,
-                },
-                "Training",
-            ),
-            FormField::new(
-                "Grad Accum Steps",
-                "1",
-                FieldKind::Integer { min: 1, max: 256 },
-                "Training",
-            ),
-            FormField::new(
-                "Z-Loss",
-                "0.0",
-                FieldKind::Number { min: 0.0, max: 1.0 },
-                "Training",
-            ),
-            FormField::new(
-                "Checkpoint Every",
-                "1000",
-                FieldKind::Integer {
-                    min: 0,
-                    max: 1_000_000,
-                },
-                "Output",
-            ),
-            FormField::new("Output Dir", "./pretrain-output", FieldKind::Text, "Output"),
-            FormField::new(
-                "Seed",
-                "42",
-                FieldKind::Integer {
-                    min: 0,
-                    max: i64::MAX,
-                },
-                "Output",
-            ),
-        ]
     }
 
     // ── Delegation to FormTabState ──
@@ -188,8 +55,9 @@ impl PretrainTab {
     // ── Config ──────────────────────────────────────────────────────────
 
     pub fn validate_config(&self) -> Result<(), String> {
-        if self.form.value("Shard Files").is_empty() {
-            return Err("Shard Files path is required.".into());
+        let arch = self.form.value("Architecture");
+        if arch.is_empty() {
+            return Err("Architecture is required.".into());
         }
         Ok(())
     }
@@ -197,8 +65,8 @@ impl PretrainTab {
     pub fn config_summary(&self) -> Vec<String> {
         vec![
             format!("Architecture: {}", self.form.value("Architecture")),
-            format!("Shards:       {}", self.form.value("Shard Files")),
-            format!("Seq Length:   {}", self.form.value("Seq Length")),
+            format!("Shards:       {}", self.form.value("Shards (csv)")),
+            format!("Seq Len:      {}", self.form.value("Seq Len")),
             format!("Batch Size:   {}", self.form.value("Batch Size")),
             format!("Steps:        {}", self.form.value("Steps")),
             format!("Learning Rate:{}", self.form.value("Learning Rate")),
@@ -212,41 +80,44 @@ impl PretrainTab {
         PathBuf::from(self.form.value("Output Dir"))
     }
 
-    /// Build CLI args for `pmetal pretrain`.
+    /// Build CLI args from the form via [`PretrainSpec::to_argv`].
     pub fn build_cli_args(&self) -> Vec<String> {
+        let spec = self.spec_from_form();
         let mut args = vec!["pretrain".to_string()];
-
-        args.extend(["--arch".into(), self.form.value("Architecture")]);
-
-        let config = self.form.value("Model Config");
-        if !config.is_empty() {
-            args.extend(["--model-config".into(), config]);
-        }
-
-        args.extend(["--shards".into(), self.form.value("Shard Files")]);
-        args.extend(["--seq-len".into(), self.form.value("Seq Length")]);
-        args.extend(["--batch-size".into(), self.form.value("Batch Size")]);
-        args.extend(["--eos-token-id".into(), self.form.value("EOS Token ID")]);
-        args.extend(["--steps".into(), self.form.value("Steps")]);
-        args.extend(["--learning-rate".into(), self.form.value("Learning Rate")]);
-        args.extend(["--min-lr".into(), self.form.value("Min LR")]);
-        args.extend(["--warmup-steps".into(), self.form.value("Warmup Steps")]);
-        args.extend(["--lr-schedule".into(), self.form.value("LR Schedule")]);
-        args.extend(["--weight-decay".into(), self.form.value("Weight Decay")]);
-        args.extend(["--max-grad-norm".into(), self.form.value("Max Grad Norm")]);
-        args.extend([
-            "--gradient-accumulation-steps".into(),
-            self.form.value("Grad Accum Steps"),
-        ]);
-        args.extend(["--z-loss".into(), self.form.value("Z-Loss")]);
-        args.extend([
-            "--checkpoint-every".into(),
-            self.form.value("Checkpoint Every"),
-        ]);
-        args.extend(["--output".into(), self.form.value("Output Dir")]);
-        args.extend(["--seed".into(), self.form.value("Seed")]);
-
+        args.extend(spec.to_argv());
         args
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    fn spec_from_form(&self) -> PretrainSpec {
+        let mut spec = PretrainSpec::default();
+        spec.arch = self.form.value("Architecture");
+        let shards = self.form.value("Shards (csv)");
+        spec.shards = if shards.is_empty() { None } else { Some(shards) };
+        spec.seq_len = self.form.value("Seq Len").parse().unwrap_or(spec.seq_len);
+        spec.batch_size = self.form.value("Batch Size").parse().unwrap_or(spec.batch_size);
+        spec.steps = self.form.value("Steps").parse().unwrap_or(spec.steps);
+        spec.learning_rate = self.form.value("Learning Rate").parse().unwrap_or(spec.learning_rate);
+        spec.min_lr = self.form.value("Min LR").parse().unwrap_or(spec.min_lr);
+        spec.warmup_steps = self.form.value("Warmup Steps").parse().unwrap_or(spec.warmup_steps);
+        spec.lr_schedule = {
+            let v = self.form.value("LR Schedule");
+            if v.is_empty() { spec.lr_schedule } else { v }
+        };
+        spec.weight_decay = self.form.value("Weight Decay").parse().unwrap_or(spec.weight_decay);
+        spec.max_grad_norm = self.form.value("Max Grad Norm").parse().unwrap_or(spec.max_grad_norm);
+        spec.eos_token_id = self.form.value("EOS Token ID").parse().unwrap_or(spec.eos_token_id);
+        spec.output_dir = {
+            let v = self.form.value("Output Dir");
+            if v.is_empty() { spec.output_dir } else { v }
+        };
+        spec.checkpoint_every = self.form.value("Checkpoint Every").parse().unwrap_or(spec.checkpoint_every);
+        spec.gradient_accumulation_steps = self.form.value("Grad Accum Steps").parse().unwrap_or(spec.gradient_accumulation_steps);
+        spec.z_loss = self.form.value("MoE z-loss").parse().unwrap_or(spec.z_loss);
+        spec.seed = self.form.value("Seed").parse().unwrap_or(spec.seed);
+        let model_config = self.form.value("Model Config");
+        spec.model_config = if model_config.is_empty() { None } else { Some(model_config) };
+        spec
     }
 }
 

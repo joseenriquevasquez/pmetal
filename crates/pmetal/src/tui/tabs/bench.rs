@@ -10,6 +10,11 @@
 //! Trials are parsed out of stdout live into a compact table and an
 //! average summary line so the operator gets an "is this fast or slow?"
 //! read at a glance.
+//!
+//! Note: the form retains the tab-local field list because [`BenchSpec`]
+//! only covers the basic `pmetal bench` subcommand (3 fields). The
+//! workload mode fields are TUI-only until a `BenchWorkloadSpec` is
+//! added to pmetal-core.
 
 use std::path::PathBuf;
 
