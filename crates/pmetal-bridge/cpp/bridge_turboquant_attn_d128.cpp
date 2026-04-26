@@ -1,6 +1,21 @@
 // TurboQuant long-context q8 attention kernels for D=128 key/value dim.
 // Single 2-pass family (base indices + packed-keys variant) sharing
 // the D=128 pass-2 merge kernel.
+//
+// ─────────────────────────────────────────────────────────────────────────
+// Templating note (audit 2026-04-25)
+// ─────────────────────────────────────────────────────────────────────────
+// This file (~520 LOC) and bridge_turboquant_attn_d256.cpp (~1930 LOC) share
+// the same kernel structure modulo three constants:
+//   * kDim         (head_dim — 128 vs 256)
+//   * kVec         (per-lane element count — 4 vs 8)
+//   * codebook size (128 vs 256 entries)
+// A future refactor could extract a common kernel template parameterised on
+// `kDim` and emit both as specialisations. Deferred until: (1) parity tests
+// for both head dims share a single fixture, (2) attention-correctness
+// regression coverage is in place for every existing variant. Until then,
+// keeping these as separate maintainable units beats sharing a fragile macro
+// that we'd have to debug across two sets of numerics.
 
 #include "bridge_turboquant_internal.h"
 

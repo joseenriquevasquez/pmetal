@@ -23,6 +23,54 @@
 //   (caller multiply-by-norms and matmul-with-rotation happen outside)
 //
 // Both return 0 on success, 1 if Metal kernel is unavailable.
+//
+// ─────────────────────────────────────────────────────────────────────────
+// Storage layout invariants (audit-pinned 2026-04-25)
+// ─────────────────────────────────────────────────────────────────────────
+// Pack/encode/decode/score MUST agree on these axis orders. Drift here
+// historically produced silently-wrong attention scores rather than a clean
+// crash, so the invariants are documented here and mirrored as Rust static
+// asserts in `src/turboquant.rs::layout_invariants`.
+//
+// Where:
+//   N            = kv_rows (batch * kv_heads)
+//   D            = head_dim (key_dim or value_dim — must match for the same
+//                  tensor)
+//   S_cap        = cache_seq_capacity (rounded-up token slots)
+//   ceil(D/32)   = qjl_words (sign-bit packing along D, 32 bits per word)
+//   C            = n_centroids (2^bits, ≤ 16 for non-fullbyte; up to 256
+//                  for the q8 d256 fullbyte path)
+//
+// Live-tensor cache layouts (the "shadow" layouts the score kernels read):
+//   indices       — [N, D, S_cap]               uint8  (7-bit centroid id)
+//   qjl_signs     — [N, ceil(D/32), S_cap]      uint32 (packed sign bits)
+//   norms         — [N, S_cap]                  f32    (slot l2 norm)
+//   residual_norms — [N, S_cap]                 f32    (residual l2 norm)
+//   codebook      — [C]                         f32    (sorted centroids)
+//
+// Scratch / one-shot encode-decode buffers:
+//   indices_2d    — [N, D]                      uint32
+//   sign_bits     — [N, ceil(D/32)]             uint32
+//   keys_packed_2d — [N, D]                     uint32
+//
+// q8 fullbyte (D=256, n_seq>=1024) uses a seq-major transposition:
+//   q8_fullbyte_seq    — [N, S_cap, D]          uint8
+//   q8_slot_scales_seq — [N, S_cap]             f16
+//   d256_rot_values_seq — [N, S_cap, D]         bf16
+//
+// Mixed-precision split layouts (regular + outlier sub-vectors):
+//   regular_indices   — [KvRows, S_cap, D_reg]
+//   outlier_indices   — [KvRows, S_cap, D_out]
+//   regular_qjl_signs — [KvRows, S_cap, ceil(D_reg/32)]
+//   outlier_qjl_signs — [KvRows, S_cap, ceil(D_out/32)]
+//
+// GPU-attention coverage (head_dim, config):
+//   * Uniform + head_dim == 128  →  fused d128 attention kernel
+//   * Uniform + head_dim == 256  →  fused d256 attention kernel
+//                                    (+ q8 fullbyte specialisation when
+//                                     bits==8 and n_seq >= 1024)
+//   * Uniform + other head_dim  →  dequantize + SDPA fallback
+//   * Mixed precision           →  dequantize + SDPA fallback (no kernel)
 
 #ifndef MLX_INLINE_BRIDGE_TURBOQUANT_H
 #define MLX_INLINE_BRIDGE_TURBOQUANT_H
@@ -200,15 +248,16 @@ int mlx_inline_turboquant_unpack_sign_bits(
     uint32_t                packed_dim,
     uint32_t                n_rows);
 
-// input:       [N, 256] f32
-// left_signs:  [256] f32
-// right_signs: [256] f32
-// out:         [N, 256] f32
-int mlx_inline_turboquant_signed_fwht_256_rows(
+// input:       [N, dim] f32 (dim must be a power of two)
+// left_signs:  [dim] f32 (Rademacher ±1)
+// right_signs: [dim] f32 (Rademacher ±1)
+// out:         [N, dim] f32  (Walsh-Hadamard transform with 1/sqrt(dim) scale)
+int mlx_inline_turboquant_signed_fwht_pow2_rows(
     mlx_inline_array*       out,
     const mlx_inline_array* input,
     const mlx_inline_array* left_signs,
     const mlx_inline_array* right_signs,
+    uint32_t                dim,
     uint32_t                n_rows);
 
 // ── Weighted-decode / attention fused kernels ────────────────────────────
