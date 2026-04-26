@@ -3199,17 +3199,153 @@ fn gpu_quantize_kv_mixed(
         outlier_src_dim: v_out_src_u8,
     };
 
-    // Force materialisation before returning. Without this, downstream
-    // consumers that compose long lazy graphs (encode → store → reload →
-    // decode) hit an MLX issue where the partition/argpartition chain
-    // re-evaluates inconsistently and produces wrong residual norms. Cost
-    // is one eval per encoded chunk (≤1ms for typical decode shapes).
+    // The Mixed encode chain branches at two non-deterministic-on-re-eval
+    // points: (1) `argpartition` returns an unspecified permutation within
+    // each bucket, so the gather (rows = take_along_axis(keys, src_dim)) and
+    // the stored `src_dim` table need to commit to the *same* permutation;
+    // (2) `gpu_quantize_mse`'s argmin is sensitive to MLX scheduler-driven
+    // re-evals on the codebook-distance argmin under f32 noise. Both are
+    // correct in isolation but compose into a hidden invariant — the stored
+    // `indices` and the residual_norms derived from `recon = take(codebook,
+    // indices)` must come from the same materialisation. A single eval+detach
+    // here freezes the whole chain at one consistent point. ~1ms per encoded
+    // chunk; matches the cost of the existing `eval_and_detach_gpu_state`
+    // barrier on the Uniform path.
     let mut to_eval: Vec<&mut InlineArray> = Vec::new();
     kstore.collect_for_detach(&mut to_eval);
     vstore.collect_for_detach(&mut to_eval);
     crate::inline_array::eval_and_detach_many(&mut to_eval);
-
     Some((kstore, vstore))
+}
+
+/// Phase 3b — Score `queries` against a Mixed-precision GPU key store using the
+/// dormant `mlx_inline_turboquant_mixed_score` kernel.
+///
+/// **Layout-oracle contract.** This helper validates the Phase 3a storage
+/// layout against the existing C++ score kernel so that Phase 3c's fused
+/// attention kernels can reuse the same memory shape with confidence. It is
+/// **not** a production scoring path: the kernel takes a single
+/// `[N, D_sub]` query slice per sub-vector and reuses it for every cache
+/// slot, so the result is only correct when every slot's outlier mask
+/// matches `kstore.regular_src_dim[..,0,..]` / `outlier_src_dim[..,0,..]`.
+/// Phase 3c's kernels gather Q per-slot from the full `[N, D_total]` query
+/// instead.
+///
+/// Inputs:
+///   - `queries`: `[B, q_heads, 1, D_total]` f32 — the un-rotated, un-projected
+///     query (matches the shape produced by attention dispatch).
+///   - `kstore`: GPU-resident encoded keys.
+///   - `n_seq`: how many of the `T` cached slots to score against (≤ T).
+///
+/// Returns scores `[N, n_seq]` (N = B · q_heads).
+#[allow(dead_code)] // Phase 3b oracle — wired by tests; Phase 3c attention path supersedes it.
+#[allow(clippy::too_many_arguments)]
+fn try_gpu_mixed_score(
+    state: &TurboQuantState,
+    config: &TurboQuantConfig,
+    kstore: &GpuMixedKeyStore,
+    queries: &InlineArray,
+    q_heads: i32,
+    kv_heads: i32,
+    n_seq: i32,
+    scale: f32,
+) -> Option<InlineArray> {
+    let (reg_core, out_core) = match &state.keys {
+        TensorRuntime::Mixed {
+            regular_core,
+            outlier_core,
+            ..
+        } => (regular_core.as_ref(), outlier_core.as_ref()),
+        _ => return None,
+    };
+    let TurboQuantTensorConfig::Mixed {
+        regular_bits,
+        outlier_bits,
+        outlier_count: _,
+    } = config.keys
+    else {
+        return None;
+    };
+    if q_heads <= 0 || kv_heads <= 0 || (q_heads % kv_heads) != 0 {
+        return None;
+    }
+
+    let reg_codebook = reg_core.codebook_arr(regular_bits.saturating_sub(1))?;
+    let out_codebook = out_core.codebook_arr(outlier_bits.saturating_sub(1))?;
+
+    let b = queries.dim(0);
+    let d_reg = kstore.regular_indices.dim(3);
+    let d_out = kstore.outlier_indices.dim(3);
+    let t = kstore.regular_indices.dim(2);
+    if n_seq <= 0 || n_seq > t {
+        return None;
+    }
+    let n_rows = b * q_heads;
+    let kv_rows = b * kv_heads;
+    let groups = q_heads / kv_heads;
+
+    // Slice the slot-0 mask (shape [B, kv_heads, 1, D_*]) and broadcast across
+    // q_heads via the GQA grouping. `repeat(groups, axis=1)` produces the
+    // q_head-sized mask in the same kv_head→q_head order the kernel expects
+    // (q_head = kv_head * groups + g).
+    let reg_src_slot0 = kstore
+        .regular_src_dim
+        .slice(&[0, 0, 0, 0], &[b, kv_heads, 1, d_reg])
+        .as_dtype(Dtype::Int32.as_i32());
+    let out_src_slot0 = kstore
+        .outlier_src_dim
+        .slice(&[0, 0, 0, 0], &[b, kv_heads, 1, d_out])
+        .as_dtype(Dtype::Int32.as_i32());
+    let reg_src_q = reg_src_slot0.repeat(groups, 1);
+    let out_src_q = out_src_slot0.repeat(groups, 1);
+
+    let q_reg = queries.take_along_axis(&reg_src_q, -1);
+    let q_out = queries.take_along_axis(&out_src_q, -1);
+
+    let q_reg_2d = q_reg.reshape(&[n_rows, d_reg]);
+    let q_out_2d = q_out.reshape(&[n_rows, d_out]);
+
+    let q_reg_rot = reg_core.rotate_array(&q_reg_2d)?;
+    let q_reg_proj = reg_core.project_array(&q_reg_2d)?;
+    let q_out_rot = out_core.rotate_array(&q_out_2d)?;
+    let q_out_proj = out_core.project_array(&q_out_2d)?;
+
+    let reg_norms_flat = kstore.regular_norms.reshape(&[kv_rows, t]);
+    let reg_residual_flat = kstore.regular_residual_norms.reshape(&[kv_rows, t]);
+    let out_norms_flat = kstore.outlier_norms.reshape(&[kv_rows, t]);
+    let out_residual_flat = kstore.outlier_residual_norms.reshape(&[kv_rows, t]);
+
+    let reg_qjl_words = kstore.regular_qjl_signs.dim(3);
+    let out_qjl_words = kstore.outlier_qjl_signs.dim(3);
+
+    InlineArray::turboquant_mixed_score(
+        &q_reg_rot,
+        &q_reg_proj,
+        &kstore.regular_indices,
+        &kstore.regular_qjl_signs,
+        &reg_norms_flat,
+        &reg_residual_flat,
+        reg_codebook,
+        &q_out_rot,
+        &q_out_proj,
+        &kstore.outlier_indices,
+        &kstore.outlier_qjl_signs,
+        &out_norms_flat,
+        &out_residual_flat,
+        out_codebook,
+        d_reg as u32,
+        reg_qjl_words as u32,
+        reg_codebook.dim(0) as u32,
+        d_out as u32,
+        out_qjl_words as u32,
+        out_codebook.dim(0) as u32,
+        n_rows as u32,
+        n_seq as u32,
+        t as u32,
+        q_heads as u32,
+        kv_heads as u32,
+        scale,
+    )
 }
 
 /// Dequantise GPU-stored keys back to `[B, H, T, Dk]` f32.
@@ -5789,6 +5925,105 @@ mod tests {
         assert!(
             pairwise_v < (cpu_err_v + gpu_err_v) * 1.5 + 0.1,
             "pairwise val diff {pairwise_v} disproportionate (cpu {cpu_err_v}, gpu {gpu_err_v})"
+        );
+    }
+
+    /// Phase 3b layout oracle: the dormant `mlx_inline_turboquant_mixed_score`
+    /// kernel reads the Phase 3a Mixed store directly. If our `[B,H,T,D_*]`
+    /// layout, dtype choice, or qjl_words count is off by one, this kernel
+    /// returns garbage. We compare its output against a reference computed
+    /// by dequantising the same store and dot-producting with the query.
+    ///
+    /// Constraint: T=1 because the kernel's signature carries a single
+    /// `[N, D_sub]` query slice — Phase 3c attention kernels gather Q
+    /// per-slot from the full `[N, D_total]` query. See `try_gpu_mixed_score`
+    /// docstring.
+    #[test]
+    fn turboquant_gpu_mixed_score_matches_dequantize_dot_product() {
+        let dim = 128usize;
+        let b = 1i32;
+        let h = 4i32; // q_heads = kv_heads = 4 (no GQA grouping in this test)
+        let s = 1i32; // T=1 — see oracle constraint above.
+        let d = dim as i32;
+        let total_keys = (b * h * s * d) as usize;
+        let q_total = (b * h * d) as usize;
+
+        // Synthetic K with deliberate outliers so the regular/outlier split
+        // exercises both codebooks. Phase wraps at 0.137 rad/element.
+        let key_data: Vec<f32> = (0..total_keys)
+            .map(|i| {
+                let phase = (i as f32) * 0.137;
+                let outlier_kick = if i % 17 == 0 { 3.0 } else { 0.0 };
+                phase.sin() + outlier_kick
+            })
+            .collect();
+        let q_data: Vec<f32> = (0..q_total)
+            .map(|i| ((i as f32) * 0.211).cos())
+            .collect();
+        let keys_arr = InlineArray::from_f32_slice(&key_data, &[b, h, s, d]);
+        let vals_arr = InlineArray::from_f32_slice(&key_data, &[b, h, s, d]);
+        let queries_arr = InlineArray::from_f32_slice(&q_data, &[b, h, 1, d]);
+
+        let config = TurboQuantConfig::preset_q3_5(dim).with_recent_window(None);
+        let mut cache = QuantizedKvCache::new(config);
+        cache.append(&keys_arr, &vals_arr).expect("append");
+
+        let kstore = cache
+            .keys
+            .as_ref()
+            .and_then(|ks| ks.gpu_mixed.as_ref())
+            .expect("gpu_mixed kstore populated");
+        let state = cache.state.as_ref().expect("state");
+
+        let scale = 1.0f32 / (dim as f32).sqrt();
+        let mut gpu_scores = try_gpu_mixed_score(state, &config, kstore, &queries_arr, h, h, s, scale)
+            .expect("try_gpu_mixed_score");
+
+        // Reference: dequantise K → recon_keys [B, H, T, D]; then
+        // scores[n, t] = sum_d Q[n, d] * recon_keys[kv_row, t, d] * scale
+        // with N = B·q_heads = B·H (kv_heads == q_heads here).
+        let mut recon_keys = gpu_dequantize_keys_mixed(kstore, &state.keys, &config)
+            .expect("gpu_dequantize_keys_mixed");
+        let recon_vec = recon_keys.to_f32_vec(total_keys).expect("recon to_f32");
+        let n = (b * h) as usize;
+        let t = s as usize;
+        let mut ref_scores = vec![0.0f32; n * t];
+        for row in 0..n {
+            // GQA mapping: kv_row = batch * kv_heads + (q_head / groups).
+            // groups=1 here, so kv_row == row.
+            let kv_row = row;
+            for slot in 0..t {
+                let mut acc = 0.0f32;
+                for di in 0..(dim) {
+                    let q = q_data[row * dim + di];
+                    let k = recon_vec[(kv_row * t + slot) * dim + di];
+                    acc += q * k;
+                }
+                ref_scores[row * t + slot] = acc * scale;
+            }
+        }
+
+        let gpu_vec = gpu_scores.to_f32_vec(n * t).expect("gpu_scores to_f32");
+        let max_diff = ref_scores
+            .iter()
+            .zip(gpu_vec.iter())
+            .map(|(r, g)| (r - g).abs())
+            .fold(0.0f32, f32::max);
+        let abs_max_ref = ref_scores
+            .iter()
+            .map(|x| x.abs())
+            .fold(0.0f32, f32::max)
+            .max(1.0);
+        // The kernel and the reference compute the same expression in
+        // different orders (kernel: rotated-space dot product + qjl-residual
+        // term; reference: full-space dot product over dequantised K).
+        // Floating-point reassociation gives roundoff ≈ 1e-3 of the score
+        // magnitude. A real layout bug (off-by-one stride, wrong dtype, mask
+        // mis-aligned with codebook lookup) flips this into >0.1·abs_max_ref.
+        let tol = 5e-3 * abs_max_ref;
+        assert!(
+            max_diff < tol,
+            "mixed_score layout drift: max_diff={max_diff}, tol={tol} (abs_max_ref={abs_max_ref})"
         );
     }
 }
