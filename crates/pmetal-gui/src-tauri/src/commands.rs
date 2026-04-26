@@ -4680,10 +4680,39 @@ pub async fn start_rlkd(
     Ok(run_id)
 }
 
+// ---------------------------------------------------------------------------
+// Ollama — action dispatcher (install / run / list / pull)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn start_ollama(
+    action: String,
+    model: String,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+) -> Result<String> {
+    if !matches!(action.as_str(), "install" | "run" | "list" | "pull") {
+        return Err(AppError(format!(
+            "Unknown action '{}' (expected install, run, list, or pull)",
+            action
+        )));
+    }
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+
+    // `pmetal ollama <action> [model]` — model is omitted for `list`.
+    let mut args: Vec<String> = vec!["ollama".into(), action.clone()];
+    if action != "list" && !model.is_empty() {
+        args.push(model.clone());
+    }
+
+    spawn_oneshot_subprocess(run_id.clone(), args, on_event).await?;
+    Ok(run_id)
+}
+
 /// Spawn a `pmetal <subcommand>` child for a one-shot job that doesn't need
 /// state tracking — just streams stdout/stderr lines through the IPC channel.
-/// Used by DFlash, EmbedTrain, and RLKD which have no corresponding run-list
-/// state in AppState (they're additive routes with no legacy state).
+/// Used by DFlash, EmbedTrain, RLKD, and Ollama which have no corresponding
+/// run-list state in AppState (they're additive routes with no legacy state).
 async fn spawn_oneshot_subprocess(
     run_id: String,
     args: Vec<String>,

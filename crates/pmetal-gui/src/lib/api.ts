@@ -1020,3 +1020,88 @@ export function onPretrainStopped(callback: (runId: string) => void): Promise<Un
     callback(event.payload);
   });
 }
+
+// =============================================================================
+// Embed-Train API
+// =============================================================================
+
+export interface EmbedTrainConfig {
+  model: string;
+  dataset: string;
+  output_dir?: string | null;
+  loss?: string | null;
+  pooling?: string | null;
+  temperature?: number | null;
+  margin?: number | null;
+  learning_rate?: number | null;
+  batch_size?: number | null;
+  epochs?: number | null;
+  max_seq_len?: number | null;
+  weight_decay?: number | null;
+  no_normalize?: boolean | null;
+  log_every?: number | null;
+  seed?: number | null;
+}
+
+export async function startEmbedTrain(
+  config: EmbedTrainConfig,
+  onEvent?: (e: Record<string, unknown>) => void,
+): Promise<string> {
+  const channel = new Channel<Record<string, unknown>>();
+  if (onEvent) channel.onmessage = onEvent;
+  return await invoke('start_embed_train', { config, onEvent: channel });
+}
+
+// =============================================================================
+// RLKD API
+// =============================================================================
+
+export interface RlkdConfig {
+  model: string;
+  teacher_model: string;
+  dataset: string;
+  output_dir?: string | null;
+  distill_alpha?: number | null;
+  final_alpha?: number | null;
+  anneal_alpha?: boolean | null;
+  distill_temperature?: number | null;
+  num_generations?: number | null;
+  beta?: number | null;
+  learning_rate?: number | null;
+  epochs?: number | null;
+  lora_r?: number | null;
+  lora_alpha?: number | null;
+  max_seq_len?: number | null;
+  max_completion_length?: number | null;
+  seed?: number | null;
+  reasoning_rewards?: boolean | null;
+  no_flash_attention?: boolean | null;
+  text_column?: string | null;
+  prompt_column?: string | null;
+  response_column?: string | null;
+}
+
+export async function startRlkd(
+  config: RlkdConfig,
+  onEvent?: (e: Record<string, unknown>) => void,
+): Promise<string> {
+  const channel = new Channel<Record<string, unknown>>();
+  if (onEvent) channel.onmessage = onEvent;
+  return await invoke('start_rlkd', { config, onEvent: channel });
+}
+
+// =============================================================================
+// Ollama API
+// =============================================================================
+
+export type OllamaAction = 'install' | 'run' | 'list' | 'pull';
+
+export async function startOllama(
+  action: OllamaAction,
+  model: string,
+  onEvent?: (e: Record<string, unknown>) => void,
+): Promise<string> {
+  const channel = new Channel<Record<string, unknown>>();
+  if (onEvent) channel.onmessage = onEvent;
+  return await invoke('start_ollama', { action, model, onEvent: channel });
+}
