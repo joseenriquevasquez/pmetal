@@ -185,6 +185,25 @@ impl pmetal_core::TrainingCallback for ChannelMetricsCallback {
     }
 }
 
+/// `JobEventSink` that fans events into the TUI's `AppMsg` mpsc channel.
+///
+/// Phase 2 wiring — runs alongside [`ChannelMetricsCallback`] until Phase 4
+/// collapses the legacy `AppMsg::Job*` variants. `try_send` keeps the trainer
+/// from back-pressuring on a slow UI thread.
+struct MpscAppMsgSink {
+    tx: mpsc::Sender<AppMsg>,
+    cancel: CancellationToken,
+}
+
+impl pmetal_core::JobEventSink for MpscAppMsgSink {
+    fn emit(&self, event: pmetal_core::JobEvent) {
+        let _ = self.tx.try_send(AppMsg::Job(event));
+    }
+    fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+}
+
 /// Run a command spec as a child process, streaming output back to the TUI.
 #[allow(unsafe_code)]
 async fn run_command(
@@ -541,20 +560,31 @@ async fn run_direct_command(
     }
 }
 
-/// Build the two-callback vec used by every direct-path training entry point:
-/// one for cancellation, one for metrics streaming. Centralised so the three
-/// trainers (train / distill / grpo) stay in lockstep when new callbacks land.
+/// Build the callback vec used by every direct-path training entry point:
+/// cancellation + legacy metrics + new `JobEvent` sink. Centralised so the
+/// three trainers (train / distill / grpo) stay in lockstep when new
+/// callbacks land.
+///
+/// Phase 2: emits both the legacy `AppMsg::Job*` variants (via
+/// `ChannelMetricsCallback`) and the canonical `AppMsg::Job(JobEvent)` (via
+/// `MpscAppMsgSink` wrapped in `TrainingCallbackToSink`). Phase 4's TUI agent
+/// collapses to the canonical path only.
 fn direct_training_callbacks(
     job_id: &str,
     tx: mpsc::Sender<AppMsg>,
     cancel: CancellationToken,
 ) -> Vec<Box<dyn pmetal_core::TrainingCallback>> {
+    let sink = MpscAppMsgSink {
+        tx: tx.clone(),
+        cancel: cancel.clone(),
+    };
     vec![
         Box::new(CancelOnToken { token: cancel }),
         Box::new(ChannelMetricsCallback {
             tx,
             job_id: job_id.to_string(),
         }),
+        Box::new(pmetal_core::TrainingCallbackToSink::new(job_id, sink)),
     ]
 }
 

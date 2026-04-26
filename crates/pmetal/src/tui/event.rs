@@ -30,6 +30,14 @@ pub enum Event {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum AppMsg {
+    /// Canonical [`pmetal_core::JobEvent`] from a running job.
+    ///
+    /// Successor to the per-event `Job*` variants below — added in Phase 2 of
+    /// the surface-cohesion roll-out so the new substrate's transports can be
+    /// validated end-to-end without breaking existing consumers. Phase 4
+    /// agents per surface (CLI/TUI/GUI/MCP) collapse the legacy variants into
+    /// this one.
+    Job(pmetal_core::JobEvent),
     /// A background job has started.
     JobStarted { job_id: String, job_type: JobType },
     /// Real-time metrics from a running training job.
