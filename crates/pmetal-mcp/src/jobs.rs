@@ -13,6 +13,9 @@ use turbomcp::prelude::*;
 
 use crate::util;
 
+/// Fraction of MAX_BUFFER_LINES to drop when the log ring-buffer is full.
+const RING_DROP_FRACTION: usize = 10;
+
 /// Maximum lines to buffer per stream (stdout/stderr) per job.
 const MAX_BUFFER_LINES: usize = 10_000;
 
@@ -133,7 +136,16 @@ impl JobManager {
         let s_stop_requested = stop_requested.clone();
 
         let handle = tokio::spawn(async move {
-            // Read stdout in a separate task
+            // Read stdout in a separate task.
+            //
+            // Event parsing strategy:
+            //   1. Try pmetal_core::events::parse_event — handles subprocesses that
+            //      emit JobEvent JSONL via `--log-events /dev/stdout` (Phase 4+).
+            //   2. Legacy fallback: try_parse_metrics for older pmetal subprocesses
+            //      that emit the flat `{"step":N,"loss":F,...}` format.
+            //
+            // The ring-buffer drops the oldest 10% of lines when full, so that
+            // long-running jobs never grow the buffer beyond MAX_BUFFER_LINES.
             let stdout_task = {
                 let buf = s_stdout.clone();
                 let met = s_metrics.clone();
@@ -142,12 +154,18 @@ impl JobManager {
                         let reader = BufReader::new(stdout);
                         let mut lines = reader.lines();
                         while let Ok(Some(line)) = lines.next_line().await {
-                            // Try to parse as metrics JSONL
-                            try_parse_metrics(&line, &met).await;
+                            // Priority 1: structured JobEvent JSONL.
+                            if let Ok(event) = pmetal_core::events::parse_event(line.trim()) {
+                                apply_job_event_to_metrics(&event, &met).await;
+                            } else {
+                                // Priority 2: legacy flat metrics JSON.
+                                try_parse_metrics(&line, &met).await;
+                            }
+                            // Ring-buffer: drop oldest 10% when at capacity.
                             let mut b = buf.write().await;
                             if b.len() >= MAX_BUFFER_LINES {
-                                let drain_end = b.len() / 4;
-                                b.drain(..drain_end);
+                                let drop_n = (MAX_BUFFER_LINES / RING_DROP_FRACTION).max(1);
+                                b.drain(..drop_n);
                             }
                             b.push(line);
                         }
@@ -155,7 +173,7 @@ impl JobManager {
                 })
             };
 
-            // Read stderr in a separate task
+            // Read stderr in a separate task.
             let stderr_task = {
                 let buf = s_stderr.clone();
                 tokio::spawn(async move {
@@ -163,10 +181,11 @@ impl JobManager {
                         let reader = BufReader::new(stderr);
                         let mut lines = reader.lines();
                         while let Ok(Some(line)) = lines.next_line().await {
+                            // Ring-buffer: drop oldest 10% when at capacity.
                             let mut b = buf.write().await;
                             if b.len() >= MAX_BUFFER_LINES {
-                                let drain_end = b.len() / 4;
-                                b.drain(..drain_end);
+                                let drop_n = (MAX_BUFFER_LINES / RING_DROP_FRACTION).max(1);
+                                b.drain(..drop_n);
                             }
                             b.push(line);
                         }
@@ -411,6 +430,42 @@ fn default_output_dir_for_command(command: &str) -> &'static str {
         "rlkd" => "./output/rlkd",
         "embed-train" => "./output-embed",
         _ => "./output",
+    }
+}
+
+/// Update metrics from a structured [`pmetal_core::JobEvent`].
+///
+/// This is the primary path for subprocesses that emit JobEvent JSONL on
+/// stdout (e.g. via `--log-events /dev/stdout`). Only the `Metric` variant
+/// carries values that map onto [`JobMetrics`]; other variants are silently
+/// ignored here (they are available via the raw line buffer for callers that
+/// need them).
+async fn apply_job_event_to_metrics(
+    event: &pmetal_core::JobEvent,
+    metrics: &Arc<RwLock<JobMetrics>>,
+) {
+    use pmetal_core::events::{JobEvent, MetricPayload};
+    if let JobEvent::Metric { payload, .. } = event {
+        match payload {
+            MetricPayload::Step(step) => {
+                let mut m = metrics.write().await;
+                m.last_step = Some(step.step as u64);
+                m.last_loss = Some(step.loss);
+                m.last_lr = Some(step.lr);
+                if step.tok_sec > 0.0 {
+                    m.tokens_per_second = Some(step.tok_sec);
+                }
+                // epoch is 0-indexed usize; report as f64 1-indexed for readability.
+                m.epoch = Some((step.epoch + 1) as f64);
+            }
+            MetricPayload::Eval(eval) => {
+                // Overwrite last_loss with eval loss so job_status surfaces it
+                // when the subprocess emits periodic evaluations.
+                let mut m = metrics.write().await;
+                m.last_loss = Some(eval.loss);
+            }
+            _ => {}
+        }
     }
 }
 

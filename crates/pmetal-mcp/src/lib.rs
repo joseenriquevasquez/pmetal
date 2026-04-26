@@ -9,6 +9,8 @@ use turbomcp::prelude::*;
 
 use jobs::JobManager;
 use util::{push_bool_flag, push_opt};
+use pmetal_core::jobs::TrainSpec;
+use pmetal_core::JobFields as _;
 
 /// MCP server exposing all PMetal functionality.
 #[derive(Clone)]
@@ -402,6 +404,25 @@ impl PmetalMcpServer {
 
     /// Start LoRA/QLoRA fine-tuning on a model. Returns a job ID for
     /// tracking progress. Use job_status/job_logs to monitor.
+    ///
+    /// # Spec-driven migration pattern
+    ///
+    /// This tool body is the exemplar for migrating all `push_opt` / `push_bool_flag`
+    /// call chains to `pmetal_core::jobs::*Spec`. The pattern for any tool:
+    ///
+    /// ```text
+    /// 1. Build the spec from tool parameters (keep all #[description] attrs on the
+    ///    fn signature — turbomcp reads them for schema generation).
+    /// 2. Call spec.normalize() to run descriptor-driven validation; map errors to
+    ///    McpError::invalid_params.
+    /// 3. let mut argv = spec.to_argv();  // replaces the entire push_opt block.
+    /// 4. Append any fields the spec does not yet model (CLI-only flags not in the
+    ///    spec; to be removed once the spec is extended).
+    /// 5. self.jobs.write().await.spawn("<subcommand>", argv).await
+    /// ```
+    ///
+    /// To migrate `distill`, `grpo`, `rlkd`, `embed_train`, etc., repeat steps
+    /// 1–5 with the corresponding `*Spec` type and subcommand string.
     #[tool]
     async fn train(
         &self,
@@ -451,62 +472,74 @@ impl PmetalMcpServer {
         #[description("Response column for SFT label masking")] response_column: Option<String>,
         #[description("Path to training config file (YAML)")] config: Option<String>,
     ) -> McpResult<String> {
-        let mut args = vec![
-            "--model".to_string(),
+        // Build and validate via TrainSpec — the canonical field contract for
+        // `pmetal train`.  Fields the spec does not yet model (no_gradient_checkpointing,
+        // gradient_checkpointing_layers) are appended after spec.to_argv().
+        let mut spec = TrainSpec {
             model,
-            "--dataset".to_string(),
             dataset,
-        ];
-        push_opt(&mut args, "--output", &output);
-        push_opt(&mut args, "--lora-r", &lora_r);
-        push_opt(&mut args, "--lora-alpha", &lora_alpha);
-        push_opt(&mut args, "--learning-rate", &learning_rate);
-        push_opt(&mut args, "--batch-size", &batch_size);
-        push_opt(&mut args, "--epochs", &epochs);
-        push_opt(&mut args, "--max-seq-len", &max_seq_len);
-        push_opt(
-            &mut args,
-            "--gradient-accumulation-steps",
-            &gradient_accumulation_steps,
-        );
-        push_opt(&mut args, "--quantization", &quantization);
-        push_opt(&mut args, "--lr-schedule", &lr_schedule);
-        push_opt(&mut args, "--eval-dataset", &eval_dataset);
-        push_opt(&mut args, "--warmup-steps", &warmup_steps);
-        push_opt(&mut args, "--weight-decay", &weight_decay);
-        push_opt(&mut args, "--seed", &seed);
-        push_opt(&mut args, "--max-grad-norm", &max_grad_norm);
-        push_opt(&mut args, "--loss-scale", &loss_scale);
-        push_opt(&mut args, "--embedding-lr", &embedding_lr);
-        push_bool_flag(&mut args, "--resume", &resume);
-        push_bool_flag(&mut args, "--cut-cross-entropy", &cut_cross_entropy);
-        push_bool_flag(&mut args, "--no-adaptive-lr", &no_adaptive_lr);
-        push_bool_flag(&mut args, "--no-flash-attention", &no_flash_attention);
-        push_bool_flag(&mut args, "--no-sequence-packing", &no_sequence_packing);
-        push_bool_flag(&mut args, "--no-jit-compilation", &no_jit_compilation);
+            output_dir: output.unwrap_or_else(|| pmetal_core::jobs::TrainSpec::default().output_dir),
+            lora_r: lora_r.unwrap_or(pmetal_core::defaults::LORA_R as u64) as usize,
+            lora_alpha: lora_alpha.unwrap_or(f64::from(pmetal_core::defaults::LORA_ALPHA)) as f32,
+            learning_rate: learning_rate.unwrap_or(pmetal_core::defaults::LEARNING_RATE),
+            batch_size: batch_size.unwrap_or(pmetal_core::defaults::CLI_BATCH_SIZE as u64) as usize,
+            epochs: epochs.unwrap_or(pmetal_core::defaults::CLI_EPOCHS as u64) as usize,
+            max_seq_len: max_seq_len.unwrap_or(0) as usize,
+            gradient_accumulation_steps: gradient_accumulation_steps
+                .unwrap_or(pmetal_core::defaults::GRADIENT_ACCUMULATION_STEPS as u64)
+                as usize,
+            quantization,
+            lr_schedule: lr_schedule
+                .unwrap_or_else(|| "cosine".to_string()),
+            eval_dataset,
+            warmup_steps: warmup_steps.unwrap_or(0) as usize,
+            weight_decay: weight_decay.unwrap_or(pmetal_core::defaults::WEIGHT_DECAY),
+            seed: seed.unwrap_or(pmetal_core::defaults::SEED),
+            max_grad_norm: max_grad_norm.unwrap_or(pmetal_core::defaults::MAX_GRAD_NORM),
+            loss_scale: loss_scale.unwrap_or(pmetal_core::defaults::LOSS_SCALE) as f32,
+            embedding_lr,
+            resume: resume.unwrap_or(false),
+            cut_cross_entropy: cut_cross_entropy.unwrap_or(false),
+            no_adaptive_lr: no_adaptive_lr.unwrap_or(false),
+            no_flash_attention: no_flash_attention.unwrap_or(false),
+            no_sequence_packing: no_sequence_packing.unwrap_or(false),
+            no_jit_compilation: no_jit_compilation.unwrap_or(false),
+            no_metal_fused_optimizer: no_metal_fused_optimizer.unwrap_or(false),
+            ane: ane.unwrap_or(false),
+            text_column,
+            prompt_column,
+            response_column,
+            config_path: config,
+            ..TrainSpec::default()
+        };
+
+        spec.normalize().map_err(|errs| {
+            McpError::invalid_params(format!(
+                "validation failed: {}",
+                errs.iter()
+                    .map(|e| format!("{}: {}", e.field, e.message))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))
+        })?;
+
+        let mut argv = spec.to_argv();
+
+        // Append fields the spec does not yet model. These will be removed
+        // once the spec gains these fields in a follow-up phase.
         push_bool_flag(
-            &mut args,
+            &mut argv,
             "--no-gradient-checkpointing",
             &no_gradient_checkpointing,
         );
         push_opt(
-            &mut args,
+            &mut argv,
             "--gradient-checkpointing-layers",
             &gradient_checkpointing_layers,
         );
-        push_bool_flag(
-            &mut args,
-            "--no-metal-fused-optimizer",
-            &no_metal_fused_optimizer,
-        );
-        push_bool_flag(&mut args, "--ane", &ane);
-        push_opt(&mut args, "--text-column", &text_column);
-        push_opt(&mut args, "--prompt-column", &prompt_column);
-        push_opt(&mut args, "--response-column", &response_column);
-        push_opt(&mut args, "--config", &config);
 
         let mut mgr = self.jobs.write().await;
-        let id = mgr.spawn("train", args).await?;
+        let id = mgr.spawn("train", argv).await?;
         job_started_response(&id, "train")
     }
 
@@ -1774,7 +1807,13 @@ impl PmetalMcpServer {
 
         if !response.status().is_success() {
             let status = response.status();
-            let text = response.text().await.unwrap_or_default();
+            let text = response
+                .text()
+                .await
+                .map_err(|e| {
+                    tracing::warn!("serve returned {status}: could not read response body: {e}");
+                    McpError::internal(format!("serve returned {status}: <body unreadable: {e}>"))
+                })?;
             return Err(McpError::internal(format!(
                 "serve returned {status}: {text}"
             )));
