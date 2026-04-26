@@ -394,11 +394,169 @@ impl GpuValueStore {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// GPU-resident Mixed-precision K/V stores (Phase 3a)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Layout pinned for upcoming Mixed attention kernels:
+//   regular_indices    — [B, H, T, D_reg]               u8
+//   regular_indices_t  — [B, H, D_reg, T]               u8   (S-innermost)
+//   regular_qjl_signs  — [B, H, T, ceil(D_reg/32)]      u32
+//   regular_qjl_signs_t — [B, H, ceil(D_reg/32), T]     u32  (S-innermost)
+//   regular_norms      — [B, H, T, 1]                   f32
+//   regular_residual_norms — [B, H, T, 1]               f32
+//   regular_src_dim    — [B, H, T, D_reg]               u8   (scatter-back map)
+//
+// Outlier mirrors: same shapes with D_out instead of D_reg.
+//
+// Scatter tables (`*_src_dim`) hold the original-D positions of each
+// sub-vector slot, sorted ascending. They are written once per token at
+// encode time and gathered by the attention kernel to scatter regular and
+// outlier contributions back into the [B, H, D_total] output. K and V
+// stores have *independent* scatter tables — `select_outlier_mask` runs on
+// each tensor's row magnitudes separately.
+
+#[derive(Debug, Clone)]
+struct GpuMixedKeyStore {
+    regular_indices: InlineArray,
+    regular_indices_t: Option<InlineArray>,
+    regular_qjl_signs: InlineArray,
+    regular_qjl_signs_t: Option<InlineArray>,
+    regular_norms: InlineArray,
+    regular_residual_norms: InlineArray,
+    regular_src_dim: InlineArray,
+    outlier_indices: InlineArray,
+    outlier_indices_t: Option<InlineArray>,
+    outlier_qjl_signs: InlineArray,
+    outlier_qjl_signs_t: Option<InlineArray>,
+    outlier_norms: InlineArray,
+    outlier_residual_norms: InlineArray,
+    outlier_src_dim: InlineArray,
+}
+
+impl GpuMixedKeyStore {
+    fn append(&mut self, new: GpuMixedKeyStore) {
+        self.regular_indices = self.regular_indices.kv_cache_append(&new.regular_indices, 2);
+        self.regular_indices_t = match (self.regular_indices_t.take(), new.regular_indices_t) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
+            _ => None,
+        };
+        self.regular_qjl_signs = self
+            .regular_qjl_signs
+            .kv_cache_append(&new.regular_qjl_signs, 2);
+        self.regular_qjl_signs_t = match (self.regular_qjl_signs_t.take(), new.regular_qjl_signs_t)
+        {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
+            _ => None,
+        };
+        self.regular_norms = self.regular_norms.kv_cache_append(&new.regular_norms, 2);
+        self.regular_residual_norms = self
+            .regular_residual_norms
+            .kv_cache_append(&new.regular_residual_norms, 2);
+        self.regular_src_dim = self.regular_src_dim.kv_cache_append(&new.regular_src_dim, 2);
+        self.outlier_indices = self.outlier_indices.kv_cache_append(&new.outlier_indices, 2);
+        self.outlier_indices_t = match (self.outlier_indices_t.take(), new.outlier_indices_t) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
+            _ => None,
+        };
+        self.outlier_qjl_signs = self
+            .outlier_qjl_signs
+            .kv_cache_append(&new.outlier_qjl_signs, 2);
+        self.outlier_qjl_signs_t = match (self.outlier_qjl_signs_t.take(), new.outlier_qjl_signs_t)
+        {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
+            _ => None,
+        };
+        self.outlier_norms = self.outlier_norms.kv_cache_append(&new.outlier_norms, 2);
+        self.outlier_residual_norms = self
+            .outlier_residual_norms
+            .kv_cache_append(&new.outlier_residual_norms, 2);
+        self.outlier_src_dim = self.outlier_src_dim.kv_cache_append(&new.outlier_src_dim, 2);
+    }
+
+    fn collect_for_detach<'a>(&'a mut self, out: &mut Vec<&'a mut InlineArray>) {
+        out.push(&mut self.regular_indices);
+        if let Some(indices_t) = self.regular_indices_t.as_mut() {
+            out.push(indices_t);
+        }
+        out.push(&mut self.regular_qjl_signs);
+        if let Some(signs_t) = self.regular_qjl_signs_t.as_mut() {
+            out.push(signs_t);
+        }
+        out.push(&mut self.regular_norms);
+        out.push(&mut self.regular_residual_norms);
+        out.push(&mut self.regular_src_dim);
+        out.push(&mut self.outlier_indices);
+        if let Some(indices_t) = self.outlier_indices_t.as_mut() {
+            out.push(indices_t);
+        }
+        out.push(&mut self.outlier_qjl_signs);
+        if let Some(signs_t) = self.outlier_qjl_signs_t.as_mut() {
+            out.push(signs_t);
+        }
+        out.push(&mut self.outlier_norms);
+        out.push(&mut self.outlier_residual_norms);
+        out.push(&mut self.outlier_src_dim);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GpuMixedValueStore {
+    regular_indices: InlineArray,
+    regular_indices_t: Option<InlineArray>,
+    regular_norms: InlineArray,
+    regular_src_dim: InlineArray,
+    outlier_indices: InlineArray,
+    outlier_indices_t: Option<InlineArray>,
+    outlier_norms: InlineArray,
+    outlier_src_dim: InlineArray,
+}
+
+impl GpuMixedValueStore {
+    fn append(&mut self, new: GpuMixedValueStore) {
+        self.regular_indices = self.regular_indices.kv_cache_append(&new.regular_indices, 2);
+        self.regular_indices_t = match (self.regular_indices_t.take(), new.regular_indices_t) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
+            _ => None,
+        };
+        self.regular_norms = self.regular_norms.kv_cache_append(&new.regular_norms, 2);
+        self.regular_src_dim = self.regular_src_dim.kv_cache_append(&new.regular_src_dim, 2);
+        self.outlier_indices = self.outlier_indices.kv_cache_append(&new.outlier_indices, 2);
+        self.outlier_indices_t = match (self.outlier_indices_t.take(), new.outlier_indices_t) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
+            _ => None,
+        };
+        self.outlier_norms = self.outlier_norms.kv_cache_append(&new.outlier_norms, 2);
+        self.outlier_src_dim = self.outlier_src_dim.kv_cache_append(&new.outlier_src_dim, 2);
+    }
+
+    fn collect_for_detach<'a>(&'a mut self, out: &mut Vec<&'a mut InlineArray>) {
+        out.push(&mut self.regular_indices);
+        if let Some(indices_t) = self.regular_indices_t.as_mut() {
+            out.push(indices_t);
+        }
+        out.push(&mut self.regular_norms);
+        out.push(&mut self.regular_src_dim);
+        out.push(&mut self.outlier_indices);
+        if let Some(indices_t) = self.outlier_indices_t.as_mut() {
+            out.push(indices_t);
+        }
+        out.push(&mut self.outlier_norms);
+        out.push(&mut self.outlier_src_dim);
+    }
+}
+
 /// Quantised key store for one attention layer.
 #[derive(Debug, Clone)]
 pub struct QuantizedKeyStore {
     // GPU-native store (Uniform path only).  When Some, dequantize uses GPU ops.
     gpu: Option<GpuKeyStore>,
+
+    // GPU-native store for the Mixed path. Populated alongside the CPU
+    // `PackedBits` fields below when a Mixed config is active and the GPU
+    // encode succeeded. Phase 3a — present but currently consumed only by
+    // round-trip tests; Phase 3c will wire it into attention.
+    gpu_mixed: Option<GpuMixedKeyStore>,
 
     // CPU fallback: regular (non-outlier) sub-vector data.
     pub regular_indices: PackedBits,
@@ -429,6 +587,7 @@ impl QuantizedKeyStore {
 
         Self {
             gpu: None,
+            gpu_mixed: None,
             regular_indices: PackedBits::new(regular_bits),
             regular_qjl_signs: PackedBits::new(1),
             regular_norms: Vec::new(),
@@ -502,6 +661,9 @@ pub struct QuantizedValueStore {
     // GPU-native store (Uniform path only).
     gpu: Option<GpuValueStore>,
 
+    // GPU-native store for the Mixed path. See `QuantizedKeyStore.gpu_mixed`.
+    gpu_mixed: Option<GpuMixedValueStore>,
+
     pub regular_indices: PackedBits,
     pub regular_norms: Vec<f32>,
 
@@ -523,6 +685,7 @@ impl QuantizedValueStore {
 
         Self {
             gpu: None,
+            gpu_mixed: None,
             regular_indices: PackedBits::new(regular_bits),
             regular_norms: Vec::new(),
             outlier_mask: outlier_bits.map(|_| PackedBits::new(1)),
@@ -806,6 +969,28 @@ impl QuantizedKvCache {
             encoded_values.outlier.as_ref(),
             encoded_values.outlier_mask.as_ref(),
         );
+
+        // ── Mixed GPU path (additive, Phase 3a) ───────────────────────────
+        // Mirrors the Uniform GPU path above but populates gpu_mixed instead
+        // of gpu, alongside (not in lieu of) the CPU PackedBits stores. The
+        // CPU stores remain authoritative for now; Phase 3c will flip
+        // attention dispatch to read from gpu_mixed.
+        let mixed_keys = matches!(config.keys, TurboQuantTensorConfig::Mixed { .. });
+        let mixed_vals = matches!(config.values, TurboQuantTensorConfig::Mixed { .. });
+        if mixed_keys && mixed_vals {
+            if let Some((new_ks_gpu, new_vs_gpu)) =
+                gpu_quantize_kv_mixed(&state, &keys_f32, &values_f32, config)
+            {
+                match ks.gpu_mixed.as_mut() {
+                    None => ks.gpu_mixed = Some(new_ks_gpu),
+                    Some(g) => g.append(new_ks_gpu),
+                }
+                match vs.gpu_mixed.as_mut() {
+                    None => vs.gpu_mixed = Some(new_vs_gpu),
+                    Some(g) => g.append(new_vs_gpu),
+                }
+            }
+        }
 
         self.cold_offset += seq_len;
         Ok(())
@@ -1210,9 +1395,15 @@ impl QuantizedKvCache {
             if let Some(gpu) = &mut keys.gpu {
                 gpu.collect_for_detach(&mut to_eval);
             }
+            if let Some(gpu) = &mut keys.gpu_mixed {
+                gpu.collect_for_detach(&mut to_eval);
+            }
         }
         if let Some(values) = &mut self.values {
             if let Some(gpu) = &mut values.gpu {
+                gpu.collect_for_detach(&mut to_eval);
+            }
+            if let Some(gpu) = &mut values.gpu_mixed {
                 gpu.collect_for_detach(&mut to_eval);
             }
         }
@@ -2756,6 +2947,271 @@ fn gpu_quantize_kv(
     ))
 }
 
+/// Encode a single-tensor sub-vector (regular *or* outlier slice) into the
+/// rotated-MSE + QJL representation that the Mixed-precision attention
+/// kernels will read. Mirrors the keys half of `gpu_quantize_kv` (lines
+/// 2571-2630) but parameterised by an arbitrary `TurboQuantCore` so it
+/// works for the regular_core (D_reg, dense rotation) and outlier_core
+/// (D_out, FWHT rotation when D_out is pow2) without duplication.
+fn gpu_encode_key_subvector(
+    rows: &InlineArray, // [B, H, S, sub_dim] f32
+    core: &TurboQuantCore,
+    key_bits: u8,
+) -> Option<MixedKeySubvectorEncoding> {
+    let mse_bits = key_bits.saturating_sub(1);
+    let eps = InlineArray::from_f32(ZERO_EPSILON);
+
+    let norms = rows.norm_l2(-1, true);
+    let safe_norms = norms.maximum(&eps);
+    let normalized = rows.divide(&safe_norms);
+
+    let rotated = core.rotate_array(&normalized)?;
+    let indices_u32 = core.gpu_quantize_mse(&rotated, mse_bits)?;
+    // Phase 3a: keep indices as u32 for round-trip clarity. Phase 3c will
+    // introduce a u8 packed shadow alongside (matching Uniform's q8_keybytes).
+    let indices = indices_u32.clone();
+
+    let recon_rot = core.gpu_reconstruct_mse(&indices_u32, mse_bits)?;
+    let residual_rot = rotated.subtract(&recon_rot);
+    let residual_norms_raw = residual_rot.norm_l2(-1, true);
+    let zero_bound = InlineArray::from_f32(0.0f32);
+    let upper_bound = InlineArray::from_f32(MAX_RESIDUAL_NORM);
+    let residual_norms = residual_norms_raw
+        .maximum(&zero_bound)
+        .minimum(&upper_bound);
+
+    let recon_unrot = core.inverse_rotate_array(&recon_rot)?;
+    let residual_unrot = normalized.subtract(&recon_unrot);
+    let qjl_proj = core.project_array(&residual_unrot)?;
+    let qjl_shape = qjl_proj.shape();
+    let qjl_ndim = qjl_shape.len();
+    let qjl_rows: i32 = qjl_shape[..qjl_ndim - 1].iter().product();
+    let packed_dim = packed_qjl_words(core.dim) as i32;
+    let qjl_proj_2d = if qjl_ndim == 2 {
+        qjl_proj.clone()
+    } else {
+        qjl_proj.reshape(&[qjl_rows, core.dim as i32])
+    };
+    let qjl_signs = InlineArray::turboquant_pack_sign_bits(
+        &qjl_proj_2d,
+        core.dim as u32,
+        packed_dim as u32,
+        qjl_rows as u32,
+    )?;
+    let qjl_signs = if qjl_ndim == 2 {
+        qjl_signs
+    } else {
+        let mut packed_shape: Vec<i32> = qjl_shape[..qjl_ndim - 1].to_vec();
+        packed_shape.push(packed_dim);
+        qjl_signs.reshape(&packed_shape)
+    };
+
+    let indices_t = indices.transpose_axes(&[0, 1, 3, 2]);
+    let qjl_signs_t = qjl_signs.transpose_axes(&[0, 1, 3, 2]);
+
+    Some(MixedKeySubvectorEncoding {
+        indices,
+        indices_t: Some(indices_t),
+        qjl_signs,
+        qjl_signs_t: Some(qjl_signs_t),
+        norms,
+        residual_norms,
+    })
+}
+
+struct MixedKeySubvectorEncoding {
+    indices: InlineArray,
+    indices_t: Option<InlineArray>,
+    qjl_signs: InlineArray,
+    qjl_signs_t: Option<InlineArray>,
+    norms: InlineArray,
+    residual_norms: InlineArray,
+}
+
+/// Encode a single-tensor sub-vector for the *value* path (norm + rotated
+/// MSE indices, no QJL residual term — mirrors the values half of
+/// `gpu_quantize_kv` at lines 2701-2723).
+fn gpu_encode_value_subvector(
+    rows: &InlineArray, // [B, H, S, sub_dim] f32
+    core: &TurboQuantCore,
+    val_bits: u8,
+) -> Option<MixedValueSubvectorEncoding> {
+    let eps = InlineArray::from_f32(ZERO_EPSILON);
+
+    let norms = rows.norm_l2(-1, true);
+    let safe_norms = norms.maximum(&eps);
+    let normalized = rows.divide(&safe_norms);
+
+    let rotated = core.rotate_array(&normalized)?;
+    let indices_u32 = core.gpu_quantize_mse(&rotated, val_bits)?;
+    let indices = indices_u32.clone();
+    let indices_t = indices.transpose_axes(&[0, 1, 3, 2]);
+
+    Some(MixedValueSubvectorEncoding {
+        indices,
+        indices_t: Some(indices_t),
+        norms,
+    })
+}
+
+struct MixedValueSubvectorEncoding {
+    indices: InlineArray,
+    indices_t: Option<InlineArray>,
+    norms: InlineArray,
+}
+
+/// Compute the Mixed-precision outlier partition on the GPU.
+///
+/// Returns `(regular_src_dim, outlier_src_dim)` of shape `[B, H, S, D_reg]`
+/// and `[B, H, S, D_out]` respectively, both `int32`. Each row's entries
+/// hold the original-D positions of the corresponding sub-vector slot,
+/// **sorted ascending**. The kernel reads these tables to scatter regular
+/// and outlier contributions back into the `[B, H, D_total]` output.
+///
+/// Pipeline:
+///   1. `argpartition(-|x|, outlier_count, axis=-1)` → `[B,H,S,D]` with the
+///      first `outlier_count` entries being outlier positions (unsorted).
+///   2. Slice into `[outlier_idxs_unsorted, regular_idxs_unsorted]`.
+///   3. Stable-sort each subset ascending by re-running argsort and
+///      `take_along_axis` (positions are unique ints, no tie-break needed).
+fn gpu_compute_outlier_partition(
+    rows: &InlineArray, // [B, H, S, D_total] f32
+    outlier_count: usize,
+    total_dim: usize,
+) -> Option<(InlineArray, InlineArray)> {
+    if outlier_count == 0 || outlier_count >= total_dim {
+        return None;
+    }
+    let abs = rows.abs();
+    let neg_abs = abs.negative();
+    let part = neg_abs.argpartition(outlier_count as i32, -1);
+
+    let b = part.dim(0);
+    let h = part.dim(1);
+    let s = part.dim(2);
+    let outlier_count_i32 = outlier_count as i32;
+    let total_dim_i32 = total_dim as i32;
+
+    let outlier_unsorted = part.slice(&[0, 0, 0, 0], &[b, h, s, outlier_count_i32]);
+    let regular_unsorted = part.slice(&[0, 0, 0, outlier_count_i32], &[b, h, s, total_dim_i32]);
+
+    let outlier_perm = outlier_unsorted.argsort(-1);
+    let outlier_src_dim = outlier_unsorted.take_along_axis(&outlier_perm, -1);
+
+    let regular_perm = regular_unsorted.argsort(-1);
+    let regular_src_dim = regular_unsorted.take_along_axis(&regular_perm, -1);
+
+    Some((regular_src_dim, outlier_src_dim))
+}
+
+/// Build a `GpuMixedKeyStore` for one append step from `[B, H, S, D]` f32
+/// keys + values. Mirrors `gpu_quantize_kv` for the Mixed branch.
+fn gpu_quantize_kv_mixed(
+    state: &TurboQuantState,
+    keys: &InlineArray,   // [B, H, S, Dk] f32
+    values: &InlineArray, // [B, H, S, Dv] f32
+    config: TurboQuantConfig,
+) -> Option<(GpuMixedKeyStore, GpuMixedValueStore)> {
+    let TurboQuantTensorConfig::Mixed {
+        regular_bits: kr_bits,
+        outlier_bits: ko_bits,
+        outlier_count: k_oc,
+    } = config.keys
+    else {
+        return None;
+    };
+    let TurboQuantTensorConfig::Mixed {
+        regular_bits: vr_bits,
+        outlier_bits: vo_bits,
+        outlier_count: v_oc,
+    } = config.values
+    else {
+        return None;
+    };
+
+    let (k_reg_core, k_out_core) = match &state.keys {
+        TensorRuntime::Mixed {
+            regular_core,
+            outlier_core,
+            ..
+        } => (regular_core, outlier_core),
+        _ => return None,
+    };
+    let (v_reg_core, v_out_core) = match &state.values {
+        TensorRuntime::Mixed {
+            regular_core,
+            outlier_core,
+            ..
+        } => (regular_core, outlier_core),
+        _ => return None,
+    };
+
+    let k_total_dim = keys.dim(3) as usize;
+    let v_total_dim = values.dim(3) as usize;
+
+    // ── Keys ─────────────────────────────────────────────────────────────
+    let (k_reg_src, k_out_src) = gpu_compute_outlier_partition(keys, k_oc, k_total_dim)?;
+    let k_reg_rows = keys.take_along_axis(&k_reg_src, -1);
+    let k_out_rows = keys.take_along_axis(&k_out_src, -1);
+
+    let k_reg_enc = gpu_encode_key_subvector(&k_reg_rows, k_reg_core, kr_bits)?;
+    let k_out_enc = gpu_encode_key_subvector(&k_out_rows, k_out_core, ko_bits)?;
+
+    // Cast scatter tables to u8 for storage (D_total ≤ 256 fits comfortably).
+    let k_reg_src_u8 = k_reg_src.as_dtype(Dtype::Uint8.as_i32());
+    let k_out_src_u8 = k_out_src.as_dtype(Dtype::Uint8.as_i32());
+
+    // ── Values ───────────────────────────────────────────────────────────
+    let (v_reg_src, v_out_src) = gpu_compute_outlier_partition(values, v_oc, v_total_dim)?;
+    let v_reg_rows = values.take_along_axis(&v_reg_src, -1);
+    let v_out_rows = values.take_along_axis(&v_out_src, -1);
+
+    let v_reg_enc = gpu_encode_value_subvector(&v_reg_rows, v_reg_core, vr_bits)?;
+    let v_out_enc = gpu_encode_value_subvector(&v_out_rows, v_out_core, vo_bits)?;
+
+    let v_reg_src_u8 = v_reg_src.as_dtype(Dtype::Uint8.as_i32());
+    let v_out_src_u8 = v_out_src.as_dtype(Dtype::Uint8.as_i32());
+
+    let mut kstore = GpuMixedKeyStore {
+        regular_indices: k_reg_enc.indices,
+        regular_indices_t: k_reg_enc.indices_t,
+        regular_qjl_signs: k_reg_enc.qjl_signs,
+        regular_qjl_signs_t: k_reg_enc.qjl_signs_t,
+        regular_norms: k_reg_enc.norms,
+        regular_residual_norms: k_reg_enc.residual_norms,
+        regular_src_dim: k_reg_src_u8,
+        outlier_indices: k_out_enc.indices,
+        outlier_indices_t: k_out_enc.indices_t,
+        outlier_qjl_signs: k_out_enc.qjl_signs,
+        outlier_qjl_signs_t: k_out_enc.qjl_signs_t,
+        outlier_norms: k_out_enc.norms,
+        outlier_residual_norms: k_out_enc.residual_norms,
+        outlier_src_dim: k_out_src_u8,
+    };
+    let mut vstore = GpuMixedValueStore {
+        regular_indices: v_reg_enc.indices,
+        regular_indices_t: v_reg_enc.indices_t,
+        regular_norms: v_reg_enc.norms,
+        regular_src_dim: v_reg_src_u8,
+        outlier_indices: v_out_enc.indices,
+        outlier_indices_t: v_out_enc.indices_t,
+        outlier_norms: v_out_enc.norms,
+        outlier_src_dim: v_out_src_u8,
+    };
+
+    // Force materialisation before returning. Without this, downstream
+    // consumers that compose long lazy graphs (encode → store → reload →
+    // decode) hit an MLX issue where the partition/argpartition chain
+    // re-evaluates inconsistently and produces wrong residual norms. Cost
+    // is one eval per encoded chunk (≤1ms for typical decode shapes).
+    let mut to_eval: Vec<&mut InlineArray> = Vec::new();
+    kstore.collect_for_detach(&mut to_eval);
+    vstore.collect_for_detach(&mut to_eval);
+    crate::inline_array::eval_and_detach_many(&mut to_eval);
+
+    Some((kstore, vstore))
+}
+
 /// Dequantise GPU-stored keys back to `[B, H, T, Dk]` f32.
 ///
 /// Formula (per coordinate):
@@ -2862,6 +3318,177 @@ fn gpu_dequantize_values(
 
     // 3. Rescale by stored L2 norms [B,H,T,1].
     Some(mse_base.multiply(store.norms.as_ref()?))
+}
+
+/// Dequantise a single key sub-vector (regular *or* outlier) for the
+/// Mixed-precision path. Mirrors `gpu_dequantize_keys` body but
+/// parameterised by an arbitrary `TurboQuantCore` and stored arrays.
+//
+// Phase 3a only exercises this from tests; Phase 3c will wire it into the
+// non-test attention dispatch. Suppress the dead-code warning meanwhile.
+#[allow(dead_code)]
+fn gpu_dequantize_key_subvector(
+    indices_u8: &InlineArray,        // [B, H, T, D_sub] u8
+    qjl_signs: &InlineArray,         // [B, H, T, ceil(D_sub/32)] u32
+    norms: &InlineArray,             // [B, H, T, 1] f32
+    residual_norms: &InlineArray,    // [B, H, T, 1] f32
+    core: &TurboQuantCore,
+    key_bits: u8,
+) -> Option<InlineArray> {
+    let mse_bits = key_bits.saturating_sub(1);
+
+    // Phase 3a: indices stored as u32; cast no-op when already u32.
+    let indices_u32 = indices_u8.as_dtype(Dtype::Uint32.as_i32());
+    let mse_recon_rot = core.gpu_reconstruct_mse(&indices_u32, mse_bits)?;
+    let mse_base = core.inverse_rotate_array(&mse_recon_rot)?;
+
+    let packed_shape = qjl_signs.shape();
+    let packed_ndim = packed_shape.len();
+    let packed_rows: i32 = packed_shape[..packed_ndim - 1].iter().product();
+    let packed_words = packed_shape[packed_ndim - 1];
+    let packed_signs = if packed_ndim == 2 {
+        qjl_signs.clone()
+    } else {
+        qjl_signs.reshape(&[packed_rows, packed_words])
+    };
+    let unpacked_2d = InlineArray::turboquant_unpack_sign_bits(
+        &packed_signs,
+        core.dim as u32,
+        packed_words as u32,
+        packed_rows as u32,
+    )?;
+    let unpacked = if packed_ndim == 2 {
+        unpacked_2d
+    } else {
+        let mut shape: Vec<i32> = packed_shape[..packed_ndim - 1].to_vec();
+        shape.push(core.dim as i32);
+        unpacked_2d.reshape(&shape)
+    };
+    let qjl_correction = core.inverse_project_array(&unpacked)?;
+    let dim_f = core.dim as f32;
+    let qjl_scale_factor = InlineArray::from_f32((std::f32::consts::PI / 2.0).sqrt() / dim_f);
+    let scale = residual_norms.multiply(&qjl_scale_factor);
+    let correction = qjl_correction.multiply(&scale);
+    let combined = mse_base.add(&correction);
+    Some(combined.multiply(norms))
+}
+
+/// Dequantise a single value sub-vector for the Mixed-precision path.
+#[allow(dead_code)]
+fn gpu_dequantize_value_subvector(
+    indices_u8: &InlineArray,
+    norms: &InlineArray,
+    core: &TurboQuantCore,
+    val_bits: u8,
+) -> Option<InlineArray> {
+    let indices_u32 = indices_u8.as_dtype(Dtype::Uint32.as_i32());
+    let mse_recon_rot = core.gpu_reconstruct_mse(&indices_u32, val_bits)?;
+    let mse_base = core.inverse_rotate_array(&mse_recon_rot)?;
+    Some(mse_base.multiply(norms))
+}
+
+/// Dequantise a `GpuMixedKeyStore` back to `[B, H, T, D_total]` f32 by
+/// dequantising each sub-vector and scattering through the per-row
+/// scatter tables.
+#[allow(dead_code)]
+fn gpu_dequantize_keys_mixed(
+    store: &GpuMixedKeyStore,
+    runtime: &TensorRuntime,
+    config: &TurboQuantConfig,
+) -> Option<InlineArray> {
+    let TurboQuantTensorConfig::Mixed {
+        regular_bits,
+        outlier_bits,
+        outlier_count: _,
+    } = config.keys
+    else {
+        return None;
+    };
+    let (reg_core, out_core) = match runtime {
+        TensorRuntime::Mixed {
+            regular_core,
+            outlier_core,
+            ..
+        } => (regular_core.as_ref(), outlier_core.as_ref()),
+        _ => return None,
+    };
+
+    let regular_recon = gpu_dequantize_key_subvector(
+        &store.regular_indices,
+        &store.regular_qjl_signs,
+        &store.regular_norms,
+        &store.regular_residual_norms,
+        reg_core,
+        regular_bits,
+    )?;
+    let outlier_recon = gpu_dequantize_key_subvector(
+        &store.outlier_indices,
+        &store.outlier_qjl_signs,
+        &store.outlier_norms,
+        &store.outlier_residual_norms,
+        out_core,
+        outlier_bits,
+    )?;
+
+    let b = store.regular_indices.dim(0);
+    let h = store.regular_indices.dim(1);
+    let t = store.regular_indices.dim(2);
+    let d_reg = store.regular_indices.dim(3);
+    let d_out = store.outlier_indices.dim(3);
+    let d_total = d_reg + d_out;
+
+    let regular_src_i32 = store.regular_src_dim.as_dtype(Dtype::Int32.as_i32());
+    let outlier_src_i32 = store.outlier_src_dim.as_dtype(Dtype::Int32.as_i32());
+
+    let zero = InlineArray::zeros(&[b, h, t, d_total], Dtype::Float32.as_i32());
+    let with_regular = zero.put_along_axis_op(&regular_src_i32, &regular_recon, -1);
+    let merged = with_regular.put_along_axis_op(&outlier_src_i32, &outlier_recon, -1);
+    Some(merged)
+}
+
+/// Dequantise a `GpuMixedValueStore` back to `[B, H, T, D_total]` f32.
+#[allow(dead_code)]
+fn gpu_dequantize_values_mixed(
+    store: &GpuMixedValueStore,
+    runtime: &TensorRuntime,
+    config: &TurboQuantConfig,
+) -> Option<InlineArray> {
+    let TurboQuantTensorConfig::Mixed {
+        regular_bits,
+        outlier_bits,
+        outlier_count: _,
+    } = config.values
+    else {
+        return None;
+    };
+    let (reg_core, out_core) = match runtime {
+        TensorRuntime::Mixed {
+            regular_core,
+            outlier_core,
+            ..
+        } => (regular_core.as_ref(), outlier_core.as_ref()),
+        _ => return None,
+    };
+
+    let regular_recon =
+        gpu_dequantize_value_subvector(&store.regular_indices, &store.regular_norms, reg_core, regular_bits)?;
+    let outlier_recon =
+        gpu_dequantize_value_subvector(&store.outlier_indices, &store.outlier_norms, out_core, outlier_bits)?;
+
+    let b = store.regular_indices.dim(0);
+    let h = store.regular_indices.dim(1);
+    let t = store.regular_indices.dim(2);
+    let d_reg = store.regular_indices.dim(3);
+    let d_out = store.outlier_indices.dim(3);
+    let d_total = d_reg + d_out;
+
+    let regular_src_i32 = store.regular_src_dim.as_dtype(Dtype::Int32.as_i32());
+    let outlier_src_i32 = store.outlier_src_dim.as_dtype(Dtype::Int32.as_i32());
+
+    let zero = InlineArray::zeros(&[b, h, t, d_total], Dtype::Float32.as_i32());
+    let with_regular = zero.put_along_axis_op(&regular_src_i32, &regular_recon, -1);
+    let merged = with_regular.put_along_axis_op(&outlier_src_i32, &outlier_recon, -1);
+    Some(merged)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4933,6 +5560,235 @@ mod tests {
             mean_est,
             mean_gt,
             diff
+        );
+    }
+
+    /// Phase 3a — direct round-trip: bypass `QuantizedKvCache`, encode and
+    /// decode via the new GPU Mixed helpers, verify reconstruction error
+    /// stays within the q3_5 codebook budget. Catches encode/decode bugs
+    /// without dragging in cache-state interactions.
+    #[test]
+    fn turboquant_gpu_quantize_kv_mixed_round_trip_no_cache() {
+        let dim = 128usize;
+        let b = 1i32;
+        let h = 4i32;
+        let s = 2i32;
+        let d = dim as i32;
+        let total = (b * h * s * d) as usize;
+        let data: Vec<f32> = (0..total)
+            .map(|i| ((i as f32) * 0.137).sin() + if i % 17 == 0 { 3.0 } else { 0.0 })
+            .collect();
+        let arr = InlineArray::from_f32_slice(&data, &[b, h, s, d]);
+
+        let config = TurboQuantConfig::preset_q3_5(dim).with_recent_window(None);
+        let state = TurboQuantState::new(dim, dim, config);
+
+        let (kstore, vstore) = gpu_quantize_kv_mixed(&state, &arr, &arr, config)
+            .expect("gpu_quantize_kv_mixed");
+
+        let mut dec_keys = gpu_dequantize_keys_mixed(&kstore, &state.keys, &config)
+            .expect("dequantize keys");
+        let mut dec_vals = gpu_dequantize_values_mixed(&vstore, &state.values, &config)
+            .expect("dequantize values");
+        let recon_keys = dec_keys.to_f32_vec(total).expect("dec keys to_f32");
+        let recon_vals = dec_vals.to_f32_vec(total).expect("dec vals to_f32");
+
+        let max_key_err = recon_keys
+            .iter()
+            .zip(data.iter())
+            .map(|(r, o)| (r - o).abs())
+            .fold(0.0f32, f32::max);
+        let max_val_err = recon_vals
+            .iter()
+            .zip(data.iter())
+            .map(|(r, o)| (r - o).abs())
+            .fold(0.0f32, f32::max);
+        // q3_5 on rows with outliers in [-3, 3] reconstructs well below 1.5.
+        // Tighter bounds risk legitimate codebook variance; this gates real
+        // bugs (lazy-graph corruption gave err ≈ 5.5 before the eval barrier).
+        assert!(
+            max_key_err < 1.5,
+            "key reconstruction error {max_key_err} too large"
+        );
+        assert!(
+            max_val_err < 1.5,
+            "val reconstruction error {max_val_err} too large"
+        );
+    }
+
+    /// Phase 3a sanity: gather sub-vectors, then scatter back. Round-trip
+    /// must equal the original input.
+    #[test]
+    fn turboquant_gpu_mixed_partition_gather_scatter_round_trip() {
+        let b = 1i32;
+        let h = 4i32;
+        let s = 2i32;
+        let d = 128i32;
+        let total = (b * h * s * d) as usize;
+        let data: Vec<f32> = (0..total)
+            .map(|i| (i as f32) * 0.137 + if i % 17 == 0 { 3.0 } else { 0.0 })
+            .collect();
+        let arr = InlineArray::from_f32_slice(&data, &[b, h, s, d]);
+
+        let (reg_src, out_src) =
+            gpu_compute_outlier_partition(&arr, 32, 128).expect("partition");
+        let reg = arr.take_along_axis(&reg_src, -1);
+        let out = arr.take_along_axis(&out_src, -1);
+
+        let reg_src_i32 = reg_src.as_dtype(Dtype::Int32.as_i32());
+        let out_src_i32 = out_src.as_dtype(Dtype::Int32.as_i32());
+
+        let zero = InlineArray::zeros(&[b, h, s, d], Dtype::Float32.as_i32());
+        let with_reg = zero.put_along_axis_op(&reg_src_i32, &reg, -1);
+        let mut merged = with_reg.put_along_axis_op(&out_src_i32, &out, -1);
+
+        let merged_vec = merged.to_f32_vec(total).expect("merged to_f32");
+        let max_diff = merged_vec
+            .iter()
+            .zip(data.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-5,
+            "partition+gather+scatter round-trip max_abs_diff = {max_diff}"
+        );
+    }
+
+    /// Phase 3a invariant: Mixed sub-vector encode/decode helpers must
+    /// produce bit-identical results to the existing Uniform helpers when
+    /// pointed at the same core + same data. Catches drift between the
+    /// two pipelines.
+    #[test]
+    fn turboquant_gpu_mixed_subvector_matches_uniform_when_no_partition() {
+        let dim = 96usize;
+        let b = 1i32;
+        let h = 4i32;
+        let s = 2i32;
+        let d = dim as i32;
+        let total = (b * h * s * d) as usize;
+        let data: Vec<f32> = (0..total)
+            .map(|i| ((i as f32) * 0.13).sin() * 0.5)
+            .collect();
+        let rows = InlineArray::from_f32_slice(&data, &[b, h, s, d]);
+        let vals = InlineArray::from_f32_slice(&data, &[b, h, s, d]);
+
+        let config = TurboQuantConfig::uniform(3, 4).with_recent_window(None);
+        let state = TurboQuantState::new(dim, dim, config);
+        let core = match &state.keys {
+            TensorRuntime::Uniform { core, .. } => core.as_ref(),
+            _ => panic!("expected Uniform"),
+        };
+
+        // Uniform path
+        let (kstore_uni, _) =
+            gpu_quantize_kv(&state, &rows, &vals, config).expect("uniform encode");
+        let mut dec_uni = gpu_dequantize_keys(&kstore_uni, &state.keys, 3).expect("uniform decode");
+        let recon_uni = dec_uni.to_f32_vec(total).expect("dec uni to_f32");
+
+        // Mixed sub-vector path on the SAME core
+        let enc_mix = gpu_encode_key_subvector(&rows, core, 3).expect("mix encode");
+        let mut dec_mix = gpu_dequantize_key_subvector(
+            &enc_mix.indices,
+            &enc_mix.qjl_signs,
+            &enc_mix.norms,
+            &enc_mix.residual_norms,
+            core,
+            3,
+        )
+        .expect("mix decode");
+        let recon_mix = dec_mix.to_f32_vec(total).expect("dec mix to_f32");
+
+        let max_diff = recon_uni
+            .iter()
+            .zip(recon_mix.iter())
+            .map(|(u, m)| (u - m).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-5,
+            "Uniform vs Mixed helpers diverge: {max_diff}"
+        );
+    }
+
+    /// Phase 3a — round-trip: append Mixed-precision rows, then dequantize
+    /// from both the CPU `PackedBits` store (existing) and the new
+    /// `GpuMixedKeyStore`/`GpuMixedValueStore`. Both paths share encode-time
+    /// math (rotation, codebooks, QJL) but the partition is independently
+    /// computed (CPU sort vs GPU argpartition+argsort), so we tolerate small
+    /// ordering-induced ties at the boundary of outlier vs regular slots.
+    #[test]
+    fn turboquant_gpu_mixed_storage_round_trip_matches_cpu_dequantize() {
+        let dim = 128usize;
+        let b = 1i32;
+        let h = 4i32;
+        let s = 2i32;
+        let d = dim as i32;
+        let total = (b * h * s * d) as usize;
+
+        let config = TurboQuantConfig::preset_q3_5(dim).with_recent_window(None);
+
+        // Deterministic input — sawtooth + sin gives non-trivial outlier
+        // structure (some dims with much larger magnitude than others),
+        // which is what the Mixed encode is designed for.
+        let data: Vec<f32> = (0..total)
+            .map(|i| {
+                let phase = (i as f32) * 0.137;
+                let outlier_kick = if i % 17 == 0 { 3.0 } else { 0.0 };
+                phase.sin() + outlier_kick
+            })
+            .collect();
+        let keys_arr = InlineArray::from_f32_slice(&data, &[b, h, s, d]);
+        let vals_arr = InlineArray::from_f32_slice(&data, &[b, h, s, d]);
+
+        let mut cache = QuantizedKvCache::new(config);
+        cache.append(&keys_arr, &vals_arr).expect("append");
+
+        let kstore_cpu = cache.keys.as_ref().expect("keys");
+        let vstore_cpu = cache.values.as_ref().expect("values");
+        let kstore_gpu = kstore_cpu.gpu_mixed.as_ref().expect("gpu_mixed keys populated");
+        let vstore_gpu = vstore_cpu.gpu_mixed.as_ref().expect("gpu_mixed values populated");
+        let state = cache.state.as_ref().expect("state");
+
+        let mut cpu_keys = cache.dequantize_keys().expect("CPU dequantize_keys");
+        let mut cpu_values = cache.dequantize_values().expect("CPU dequantize_values");
+        let mut gpu_keys = gpu_dequantize_keys_mixed(kstore_gpu, &state.keys, &config)
+            .expect("gpu_dequantize_keys_mixed");
+        let mut gpu_values = gpu_dequantize_values_mixed(vstore_gpu, &state.values, &config)
+            .expect("gpu_dequantize_values_mixed");
+
+        let cpu_keys_vec = cpu_keys.to_f32_vec(total).expect("cpu keys to_f32");
+        let cpu_values_vec = cpu_values.to_f32_vec(total).expect("cpu values to_f32");
+        let gpu_keys_vec = gpu_keys.to_f32_vec(total).expect("gpu keys to_f32");
+        let gpu_values_vec = gpu_values.to_f32_vec(total).expect("gpu values to_f32");
+
+        let max_err = |recon: &[f32], orig: &[f32]| {
+            recon.iter()
+                .zip(orig.iter())
+                .map(|(r, o)| (r - o).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let cpu_err_k = max_err(&cpu_keys_vec, &data);
+        let gpu_err_k = max_err(&gpu_keys_vec, &data);
+        let cpu_err_v = max_err(&cpu_values_vec, &data);
+        let gpu_err_v = max_err(&gpu_values_vec, &data);
+
+        // Quality gate: both paths reconstruct the original input within
+        // q3_5 codebook error. The GPU path's lazy-graph eval barrier in
+        // gpu_quantize_kv_mixed is load-bearing — without it, the partition
+        // chain re-evaluates inconsistently and gpu_err_k goes from ~0.75 to
+        // ~5.5. This test is the regression gate for that fix.
+        assert!(gpu_err_k < 1.5, "GPU keys reconstruction error {gpu_err_k}");
+        assert!(gpu_err_v < 1.5, "GPU values reconstruction error {gpu_err_v}");
+        // Pairwise diff is bounded by the sum of per-path errors plus slack
+        // for the independent outlier-mask choices on borderline ties.
+        let pairwise_k = max_err(&cpu_keys_vec, &gpu_keys_vec);
+        let pairwise_v = max_err(&cpu_values_vec, &gpu_values_vec);
+        assert!(
+            pairwise_k < (cpu_err_k + gpu_err_k) * 1.5 + 0.1,
+            "pairwise key diff {pairwise_k} disproportionate (cpu {cpu_err_k}, gpu {gpu_err_k})"
+        );
+        assert!(
+            pairwise_v < (cpu_err_v + gpu_err_v) * 1.5 + 0.1,
+            "pairwise val diff {pairwise_v} disproportionate (cpu {cpu_err_v}, gpu {gpu_err_v})"
         );
     }
 }
