@@ -119,6 +119,27 @@ pub struct TrainSpec {
     pub gradient_accumulation_steps: usize,
 
     #[job(
+        label = "Disable Gradient Checkpointing",
+        group = "Optimization",
+        argv = "--no-gradient-checkpointing",
+        flag,
+        default_bool = false
+    )]
+    #[serde(default)]
+    pub no_gradient_checkpointing: bool,
+
+    #[job(
+        label = "Gradient Checkpointing Layers",
+        group = "Optimization",
+        argv = "--gradient-checkpointing-layers",
+        min = 1,
+        max = 1024,
+        default_int = 4
+    )]
+    #[serde(default = "default_grad_ckpt_layers")]
+    pub gradient_checkpointing_layers: usize,
+
+    #[job(
         label = "Max Grad Norm",
         group = "Optimization",
         argv = "--max-grad-norm",
@@ -347,6 +368,8 @@ impl Default for TrainSpec {
             epochs: default_epochs(),
             max_seq_len: 0,
             gradient_accumulation_steps: default_grad_accum(),
+            no_gradient_checkpointing: false,
+            gradient_checkpointing_layers: default_grad_ckpt_layers(),
             max_grad_norm: default_max_grad_norm(),
             warmup_steps: 0,
             weight_decay: default_weight_decay(),
@@ -403,6 +426,9 @@ fn default_epochs() -> usize {
 }
 fn default_grad_accum() -> usize {
     defaults::GRADIENT_ACCUMULATION_STEPS
+}
+fn default_grad_ckpt_layers() -> usize {
+    4
 }
 fn default_max_grad_norm() -> f64 {
     defaults::MAX_GRAD_NORM

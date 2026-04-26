@@ -8,7 +8,6 @@ use tokio::sync::RwLock;
 use turbomcp::prelude::*;
 
 use jobs::JobManager;
-use util::push_bool_flag;
 use pmetal_core::jobs::{
     DistillSpec, DflashSpec, EmbedTrainSpec, FuseSpec, GrpoSpec, InferSpec, MergeSpec,
     PackExpertsSpec, QuantizeSpec, RlkdSpec, ServeSpec, TokenizeSpec, TrainSpec,
@@ -539,6 +538,10 @@ impl PmetalMcpServer {
             no_sequence_packing: no_sequence_packing.unwrap_or(false),
             no_jit_compilation: no_jit_compilation.unwrap_or(false),
             no_metal_fused_optimizer: no_metal_fused_optimizer.unwrap_or(false),
+            no_gradient_checkpointing: no_gradient_checkpointing.unwrap_or(false),
+            gradient_checkpointing_layers: gradient_checkpointing_layers
+                .map(|n| n as usize)
+                .unwrap_or_else(|| TrainSpec::default().gradient_checkpointing_layers),
             ane: ane.unwrap_or(false),
             text_column,
             prompt_column,
@@ -549,19 +552,7 @@ impl PmetalMcpServer {
 
         spec.normalize().map_err(into_mcp_error)?;
 
-        let mut argv = spec.to_argv();
-
-        // Append fields the spec does not yet model. These will be removed
-        // once the spec gains these fields in a follow-up phase.
-        push_bool_flag(
-            &mut argv,
-            "--no-gradient-checkpointing",
-            &no_gradient_checkpointing,
-        );
-        if let Some(layers) = gradient_checkpointing_layers {
-            argv.push("--gradient-checkpointing-layers".to_string());
-            argv.push(layers.to_string());
-        }
+        let argv = spec.to_argv();
 
         let mut mgr = self.jobs.write().await;
         let id = mgr.spawn("train", argv).await?;
@@ -1500,26 +1491,20 @@ impl PmetalMcpServer {
         #[description("Maximum ANE kernel sequence length")] ane_max_seq_len: Option<u64>,
         #[description("Use experimental ANE real-time serving path")] ane_real_time: Option<bool>,
     ) -> McpResult<String> {
-        // `lora` is not in ServeSpec yet — append after to_argv().
-        // TODO: remove after ServeSpec gains a `lora` field.
         let mut spec = ServeSpec {
             model,
             port: port.unwrap_or(8080) as u16,
             host: host.unwrap_or_else(|| "0.0.0.0".to_string()),
             max_seq_len: max_seq_len.unwrap_or(4096) as usize,
             experts_dir,
+            lora,
             ane: ane.unwrap_or(false),
             ane_max_seq_len: ane_max_seq_len.unwrap_or(1024) as usize,
             ane_real_time: ane_real_time.unwrap_or(false),
             ..ServeSpec::default()
         };
         spec.normalize().map_err(into_mcp_error)?;
-        let mut argv = spec.to_argv();
-        // `lora` is not yet in ServeSpec.
-        if let Some(ref l) = lora {
-            argv.push("--lora".to_string());
-            argv.push(l.clone());
-        }
+        let argv = spec.to_argv();
         let mut mgr = self.jobs.write().await;
         let id = mgr.spawn("serve", argv).await?;
         job_started_response(&id, "serve")

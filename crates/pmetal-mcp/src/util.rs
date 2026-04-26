@@ -150,18 +150,6 @@ pub async fn run_pmetal_blocking_argv(subcommand: &str, argv: &[String]) -> McpR
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-// TODO: remove push_opt and push_bool_flag once all remaining manual argv
-// construction sites (dataset_*, bench_*, eval_*, ollama_*, chat) are migrated
-// to specs. The job-spawning tools are fully migrated; only blocking-call tools
-// with no *Spec equivalent still use these helpers.
-
-/// Conditionally push a boolean `--flag` onto an args vec.
-pub fn push_bool_flag(args: &mut Vec<String>, flag: &str, value: &Option<bool>) {
-    if let Some(true) = value {
-        args.push(flag.to_string());
-    }
-}
-
 /// Find the HuggingFace cache directory.
 pub fn hf_cache_dir() -> std::path::PathBuf {
     if let Ok(cache) = std::env::var("HF_HOME") {

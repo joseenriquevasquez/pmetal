@@ -412,6 +412,8 @@ impl TrainingTab {
                 .value("Grad Accum Steps")
                 .parse()
                 .unwrap_or(TrainSpec::default().gradient_accumulation_steps),
+            no_gradient_checkpointing: false,
+            gradient_checkpointing_layers: TrainSpec::default().gradient_checkpointing_layers,
             max_grad_norm: self
                 .form
                 .value("Max Grad Norm")
