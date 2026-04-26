@@ -114,6 +114,10 @@ pub fn run() {
             get_merge_strategies,
             fuse_lora,
             quantize_model,
+            // New additive routes
+            start_dflash,
+            start_embed_train,
+            start_rlkd,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {

@@ -653,8 +653,13 @@ export interface BenchConfigDto {
   json_output?: string | null;
 }
 
-export async function startBench(config: BenchConfigDto): Promise<string> {
-  return await invoke('start_bench', { config });
+export async function startBench(
+  config: BenchConfigDto,
+  onEvent?: (e: Record<string, unknown>) => void,
+): Promise<string> {
+  const channel = new Channel<Record<string, unknown>>();
+  if (onEvent) channel.onmessage = onEvent;
+  return await invoke('start_bench', { config, onEvent: channel });
 }
 
 export async function stopBench(runId: string): Promise<void> {
@@ -716,8 +721,13 @@ export interface EvalConfigDto {
   json_output?: boolean | null;
 }
 
-export async function startEval(config: EvalConfigDto): Promise<string> {
-  return await invoke('start_eval', { config });
+export async function startEval(
+  config: EvalConfigDto,
+  onEvent?: (e: Record<string, unknown>) => void,
+): Promise<string> {
+  const channel = new Channel<Record<string, unknown>>();
+  if (onEvent) channel.onmessage = onEvent;
+  return await invoke('start_eval', { config, onEvent: channel });
 }
 
 export async function stopEval(runId: string): Promise<void> {
@@ -750,8 +760,13 @@ export function onEvalStopped(callback: (runId: string) => void): Promise<Unlist
 // GRPO API
 // =============================================================================
 
-export async function startGrpo(config: GrpoConfig): Promise<string> {
-  return await invoke('start_grpo', { config });
+export async function startGrpo(
+  config: GrpoConfig,
+  onEvent?: (e: Record<string, unknown>) => void,
+): Promise<string> {
+  const channel = new Channel<Record<string, unknown>>();
+  if (onEvent) channel.onmessage = onEvent;
+  return await invoke('start_grpo', { config, onEvent: channel });
 }
 
 export async function getGrpoStatus(runId: string): Promise<GrpoRun> {
@@ -788,8 +803,13 @@ export function onGrpoUpdate(callback: (run: GrpoRun) => void): Promise<Unlisten
 // Distillation API
 // =============================================================================
 
-export async function startDistillation(config: DistillationConfig): Promise<string> {
-  return await invoke('start_distillation', { config });
+export async function startDistillation(
+  config: DistillationConfig,
+  onEvent?: (e: Record<string, unknown>) => void,
+): Promise<string> {
+  const channel = new Channel<Record<string, unknown>>();
+  if (onEvent) channel.onmessage = onEvent;
+  return await invoke('start_distillation', { config, onEvent: channel });
 }
 
 export async function getDistillationStatus(runId: string): Promise<DistillationRun> {
@@ -966,8 +986,13 @@ export interface PretrainConfigDto {
   seed?: number | null;
 }
 
-export async function startPretrain(config: PretrainConfigDto): Promise<string> {
-  return await invoke('start_pretrain', { config });
+export async function startPretrain(
+  config: PretrainConfigDto,
+  onEvent?: (e: Record<string, unknown>) => void,
+): Promise<string> {
+  const channel = new Channel<Record<string, unknown>>();
+  if (onEvent) channel.onmessage = onEvent;
+  return await invoke('start_pretrain', { config, onEvent: channel });
 }
 
 export async function listPretrainRuns(): Promise<PretrainRun[]> {

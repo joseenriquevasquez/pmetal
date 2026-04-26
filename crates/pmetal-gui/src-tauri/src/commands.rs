@@ -1466,6 +1466,7 @@ pub async fn start_distillation(
     state: State<'_, AppState>,
     _app_handle: AppHandle,
     config: DistillationConfig,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
     let temperature = config.temperature.unwrap_or(2.0) as f64;
     let loss_type = config.loss_type.clone().unwrap_or_else(|| "kl".to_string());
@@ -1507,18 +1508,27 @@ pub async fn start_distillation(
         let _ = tokio::fs::create_dir_all(&output_dir).await;
         let _ = tokio::fs::write(&metrics_path, "").await;
 
+        // Tail the metrics JSONL file and forward each row through the IPC
+        // channel. This replaces the legacy file-poll watcher with a channel-
+        // based approach so the frontend can consume events without polling.
+        let watcher_metrics = metrics_path.clone();
+        let watcher_cancel = cancel_flag.clone();
         let watcher_state = state_arc.clone();
         let watcher_event_tx = event_tx.clone();
         let watcher_run_id = run_id_task.clone();
-        let watcher_metrics = metrics_path.clone();
-        let watcher_cancel = cancel_flag.clone();
         tokio::spawn(async move {
-            watch_distillation_metrics_file(
+            tail_jsonl_to_channel(
                 watcher_metrics,
-                watcher_run_id,
-                watcher_state,
-                watcher_event_tx,
                 watcher_cancel,
+                on_event,
+                move |row| {
+                    let mut runs = watcher_state.try_write().ok()?;
+                    let run = runs.iter_mut().find(|r| r.id == watcher_run_id)?;
+                    let started_at = Utc::now(); // approximate; ETA is best-effort
+                    apply_metrics_to_distillation(run, row, started_at);
+                    let _ = watcher_event_tx.send(AppEvent::DistillationUpdate { run: run.clone() });
+                    Some(())
+                },
             )
             .await;
         });
@@ -1589,6 +1599,7 @@ pub async fn start_grpo(
     state: State<'_, AppState>,
     _app_handle: AppHandle,
     config: GrpoConfig,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
     let group_size = config.group_size.unwrap_or(8);
     let beta = config.beta.unwrap_or(0.04);
@@ -1627,18 +1638,24 @@ pub async fn start_grpo(
         let _ = tokio::fs::create_dir_all(&output_dir).await;
         let _ = tokio::fs::write(&metrics_path, "").await;
 
+        let watcher_metrics = metrics_path.clone();
+        let watcher_cancel = cancel_flag.clone();
         let watcher_state = state_arc.clone();
         let watcher_event_tx = event_tx.clone();
         let watcher_run_id = run_id_task.clone();
-        let watcher_metrics = metrics_path.clone();
-        let watcher_cancel = cancel_flag.clone();
         tokio::spawn(async move {
-            watch_grpo_metrics_file(
+            tail_jsonl_to_channel(
                 watcher_metrics,
-                watcher_run_id,
-                watcher_state,
-                watcher_event_tx,
                 watcher_cancel,
+                on_event,
+                move |row| {
+                    let mut runs = watcher_state.try_write().ok()?;
+                    let run = runs.iter_mut().find(|r| r.id == watcher_run_id)?;
+                    let started_at = Utc::now();
+                    apply_metrics_to_grpo(run, row, started_at);
+                    let _ = watcher_event_tx.send(AppEvent::GrpoUpdate { run: run.clone() });
+                    Some(())
+                },
             )
             .await;
         });
@@ -1987,6 +2004,7 @@ pub async fn start_bench(
     state: State<'_, AppState>,
     _app_handle: AppHandle,
     config: BenchConfigDto,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
     let mode = config
         .mode
@@ -2055,7 +2073,7 @@ pub async fn start_bench(
         }
     }
 
-    spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Bench).await?;
+    spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Bench, on_event).await?;
     Ok(run_id)
 }
 
@@ -2089,6 +2107,7 @@ pub async fn start_eval(
     state: State<'_, AppState>,
     _app_handle: AppHandle,
     config: EvalConfigDto,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
     if config.model.is_empty() {
         return Err(AppError("Model is required".into()));
@@ -2121,7 +2140,7 @@ pub async fn start_eval(
         args.push("--json".into());
     }
 
-    spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Eval).await?;
+    spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Eval, on_event).await?;
     Ok(run_id)
 }
 
@@ -2143,6 +2162,7 @@ async fn spawn_job_subprocess(
     run_id: String,
     args: Vec<String>,
     kind: JobKind,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<()> {
     let binary = pmetal_binary();
     let mut cmd = tokio::process::Command::new(&binary);
@@ -2178,6 +2198,7 @@ async fn spawn_job_subprocess(
         run_id.clone(),
         stdout,
         stderr,
+        on_event,
     );
     spawn_job_exit_watcher(
         kind,
@@ -2202,6 +2223,7 @@ fn spawn_job_reader(
     run_id: String,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -2213,9 +2235,14 @@ fn spawn_job_reader(
         event_tx: tokio::sync::broadcast::Sender<AppEvent>,
         run_id: String,
         stream: R,
+        on_event: tauri::ipc::Channel<serde_json::Value>,
     ) {
         let mut reader = BufReader::new(stream).lines();
         while let Ok(Some(line)) = reader.next_line().await {
+            // Forward every stdout/stderr line to the frontend channel so the
+            // page can display a live log without polling.
+            let _ = on_event.send(serde_json::json!({ "event": "log", "line": &line }));
+
             match kind {
                 JobKind::Bench => {
                     let mut runs = bench_runs.write().await;
@@ -2248,21 +2275,25 @@ fn spawn_job_reader(
         }
     }
 
+    // Stdout lines are forwarded to the IPC channel. Stderr is also captured
+    // for the log tail but shares the channel via Clone (Channel<T> wraps Arc).
     if let Some(s) = stdout {
-        let bench_runs = bench_runs.clone();
-        let eval_runs = eval_runs.clone();
-        let pretrain_runs = pretrain_runs.clone();
-        let event_tx = event_tx.clone();
-        let run_id = run_id.clone();
+        let bench_runs_cl = bench_runs.clone();
+        let eval_runs_cl = eval_runs.clone();
+        let pretrain_runs_cl = pretrain_runs.clone();
+        let event_tx_cl = event_tx.clone();
+        let run_id_cl = run_id.clone();
+        let on_event_cl = on_event.clone();
         tokio::spawn(async move {
             drain(
                 kind,
-                bench_runs,
-                eval_runs,
-                pretrain_runs,
-                event_tx,
-                run_id,
+                bench_runs_cl,
+                eval_runs_cl,
+                pretrain_runs_cl,
+                event_tx_cl,
+                run_id_cl,
                 s,
+                on_event_cl,
             )
             .await;
         });
@@ -2277,6 +2308,7 @@ fn spawn_job_reader(
                 event_tx,
                 run_id,
                 s,
+                on_event,
             )
             .await;
         });
@@ -2410,6 +2442,7 @@ pub async fn start_pretrain(
     state: State<'_, AppState>,
     _app_handle: AppHandle,
     config: PretrainConfigDto,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
     if config.arch.is_empty() {
         return Err(AppError("Architecture is required".into()));
@@ -2490,7 +2523,7 @@ pub async fn start_pretrain(
     args.extend(["--output-dir".into(), output_dir]);
     args.extend(["--seed".into(), config.seed.unwrap_or(42).to_string()]);
 
-    spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Pretrain).await?;
+    spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Pretrain, on_event).await?;
     Ok(run_id)
 }
 
@@ -3048,15 +3081,22 @@ async fn finalize_training_run(
     }
 }
 
-async fn watch_distillation_metrics_file(
+/// Tail a JSONL metrics file written by the in-process trainer, forwarding
+/// each parsed row to `on_event` and calling `on_row` for state updates.
+///
+/// This replaces the former per-job `watch_*_metrics_file` helpers with a
+/// single shared implementation. `on_row` is a sync closure that updates the
+/// caller's run record in the shared state vec and returns `Some(())` on
+/// success or `None` if the run record is gone (caller should stop).
+async fn tail_jsonl_to_channel<F>(
     metrics_path: PathBuf,
-    run_id: String,
-    state_arc: Arc<tokio::sync::RwLock<Vec<DistillationRun>>>,
-    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
-) {
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+    mut on_row: F,
+) where
+    F: FnMut(&serde_json::Value) -> Option<()> + Send + 'static,
+{
     let mut last_pos: u64 = 0;
-    let started_at = Utc::now();
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
 
     loop {
@@ -3074,7 +3114,7 @@ async fn watch_distillation_metrics_file(
         };
         let file_len = metadata.len();
         if file_len < last_pos {
-            // File was truncated (e.g., ANE→GPU fallback recreates the metrics file).
+            // File was truncated (ANE→GPU fallback recreates the metrics file).
             last_pos = 0;
         }
         if file_len <= last_pos {
@@ -3112,16 +3152,14 @@ async fn watch_distillation_metrics_file(
         };
         last_pos = new_pos;
 
-        if rows.is_empty() {
-            continue;
-        }
-
-        let mut runs = state_arc.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-            for row in rows {
-                apply_metrics_to_distillation(run, &row, started_at);
+        for row in &rows {
+            // Forward the raw JSON row to the channel so the frontend page
+            // receives live step events without polling.
+            let _ = on_event.send(row.clone());
+            // Also update the shared run record for list/status queries.
+            if on_row(row).is_none() {
+                return;
             }
-            let _ = event_tx.send(AppEvent::DistillationUpdate { run: run.clone() });
         }
     }
 }
@@ -3193,84 +3231,6 @@ async fn finalize_distillation_run(
         let _ = event_tx.send(AppEvent::DistillationStopped {
             run_id: run_id.to_string(),
         });
-    }
-}
-
-async fn watch_grpo_metrics_file(
-    metrics_path: PathBuf,
-    run_id: String,
-    state_arc: Arc<tokio::sync::RwLock<Vec<GrpoRun>>>,
-    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
-    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
-) {
-    let mut last_pos: u64 = 0;
-    let started_at = Utc::now();
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-
-    loop {
-        interval.tick().await;
-
-        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-
-        let Ok(file) = tokio::fs::File::open(&metrics_path).await else {
-            continue;
-        };
-        let Ok(metadata) = file.metadata().await else {
-            continue;
-        };
-        let file_len = metadata.len();
-        if file_len < last_pos {
-            // File was truncated (e.g., ANE→GPU fallback recreates the metrics file).
-            last_pos = 0;
-        }
-        if file_len <= last_pos {
-            continue;
-        }
-
-        let path = metrics_path.clone();
-        let read_result = tokio::task::spawn_blocking(move || {
-            use std::io::{BufRead, Seek};
-
-            let Ok(file) = std::fs::File::open(&path) else {
-                return (last_pos, Vec::<serde_json::Value>::new());
-            };
-            let mut reader = std::io::BufReader::new(file);
-            if reader.seek(std::io::SeekFrom::Start(last_pos)).is_err() {
-                return (last_pos, Vec::new());
-            }
-
-            let mut line = String::new();
-            let mut rows = Vec::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                    rows.push(json);
-                }
-                line.clear();
-            }
-
-            let pos = reader.stream_position().unwrap_or(last_pos);
-            (pos, rows)
-        })
-        .await;
-
-        let Ok((new_pos, rows)) = read_result else {
-            continue;
-        };
-        last_pos = new_pos;
-
-        if rows.is_empty() {
-            continue;
-        }
-
-        let mut runs = state_arc.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-            for row in rows {
-                apply_metrics_to_grpo(run, &row, started_at);
-            }
-            let _ = event_tx.send(AppEvent::GrpoUpdate { run: run.clone() });
-        }
     }
 }
 
@@ -4414,6 +4374,389 @@ async fn read_model_config_json(repo_path: &str) -> Option<serde_json::Value> {
     }
 
     None
+}
+
+// ---------------------------------------------------------------------------
+// DFlash — block-diffusion speculative decoding (additive new route)
+// ---------------------------------------------------------------------------
+
+/// Hand-rolled DTO matching `DflashSpec` field names so the future
+/// DTO-migration PR is a no-op: only the Rust type changes, not the JSON shape.
+#[derive(Debug, Deserialize)]
+pub struct DflashDto {
+    pub target: String,
+    pub draft: String,
+    pub prompt: String,
+    pub max_new_tokens: Option<usize>,
+    pub temperature: Option<f32>,
+    pub speculative_tokens: Option<usize>,
+    pub draft_fp8: Option<bool>,
+    pub json: Option<bool>,
+    pub no_chat: Option<bool>,
+    pub tree_budget: Option<usize>,
+}
+
+#[tauri::command]
+pub async fn start_dflash(
+    config: DflashDto,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+) -> Result<String> {
+    if config.target.is_empty() {
+        return Err(AppError("target model is required".into()));
+    }
+    if config.draft.is_empty() {
+        return Err(AppError("draft model is required".into()));
+    }
+    if config.prompt.is_empty() {
+        return Err(AppError("prompt is required".into()));
+    }
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+
+    let mut args: Vec<String> = vec!["dflash".into()];
+    args.extend(["--target".into(), config.target.clone()]);
+    args.extend(["--draft".into(), config.draft.clone()]);
+    args.extend(["--prompt".into(), config.prompt.clone()]);
+    args.extend([
+        "--max-new-tokens".into(),
+        config.max_new_tokens.unwrap_or(128).to_string(),
+    ]);
+    args.extend([
+        "--temperature".into(),
+        config.temperature.unwrap_or(0.0).to_string(),
+    ]);
+    if let Some(n) = config.speculative_tokens {
+        args.extend(["--speculative-tokens".into(), n.to_string()]);
+    }
+    if config.draft_fp8.unwrap_or(false) {
+        args.push("--draft-fp8".into());
+    }
+    if config.json.unwrap_or(false) {
+        args.push("--json".into());
+    }
+    if config.no_chat.unwrap_or(false) {
+        args.push("--no-chat".into());
+    }
+    let tree_budget = config.tree_budget.unwrap_or(0);
+    if tree_budget > 0 {
+        args.extend(["--tree-budget".into(), tree_budget.to_string()]);
+    }
+
+    spawn_oneshot_subprocess(run_id.clone(), args, on_event).await?;
+    Ok(run_id)
+}
+
+// ---------------------------------------------------------------------------
+// EmbedTrain — sentence-embedding contrastive training (additive new route)
+// ---------------------------------------------------------------------------
+
+/// Hand-rolled DTO matching `EmbedTrainSpec` field names.
+#[derive(Debug, Deserialize)]
+pub struct EmbedTrainDto {
+    pub model: String,
+    pub dataset: String,
+    pub output_dir: Option<String>,
+    pub loss: Option<String>,
+    pub pooling: Option<String>,
+    pub temperature: Option<f32>,
+    pub margin: Option<f32>,
+    pub learning_rate: Option<f64>,
+    pub batch_size: Option<usize>,
+    pub epochs: Option<usize>,
+    pub max_seq_len: Option<usize>,
+    pub weight_decay: Option<f64>,
+    pub no_normalize: Option<bool>,
+    pub log_every: Option<usize>,
+    pub seed: Option<u64>,
+}
+
+#[tauri::command]
+pub async fn start_embed_train(
+    config: EmbedTrainDto,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+) -> Result<String> {
+    if config.model.is_empty() {
+        return Err(AppError("model is required".into()));
+    }
+    if config.dataset.is_empty() {
+        return Err(AppError("dataset is required".into()));
+    }
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let output_dir = config
+        .output_dir
+        .as_deref()
+        .unwrap_or("./output-embed")
+        .to_string();
+
+    let mut args: Vec<String> = vec!["embed-train".into()];
+    args.extend(["--model".into(), config.model.clone()]);
+    args.extend(["--dataset".into(), config.dataset.clone()]);
+    args.extend(["--output".into(), output_dir]);
+    args.extend([
+        "--loss".into(),
+        config.loss.unwrap_or_else(|| "info_nce".into()),
+    ]);
+    args.extend([
+        "--pooling".into(),
+        config.pooling.unwrap_or_else(|| "mean".into()),
+    ]);
+    args.extend([
+        "--temperature".into(),
+        config.temperature.unwrap_or(0.05).to_string(),
+    ]);
+    args.extend([
+        "--margin".into(),
+        config.margin.unwrap_or(0.3).to_string(),
+    ]);
+    args.extend([
+        "--learning-rate".into(),
+        config.learning_rate.unwrap_or(2e-5).to_string(),
+    ]);
+    args.extend([
+        "--batch-size".into(),
+        config.batch_size.unwrap_or(32).to_string(),
+    ]);
+    args.extend([
+        "--epochs".into(),
+        config.epochs.unwrap_or(3).to_string(),
+    ]);
+    args.extend([
+        "--max-seq-len".into(),
+        config.max_seq_len.unwrap_or(512).to_string(),
+    ]);
+    args.extend([
+        "--weight-decay".into(),
+        config.weight_decay.unwrap_or(0.01).to_string(),
+    ]);
+    if config.no_normalize.unwrap_or(false) {
+        args.push("--no-normalize".into());
+    }
+    args.extend([
+        "--log-every".into(),
+        config.log_every.unwrap_or(10).to_string(),
+    ]);
+    args.extend([
+        "--seed".into(),
+        config.seed.unwrap_or(42).to_string(),
+    ]);
+
+    spawn_oneshot_subprocess(run_id.clone(), args, on_event).await?;
+    Ok(run_id)
+}
+
+// ---------------------------------------------------------------------------
+// RLKD — Reinforcement Learning with Knowledge Distillation (additive new route)
+// ---------------------------------------------------------------------------
+
+/// Hand-rolled DTO matching `RlkdSpec` field names.
+#[derive(Debug, Deserialize)]
+pub struct RlkdDto {
+    pub model: String,
+    pub teacher_model: String,
+    pub dataset: String,
+    pub output_dir: Option<String>,
+    pub distill_alpha: Option<f32>,
+    pub final_alpha: Option<f32>,
+    pub anneal_alpha: Option<bool>,
+    pub distill_temperature: Option<f32>,
+    pub num_generations: Option<usize>,
+    pub beta: Option<f64>,
+    pub learning_rate: Option<f64>,
+    pub epochs: Option<usize>,
+    pub lora_r: Option<usize>,
+    pub lora_alpha: Option<f32>,
+    pub max_seq_len: Option<usize>,
+    pub max_completion_length: Option<usize>,
+    pub seed: Option<u64>,
+    pub reasoning_rewards: Option<bool>,
+    pub no_flash_attention: Option<bool>,
+    pub text_column: Option<String>,
+    pub prompt_column: Option<String>,
+    pub response_column: Option<String>,
+}
+
+#[tauri::command]
+pub async fn start_rlkd(
+    config: RlkdDto,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+) -> Result<String> {
+    if config.model.is_empty() {
+        return Err(AppError("policy model is required".into()));
+    }
+    if config.teacher_model.is_empty() {
+        return Err(AppError("teacher model is required".into()));
+    }
+    if config.dataset.is_empty() {
+        return Err(AppError("dataset is required".into()));
+    }
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let output_dir = config
+        .output_dir
+        .as_deref()
+        .unwrap_or("./output/rlkd")
+        .to_string();
+
+    let mut args: Vec<String> = vec!["rlkd".into()];
+    args.extend(["--model".into(), config.model.clone()]);
+    args.extend(["--teacher-model".into(), config.teacher_model.clone()]);
+    args.extend(["--dataset".into(), config.dataset.clone()]);
+    args.extend(["--output".into(), output_dir]);
+    args.extend([
+        "--distill-alpha".into(),
+        config.distill_alpha.unwrap_or(0.3).to_string(),
+    ]);
+    args.extend([
+        "--final-alpha".into(),
+        config.final_alpha.unwrap_or(0.05).to_string(),
+    ]);
+    if config.anneal_alpha.unwrap_or(false) {
+        args.push("--anneal-alpha".into());
+    }
+    args.extend([
+        "--distill-temperature".into(),
+        config.distill_temperature.unwrap_or(2.0).to_string(),
+    ]);
+    args.extend([
+        "--num-generations".into(),
+        config.num_generations.unwrap_or(8).to_string(),
+    ]);
+    args.extend([
+        "--beta".into(),
+        config.beta.unwrap_or(0.001).to_string(),
+    ]);
+    args.extend([
+        "--learning-rate".into(),
+        config.learning_rate.unwrap_or(5e-6).to_string(),
+    ]);
+    args.extend([
+        "--epochs".into(),
+        config.epochs.unwrap_or(1).to_string(),
+    ]);
+    args.extend([
+        "--lora-r".into(),
+        config.lora_r.unwrap_or(16).to_string(),
+    ]);
+    args.extend([
+        "--lora-alpha".into(),
+        config.lora_alpha.unwrap_or(32.0).to_string(),
+    ]);
+    args.extend([
+        "--max-seq-len".into(),
+        config.max_seq_len.unwrap_or(512).to_string(),
+    ]);
+    args.extend([
+        "--max-completion-length".into(),
+        config.max_completion_length.unwrap_or(512).to_string(),
+    ]);
+    args.extend([
+        "--seed".into(),
+        config.seed.unwrap_or(42).to_string(),
+    ]);
+    if config.reasoning_rewards.unwrap_or(false) {
+        args.push("--reasoning-rewards".into());
+    }
+    if config.no_flash_attention.unwrap_or(false) {
+        args.push("--no-flash-attention".into());
+    }
+    if let Some(ref tc) = config.text_column {
+        if !tc.is_empty() {
+            args.extend(["--text-column".into(), tc.clone()]);
+        }
+    }
+    if let Some(ref pc) = config.prompt_column {
+        if !pc.is_empty() {
+            args.extend(["--prompt-column".into(), pc.clone()]);
+        }
+    }
+    if let Some(ref rc) = config.response_column {
+        if !rc.is_empty() {
+            args.extend(["--response-column".into(), rc.clone()]);
+        }
+    }
+
+    spawn_oneshot_subprocess(run_id.clone(), args, on_event).await?;
+    Ok(run_id)
+}
+
+/// Spawn a `pmetal <subcommand>` child for a one-shot job that doesn't need
+/// state tracking — just streams stdout/stderr lines through the IPC channel.
+/// Used by DFlash, EmbedTrain, and RLKD which have no corresponding run-list
+/// state in AppState (they're additive routes with no legacy state).
+async fn spawn_oneshot_subprocess(
+    run_id: String,
+    args: Vec<String>,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let binary = pmetal_binary();
+    let mut cmd = tokio::process::Command::new(&binary);
+    cmd.args(&args);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| AppError(format!("Failed to spawn `{}`: {e}", binary.display())))?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let run_id_stdout = run_id.clone();
+    let run_id_stderr = run_id.clone();
+    let run_id_wait = run_id.clone();
+    let on_event_stdout = on_event.clone();
+    let on_event_stderr = on_event.clone();
+
+    // Drain stdout — forward every line to the IPC channel as a log event.
+    if let Some(s) = stdout {
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(s).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let _ = on_event_stdout
+                    .send(serde_json::json!({ "event": "log", "line": &line, "run_id": &run_id_stdout }));
+            }
+        });
+    }
+
+    // Drain stderr (also forwarded so the UI shows errors inline).
+    if let Some(s) = stderr {
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(s).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let _ = on_event_stderr
+                    .send(serde_json::json!({ "event": "log", "line": &line, "run_id": &run_id_stderr }));
+            }
+        });
+    }
+
+    // Wait for exit and emit a completion event so the frontend can show done/failed.
+    tokio::spawn(async move {
+        match child.wait().await {
+            Ok(status) => {
+                let _ = on_event.send(serde_json::json!({
+                    "event": if status.success() { "done" } else { "failed" },
+                    "run_id": &run_id_wait,
+                    "exit_code": status.code(),
+                }));
+                tracing::info!(run_id = %run_id_wait, exit = ?status, "oneshot subprocess exited");
+            }
+            Err(e) => {
+                let _ = on_event.send(serde_json::json!({
+                    "event": "failed",
+                    "run_id": &run_id_wait,
+                    "error": e.to_string(),
+                }));
+                tracing::error!(run_id = %run_id_wait, error = %e, "oneshot subprocess wait failed");
+            }
+        }
+    });
+
+    Ok(())
 }
 
 #[cfg(test)]
