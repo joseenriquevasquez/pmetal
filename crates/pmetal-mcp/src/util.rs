@@ -117,15 +117,45 @@ pub fn build_device_spec() -> McpResult<pmetal_hub::DeviceSpec> {
     })
 }
 
-/// Conditionally push an `--option value` pair onto an args vec.
-pub fn push_opt(args: &mut Vec<String>, flag: &str, value: &Option<impl ToString>) {
-    if let Some(v) = value {
-        args.push(flag.to_string());
-        args.push(v.to_string());
+/// Run a pmetal subcommand synchronously, taking an already-built argv slice.
+///
+/// `subcommand` is passed as the first argument to the binary (e.g. `"infer"`);
+/// `argv` is the remainder produced by `*Spec::to_argv()`.
+pub async fn run_pmetal_blocking_argv(subcommand: &str, argv: &[String]) -> McpResult<String> {
+    let mut cmd = pmetal_command();
+    cmd.arg(subcommand);
+    for arg in argv {
+        cmd.arg(arg);
     }
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| McpError::internal(format!("failed to run pmetal: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let msg = if stderr.is_empty() {
+            stdout.into_owned()
+        } else {
+            stderr.into_owned()
+        };
+        return Err(McpError::internal(format!(
+            "pmetal exited with {}: {msg}",
+            output.status
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Conditionally push a `--flag` (boolean) onto an args vec.
+// TODO: remove push_opt and push_bool_flag once all remaining manual argv
+// construction sites (dataset_*, bench_*, eval_*, ollama_*, chat) are migrated
+// to specs. The job-spawning tools are fully migrated; only blocking-call tools
+// with no *Spec equivalent still use these helpers.
+
+/// Conditionally push a boolean `--flag` onto an args vec.
 pub fn push_bool_flag(args: &mut Vec<String>, flag: &str, value: &Option<bool>) {
     if let Some(true) = value {
         args.push(flag.to_string());

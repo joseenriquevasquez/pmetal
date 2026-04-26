@@ -8,8 +8,11 @@ use tokio::sync::RwLock;
 use turbomcp::prelude::*;
 
 use jobs::JobManager;
-use util::{push_bool_flag, push_opt};
-use pmetal_core::jobs::TrainSpec;
+use util::push_bool_flag;
+use pmetal_core::jobs::{
+    DistillSpec, DflashSpec, EmbedTrainSpec, FuseSpec, GrpoSpec, InferSpec, MergeSpec,
+    PackExpertsSpec, QuantizeSpec, RlkdSpec, ServeSpec, TokenizeSpec, TrainSpec,
+};
 use pmetal_core::JobFields as _;
 
 /// MCP server exposing all PMetal functionality.
@@ -30,6 +33,73 @@ impl PmetalMcpServer {
 pub async fn run_stdio() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     PmetalMcpServer::new().run_stdio().await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Map a spec `validate_descriptors` error list into an `McpError`.
+fn into_mcp_error(errs: Vec<pmetal_core::FieldError>) -> McpError {
+    McpError::invalid_params(format!(
+        "validation failed: {}",
+        errs.iter()
+            .map(|e| format!("{}: {}", e.field, e.message))
+            .collect::<Vec<_>>()
+            .join("; ")
+    ))
+}
+
+/// Core memory-estimation logic shared between `model_fit` and `memory`.
+///
+/// Looks up the model via `pmetal search --json`, builds a `ModelSpec`, runs
+/// `estimate_fit`, and returns the raw fit result together with `params_b`.
+async fn estimate_model_memory(
+    model: &str,
+    context_length: Option<u64>,
+    quantization: Option<&str>,
+) -> McpResult<(pmetal_hub::FitEstimate, f64)> {
+    let args: Vec<&str> = vec!["search", model, "--limit", "1", "--json"];
+    let output = util::run_pmetal_blocking(&args).await?;
+
+    let results: Vec<serde_json::Value> = serde_json::from_str(&output)
+        .map_err(|e| McpError::internal(format!("parse error: {e}")))?;
+
+    let result = results
+        .first()
+        .ok_or_else(|| McpError::invalid_params(format!("model not found: {model}")))?;
+
+    let device_spec = util::build_device_spec()?;
+    let params_b = result
+        .get("estimated_params_b")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    let quant = quantization
+        .map(pmetal_hub::fit::detect_quantization_from_id)
+        .unwrap_or_else(|| pmetal_hub::fit::detect_quantization_from_id(model));
+
+    let is_moe = result
+        .get("tags")
+        .and_then(|t| t.as_array())
+        .map(|tags| tags.iter().any(|t| t.as_str() == Some("moe")))
+        .unwrap_or(false);
+
+    let model_spec = pmetal_hub::ModelSpec {
+        params_b,
+        quantization: quant,
+        context_length: context_length.unwrap_or(4096) as u32,
+        num_kv_heads: None,
+        head_dim: None,
+        num_layers: None,
+        is_moe,
+        num_experts: None,
+        active_experts: None,
+        kv_cache_bits: None,
+    };
+
+    let fit = pmetal_hub::estimate_fit(&model_spec, &device_spec);
+    Ok((fit, params_b))
 }
 
 // ---------------------------------------------------------------------------
@@ -181,47 +251,47 @@ impl PmetalMcpServer {
         #[description("HuggingFace model ID or local path")] model: String,
         #[description("Context length in tokens (default: 4096)")] context_length: Option<u64>,
     ) -> McpResult<String> {
-        let args: Vec<&str> = vec!["search", &model, "--limit", "1", "--json"];
-        let output = util::run_pmetal_blocking(&args).await?;
-
-        let results: Vec<serde_json::Value> = serde_json::from_str(&output)
-            .map_err(|e| McpError::internal(format!("parse error: {e}")))?;
-
-        let result = results
-            .first()
-            .ok_or_else(|| McpError::invalid_params(format!("model not found: {model}")))?;
-
-        let device_spec = util::build_device_spec()?;
-        let params_b = result
-            .get("estimated_params_b")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-
-        let quant = pmetal_hub::fit::detect_quantization_from_id(&model);
-        let is_moe = result
-            .get("tags")
-            .and_then(|t| t.as_array())
-            .map(|tags| tags.iter().any(|t| t.as_str() == Some("moe")))
-            .unwrap_or(false);
-
-        let model_spec = pmetal_hub::ModelSpec {
-            params_b,
-            quantization: quant,
-            context_length: context_length.unwrap_or(4096) as u32,
-            num_kv_heads: None,
-            head_dim: None,
-            num_layers: None,
-            is_moe,
-            num_experts: None,
-            active_experts: None,
-            kv_cache_bits: None,
-        };
-
-        let fit = pmetal_hub::estimate_fit(&model_spec, &device_spec);
+        let (fit, params_b) = estimate_model_memory(&model, context_length, None).await?;
 
         serde_json::to_string_pretty(&serde_json::json!({
             "model": model,
             "params_b": params_b,
+            "inference": {
+                "fit_level": fit.fit_level.label(),
+                "total_required_gb": fit.total_required_gb,
+                "weights_gb": fit.weights_gb,
+                "kv_cache_gb": fit.kv_cache_gb,
+                "overhead_gb": fit.overhead_gb,
+                "available_gb": fit.available_gb,
+                "utilization_pct": fit.utilization_pct,
+                "estimated_tps": fit.estimated_tps,
+            },
+            "training": {
+                "fit_level": fit.training_fit.label(),
+                "memory_gb": fit.training_memory_gb,
+            },
+        }))
+        .map_err(|e| McpError::internal(e.to_string()))
+    }
+
+    /// Estimate memory requirements for a model, with optional context length
+    /// and quantization overrides. Equivalent to `pmetal memory --model <model>`.
+    /// Returns inference/training memory breakdown and fit level.
+    #[tool]
+    async fn memory(
+        &self,
+        #[description("Model ID or local path")] model: String,
+        #[description("Context length (default: 4096)")] context_length: Option<u64>,
+        #[description("Quantization format (fp16, q4_k_m, fp8, …)")] quantization: Option<String>,
+    ) -> McpResult<String> {
+        let (fit, params_b) =
+            estimate_model_memory(&model, context_length, quantization.as_deref()).await?;
+
+        serde_json::to_string_pretty(&serde_json::json!({
+            "model": model,
+            "params_b": params_b,
+            "quantization": quantization,
+            "context_length": context_length.unwrap_or(4096),
             "inference": {
                 "fit_level": fit.fit_level.label(),
                 "total_required_gb": fit.total_required_gb,
@@ -290,114 +360,78 @@ impl PmetalMcpServer {
             "Enable QJL residual correction for Q2-Q3 uniform KV cache (reduces accuracy loss at low bits)"
         )]
         kv_qjl: Option<bool>,
+        // ── Parity gap 1: newly added inference flags ──────────────────────
+        #[description(
+            "Inference backend: auto, standard, compiled, metal-sampler, ane, minimal, dflash"
+        )]
+        backend: Option<String>,
+        #[description("Draft model for speculative decoding (required when backend=dflash)")]
+        draft_model: Option<String>,
+        #[description("Enable compiled sampling path")] compiled: Option<bool>,
+        #[description("Stream tokens to stdout as they are generated")] stream: Option<bool>,
+        #[description("Run in benchmark mode (reports tok/s, prefill latency)")] benchmark: Option<
+            bool,
+        >,
+        #[description("Profile per-layer latency and print a breakdown")] profile_layers: Option<
+            bool,
+        >,
+        #[description("Per-key KV cache quantization bits (asymmetric split-bit)")] kv_k_bits: Option<
+            u64,
+        >,
+        #[description("Per-value KV cache quantization bits (asymmetric split-bit)")] kv_v_bits: Option<
+            u64,
+        >,
+        #[description("KV cache quantization group size (default: 64)")] kv_group_size: Option<
+            u64,
+        >,
+        #[description(
+            "Enable TurboQuant mixed-precision KV cache (requires kv_k_bits / kv_v_bits)"
+        )]
+        kv_turboquant: Option<bool>,
+        #[description("Enable repetition detection heuristics to stop degenerate loops")]
+        detect_repetition: Option<bool>,
     ) -> McpResult<String> {
-        let max_tokens_str = max_tokens.unwrap_or(256).to_string();
-        let mut args: Vec<&str> = vec![
-            "infer",
-            "--model",
-            &model,
-            "--prompt",
-            &prompt,
-            "--max-tokens",
-            &max_tokens_str,
-        ];
-
-        let temp_str;
-        if let Some(t) = temperature {
-            temp_str = t.to_string();
-            args.extend_from_slice(&["--temperature", &temp_str]);
-        }
-        if chat.unwrap_or(false) {
-            args.push("--chat");
-        }
-        let system_ref;
-        if let Some(ref sys) = system {
-            system_ref = sys.as_str();
-            args.extend_from_slice(&["--system", system_ref]);
-        }
-        let lora_ref;
-        if let Some(ref l) = lora {
-            lora_ref = l.as_str();
-            args.extend_from_slice(&["--lora", lora_ref]);
-        }
-        let top_k_str;
-        if let Some(k) = top_k {
-            top_k_str = k.to_string();
-            args.extend_from_slice(&["--top-k", &top_k_str]);
-        }
-        let top_p_str;
-        if let Some(p) = top_p {
-            top_p_str = p.to_string();
-            args.extend_from_slice(&["--top-p", &top_p_str]);
-        }
-        let min_p_str;
-        if let Some(p) = min_p {
-            min_p_str = p.to_string();
-            args.extend_from_slice(&["--min-p", &min_p_str]);
-        }
-        let rep_pen_str;
-        if let Some(r) = repetition_penalty {
-            rep_pen_str = r.to_string();
-            args.extend_from_slice(&["--repetition-penalty", &rep_pen_str]);
-        }
-        let freq_pen_str;
-        if let Some(f) = frequency_penalty {
-            freq_pen_str = f.to_string();
-            args.extend_from_slice(&["--frequency-penalty", &freq_pen_str]);
-        }
-        let pres_pen_str;
-        if let Some(p) = presence_penalty {
-            pres_pen_str = p.to_string();
-            args.extend_from_slice(&["--presence-penalty", &pres_pen_str]);
-        }
-        let seed_str;
-        if let Some(s) = seed {
-            seed_str = s.to_string();
-            args.extend_from_slice(&["--seed", &seed_str]);
-        }
-        if no_thinking.unwrap_or(false) {
-            args.push("--no-thinking");
-        }
-        if hide_thinking.unwrap_or(false) {
-            args.push("--hide-thinking");
-        }
-        if fp8.unwrap_or(false) {
-            args.push("--fp8");
-        }
-        let experts_dir_ref;
-        if let Some(ref e) = experts_dir {
-            experts_dir_ref = e.as_str();
-            args.extend_from_slice(&["--experts-dir", experts_dir_ref]);
-        }
-        if ane.unwrap_or(false) {
-            args.push("--ane");
-        }
-        let ane_max_seq_len_str;
-        if let Some(seq) = ane_max_seq_len {
-            ane_max_seq_len_str = seq.to_string();
-            args.extend_from_slice(&["--ane-max-seq-len", &ane_max_seq_len_str]);
-        }
-        if ane_real_time.unwrap_or(false) {
-            args.push("--ane-real-time");
-        }
-        let kv_quant_str;
-        if let Some(k) = kv_quant {
-            kv_quant_str = k.to_string();
-            args.extend_from_slice(&["--kv-quant", &kv_quant_str]);
-        }
-        if no_kv_quant.unwrap_or(false) {
-            args.push("--no-kv-quant");
-        }
-        let kv_quant_preset_ref;
-        if let Some(ref preset) = kv_quant_preset {
-            kv_quant_preset_ref = preset.as_str();
-            args.extend_from_slice(&["--kv-quant-preset", kv_quant_preset_ref]);
-        }
-        if kv_qjl.unwrap_or(false) {
-            args.push("--kv-qjl");
-        }
-
-        util::run_pmetal_blocking(&args).await
+        let spec = InferSpec {
+            model,
+            prompt,
+            max_tokens: max_tokens.unwrap_or(256) as usize,
+            temperature: temperature.map(|t| t as f32),
+            chat: chat.unwrap_or(false),
+            system,
+            lora,
+            top_k: top_k.map(|k| k as usize),
+            top_p: top_p.map(|p| p as f32),
+            min_p: min_p.map(|p| p as f32),
+            repetition_penalty: repetition_penalty.map(|r| r as f32),
+            frequency_penalty: frequency_penalty.map(|f| f as f32),
+            presence_penalty: presence_penalty.map(|p| p as f32),
+            seed,
+            no_thinking: no_thinking.unwrap_or(false),
+            hide_thinking: hide_thinking.unwrap_or(false),
+            fp8: fp8.unwrap_or(false),
+            experts_dir,
+            ane: ane.unwrap_or(false),
+            ane_max_seq_len: ane_max_seq_len.unwrap_or(1024) as usize,
+            ane_real_time: ane_real_time.unwrap_or(false),
+            kv_quant: kv_quant.map(|k| k as u8),
+            no_kv_quant: no_kv_quant.unwrap_or(false),
+            kv_quant_preset,
+            kv_qjl: kv_qjl.unwrap_or(false),
+            backend: backend.unwrap_or_else(|| "auto".to_string()),
+            draft_model,
+            compiled: compiled.unwrap_or(false),
+            stream: stream.unwrap_or(false),
+            benchmark: benchmark.unwrap_or(false),
+            profile_layers: profile_layers.unwrap_or(false),
+            kv_k_bits: kv_k_bits.map(|b| b as u8),
+            kv_v_bits: kv_v_bits.map(|b| b as u8),
+            kv_group_size: kv_group_size.unwrap_or(64) as usize,
+            kv_turboquant: kv_turboquant.unwrap_or(false),
+            detect_repetition: detect_repetition.unwrap_or(false),
+            ..InferSpec::default()
+        };
+        let argv = spec.to_argv();
+        util::run_pmetal_blocking_argv("infer", &argv).await
     }
 
     // ── Training (background jobs) ────────────────────────────────────────
@@ -513,15 +547,7 @@ impl PmetalMcpServer {
             ..TrainSpec::default()
         };
 
-        spec.normalize().map_err(|errs| {
-            McpError::invalid_params(format!(
-                "validation failed: {}",
-                errs.iter()
-                    .map(|e| format!("{}: {}", e.field, e.message))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ))
-        })?;
+        spec.normalize().map_err(into_mcp_error)?;
 
         let mut argv = spec.to_argv();
 
@@ -532,11 +558,10 @@ impl PmetalMcpServer {
             "--no-gradient-checkpointing",
             &no_gradient_checkpointing,
         );
-        push_opt(
-            &mut argv,
-            "--gradient-checkpointing-layers",
-            &gradient_checkpointing_layers,
-        );
+        if let Some(layers) = gradient_checkpointing_layers {
+            argv.push("--gradient-checkpointing-layers".to_string());
+            argv.push(layers.to_string());
+        }
 
         let mut mgr = self.jobs.write().await;
         let id = mgr.spawn("train", argv).await?;
@@ -570,34 +595,33 @@ impl PmetalMcpServer {
         #[description("Prompt column for SFT label masking")] prompt_column: Option<String>,
         #[description("Response column for SFT label masking")] response_column: Option<String>,
     ) -> McpResult<String> {
-        let mut args = vec![
-            "--teacher".to_string(),
+        let mut spec = DistillSpec {
             teacher,
-            "--student".to_string(),
             student,
-            "--dataset".to_string(),
             dataset,
-        ];
-        push_opt(&mut args, "--output", &output);
-        push_opt(&mut args, "--method", &method);
-        push_opt(&mut args, "--temperature", &temperature);
-        push_opt(&mut args, "--alpha", &alpha);
-        push_opt(&mut args, "--learning-rate", &learning_rate);
-        push_opt(&mut args, "--epochs", &epochs);
-        push_opt(&mut args, "--max-seq-len", &max_seq_len);
-        push_opt(&mut args, "--loss-type", &loss_type);
-        push_bool_flag(&mut args, "--rationale", &rationale);
-        push_opt(&mut args, "--rationale-weight", &rationale_weight);
-        push_opt(&mut args, "--lora-r", &lora_r);
-        push_opt(&mut args, "--lora-alpha", &lora_alpha);
-        push_opt(&mut args, "--batch-size", &batch_size);
-        push_opt(&mut args, "--seed", &seed);
-        push_opt(&mut args, "--text-column", &text_column);
-        push_opt(&mut args, "--prompt-column", &prompt_column);
-        push_opt(&mut args, "--response-column", &response_column);
-
+            output_dir: output.unwrap_or_else(|| DistillSpec::default().output_dir),
+            method: method.unwrap_or_else(|| "online".to_string()),
+            temperature: temperature.unwrap_or(2.0) as f32,
+            alpha: alpha.unwrap_or(0.5) as f32,
+            learning_rate: learning_rate.unwrap_or(2e-5) as f32,
+            epochs: epochs.unwrap_or(1) as usize,
+            max_seq_len: max_seq_len.unwrap_or(1024) as usize,
+            loss_type: loss_type.unwrap_or_else(|| "kl_divergence".to_string()),
+            rationale: rationale.unwrap_or(false),
+            rationale_weight: rationale_weight.unwrap_or(1.0) as f32,
+            lora_r: lora_r.unwrap_or(16) as usize,
+            lora_alpha: lora_alpha.unwrap_or(32.0) as f32,
+            batch_size: batch_size.unwrap_or(1) as usize,
+            seed: seed.unwrap_or(42),
+            text_column,
+            prompt_column,
+            response_column,
+            ..DistillSpec::default()
+        };
+        spec.normalize().map_err(into_mcp_error)?;
+        let argv = spec.to_argv();
         let mut mgr = self.jobs.write().await;
-        let id = mgr.spawn("distill", args).await?;
+        let id = mgr.spawn("distill", argv).await?;
         job_started_response(&id, "distill")
     }
 
@@ -642,49 +666,41 @@ impl PmetalMcpServer {
         )]
         grpo_kv_bits: Option<u64>,
     ) -> McpResult<String> {
-        let mut args = vec![
-            "--model".to_string(),
+        let mut spec = GrpoSpec {
             model,
-            "--dataset".to_string(),
             dataset,
-        ];
-        push_opt(&mut args, "--output", &output);
-        push_opt(&mut args, "--num-generations", &num_generations);
-        push_opt(&mut args, "--beta", &beta);
-        push_opt(&mut args, "--learning-rate", &learning_rate);
-        push_opt(&mut args, "--epochs", &epochs);
-        push_opt(&mut args, "--lora-r", &lora_r);
-        push_bool_flag(&mut args, "--reasoning-rewards", &reasoning_rewards);
-        push_opt(&mut args, "--lora-alpha", &lora_alpha);
-        push_opt(&mut args, "--max-seq-len", &max_seq_len);
-        push_opt(&mut args, "--max-completion-length", &max_completion_length);
-        push_opt(&mut args, "--seed", &seed);
-        push_bool_flag(&mut args, "--dapo", &dapo);
-        push_bool_flag(&mut args, "--no-flash-attention", &no_flash_attention);
-        push_bool_flag(&mut args, "--vlm", &vlm);
-        push_opt(&mut args, "--max-image-size", &max_image_size);
-        push_opt(&mut args, "--reward-model", &reward_model);
-        push_opt(
-            &mut args,
-            "--reward-model-max-length",
-            &reward_model_max_length,
-        );
-        push_opt(&mut args, "--reward-model-weight", &reward_model_weight);
-        push_opt(&mut args, "--reward-model-template", &reward_model_template);
-        push_bool_flag(&mut args, "--speculative", &speculative);
-        push_opt(
-            &mut args,
-            "--speculative-draft-tokens",
-            &speculative_draft_tokens,
-        );
-        push_bool_flag(&mut args, "--async-rewards", &async_rewards);
-        push_opt(&mut args, "--text-column", &text_column);
-        push_opt(&mut args, "--prompt-column", &prompt_column);
-        push_opt(&mut args, "--response-column", &response_column);
-        push_opt(&mut args, "--grpo-kv-bits", &grpo_kv_bits);
-
+            output_dir: output.unwrap_or_else(|| GrpoSpec::default().output_dir),
+            num_generations: num_generations.unwrap_or(8) as usize,
+            beta: beta.unwrap_or(0.001),
+            learning_rate: learning_rate.unwrap_or(5e-6),
+            epochs: epochs.unwrap_or(1) as usize,
+            lora_r: lora_r.unwrap_or(16) as usize,
+            lora_alpha: lora_alpha.unwrap_or(32.0) as f32,
+            max_seq_len: max_seq_len.unwrap_or(512) as usize,
+            max_completion_length: max_completion_length.unwrap_or(512) as usize,
+            seed: seed.unwrap_or(42),
+            dapo: dapo.unwrap_or(false),
+            reasoning_rewards: reasoning_rewards.unwrap_or(false),
+            no_flash_attention: no_flash_attention.unwrap_or(false),
+            vlm: vlm.unwrap_or(false),
+            max_image_size: max_image_size.unwrap_or(336) as usize,
+            reward_model,
+            reward_model_max_length: reward_model_max_length.unwrap_or(2048) as usize,
+            reward_model_weight: reward_model_weight.unwrap_or(1.0),
+            reward_model_template,
+            speculative: speculative.unwrap_or(false),
+            speculative_draft_tokens: speculative_draft_tokens.unwrap_or(3) as usize,
+            async_rewards: async_rewards.unwrap_or(false),
+            text_column,
+            prompt_column,
+            response_column,
+            grpo_kv_bits: grpo_kv_bits.map(|b| b as u8),
+            ..GrpoSpec::default()
+        };
+        spec.normalize().map_err(into_mcp_error)?;
+        let argv = spec.to_argv();
         let mut mgr = self.jobs.write().await;
-        let id = mgr.spawn("grpo", args).await?;
+        let id = mgr.spawn("grpo", argv).await?;
         job_started_response(&id, "grpo")
     }
 
@@ -712,32 +728,31 @@ impl PmetalMcpServer {
         #[description("Random seed (default: 42)")] seed: Option<u64>,
         #[description("Enable reasoning-aware rewards")] reasoning_rewards: Option<bool>,
     ) -> McpResult<String> {
-        let mut args = vec![
-            "--model".to_string(),
+        let mut spec = RlkdSpec {
             model,
-            "--teacher-model".to_string(),
             teacher_model,
-            "--dataset".to_string(),
             dataset,
-        ];
-        push_opt(&mut args, "--output", &output);
-        push_opt(&mut args, "--distill-alpha", &distill_alpha);
-        push_opt(&mut args, "--final-alpha", &final_alpha);
-        push_bool_flag(&mut args, "--anneal-alpha", &anneal_alpha);
-        push_opt(&mut args, "--distill-temperature", &distill_temperature);
-        push_opt(&mut args, "--num-generations", &num_generations);
-        push_opt(&mut args, "--beta", &beta);
-        push_opt(&mut args, "--learning-rate", &learning_rate);
-        push_opt(&mut args, "--epochs", &epochs);
-        push_opt(&mut args, "--lora-r", &lora_r);
-        push_opt(&mut args, "--lora-alpha", &lora_alpha);
-        push_opt(&mut args, "--max-seq-len", &max_seq_len);
-        push_opt(&mut args, "--max-completion-length", &max_completion_length);
-        push_opt(&mut args, "--seed", &seed);
-        push_bool_flag(&mut args, "--reasoning-rewards", &reasoning_rewards);
-
+            output_dir: output.unwrap_or_else(|| RlkdSpec::default().output_dir),
+            distill_alpha: distill_alpha.unwrap_or(0.3) as f32,
+            final_alpha: final_alpha.unwrap_or(0.05) as f32,
+            anneal_alpha: anneal_alpha.unwrap_or(false),
+            distill_temperature: distill_temperature.unwrap_or(2.0) as f32,
+            num_generations: num_generations.unwrap_or(8) as usize,
+            beta: beta.unwrap_or(0.001),
+            learning_rate: learning_rate.unwrap_or(5e-6),
+            epochs: epochs.unwrap_or(1) as usize,
+            lora_r: lora_r.unwrap_or(16) as usize,
+            lora_alpha: lora_alpha.unwrap_or(32.0) as f32,
+            max_seq_len: max_seq_len.unwrap_or(512) as usize,
+            max_completion_length: max_completion_length.unwrap_or(512) as usize,
+            seed: seed.unwrap_or(42),
+            reasoning_rewards: reasoning_rewards.unwrap_or(false),
+            ..RlkdSpec::default()
+        };
+        spec.normalize().map_err(into_mcp_error)?;
+        let argv = spec.to_argv();
         let mut mgr = self.jobs.write().await;
-        let id = mgr.spawn("rlkd", args).await?;
+        let id = mgr.spawn("rlkd", argv).await?;
         job_started_response(&id, "rlkd")
     }
 
@@ -764,27 +779,27 @@ impl PmetalMcpServer {
         #[description("Disable L2 normalization of embeddings")] no_normalize: Option<bool>,
         #[description("Random seed (default: 42)")] seed: Option<u64>,
     ) -> McpResult<String> {
-        let mut args = vec![
-            "--model".to_string(),
+        let mut spec = EmbedTrainSpec {
             model,
-            "--dataset".to_string(),
             dataset,
-        ];
-        push_opt(&mut args, "--output", &output);
-        push_opt(&mut args, "--loss", &loss);
-        push_opt(&mut args, "--pooling", &pooling);
-        push_opt(&mut args, "--temperature", &temperature);
-        push_opt(&mut args, "--margin", &margin);
-        push_opt(&mut args, "--learning-rate", &learning_rate);
-        push_opt(&mut args, "--batch-size", &batch_size);
-        push_opt(&mut args, "--epochs", &epochs);
-        push_opt(&mut args, "--max-seq-len", &max_seq_len);
-        push_opt(&mut args, "--weight-decay", &weight_decay);
-        push_bool_flag(&mut args, "--no-normalize", &no_normalize);
-        push_opt(&mut args, "--seed", &seed);
-
+            output_dir: output.unwrap_or_else(|| EmbedTrainSpec::default().output_dir),
+            loss: loss.unwrap_or_else(|| "info_nce".to_string()),
+            pooling: pooling.unwrap_or_else(|| "mean".to_string()),
+            temperature: temperature.unwrap_or(0.05) as f32,
+            margin: margin.unwrap_or(0.3) as f32,
+            learning_rate: learning_rate.unwrap_or(2e-5),
+            batch_size: batch_size.unwrap_or(32) as usize,
+            epochs: epochs.unwrap_or(3) as usize,
+            max_seq_len: max_seq_len.unwrap_or(512) as usize,
+            weight_decay: weight_decay.unwrap_or(0.01),
+            no_normalize: no_normalize.unwrap_or(false),
+            seed: seed.unwrap_or(42),
+            ..EmbedTrainSpec::default()
+        };
+        spec.normalize().map_err(into_mcp_error)?;
+        let argv = spec.to_argv();
         let mut mgr = self.jobs.write().await;
-        let id = mgr.spawn("embed-train", args).await?;
+        let id = mgr.spawn("embed-train", argv).await?;
         job_started_response(&id, "embed-train")
     }
 
@@ -1238,16 +1253,21 @@ impl PmetalMcpServer {
         #[description("Target average bits per weight for KL calibration")] target_bpw: Option<f64>,
         #[description("KL quality-loss threshold (default: 0.01)")] kl_threshold: Option<f64>,
     ) -> McpResult<String> {
-        let mut args = vec!["--model".to_string(), model, "--output".to_string(), output];
-        push_opt(&mut args, "--method", &method);
-        push_opt(&mut args, "--imatrix", &imatrix);
-        push_opt(&mut args, "--lora", &lora);
-        push_bool_flag(&mut args, "--kl-calibrate", &kl_calibrate);
-        push_opt(&mut args, "--target-bpw", &target_bpw);
-        push_opt(&mut args, "--kl-threshold", &kl_threshold);
-
+        let mut spec = QuantizeSpec {
+            model,
+            output,
+            method: method.unwrap_or_else(|| "dynamic".to_string()),
+            imatrix,
+            lora,
+            kl_calibrate: kl_calibrate.unwrap_or(false),
+            target_bpw: target_bpw.map(|b| b as f32),
+            kl_threshold: kl_threshold.unwrap_or(0.01),
+            ..QuantizeSpec::default()
+        };
+        spec.normalize().map_err(into_mcp_error)?;
+        let argv = spec.to_argv();
         let mut mgr = self.jobs.write().await;
-        let id = mgr.spawn("quantize", args).await?;
+        let id = mgr.spawn("quantize", argv).await?;
         job_started_response(&id, "quantize")
     }
 
@@ -1264,21 +1284,19 @@ impl PmetalMcpServer {
         #[description("LoRA rank (default: auto-detect)")] rank: Option<u64>,
         #[description("Use tiled low-memory mode with --accurate")] low_memory: Option<bool>,
     ) -> McpResult<String> {
-        let mut args = vec![
-            "--model".to_string(),
+        let mut spec = FuseSpec {
             model,
-            "--lora".to_string(),
             lora,
-            "--output".to_string(),
             output,
-        ];
-        push_bool_flag(&mut args, "--accurate", &accurate);
-        push_opt(&mut args, "--alpha", &alpha);
-        push_opt(&mut args, "--rank", &rank);
-        push_bool_flag(&mut args, "--low-memory", &low_memory);
-
+            accurate: accurate.unwrap_or(false),
+            alpha: alpha.map(|a| a as f32),
+            rank: rank.map(|r| r as usize),
+            low_memory: low_memory.unwrap_or(false),
+        };
+        spec.normalize().map_err(into_mcp_error)?;
+        let argv = spec.to_argv();
         let mut mgr = self.jobs.write().await;
-        let id = mgr.spawn("fuse", args).await?;
+        let id = mgr.spawn("fuse", argv).await?;
         job_started_response(&id, "fuse")
     }
 
@@ -1298,24 +1316,22 @@ impl PmetalMcpServer {
         #[description("Sparsification density for TIES/DARE (default: 0.5)")] density: Option<f64>,
         #[description("Output dtype: float32, float16, bfloat16")] dtype: Option<String>,
     ) -> McpResult<String> {
-        let mut args = vec![
-            "--model-a".to_string(),
+        let mut spec = MergeSpec {
             model_a,
-            "--model-b".to_string(),
             model_b,
-            "--output".to_string(),
             output,
-        ];
-        push_opt(&mut args, "--method", &method);
-        push_opt(&mut args, "-t", &t);
-        push_opt(&mut args, "--base", &base);
-        push_opt(&mut args, "--weight-a", &weight_a);
-        push_opt(&mut args, "--weight-b", &weight_b);
-        push_opt(&mut args, "--density", &density);
-        push_opt(&mut args, "--dtype", &dtype);
-
+            method: method.unwrap_or_else(|| "slerp".to_string()),
+            t: t.unwrap_or(0.5) as f32,
+            base,
+            weight_a: weight_a.unwrap_or(0.5) as f32,
+            weight_b: weight_b.unwrap_or(0.5) as f32,
+            density: density.unwrap_or(0.5) as f32,
+            dtype: dtype.unwrap_or_else(|| "bfloat16".to_string()),
+        };
+        spec.normalize().map_err(into_mcp_error)?;
+        let argv = spec.to_argv();
         let mut mgr = self.jobs.write().await;
-        let id = mgr.spawn("merge", args).await?;
+        let id = mgr.spawn("merge", argv).await?;
         job_started_response(&id, "merge")
     }
 
@@ -1328,12 +1344,15 @@ impl PmetalMcpServer {
         #[description("Output directory for packed experts")] output: Option<String>,
         #[description("Quantization bits: 4 or 2")] bits: Option<u64>,
     ) -> McpResult<String> {
-        let mut args = vec!["--model".to_string(), model];
-        push_opt(&mut args, "--output", &output);
-        push_opt(&mut args, "--bits", &bits);
-
+        let mut spec = PackExpertsSpec {
+            model,
+            output: output.unwrap_or_else(|| PackExpertsSpec::default().output),
+            bits: bits.map(|b| b as u8),
+        };
+        spec.normalize().map_err(into_mcp_error)?;
+        let argv = spec.to_argv();
         let mut mgr = self.jobs.write().await;
-        let id = mgr.spawn("pack-experts", args).await?;
+        let id = mgr.spawn("pack-experts", argv).await?;
         job_started_response(&id, "pack-experts")
     }
 
@@ -1481,19 +1500,91 @@ impl PmetalMcpServer {
         #[description("Maximum ANE kernel sequence length")] ane_max_seq_len: Option<u64>,
         #[description("Use experimental ANE real-time serving path")] ane_real_time: Option<bool>,
     ) -> McpResult<String> {
-        let mut args = vec!["--model".to_string(), model];
-        push_opt(&mut args, "--port", &port);
-        push_opt(&mut args, "--lora", &lora);
-        push_opt(&mut args, "--host", &host);
-        push_opt(&mut args, "--max-seq-len", &max_seq_len);
-        push_opt(&mut args, "--experts-dir", &experts_dir);
-        push_bool_flag(&mut args, "--ane", &ane);
-        push_opt(&mut args, "--ane-max-seq-len", &ane_max_seq_len);
-        push_bool_flag(&mut args, "--ane-real-time", &ane_real_time);
-
+        // `lora` is not in ServeSpec yet — append after to_argv().
+        // TODO: remove after ServeSpec gains a `lora` field.
+        let mut spec = ServeSpec {
+            model,
+            port: port.unwrap_or(8080) as u16,
+            host: host.unwrap_or_else(|| "0.0.0.0".to_string()),
+            max_seq_len: max_seq_len.unwrap_or(4096) as usize,
+            experts_dir,
+            ane: ane.unwrap_or(false),
+            ane_max_seq_len: ane_max_seq_len.unwrap_or(1024) as usize,
+            ane_real_time: ane_real_time.unwrap_or(false),
+            ..ServeSpec::default()
+        };
+        spec.normalize().map_err(into_mcp_error)?;
+        let mut argv = spec.to_argv();
+        // `lora` is not yet in ServeSpec.
+        if let Some(ref l) = lora {
+            argv.push("--lora".to_string());
+            argv.push(l.clone());
+        }
         let mut mgr = self.jobs.write().await;
-        let id = mgr.spawn("serve", args).await?;
+        let id = mgr.spawn("serve", argv).await?;
         job_started_response(&id, "serve")
+    }
+
+    // ── Parity gap 2: tokenize ────────────────────────────────────────────
+
+    /// Tokenize a JSONL text corpus into binary shards for pretraining.
+    /// Returns a job ID for tracking. Maps to `pmetal tokenize`.
+    #[tool]
+    async fn tokenize(
+        &self,
+        #[description("Input JSONL path")] input: String,
+        #[description("Output shard directory")] output: String,
+        #[description("Tokenizer model path or HF ID")] tokenizer: String,
+        #[description("Text column in JSONL (default: text)")] text_column: Option<String>,
+        #[description("Documents per shard (default: 10000)")] docs_per_shard: Option<u64>,
+    ) -> McpResult<String> {
+        let mut spec = TokenizeSpec {
+            input,
+            output,
+            tokenizer,
+            text_column: text_column.unwrap_or_else(|| "text".to_string()),
+            docs_per_shard: docs_per_shard.unwrap_or(10_000) as usize,
+        };
+        spec.normalize().map_err(into_mcp_error)?;
+        let argv = spec.to_argv();
+        let mut mgr = self.jobs.write().await;
+        let id = mgr.spawn("tokenize", argv).await?;
+        job_started_response(&id, "tokenize")
+    }
+
+    // ── Parity gap 4: dflash ─────────────────────────────────────────────
+
+    /// Run block-diffusion speculative decoding (dflash).
+    /// Requires a target model and a draft model.
+    /// Returns a job ID for tracking.
+    #[tool]
+    async fn dflash(
+        &self,
+        #[description("Target (large) model ID or path")] target: String,
+        #[description("Draft (small) model ID or path")] draft: String,
+        #[description("Prompt text")] prompt: String,
+        #[description("Max new tokens (default: 128)")] max_new_tokens: Option<u64>,
+        #[description("Temperature (0.0 = greedy)")] temperature: Option<f64>,
+        #[description("Speculative tokens per step")] speculative_tokens: Option<u64>,
+        #[description("Use FP8 for draft model")] draft_fp8: Option<bool>,
+        #[description("Tree budget (0 = disabled)")] tree_budget: Option<u64>,
+    ) -> McpResult<String> {
+        let mut spec = DflashSpec {
+            target,
+            draft,
+            prompt,
+            max_new_tokens: max_new_tokens.unwrap_or(128) as usize,
+            temperature: temperature.unwrap_or(0.0) as f32,
+            speculative_tokens: speculative_tokens.map(|t| t as usize),
+            draft_fp8: draft_fp8.unwrap_or(false),
+            tree_budget: tree_budget.unwrap_or(0) as usize,
+            ..DflashSpec::default()
+        };
+        spec.normalize().map_err(into_mcp_error)?;
+        let argv = spec.to_argv();
+        let mut mgr = self.jobs.write().await;
+        let id = mgr.spawn("dflash", argv).await?;
+        job_started_response(&id, "dflash")
     }
 
     // ── Ollama Integration ────────────────────────────────────────────────
