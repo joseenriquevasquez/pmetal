@@ -114,6 +114,14 @@ pub enum JobType {
     Merge,
     /// Full-parameter pretraining job (`pmetal pretrain`).
     Pretrain,
+    /// Sentence embedding training job (`pmetal embed-train`).
+    EmbedTrain,
+    /// RL with Knowledge Distillation job (`pmetal rlkd`).
+    Rlkd,
+    /// Corpus tokenization job (`pmetal tokenize`).
+    Tokenize,
+    /// Ollama subcommand wrapper (`pmetal ollama`).
+    Ollama,
 }
 
 impl std::fmt::Display for JobType {
@@ -131,6 +139,10 @@ impl std::fmt::Display for JobType {
             JobType::Eval => write!(f, "Eval"),
             JobType::Merge => write!(f, "Merge"),
             JobType::Pretrain => write!(f, "Pretrain"),
+            JobType::EmbedTrain => write!(f, "EmbedTrain"),
+            JobType::Rlkd => write!(f, "RLKD"),
+            JobType::Tokenize => write!(f, "Tokenize"),
+            JobType::Ollama => write!(f, "Ollama"),
         }
     }
 }

@@ -174,6 +174,30 @@ impl Widget for Footer {
                     Span::styled(" cancel  ", THEME.footer_desc),
                 ]);
             }
+            Tab::EmbedTrain | Tab::Rlkd | Tab::Tokenize => {
+                spans.extend([
+                    Span::styled("jk", THEME.footer_key),
+                    Span::styled(" navigate  ", THEME.footer_desc),
+                    Span::styled("Enter", THEME.footer_key),
+                    Span::styled(" edit/pick  ", THEME.footer_desc),
+                    Span::styled("S", THEME.footer_key),
+                    Span::styled(" start  ", THEME.footer_desc),
+                    Span::styled("x", THEME.footer_key),
+                    Span::styled(" cancel  ", THEME.footer_desc),
+                ]);
+            }
+            Tab::Ollama => {
+                spans.extend([
+                    Span::styled("jk", THEME.footer_key),
+                    Span::styled(" navigate  ", THEME.footer_desc),
+                    Span::styled("Enter", THEME.footer_key),
+                    Span::styled(" edit field  ", THEME.footer_desc),
+                    Span::styled("S", THEME.footer_key),
+                    Span::styled(" run  ", THEME.footer_desc),
+                    Span::styled("x", THEME.footer_key),
+                    Span::styled(" cancel  ", THEME.footer_desc),
+                ]);
+            }
         }
 
         // Global keybindings (not shown for Inference since it has its own quit)

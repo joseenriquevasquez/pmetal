@@ -14,12 +14,18 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::Widget;
 
+use pmetal_core::JobFields as _;
+
 use crate::tui::command_runner::CommandRunner;
 use crate::tui::event::{AppMsg, CommandSpec, Event, EventHandler, JobType};
 use crate::tui::modal::{Modal, ModalAction, PickerEntry};
-use crate::tui::tabs::ModelSource;
 use crate::tui::tabs::dashboard::MetricSample;
-use crate::tui::tabs::*;
+use crate::tui::tabs::{
+    BenchTab, DashboardTab, DatasetsTab, DeviceTab, DistillationTab, EmbedTrainTab, EvalTab,
+    GrpoTab, InferenceFocus, InferenceTab, JobsTab, MergeTab, ModelSource, ModelsTab, OllamaTab,
+    PretrainTab, QuantizeTab, RlkdTab, ServeTab, Tab, TokenizeTab, TrainingStatus, TrainingTab,
+    write_training_info,
+};
 use crate::tui::theme::THEME;
 use crate::tui::widgets::{Footer, FormAction, Header};
 
@@ -40,6 +46,10 @@ pub struct App {
     pub models: ModelsTab,
     pub datasets: DatasetsTab,
     pub training: TrainingTab,
+    pub embed_train: EmbedTrainTab,
+    pub rlkd: RlkdTab,
+    pub tokenize: TokenizeTab,
+    pub ollama: OllamaTab,
     pub inference: InferenceTab,
     pub jobs: JobsTab,
     pub pretrain: PretrainTab,
@@ -95,6 +105,18 @@ pub struct App {
     /// Currently active pretrain job ID (if any).
     active_pretrain_job: Option<String>,
 
+    /// Currently active embed-train job ID (if any).
+    active_embed_train_job: Option<String>,
+
+    /// Currently active rlkd job ID (if any).
+    active_rlkd_job: Option<String>,
+
+    /// Currently active tokenize job ID (if any).
+    active_tokenize_job: Option<String>,
+
+    /// Currently active ollama job ID (if any).
+    active_ollama_job: Option<String>,
+
     /// Cancellation token for the in-flight HF search background task (if any).
     ///
     /// When `Esc` dismisses the Progress modal that was opened by `search_hf`,
@@ -142,6 +164,16 @@ enum PendingModalTarget {
     MergeBaseModel,
     MergeStart,
     PretrainStart,
+    EmbedTrainModel,
+    EmbedTrainDataset,
+    EmbedTrainStart,
+    RlkdPolicyModel,
+    RlkdTeacherModel,
+    RlkdDataset,
+    RlkdStart,
+    TokenizeModel,
+    TokenizeStart,
+    OllamaStart,
     DownloadModel,
     HfSearch,
     AddModelDir,
@@ -163,6 +195,10 @@ impl App {
             models: ModelsTab::new(),
             datasets: DatasetsTab::new(),
             training: TrainingTab::new(),
+            embed_train: EmbedTrainTab::new(),
+            rlkd: RlkdTab::new(),
+            tokenize: TokenizeTab::new(),
+            ollama: OllamaTab::new(),
             inference: InferenceTab::new(),
             jobs: JobsTab::new(),
             pretrain: PretrainTab::new(),
@@ -187,6 +223,10 @@ impl App {
             active_eval_job: None,
             active_merge_job: None,
             active_pretrain_job: None,
+            active_embed_train_job: None,
+            active_rlkd_job: None,
+            active_tokenize_job: None,
+            active_ollama_job: None,
             hf_search_cancel: None,
             header_area: ratatui::layout::Rect::default(),
         }
@@ -521,6 +561,10 @@ impl App {
                 _ => {}
             },
             Tab::Training => self.handle_training_key(key),
+            Tab::EmbedTrain => self.handle_embed_train_key(key),
+            Tab::Rlkd => self.handle_rlkd_key(key),
+            Tab::Tokenize => self.handle_tokenize_key(key),
+            Tab::Ollama => self.handle_ollama_key(key),
             Tab::Pretrain => self.handle_pretrain_key(key),
             Tab::Inference => self.handle_inference_key(key),
             Tab::Jobs => self.handle_jobs_key(key),
@@ -593,8 +637,6 @@ impl App {
 
     // --- Inference tab key handler ---
     fn handle_inference_key(&mut self, key: crossterm::event::KeyEvent) {
-        use crate::tui::tabs::InferenceFocus;
-
         match key.code {
             // --- Global keybindings (any focus mode) ---
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1104,6 +1146,207 @@ impl App {
         }
     }
 
+    // --- EmbedTrain tab key handler ---
+    fn handle_embed_train_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        if self.embed_train.is_editing() {
+            match key.code {
+                KeyCode::Enter => self.embed_train.confirm_edit(),
+                KeyCode::Esc => self.embed_train.cancel_edit(),
+                _ => self.embed_train.handle_edit_key(key),
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.embed_train.next_param(),
+            KeyCode::Up | KeyCode::Char('k') => self.embed_train.prev_param(),
+            KeyCode::Enter => {
+                if let Some(action) = self.embed_train.handle_enter() {
+                    match action {
+                        FormAction::OpenModelPicker { .. } => {
+                            self.pending_modal_context = Some(PendingModalTarget::EmbedTrainModel);
+                            let entries = self.model_picker_entries();
+                            self.modal_stack.push(Modal::model_picker(entries));
+                        }
+                        FormAction::OpenDatasetPicker { .. } => {
+                            self.pending_modal_context = Some(PendingModalTarget::EmbedTrainDataset);
+                            let entries = self.dataset_picker_entries();
+                            self.modal_stack.push(Modal::dataset_picker(entries));
+                        }
+                        FormAction::StartEdit => {}
+                    }
+                }
+            }
+            KeyCode::Char('S') => {
+                if self.embed_train.is_running() {
+                    self.modal_stack.push(Modal::error(
+                        "Already Running",
+                        "An embed-train job is already in progress. Cancel it first (x).",
+                    ));
+                } else {
+                    self.start_embed_train_prompt();
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(ref job_id) = self.active_embed_train_job.clone() {
+                    if let Some(runner) = &mut self.runner {
+                        runner.cancel(job_id);
+                    }
+                    self.embed_train.mark_failed("cancelled by user");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // --- RLKD tab key handler ---
+    fn handle_rlkd_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        if self.rlkd.is_editing() {
+            match key.code {
+                KeyCode::Enter => self.rlkd.confirm_edit(),
+                KeyCode::Esc => self.rlkd.cancel_edit(),
+                _ => self.rlkd.handle_edit_key(key),
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.rlkd.next_param(),
+            KeyCode::Up | KeyCode::Char('k') => self.rlkd.prev_param(),
+            KeyCode::Enter => {
+                if let Some(action) = self.rlkd.handle_enter() {
+                    match action {
+                        FormAction::OpenModelPicker { field_label } => {
+                            let target = match field_label.as_str() {
+                                "Policy Model" => PendingModalTarget::RlkdPolicyModel,
+                                "Teacher Model" => PendingModalTarget::RlkdTeacherModel,
+                                _ => return,
+                            };
+                            self.pending_modal_context = Some(target);
+                            let entries = self.model_picker_entries();
+                            self.modal_stack.push(Modal::model_picker(entries));
+                        }
+                        FormAction::OpenDatasetPicker { .. } => {
+                            self.pending_modal_context = Some(PendingModalTarget::RlkdDataset);
+                            let entries = self.dataset_picker_entries();
+                            self.modal_stack.push(Modal::dataset_picker(entries));
+                        }
+                        FormAction::StartEdit => {}
+                    }
+                }
+            }
+            KeyCode::Char('S') => {
+                if self.rlkd.is_running() {
+                    self.modal_stack.push(Modal::error(
+                        "Already Running",
+                        "An RLKD job is already in progress. Cancel it first (x).",
+                    ));
+                } else {
+                    self.start_rlkd_prompt();
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(ref job_id) = self.active_rlkd_job.clone() {
+                    if let Some(runner) = &mut self.runner {
+                        runner.cancel(job_id);
+                    }
+                    self.rlkd.mark_failed("cancelled by user");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // --- Tokenize tab key handler ---
+    fn handle_tokenize_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        if self.tokenize.is_editing() {
+            match key.code {
+                KeyCode::Enter => self.tokenize.confirm_edit(),
+                KeyCode::Esc => self.tokenize.cancel_edit(),
+                _ => self.tokenize.handle_edit_key(key),
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.tokenize.next_param(),
+            KeyCode::Up | KeyCode::Char('k') => self.tokenize.prev_param(),
+            KeyCode::Enter => {
+                if let Some(action) = self.tokenize.handle_enter() {
+                    match action {
+                        FormAction::OpenModelPicker { .. } => {
+                            self.pending_modal_context = Some(PendingModalTarget::TokenizeModel);
+                            let entries = self.model_picker_entries();
+                            self.modal_stack.push(Modal::model_picker(entries));
+                        }
+                        FormAction::OpenDatasetPicker { .. } => {}
+                        FormAction::StartEdit => {}
+                    }
+                }
+            }
+            KeyCode::Char('S') => {
+                if self.tokenize.is_running() {
+                    self.modal_stack.push(Modal::error(
+                        "Already Running",
+                        "A tokenize job is already in progress. Cancel it first (x).",
+                    ));
+                } else {
+                    self.start_tokenize_prompt();
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(ref job_id) = self.active_tokenize_job.clone() {
+                    if let Some(runner) = &mut self.runner {
+                        runner.cancel(job_id);
+                    }
+                    self.tokenize.mark_failed("cancelled by user");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // --- Ollama tab key handler ---
+    fn handle_ollama_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        if self.ollama.is_editing() {
+            match key.code {
+                KeyCode::Enter => self.ollama.confirm_edit(),
+                KeyCode::Esc => self.ollama.cancel_edit(),
+                _ => self.ollama.handle_edit_key(key),
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.ollama.next_param(),
+            KeyCode::Up | KeyCode::Char('k') => self.ollama.prev_param(),
+            KeyCode::Enter => self.ollama.handle_enter(),
+            KeyCode::Char('S') => {
+                if self.ollama.is_running() {
+                    self.modal_stack.push(Modal::error(
+                        "Already Running",
+                        "An Ollama command is already running. Cancel it first (x).",
+                    ));
+                } else {
+                    self.start_ollama_prompt();
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(ref job_id) = self.active_ollama_job.clone() {
+                    if let Some(runner) = &mut self.runner {
+                        runner.cancel(job_id);
+                    }
+                    self.ollama.mark_failed("cancelled by user");
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Handle mouse events.
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         // Don't process mouse if a modal is open
@@ -1141,6 +1384,9 @@ impl App {
                     Tab::Models => self.models.prev_row(),
                     Tab::Datasets => self.datasets.prev_row(),
                     Tab::Training => self.training.prev_param(),
+                    Tab::EmbedTrain => self.embed_train.prev_param(),
+                    Tab::Rlkd => self.rlkd.prev_param(),
+                    Tab::Tokenize => self.tokenize.prev_param(),
                     Tab::Pretrain => self.pretrain.prev_param(),
                     Tab::Jobs => self.jobs.prev_row(),
                     Tab::Distillation => self.distillation.prev_param(),
@@ -1150,6 +1396,7 @@ impl App {
                     Tab::Bench => self.bench.prev_param(),
                     Tab::Eval => self.eval.prev_param(),
                     Tab::Merge => self.merge.prev_param(),
+                    Tab::Ollama => self.ollama.prev_param(),
                     _ => {}
                 }
             }
@@ -1157,6 +1404,9 @@ impl App {
                 Tab::Models => self.models.next_row(),
                 Tab::Datasets => self.datasets.next_row(),
                 Tab::Training => self.training.next_param(),
+                Tab::EmbedTrain => self.embed_train.next_param(),
+                Tab::Rlkd => self.rlkd.next_param(),
+                Tab::Tokenize => self.tokenize.next_param(),
                 Tab::Pretrain => self.pretrain.next_param(),
                 Tab::Jobs => self.jobs.next_row(),
                 Tab::Distillation => self.distillation.next_param(),
@@ -1166,6 +1416,7 @@ impl App {
                 Tab::Bench => self.bench.next_param(),
                 Tab::Eval => self.eval.next_param(),
                 Tab::Merge => self.merge.next_param(),
+                Tab::Ollama => self.ollama.next_param(),
                 _ => {}
             },
             _ => {}
@@ -1292,6 +1543,22 @@ impl App {
                 // Merge output lives in the Merge tab.
                 if self.active_merge_job.as_deref() == Some(&job_id) {
                     self.merge.append_log(&line);
+                }
+                // EmbedTrain output lives in the EmbedTrain tab.
+                if self.active_embed_train_job.as_deref() == Some(&job_id) {
+                    self.embed_train.append_log(&line);
+                }
+                // RLKD output lives in the RLKD tab.
+                if self.active_rlkd_job.as_deref() == Some(&job_id) {
+                    self.rlkd.append_log(&line);
+                }
+                // Tokenize output lives in the Tokenize tab.
+                if self.active_tokenize_job.as_deref() == Some(&job_id) {
+                    self.tokenize.append_log(&line);
+                }
+                // Ollama output lives in the Ollama tab.
+                if self.active_ollama_job.as_deref() == Some(&job_id) {
+                    self.ollama.append_log(&line);
                 }
             }
             AppMsg::JobFinished {
@@ -1455,6 +1722,38 @@ impl App {
                 }
                 if self.active_pretrain_job.as_deref() == Some(&job_id) {
                     self.active_pretrain_job = None;
+                }
+                if self.active_embed_train_job.as_deref() == Some(&job_id) {
+                    self.active_embed_train_job = None;
+                    if success {
+                        self.embed_train.mark_completed();
+                    } else {
+                        self.embed_train.mark_failed(&message);
+                    }
+                }
+                if self.active_rlkd_job.as_deref() == Some(&job_id) {
+                    self.active_rlkd_job = None;
+                    if success {
+                        self.rlkd.mark_completed();
+                    } else {
+                        self.rlkd.mark_failed(&message);
+                    }
+                }
+                if self.active_tokenize_job.as_deref() == Some(&job_id) {
+                    self.active_tokenize_job = None;
+                    if success {
+                        self.tokenize.mark_completed();
+                    } else {
+                        self.tokenize.mark_failed(&message);
+                    }
+                }
+                if self.active_ollama_job.as_deref() == Some(&job_id) {
+                    self.active_ollama_job = None;
+                    if success {
+                        self.ollama.mark_completed();
+                    } else {
+                        self.ollama.mark_failed(&message);
+                    }
                 }
                 // Pop progress modal if one is showing (for convert/download jobs)
                 if matches!(self.modal_stack.last(), Some(Modal::Progress { .. })) {
@@ -1631,6 +1930,18 @@ impl App {
                     Some(PendingModalTarget::PretrainStart) => {
                         self.start_pretrain();
                     }
+                    Some(PendingModalTarget::EmbedTrainStart) => {
+                        self.start_embed_train();
+                    }
+                    Some(PendingModalTarget::RlkdStart) => {
+                        self.start_rlkd();
+                    }
+                    Some(PendingModalTarget::TokenizeStart) => {
+                        self.start_tokenize();
+                    }
+                    Some(PendingModalTarget::OllamaStart) => {
+                        self.start_ollama();
+                    }
                     Some(PendingModalTarget::FuseStart) => {
                         self.start_fuse();
                     }
@@ -1721,6 +2032,18 @@ impl App {
                 Some(PendingModalTarget::MergeBaseModel) => {
                     self.merge.set_model("Base Model", &id);
                 }
+                Some(PendingModalTarget::EmbedTrainModel) => {
+                    self.embed_train.set_model(&id);
+                }
+                Some(PendingModalTarget::RlkdPolicyModel) => {
+                    self.rlkd.set_policy_model(&id);
+                }
+                Some(PendingModalTarget::RlkdTeacherModel) => {
+                    self.rlkd.set_teacher_model(&id);
+                }
+                Some(PendingModalTarget::TokenizeModel) => {
+                    self.tokenize.set_tokenizer(&id);
+                }
                 Some(PendingModalTarget::FuseBaseModel(adapter_id)) => {
                     // User picked a base model for fusing — store it and confirm
                     let model_path = self.resolve_model_path(&id);
@@ -1762,6 +2085,12 @@ impl App {
                 }
                 Some(PendingModalTarget::GrpoDataset) => {
                     self.grpo.set_dataset(&path);
+                }
+                Some(PendingModalTarget::EmbedTrainDataset) => {
+                    self.embed_train.set_dataset(&path);
+                }
+                Some(PendingModalTarget::RlkdDataset) => {
+                    self.rlkd.set_dataset(&path);
                 }
                 _ => {}
             },
@@ -1852,6 +2181,10 @@ impl App {
             self.active_eval_job.is_some(),
             self.active_merge_job.is_some(),
             self.active_pretrain_job.is_some(),
+            self.active_embed_train_job.is_some(),
+            self.active_rlkd_job.is_some(),
+            self.active_tokenize_job.is_some(),
+            self.active_ollama_job.is_some(),
         ]
         .iter()
         .filter(|x| **x)
@@ -2238,6 +2571,110 @@ impl App {
         }
     }
 
+    fn start_embed_train_prompt(&mut self) {
+        if let Err(msg) = self.embed_train.validate_config() {
+            self.modal_stack.push(Modal::error("Invalid Config", msg));
+            return;
+        }
+        let summary = self.embed_train.config_summary();
+        self.pending_modal_context = Some(PendingModalTarget::EmbedTrainStart);
+        self.modal_stack
+            .push(Modal::confirm("Start Embed-Train?", summary));
+    }
+
+    fn start_embed_train(&mut self) {
+        let args = self.embed_train.build_cli_args();
+        let spec = CommandSpec {
+            job_type: JobType::EmbedTrain,
+            args,
+            metrics_file: None,
+            output_dir: None,
+        };
+        if let Some(runner) = &mut self.runner {
+            let job_id = runner.spawn(spec);
+            self.active_embed_train_job = Some(job_id);
+            self.embed_train.mark_running();
+        }
+    }
+
+    fn start_rlkd_prompt(&mut self) {
+        if let Err(msg) = self.rlkd.validate_config() {
+            self.modal_stack.push(Modal::error("Invalid Config", msg));
+            return;
+        }
+        let summary = self.rlkd.config_summary();
+        self.pending_modal_context = Some(PendingModalTarget::RlkdStart);
+        self.modal_stack
+            .push(Modal::confirm("Start RLKD?", summary));
+    }
+
+    fn start_rlkd(&mut self) {
+        let args = self.rlkd.build_cli_args();
+        let spec = CommandSpec {
+            job_type: JobType::Rlkd,
+            args,
+            metrics_file: None,
+            output_dir: None,
+        };
+        if let Some(runner) = &mut self.runner {
+            let job_id = runner.spawn(spec);
+            self.active_rlkd_job = Some(job_id);
+            self.rlkd.mark_running();
+        }
+    }
+
+    fn start_tokenize_prompt(&mut self) {
+        if let Err(msg) = self.tokenize.validate_config() {
+            self.modal_stack.push(Modal::error("Invalid Config", msg));
+            return;
+        }
+        let summary = self.tokenize.config_summary();
+        self.pending_modal_context = Some(PendingModalTarget::TokenizeStart);
+        self.modal_stack
+            .push(Modal::confirm("Start Tokenize?", summary));
+    }
+
+    fn start_tokenize(&mut self) {
+        let args = self.tokenize.build_cli_args();
+        let spec = CommandSpec {
+            job_type: JobType::Tokenize,
+            args,
+            metrics_file: None,
+            output_dir: None,
+        };
+        if let Some(runner) = &mut self.runner {
+            let job_id = runner.spawn(spec);
+            self.active_tokenize_job = Some(job_id);
+            self.tokenize.mark_running();
+        }
+    }
+
+    fn start_ollama_prompt(&mut self) {
+        if let Err(msg) = self.ollama.validate_config() {
+            self.modal_stack.push(Modal::error("Invalid Config", msg));
+            return;
+        }
+        let summary = self.ollama.config_summary();
+        self.pending_modal_context = Some(PendingModalTarget::OllamaStart);
+        self.modal_stack
+            .push(Modal::confirm("Run Ollama?", summary));
+    }
+
+    fn start_ollama(&mut self) {
+        let args = self.ollama.build_cli_args();
+        let spec = CommandSpec {
+            job_type: JobType::Ollama,
+            args,
+            metrics_file: None,
+            output_dir: None,
+        };
+        if let Some(runner) = &mut self.runner {
+            let job_id = runner.spawn(spec);
+            self.active_ollama_job = Some(job_id);
+            self.ollama.mark_running();
+        }
+    }
+
     /// Open a text-input modal to let the user override the learning rate of the active job.
     fn open_lr_override_modal(&mut self) {
         // Check that there's an active job with an existing output directory
@@ -2391,98 +2828,13 @@ impl App {
         // Start placeholder assistant message
         self.inference.start_generation();
 
-        // Build inference command
-        let mut args = vec![
-            "infer".to_string(),
-            "--model".to_string(),
-            effective_model,
-            "--prompt".to_string(),
-            prompt,
-            "--max-tokens".to_string(),
-            self.inference.max_tokens.to_string(),
-        ];
-
-        if let Some(lora) = lora_path {
-            args.extend(["--lora".to_string(), lora]);
-        }
-
-        // Always show thinking content so TUI can display it separately
+        // Build inference command via InferSpec::to_argv() for spec parity.
+        // --show-thinking is a TUI-only flag (not in InferSpec) appended afterward.
+        let spec = self.inference.build_infer_spec(effective_model, prompt, lora_path);
+        let mut args = vec!["infer".to_string()];
+        args.extend(spec.to_argv());
+        // Always show thinking content so TUI can display it separately.
         args.push("--show-thinking".to_string());
-
-        if self.inference.temperature > 0.0 {
-            args.extend([
-                "--temperature".to_string(),
-                self.inference.temperature.to_string(),
-            ]);
-        }
-        if self.inference.top_k > 0 {
-            args.extend(["--top-k".to_string(), self.inference.top_k.to_string()]);
-        }
-        if self.inference.top_p < 1.0 {
-            args.extend(["--top-p".to_string(), self.inference.top_p.to_string()]);
-        }
-        if self.inference.min_p > 0.0 {
-            args.extend(["--min-p".to_string(), self.inference.min_p.to_string()]);
-        }
-        if self.inference.repetition_penalty > 1.0 {
-            args.extend([
-                "--repetition-penalty".to_string(),
-                self.inference.repetition_penalty.to_string(),
-            ]);
-        }
-        if self.inference.frequency_penalty > 0.0 {
-            args.extend([
-                "--frequency-penalty".to_string(),
-                self.inference.frequency_penalty.to_string(),
-            ]);
-        }
-        if self.inference.presence_penalty > 0.0 {
-            args.extend([
-                "--presence-penalty".to_string(),
-                self.inference.presence_penalty.to_string(),
-            ]);
-        }
-        if let Some(seed) = self.inference.seed {
-            args.extend(["--seed".to_string(), seed.to_string()]);
-        }
-        match self.inference.kv_quant_mode {
-            255 => args.push("--no-kv-quant".to_string()),
-            bits @ (4 | 8) => {
-                args.extend(["--kv-quant".to_string(), bits.to_string()]);
-            }
-            tq @ (104 | 108) => {
-                args.push("--kv-turboquant".to_string());
-                args.extend(["--kv-quant".to_string(), (tq - 100).to_string()]);
-            }
-            125 => {
-                // TQ2.5 preset
-                args.extend(["--kv-quant-preset".to_string(), "q2_5".to_string()]);
-            }
-            135 => {
-                // TQ3.5 preset
-                args.extend(["--kv-quant-preset".to_string(), "q3_5".to_string()]);
-            }
-            _ => {} // 0 = auto (omit flag)
-        }
-        if self.inference.fp8 {
-            args.push("--fp8".to_string());
-        }
-        if self.inference.no_thinking {
-            args.push("--no-thinking".to_string());
-        }
-        // Backend selection. Auto is the CLI default, so we only emit the
-        // flag when the user has pinned a specific path.
-        if self.inference.backend != pmetal_data::inference_config::InferenceBackend::Auto {
-            args.extend([
-                "--backend".to_string(),
-                self.inference.backend.as_str().to_string(),
-            ]);
-        }
-        // Always use chat mode in TUI
-        args.push("--chat".to_string());
-        if let Some(ref experts_dir) = self.inference.experts_dir {
-            args.extend(["--experts-dir".to_string(), experts_dir.clone()]);
-        }
 
         let spec = CommandSpec {
             job_type: JobType::Infer,
@@ -2636,7 +2988,7 @@ impl App {
         let dash_throughput;
         let needs_metrics = matches!(
             self.active_tab,
-            Tab::Training | Tab::Pretrain | Tab::Distillation | Tab::Grpo
+            Tab::Training | Tab::Pretrain | Tab::Distillation | Tab::Grpo | Tab::EmbedTrain | Tab::Rlkd
         );
         if needs_metrics {
             dash_samples = self.dashboard.samples.clone();
@@ -2652,6 +3004,7 @@ impl App {
             Tab::Device => (&self.device).render(content_area, buf),
             Tab::Models => (&mut self.models).render(content_area, buf),
             Tab::Datasets => (&mut self.datasets).render(content_area, buf),
+            Tab::Tokenize => self.tokenize.render(content_area, buf),
             Tab::Training => {
                 self.training.render_with_metrics(
                     content_area,
@@ -2660,6 +3013,7 @@ impl App {
                     &dash_throughput,
                 );
             }
+            Tab::EmbedTrain => self.embed_train.render(content_area, buf),
             Tab::Pretrain => {
                 self.pretrain.render_with_metrics(
                     content_area,
@@ -2668,6 +3022,7 @@ impl App {
                     &dash_throughput,
                 );
             }
+            Tab::Rlkd => self.rlkd.render(content_area, buf),
             Tab::Inference => (&mut self.inference).render(content_area, buf),
             Tab::Jobs => (&mut self.jobs).render(content_area, buf),
             Tab::Distillation => {
@@ -2687,6 +3042,7 @@ impl App {
             Tab::Bench => self.bench.render(content_area, buf),
             Tab::Eval => self.eval.render(content_area, buf),
             Tab::Merge => self.merge.render(content_area, buf),
+            Tab::Ollama => self.ollama.render(content_area, buf),
         }
 
         // Footer with keybindings and active-job count.

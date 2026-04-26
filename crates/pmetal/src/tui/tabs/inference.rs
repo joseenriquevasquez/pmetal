@@ -1,5 +1,6 @@
 //! Inference tab — interactive chat/completion with real model inference.
 
+use pmetal_core::jobs::InferSpec;
 use pmetal_data::inference_config::InferenceBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -563,6 +564,89 @@ impl InferenceTab {
         }
 
         lines
+    }
+}
+
+impl InferenceTab {
+    /// Build an [`InferSpec`] from the current sidebar settings.
+    ///
+    /// The caller is responsible for `model`, `prompt`, `lora`, and any
+    /// TUI-only flags (`--show-thinking`) that are not part of `InferSpec`.
+    ///
+    /// # Spec gaps (documented here)
+    ///
+    /// `InferSpec` has no single `kv_quant_mode: u8` field — it instead has
+    /// separate `kv_quant`, `kv_turboquant`, and `kv_quant_preset` fields.
+    /// The mapping from the sidebar's combined mode byte is tab-local and
+    /// cannot be expressed via a spec round-trip, so we perform it here.
+    ///
+    /// `InferSpec` has no `--show-thinking` flag (TUI-only); the caller
+    /// appends it directly to argv after calling `spec.to_argv()`.
+    pub fn build_infer_spec(&self, model: String, prompt: String, lora: Option<String>) -> InferSpec {
+        // Resolve optional sampling params (only set when non-default).
+        let temperature = if self.temperature > 0.0 { Some(self.temperature) } else { None };
+        let top_k = if self.top_k > 0 { Some(self.top_k) } else { None };
+        let top_p = if self.top_p < 1.0 { Some(self.top_p) } else { None };
+        let min_p = if self.min_p > 0.0 { Some(self.min_p) } else { None };
+        let repetition_penalty = if self.repetition_penalty > 1.0 {
+            Some(self.repetition_penalty)
+        } else {
+            None
+        };
+        let frequency_penalty = if self.frequency_penalty > 0.0 {
+            Some(self.frequency_penalty)
+        } else {
+            None
+        };
+        let presence_penalty = if self.presence_penalty > 0.0 {
+            Some(self.presence_penalty)
+        } else {
+            None
+        };
+
+        // KV quant mode — map sidebar's combined byte to spec fields.
+        // 0=auto (omit), 255=fp16 (disable), 4/8=Q4/Q8, 104/108=TQ4/TQ8, 125=TQ2.5, 135=TQ3.5
+        let (kv_quant, kv_turboquant, kv_quant_preset, no_kv_quant) =
+            match self.kv_quant_mode {
+                255 => (None, false, None, true),
+                bits @ (4 | 8) => (Some(bits), false, None, false),
+                108 => (Some(8), true, None, false),
+                104 => (Some(4), true, None, false),
+                125 => (None, false, Some("q2_5".to_string()), false),
+                135 => (None, false, Some("q3_5".to_string()), false),
+                _ => (None, false, None, false), // 0 = auto
+            };
+
+        let backend = if self.backend != InferenceBackend::Auto {
+            self.backend.as_str().to_string()
+        } else {
+            "auto".to_string()
+        };
+
+        InferSpec {
+            model,
+            prompt,
+            lora,
+            max_tokens: self.max_tokens,
+            temperature,
+            top_k,
+            top_p,
+            min_p,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            seed: self.seed,
+            chat: true,
+            fp8: self.fp8,
+            no_thinking: self.no_thinking,
+            backend,
+            kv_quant,
+            kv_turboquant,
+            kv_quant_preset,
+            no_kv_quant,
+            experts_dir: self.experts_dir.clone(),
+            ..InferSpec::default()
+        }
     }
 }
 

@@ -7,15 +7,19 @@ mod device;
 #[allow(dead_code)]
 mod dflash;
 mod distillation;
+mod embed_train;
 mod eval;
 mod grpo;
 mod inference;
 mod jobs;
 mod merge;
 mod models;
+mod ollama;
 mod pretrain;
 mod quantize;
+mod rlkd;
 mod serve;
+mod tokenize;
 mod training;
 
 pub use bench::BenchTab;
@@ -23,15 +27,19 @@ pub use dashboard::DashboardTab;
 pub use datasets::DatasetsTab;
 pub use device::DeviceTab;
 pub use distillation::DistillationTab;
+pub use embed_train::EmbedTrainTab;
 pub use eval::EvalTab;
 pub use grpo::GrpoTab;
 pub use inference::{InferenceFocus, InferenceTab};
 pub use jobs::JobsTab;
 pub use merge::MergeTab;
 pub use models::{ModelSource, ModelsTab, write_training_info};
+pub use ollama::OllamaTab;
 pub use pretrain::PretrainTab;
 pub use quantize::QuantizeTab;
+pub use rlkd::RlkdTab;
 pub use serve::ServeTab;
+pub use tokenize::TokenizeTab;
 pub use training::{TrainingStatus, TrainingTab};
 
 /// Extract a short model name from a model ID.
@@ -47,9 +55,12 @@ pub enum Tab {
     Device,
     Models,
     Datasets,
+    Tokenize,
     Training,
+    EmbedTrain,
     Pretrain,
     Distillation,
+    Rlkd,
     Grpo,
     Inference,
     Serve,
@@ -57,18 +68,31 @@ pub enum Tab {
     Merge,
     Bench,
     Eval,
+    Ollama,
     Jobs,
 }
 
 impl Tab {
     /// All tabs in display order.
+    ///
+    /// Ordering rationale:
+    /// - System/data tabs first: Device, Models, Datasets, Tokenize
+    /// - Training family: Training, EmbedTrain, Pretrain, Distillation, Rlkd, Grpo
+    /// - Dashboard (metrics monitor) after training group
+    /// - Inference/serving: Inference, Serve
+    /// - Post-processing: Quantize, Merge, Bench, Eval
+    /// - External integrations: Ollama
+    /// - Jobs log last
     pub const ALL: &[Tab] = &[
         Tab::Device,
         Tab::Models,
         Tab::Datasets,
+        Tab::Tokenize,
         Tab::Training,
+        Tab::EmbedTrain,
         Tab::Pretrain,
         Tab::Distillation,
+        Tab::Rlkd,
         Tab::Grpo,
         Tab::Dashboard,
         Tab::Inference,
@@ -77,6 +101,7 @@ impl Tab {
         Tab::Merge,
         Tab::Bench,
         Tab::Eval,
+        Tab::Ollama,
         Tab::Jobs,
     ];
 
@@ -87,9 +112,12 @@ impl Tab {
             Tab::Device => "@",
             Tab::Models => "~",
             Tab::Datasets => "&",
+            Tab::Tokenize => "|",
             Tab::Training => ">",
+            Tab::EmbedTrain => "e",
             Tab::Pretrain => "]",
             Tab::Distillation => "^",
+            Tab::Rlkd => "r",
             Tab::Grpo => "!",
             Tab::Inference => "$",
             Tab::Serve => "*",
@@ -97,6 +125,7 @@ impl Tab {
             Tab::Merge => "x",
             Tab::Bench => "+",
             Tab::Eval => "?",
+            Tab::Ollama => "o",
             Tab::Jobs => "%",
         }
     }
@@ -123,9 +152,12 @@ impl std::fmt::Display for Tab {
             Tab::Device => write!(f, "System"),
             Tab::Models => write!(f, "Models"),
             Tab::Datasets => write!(f, "Datasets"),
+            Tab::Tokenize => write!(f, "Tokenize"),
             Tab::Training => write!(f, "Training"),
+            Tab::EmbedTrain => write!(f, "EmbedTrain"),
             Tab::Pretrain => write!(f, "Pretrain"),
             Tab::Distillation => write!(f, "Distill"),
+            Tab::Rlkd => write!(f, "RLKD"),
             Tab::Grpo => write!(f, "GRPO"),
             Tab::Inference => write!(f, "Inference"),
             Tab::Serve => write!(f, "Serve"),
@@ -133,6 +165,7 @@ impl std::fmt::Display for Tab {
             Tab::Merge => write!(f, "Merge"),
             Tab::Bench => write!(f, "Bench"),
             Tab::Eval => write!(f, "Eval"),
+            Tab::Ollama => write!(f, "Ollama"),
             Tab::Jobs => write!(f, "Jobs"),
         }
     }
