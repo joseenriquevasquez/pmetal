@@ -4,6 +4,7 @@ exclude = ["fuzz", "crates/pmetal-gui/src-tauri"]
 members = [
     "crates/pmetal-bridge",
     "crates/pmetal-core",
+    "crates/pmetal-core-derive",
     "crates/pmetal-metal",
     "crates/pmetal-mlx",
     "crates/pmetal-models",
@@ -36,6 +37,7 @@ categories = ["science", "algorithms"]
 # Internal crates
 pmetal-bridge = { path = "crates/pmetal-bridge", version = "0.5.0" }
 pmetal-core = { path = "crates/pmetal-core", version = "0.5.0", default-features = false }
+pmetal-core-derive = { path = "crates/pmetal-core-derive", version = "0.5.0" }
 pmetal-metal = { path = "crates/pmetal-metal", version = "0.5.0", default-features = false }
 pmetal-mlx = { path = "crates/pmetal-mlx", version = "0.5.0" }
 pmetal-models = { path = "crates/pmetal-models", version = "0.5.0" }
