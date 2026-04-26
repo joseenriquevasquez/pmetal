@@ -445,9 +445,12 @@ async fn run_command(
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                // Capture recent stderr lines for error reporting
+                // Capture recent stderr lines for error reporting.
+                // Use `unwrap_or_else` so a poisoned mutex (from a panicking
+                // sibling task) never kills the metrics-streaming task.
                 {
-                    let mut buf = stderr_capture.lock().unwrap();
+                    let mut buf =
+                        stderr_capture.lock().unwrap_or_else(|e| e.into_inner());
                     buf.push(line.clone());
                     if buf.len() > MAX_STDERR_LINES {
                         buf.remove(0);
@@ -493,7 +496,9 @@ async fn run_command(
 
                 // Include last stderr lines in error for better diagnostics
                 let code = status.code().unwrap_or(-1);
-                let stderr_lines = last_stderr.lock().unwrap();
+                // Same poison guard — a panic in the stderr-capture task must
+                // not prevent the error from being propagated to the TUI.
+                let stderr_lines = last_stderr.lock().unwrap_or_else(|e| e.into_inner());
                 let context: Vec<&str> = stderr_lines
                     .iter()
                     .rev()

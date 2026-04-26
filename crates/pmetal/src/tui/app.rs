@@ -95,6 +95,14 @@ pub struct App {
     /// Currently active pretrain job ID (if any).
     active_pretrain_job: Option<String>,
 
+    /// Cancellation token for the in-flight HF search background task (if any).
+    ///
+    /// When `Esc` dismisses the Progress modal that was opened by `search_hf`,
+    /// the `ModalAction::None` path calls `cancel_hf_search()` to signal this
+    /// token.  The search task checks `is_cancelled()` before sending results,
+    /// so a fast Esc prevents stale results from appearing later.
+    hf_search_cancel: Option<tokio_util::sync::CancellationToken>,
+
     /// Header area for mouse hit-testing.
     header_area: ratatui::layout::Rect,
 }
@@ -179,6 +187,7 @@ impl App {
             active_eval_job: None,
             active_merge_job: None,
             active_pretrain_job: None,
+            hf_search_cancel: None,
             header_area: ratatui::layout::Rect::default(),
         }
     }
@@ -246,8 +255,18 @@ impl App {
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         // If a modal is open, route keys there first
         if let Some(modal) = self.modal_stack.last_mut() {
+            // Peek modal kind before consuming the handle_key result so we can
+            // perform side-effects (e.g. cancelling the HF search task) that
+            // depend on which modal was dismissed.
+            let is_progress = matches!(modal, Modal::Progress { .. });
             if let Some(action) = modal.handle_key(key) {
                 self.modal_stack.pop();
+                // A Progress modal dismissed via None (Esc) means the user
+                // cancelled whatever background operation it was showing —
+                // currently only the HF search task uses this modal pattern.
+                if is_progress && matches!(action, ModalAction::None) {
+                    self.cancel_hf_search();
+                }
                 self.handle_modal_action(action);
             }
             return;
@@ -2483,25 +2502,46 @@ impl App {
         let query = query.to_string();
         let tx = runner.app_tx();
 
+        // Cancel any previous in-flight search before starting a new one.
+        self.cancel_hf_search();
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_child = cancel.clone();
+        self.hf_search_cancel = Some(cancel);
+
         self.modal_stack.push(Modal::progress(
             "Searching",
             format!("Searching HuggingFace for '{query}'..."),
         ));
 
         tokio::spawn(async move {
-            match pmetal_hub::search_models(&query, 20, None).await {
-                Ok(results) => {
-                    let _ = tx.send(AppMsg::HfSearchResults { results }).await;
+            tokio::select! {
+                result = pmetal_hub::search_models(&query, 20, None) => {
+                    match result {
+                        Ok(results) => {
+                            let _ = tx.send(AppMsg::HfSearchResults { results }).await;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(AppMsg::HfSearchError {
+                                    message: e.to_string(),
+                                })
+                                .await;
+                        }
+                    }
                 }
-                Err(e) => {
-                    let _ = tx
-                        .send(AppMsg::HfSearchError {
-                            message: e.to_string(),
-                        })
-                        .await;
+                _ = cancel_child.cancelled() => {
+                    // Esc was pressed while the search was in-flight; drop results silently.
                 }
             }
         });
+    }
+
+    /// Cancel any in-flight HF search task.
+    fn cancel_hf_search(&mut self) {
+        if let Some(cancel) = self.hf_search_cancel.take() {
+            cancel.cancel();
+        }
     }
 
     fn download_model(&mut self, model_id: &str) {

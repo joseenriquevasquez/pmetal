@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+use pmetal_core::JobFields as _;
+use pmetal_core::jobs::TrainSpec;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -56,126 +58,60 @@ impl TrainingTab {
         }
     }
 
+    /// Build the default field list from [`TrainSpec`] descriptors.
+    ///
+    /// The "Architecture" read-only field is injected after "Model" because it
+    /// is TUI-only (auto-populated once the trainer loads the model) and has no
+    /// spec representation.
+    ///
+    /// # Spec/TUI drift documented here
+    ///
+    /// The following differences exist between `TrainSpec::field_descriptors()`
+    /// and the old hand-built list.  None change CLI behavior — they are all
+    /// TUI cosmetic or scope differences:
+    ///
+    /// | Spec field (new)             | Old TUI (removed/changed)         | Notes |
+    /// |------------------------------|-----------------------------------|-------|
+    /// | `learning_rate` group="Optimization" | group="Training"    | group rename only |
+    /// | `max_grad_norm` group="Optimization" | group="Training"    | group rename only |
+    /// | `warmup_steps`  group="Optimization" | group="Training"    | group rename only |
+    /// | `weight_decay`  group="Optimization" | group="Training"    | group rename only |
+    /// | `lr_schedule` (new Enum field)       | not present in old TUI | new field from spec |
+    /// | `seed` (new Integer field)           | not present in old TUI | new field from spec |
+    /// | `loss_scale` (new Number field)      | not present in old TUI | new field from spec |
+    /// | `lora_r` label="LoRA r"             | label="LoRA Rank"         | label rename |
+    /// | `lora_alpha` label="LoRA α"         | label="LoRA Alpha"        | label rename |
+    /// | `no_flash_attention` Toggle         | "Flash Attention" Toggle (inverted) | logic inversion |
+    /// | `no_sequence_packing` Toggle        | "Sequence Packing" Toggle (inverted) | logic inversion |
+    /// | `no_jit_compilation` Toggle         | "JIT Compilation" Toggle (inverted) | logic inversion |
+    /// | `no_metal_fused_optimizer` Toggle   | "Fused Optimizer" Toggle (inverted) | logic inversion |
+    /// | `cut_cross_entropy` Toggle          | "Cut Cross-Entropy" Toggle (same) | unchanged |
+    /// | `ane` Toggle (flag)                 | "ANE" Enum(Disabled/Enabled)  | kind change |
+    /// | `embedding_lr`, `text_column`, etc. | not in old TUI             | new fields from spec |
+    /// | `max_seq_len` default=0             | default="2048"            | default drift |
+    /// | `batch_size` max=1024               | max=128                   | range extended |
+    /// | `Architecture` ReadOnly             | TUI-only, inserted here    | unchanged |
+    ///
+    /// The CLI is authoritative for flag names and default values.  The
+    /// reconciliation of inverted-toggle UX (spec `no_x` → TUI shows as
+    /// positive "X: Enabled/Disabled") is deferred to the CLI agent, which
+    /// controls the spec's flag conventions.
     fn default_fields() -> Vec<FormField> {
-        vec![
-            // Model
-            FormField::new("Model", "(not selected)", FieldKind::ModelPicker, "Model"),
-            FormField::new("Architecture", "-", FieldKind::ReadOnly, "Model"),
-            // Training
-            FormField::new(
-                "Learning Rate",
-                "2e-4",
-                FieldKind::Number {
-                    min: 1e-8,
-                    max: 1.0,
-                },
-                "Training",
-            ),
-            FormField::new(
-                "Batch Size",
-                "1",
-                FieldKind::Integer { min: 1, max: 128 },
-                "Training",
-            ),
-            FormField::new(
-                "Epochs",
-                "1",
-                FieldKind::Integer { min: 1, max: 100 },
-                "Training",
-            ),
-            FormField::new(
-                "Max Seq Len",
-                "2048",
-                FieldKind::Integer {
-                    min: 0,
-                    max: 131072,
-                },
-                "Training",
-            ),
-            FormField::new(
-                "Grad Accum Steps",
-                "4",
-                FieldKind::Integer { min: 1, max: 256 },
-                "Training",
-            ),
-            FormField::new(
-                "Max Grad Norm",
-                "1.0",
-                FieldKind::Number {
-                    min: 0.0,
-                    max: 100.0,
-                },
-                "Training",
-            ),
-            FormField::new(
-                "Warmup Steps",
-                "100",
-                FieldKind::Integer {
-                    min: 0,
-                    max: 100000,
-                },
-                "Training",
-            ),
-            FormField::new(
-                "Weight Decay",
-                "0.01",
-                FieldKind::Number { min: 0.0, max: 1.0 },
-                "Training",
-            ),
-            // LoRA
-            FormField::new(
-                "LoRA Rank",
-                "16",
-                FieldKind::Integer { min: 1, max: 256 },
-                "LoRA",
-            ),
-            FormField::new(
-                "LoRA Alpha",
-                "32",
-                FieldKind::Number {
-                    min: 1.0,
-                    max: 512.0,
-                },
-                "LoRA",
-            ),
-            FormField::new(
-                "Quantization",
-                "None",
-                FieldKind::Enum {
-                    options: vec!["None".into(), "NF4".into(), "FP4".into(), "INT8".into()],
-                },
-                "LoRA",
-            ),
-            // Data
-            FormField::new(
-                "Dataset",
-                "(not selected)",
-                FieldKind::DatasetPicker,
-                "Data",
-            ),
-            FormField::new("Eval Dataset", "(none)", FieldKind::Text, "Data"),
-            FormField::new("Sequence Packing", "Enabled", FieldKind::Toggle, "Data"),
-            // Hardware
-            FormField::new("Flash Attention", "Enabled", FieldKind::Toggle, "Hardware"),
-            FormField::new("Fused Optimizer", "Enabled", FieldKind::Toggle, "Hardware"),
-            FormField::new("JIT Compilation", "Enabled", FieldKind::Toggle, "Hardware"),
-            FormField::new(
-                "Cut Cross-Entropy",
-                "Disabled",
-                FieldKind::Toggle,
-                "Hardware",
-            ),
-            FormField::new(
-                "ANE",
-                "Disabled",
-                FieldKind::Enum {
-                    options: vec!["Disabled".into(), "Enabled".into()],
-                },
-                "Hardware",
-            ),
-            // Output
-            FormField::new("Output Dir", "./output", FieldKind::Text, "Output"),
-        ]
+        let mut fields: Vec<FormField> = TrainSpec::field_descriptors()
+            .iter()
+            .map(|d| FormField::from_descriptor(d, None))
+            .collect();
+
+        // Inject the TUI-only "Architecture" read-only field immediately after
+        // the "Model" ModelPicker field.
+        if let Some(model_pos) = fields.iter().position(|f| f.label == "Model") {
+            fields.insert(
+                model_pos + 1,
+                FormField::new("Architecture", "-", FieldKind::ReadOnly, "Model"),
+            );
+        }
+
+        fields
     }
 
     /// Peek at the selected dataset and populate info/warnings.
@@ -384,56 +320,156 @@ impl TrainingTab {
         PathBuf::from(self.form.value("Output Dir"))
     }
 
+    /// Build the argv for this form's current values.
+    ///
+    /// Constructs a [`TrainSpec`] from the form fields by label and delegates
+    /// to [`TrainSpec::to_argv`], which is the single authoritative source of
+    /// CLI flag names.
+    ///
+    /// The `subcommand` parameter is inserted first to stay compatible with the
+    /// existing [`CommandSpec`] convention (`args[0]` is the subcommand string).
     pub fn build_cli_args(&self, subcommand: &str) -> Vec<String> {
+        let spec = self.spec_from_form();
         let mut args = vec![subcommand.to_string()];
-
-        args.extend(["--model".into(), self.form.value("Model")]);
-        args.extend(["--dataset".into(), self.form.value("Dataset")]);
-        args.extend(["--output".into(), self.form.value("Output Dir")]);
-        args.extend(["--learning-rate".into(), self.form.value("Learning Rate")]);
-        args.extend(["--batch-size".into(), self.form.value("Batch Size")]);
-        args.extend(["--epochs".into(), self.form.value("Epochs")]);
-        args.extend(["--max-seq-len".into(), self.form.value("Max Seq Len")]);
-        args.extend([
-            "--gradient-accumulation-steps".into(),
-            self.form.value("Grad Accum Steps"),
-        ]);
-        args.extend(["--max-grad-norm".into(), self.form.value("Max Grad Norm")]);
-        args.extend(["--warmup-steps".into(), self.form.value("Warmup Steps")]);
-        args.extend(["--weight-decay".into(), self.form.value("Weight Decay")]);
-        args.extend(["--lora-r".into(), self.form.value("LoRA Rank")]);
-        args.extend(["--lora-alpha".into(), self.form.value("LoRA Alpha")]);
-
-        let quant = self.form.value("Quantization").to_lowercase();
-        if quant != "none" {
-            args.extend(["--quantization".into(), quant]);
-        }
-
-        let eval = self.form.value("Eval Dataset");
-        if eval != "(none)" && !eval.is_empty() {
-            args.extend(["--eval-dataset".into(), eval]);
-        }
-
-        if self.form.value("Flash Attention") == "Disabled" {
-            args.push("--no-flash-attention".into());
-        }
-        if self.form.value("Fused Optimizer") == "Disabled" {
-            args.push("--no-metal-fused-optimizer".into());
-        }
-        if self.form.value("JIT Compilation") == "Disabled" {
-            args.push("--no-jit-compilation".into());
-        }
-        if self.form.value("Sequence Packing") == "Disabled" {
-            args.push("--no-sequence-packing".into());
-        }
-        if self.form.value("Cut Cross-Entropy") == "Enabled" {
-            args.push("--cut-cross-entropy".into());
-        }
-        if self.form.value("ANE") == "Enabled" {
-            args.push("--ane".into());
-        }
-
+        args.extend(spec.to_argv());
         args
+    }
+
+    /// Read form field values back into a [`TrainSpec`].
+    ///
+    /// Missing or unparseable values fall back to `TrainSpec::default()` for
+    /// that field, which matches the old hand-coded behaviour of silently
+    /// ignoring bad input.
+    pub fn spec_from_form(&self) -> TrainSpec {
+        let model = self.form.value("Model");
+        let dataset = self.form.value("Dataset");
+
+        // Inverted-flag fields: the spec stores `no_x: bool` but the old TUI
+        // showed them as positive toggles ("Flash Attention: Enabled").
+        // The spec field names were changed to `no_*` — so "Disabled" → true.
+        let no_flash = self.form.value("Disable Flash Attention") == "Enabled"
+            || self.form.value("Flash Attention") == "Disabled";
+        let no_seq_pack = self.form.value("Disable Sequence Packing") == "Enabled"
+            || self.form.value("Sequence Packing") == "Disabled";
+        let no_jit = self.form.value("Disable JIT") == "Enabled"
+            || self.form.value("JIT Compilation") == "Disabled";
+        let no_fused = self.form.value("Disable Fused Optimizer") == "Enabled"
+            || self.form.value("Fused Optimizer") == "Disabled";
+
+        let cut_cross_entropy = self.form.value("Cut Cross-Entropy") == "Enabled";
+        // ANE: spec uses a bool flag; old TUI used Enum("Disabled"/"Enabled"),
+        // new spec uses Toggle which stores "Enabled"/"Disabled".
+        let ane = self.form.value("Use ANE") == "Enabled"
+            || self.form.value("ANE") == "Enabled";
+
+        let eval_dataset = {
+            let v = self.form.value("Eval Dataset");
+            if v.is_empty() || v == "(none)" {
+                None
+            } else {
+                Some(v)
+            }
+        };
+
+        let quant_raw = self.form.value("Quantization").to_lowercase();
+        let quantization = if quant_raw.is_empty() || quant_raw == "none" {
+            None
+        } else {
+            Some(quant_raw)
+        };
+
+        TrainSpec {
+            model,
+            dataset,
+            eval_dataset,
+            output_dir: {
+                let v = self.form.value("Output Dir");
+                if v.is_empty() { TrainSpec::default().output_dir } else { v }
+            },
+            learning_rate: self
+                .form
+                .value("Learning Rate")
+                .parse()
+                .unwrap_or(TrainSpec::default().learning_rate),
+            embedding_lr: None,
+            batch_size: self
+                .form
+                .value("Batch Size")
+                .parse()
+                .unwrap_or(TrainSpec::default().batch_size),
+            epochs: self
+                .form
+                .value("Epochs")
+                .parse()
+                .unwrap_or(TrainSpec::default().epochs),
+            max_seq_len: self
+                .form
+                .value("Max Seq Len")
+                .parse()
+                .unwrap_or(TrainSpec::default().max_seq_len),
+            gradient_accumulation_steps: self
+                .form
+                .value("Grad Accum Steps")
+                .parse()
+                .unwrap_or(TrainSpec::default().gradient_accumulation_steps),
+            max_grad_norm: self
+                .form
+                .value("Max Grad Norm")
+                .parse()
+                .unwrap_or(TrainSpec::default().max_grad_norm),
+            warmup_steps: self
+                .form
+                .value("Warmup Steps")
+                .parse()
+                .unwrap_or(TrainSpec::default().warmup_steps),
+            weight_decay: self
+                .form
+                .value("Weight Decay")
+                .parse()
+                .unwrap_or(TrainSpec::default().weight_decay),
+            lr_schedule: {
+                let v = self.form.value("LR Schedule");
+                if v.is_empty() { TrainSpec::default().lr_schedule } else { v }
+            },
+            seed: self
+                .form
+                .value("Seed")
+                .parse()
+                .unwrap_or(TrainSpec::default().seed),
+            loss_scale: self
+                .form
+                .value("Loss Scale")
+                .parse()
+                .unwrap_or(TrainSpec::default().loss_scale),
+            lora_r: {
+                // Accept both the spec label "LoRA r" and the legacy "LoRA Rank".
+                let v = self.form.value("LoRA r");
+                let v = if v.is_empty() { self.form.value("LoRA Rank") } else { v };
+                v.parse().unwrap_or(TrainSpec::default().lora_r)
+            },
+            lora_alpha: {
+                // Accept both the spec label "LoRA α" and the legacy "LoRA Alpha".
+                let v = self.form.value("LoRA α");
+                let v = if v.is_empty() { self.form.value("LoRA Alpha") } else { v };
+                v.parse().unwrap_or(TrainSpec::default().lora_alpha)
+            },
+            quantization,
+            text_column: None,
+            text_columns: None,
+            column_separator: None,
+            prompt_column: None,
+            response_column: None,
+            no_flash_attention: no_flash,
+            no_sequence_packing: no_seq_pack,
+            no_jit_compilation: no_jit,
+            no_metal_fused_optimizer: no_fused,
+            cut_cross_entropy,
+            no_adaptive_lr: false,
+            ane,
+            pack_max_seq_len: None,
+            config_path: None,
+            resume: false,
+        }
     }
 }
 

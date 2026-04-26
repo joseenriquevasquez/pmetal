@@ -55,10 +55,14 @@ pub enum Modal {
         search: String,
         searching: bool,
     },
-    /// Dataset picker (list of local datasets).
+    /// Dataset picker (list of local datasets) with optional `/` search filter.
     DatasetPicker {
         datasets: Vec<PickerEntry>,
         list_state: ListState,
+        /// Current search string (filtered on every key while `searching`).
+        search: String,
+        /// Whether the user has activated search mode with `/`.
+        searching: bool,
     },
     /// Error display.
     Error { title: String, message: String },
@@ -143,6 +147,8 @@ impl Modal {
         Modal::DatasetPicker {
             datasets,
             list_state: state,
+            search: String::new(),
+            searching: false,
         }
     }
 
@@ -265,16 +271,31 @@ impl Modal {
                 }
                 KeyCode::Char(c) if *searching => {
                     search.push(c);
+                    // Always reset to 0 on new character — the filtered set
+                    // may have shrunk and the previous index could be past the end.
                     table_state.select(Some(0));
                     None
                 }
                 KeyCode::Backspace if *searching => {
                     search.pop();
+                    // After removing a character the filtered list may grow;
+                    // clamp the selection to the new last item if it overshot.
+                    let filtered = filtered_models(models, search);
+                    let max_idx = filtered.len().saturating_sub(1);
+                    if let Some(i) = table_state.selected() {
+                        if i > max_idx {
+                            table_state.select(Some(max_idx));
+                        }
+                    }
                     None
                 }
                 KeyCode::Esc if *searching => {
                     *searching = false;
                     search.clear();
+                    // Restore selection to 0 (the full list is restored).
+                    if !models.is_empty() {
+                        table_state.select(Some(0));
+                    }
                     None
                 }
                 KeyCode::Esc => Some(ModalAction::None),
@@ -313,10 +334,44 @@ impl Modal {
             Modal::DatasetPicker {
                 datasets,
                 list_state,
+                search,
+                searching,
             } => match key.code {
+                KeyCode::Char('/') if !*searching => {
+                    *searching = true;
+                    None
+                }
+                KeyCode::Char(c) if *searching => {
+                    search.push(c);
+                    // Filtered list may shrink — reset to first visible item.
+                    list_state.select(Some(0));
+                    None
+                }
+                KeyCode::Backspace if *searching => {
+                    search.pop();
+                    // Filtered list may grow — clamp to last item if overshot.
+                    let filtered = filtered_datasets(datasets, search);
+                    let max_idx = filtered.len().saturating_sub(1);
+                    if let Some(i) = list_state.selected() {
+                        if i > max_idx {
+                            list_state.select(Some(max_idx));
+                        }
+                    }
+                    None
+                }
+                KeyCode::Esc if *searching => {
+                    *searching = false;
+                    search.clear();
+                    // Restore selection to 0 (full list restored).
+                    if !datasets.is_empty() {
+                        list_state.select(Some(0));
+                    }
+                    None
+                }
                 KeyCode::Esc => Some(ModalAction::None),
                 KeyCode::Down | KeyCode::Char('j') => {
-                    let count = datasets.len();
+                    let filtered = filtered_datasets(datasets, search);
+                    let count = filtered.len();
                     if count > 0 {
                         let i = list_state.selected().map_or(0, |i| (i + 1) % count);
                         list_state.select(Some(i));
@@ -324,16 +379,20 @@ impl Modal {
                     None
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    let count = datasets.len();
+                    let filtered = filtered_datasets(datasets, search);
+                    let count = filtered.len();
                     if count > 0 {
-                        let i = list_state.selected().map_or(0, |i| (i + count - 1) % count);
+                        let i = list_state
+                            .selected()
+                            .map_or(0, |i| (i + count - 1) % count);
                         list_state.select(Some(i));
                     }
                     None
                 }
                 KeyCode::Enter => {
+                    let filtered = filtered_datasets(datasets, search);
                     if let Some(idx) = list_state.selected() {
-                        if let Some(entry) = datasets.get(idx) {
+                        if let Some(entry) = filtered.get(idx) {
                             return Some(ModalAction::SelectDataset(entry.path.clone()));
                         }
                     }
@@ -426,7 +485,9 @@ impl Modal {
             Modal::DatasetPicker {
                 datasets,
                 list_state,
-            } => render_dataset_picker(popup_area, buf, datasets, list_state),
+                search,
+                searching,
+            } => render_dataset_picker(popup_area, buf, datasets, list_state, search, *searching),
             Modal::Error { title, message } => render_error(popup_area, buf, title, message),
             Modal::Progress {
                 title,
@@ -620,33 +681,62 @@ fn render_model_picker(
     StatefulWidget::render(table, area, buf, table_state);
 }
 
+/// Return the subset of `datasets` whose `id` or `path` contains `search`
+/// (case-insensitive).  Returns the full slice when `search` is empty.
+fn filtered_datasets<'a>(datasets: &'a [PickerEntry], search: &str) -> Vec<&'a PickerEntry> {
+    if search.is_empty() {
+        datasets.iter().collect()
+    } else {
+        let lower = search.to_lowercase();
+        datasets
+            .iter()
+            .filter(|e| {
+                e.id.to_lowercase().contains(&lower) || e.path.to_lowercase().contains(&lower)
+            })
+            .collect()
+    }
+}
+
 fn render_dataset_picker(
     area: Rect,
     buf: &mut Buffer,
     datasets: &[PickerEntry],
     list_state: &mut ListState,
+    search: &str,
+    searching: bool,
 ) {
+    let title = if searching {
+        format!(" Select Dataset [/{search}] ")
+    } else {
+        " Select Dataset ".to_string()
+    };
     let block = Block::default()
-        .title(" Select Dataset ")
+        .title(title)
         .title_style(THEME.block_title_focused)
         .borders(Borders::ALL)
         .border_style(THEME.block_focused);
 
-    if datasets.is_empty() {
-        Paragraph::new("\n  No datasets found in ./, ./data/, ./datasets/")
-            .style(THEME.text_muted)
-            .block(block)
-            .render(area, buf);
+    let filtered = filtered_datasets(datasets, search);
+
+    if filtered.is_empty() {
+        Paragraph::new(if datasets.is_empty() {
+            "\n  No datasets found in ./, ./data/, ./datasets/"
+        } else {
+            "\n  No datasets match search."
+        })
+        .style(THEME.text_muted)
+        .block(block)
+        .render(area, buf);
         return;
     }
 
-    let items: Vec<ListItem> = datasets
+    let items: Vec<ListItem> = filtered
         .iter()
         .map(|ds| {
             ListItem::new(Line::from(vec![
-                Span::styled(&ds.id, THEME.kv_value),
+                Span::styled(ds.id.as_str(), THEME.kv_value),
                 Span::raw("  "),
-                Span::styled(&ds.detail, THEME.text_dim),
+                Span::styled(ds.detail.as_str(), THEME.text_dim),
             ]))
         })
         .collect();

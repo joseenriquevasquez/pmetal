@@ -55,6 +55,26 @@ pub struct FormTabState {
 }
 
 impl FormTabState {
+    /// Build a `FormTabState` whose fields are derived from a spec's
+    /// [`pmetal_core::JobFields::field_descriptors`] using default values.
+    ///
+    /// This is the spec-driven constructor: each descriptor becomes a
+    /// `FormField` via [`FormField::from_descriptor`], so the form automatically
+    /// stays in sync with the spec's field set and defaults.
+    ///
+    /// Call [`FormTabState::new`] directly when you need hand-crafted fields
+    /// (e.g. read-only auto-detected values like "Architecture").
+    pub fn from_spec_default<S>() -> Self
+    where
+        S: pmetal_core::JobFields + Default,
+    {
+        let fields = S::field_descriptors()
+            .iter()
+            .map(|d| FormField::from_descriptor(d, None))
+            .collect();
+        Self::new(fields)
+    }
+
     /// Create a form-tab state from a pre-built field list.
     ///
     /// Selects the second visible row by default (index 1) to put the
