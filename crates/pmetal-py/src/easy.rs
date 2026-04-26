@@ -145,7 +145,7 @@ pub fn infer(
             use pmetal_hub::resolve_model_path;
             use pmetal_models::{DynamicModel, GenerationConfig, generate_cached_async};
 
-            let model_path = resolve_model_path(&model_id)
+            let model_path = resolve_model_path(&model_id, None, None)
                 .await
                 .map_err(|e| e.to_string())?;
             let tokenizer = Tokenizer::from_model_dir(&model_path)

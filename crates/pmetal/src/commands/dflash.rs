@@ -227,26 +227,15 @@ pub async fn run_dflash(
     Ok(())
 }
 
-/// Download or locate a model on disk.
+/// Download or locate a model on disk. Pulls extra tokenizer files for the
+/// target model so the speculative decoder can use them at runtime.
 async fn resolve_model_path(path_or_id: &str, need_tokenizer: bool) -> Result<PathBuf> {
-    if is_hf_like(path_or_id) {
-        let path = pmetal_hub::download_model(path_or_id, None, None)
-            .await
-            .map_err(|e| anyhow::anyhow!("download_model {path_or_id}: {e}"))?;
-        if need_tokenizer {
-            let _ = pmetal_hub::download_file(path_or_id, "tokenizer.json", None, None).await;
-            let _ =
-                pmetal_hub::download_file(path_or_id, "tokenizer_config.json", None, None).await;
-        }
-        Ok(path)
-    } else {
-        Ok(PathBuf::from(path_or_id))
+    let path = pmetal_hub::resolve_model_path(path_or_id, None, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("resolve_model_path {path_or_id}: {e}"))?;
+    if need_tokenizer && pmetal_hub::is_hf_id(path_or_id) {
+        let _ = pmetal_hub::download_file(path_or_id, "tokenizer.json", None, None).await;
+        let _ = pmetal_hub::download_file(path_or_id, "tokenizer_config.json", None, None).await;
     }
-}
-
-fn is_hf_like(s: &str) -> bool {
-    // HF model ids have the shape `owner/repo`. Local paths tend to contain
-    // `/` too but also have a leading `.` or absolute prefix; err on the
-    // side of treating anything starting with `.` or `/` as a local path.
-    !(s.starts_with('.') || s.starts_with('/')) && s.contains('/')
+    Ok(path)
 }

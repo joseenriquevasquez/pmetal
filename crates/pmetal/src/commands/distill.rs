@@ -245,18 +245,10 @@ pub(crate) async fn run_distillation_cli(
     }
 
     tracing::info!("Resolving teacher model: {}", teacher_id);
-    let teacher_path = if teacher_id.contains('/') && !Path::new(teacher_id).exists() {
-        pmetal_hub::download_model(teacher_id, None, None).await?
-    } else {
-        PathBuf::from(teacher_id)
-    };
+    let teacher_path = pmetal_hub::resolve_model_path(teacher_id, None, None).await?;
 
     tracing::info!("Resolving student model: {}", student_id);
-    let student_path = if student_id.contains('/') && !Path::new(student_id).exists() {
-        pmetal_hub::download_model(student_id, None, None).await?
-    } else {
-        PathBuf::from(student_id)
-    };
+    let student_path = pmetal_hub::resolve_model_path(student_id, None, None).await?;
 
     tracing::info!("Loading tokenizer...");
     let tokenizer = Tokenizer::from_model_dir(&student_path)?;

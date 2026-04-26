@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("----------------------------------------\n");
 
     // Resolve model
-    let model_path = resolve_model_path(model_id).await?;
+    let model_path = resolve_model_path(model_id, None, None).await?;
 
     // Load tokenizer
     let tokenizer = Tokenizer::from_model_dir(&model_path)?;

@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[smoke] seq_len: {seq_len}");
 
     let t0 = Instant::now();
-    let model_path = resolve_model_path(model_id).await?;
+    let model_path = resolve_model_path(model_id, None, None).await?;
     println!(
         "[smoke] resolved path: {} ({:.1}s)",
         model_path.display(),

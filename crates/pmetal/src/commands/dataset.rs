@@ -23,12 +23,7 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
             // Load tokenizer if model specified
             let tokenizer = if let Some(model_id) = &model {
                 println!("Loading tokenizer from {}...", model_id);
-                let model_path =
-                    if model_id.contains('/') && !std::path::Path::new(model_id).exists() {
-                        pmetal_hub::download_model(model_id, None, None).await?
-                    } else {
-                        std::path::PathBuf::from(model_id)
-                    };
+                let model_path = pmetal_hub::resolve_model_path(model_id, None, None).await?;
                 Some(Tokenizer::from_model_dir(&model_path)?)
             } else {
                 None
@@ -481,12 +476,7 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
             // Load tokenizer
             let tokenizer = if let Some(model_id) = &model {
                 println!("Loading tokenizer from {}...", model_id);
-                let model_path =
-                    if model_id.contains('/') && !std::path::Path::new(model_id).exists() {
-                        pmetal_hub::download_model(model_id, None, None).await?
-                    } else {
-                        std::path::PathBuf::from(model_id)
-                    };
+                let model_path = pmetal_hub::resolve_model_path(model_id, None, None).await?;
                 Some(Tokenizer::from_model_dir(&model_path)?)
             } else {
                 None
@@ -714,12 +704,7 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
             let tokenizer = if min_tokens.is_some() || max_tokens.is_some() {
                 if let Some(model_id) = &model {
                     println!("Loading tokenizer from {}...", model_id);
-                    let model_path =
-                        if model_id.contains('/') && !std::path::Path::new(model_id).exists() {
-                            pmetal_hub::download_model(model_id, None, None).await?
-                        } else {
-                            std::path::PathBuf::from(model_id)
-                        };
+                    let model_path = pmetal_hub::resolve_model_path(model_id, None, None).await?;
                     Some(Tokenizer::from_model_dir(&model_path)?)
                 } else {
                     return Err(anyhow::anyhow!(
@@ -1112,12 +1097,7 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
             // provided and we are in training mode (not generation prompt).
             let template_eos_token: Option<String> = if !add_generation_prompt {
                 if let Some(ref model_id) = model {
-                    let model_dir =
-                        if model_id.contains('/') && !std::path::Path::new(model_id).exists() {
-                            pmetal_hub::download_model(model_id, None, None).await?
-                        } else {
-                            std::path::PathBuf::from(model_id)
-                        };
+                    let model_dir = pmetal_hub::resolve_model_path(model_id, None, None).await?;
                     match Tokenizer::from_model_dir(&model_dir) {
                         Ok(tok) => {
                             let eos = tok.eos_token_str();
@@ -1327,11 +1307,7 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
 
             // Step 2: Load tokenizer
             println!("[2/5] Loading tokenizer...");
-            let model_path = if model.contains('/') && !std::path::Path::new(&model).exists() {
-                pmetal_hub::download_model(&model, None, None).await?
-            } else {
-                std::path::PathBuf::from(&model)
-            };
+            let model_path = pmetal_hub::resolve_model_path(&model, None, None).await?;
             let tokenizer = Tokenizer::from_model_dir(&model_path)?;
             println!("  Loaded tokenizer from {}", model_path.display());
 

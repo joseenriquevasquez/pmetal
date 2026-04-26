@@ -67,6 +67,12 @@ struct ChannelMetricsCallback {
     best_loss: Option<f64>,
 }
 
+// Phase 4's GUI agent will add a `TauriJobEventSink` once the Svelte frontend
+// is migrated to consume `pmetal::core::JobEvent` directly. `Channel<T>` does
+// not implement `Deserialize`, so it can't be wrapped in `Option<>` for a
+// backwards-compatible Phase 2 hook — the migration is necessarily a single
+// step, deferred to Phase 4.
+
 impl TrainingCallback for ChannelMetricsCallback {
     fn on_train_start(&mut self) {
         let _ = self.channel.send(serde_json::json!({
@@ -2479,7 +2485,6 @@ async fn run_inference_streaming(
     cancel_flag: &std::sync::atomic::AtomicBool,
     app_handle: &AppHandle,
 ) -> std::result::Result<serde_json::Value, String> {
-    use pmetal::hub::resolve_model_path;
     use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig, TurboQuantPreset};
 
     let kv_turboquant_preset = match config.kv_turboquant_preset.as_deref() {
@@ -3313,13 +3318,9 @@ fn find_parquet_in_dir(dir: &Path) -> Option<PathBuf> {
 }
 
 async fn resolve_model_path(model_id: &str) -> Result<PathBuf> {
-    if model_id.contains('/') && !PathBuf::from(model_id).exists() {
-        pmetal::hub::download_model(model_id, None, None)
-            .await
-            .map_err(|e| AppError(e.to_string()))
-    } else {
-        Ok(PathBuf::from(model_id))
-    }
+    pmetal::hub::resolve_model_path(model_id, None, None)
+        .await
+        .map_err(|e| AppError(e.to_string()))
 }
 
 async fn resolve_dataset_path(dataset_id: &str) -> Result<PathBuf> {

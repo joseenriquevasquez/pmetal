@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Running inference with {model_id}...\n");
 
     // Resolve model (downloads from HF if needed)
-    let model_path = resolve_model_path(model_id).await?;
+    let model_path = resolve_model_path(model_id, None, None).await?;
 
     // Load tokenizer and detect chat template
     let tokenizer = Tokenizer::from_model_dir(&model_path)?;

@@ -1,7 +1,7 @@
 use pmetal_core::TrainingConfig;
 use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
 use pmetal_trainer::{GrpoConfig, GrpoTrainer, TrainingLoopConfig};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Run GRPO (Group Relative Policy Optimization) for reasoning models.
 #[allow(clippy::too_many_arguments)]
@@ -72,11 +72,7 @@ pub(crate) async fn run_grpo_cli(
 
     // 1. Resolve and Download Model
     tracing::info!("Resolving model: {}", model_id);
-    let model_path = if model_id.contains('/') && !Path::new(model_id).exists() {
-        pmetal_hub::download_model(model_id, None, None).await?
-    } else {
-        PathBuf::from(model_id)
-    };
+    let model_path = pmetal_hub::resolve_model_path(model_id, None, None).await?;
 
     // 2. Load Tokenizer (with config-aware special token resolution)
     tracing::info!("Loading tokenizer...");
@@ -259,11 +255,7 @@ pub(crate) async fn run_grpo_cli(
 
         // Resolve the reward model path — download from HF if it looks like a
         // model ID and doesn't exist locally.
-        let rm_path = if rm_path_str.contains('/') && !std::path::Path::new(rm_path_str).exists() {
-            pmetal_hub::download_model(rm_path_str, None, None).await?
-        } else {
-            std::path::PathBuf::from(rm_path_str)
-        };
+        let rm_path = pmetal_hub::resolve_model_path(rm_path_str, None, None).await?;
 
         let rm_tokenizer = pmetal_data::Tokenizer::from_model_dir(&rm_path)
             .map_err(|e| anyhow::anyhow!("Failed to load reward model tokenizer: {}", e))?;

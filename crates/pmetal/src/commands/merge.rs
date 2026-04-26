@@ -26,32 +26,20 @@ pub(crate) async fn run_merge_command(
     println!();
 
     // Resolve HuggingFace model IDs to local paths
-    let path_a = if model_a.contains('/') && !std::path::Path::new(model_a).exists() {
-        println!("Downloading model A...");
-        pmetal_hub::download_model(model_a, None, None).await?
-    } else {
-        std::path::PathBuf::from(model_a)
-    };
+    println!("Resolving model A...");
+    let path_a = pmetal_hub::resolve_model_path(model_a, None, None).await?;
 
-    let path_b = if model_b.contains('/') && !std::path::Path::new(model_b).exists() {
-        println!("Downloading model B...");
-        pmetal_hub::download_model(model_b, None, None).await?
-    } else {
-        std::path::PathBuf::from(model_b)
-    };
+    println!("Resolving model B...");
+    let path_b = pmetal_hub::resolve_model_path(model_b, None, None).await?;
 
     let base_path = if let Some(base_id) = base {
-        if base_id.contains('/') && !std::path::Path::new(base_id).exists() {
-            println!("Downloading base model...");
-            Some(
-                pmetal_hub::download_model(base_id, None, None)
-                    .await?
-                    .to_string_lossy()
-                    .to_string(),
-            )
-        } else {
-            Some(base_id.to_string())
-        }
+        println!("Resolving base model...");
+        Some(
+            pmetal_hub::resolve_model_path(base_id, None, None)
+                .await?
+                .to_string_lossy()
+                .to_string(),
+        )
     } else {
         None
     };

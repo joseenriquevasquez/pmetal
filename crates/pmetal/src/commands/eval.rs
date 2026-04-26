@@ -15,11 +15,7 @@ pub(crate) async fn run_eval(
     use pmetal_bridge::compat::indexing::take_along_axis;
 
     // Resolve model
-    let model_path = if model_id.contains('/') && !std::path::Path::new(model_id).exists() {
-        pmetal_hub::download_model(model_id, None, None).await?
-    } else {
-        std::path::PathBuf::from(model_id)
-    };
+    let model_path = pmetal_hub::resolve_model_path(model_id, None, None).await?;
 
     if !json_output {
         println!("PMetal Eval");

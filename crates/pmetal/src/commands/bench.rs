@@ -2058,11 +2058,7 @@ fn split_combined_projection(
 }
 
 async fn resolve_workload_model_path(model_id: &str) -> anyhow::Result<PathBuf> {
-    if model_id.contains('/') && !Path::new(model_id).exists() {
-        Ok(pmetal_hub::download_model(model_id, None, None).await?)
-    } else {
-        Ok(PathBuf::from(model_id))
-    }
+    Ok(pmetal_hub::resolve_model_path(model_id, None, None).await?)
 }
 
 fn load_workload_text_samples(
@@ -4231,18 +4227,13 @@ pub(crate) fn run_ffi_benchmark() -> anyhow::Result<()> {
 pub(crate) async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
     use pmetal_bridge::compat::{Array, indexing::argmax, ops::async_eval, transforms::eval};
     use pmetal_models::DynamicModel;
-    use std::path::PathBuf;
     use std::time::Instant;
 
     println!("=== Generation Loop Benchmark ===");
     println!("Model: {}\n", model_id);
 
-    // Download model if needed
-    let model_path = if model_id.contains('/') && !PathBuf::from(model_id).exists() {
-        pmetal_hub::download_model(model_id, None, None).await?
-    } else {
-        PathBuf::from(model_id)
-    };
+    // Resolve model
+    let model_path = pmetal_hub::resolve_model_path(model_id, None, None).await?;
 
     // Load model
     println!("Loading model...");

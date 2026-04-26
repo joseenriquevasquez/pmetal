@@ -57,13 +57,9 @@ pub(crate) async fn run_quantization(
     println!("========================================\n");
 
     // Resolve HuggingFace model ID to local path
+    tracing::info!("Resolving model: {}", model_path);
     let resolved_model_path: PathBuf =
-        if model_path.contains('/') && !PathBuf::from(model_path).exists() {
-            tracing::info!("Resolving HuggingFace model: {}", model_path);
-            pmetal_hub::download_model(model_path, None, None).await?
-        } else {
-            PathBuf::from(model_path)
-        };
+        pmetal_hub::resolve_model_path(model_path, None, None).await?;
 
     // 1. Load IMatrix if provided
     let imatrix = if let Some(path) = imatrix_path {
@@ -274,13 +270,9 @@ pub(crate) async fn run_quantization_mlx(
     println!("========================================\n");
 
     // 1. Resolve HuggingFace model ID to local path.
+    println!("Resolving model: {}", model_path);
     let resolved_model_path: std::path::PathBuf =
-        if model_path.contains('/') && !std::path::PathBuf::from(model_path).exists() {
-            println!("Resolving HuggingFace model: {}", model_path);
-            pmetal_hub::download_model(model_path, None, None).await?
-        } else {
-            std::path::PathBuf::from(model_path)
-        };
+        pmetal_hub::resolve_model_path(model_path, None, None).await?;
 
     // 2. Load all weights as InlineArray (stays on GPU, avoids f32 copy).
     println!("Loading weights...");

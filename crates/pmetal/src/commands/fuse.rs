@@ -16,12 +16,8 @@ pub(crate) async fn run_fuse(
     println!("========================================");
 
     // Resolve model path (could be HF ID or local path)
-    let model_dir: PathBuf = if model_path.contains('/') && !PathBuf::from(model_path).exists() {
-        tracing::info!("Resolving HuggingFace model: {}", model_path);
-        pmetal_hub::download_model(model_path, None, None).await?
-    } else {
-        PathBuf::from(model_path)
-    };
+    tracing::info!("Resolving model: {}", model_path);
+    let model_dir: PathBuf = pmetal_hub::resolve_model_path(model_path, None, None).await?;
     println!("Base model:   {}", model_dir.display());
 
     // Resolve LoRA adapter path
@@ -250,12 +246,8 @@ pub(crate) async fn run_fuse_accurate(
     println!("========================================");
 
     // Resolve model path (could be HF ID or local path)
-    let model_dir: PathBuf = if model_path.contains('/') && !PathBuf::from(model_path).exists() {
-        tracing::info!("Resolving HuggingFace model: {}", model_path);
-        pmetal_hub::download_model(model_path, None, None).await?
-    } else {
-        PathBuf::from(model_path)
-    };
+    tracing::info!("Resolving model: {}", model_path);
+    let model_dir: PathBuf = pmetal_hub::resolve_model_path(model_path, None, None).await?;
 
     // The adapter path must be a directory containing adapter_config.json.
     let adapter_dir: PathBuf = if std::path::Path::new(lora_path).is_dir() {

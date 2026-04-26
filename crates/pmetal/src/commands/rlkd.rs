@@ -1,7 +1,7 @@
 use pmetal_core::TrainingConfig;
 use pmetal_data::{DatasetFormat, Tokenizer, TrainingDataset};
 use pmetal_trainer::{GrpoConfig, RlkdConfig, RlkdTrainer};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Run RLKD (Reinforcement Learning with Knowledge Distillation).
 ///
@@ -69,19 +69,11 @@ pub(crate) async fn run_rlkd_cli(
 
     // 1. Resolve and download policy model
     tracing::info!("Resolving policy model: {}", model_id);
-    let model_path = if model_id.contains('/') && !Path::new(model_id).exists() {
-        pmetal_hub::download_model(model_id, None, None).await?
-    } else {
-        PathBuf::from(model_id)
-    };
+    let model_path = pmetal_hub::resolve_model_path(model_id, None, None).await?;
 
     // 2. Resolve and download teacher model
     tracing::info!("Resolving teacher model: {}", teacher_model_id);
-    let teacher_path = if teacher_model_id.contains('/') && !Path::new(teacher_model_id).exists() {
-        pmetal_hub::download_model(teacher_model_id, None, None).await?
-    } else {
-        PathBuf::from(teacher_model_id)
-    };
+    let teacher_path = pmetal_hub::resolve_model_path(teacher_model_id, None, None).await?;
 
     // 3. Load tokenizer (policy model's tokenizer drives generation)
     tracing::info!("Loading tokenizer...");

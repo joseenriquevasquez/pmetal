@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Context;
 use pmetal_mlx::{Array, Exception};
@@ -368,14 +368,8 @@ pub(crate) async fn run_inference(
     tracing::info!(model = %model_id, "Loading model for inference");
 
     // Download model if needed (HuggingFace repo ID contains '/')
-    let model_path = if model_id.contains('/') && !PathBuf::from(model_id).exists() {
-        tracing::info!("Model not found locally, downloading from HuggingFace Hub...");
-        let path = pmetal_hub::download_model(model_id, None, None).await?;
-        tracing::info!("Model downloaded successfully to {:?}", path);
-        path
-    } else {
-        PathBuf::from(model_id)
-    };
+    let model_path = pmetal_hub::resolve_model_path(model_id, None, None).await?;
+    tracing::info!("Model ready at {:?}", model_path);
 
     // ── Prepare inference via shared runner ──────────────────────────────
     use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig};

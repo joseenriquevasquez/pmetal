@@ -28,12 +28,8 @@ pub(crate) async fn run_serve(
     use pmetal_serve::{BatcherConfig, InferenceEngine, ServeConfig};
 
     // Resolve model path
-    let model_path = if model_id.contains('/') && !PathBuf::from(&model_id).exists() {
-        tracing::info!("Downloading model from HuggingFace: {}", model_id);
-        pmetal_hub::download_model(&model_id, None, None).await?
-    } else {
-        PathBuf::from(&model_id)
-    };
+    tracing::info!("Resolving model: {}", model_id);
+    let model_path = pmetal_hub::resolve_model_path(&model_id, None, None).await?;
 
     // Load tokenizer — use pmetal_data::Tokenizer for config-aware special token
     // resolution (needed by collect_all_stop_tokens inside InferenceEngine::new).
