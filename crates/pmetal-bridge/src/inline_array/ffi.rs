@@ -667,11 +667,12 @@ unsafe extern "C" {
         n_rows: u32,
     ) -> i32;
 
-    pub(super) fn mlx_inline_turboquant_signed_fwht_256_rows(
+    pub(super) fn mlx_inline_turboquant_signed_fwht_pow2_rows(
         out: *mut RawBuf,
         input: *const RawBuf,
         left_signs: *const RawBuf,
         right_signs: *const RawBuf,
+        dim: u32,
         n_rows: u32,
     ) -> i32;
 

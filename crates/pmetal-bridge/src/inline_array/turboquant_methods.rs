@@ -448,23 +448,28 @@ impl InlineArray {
     /// Signed, normalized FWHT-256 transform applied row-wise:
     /// `out[row] = left_signs * FWHT(right_signs * input[row]) / sqrt(256)`.
     ///
-    /// - `input`: `[N, 256]` f32
-    /// - `left_signs`: `[256]` f32
-    /// - `right_signs`: `[256]` f32
-    /// - Returns `[N, 256]` f32 on success.
-    pub fn turboquant_signed_fwht_256_rows(
+    /// - `input`: `[N, dim]` f32 (`dim` must be a power of two)
+    /// - `left_signs`: `[dim]` f32 (Rademacher ±1)
+    /// - `right_signs`: `[dim]` f32 (Rademacher ±1)
+    /// - Returns `[N, dim]` f32 on success, with the unitary 1/sqrt(dim) scale baked in.
+    pub fn turboquant_signed_fwht_pow2_rows(
         input: &Self,
         left_signs: &Self,
         right_signs: &Self,
+        dim: u32,
         n_rows: u32,
     ) -> Option<Self> {
+        if dim == 0 || (dim & (dim - 1)) != 0 {
+            return None;
+        }
         let mut out = MaybeUninit::<RawBuf>::uninit();
         let rc = unsafe {
-            mlx_inline_turboquant_signed_fwht_256_rows(
+            mlx_inline_turboquant_signed_fwht_pow2_rows(
                 out.as_mut_ptr(),
                 &input.raw,
                 &left_signs.raw,
                 &right_signs.raw,
+                dim,
                 n_rows,
             )
         };

@@ -205,6 +205,23 @@ impl KVCache {
         &self.config
     }
 
+    /// Returns `true` when the cache is in TurboQuant mode and at least one
+    /// layer has actually compressed history. Prefix-cache snapshots must skip
+    /// these caches: `KVCacheSnapshot::from_cache` only sees the (empty) dense
+    /// `keys`/`values` fields and would persist a zero-layer snapshot, while
+    /// even a working "decode-everything-back-to-fp16" path would silently
+    /// negate the compression savings (~37 GB at 100K context per SwiftLM's
+    /// observation).
+    pub fn turboquant_compression_active(&self) -> bool {
+        if !matches!(self.config.mode, CacheMode::TurboQuant { .. }) {
+            return false;
+        }
+        match self.turboquant_layers.as_ref() {
+            Some(layers) => layers.iter().any(|layer| !layer.is_empty()),
+            None => false,
+        }
+    }
+
     /// Take the layer's KV buffers and current offset for a fused
     /// compiled update step (used by `compiled_*_attn_block` callers).
     /// The buffer is grown to fit the next `prev_offset + new_seq_len`

@@ -370,28 +370,31 @@ int mlx_inline_turboquant_unpack_sign_bits(
     } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_unpack_sign_bits", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_unpack_sign_bits", "unknown C++ exception"); return 1; }
 }
 
-int mlx_inline_turboquant_signed_fwht_256_rows(
+int mlx_inline_turboquant_signed_fwht_pow2_rows(
     mlx_inline_array*       out,
     const mlx_inline_array* input,
     const mlx_inline_array* left_signs,
     const mlx_inline_array* right_signs,
+    uint32_t                dim,
     uint32_t                n_rows)
 {
     using namespace mlx::core;
 
-    if (n_rows == 0) return 1;
+    if (n_rows == 0 || dim == 0 || (dim & (dim - 1)) != 0) return 1;
 
     try {
-        constexpr float kScale = 0.0625f;
+        // Walsh-Hadamard transform is unitary up to a 1/sqrt(dim) factor, which
+        // mlx::core::hadamard_transform passes through as the scale argument.
+        const float scale = 1.0f / std::sqrt(static_cast<float>(dim));
         auto input_f32 = mlx::core::astype(as_arr(input), float32);
         auto input_contig = mlx::core::contiguous(input_f32);
         auto signed_input = mlx::core::multiply(input_contig, as_arr(left_signs));
         auto signed_input_contig = mlx::core::contiguous(signed_input);
-        auto transformed = mlx::core::hadamard_transform(signed_input_contig, kScale);
+        auto transformed = mlx::core::hadamard_transform(signed_input_contig, scale);
         auto output_arr = mlx::core::multiply(transformed, as_arr(right_signs));
         new (out->buf) array(output_arr);
         return 0;
-    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_signed_fwht_256_rows", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_signed_fwht_256_rows", "unknown C++ exception"); return 1; }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_signed_fwht_pow2_rows", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_signed_fwht_pow2_rows", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_gather_last_dim(

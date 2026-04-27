@@ -240,6 +240,7 @@ pub fn sanitize_turboquant_config(
     TurboQuantConfig {
         keys: sanitize_turboquant_tensor_config(key_head_dim, config.keys),
         values: sanitize_turboquant_tensor_config(value_head_dim, config.values),
+        recent_window: config.recent_window,
     }
 }
 

@@ -1031,6 +1031,7 @@ fn turboquant_config_from_mode(
         CacheMode::TurboQuant { config } => Some(BridgeTurboQuantConfig {
             keys: bridge_turboquant_tensor_config(config.keys),
             values: bridge_turboquant_tensor_config(config.values),
+            recent_window: config.recent_window,
         }),
         _ => None,
     }
@@ -1265,6 +1266,7 @@ impl TurboQuantPreset {
         TurboQuantConfig {
             keys: key_config,
             values: value_config,
+            recent_window: Some(pmetal_mlx::kv_cache::DEFAULT_RECENT_WINDOW),
         }
     }
 }
@@ -1818,6 +1820,7 @@ mod tests {
         let expected = TurboQuantConfig {
             keys: TurboQuantConfig::preset_q2_5(256).keys,
             values: TurboQuantConfig::preset_q2_5(128).values,
+            recent_window: Some(pmetal_mlx::kv_cache::DEFAULT_RECENT_WINDOW),
         };
         assert_eq!(mode, CacheMode::TurboQuant { config: expected });
     }

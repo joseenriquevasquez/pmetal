@@ -159,6 +159,21 @@ impl ServePrefixCache {
             return;
         }
 
+        // TurboQuant mode stores its history in a compressed format that
+        // `KVCacheSnapshot::from_cache` cannot capture (it only walks the
+        // dense per-layer K/V buffers, which TurboQuant leaves empty). Even
+        // with a hypothetical full-decode path the snapshot would re-inflate
+        // the entire history to fp16 — at 100K context that's ~37 GB
+        // negating the compression savings. Skip the save quietly here.
+        if cache.turboquant_compression_active() {
+            tracing::debug!(
+                target = "pmetal_serve::prefix_cache",
+                "skipping prompt-cache save: TurboQuant has active compressed layers; \
+                 saving would re-decode history to fp16"
+            );
+            return;
+        }
+
         // Replace existing entry with identical key.
         if let Some(pos) = self
             .entries
@@ -394,5 +409,35 @@ mod tests {
         let (cache, _) = make_cache();
         pc.insert(&[], &cache);
         assert!(pc.is_empty());
+    }
+
+    #[test]
+    fn turboquant_active_caches_are_skipped_on_save() {
+        // Once any TurboQuant layer has compressed history, the prefix cache
+        // must NOT save a snapshot. KVCacheSnapshot would either capture an
+        // empty (zero-layer) snapshot or — with a hypothetical full-decode
+        // path — re-inflate ~37 GB of compressed state at 100K context.
+        use pmetal_bridge::compat::Array;
+        use pmetal_mlx::kv_cache::{CacheMode, TurboQuantConfig};
+
+        let cfg = KVCacheConfig::new(2, 128, 4, 64).with_mode(CacheMode::TurboQuant {
+            // Disable the hot window — we want eager compression so the test
+            // can assert `turboquant_compression_active()` after a single
+            // append.
+            config: TurboQuantConfig::uniform(4, 3).with_recent_window(None),
+        });
+        let mut cache = KVCache::new(cfg.clone());
+        let k = Array::zeros_f32(&[1, 4, 8, 64]);
+        let v = Array::zeros_f32(&[1, 4, 8, 64]);
+        cache.update_and_fetch(0, &k, &v).unwrap();
+        assert!(cache.turboquant_compression_active());
+
+        let mut pc = ServePrefixCache::new(8, 0);
+        pc.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &cache);
+        assert_eq!(
+            pc.len(),
+            0,
+            "prefix cache should refuse to snapshot a TurboQuant-active cache"
+        );
     }
 }

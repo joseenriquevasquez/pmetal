@@ -361,18 +361,6 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
     Ok(cfg)
 }
 
-/// Trace helper — toggled by the `PMETAL_TRACE_TURBOQUANT` env var. Used by
-/// the TurboQuant code paths scattered across submodules.
-pub(super) fn turboquant_trace_enabled() -> bool {
-    std::env::var_os("PMETAL_TRACE_TURBOQUANT").is_some()
-}
-
-pub(super) fn trace_turboquant_qwen(message: &str) {
-    if turboquant_trace_enabled() {
-        eprintln!("[TURBOQUANT TRACE][QWEN] {message}");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::mlp_moe::moe_switch_glu_input;

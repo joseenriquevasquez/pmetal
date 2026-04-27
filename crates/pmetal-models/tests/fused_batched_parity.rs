@@ -570,6 +570,33 @@ fn fused_vs_serial_qwen3_moe_single_token() {
     assert!(diff < 5e-4, "Qwen3MoE single-token divergence: {diff}");
 }
 
+/// Multi-step Qwen3-MoE — exercises per-layer RoPE offset + per-head qk-norm
+/// at offset > 0. Single-token can't expose RoPE-axis drift since RoPE at
+/// offset=0 is identity regardless of axis interpretation.
+#[test]
+fn fused_vs_serial_qwen3_moe_multi_step() {
+    let config = tiny_qwen3_moe_config();
+    let mut model = Qwen3MoE::new(config.clone()).unwrap();
+    model.init_stacked_moe().unwrap();
+
+    let max_seq = config.max_position_embeddings as usize;
+    let hkv = config.num_kv_heads() as usize;
+    let hd = config.head_dim as usize;
+    let nl = config.num_hidden_layers as usize;
+
+    let mut cs = KVCache::new(kv_cfg(nl, max_seq, hkv, hd));
+    let mut cf = FusedBatchKVCache::new(kv_cfg(nl, max_seq, hkv, hd), 1).unwrap();
+    cf.admit(0).unwrap();
+
+    for (step, tok) in [4_i32, 7, 13, 19, 23].iter().enumerate() {
+        let inp = Array::from_i32_slice(&[*tok]).reshape(&[1, 1]);
+        let s = model.forward(&inp, None, Some(&mut cs)).unwrap();
+        let f = model.forward_batched_impl(&inp, &[0], &mut cf).unwrap();
+        let d = max_abs_diff(&last_logits(&s), &last_logits(&f));
+        assert!(d < 5e-4, "Qwen3MoE step {step} (token {tok}) divergence: {d}");
+    }
+}
+
 fn tiny_gpt_oss_config() -> GptOssConfig {
     GptOssConfig {
         vocab_size: 64,

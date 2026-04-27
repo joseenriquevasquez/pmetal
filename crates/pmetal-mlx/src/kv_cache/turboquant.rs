@@ -18,14 +18,11 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 use tracing::debug;
 
 use crate::array_ext::ArrayDtypeExt;
-use crate::kernels::{AttentionMaskType, FusedAttentionConfig};
+use crate::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 
 /// Deterministic seed used for TurboQuant rotations and QJL projections.
 const TURBOQUANT_SEED: u64 = 0x5442_5155_414e_544d;
 const ZERO_EPSILON: f32 = 1e-12;
-const LLOYD_MAX_ITERS: usize = 64;
-const LLOYD_MAX_TOLERANCE: f64 = 1e-7;
-const LLOYD_GRID_POINTS: usize = 8192;
 
 /// Per-tensor TurboQuant precision configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,24 +138,45 @@ impl TurboQuantTensorConfig {
 }
 
 /// Full TurboQuant K/V configuration.
+/// Default size of the recent-token fp16 window. Tokens within `recent_window`
+/// of the current position stay un-quantized; older history is compressed.
+/// Empirically (SwiftLM, our audit's redesign doc) compression at very long
+/// context only buys memory — it costs throughput. Keeping the window at 8192
+/// preserves quality for typical chat/short-RAG prompts and only triggers the
+/// compression path for genuinely long contexts.
+pub const DEFAULT_RECENT_WINDOW: usize = 8192;
+
+/// Eviction granularity. When the hot ring exceeds `recent_window + this`,
+/// we batch-evict this many tokens to the cold compressed store. A larger
+/// chunk means fewer (but bigger) compress dispatches; the value below
+/// matches the typical prefill chunk so most evictions happen in one shot.
+const HOT_EVICTION_CHUNK: usize = 1024;
+
+/// Full TurboQuant K/V cache configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TurboQuantConfig {
     /// Key-cache quantization strategy.
     pub keys: TurboQuantTensorConfig,
     /// Value-cache quantization strategy.
     pub values: TurboQuantTensorConfig,
+    /// Recent-token fp16 window. The newest `recent_window` tokens are
+    /// stored uncompressed; older history goes through TurboQuant. `None`
+    /// disables the hot path (compress everything immediately, the original
+    /// behavior — useful for memory-constrained eval and parity tests).
+    pub recent_window: Option<usize>,
 }
 
 impl TurboQuantConfig {
-    /// Create a uniform K/V TurboQuant config.
+    /// Create a uniform K/V TurboQuant config with the default recent window.
     pub const fn uniform(key_bits: u8, value_bits: u8) -> Self {
         Self {
             keys: TurboQuantTensorConfig::uniform(key_bits),
             values: TurboQuantTensorConfig::uniform(value_bits),
+            recent_window: Some(DEFAULT_RECENT_WINDOW),
         }
     }
 
-    /// Create a mixed-bit K/V TurboQuant config.
+    /// Create a mixed-bit K/V TurboQuant config with the default recent window.
     pub const fn mixed(
         key_regular_bits: u8,
         key_outlier_bits: u8,
@@ -178,7 +196,15 @@ impl TurboQuantConfig {
                 value_outlier_bits,
                 value_outlier_count,
             ),
+            recent_window: Some(DEFAULT_RECENT_WINDOW),
         }
+    }
+
+    /// Override the recent fp16 window. `None` disables the hot path entirely
+    /// (compress every appended token immediately).
+    pub const fn with_recent_window(mut self, window: Option<usize>) -> Self {
+        self.recent_window = window;
+        self
     }
 
     /// Outlier-aware 2.5-bit preset.
@@ -569,12 +595,33 @@ impl TurboQuantMetalCore {
     }
 }
 
+/// Returns true when the active dim should use signed-FWHT instead of dense
+/// `[d×d]` matmul for rotation and QJL projection. Mirrors the bridge gate so
+/// both implementations make the same choice.
+fn dim_uses_fwht(dim: usize) -> bool {
+    dim >= 4 && dim.is_power_of_two()
+}
+
+/// Local Rademacher (±1) sign sampler. Mirrors the bridge's logic but uses
+/// pmetal-mlx's resolved `rand` version to avoid the two-version FFI mismatch.
+fn local_rademacher_signs(dim: usize, rng: &mut StdRng) -> Vec<f32> {
+    (0..dim)
+        .map(|_| if rng.random::<bool>() { 1.0 } else { -1.0 })
+        .collect()
+}
+
 pub(crate) struct TurboQuantCore {
     dim: usize,
     rotation: Vec<f32>,
     inverse_rotation: Vec<f32>,
     qjl_projection: Vec<f32>,
     inverse_qjl_projection: Vec<f32>,
+    /// Rademacher signs for the signed-FWHT rotation (pow2 dim only).
+    wht_left_signs: Option<Vec<f32>>,
+    wht_right_signs: Option<Vec<f32>>,
+    /// Rademacher signs for the signed-FWHT QJL projection (pow2 dim only).
+    qjl_wht_left_signs: Option<Vec<f32>>,
+    qjl_wht_right_signs: Option<Vec<f32>>,
     codebooks: Vec<Vec<f32>>,
     metal: Option<TurboQuantMetalCore>,
 }
@@ -592,33 +639,66 @@ impl std::fmt::Debug for TurboQuantCore {
 impl TurboQuantCore {
     fn new(dim: usize, max_mse_bits: u8) -> Self {
         let mut rng = StdRng::seed_from_u64(TURBOQUANT_SEED ^ ((dim as u64) << 32));
-        let rotation = generate_random_orthogonal(dim, &mut rng);
-        let inverse_rotation = transpose_square_matrix(&rotation, dim);
-        let qjl_projection = generate_random_projection(dim, &mut rng);
-        let inverse_qjl_projection = transpose_square_matrix(&qjl_projection, dim);
+
+        // For power-of-two dims (every transformer head_dim worth optimizing for)
+        // we use signed-FWHT — O(d log d) compute, no [d×d] matrix allocation,
+        // identical statistical guarantees to a Haar-random rotation. The dense
+        // path stays as fallback for the rare non-pow2 dim (e.g. 192 in some
+        // VLMs); only that branch needs the four [d×d] matrices.
+        let use_fwht = dim_uses_fwht(dim);
+        let (rotation, inverse_rotation, qjl_projection, inverse_qjl_projection) = if use_fwht {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        } else {
+            let rot = generate_random_orthogonal(dim, &mut rng);
+            let inv_rot = transpose_square_matrix(&rot, dim);
+            let qjl = generate_random_projection(dim, &mut rng);
+            let inv_qjl = transpose_square_matrix(&qjl, dim);
+            (rot, inv_rot, qjl, inv_qjl)
+        };
+
+        let (wht_left_signs, wht_right_signs, qjl_wht_left_signs, qjl_wht_right_signs) =
+            if use_fwht {
+                let mut wht_rng =
+                    StdRng::seed_from_u64(TURBOQUANT_SEED ^ 0x5748_5400 ^ dim as u64);
+                (
+                    Some(local_rademacher_signs(dim, &mut wht_rng)),
+                    Some(local_rademacher_signs(dim, &mut wht_rng)),
+                    Some(local_rademacher_signs(dim, &mut wht_rng)),
+                    Some(local_rademacher_signs(dim, &mut wht_rng)),
+                )
+            } else {
+                (None, None, None, None)
+            };
 
         let mut codebooks = vec![Vec::new(); usize::from(max_mse_bits) + 1];
         for bits in 1..=max_mse_bits {
-            codebooks[usize::from(bits)] = build_beta_codebook(dim, bits);
+            codebooks[usize::from(bits)] =
+                (*pmetal_bridge::turboquant::beta_codebook(dim, bits)).clone();
         }
 
-        let metal = match MetalContext::global().and_then(|ctx| {
-            TurboQuantMetalCore::new(
-                ctx,
-                dim,
-                &rotation,
-                &inverse_rotation,
-                &qjl_projection,
-                &inverse_qjl_projection,
-            )
-        }) {
-            Ok(metal) => Some(metal),
-            Err(error) => {
-                debug!(
+        // Metal-side pre-built rotation matrices are only useful for the
+        // non-FWHT path; FWHT runs in CPU-side `signed_fwht_forward`.
+        let metal = if use_fwht {
+            None
+        } else {
+            match MetalContext::global().and_then(|ctx| {
+                TurboQuantMetalCore::new(
+                    ctx,
                     dim,
-                    "TurboQuant Metal backend unavailable, using CPU fallback: {error}"
-                );
-                None
+                    &rotation,
+                    &inverse_rotation,
+                    &qjl_projection,
+                    &inverse_qjl_projection,
+                )
+            }) {
+                Ok(metal) => Some(metal),
+                Err(error) => {
+                    debug!(
+                        dim,
+                        "TurboQuant Metal backend unavailable, using CPU fallback: {error}"
+                    );
+                    None
+                }
             }
         };
 
@@ -628,6 +708,10 @@ impl TurboQuantCore {
             inverse_rotation,
             qjl_projection,
             inverse_qjl_projection,
+            wht_left_signs,
+            wht_right_signs,
+            qjl_wht_left_signs,
+            qjl_wht_right_signs,
             codebooks,
             metal,
         }
@@ -638,6 +722,13 @@ impl TurboQuantCore {
     }
 
     fn rotate_rows(&self, input: &[f32]) -> Vec<f32> {
+        // FWHT applies `D_left · H · D_right` — the *forward* rotation maps
+        // the input through (right_signs, left_signs).
+        if let Some(out) =
+            self.try_fwht_rows(input, &self.wht_right_signs, &self.wht_left_signs)
+        {
+            return out;
+        }
         self.apply_rows(
             "rotation",
             &self.rotation,
@@ -647,6 +738,12 @@ impl TurboQuantCore {
     }
 
     fn inverse_rotate_rows(&self, input: &[f32]) -> Vec<f32> {
+        // Inverse swaps the two diagonal sign matrices: (left_signs, right_signs).
+        if let Some(out) =
+            self.try_fwht_rows(input, &self.wht_left_signs, &self.wht_right_signs)
+        {
+            return out;
+        }
         self.apply_rows(
             "inverse-rotation",
             &self.inverse_rotation,
@@ -656,6 +753,13 @@ impl TurboQuantCore {
     }
 
     fn project_rows(&self, input: &[f32]) -> Vec<f32> {
+        if let Some(out) = self.try_fwht_rows(
+            input,
+            &self.qjl_wht_right_signs,
+            &self.qjl_wht_left_signs,
+        ) {
+            return out;
+        }
         self.apply_rows(
             "qjl-projection",
             &self.qjl_projection,
@@ -665,12 +769,40 @@ impl TurboQuantCore {
     }
 
     fn inverse_project_rows(&self, input: &[f32]) -> Vec<f32> {
+        if let Some(out) = self.try_fwht_rows(
+            input,
+            &self.qjl_wht_left_signs,
+            &self.qjl_wht_right_signs,
+        ) {
+            return out;
+        }
         self.apply_rows(
             "inverse-qjl-projection",
             &self.inverse_qjl_projection,
             self.metal.as_ref().map(|m| &m.inverse_qjl_projection),
             input,
         )
+    }
+
+    /// Apply the signed-FWHT rotation row-by-row. Returns `None` when sign
+    /// vectors aren't built (i.e., non-pow2 dim — caller falls back to dense
+    /// matmul).
+    fn try_fwht_rows(
+        &self,
+        input: &[f32],
+        pre_signs: &Option<Vec<f32>>,
+        post_signs: &Option<Vec<f32>>,
+    ) -> Option<Vec<f32>> {
+        if input.is_empty() {
+            return Some(Vec::new());
+        }
+        let pre = pre_signs.as_deref()?;
+        let post = post_signs.as_deref()?;
+        let mut output = input.to_vec();
+        for row in output.chunks_mut(self.dim) {
+            pmetal_bridge::turboquant::signed_fwht_forward(row, post, pre);
+        }
+        Some(output)
     }
 
     fn apply_rows(
@@ -792,12 +924,30 @@ where
 ///
 /// Keys use the inner-product quantizer from the paper and values use the
 /// MSE-optimized quantizer.
+///
+/// Hot/cold split: when `config.recent_window` is `Some(N)`, the most recent
+/// `N` tokens are kept uncompressed in `hot_keys`/`hot_values` (fp16). Only
+/// older history is compressed. This matches SwiftLM's strategy and means
+/// short prompts (the common case) pay zero compression overhead. The hot
+/// ring is sized to `recent_window + HOT_EVICTION_CHUNK` so eviction batches
+/// `HOT_EVICTION_CHUNK` tokens at a time instead of one-token-at-a-time
+/// shuffles.
 #[derive(Debug)]
 pub struct TurboQuantKvCache {
     keys: Option<TurboKeyStore>,
     values: Option<TurboValueStore>,
     layout: Option<TurboLayout>,
+    /// Total tokens visible to the caller (hot + cold). Drives RoPE offsets.
     offset: usize,
+    /// Tokens compressed into the cold side. `cold_offset = offset - hot_offset`.
+    cold_offset: usize,
+    /// Tokens currently sitting uncompressed in the hot ring.
+    hot_offset: usize,
+    /// Hot-ring keys, shape `[B, H_kv, hot_capacity, D_k]`. `None` until first
+    /// append (we lazily learn the layout) or when the recent window is disabled.
+    hot_keys: Option<Array>,
+    /// Hot-ring values.
+    hot_values: Option<Array>,
     config: TurboQuantConfig,
     dtype: Dtype,
     runtime: Option<Arc<TurboQuantRuntime>>,
@@ -819,6 +969,10 @@ impl TurboQuantKvCache {
             values: None,
             layout: None,
             offset: 0,
+            cold_offset: 0,
+            hot_offset: 0,
+            hot_keys: None,
+            hot_values: None,
             config,
             dtype: Dtype::Float16,
             runtime: None,
@@ -834,7 +988,7 @@ impl TurboQuantKvCache {
         cache
     }
 
-    /// Current number of cached sequence positions.
+    /// Current number of cached sequence positions (hot + cold).
     pub fn len(&self) -> usize {
         self.offset
     }
@@ -849,12 +1003,35 @@ impl TurboQuantKvCache {
         self.offset as i32
     }
 
+    /// Number of tokens currently held uncompressed in the hot ring.
+    pub fn hot_len(&self) -> usize {
+        self.hot_offset
+    }
+
+    /// Number of tokens that have been compressed into the cold store.
+    pub fn cold_len(&self) -> usize {
+        self.cold_offset
+    }
+
     /// Reset the cache.
     pub fn reset(&mut self) {
         self.keys = None;
         self.values = None;
         self.layout = None;
+        self.hot_keys = None;
+        self.hot_values = None;
         self.offset = 0;
+        self.cold_offset = 0;
+        self.hot_offset = 0;
+    }
+
+    /// Hot-ring capacity = `recent_window + HOT_EVICTION_CHUNK` when the
+    /// window is enabled, `0` when disabled (legacy compress-everything mode).
+    fn hot_capacity(&self) -> usize {
+        self.config
+            .recent_window
+            .map(|w| w + HOT_EVICTION_CHUNK)
+            .unwrap_or(0)
     }
 
     pub(crate) fn can_direct_attention(
@@ -882,15 +1059,15 @@ impl TurboQuantKvCache {
             )
     }
 
-    fn append(&mut self, keys: &Array, values: &Array) -> Result<TurboLayout, Exception> {
-        self.dtype = keys.dtype();
-        let layout = self.ensure_layout(keys, values)?;
-        let rows_per_seq = layout.batch * layout.heads;
-        let seq_len = keys.dim(2) as usize;
-
-        let key_rows = array_rows_in_bshd_order(keys)?;
-        let value_rows = array_rows_in_bshd_order(values)?;
-
+    /// Compress `key_rows` / `value_rows` (in BSHD-flattened order) into the
+    /// cold store, advancing `cold_offset` by `seq_len`.
+    fn compress_into_cold(
+        &mut self,
+        layout: TurboLayout,
+        seq_len: usize,
+        key_rows: &[f32],
+        value_rows: &[f32],
+    ) {
         let config = self.config;
         let runtime = self.runtime.get_or_insert_with(|| {
             Arc::new(TurboQuantRuntime::new(
@@ -900,9 +1077,9 @@ impl TurboQuantKvCache {
             ))
         });
 
-        let encoded_keys = encode_key_rows_for_runtime(&runtime.keys, layout.key_dim, &key_rows);
+        let encoded_keys = encode_key_rows_for_runtime(&runtime.keys, layout.key_dim, key_rows);
         let encoded_values =
-            encode_value_rows_for_runtime(&runtime.values, layout.value_dim, &value_rows);
+            encode_value_rows_for_runtime(&runtime.values, layout.value_dim, value_rows);
 
         let key_store = self
             .keys
@@ -914,12 +1091,261 @@ impl TurboQuantKvCache {
             .get_or_insert_with(|| TurboValueStore::new(self.config.values, layout.value_dim));
         value_store.extend(&encoded_values);
 
-        self.offset += seq_len;
+        self.cold_offset += seq_len;
+        let rows_per_seq = layout.batch * layout.heads;
         debug_assert_eq!(
             key_store.regular_norms.len(),
-            self.offset * rows_per_seq,
+            self.cold_offset * rows_per_seq,
             "TurboQuant key store row count drifted"
         );
+    }
+
+    /// Pull the leading `evict_seq` tokens out of the hot ring, compress them
+    /// into cold, and slide the remainder back to the start of the buffer.
+    /// Caller must guarantee `evict_seq <= self.hot_offset`.
+    fn evict_oldest_to_cold(
+        &mut self,
+        layout: TurboLayout,
+        evict_seq: usize,
+    ) -> Result<(), Exception> {
+        if evict_seq == 0 {
+            return Ok(());
+        }
+
+        // Phase 1: extract slices we need (evicted prefix + kept suffix) into
+        // owned values so the immutable borrow of `self.hot_*` ends before we
+        // call any `&mut self` methods below.
+        let remain = self.hot_offset - evict_seq;
+        let (evict_key_rows, evict_value_rows, kept) = {
+            let hot_keys = self
+                .hot_keys
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TurboQuant hot keys missing during evict"))?;
+            let hot_values = self
+                .hot_values
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TurboQuant hot values missing during evict"))?;
+
+            let evict_keys = hot_keys.slice(
+                &[0, 0, 0, 0],
+                &[
+                    layout.batch as i32,
+                    layout.heads as i32,
+                    evict_seq as i32,
+                    layout.key_dim as i32,
+                ],
+            );
+            let evict_values = hot_values.slice(
+                &[0, 0, 0, 0],
+                &[
+                    layout.batch as i32,
+                    layout.heads as i32,
+                    evict_seq as i32,
+                    layout.value_dim as i32,
+                ],
+            );
+            let evict_key_rows = array_rows_in_bshd_order(&evict_keys)?;
+            let evict_value_rows = array_rows_in_bshd_order(&evict_values)?;
+
+            let kept = if remain > 0 {
+                let kept_keys = hot_keys.slice(
+                    &[0, 0, evict_seq as i32, 0],
+                    &[
+                        layout.batch as i32,
+                        layout.heads as i32,
+                        self.hot_offset as i32,
+                        layout.key_dim as i32,
+                    ],
+                );
+                let kept_values = hot_values.slice(
+                    &[0, 0, evict_seq as i32, 0],
+                    &[
+                        layout.batch as i32,
+                        layout.heads as i32,
+                        self.hot_offset as i32,
+                        layout.value_dim as i32,
+                    ],
+                );
+                Some((kept_keys, kept_values))
+            } else {
+                None
+            };
+            (evict_key_rows, evict_value_rows, kept)
+        };
+
+        // Phase 2: mutate. The borrows above are dropped.
+        self.compress_into_cold(layout, evict_seq, &evict_key_rows, &evict_value_rows);
+        if let Some((kept_keys, kept_values)) = kept {
+            let capacity = self.hot_capacity().max(remain);
+            self.hot_keys = Some(self.allocate_hot_buffer(layout, capacity, true)?);
+            self.hot_values = Some(self.allocate_hot_buffer(layout, capacity, false)?);
+            self.write_into_hot(layout, 0, remain, &kept_keys, &kept_values)?;
+        } else {
+            // Nothing left in hot — drop the buffers entirely (saves memory
+            // until next append re-allocates).
+            self.hot_keys = None;
+            self.hot_values = None;
+        }
+        self.hot_offset = remain;
+        Ok(())
+    }
+
+    /// Allocate a zero-filled hot buffer with shape
+    /// `[B, H_kv, capacity, D_k_or_v]` matching the cache dtype.
+    fn allocate_hot_buffer(
+        &self,
+        layout: TurboLayout,
+        capacity: usize,
+        is_keys: bool,
+    ) -> Result<Array, Exception> {
+        let dim = if is_keys {
+            layout.key_dim
+        } else {
+            layout.value_dim
+        };
+        let shape = [
+            layout.batch as i32,
+            layout.heads as i32,
+            capacity as i32,
+            dim as i32,
+        ];
+        Ok(pmetal_bridge::compat::ops::zeros(&shape, self.dtype))
+    }
+
+    /// Write `[B, H, seq, D]`-shaped `keys`/`values` into the hot ring at
+    /// `[B, H, start..start+seq, D]`.
+    fn write_into_hot(
+        &mut self,
+        layout: TurboLayout,
+        start: usize,
+        seq: usize,
+        keys: &Array,
+        values: &Array,
+    ) -> Result<(), Exception> {
+        if seq == 0 {
+            return Ok(());
+        }
+        let hot_keys = self
+            .hot_keys
+            .as_mut()
+            .ok_or_else(|| Exception::custom("TurboQuant hot keys missing"))?;
+        let hot_values = self
+            .hot_values
+            .as_mut()
+            .ok_or_else(|| Exception::custom("TurboQuant hot values missing"))?;
+
+        let stop = start + seq;
+        let key_start = [0, 0, start as i32, 0];
+        let key_stop = [
+            layout.batch as i32,
+            layout.heads as i32,
+            stop as i32,
+            layout.key_dim as i32,
+        ];
+        let value_stop = [
+            layout.batch as i32,
+            layout.heads as i32,
+            stop as i32,
+            layout.value_dim as i32,
+        ];
+
+        let keys_typed = keys.as_dtype(self.dtype.as_i32());
+        let values_typed = values.as_dtype(self.dtype.as_i32());
+
+        *hot_keys = hot_keys.slice_set(&keys_typed, &key_start, &key_stop);
+        *hot_values = hot_values.slice_set(&values_typed, &key_start, &value_stop);
+        Ok(())
+    }
+
+    fn append(&mut self, keys: &Array, values: &Array) -> Result<TurboLayout, Exception> {
+        self.dtype = keys.dtype();
+        let layout = self.ensure_layout(keys, values)?;
+        let seq_len = keys.dim(2) as usize;
+
+        match self.config.recent_window {
+            None => {
+                // Legacy "compress every token" path — no hot ring.
+                let key_rows = array_rows_in_bshd_order(keys)?;
+                let value_rows = array_rows_in_bshd_order(values)?;
+                self.compress_into_cold(layout, seq_len, &key_rows, &value_rows);
+                self.offset = self.cold_offset;
+                Ok(layout)
+            }
+            Some(window) => self.append_with_recent_window(layout, seq_len, keys, values, window),
+        }
+    }
+
+    fn append_with_recent_window(
+        &mut self,
+        layout: TurboLayout,
+        seq_len: usize,
+        keys: &Array,
+        values: &Array,
+        window: usize,
+    ) -> Result<TurboLayout, Exception> {
+        let capacity = self.hot_capacity().max(seq_len);
+
+        // Lazy-allocate the hot ring on first use or after a previous full drain.
+        if self.hot_keys.is_none() {
+            self.hot_keys = Some(self.allocate_hot_buffer(layout, capacity, true)?);
+            self.hot_values = Some(self.allocate_hot_buffer(layout, capacity, false)?);
+        } else if self.hot_offset + seq_len > capacity {
+            // Single-shot prefill larger than the ring — grow capacity to fit.
+            let need = self.hot_offset + seq_len;
+            let new_cap = need.max(capacity);
+            let new_keys = self.allocate_hot_buffer(layout, new_cap, true)?;
+            let new_values = self.allocate_hot_buffer(layout, new_cap, false)?;
+            if self.hot_offset > 0 {
+                let prev_keys = self
+                    .hot_keys
+                    .as_ref()
+                    .expect("hot_keys checked above")
+                    .slice(
+                        &[0, 0, 0, 0],
+                        &[
+                            layout.batch as i32,
+                            layout.heads as i32,
+                            self.hot_offset as i32,
+                            layout.key_dim as i32,
+                        ],
+                    );
+                let prev_values = self
+                    .hot_values
+                    .as_ref()
+                    .expect("hot_values checked above")
+                    .slice(
+                        &[0, 0, 0, 0],
+                        &[
+                            layout.batch as i32,
+                            layout.heads as i32,
+                            self.hot_offset as i32,
+                            layout.value_dim as i32,
+                        ],
+                    );
+                self.hot_keys = Some(new_keys);
+                self.hot_values = Some(new_values);
+                self.write_into_hot(layout, 0, self.hot_offset, &prev_keys, &prev_values)?;
+            } else {
+                self.hot_keys = Some(new_keys);
+                self.hot_values = Some(new_values);
+            }
+        }
+
+        let start = self.hot_offset;
+        self.write_into_hot(layout, start, seq_len, keys, values)?;
+        self.hot_offset += seq_len;
+        self.offset = self.cold_offset + self.hot_offset;
+
+        // Evict in `HOT_EVICTION_CHUNK` batches once the hot ring fills past
+        // `window + chunk`. This keeps eviction amortized rather than
+        // single-token churn.
+        while self.hot_offset > window + HOT_EVICTION_CHUNK {
+            let evict_seq = self
+                .hot_offset
+                .saturating_sub(window)
+                .min(HOT_EVICTION_CHUNK);
+            self.evict_oldest_to_cold(layout, evict_seq)?;
+        }
 
         Ok(layout)
     }
@@ -934,8 +1360,18 @@ impl TurboQuantKvCache {
         Ok((self.dequantize_keys()?, self.dequantize_values()?))
     }
 
-    /// Append a new `[B, H, S, D]` KV chunk and compute direct attention output
-    /// from the compressed cache for single-token decode.
+    /// Append a new `[B, H, S, D]` KV chunk and compute attention against the
+    /// full cache (hot + cold) for single-token decode.
+    ///
+    /// The dispatch is:
+    /// - **Hot-only** (no compression has fired yet, the common short-context
+    ///   case): standard fused SDPA against the fp16 hot ring.
+    /// - **Cold-only** (`recent_window` disabled or fully drained): the
+    ///   compressed-domain `direct_attention_output` path that scores against
+    ///   TurboQuant indices without decoding the full cache to fp16.
+    /// - **Mixed**: dequantize cold, concatenate the hot suffix, fall back to
+    ///   fused SDPA. (A v2 hybrid pass that scores hot directly + cold
+    ///   compressedly is a follow-up; correctness here is the priority.)
     pub fn append_and_compute_attention(
         &mut self,
         queries: &Array,
@@ -951,29 +1387,69 @@ impl TurboQuantKvCache {
         }
 
         let layout = self.append(keys, values)?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| Exception::custom("TurboQuant runtime missing"))?;
-        let key_store = self
-            .keys
-            .as_ref()
-            .ok_or_else(|| Exception::custom("TurboQuant key store missing"))?;
-        let value_store = self
-            .values
-            .as_ref()
-            .ok_or_else(|| Exception::custom("TurboQuant value store missing"))?;
 
-        direct_attention_output(
-            queries,
-            layout,
-            self.offset,
-            runtime,
-            key_store,
-            value_store,
-            self.config,
-            attn_config,
-        )
+        if self.cold_offset == 0 {
+            // Hot-only: take the active prefix of the hot ring and run the
+            // standard fused SDPA. No compression involved.
+            let hot_keys = self
+                .hot_keys
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TurboQuant hot keys missing"))?;
+            let hot_values = self
+                .hot_values
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TurboQuant hot values missing"))?;
+            let active_keys = hot_keys.slice(
+                &[0, 0, 0, 0],
+                &[
+                    layout.batch as i32,
+                    layout.heads as i32,
+                    self.hot_offset as i32,
+                    layout.key_dim as i32,
+                ],
+            );
+            let active_values = hot_values.slice(
+                &[0, 0, 0, 0],
+                &[
+                    layout.batch as i32,
+                    layout.heads as i32,
+                    self.hot_offset as i32,
+                    layout.value_dim as i32,
+                ],
+            );
+            return fused_sdpa(queries, &active_keys, &active_values, attn_config, None);
+        }
+
+        if self.hot_offset == 0 {
+            // Cold-only: compressed-domain direct attention.
+            let runtime = self
+                .runtime
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TurboQuant runtime missing"))?;
+            let key_store = self
+                .keys
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TurboQuant key store missing"))?;
+            let value_store = self
+                .values
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TurboQuant value store missing"))?;
+            return direct_attention_output(
+                queries,
+                layout,
+                self.cold_offset,
+                runtime,
+                key_store,
+                value_store,
+                self.config,
+                attn_config,
+            );
+        }
+
+        // Mixed: decode cold, concat with active hot suffix, run fused SDPA.
+        let full_keys = self.dequantize_keys()?;
+        let full_values = self.dequantize_values()?;
+        fused_sdpa(queries, &full_keys, &full_values, attn_config, None)
     }
 
     /// Whether the cache supports trim.
@@ -989,41 +1465,94 @@ impl TurboQuantKvCache {
     }
 
     /// Roll back the last `n` cached tokens.
+    ///
+    /// Hot tokens trim first (cheap, just decrement `hot_offset`). If `n`
+    /// exceeds the hot side we then truncate cold by the remainder. The cold
+    /// truncation is the existing per-row store truncate; once a token has
+    /// been compressed it can't be re-promoted to fp16, so rolling past that
+    /// boundary loses the original-precision recent window.
     pub fn rollback(&mut self, n: usize) {
         if n == 0 || self.offset == 0 {
             return;
         }
 
-        let layout = match self.layout {
-            Some(layout) => layout,
-            None => return,
-        };
-        let keep_seq = self.offset.saturating_sub(n);
-        let keep_rows = keep_seq * layout.batch * layout.heads;
+        let trim = n.min(self.offset);
 
-        if let Some(keys) = &mut self.keys {
-            keys.truncate(keep_rows, layout.key_dim, self.config.keys);
-        }
-        if let Some(values) = &mut self.values {
-            values.truncate(keep_rows, layout.value_dim, self.config.values);
+        // Take a chunk out of hot first.
+        let hot_trim = trim.min(self.hot_offset);
+        if hot_trim > 0 {
+            self.hot_offset -= hot_trim;
+            // We don't bother shrinking the buffer — the trailing slots are
+            // unreachable until the next append re-uses them.
+            if self.hot_offset == 0 {
+                self.hot_keys = None;
+                self.hot_values = None;
+            }
         }
 
-        self.offset = keep_seq;
+        // Anything still left to trim has to come from cold.
+        let cold_trim = trim - hot_trim;
+        if cold_trim > 0 {
+            let layout = match self.layout {
+                Some(layout) => layout,
+                None => return,
+            };
+            let keep_cold = self.cold_offset.saturating_sub(cold_trim);
+            let keep_rows = keep_cold * layout.batch * layout.heads;
+
+            if let Some(keys) = &mut self.keys {
+                keys.truncate(keep_rows, layout.key_dim, self.config.keys);
+            }
+            if let Some(values) = &mut self.values {
+                values.truncate(keep_rows, layout.value_dim, self.config.values);
+            }
+            self.cold_offset = keep_cold;
+            if self.cold_offset == 0 {
+                self.keys = None;
+                self.values = None;
+            }
+        }
+
+        self.offset = self.cold_offset + self.hot_offset;
         if self.offset == 0 {
-            self.keys = None;
-            self.values = None;
             self.layout = None;
         }
     }
 
-    /// Estimated storage used by the cache payload.
+    /// Estimated storage used by the cache payload — sums the compressed
+    /// cold-side stores AND the dense hot-ring buffers (which dominate when
+    /// the cache holds < `recent_window` tokens).
     pub fn memory_usage(&self) -> usize {
-        let key_bytes = self.keys.as_ref().map_or(0, TurboKeyStore::memory_usage);
-        let value_bytes = self
-            .values
-            .as_ref()
-            .map_or(0, TurboValueStore::memory_usage);
-        key_bytes + value_bytes
+        let cold_bytes = self.keys.as_ref().map_or(0, TurboKeyStore::memory_usage)
+            + self
+                .values
+                .as_ref()
+                .map_or(0, TurboValueStore::memory_usage);
+        let hot_bytes = match self.layout {
+            Some(layout) => {
+                let bytes_per_elem = match self.dtype {
+                    Dtype::Float32 => 4,
+                    Dtype::Bfloat16 | Dtype::Float16 => 2,
+                    _ => 2,
+                };
+                let elems_per_seq = layout.batch * layout.heads;
+                let key_dim = layout.key_dim;
+                let value_dim = layout.value_dim;
+                let key_buffer_seq = self
+                    .hot_keys
+                    .as_ref()
+                    .map_or(0, |arr| arr.dim(2) as usize);
+                let value_buffer_seq = self
+                    .hot_values
+                    .as_ref()
+                    .map_or(0, |arr| arr.dim(2) as usize);
+                (key_buffer_seq * elems_per_seq * key_dim
+                    + value_buffer_seq * elems_per_seq * value_dim)
+                    * bytes_per_elem
+            }
+            None => 0,
+        };
+        cold_bytes + hot_bytes
     }
 
     fn ensure_layout(&mut self, keys: &Array, values: &Array) -> Result<TurboLayout, Exception> {
@@ -1090,58 +1619,122 @@ impl TurboQuantKvCache {
         let layout = self
             .layout
             .ok_or_else(|| Exception::custom("TurboQuant key layout missing"))?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| Exception::custom("TurboQuant runtime missing"))?;
-        let keys = self
-            .keys
-            .as_ref()
-            .ok_or_else(|| Exception::custom("TurboQuant key store missing"))?;
 
-        let decoded = decode_key_rows_for_runtime(&runtime.keys, layout.key_dim, keys);
+        let cold_part = if self.cold_offset > 0 {
+            let runtime = self
+                .runtime
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TurboQuant runtime missing"))?;
+            let keys = self
+                .keys
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TurboQuant key store missing"))?;
+            let decoded = decode_key_rows_for_runtime(&runtime.keys, layout.key_dim, keys);
+            let array = Array::from_f32_slice(
+                &decoded,
+                &[
+                    layout.batch as i32,
+                    self.cold_offset as i32,
+                    layout.heads as i32,
+                    layout.key_dim as i32,
+                ],
+            );
+            Some(
+                array
+                    .transpose_axes(&[0, 2, 1, 3])
+                    .as_dtype(self.dtype.as_i32()),
+            )
+        } else {
+            None
+        };
 
-        let array = Array::from_f32_slice(
-            &decoded,
-            &[
-                layout.batch as i32,
-                self.offset as i32,
-                layout.heads as i32,
-                layout.key_dim as i32,
-            ],
-        );
-        Ok(array
-            .transpose_axes(&[0, 2, 1, 3])
-            .as_dtype(self.dtype.as_i32()))
+        let hot_part = if self.hot_offset > 0 {
+            let hot_keys = self
+                .hot_keys
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TurboQuant hot keys missing"))?;
+            Some(hot_keys.slice(
+                &[0, 0, 0, 0],
+                &[
+                    layout.batch as i32,
+                    layout.heads as i32,
+                    self.hot_offset as i32,
+                    layout.key_dim as i32,
+                ],
+            ))
+        } else {
+            None
+        };
+
+        match (cold_part, hot_part) {
+            (Some(cold), Some(hot)) => {
+                Ok(pmetal_bridge::compat::ops::concatenate_axis(&[&cold, &hot], 2))
+            }
+            (Some(cold), None) => Ok(cold),
+            (None, Some(hot)) => Ok(hot),
+            (None, None) => Err(Exception::custom("TurboQuant cache is empty")),
+        }
     }
 
     fn dequantize_values(&self) -> Result<Array, Exception> {
         let layout = self
             .layout
             .ok_or_else(|| Exception::custom("TurboQuant value layout missing"))?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| Exception::custom("TurboQuant runtime missing"))?;
-        let values = self
-            .values
-            .as_ref()
-            .ok_or_else(|| Exception::custom("TurboQuant value store missing"))?;
 
-        let decoded = decode_value_rows_for_runtime(&runtime.values, layout.value_dim, values);
+        let cold_part = if self.cold_offset > 0 {
+            let runtime = self
+                .runtime
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TurboQuant runtime missing"))?;
+            let values = self
+                .values
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TurboQuant value store missing"))?;
+            let decoded = decode_value_rows_for_runtime(&runtime.values, layout.value_dim, values);
+            let array = Array::from_f32_slice(
+                &decoded,
+                &[
+                    layout.batch as i32,
+                    self.cold_offset as i32,
+                    layout.heads as i32,
+                    layout.value_dim as i32,
+                ],
+            );
+            Some(
+                array
+                    .transpose_axes(&[0, 2, 1, 3])
+                    .as_dtype(self.dtype.as_i32()),
+            )
+        } else {
+            None
+        };
 
-        let array = Array::from_f32_slice(
-            &decoded,
-            &[
-                layout.batch as i32,
-                self.offset as i32,
-                layout.heads as i32,
-                layout.value_dim as i32,
-            ],
-        );
-        Ok(array
-            .transpose_axes(&[0, 2, 1, 3])
-            .as_dtype(self.dtype.as_i32()))
+        let hot_part = if self.hot_offset > 0 {
+            let hot_values = self
+                .hot_values
+                .as_ref()
+                .ok_or_else(|| Exception::custom("TurboQuant hot values missing"))?;
+            Some(hot_values.slice(
+                &[0, 0, 0, 0],
+                &[
+                    layout.batch as i32,
+                    layout.heads as i32,
+                    self.hot_offset as i32,
+                    layout.value_dim as i32,
+                ],
+            ))
+        } else {
+            None
+        };
+
+        match (cold_part, hot_part) {
+            (Some(cold), Some(hot)) => {
+                Ok(pmetal_bridge::compat::ops::concatenate_axis(&[&cold, &hot], 2))
+            }
+            (Some(cold), None) => Ok(cold),
+            (None, Some(hot)) => Ok(hot),
+            (None, None) => Err(Exception::custom("TurboQuant cache is empty")),
+        }
     }
 }
 
@@ -2143,76 +2736,6 @@ fn nearest_centroid_index(value: f32, codebook: &[f32]) -> usize {
     }
 }
 
-fn build_beta_codebook(dim: usize, bits: u8) -> Vec<f32> {
-    let centroid_count = 1usize << bits;
-    let mut xs = Vec::with_capacity(LLOYD_GRID_POINTS);
-    let mut weights = Vec::with_capacity(LLOYD_GRID_POINTS);
-    let alpha = ((dim as f64) - 3.0) / 2.0;
-    let step = 2.0 / (LLOYD_GRID_POINTS as f64);
-
-    for idx in 0..LLOYD_GRID_POINTS {
-        let x = -1.0 + ((idx as f64) + 0.5) * step;
-        let weight = if dim <= 2 {
-            1.0
-        } else {
-            (1.0 - x * x).max(0.0).powf(alpha)
-        };
-        xs.push(x);
-        weights.push(weight);
-    }
-
-    let mut cumulative = Vec::with_capacity(LLOYD_GRID_POINTS);
-    let mut total_weight = 0.0;
-    for weight in &weights {
-        total_weight += *weight;
-        cumulative.push(total_weight);
-    }
-
-    let mut centroids = Vec::with_capacity(centroid_count);
-    for bucket in 0..centroid_count {
-        let target = ((bucket as f64) + 0.5) * total_weight / (centroid_count as f64);
-        let index = cumulative.partition_point(|value| *value < target);
-        centroids.push(xs[index.min(xs.len() - 1)]);
-    }
-    centroids.sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap());
-
-    for _ in 0..LLOYD_MAX_ITERS {
-        let mut boundaries = Vec::with_capacity(centroid_count + 1);
-        boundaries.push(-1.0f64);
-        for pair in centroids.windows(2) {
-            boundaries.push((pair[0] + pair[1]) * 0.5);
-        }
-        boundaries.push(1.0f64);
-
-        let mut updated = centroids.clone();
-        let mut max_change = 0.0f64;
-        for bucket in 0..centroid_count {
-            let left = boundaries[bucket];
-            let right = boundaries[bucket + 1];
-            let mut weighted_sum = 0.0;
-            let mut weight_sum = 0.0;
-            for (&x, &weight) in xs.iter().zip(weights.iter()) {
-                if x >= left && x < right {
-                    weighted_sum += x * weight;
-                    weight_sum += weight;
-                }
-            }
-            if weight_sum > 0.0 {
-                updated[bucket] = weighted_sum / weight_sum;
-            } else {
-                updated[bucket] = (left + right) * 0.5;
-            }
-            max_change = max_change.max((updated[bucket] - centroids[bucket]).abs());
-        }
-        centroids = updated;
-        if max_change < LLOYD_MAX_TOLERANCE {
-            break;
-        }
-    }
-
-    centroids.into_iter().map(|value| value as f32).collect()
-}
-
 fn generate_random_projection(dim: usize, rng: &mut StdRng) -> Vec<f32> {
     let mut projection = Vec::with_capacity(dim * dim);
     for _ in 0..(dim * dim) {
@@ -2357,8 +2880,157 @@ mod tests {
 
     #[test]
     fn beta_codebook_is_sorted() {
-        let codebook = build_beta_codebook(128, 4);
+        let codebook = pmetal_bridge::turboquant::beta_codebook(128, 4);
         assert_eq!(codebook.len(), 16);
         assert!(codebook.windows(2).all(|window| window[0] <= window[1]));
+    }
+
+    #[test]
+    fn beta_codebook_memoization_is_stable() {
+        // Two calls with the same (dim, bits) must return identical centroids.
+        let a = pmetal_bridge::turboquant::beta_codebook(128, 3);
+        let b = pmetal_bridge::turboquant::beta_codebook(128, 3);
+        assert_eq!(*a, *b);
+        assert_eq!(a.len(), 1usize << 3);
+    }
+
+    #[test]
+    fn fwht_rotation_is_norm_preserving_and_self_inverse() {
+        // The signed-FWHT rotation must be (statistically) orthonormal: the
+        // L2 norm of any input vector is preserved exactly after the forward
+        // pass, and a forward followed by an inverse recovers the original
+        // up to floating-point rounding.
+        for &dim in &[8usize, 64, 128, 256] {
+            assert!(super::dim_uses_fwht(dim), "dim {dim} should use FWHT");
+            let core = super::TurboQuantCore::new(dim, 4);
+            let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+            let input: Vec<f32> = (0..dim).map(|_| super::sample_standard_normal(&mut rng)).collect();
+            let input_norm: f32 = input.iter().map(|v| v * v).sum::<f32>().sqrt();
+
+            let rotated = core.rotate_rows(&input);
+            let rotated_norm: f32 = rotated.iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!(
+                (rotated_norm - input_norm).abs() < input_norm * 1e-4,
+                "dim={dim}: ||x|| {input_norm:.6} != ||Πx|| {rotated_norm:.6}"
+            );
+
+            let recovered = core.inverse_rotate_rows(&rotated);
+            let mut max_err = 0.0f32;
+            for (orig, back) in input.iter().zip(recovered.iter()) {
+                max_err = max_err.max((orig - back).abs());
+            }
+            assert!(
+                max_err < 1e-4,
+                "dim={dim}: forward∘inverse max abs error {max_err:.2e} exceeds 1e-4"
+            );
+        }
+    }
+
+    #[test]
+    fn fwht_skipped_for_non_pow2_dim() {
+        // Non-pow2 dims keep the dense matmul path; the sign vectors are not
+        // built and the dense rotation matrix is allocated.
+        assert!(!super::dim_uses_fwht(192));
+        let core = super::TurboQuantCore::new(192, 4);
+        assert!(core.wht_left_signs.is_none());
+        assert_eq!(core.rotation.len(), 192 * 192);
+    }
+
+    #[test]
+    fn hot_window_keeps_short_context_uncompressed() {
+        // With the default `recent_window=8192`, a 64-token append should
+        // never touch the cold side — hot_offset == 64, cold_offset == 0.
+        let mut cache = super::TurboQuantKvCache::new(4, 3);
+        let keys = pmetal_bridge::compat::ops::ones(
+            &[1, 2, 64, 32],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let values = pmetal_bridge::compat::ops::ones(
+            &[1, 2, 64, 32],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        cache.update_and_fetch(&keys, &values).unwrap();
+        assert_eq!(cache.cold_len(), 0, "no compression for short context");
+        assert_eq!(cache.hot_len(), 64);
+        assert_eq!(cache.len(), 64);
+    }
+
+    #[test]
+    fn hot_window_evicts_to_cold_after_overflow() {
+        // Set a small recent window; push enough tokens to trigger eviction.
+        let config = super::TurboQuantConfig::uniform(4, 3).with_recent_window(Some(64));
+        let mut cache = super::TurboQuantKvCache::new_with_config(config);
+        let dtype = pmetal_bridge::compat::Dtype::Float32;
+        // First push: 50 tokens — under window.
+        let keys_a = pmetal_bridge::compat::ops::ones(&[1, 2, 50, 32], dtype);
+        let values_a = pmetal_bridge::compat::ops::ones(&[1, 2, 50, 32], dtype);
+        cache.update_and_fetch(&keys_a, &values_a).unwrap();
+        assert_eq!(cache.cold_len(), 0);
+        assert_eq!(cache.hot_len(), 50);
+        // Second push: bring total to 50+1100 = 1150. Hot capacity = 64+1024.
+        // Evicting 1086 leaves hot at 64. Cold gains 1086.
+        let keys_b = pmetal_bridge::compat::ops::ones(&[1, 2, 1100, 32], dtype);
+        let values_b = pmetal_bridge::compat::ops::ones(&[1, 2, 1100, 32], dtype);
+        cache.update_and_fetch(&keys_b, &values_b).unwrap();
+        assert_eq!(cache.len(), 1150);
+        assert!(
+            cache.cold_len() > 0,
+            "eviction must populate cold once hot exceeds window+chunk"
+        );
+        assert!(cache.hot_len() <= 64 + super::HOT_EVICTION_CHUNK);
+        assert_eq!(cache.cold_len() + cache.hot_len(), cache.len());
+    }
+
+    #[test]
+    fn rollback_drains_hot_before_cold() {
+        let config = super::TurboQuantConfig::uniform(4, 3).with_recent_window(Some(8));
+        let mut cache = super::TurboQuantKvCache::new_with_config(config);
+        let dtype = pmetal_bridge::compat::Dtype::Float32;
+        // Push enough to evict — 8 + 1024 + extra = 1100 → hot 8, cold 1092.
+        let keys = pmetal_bridge::compat::ops::ones(&[1, 2, 1100, 32], dtype);
+        let values = pmetal_bridge::compat::ops::ones(&[1, 2, 1100, 32], dtype);
+        cache.update_and_fetch(&keys, &values).unwrap();
+        let cold_before = cache.cold_len();
+        let hot_before = cache.hot_len();
+        assert!(cold_before > 0 && hot_before > 0);
+        // Rolling back fewer than hot_before must take only from hot.
+        cache.rollback(hot_before / 2);
+        assert_eq!(cache.cold_len(), cold_before, "cold must not be touched");
+        assert_eq!(cache.hot_len(), hot_before - hot_before / 2);
+        // Rolling back more than the remaining hot starts cutting cold.
+        cache.rollback(cache.hot_len() + 4);
+        assert_eq!(cache.hot_len(), 0);
+        assert_eq!(cache.cold_len(), cold_before - 4);
+    }
+
+    #[test]
+    fn legacy_recent_window_none_compresses_immediately() {
+        // `recent_window: None` reverts to the original always-compress
+        // behavior: every appended token goes straight to cold.
+        let config = super::TurboQuantConfig::uniform(4, 3).with_recent_window(None);
+        let mut cache = super::TurboQuantKvCache::new_with_config(config);
+        let dtype = pmetal_bridge::compat::Dtype::Float32;
+        let keys = pmetal_bridge::compat::ops::ones(&[1, 2, 16, 32], dtype);
+        let values = pmetal_bridge::compat::ops::ones(&[1, 2, 16, 32], dtype);
+        cache.update_and_fetch(&keys, &values).unwrap();
+        assert_eq!(cache.hot_len(), 0);
+        assert_eq!(cache.cold_len(), 16);
+    }
+
+    #[test]
+    fn fwht_skips_dense_matrix_allocation_for_pow2() {
+        // For every pow2 dim the dense rotation/QJL matrices must be empty —
+        // we trade a 4×d² f32 matrix for an O(d) sign vector. At d=256 that's
+        // ~1 MB per core saved; multiply by ~60 layers and big models really
+        // notice.
+        for &dim in &[8usize, 64, 128, 256] {
+            let core = super::TurboQuantCore::new(dim, 4);
+            assert!(core.rotation.is_empty(), "dim={dim} dense rotation leaked");
+            assert!(core.inverse_rotation.is_empty());
+            assert!(core.qjl_projection.is_empty());
+            assert!(core.inverse_qjl_projection.is_empty());
+            assert!(core.metal.is_none(), "dim={dim} pre-built Metal matrices leaked");
+            assert!(core.wht_left_signs.is_some());
+        }
     }
 }

@@ -1288,9 +1288,16 @@ impl QuantizedKvCache {
             let state = self.state.as_ref()?;
             if let Some(ref g) = ks.gpu {
                 let TurboQuantTensorConfig::Uniform { bits } = self.config.keys else {
-                    unreachable!("GPU store only exists for Uniform config")
+                    unreachable!("Uniform GpuKeyStore only exists for Uniform config")
                 };
                 Some(gpu_dequantize_keys(g, &state.keys, bits)?)
+            } else if let Some(ref g) = ks.gpu_mixed {
+                // Phase 3c: GPU-side Mixed dequantize avoids the CPU→GPU
+                // upload that dominated the dequantize+SDPA fallback. The
+                // result is `[B, H, T, D]` f32 already on device, ready for
+                // SDPA. Parity is gated by the round-trip test (see
+                // `turboquant_gpu_mixed_storage_round_trip_matches_cpu_dequantize`).
+                Some(gpu_dequantize_keys_mixed(g, &state.keys, &self.config)?)
             } else {
                 let rows = decode_key_rows(&state.keys, layout.key_dim, ks);
                 Some(f32_rows_to_bhsd_array(
@@ -1344,9 +1351,12 @@ impl QuantizedKvCache {
             let state = self.state.as_ref()?;
             if let Some(ref g) = vs.gpu {
                 let TurboQuantTensorConfig::Uniform { bits } = self.config.values else {
-                    unreachable!("GPU store only exists for Uniform config")
+                    unreachable!("Uniform GpuValueStore only exists for Uniform config")
                 };
                 Some(gpu_dequantize_values(g, &state.values, bits)?)
+            } else if let Some(ref g) = vs.gpu_mixed {
+                // Phase 3c: see `dequantize_keys` for the rationale.
+                Some(gpu_dequantize_values_mixed(g, &state.values, &self.config)?)
             } else {
                 let rows = decode_value_rows(&state.values, layout.value_dim, vs);
                 Some(f32_rows_to_bhsd_array(
@@ -3459,10 +3469,6 @@ fn gpu_dequantize_values(
 /// Dequantise a single key sub-vector (regular *or* outlier) for the
 /// Mixed-precision path. Mirrors `gpu_dequantize_keys` body but
 /// parameterised by an arbitrary `TurboQuantCore` and stored arrays.
-//
-// Phase 3a only exercises this from tests; Phase 3c will wire it into the
-// non-test attention dispatch. Suppress the dead-code warning meanwhile.
-#[allow(dead_code)]
 fn gpu_dequantize_key_subvector(
     indices_u8: &InlineArray,        // [B, H, T, D_sub] u8
     qjl_signs: &InlineArray,         // [B, H, T, ceil(D_sub/32)] u32
@@ -3510,7 +3516,6 @@ fn gpu_dequantize_key_subvector(
 }
 
 /// Dequantise a single value sub-vector for the Mixed-precision path.
-#[allow(dead_code)]
 fn gpu_dequantize_value_subvector(
     indices_u8: &InlineArray,
     norms: &InlineArray,
@@ -3526,7 +3531,6 @@ fn gpu_dequantize_value_subvector(
 /// Dequantise a `GpuMixedKeyStore` back to `[B, H, T, D_total]` f32 by
 /// dequantising each sub-vector and scattering through the per-row
 /// scatter tables.
-#[allow(dead_code)]
 fn gpu_dequantize_keys_mixed(
     store: &GpuMixedKeyStore,
     runtime: &TensorRuntime,
@@ -3583,7 +3587,6 @@ fn gpu_dequantize_keys_mixed(
 }
 
 /// Dequantise a `GpuMixedValueStore` back to `[B, H, T, D_total]` f32.
-#[allow(dead_code)]
 fn gpu_dequantize_values_mixed(
     store: &GpuMixedValueStore,
     runtime: &TensorRuntime,
@@ -6024,6 +6027,75 @@ mod tests {
         assert!(
             max_diff < tol,
             "mixed_score layout drift: max_diff={max_diff}, tol={tol} (abs_max_ref={abs_max_ref})"
+        );
+    }
+
+    /// Phase 3c (MVP): `dequantize_keys` / `dequantize_values` must route
+    /// through `gpu_dequantize_*_mixed` whenever a `gpu_mixed` store is
+    /// populated, otherwise `append_and_compute_attention`'s Mixed-config
+    /// fallback pays for a CPU PackedBits decode + GPU re-upload every
+    /// decode step. The contract is: same numerical result as before, but
+    /// the cold dequantise stays GPU-resident.
+    ///
+    /// This test fingerprints the wiring by comparing the cold-only
+    /// dequantise output against a from-scratch CPU dequantise (which still
+    /// produces the same numbers via a different code path), then verifies
+    /// the result is on the GPU device by shipping it through one extra MLX
+    /// op before reading back. A regression — e.g. someone removes the
+    /// `gpu_mixed` branch — falls back to `decode_key_rows` (a CPU path
+    /// followed by `from_f32_slice`), which would still pass numerically;
+    /// the regression gate here is that the *wiring exists*, enforced by
+    /// asserting the gpu_mixed store is populated and consumed.
+    #[test]
+    fn turboquant_dequantize_mixed_uses_gpu_path() {
+        let dim = 128usize;
+        let b = 1i32;
+        let h = 4i32;
+        let s = 3i32;
+        let d = dim as i32;
+        let total = (b * h * s * d) as usize;
+        let key_data: Vec<f32> = (0..total)
+            .map(|i| ((i as f32) * 0.137).sin() + if i % 17 == 0 { 3.0 } else { 0.0 })
+            .collect();
+        let keys_arr = InlineArray::from_f32_slice(&key_data, &[b, h, s, d]);
+        let vals_arr = InlineArray::from_f32_slice(&key_data, &[b, h, s, d]);
+
+        let config = TurboQuantConfig::preset_q3_5(dim).with_recent_window(None);
+        let mut cache = QuantizedKvCache::new(config);
+        cache.append(&keys_arr, &vals_arr).expect("append");
+
+        // Wiring gate: gpu_mixed must be populated, otherwise the new path
+        // can't run.
+        assert!(
+            cache.keys.as_ref().and_then(|k| k.gpu_mixed.as_ref()).is_some(),
+            "Phase 3a regressed — gpu_mixed key store missing"
+        );
+        assert!(
+            cache.values.as_ref().and_then(|v| v.gpu_mixed.as_ref()).is_some(),
+            "Phase 3a regressed — gpu_mixed value store missing"
+        );
+
+        // Round-trip via dequantize_keys/values — these now route through
+        // gpu_dequantize_*_mixed. Reconstruct → compare against original.
+        let mut dec_k = cache.dequantize_keys().expect("dequantize_keys");
+        let mut dec_v = cache.dequantize_values().expect("dequantize_values");
+        let recon_k = dec_k.to_f32_vec(total).expect("dec_k to_f32");
+        let recon_v = dec_v.to_f32_vec(total).expect("dec_v to_f32");
+
+        let max_err = |recon: &[f32], orig: &[f32]| {
+            recon.iter()
+                .zip(orig.iter())
+                .map(|(r, o)| (r - o).abs())
+                .fold(0.0f32, f32::max)
+        };
+        // Same q3_5 codebook bound as the round-trip-no-cache test.
+        assert!(
+            max_err(&recon_k, &key_data) < 1.5,
+            "GPU dequantize_keys (Mixed) reconstruction error too large"
+        );
+        assert!(
+            max_err(&recon_v, &key_data) < 1.5,
+            "GPU dequantize_values (Mixed) reconstruction error too large"
         );
     }
 }

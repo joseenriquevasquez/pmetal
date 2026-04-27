@@ -13,15 +13,19 @@ use super::weights::NativeWeights;
 ///   - Full attention: unbounded growth (256-token chunk reallocation strategy)
 ///   - Sliding attention: rotating window of `sliding_window` tokens
 ///
-/// Zero-overhead affine quantization is supported for full-attention layers only.
-/// Sliding window layers use the bf16 rotating buffer path unconditionally (the
-/// rotation logic makes quantized buffers incompatible).
+/// Zero-overhead affine quantization and TurboQuant compression are both
+/// supported for full-attention layers only. Sliding window layers use the
+/// bf16 rotating buffer path unconditionally (rotation logic is incompatible
+/// with both compression schemes).
 pub struct KvLayerCache {
     pub keys: Option<InlineArray>, // [B, H, MAX_T, D] (or [B, H, window, D] for sliding)
     pub values: Option<InlineArray>, // [B, H, MAX_T, D]
     pub offset: i32,               // total tokens written
     pub is_sliding: bool,
     pub window: i32, // sliding window size (ignored when is_sliding=false)
+    /// TurboQuant compressed cache (full-attention layers only). When set,
+    /// takes precedence over the bf16 / affine paths.
+    pub turboquant: Option<crate::turboquant::QuantizedKvCache>,
     /// Zero-overhead affine-quantized cache (full-attention layers only).
     pub quantized_keys: Option<crate::qwen3_native::QuantizedTuple>,
     pub quantized_values: Option<crate::qwen3_native::QuantizedTuple>,
@@ -33,6 +37,9 @@ pub struct KvLayerCache {
 pub struct NativeCache {
     pub kv_caches: Vec<KvLayerCache>,
     pub rope_offset: i32,
+    /// Shared TurboQuant runtime state (rotation matrices, codebooks). Built
+    /// once on the first cache constructor call when TurboQuant is enabled.
+    pub turboquant_state: Option<std::sync::Arc<crate::turboquant::TurboQuantState>>,
 }
 
 impl NativeCache {
@@ -65,6 +72,9 @@ impl NativeCache {
             if let Some(ref mut v) = c.values {
                 to_eval.push(v);
             }
+            if let Some(ref mut tq) = c.turboquant {
+                tq.eval_and_detach_gpu_state();
+            }
         }
         bridge::eval_and_detach_many(&mut to_eval);
     }
@@ -83,6 +93,37 @@ impl NativeCache {
         weights: &NativeWeights,
         quant_config: Option<crate::qwen3_native::QuantCacheConfig>,
     ) -> Self {
+        Self::new_with_caches(weights, quant_config, None)
+    }
+
+    /// Create a cache with TurboQuant compression on full-attention layers.
+    /// Sliding-window layers stay on the bf16 rotating buffer (rotation is
+    /// incompatible with TurboQuant's accumulating cold store).
+    pub fn new_with_turboquant(
+        weights: &NativeWeights,
+        tq_config: Option<crate::turboquant::TurboQuantConfig>,
+    ) -> Self {
+        Self::new_with_caches(weights, None, tq_config)
+    }
+
+    fn new_with_caches(
+        weights: &NativeWeights,
+        quant_config: Option<crate::qwen3_native::QuantCacheConfig>,
+        tq_config: Option<crate::turboquant::TurboQuantConfig>,
+    ) -> Self {
+        // Build a shared TurboQuant runtime once if compression is requested.
+        // The first full-attention layer's head_dim drives the runtime tables;
+        // GPT-OSS uses a uniform head_dim across full-attention layers.
+        let tq_state = tq_config.map(|cfg| {
+            let head_dim = weights
+                .layers
+                .iter()
+                .find(|lw| !lw.attn_is_sliding)
+                .map(|lw| lw.attn_head_dim as usize)
+                .unwrap_or(64);
+            crate::turboquant::build_state(head_dim, head_dim, cfg)
+        });
+
         let kv_caches = weights
             .layers
             .iter()
@@ -92,6 +133,16 @@ impl NativeCache {
                 offset: 0,
                 is_sliding: lw.attn_is_sliding,
                 window: lw.attn_sliding_window,
+                turboquant: if lw.attn_is_sliding {
+                    None
+                } else {
+                    tq_state.as_ref().map(|state| {
+                        crate::turboquant::new_cache_with_state(
+                            tq_config.expect("tq_config is Some when tq_state is Some"),
+                            state.clone(),
+                        )
+                    })
+                },
                 quantized_keys: None,
                 quantized_values: None,
                 // Disable quantization for sliding layers — their rotating buffer
@@ -107,6 +158,7 @@ impl NativeCache {
         NativeCache {
             kv_caches,
             rope_offset: 0,
+            turboquant_state: tq_state,
         }
     }
 }
