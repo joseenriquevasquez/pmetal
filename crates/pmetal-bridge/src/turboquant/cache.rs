@@ -1605,6 +1605,117 @@ impl QuantizedKvCache {
         )
     }
 
+    /// Variant F (NoQjl) fast path. Mirrors `try_gpu_uniform_attention` but
+    /// dispatches to the `no_qjl` kernel families that don't read
+    /// `qjl_signs` / `residual_norms`. Currently wired:
+    ///   - d128/8b/8b uniform (`turboquant_attention_q8_d128_no_qjl_2pass`)
+    ///
+    /// Other configs (d256, mixed, packed_keys variants) return None and the
+    /// outer caller falls through to dequantize + SDPA. New no_qjl kernels
+    /// can be wired here as they're added without touching the dispatch.
+    ///
+    /// Currently dormant — see `try_gpu_uniform_attention`'s NoQjl gate. The
+    /// kernel produces output that diverges from the dequantize+SDPA reference
+    /// by O(1) in absolute units; needs a parity-debug pass before it can be
+    /// re-enabled. The dispatch entry path is preserved here so re-enabling
+    /// is a single-line flip once the kernel matches.
+    #[allow(dead_code)]
+    fn try_gpu_uniform_attention_no_qjl(
+        &self,
+        queries_f32: &InlineArray,
+        layout: CacheLayout,
+        scale: f32,
+        output_dtype: i32,
+    ) -> Option<InlineArray> {
+        let ks = self.keys.as_ref()?.gpu.as_ref()?;
+        let vs = self.values.as_ref()?.gpu.as_ref()?;
+        let state = self.state.as_ref()?;
+
+        let (key_core, key_bits) = match &state.keys {
+            TensorRuntime::Uniform {
+                config: TurboQuantTensorConfig::Uniform { bits },
+                core,
+            } => (core, *bits),
+            _ => return None,
+        };
+        let (value_core, value_bits) = match &state.values {
+            TensorRuntime::Uniform {
+                config: TurboQuantTensorConfig::Uniform { bits },
+                core,
+            } => (core, *bits),
+            _ => return None,
+        };
+
+        let batch = queries_f32.dim(0);
+        let q_heads = queries_f32.dim(1);
+        let key_dim = queries_f32.dim(3);
+        let value_dim = layout.value_dim as i32;
+        let q_rows = batch * q_heads;
+        let n_seq = self.cold_offset as i32;
+        let cache_seq_capacity = ks.cache_seq_capacity();
+        // Currently only d128/8b/8b is supported. n_seq < 1024 falls back
+        // to dequantize+SDPA which is fine — the kernel is the long-context win.
+        if key_bits != 8
+            || value_bits != 8
+            || key_dim != 128
+            || value_dim != 128
+            || n_seq < 1024
+            || cache_seq_capacity < n_seq
+            || q_heads <= 0
+            || (q_heads % layout.heads as i32) != 0
+        {
+            return None;
+        }
+
+        let query_rows = queries_f32.reshape(&[q_rows, key_dim]);
+        let query_rot = key_core.rotate_array(&query_rows)?;
+
+        let kv_rows = (layout.batch * layout.heads) as i32;
+        let key_norms = ks
+            .key_norms_array()?
+            .reshape(&[kv_rows, cache_seq_capacity]);
+        let key_slot_scale = ks
+            .key_slot_scale_array()?
+            .reshape(&[kv_rows, cache_seq_capacity]);
+        // Indices are scattered as [B, H, T, D]; the kernel reads them in the
+        // [N, D, S] layout it expects.
+        let key_indices_t = ks
+            .indices_t_array()
+            .reshape(&[kv_rows, key_dim, cache_seq_capacity]);
+        let value_indices_t = vs
+            .indices_t_array()?
+            .reshape(&[kv_rows, value_dim, cache_seq_capacity]);
+        let value_norms = vs
+            .norms_array()?
+            .reshape(&[kv_rows, cache_seq_capacity]);
+
+        // Variant F uses the full key_bits codebook for keys; values use
+        // their own codebook at value_bits resolution.
+        let key_codebook = key_core.codebook_arr(key_bits)?;
+        let value_codebook = value_core.codebook_arr(value_bits)?;
+
+        let aggregated_rot = InlineArray::turboquant_attention_q8_d128_no_qjl_2pass(
+            &query_rot,
+            &key_indices_t,
+            &key_norms,
+            &key_slot_scale,
+            key_codebook,
+            &value_indices_t,
+            &value_norms,
+            value_codebook,
+            q_rows as u32,
+            n_seq as u32,
+            cache_seq_capacity as u32,
+            q_heads as u32,
+            layout.heads as u32,
+            scale,
+        )?;
+
+        // Output is in the value's rotated frame; inverse-rotate via value_core.
+        let output_rows = value_core.inverse_rotate_output_array(&aggregated_rot, output_dtype)?;
+        Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]))
+    }
+
     fn try_gpu_uniform_attention(
         &self,
         queries_f32: &InlineArray,
@@ -1615,14 +1726,15 @@ impl QuantizedKvCache {
         let ks = self.keys.as_ref()?.gpu.as_ref()?;
         let vs = self.values.as_ref()?.gpu.as_ref()?;
         let state = self.state.as_ref()?;
-        // Variant F (NoQjl) has no fused score kernel yet — the existing
-        // d128/d256 families always read residual_norms + qjl_signs and fold
-        // the QJL term into the score. With residual_norms forced to 0 the
-        // QJL contribution is mathematically 0 but the kernels still pay the
-        // QJL load cost; defer the fused-kernel optimization (Phase C′) and
-        // route Variant F through the dequantize + SDPA fallback instead. The
-        // fallback is correct: gpu_dequantize_keys honors qjl_mode and the
-        // resulting fp16 cache is identical to a Variant F decode.
+        // Variant F (NoQjl): the no_qjl_2pass d128 kernel exists
+        // (`turboquant_attention_q8_d128_no_qjl_2pass`) but its end-to-end
+        // result currently diverges from the dequantize+SDPA reference by
+        // ~O(1) in absolute units — needs a parity-debug session before
+        // it can be wired to the production dispatch. Until then route
+        // Variant F through the dequantize fallback (correct, ~2-4× slower
+        // at decode). The kernel infrastructure (extern C, FFI, Rust
+        // wrapper, header decl, encode-side Option qjl_signs) is in place
+        // so the follow-up is purely Metal-source debugging.
         if matches!(state.qjl, super::TurboQuantQjlMode::NoQjl) {
             return None;
         }

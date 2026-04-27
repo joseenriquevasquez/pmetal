@@ -671,6 +671,90 @@ mod kvcache {
         );
     }
 
+    // Pinning the no_qjl_2pass d128 kernel-fast-path parity is Phase C′
+    // follow-up. The kernel binding is in place; the kernel itself produces
+    // results that currently diverge from the dequantize+SDPA reference by
+    // O(1) — a debug session against the existing q8_d128_2pass kernel
+    // structure is needed to find the discrepancy before re-enabling the
+    // dispatcher route.
+    #[allow(dead_code)]
+    fn turboquant_no_qjl_d128_long_context_matches_dequantized_sdpa() {
+        // Exercises the new no_qjl fused d128 fast path (n_seq >= 1024 +
+        // d=128 + 8b/8b uniform). The kernel result must match the
+        // dequantize+SDPA reference within fp32 numerical precision.
+        let dim = 128usize;
+        let heads = 2i32;
+        let prefill = 1023i32;
+        let config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl);
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let step_len = (b * h * d) as usize;
+        let prefill_keys =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.2), &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
+        let queries = InlineArray::from_f32_slice(&make_data(step_len, 1.3), &[b, h, 1, d]);
+        let step_keys = InlineArray::from_f32_slice(&make_data(step_len, 1.9), &[b, h, 1, d]);
+        let step_values = InlineArray::from_f32_slice(&make_data(step_len, 2.4), &[b, h, 1, d]);
+
+        let mut seed_cache = QuantizedKvCache::new(config);
+        seed_cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+
+        ref_cache
+            .append(&step_keys, &step_values)
+            .expect("reference append");
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let reference_vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut full_keys,
+            &mut full_values,
+            b,
+            h,
+            1024,
+            d,
+            scale,
+        );
+
+        let direct_vals = direct
+            .to_f32_vec((b * h * d) as usize)
+            .expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        // Fused kernel uses the same Beta codebook + slot_scale + key_norm
+        // factors as the dequantize path; differences are pure fp32
+        // accumulation order. 1e-3 tolerance handles long-context summation
+        // drift across 1024 keys.
+        assert!(
+            max_abs_diff < 1e-3,
+            "Variant F d128 fused kernel diverged from dequantized sdpa: max_abs_diff={max_abs_diff}"
+        );
+    }
+
     #[test]
     fn turboquant_no_qjl_direct_attention_matches_dequantized_sdpa() {
         // Variant F (NoQjl) end-to-end: append → direct attention through the
