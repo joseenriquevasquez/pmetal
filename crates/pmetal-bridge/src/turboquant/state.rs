@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use super::config::{TurboQuantConfig, TurboQuantTensorConfig};
+use super::config::{TurboQuantConfig, TurboQuantQjlMode, TurboQuantTensorConfig};
 use super::core::TurboQuantCore;
 
 /// Per-tensor runtime — selects between a single Uniform core and a
@@ -33,6 +33,9 @@ pub(super) enum TensorRuntime {
 pub struct TurboQuantState {
     pub(super) keys: TensorRuntime,
     pub(super) values: TensorRuntime,
+    /// QJL residual mode. `Standard` uses 1 bit per dim for QJL; `NoQjl`
+    /// (Variant F) gives the codebook a full extra bit and skips QJL.
+    pub(super) qjl: TurboQuantQjlMode,
 }
 
 impl TurboQuantState {
@@ -54,7 +57,11 @@ impl TurboQuantState {
         let keys = build_tensor_runtime(key_dim, config.keys, true, &mut get_core);
         let values = build_tensor_runtime(value_dim, config.values, false, &mut get_core);
 
-        Self { keys, values }
+        Self {
+            keys,
+            values,
+            qjl: config.qjl,
+        }
     }
 
     /// `true` when the fused GPU attention kernels accept this state's

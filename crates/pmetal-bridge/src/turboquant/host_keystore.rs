@@ -7,7 +7,7 @@
 //! and any future fused score kernel.
 
 use super::bits::PackedBits;
-use super::config::TurboQuantTensorConfig;
+use super::config::{TurboQuantQjlMode, TurboQuantTensorConfig};
 use super::encode::{EncodedKeyRows, EncodedValueRows};
 use super::gpu_keystore::{GpuKeyStore, GpuMixedKeyStore, GpuMixedValueStore, GpuValueStore};
 
@@ -43,16 +43,20 @@ pub struct QuantizedKeyStore {
 }
 
 impl QuantizedKeyStore {
-    pub(super) fn new(config: TurboQuantTensorConfig) -> Self {
+    pub(super) fn new(config: TurboQuantTensorConfig, qjl_mode: TurboQuantQjlMode) -> Self {
+        // Variant F (NoQjl) uses full `bits` for the codebook; Variant E uses
+        // `bits-1` (1 bit reserved for QJL signs).
+        let codebook_bits = |b: u8| match qjl_mode {
+            TurboQuantQjlMode::Standard => b.saturating_sub(1),
+            TurboQuantQjlMode::NoQjl => b,
+        };
         let regular_bits = match config {
-            TurboQuantTensorConfig::Uniform { bits } => bits.saturating_sub(1),
-            TurboQuantTensorConfig::Mixed { regular_bits, .. } => regular_bits.saturating_sub(1),
+            TurboQuantTensorConfig::Uniform { bits } => codebook_bits(bits),
+            TurboQuantTensorConfig::Mixed { regular_bits, .. } => codebook_bits(regular_bits),
         };
         let outlier_bits: Option<u8> = match config {
             TurboQuantTensorConfig::Uniform { .. } => None,
-            TurboQuantTensorConfig::Mixed { outlier_bits, .. } => {
-                Some(outlier_bits.saturating_sub(1))
-            }
+            TurboQuantTensorConfig::Mixed { outlier_bits, .. } => Some(codebook_bits(outlier_bits)),
         };
 
         Self {

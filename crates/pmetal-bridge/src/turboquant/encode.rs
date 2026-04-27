@@ -14,7 +14,7 @@
 
 use std::f32::consts::PI;
 
-use super::config::TurboQuantTensorConfig;
+use super::config::{TurboQuantQjlMode, TurboQuantTensorConfig};
 use super::core::TurboQuantCore;
 use super::math::l2_norm;
 use super::state::TensorRuntime;
@@ -52,14 +52,19 @@ pub(super) struct BatchedValueRows {
     pub(super) outlier: Option<EncodedValueRows>,
 }
 
-pub(super) fn encode_key_rows(runtime: &TensorRuntime, total_dim: usize, rows: &[f32]) -> BatchedKeyRows {
+pub(super) fn encode_key_rows(
+    runtime: &TensorRuntime,
+    total_dim: usize,
+    rows: &[f32],
+    qjl_mode: TurboQuantQjlMode,
+) -> BatchedKeyRows {
     match runtime {
         TensorRuntime::Uniform { config, core } => {
             let TurboQuantTensorConfig::Uniform { bits } = config else {
                 unreachable!()
             };
             BatchedKeyRows {
-                regular: encode_key_component_rows(core, rows, *bits),
+                regular: encode_key_component_rows(core, rows, *bits, qjl_mode),
                 outlier_mask: None,
                 outlier: None,
             }
@@ -80,12 +85,18 @@ pub(super) fn encode_key_rows(runtime: &TensorRuntime, total_dim: usize, rows: &
             let (mask, regular_rows, outlier_rows) =
                 split_rows_by_outliers(rows, total_dim, *outlier_count);
             BatchedKeyRows {
-                regular: encode_key_component_rows(regular_core, &regular_rows, *regular_bits),
+                regular: encode_key_component_rows(
+                    regular_core,
+                    &regular_rows,
+                    *regular_bits,
+                    qjl_mode,
+                ),
                 outlier_mask: Some(mask),
                 outlier: Some(encode_key_component_rows(
                     outlier_core,
                     &outlier_rows,
                     *outlier_bits,
+                    qjl_mode,
                 )),
             }
         }
@@ -132,15 +143,28 @@ pub(super) fn encode_value_rows(runtime: &TensorRuntime, total_dim: usize, rows:
     }
 }
 
-/// Two-stage key encoder: MSE at (bits-1) with per-row slot_scale + QJL on residual.
+/// Two-stage key encoder: MSE codebook + per-row slot_scale + (optional) QJL on residual.
 ///
 /// `slot_scale` adapts the fixed Beta codebook to each row's rotated range so
 /// values closer to ±1 are quantized at full codebook resolution rather than
 /// crowding the centre. Reconstruction multiplies the codebook lookup by
 /// `slot_scale` before inverse-rotation; the score kernel multiplies by it
 /// once per slot in the inner loop.
+///
+/// `qjl_mode = Standard` (Variant E): codebook at `key_bits - 1`, residual is
+/// projected through Gaussian J and signs are packed (`qjl_signs` non-empty,
+/// `residual_norms` populated).
+///
+/// `qjl_mode = NoQjl` (Variant F): codebook at full `key_bits`, no residual
+/// pack. `qjl_signs` is filled with zeros (so the existing decode short-circuit
+/// on residual_norms ≤ ZERO_EPSILON makes the QJL term contribute 0).
 #[allow(clippy::needless_range_loop)]
-pub(super) fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key_bits: u8) -> EncodedKeyRows {
+pub(super) fn encode_key_component_rows(
+    core: &TurboQuantCore,
+    rows: &[f32],
+    key_bits: u8,
+    qjl_mode: TurboQuantQjlMode,
+) -> EncodedKeyRows {
     let num_rows = rows.len() / core.dim;
     let mut norms = vec![0.0f32; num_rows];
     let mut normalized = vec![0.0f32; rows.len()];
@@ -162,7 +186,12 @@ pub(super) fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key
         }
     }
 
-    let mse_bits = key_bits.saturating_sub(1);
+    // Variant F (NoQjl) uses the full `key_bits` for the codebook; Variant E
+    // (Standard) reserves 1 bit per dim for the QJL residual sign.
+    let mse_bits = match qjl_mode {
+        TurboQuantQjlMode::Standard => key_bits.saturating_sub(1),
+        TurboQuantQjlMode::NoQjl => key_bits,
+    };
     let mut mse_indices = vec![0u16; rows.len()];
     let mut slot_scale = vec![0.0f32; num_rows];
     let mut decoded_mse = vec![0.0f32; rows.len()];
@@ -235,11 +264,25 @@ pub(super) fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key
     }
 
     // Step 6: QJL — project residual and take signs.
-    let projected = core.project_rows(&residual);
-    let mut qjl_signs: Vec<u16> = projected
-        .iter()
-        .map(|&v| if v >= 0.0 { 1 } else { 0 })
-        .collect();
+    //
+    // Variant F (NoQjl): skip the projection entirely and emit zeros for both
+    // qjl_signs and residual_norms. The decoder's
+    // `if residual_norms.iter().any(|&rn| rn > ZERO_EPSILON)` short-circuit
+    // then makes the QJL term contribute exactly 0 — no other decode-path
+    // changes needed.
+    let mut qjl_signs: Vec<u16> = match qjl_mode {
+        TurboQuantQjlMode::Standard => {
+            let projected = core.project_rows(&residual);
+            projected
+                .iter()
+                .map(|&v| if v >= 0.0 { 1 } else { 0 })
+                .collect()
+        }
+        TurboQuantQjlMode::NoQjl => {
+            residual_norms.fill(0.0);
+            vec![0u16; rows.len()]
+        }
+    };
 
     // Zero-vector rows get all-zero signs.
     for row_idx in 0..num_rows {
@@ -254,7 +297,7 @@ pub(super) fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key
     // The decode path's QJL correction block is gated on
     // `residual_norms.iter().any(|rn| rn > ZERO_EPSILON)`, so all-zero
     // residual_norms make the entire QJL stage a no-op without touching
-    // the decoder.
+    // the decoder. Redundant when qjl_mode = NoQjl.
     if super::should_zero_qjl() {
         residual_norms.fill(0.0);
     }
@@ -310,6 +353,7 @@ pub(super) fn decode_key_rows(
     runtime: &TensorRuntime,
     total_dim: usize,
     store: &QuantizedKeyStore,
+    qjl_mode: TurboQuantQjlMode,
 ) -> Vec<f32> {
     match runtime {
         TensorRuntime::Uniform { config, core } => {
@@ -324,6 +368,7 @@ pub(super) fn decode_key_rows(
                 &store.regular_residual_norms,
                 &store.regular_slot_scale,
                 *bits,
+                qjl_mode,
             )
         }
         TensorRuntime::Mixed {
@@ -347,6 +392,7 @@ pub(super) fn decode_key_rows(
                 &store.regular_residual_norms,
                 &store.regular_slot_scale,
                 *regular_bits,
+                qjl_mode,
             );
             let outlier = decode_key_component_rows_raw(
                 outlier_core,
@@ -375,6 +421,7 @@ pub(super) fn decode_key_rows(
                     .as_ref()
                     .expect("TurboQuant key outlier slot_scale missing"),
                 *outlier_bits,
+                qjl_mode,
             );
             let mask = unpack_all(
                 store
@@ -453,7 +500,7 @@ pub(super) fn decode_value_rows(
 /// Formula (per row):
 ///   k̃ = Π^T · (codebook[idx] · slot_scale) · norm
 ///       + (√(π/2)/D) · Π^T · J^T · sign · residual_norm · norm
-#[allow(clippy::needless_range_loop)]
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 pub(super) fn decode_key_component_rows_raw(
     core: &TurboQuantCore,
     indices: &[u16],
@@ -462,9 +509,13 @@ pub(super) fn decode_key_component_rows_raw(
     residual_norms: &[f32],
     slot_scale: &[f32],
     key_bits: u8,
+    qjl_mode: TurboQuantQjlMode,
 ) -> Vec<f32> {
     let total_rows = norms.len();
-    let mse_bits = key_bits.saturating_sub(1);
+    let mse_bits = match qjl_mode {
+        TurboQuantQjlMode::Standard => key_bits.saturating_sub(1),
+        TurboQuantQjlMode::NoQjl => key_bits,
+    };
 
     // MSE base reconstruction: codebook[idx] * slot_scale, then inverse-rotate.
     let mut reconstructed = if mse_bits == 0 {

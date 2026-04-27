@@ -471,16 +471,24 @@ impl TurboValueStore {
 }
 
 impl TurboKeyStore {
-    fn new(config: TurboQuantTensorConfig, _total_dim: usize) -> Self {
+    fn new(
+        config: TurboQuantTensorConfig,
+        _total_dim: usize,
+        qjl_mode: TurboQuantQjlMode,
+    ) -> Self {
+        // Variant E: indices use `bits-1` (1 bit reserved for QJL sign).
+        // Variant F: indices use full `bits` (no QJL).
+        let codebook_bits = |b: u8| match qjl_mode {
+            TurboQuantQjlMode::Standard => b.saturating_sub(1),
+            TurboQuantQjlMode::NoQjl => b,
+        };
         let regular_bits = match config {
-            TurboQuantTensorConfig::Uniform { bits } => bits.saturating_sub(1),
-            TurboQuantTensorConfig::Mixed { regular_bits, .. } => regular_bits.saturating_sub(1),
+            TurboQuantTensorConfig::Uniform { bits } => codebook_bits(bits),
+            TurboQuantTensorConfig::Mixed { regular_bits, .. } => codebook_bits(regular_bits),
         };
         let outlier_bits = match config {
             TurboQuantTensorConfig::Uniform { .. } => None,
-            TurboQuantTensorConfig::Mixed { outlier_bits, .. } => {
-                Some(outlier_bits.saturating_sub(1))
-            }
+            TurboQuantTensorConfig::Mixed { outlier_bits, .. } => Some(codebook_bits(outlier_bits)),
         };
 
         Self {
@@ -912,8 +920,10 @@ impl TurboQuantRuntime {
                 .clone()
         };
 
-        let keys = build_tensor_runtime(key_dim, config.keys, true, &mut get_core);
-        let values = build_tensor_runtime(value_dim, config.values, false, &mut get_core);
+        let keys =
+            build_tensor_runtime(key_dim, config.keys, true, config.qjl, &mut get_core);
+        let values =
+            build_tensor_runtime(value_dim, config.values, false, config.qjl, &mut get_core);
 
         Self {
             key_dim,
@@ -928,14 +938,23 @@ fn build_tensor_runtime<F>(
     total_dim: usize,
     config: TurboQuantTensorConfig,
     keys: bool,
+    qjl_mode: TurboQuantQjlMode,
     get_core: &mut F,
 ) -> TurboQuantTensorRuntime
 where
     F: FnMut(usize, u8) -> Arc<TurboQuantCore>,
 {
+    // Variant E reserves 1 bit per dim for the QJL residual sign so the
+    // codebook only needs `bits-1` levels. Variant F uses the full `bits`
+    // for the codebook, so the Lloyd-Max ladder must go all the way to
+    // `bits` for keys too.
+    let key_codebook_bits = |b: u8| match qjl_mode {
+        TurboQuantQjlMode::Standard => b.saturating_sub(1),
+        TurboQuantQjlMode::NoQjl => b,
+    };
     match config {
         TurboQuantTensorConfig::Uniform { bits } => {
-            let max_mse_bits = if keys { bits.saturating_sub(1) } else { bits };
+            let max_mse_bits = if keys { key_codebook_bits(bits) } else { bits };
             TurboQuantTensorRuntime::Uniform {
                 config,
                 core: get_core(total_dim, max_mse_bits),
@@ -948,12 +967,12 @@ where
         } => {
             let regular_dim = total_dim - outlier_count;
             let regular_max_bits = if keys {
-                regular_bits.saturating_sub(1)
+                key_codebook_bits(regular_bits)
             } else {
                 regular_bits
             };
             let outlier_max_bits = if keys {
-                outlier_bits.saturating_sub(1)
+                key_codebook_bits(outlier_bits)
             } else {
                 outlier_bits
             };
@@ -1123,13 +1142,14 @@ impl TurboQuantKvCache {
             ))
         });
 
-        let encoded_keys = encode_key_rows_for_runtime(&runtime.keys, layout.key_dim, key_rows);
+        let encoded_keys =
+            encode_key_rows_for_runtime(&runtime.keys, layout.key_dim, key_rows, config.qjl);
         let encoded_values =
             encode_value_rows_for_runtime(&runtime.values, layout.value_dim, value_rows);
 
         let key_store = self
             .keys
-            .get_or_insert_with(|| TurboKeyStore::new(self.config.keys, layout.key_dim));
+            .get_or_insert_with(|| TurboKeyStore::new(self.config.keys, layout.key_dim, self.config.qjl));
         key_store.extend(&encoded_keys);
 
         let value_store = self
@@ -1675,7 +1695,8 @@ impl TurboQuantKvCache {
                 .keys
                 .as_ref()
                 .ok_or_else(|| Exception::custom("TurboQuant key store missing"))?;
-            let decoded = decode_key_rows_for_runtime(&runtime.keys, layout.key_dim, keys);
+            let decoded =
+                decode_key_rows_for_runtime(&runtime.keys, layout.key_dim, keys, self.config.qjl);
             let array = Array::from_f32_slice(
                 &decoded,
                 &[
@@ -1833,6 +1854,7 @@ fn direct_attention_output(
                 key_store,
                 query_row,
                 &row_indices,
+                config.qjl,
             );
             let weights = scaled_softmax(&scores, attn_config.scale, attn_config.logit_softcapping);
 
@@ -1918,6 +1940,7 @@ fn scaled_softmax(scores: &[f32], scale: f32, softcap: Option<f32>) -> Vec<f32> 
     exp_scores
 }
 
+#[allow(clippy::too_many_arguments)]
 fn direct_attention_scores_for_query(
     runtime: &TurboQuantTensorRuntime,
     config: TurboQuantTensorConfig,
@@ -1925,6 +1948,7 @@ fn direct_attention_scores_for_query(
     store: &TurboKeyStore,
     query_row: &[f32],
     row_indices: &[usize],
+    qjl_mode: TurboQuantQjlMode,
 ) -> Vec<f32> {
     match runtime {
         TurboQuantTensorRuntime::Uniform { core, .. } => {
@@ -1943,6 +1967,7 @@ fn direct_attention_scores_for_query(
                         &store.regular_norms,
                         &store.regular_residual_norms,
                         bits,
+                        qjl_mode,
                         *row,
                         &q_rot,
                         &q_proj,
@@ -1999,6 +2024,7 @@ fn direct_attention_scores_for_query(
                         &store.regular_norms,
                         &store.regular_residual_norms,
                         regular_bits,
+                        qjl_mode,
                         *row,
                         regular_slice,
                         regular_proj_slice,
@@ -2021,6 +2047,7 @@ fn direct_attention_scores_for_query(
                             .as_ref()
                             .expect("TurboQuant key outlier residual norms missing"),
                         outlier_bits,
+                        qjl_mode,
                         *row,
                         outlier_slice,
                         outlier_proj_slice,
@@ -2039,6 +2066,7 @@ fn score_key_component_row(
     norms: &[f32],
     residual_norms: &[f32],
     key_bits: u8,
+    qjl_mode: TurboQuantQjlMode,
     row: usize,
     query_rot: &[f32],
     query_proj: &[f32],
@@ -2048,7 +2076,10 @@ fn score_key_component_row(
         return 0.0;
     }
 
-    let mse_bits = key_bits.saturating_sub(1);
+    let mse_bits = match qjl_mode {
+        TurboQuantQjlMode::Standard => key_bits.saturating_sub(1),
+        TurboQuantQjlMode::NoQjl => key_bits,
+    };
     let width = core.dim;
     let base = row * width;
 
@@ -2233,7 +2264,12 @@ struct EncodedTurboValueRows {
     outlier: Option<EncodedValueRows>,
 }
 
-fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key_bits: u8) -> EncodedKeyRows {
+fn encode_key_component_rows(
+    core: &TurboQuantCore,
+    rows: &[f32],
+    key_bits: u8,
+    qjl_mode: TurboQuantQjlMode,
+) -> EncodedKeyRows {
     let num_rows = rows.len() / core.dim;
     let mut norms = vec![0.0f32; num_rows];
     let mut residual_norms = vec![0.0f32; num_rows];
@@ -2250,7 +2286,12 @@ fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key_bits: u8) 
         }
     }
 
-    let mse_bits = key_bits.saturating_sub(1);
+    // Variant F (NoQjl) uses the full `key_bits` for the codebook; Variant E
+    // (Standard) reserves 1 bit per dim for the QJL residual sign.
+    let mse_bits = match qjl_mode {
+        TurboQuantQjlMode::Standard => key_bits.saturating_sub(1),
+        TurboQuantQjlMode::NoQjl => key_bits,
+    };
     let mut mse_indices = vec![0u16; rows.len()];
     let mut slot_scale = vec![0.0f32; num_rows];
     let mut decoded_mse = vec![0.0f32; rows.len()];
@@ -2309,11 +2350,22 @@ fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key_bits: u8) 
         residual_norms[row_idx] = l2_norm(residual_row);
     }
 
-    let projected = core.project_rows(&residual);
-    let mut qjl_signs: Vec<u16> = projected
-        .iter()
-        .map(|value| if *value >= 0.0 { 1u16 } else { 0u16 })
-        .collect();
+    // Variant F: skip QJL entirely. residual_norms zeroed so the decode
+    // path's QJL short-circuit (residual_norms <= ZERO_EPSILON) makes the
+    // QJL term contribute exactly 0.
+    let mut qjl_signs: Vec<u16> = match qjl_mode {
+        TurboQuantQjlMode::Standard => {
+            let projected = core.project_rows(&residual);
+            projected
+                .iter()
+                .map(|value| if *value >= 0.0 { 1u16 } else { 0u16 })
+                .collect()
+        }
+        TurboQuantQjlMode::NoQjl => {
+            residual_norms.fill(0.0);
+            vec![0u16; rows.len()]
+        }
+    };
 
     for row_idx in 0..num_rows {
         if norms[row_idx] <= ZERO_EPSILON {
@@ -2368,6 +2420,7 @@ fn encode_key_rows_for_runtime(
     runtime: &TurboQuantTensorRuntime,
     total_dim: usize,
     rows: &[f32],
+    qjl_mode: TurboQuantQjlMode,
 ) -> EncodedTurboKeyRows {
     match runtime {
         TurboQuantTensorRuntime::Uniform { config, core } => {
@@ -2375,7 +2428,7 @@ fn encode_key_rows_for_runtime(
                 unreachable!("uniform runtime must carry uniform config");
             };
             EncodedTurboKeyRows {
-                regular: encode_key_component_rows(core, rows, *bits),
+                regular: encode_key_component_rows(core, rows, *bits, qjl_mode),
                 outlier_mask: None,
                 outlier: None,
             }
@@ -2396,12 +2449,18 @@ fn encode_key_rows_for_runtime(
             let (outlier_mask, regular_rows, outlier_rows) =
                 split_rows_by_outliers(rows, total_dim, *outlier_count);
             EncodedTurboKeyRows {
-                regular: encode_key_component_rows(regular_core, &regular_rows, *regular_bits),
+                regular: encode_key_component_rows(
+                    regular_core,
+                    &regular_rows,
+                    *regular_bits,
+                    qjl_mode,
+                ),
                 outlier_mask: Some(outlier_mask),
                 outlier: Some(encode_key_component_rows(
                     outlier_core,
                     &outlier_rows,
                     *outlier_bits,
+                    qjl_mode,
                 )),
             }
         }
@@ -2452,6 +2511,7 @@ fn encode_value_rows_for_runtime(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_key_component_rows(
     core: &TurboQuantCore,
     indices: &PackedBits,
@@ -2460,6 +2520,7 @@ fn decode_key_component_rows(
     residual_norms: &[f32],
     slot_scale: &[f32],
     key_bits: u8,
+    qjl_mode: TurboQuantQjlMode,
 ) -> Vec<f32> {
     decode_key_component_rows_raw(
         core,
@@ -2469,6 +2530,7 @@ fn decode_key_component_rows(
         residual_norms,
         slot_scale,
         key_bits,
+        qjl_mode,
     )
 }
 
@@ -2481,6 +2543,7 @@ fn decode_value_component_rows(
     decode_value_component_rows_raw(core, &unpack_all(indices), norms, value_bits)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_key_component_rows_raw(
     core: &TurboQuantCore,
     indices: &[u16],
@@ -2489,9 +2552,13 @@ fn decode_key_component_rows_raw(
     residual_norms: &[f32],
     slot_scale: &[f32],
     key_bits: u8,
+    qjl_mode: TurboQuantQjlMode,
 ) -> Vec<f32> {
     let total_rows = norms.len();
-    let mse_bits = key_bits.saturating_sub(1);
+    let mse_bits = match qjl_mode {
+        TurboQuantQjlMode::Standard => key_bits.saturating_sub(1),
+        TurboQuantQjlMode::NoQjl => key_bits,
+    };
     let mut reconstructed = if mse_bits == 0 {
         vec![0.0; total_rows * core.dim]
     } else {
@@ -2578,6 +2645,7 @@ fn decode_key_rows_for_runtime(
     runtime: &TurboQuantTensorRuntime,
     total_dim: usize,
     store: &TurboKeyStore,
+    qjl_mode: TurboQuantQjlMode,
 ) -> Vec<f32> {
     match runtime {
         TurboQuantTensorRuntime::Uniform { config, core } => {
@@ -2592,6 +2660,7 @@ fn decode_key_rows_for_runtime(
                 &store.regular_residual_norms,
                 &store.regular_slot_scale,
                 *bits,
+                qjl_mode,
             )
         }
         TurboQuantTensorRuntime::Mixed {
@@ -2615,6 +2684,7 @@ fn decode_key_rows_for_runtime(
                 &store.regular_residual_norms,
                 &store.regular_slot_scale,
                 *regular_bits,
+                qjl_mode,
             );
             let outlier = decode_key_component_rows(
                 outlier_core,
@@ -2639,6 +2709,7 @@ fn decode_key_rows_for_runtime(
                     .as_ref()
                     .expect("TurboQuant key outlier slot_scale missing"),
                 *outlier_bits,
+                qjl_mode,
             );
             scatter_mixed_rows(
                 &unpack_all(
@@ -2958,7 +3029,7 @@ mod tests {
     #[test]
     fn turboquant_handles_zero_rows() {
         let core = TurboQuantCore::new(8, 4);
-        let encoded = encode_key_component_rows(&core, &[0.0; 8], 4);
+        let encoded = encode_key_component_rows(&core, &[0.0; 8], 4, TurboQuantQjlMode::Standard);
         assert_eq!(encoded.norms, vec![0.0]);
         assert_eq!(encoded.residual_norms, vec![0.0]);
         assert!(encoded.mse_indices.iter().all(|value| *value == 0));
@@ -3100,6 +3171,97 @@ mod tests {
         assert!(
             max_relative_error < 0.05,
             "TurboQuant slot_scale round-trip relative error too large: {max_relative_error}"
+        );
+    }
+
+    #[test]
+    fn turboquant_no_qjl_round_trip_matches_standard_within_tolerance() {
+        // Variant F (NoQjl) vs Variant E (Standard) on the same inputs: both
+        // must round-trip to the same fp16-grade fidelity within their bit
+        // budget. NoQjl reclaims the QJL bit for the codebook so reconstruction
+        // error should be comparable, not strictly lower (per Phase A's
+        // synthetic ablation it's a wash on Gaussian-rotated keys).
+        use pmetal_bridge::compat::Array;
+
+        let n_rows = 16usize;
+        let dim = 64usize;
+        let mut data = vec![0.0f32; n_rows * dim];
+        for r in 0..n_rows {
+            let scale = 0.1f32 + (r as f32) * 0.05;
+            for c in 0..dim {
+                data[r * dim + c] = scale * ((r as f32 * 0.13 + c as f32 * 0.07).sin());
+            }
+        }
+        let shape = &[1, 1, n_rows as i32, dim as i32];
+        let keys = Array::from_f32_slice(&data, shape);
+        let values = Array::from_f32_slice(&data, shape);
+
+        let rel_err_for_mode = |qjl: super::TurboQuantQjlMode| -> f32 {
+            let config = super::TurboQuantConfig::uniform(4, 4)
+                .with_recent_window(None)
+                .with_qjl_mode(qjl);
+            let mut cache = super::TurboQuantKvCache::new_with_config(config);
+            let (recon_k, _recon_v) = cache.update_and_fetch(&keys, &values).unwrap();
+            recon_k.eval();
+            let recon = crate::test_utils::to_f32_vec_eval(&recon_k);
+
+            let mut max_rel = 0.0f32;
+            for r in 0..n_rows {
+                let mut sq_err = 0.0f32;
+                let mut sq_orig = 0.0f32;
+                for c in 0..dim {
+                    let i = r * dim + c;
+                    let d = recon[i] - data[i];
+                    sq_err += d * d;
+                    sq_orig += data[i] * data[i];
+                }
+                max_rel = max_rel.max((sq_err / sq_orig.max(1e-12)).sqrt());
+            }
+            max_rel
+        };
+
+        let std_err = rel_err_for_mode(super::TurboQuantQjlMode::Standard);
+        let no_qjl_err = rel_err_for_mode(super::TurboQuantQjlMode::NoQjl);
+
+        // Both should achieve reasonable quantization at 4 bits. At small
+        // dim=64, slot_scale + 4-bit codebook reconstructs to within ~30% rel
+        // error — the absolute value isn't the point, parity is. NoQjl
+        // shouldn't be dramatically worse than Standard (within 2× is fine).
+        assert!(
+            std_err < 0.5,
+            "Standard 4b reconstruction degraded: {std_err}"
+        );
+        assert!(
+            no_qjl_err < 0.5,
+            "NoQjl 4b reconstruction degraded: {no_qjl_err}"
+        );
+        assert!(
+            no_qjl_err <= 2.0 * std_err.max(1e-3),
+            "NoQjl error {no_qjl_err} > 2x Standard error {std_err}"
+        );
+    }
+
+    #[test]
+    fn turboquant_no_qjl_skips_residual_storage() {
+        // Variant F encode must produce zero residual_norms across all rows.
+        // The encode path zeros residual_norms when qjl_mode is NoQjl; the
+        // dequantize path then short-circuits the QJL correction term entirely.
+        let core = super::TurboQuantCore::new(32, 4);
+        let row: Vec<f32> = (0..32).map(|i| (i as f32 * 0.13).sin()).collect();
+        let encoded = super::encode_key_component_rows(
+            &core,
+            &row,
+            4,
+            super::TurboQuantQjlMode::NoQjl,
+        );
+        assert!(
+            encoded.residual_norms.iter().all(|&rn| rn == 0.0),
+            "NoQjl must zero residual_norms; got {:?}",
+            encoded.residual_norms
+        );
+        assert!(
+            encoded.qjl_signs.iter().all(|&s| s == 0),
+            "NoQjl must zero qjl_signs"
         );
     }
 

@@ -387,7 +387,7 @@ mod kvcache {
     #[test]
     fn turboquant_handles_zero_rows() {
         let core = TurboQuantCore::new(8, 4);
-        let encoded = encode_key_component_rows(&core, &[0.0; 8], 4);
+        let encoded = encode_key_component_rows(&core, &[0.0; 8], 4, super::config::TurboQuantQjlMode::Standard);
         assert_eq!(encoded.norms, vec![0.0]);
         assert_eq!(encoded.residual_norms, vec![0.0]);
         assert!(encoded.mse_indices.iter().all(|&v| v == 0));
@@ -622,6 +622,87 @@ mod kvcache {
         assert!(
             gpu_values.indices_t.is_none(),
             "d256 q8 path should not keep transposed value indices"
+        );
+    }
+
+    #[test]
+    fn turboquant_no_qjl_direct_attention_matches_dequantized_sdpa() {
+        // Variant F (NoQjl) end-to-end: append → direct attention through the
+        // dequantize-and-SDPA fallback path (try_gpu_uniform_attention is
+        // gated off for NoQjl) must match a manual reference attention
+        // computed against gpu_dequantize_keys output. This pins:
+        //   - GPU encode honors qjl_mode (full-bits codebook, zero residuals)
+        //   - gpu_dequantize_keys honors qjl_mode (full-bits codebook lookup)
+        //   - cache.rs routes NoQjl off the fast path
+        let dim = 16usize;
+        let heads = 2i32;
+        let prefill = 3i32;
+        let config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl);
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let step_len = (b * h * d) as usize;
+        let prefill_keys =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.2), &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
+        let queries = InlineArray::from_f32_slice(&make_data(step_len, 1.3), &[b, h, 1, d]);
+        let step_keys = InlineArray::from_f32_slice(&make_data(step_len, 1.9), &[b, h, 1, d]);
+        let step_values = InlineArray::from_f32_slice(&make_data(step_len, 2.4), &[b, h, 1, d]);
+
+        let mut seed_cache = QuantizedKvCache::new(config);
+        seed_cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+
+        ref_cache
+            .append(&step_keys, &step_values)
+            .expect("reference append");
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let reference_vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut full_keys,
+            &mut full_values,
+            b,
+            h,
+            4,
+            d,
+            scale,
+        );
+
+        let direct_vals = direct
+            .to_f32_vec((b * h * d) as usize)
+            .expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        // NoQjl goes through the fallback path which IS the same dequantize
+        // + SDPA computation as the reference, so this should match to
+        // numerical precision.
+        assert!(
+            max_abs_diff < 1e-4,
+            "Variant F direct attention diverged from dequantized sdpa: max_abs_diff={max_abs_diff}"
         );
     }
 
@@ -1306,7 +1387,7 @@ mod kvcache {
         let core = TurboQuantCore::new(16, 4);
         let mut row = vec![0.1f32; 16];
         row[0] = f32::NAN;
-        let encoded = encode_key_component_rows(&core, &row, 4);
+        let encoded = encode_key_component_rows(&core, &row, 4, super::config::TurboQuantQjlMode::Standard);
         assert_eq!(encoded.residual_norms.len(), 1);
         assert!(
             encoded.residual_norms[0].is_finite(),
@@ -1325,7 +1406,7 @@ mod kvcache {
         let core = TurboQuantCore::new(16, 4);
         let mut row = vec![1.0f32; 16];
         row[5] = f32::INFINITY;
-        let encoded = encode_key_component_rows(&core, &row, 4);
+        let encoded = encode_key_component_rows(&core, &row, 4, super::config::TurboQuantQjlMode::Standard);
         assert!(
             encoded.residual_norms[0].is_finite(),
             "Inf input must not leak into residual_norm"
@@ -1391,6 +1472,7 @@ mod kvcache {
             &encoded.residual_norms,
             &encoded.slot_scale,
             bits,
+            super::config::TurboQuantQjlMode::Standard,
         )
     }
 
@@ -1407,7 +1489,7 @@ mod kvcache {
         let mut errors = Vec::new();
         for &bits in &[3u8, 5u8, 7u8] {
             let core = TurboQuantCore::new(dim, bits);
-            let encoded = encode_key_component_rows(&core, &data, bits);
+            let encoded = encode_key_component_rows(&core, &data, bits, super::config::TurboQuantQjlMode::Standard);
             let decoded = decode_cpu_key(&core, &encoded, bits, num_rows);
             // Per-element MSE, averaged across all rows.
             let mse: f32 = data
@@ -1464,7 +1546,7 @@ mod kvcache {
         let keys = seeded_gaussian_rows(num_rows, dim, 0x1111_2222_3333_4444);
         let queries = seeded_gaussian_rows(num_rows, dim, 0x5555_6666_7777_8888);
 
-        let encoded = encode_key_component_rows(&core, &keys, bits);
+        let encoded = encode_key_component_rows(&core, &keys, bits, super::config::TurboQuantQjlMode::Standard);
         let decoded = decode_cpu_key(&core, &encoded, bits, num_rows);
 
         let mut sum_gt = 0.0f64;
@@ -1624,7 +1706,13 @@ mod kvcache {
         // Uniform path
         let (kstore_uni, _) =
             gpu_quantize_kv(&state, &rows, &vals, config).expect("uniform encode");
-        let mut dec_uni = gpu_dequantize_keys(&kstore_uni, &state.keys, 3).expect("uniform decode");
+        let mut dec_uni = gpu_dequantize_keys(
+            &kstore_uni,
+            &state.keys,
+            3,
+            super::config::TurboQuantQjlMode::Standard,
+        )
+        .expect("uniform decode");
         let recon_uni = dec_uni.to_f32_vec(total).expect("dec uni to_f32");
 
         // Mixed sub-vector path on the SAME core

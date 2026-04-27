@@ -211,7 +211,7 @@ impl QuantizedKvCache {
 
         let ks = self
             .keys
-            .get_or_insert_with(|| QuantizedKeyStore::new(config.keys));
+            .get_or_insert_with(|| QuantizedKeyStore::new(config.keys, config.qjl));
         let vs = self
             .values
             .get_or_insert_with(|| QuantizedValueStore::new(config.values));
@@ -245,7 +245,7 @@ impl QuantizedKvCache {
         let rows_per_seq = layout.batch * layout.heads;
         debug_assert_eq!(key_rows.len(), rows_per_seq * seq_len * layout.key_dim);
 
-        let encoded_keys = encode_key_rows(&state.keys, layout.key_dim, &key_rows);
+        let encoded_keys = encode_key_rows(&state.keys, layout.key_dim, &key_rows, state.qjl);
         let encoded_values = encode_value_rows(&state.values, layout.value_dim, &value_rows);
 
         ks.extend(
@@ -580,7 +580,7 @@ impl QuantizedKvCache {
                 let TurboQuantTensorConfig::Uniform { bits } = self.config.keys else {
                     unreachable!("Uniform GpuKeyStore only exists for Uniform config")
                 };
-                Some(gpu_dequantize_keys(g, &state.keys, bits)?)
+                Some(gpu_dequantize_keys(g, &state.keys, bits, state.qjl)?)
             } else if let Some(ref g) = ks.gpu_mixed {
                 // Phase 3c: GPU-side Mixed dequantize avoids the CPU→GPU
                 // upload that dominated the dequantize+SDPA fallback. The
@@ -589,7 +589,7 @@ impl QuantizedKvCache {
                 // `turboquant_gpu_mixed_storage_round_trip_matches_cpu_dequantize`).
                 Some(gpu_dequantize_keys_mixed(g, &state.keys, &self.config)?)
             } else {
-                let rows = decode_key_rows(&state.keys, layout.key_dim, ks);
+                let rows = decode_key_rows(&state.keys, layout.key_dim, ks, state.qjl);
                 Some(f32_rows_to_bhsd_array(
                     &rows,
                     layout.batch,
@@ -1615,6 +1615,17 @@ impl QuantizedKvCache {
         let ks = self.keys.as_ref()?.gpu.as_ref()?;
         let vs = self.values.as_ref()?.gpu.as_ref()?;
         let state = self.state.as_ref()?;
+        // Variant F (NoQjl) has no fused score kernel yet — the existing
+        // d128/d256 families always read residual_norms + qjl_signs and fold
+        // the QJL term into the score. With residual_norms forced to 0 the
+        // QJL contribution is mathematically 0 but the kernels still pay the
+        // QJL load cost; defer the fused-kernel optimization (Phase C′) and
+        // route Variant F through the dequantize + SDPA fallback instead. The
+        // fallback is correct: gpu_dequantize_keys honors qjl_mode and the
+        // resulting fp16 cache is identical to a Variant F decode.
+        if matches!(state.qjl, super::TurboQuantQjlMode::NoQjl) {
+            return None;
+        }
 
         let (key_core, key_bits) = match &state.keys {
             TensorRuntime::Uniform {

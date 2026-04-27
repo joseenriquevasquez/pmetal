@@ -48,7 +48,14 @@ pub(super) fn gpu_quantize_kv(
     let TurboQuantTensorConfig::Uniform { bits: val_bits } = config.values else {
         return None;
     };
-    let key_mse_bits = key_bits.saturating_sub(1);
+    // Variant F (NoQjl) gives the codebook a full extra bit; Variant E reserves
+    // one bit per dim for the QJL residual sign.
+    let no_qjl = matches!(config.qjl, super::TurboQuantQjlMode::NoQjl);
+    let key_mse_bits = if no_qjl {
+        key_bits
+    } else {
+        key_bits.saturating_sub(1)
+    };
 
     let k_core = match &state.keys {
         TensorRuntime::Uniform { core, .. } => core,
@@ -115,7 +122,11 @@ pub(super) fn gpu_quantize_kv(
     // QJL ablation: when the tq-ablation feature is enabled and the runtime
     // flag is set, zero the residual norms so the score kernel's residual
     // term collapses to 0 — measurement-only short-circuit, no kernel change.
-    let k_residual_norms = if super::should_zero_qjl() {
+    // Force-zero residual_norms when (a) the ablation knob is on or
+    // (b) qjl mode is NoQjl. Both flatten the QJL correction term in the
+    // score / dequantize paths to 0 — they read residual_norms and skip the
+    // J^T·sign correction when norms are below ZERO_EPSILON.
+    let k_residual_norms = if super::should_zero_qjl() || no_qjl {
         k_residual_norms.multiply(&zero_bound)
     } else {
         k_residual_norms
@@ -724,8 +735,12 @@ pub(super) fn gpu_dequantize_keys(
     store: &GpuKeyStore,
     runtime: &TensorRuntime,
     key_bits: u8,
+    qjl_mode: super::TurboQuantQjlMode,
 ) -> Option<InlineArray> {
-    let key_mse_bits = key_bits.saturating_sub(1);
+    let key_mse_bits = match qjl_mode {
+        super::TurboQuantQjlMode::Standard => key_bits.saturating_sub(1),
+        super::TurboQuantQjlMode::NoQjl => key_bits,
+    };
     let core = match runtime {
         TensorRuntime::Uniform { core, .. } => core,
         TensorRuntime::Mixed { .. } => return None,
