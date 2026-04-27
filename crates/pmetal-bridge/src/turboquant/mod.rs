@@ -554,8 +554,9 @@ pub struct QuantizedKeyStore {
 
     // GPU-native store for the Mixed path. Populated alongside the CPU
     // `PackedBits` fields below when a Mixed config is active and the GPU
-    // encode succeeded. Phase 3a — present but currently consumed only by
-    // round-trip tests; Phase 3c will wire it into attention.
+    // encode succeeded. `dequantize_keys` reads this directly so the cold
+    // dequantize stays GPU-resident; a fused mixed-score kernel that
+    // consumes it without going through dequantize is still future work.
     gpu_mixed: Option<GpuMixedKeyStore>,
 
     // CPU fallback: regular (non-outlier) sub-vector data.
@@ -970,11 +971,12 @@ impl QuantizedKvCache {
             encoded_values.outlier_mask.as_ref(),
         );
 
-        // ── Mixed GPU path (additive, Phase 3a) ───────────────────────────
+        // ── Mixed GPU path ────────────────────────────────────────────────
         // Mirrors the Uniform GPU path above but populates gpu_mixed instead
         // of gpu, alongside (not in lieu of) the CPU PackedBits stores. The
-        // CPU stores remain authoritative for now; Phase 3c will flip
-        // attention dispatch to read from gpu_mixed.
+        // CPU stores remain the authoritative source for the score kernel
+        // (which still reads PackedBits); the GPU store is consumed by the
+        // cold dequantize path so reconstruction never re-uploads via CPU.
         let mixed_keys = matches!(config.keys, TurboQuantTensorConfig::Mixed { .. });
         let mixed_vals = matches!(config.values, TurboQuantTensorConfig::Mixed { .. });
         if mixed_keys && mixed_vals {
@@ -2977,8 +2979,9 @@ fn gpu_encode_key_subvector(
 
     let rotated = core.rotate_array(&normalized)?;
     let indices_u32 = core.gpu_quantize_mse(&rotated, mse_bits)?;
-    // Phase 3a: keep indices as u32 for round-trip clarity. Phase 3c will
-    // introduce a u8 packed shadow alongside (matching Uniform's q8_keybytes).
+    // Indices kept as u32 for round-trip clarity. A u8 packed shadow (matching
+    // Uniform's q8_keybytes) would let a fused Mixed score kernel skip the
+    // u32→u8 cast each step; deferred until the fused path lands.
     let indices = indices_u32.clone();
 
     let recon_rot = core.gpu_reconstruct_mse(&indices_u32, mse_bits)?;
@@ -3228,18 +3231,18 @@ fn gpu_quantize_kv_mixed(
     Some((kstore, vstore))
 }
 
-/// Phase 3b — Score `queries` against a Mixed-precision GPU key store using the
-/// dormant `mlx_inline_turboquant_mixed_score` kernel.
+/// Score `queries` against a Mixed-precision GPU key store using the
+/// `mlx_inline_turboquant_mixed_score` kernel.
 ///
-/// **Layout-oracle contract.** This helper validates the Phase 3a storage
-/// layout against the existing C++ score kernel so that Phase 3c's fused
-/// attention kernels can reuse the same memory shape with confidence. It is
-/// **not** a production scoring path: the kernel takes a single
-/// `[N, D_sub]` query slice per sub-vector and reuses it for every cache
-/// slot, so the result is only correct when every slot's outlier mask
+/// **Layout-oracle contract.** This helper validates the Mixed-precision
+/// GPU storage layout against the C++ score kernel — a regression gate that
+/// catches stride/dtype/qjl-word-count drift before it reaches a fused
+/// attention path. It is **not** a production scoring path: the kernel takes
+/// a single `[N, D_sub]` query slice per sub-vector and reuses it for every
+/// cache slot, so the result is only correct when every slot's outlier mask
 /// matches `kstore.regular_src_dim[..,0,..]` / `outlier_src_dim[..,0,..]`.
-/// Phase 3c's kernels gather Q per-slot from the full `[N, D_total]` query
-/// instead.
+/// A production fused mixed-score kernel would gather Q per-slot from the
+/// full `[N, D_total]` query instead.
 ///
 /// Inputs:
 ///   - `queries`: `[B, q_heads, 1, D_total]` f32 — the un-rotated, un-projected
@@ -3248,7 +3251,7 @@ fn gpu_quantize_kv_mixed(
 ///   - `n_seq`: how many of the `T` cached slots to score against (≤ T).
 ///
 /// Returns scores `[N, n_seq]` (N = B · q_heads).
-#[allow(dead_code)] // Phase 3b oracle — wired by tests; Phase 3c attention path supersedes it.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn try_gpu_mixed_score(
     state: &TurboQuantState,
