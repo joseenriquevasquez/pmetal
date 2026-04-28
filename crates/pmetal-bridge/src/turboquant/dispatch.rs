@@ -165,6 +165,39 @@ pub(super) fn gpu_quantize_kv(
         None
     };
 
+    // Phase E (Variant G per-block outliers): extract the top-K |rotated|
+    // channels per slot and store them as (channel: u8, value: f16) pairs.
+    // Decode-time override is NOT yet wired — these buffers are populated for
+    // future use; reconstruction still goes through the codebook path. Storing
+    // without zeroing pre-quant means there is no quality regression today;
+    // when the override path lands we'll also zero the K coords before the
+    // codebook quant so `inv_std` and the codebook fit the body without
+    // outlier contamination (per the Phase E plan).
+    let (outlier_channels, outlier_values) = match config.outliers {
+        super::TurboQuantOutlierMode::None => (None, None),
+        super::TurboQuantOutlierMode::PerBlock { k } => {
+            let kv_rows = keys.dim(0) * keys.dim(1) * keys.dim(2);
+            let dim = k_core.dim as i32;
+            let k_i32 = k as i32;
+            if k_i32 <= 0 || k_i32 > dim {
+                (None, None)
+            } else {
+                let k_rot_2d = k_rot.reshape(&[kv_rows, dim]);
+                // argpartition on negative |rotated| ⇒ first K positions
+                // hold indices of the K largest |rotated| values.
+                let neg_abs = k_rot_2d.abs().negative();
+                let part = neg_abs.argpartition(k_i32 - 1, -1);
+                let channels_2d = part.slice(&[0, 0], &[kv_rows, k_i32]);
+                // Use take_along_axis with the u32 indices (MLX accepts).
+                let values_2d = k_rot_2d.take_along_axis(&channels_2d, -1);
+                let shape4 = [keys.dim(0), keys.dim(1), keys.dim(2), k_i32];
+                let channels_u8 = channels_2d.reshape(&shape4).as_dtype(Dtype::Uint8.as_i32());
+                let values_f16 = values_2d.reshape(&shape4).as_dtype(Dtype::Float16.as_i32());
+                (Some(channels_u8), Some(values_f16))
+            }
+        }
+    };
+
     let (k_qjl_signs, k_qjl_signs_t, q8_keybytes_t, q8_keybytes_seq) = if no_qjl {
         (None, None, None, None)
     } else {
@@ -330,6 +363,8 @@ pub(super) fn gpu_quantize_kv(
             residual_norms: (!use_q8_seq_shadow).then_some(k_residual_norms),
             key_slot_scale: (!use_q8_seq_shadow).then_some(k_slot_scale),
             sign_hash,
+            outlier_channels,
+            outlier_values,
         },
         GpuValueStore {
             indices: v_indices,

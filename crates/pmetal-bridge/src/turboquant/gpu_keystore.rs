@@ -41,6 +41,13 @@ use crate::InlineArray;
 ///                                           set on the active TurboQuantConfig;
 ///                                           otherwise None and the pre-filter
 ///                                           dispatch path is bypassed.
+///   outlier_channels: [B, H, T, k]  uint8   — per-slot top-K |rotated| channel
+///                                           indices (Phase E Variant G).
+///                                           Populated only when
+///                                           `outliers = PerBlock { k }`.
+///   outlier_values:   [B, H, T, k]  fp16    — original rotated values at the
+///                                           outlier channels. Pairs with
+///                                           `outlier_channels`; same gating.
 #[derive(Debug, Clone)]
 pub(super) struct GpuKeyStore {
     pub(super) indices: InlineArray,
@@ -56,6 +63,8 @@ pub(super) struct GpuKeyStore {
     pub(super) residual_norms: Option<InlineArray>,
     pub(super) key_slot_scale: Option<InlineArray>,
     pub(super) sign_hash: Option<InlineArray>,
+    pub(super) outlier_channels: Option<InlineArray>,
+    pub(super) outlier_values: Option<InlineArray>,
 }
 
 impl GpuKeyStore {
@@ -120,6 +129,16 @@ impl GpuKeyStore {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
             (None, None) => None,
             _ => panic!("GpuKeyStore.sign_hash Option-state mismatch on append"),
+        };
+        self.outlier_channels = match (self.outlier_channels.take(), new.outlier_channels) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
+            (None, None) => None,
+            _ => panic!("GpuKeyStore.outlier_channels Option-state mismatch on append"),
+        };
+        self.outlier_values = match (self.outlier_values.take(), new.outlier_values) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
+            (None, None) => None,
+            _ => panic!("GpuKeyStore.outlier_values Option-state mismatch on append"),
         };
     }
 
@@ -227,6 +246,12 @@ impl GpuKeyStore {
         }
         if let Some(sign_hash) = self.sign_hash.as_mut() {
             out.push(sign_hash);
+        }
+        if let Some(outlier_channels) = self.outlier_channels.as_mut() {
+            out.push(outlier_channels);
+        }
+        if let Some(outlier_values) = self.outlier_values.as_mut() {
+            out.push(outlier_values);
         }
     }
 }

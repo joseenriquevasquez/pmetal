@@ -883,6 +883,100 @@ mod kvcache {
         );
     }
 
+    // Phase E.2: when outliers = PerBlock { k }, encode must populate
+    // outlier_channels (u8 channel index per slot) and outlier_values (f16
+    // rotated value at that channel). Default None leaves both buffers
+    // unallocated. Decode-time override is not yet wired — this test only
+    // pins the storage gating + content; reconstruction quality is unchanged.
+    #[test]
+    fn turboquant_outliers_per_block_populates_extrema() {
+        let dim = 16usize;
+        let heads = 1i32;
+        let prefill = 3i32;
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let k_outliers: u8 = 4;
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let make_data = |seed: f32| -> Vec<f32> {
+            (0..prefill_len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.13 - seed).cos())
+                .collect()
+        };
+        let keys = InlineArray::from_f32_slice(&make_data(0.2), &[b, h, prefill, d]);
+        let values = InlineArray::from_f32_slice(&make_data(0.7), &[b, h, prefill, d]);
+
+        // Default (None): no outlier buffers.
+        let off_config = TurboQuantConfig::uniform(8, 8).with_recent_window(None);
+        let mut off_cache = QuantizedKvCache::new(off_config);
+        off_cache.append(&keys, &values).expect("off append");
+        let off_gpu = off_cache
+            .keys
+            .as_ref()
+            .and_then(|k| k.gpu.as_ref())
+            .expect("uniform should produce a GpuKeyStore");
+        assert!(
+            off_gpu.outlier_channels.is_none(),
+            "outliers = None must NOT allocate outlier_channels"
+        );
+        assert!(
+            off_gpu.outlier_values.is_none(),
+            "outliers = None must NOT allocate outlier_values"
+        );
+
+        // PerBlock { k }: both buffers populated with shape [B, H, T, k].
+        let on_config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None)
+            .with_outliers(super::config::TurboQuantOutlierMode::PerBlock { k: k_outliers });
+        let mut on_cache = QuantizedKvCache::new(on_config);
+        on_cache.append(&keys, &values).expect("on append");
+        let on_gpu = on_cache
+            .keys
+            .as_ref()
+            .and_then(|k| k.gpu.as_ref())
+            .expect("uniform should produce a GpuKeyStore");
+
+        let channels = on_gpu
+            .outlier_channels
+            .as_ref()
+            .expect("outliers = PerBlock must allocate outlier_channels");
+        let values_arr = on_gpu
+            .outlier_values
+            .as_ref()
+            .expect("outliers = PerBlock must allocate outlier_values");
+
+        assert_eq!(channels.dim(0), b);
+        assert_eq!(channels.dim(1), h);
+        assert_eq!(channels.dim(2), prefill);
+        assert_eq!(channels.dim(3), k_outliers as i32);
+        assert_eq!(values_arr.dim(3), k_outliers as i32);
+
+        // Sanity: every channel index must be in [0, D).
+        let channels_u32 = channels.as_dtype(crate::dtype::U32);
+        channels_u32.eval();
+        let n_per_slot = k_outliers as usize;
+        let total = (b * h * prefill) as usize * n_per_slot;
+        let raw: &[u32] = channels_u32.as_slice();
+        assert!(raw.len() >= total);
+        for &c in &raw[..total] {
+            assert!(
+                c < dim as u32,
+                "outlier channel {c} out of range [0, {dim})"
+            );
+        }
+
+        // Sanity: outlier values are finite f16 reads.
+        let values_f32 = values_arr.as_dtype(crate::dtype::F32);
+        values_f32.eval();
+        let vals: &[f32] = values_f32.as_slice();
+        assert!(vals.len() >= total);
+        assert!(
+            vals[..total].iter().all(|v| v.is_finite()),
+            "outlier values must be finite"
+        );
+    }
+
     // Phase D.2: setting pack_mode = Fullbyte must build the q8_fullbyte_seq
     // shadow buffer at encode time, even when the legacy env-var override
     // (PMETAL_TQ_Q8_FULLBYTE) is unset. Default Bitstream leaves the buffer
