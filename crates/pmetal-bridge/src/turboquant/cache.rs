@@ -235,7 +235,21 @@ impl QuantizedKvCache {
                 self.cold_offset += seq_len;
                 return Ok(());
             }
-            // GPU path failed — fall through to CPU.
+            // GPU path failed — fall through to CPU. But CPU encode does
+            // NOT mirror the Phase E.3 outlier override (the host
+            // encode_key_component_rows has no notion of per-block
+            // outliers). Silently falling through would produce broken
+            // cache state — error explicitly so the caller can either
+            // disable outliers or pin a GPU-supported config.
+            if config.outliers.is_enabled() {
+                return Err(
+                    "TurboQuant outliers (PerBlock) require GPU encode; \
+                     CPU fallback does not mirror the override. Disable \
+                     outliers or use a GPU-supported config (Uniform + \
+                     codebook available)."
+                        .to_string(),
+                );
+            }
         }
 
         // ── CPU fallback path ─────────────────────────────────────────────
