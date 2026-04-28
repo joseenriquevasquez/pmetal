@@ -632,6 +632,15 @@ unsafe extern "C" {
         n_rows: u32,
     ) -> i32;
 
+    pub(super) fn mlx_inline_turboquant_hamming_distances(
+        out: *mut RawBuf,
+        query_signs: *const RawBuf,
+        key_signs: *const RawBuf,
+        packed_dim: u32,
+        n_rows: u32,
+        n_seq: u32,
+    ) -> i32;
+
     pub(super) fn mlx_inline_turboquant_pack_q8_keybytes(
         out: *mut RawBuf,
         indices: *const RawBuf,

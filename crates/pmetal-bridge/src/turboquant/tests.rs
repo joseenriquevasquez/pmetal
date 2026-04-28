@@ -673,6 +673,63 @@ mod kvcache {
     }
 
     #[test]
+    fn turboquant_hamming_distances_matches_scalar_reference() {
+        // Phase F kernel parity: the Metal XOR+popcount kernel must agree
+        // with a scalar Rust reference on arbitrary u32 inputs.
+        let n_rows = 3usize;
+        let n_seq = 17usize;
+        let packed_dim = 4usize; // D = 128
+
+        let mut query: Vec<u32> = (0..(n_rows * packed_dim))
+            .map(|i| (i as u32).wrapping_mul(0x9E3779B1) ^ 0xDEADBEEF)
+            .collect();
+        // Salt query[1] differently so different rows produce distinct
+        // distances and we exercise multi-row indexing.
+        for w in query.iter_mut().skip(packed_dim).take(packed_dim) {
+            *w = w.wrapping_mul(0xC2B2AE35).wrapping_add(0x85EBCA77);
+        }
+
+        let keys: Vec<u32> = (0..(n_rows * n_seq * packed_dim))
+            .map(|i| (i as u32).wrapping_mul(0xCC9E2D51).rotate_left(13) ^ 0xC2B2AE35)
+            .collect();
+
+        let query_arr = InlineArray::from_u32_slice(
+            &query,
+            &[n_rows as i32, packed_dim as i32],
+        );
+        let keys_arr = InlineArray::from_u32_slice(
+            &keys,
+            &[n_rows as i32, n_seq as i32, packed_dim as i32],
+        );
+
+        let distances = InlineArray::turboquant_hamming_distances(
+            &query_arr,
+            &keys_arr,
+            packed_dim as u32,
+            n_rows as u32,
+            n_seq as u32,
+        )
+        .expect("hamming kernel");
+        distances.eval();
+        let actual: &[u32] = distances.as_slice();
+        for row in 0..n_rows {
+            for slot in 0..n_seq {
+                let mut expected = 0u32;
+                for w in 0..packed_dim {
+                    let q = query[row * packed_dim + w];
+                    let k = keys[(row * n_seq + slot) * packed_dim + w];
+                    expected += (q ^ k).count_ones();
+                }
+                let got = actual[row * n_seq + slot];
+                assert_eq!(
+                    got, expected,
+                    "row={row} slot={slot}: expected {expected}, got {got}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn turboquant_skiplist_threshold_populates_sign_hash() {
         // Phase F: when skiplist_threshold is set, encode must produce the
         // per-slot sign-hash buffer used by the Hamming pre-filter. When

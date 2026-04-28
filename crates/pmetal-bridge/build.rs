@@ -416,6 +416,7 @@ fn build_and_link() {
         "bridge_turboquant_weighted.cpp",
         "bridge_turboquant_attn_d256.cpp",
         "bridge_turboquant_attn_d128.cpp",
+        "bridge_turboquant_hamming.cpp",
         "bridge_compiled.cpp",
         "bridge_native.cpp",
         "bridge_training.cpp",

@@ -283,6 +283,41 @@ impl InlineArray {
         }
     }
 
+    /// Phase F: XOR + popcount Hamming distance from a per-row query sign
+    /// hash to a `[N, S, packed_dim]` cache of key sign hashes. Output:
+    /// `[N, S]` u32 — Hamming distance per (row, slot), in range `[0, D]`.
+    /// Pre-filter caller picks the M slots with the smallest distances and
+    /// runs exact attention on those M only (sparse score path).
+    ///
+    /// - `query_signs`: `[N, packed_dim]` uint32
+    /// - `key_signs`:   `[N, S, packed_dim]` uint32
+    pub fn turboquant_hamming_distances(
+        query_signs: &Self,
+        key_signs: &Self,
+        packed_dim: u32,
+        n_rows: u32,
+        n_seq: u32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_hamming_distances(
+                out.as_mut_ptr(),
+                &query_signs.raw,
+                &key_signs.raw,
+                packed_dim,
+                n_rows,
+                n_seq,
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
     /// Pack `sign(projected >= 0)` along the last dimension into uint32 words.
     ///
     /// - `projected`: `[N, D]` f32

@@ -248,6 +248,19 @@ int mlx_inline_turboquant_pack_q8_kvbytes_seq(
     uint32_t                n_rows,
     uint32_t                cache_seq_capacity);
 
+// Phase F (Hamming skip-list): XOR + popcount Hamming distance between a
+// per-row query sign hash and a [N, S, packed_dim] cache of key sign hashes.
+//   query_signs:    [N, packed_dim] uint32
+//   key_signs:      [N, S, packed_dim] uint32
+//   out_distances:  [N, S] uint32  (Hamming distance, 0..D)
+int mlx_inline_turboquant_hamming_distances(
+    mlx_inline_array*       out,
+    const mlx_inline_array* query_signs,
+    const mlx_inline_array* key_signs,
+    uint32_t                packed_dim,
+    uint32_t                n_rows,
+    uint32_t                n_seq);
+
 // Unpack uint32 sign words back to {-1,+1} f32 signs.
 // packed: [N, ceil(D/32)] uint32
 // out:    [N, D] f32
