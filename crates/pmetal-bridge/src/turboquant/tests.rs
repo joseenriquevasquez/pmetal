@@ -883,6 +883,63 @@ mod kvcache {
         );
     }
 
+    // Phase F.4 partial-selection smoke: cold_offset > 2048 forces top_m < n_seq
+    // (real Hamming pre-filter selection, not a no-op). Asserts the dispatch
+    // returns a finite output of the correct shape — exact agreement vs dense
+    // is not expected because attention is computed over a strict subset of
+    // slots. A separate quality bench will measure recall@M against dense.
+    #[test]
+    fn turboquant_hamming_skiplist_partial_selection_runs() {
+        let dim = 128usize;
+        let heads = 2i32;
+        let prefill = 2049i32;
+        let config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl)
+            .with_skiplist_threshold(Some(1024));
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let step_len = (b * h * d) as usize;
+        let prefill_keys =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.2), &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
+        let queries = InlineArray::from_f32_slice(&make_data(step_len, 1.3), &[b, h, 1, d]);
+        let step_keys = InlineArray::from_f32_slice(&make_data(step_len, 1.9), &[b, h, 1, d]);
+        let step_values = InlineArray::from_f32_slice(&make_data(step_len, 2.4), &[b, h, 1, d]);
+
+        let mut cache = QuantizedKvCache::new(config);
+        cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+
+        let mut output = cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("partial-selection skiplist dispatch");
+        assert_eq!(output.dim(0), b);
+        assert_eq!(output.dim(1), h);
+        assert_eq!(output.dim(2), 1);
+        assert_eq!(output.dim(3), d);
+
+        let vals = output
+            .to_f32_vec((b * h * d) as usize)
+            .expect("output to_f32");
+        assert!(
+            vals.iter().all(|v| v.is_finite()),
+            "skiplist output contained non-finite values"
+        );
+    }
+
     // Pins the no_qjl_2pass d128 kernel fast path. Shares pass 2 with the
     // Standard d128 kernel; both were unblocked by the 2026-04-27 pass-2
     // reduction fix.
