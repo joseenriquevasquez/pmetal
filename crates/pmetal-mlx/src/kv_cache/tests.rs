@@ -113,6 +113,7 @@ fn test_sanitize_cache_mode_clamps_turboquant_outliers_per_tensor_dim() {
                 qjl: Default::default(),
                 skiplist_threshold: None,
                 outliers: Default::default(),
+                pack_mode: Default::default(),
             },
         },
     );
@@ -127,6 +128,7 @@ fn test_sanitize_cache_mode_clamps_turboquant_outliers_per_tensor_dim() {
                 qjl: Default::default(),
                 skiplist_threshold: None,
                 outliers: Default::default(),
+                pack_mode: Default::default(),
             }
         }
     );

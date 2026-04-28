@@ -108,6 +108,30 @@ impl TurboQuantTensorConfig {
     }
 }
 
+/// Centroid-index storage layout — orthogonal to bit-width, QJL mode,
+/// and outlier mode.
+///
+/// `Bitstream` (default): centroid indices are bit-packed into a
+/// contiguous LSB-first byte stream. At N bits per index the storage is
+/// `ceil(N · D / 8)` bytes per slot. This is the historical layout and
+/// minimises memory.
+///
+/// `Fullbyte`: each centroid index occupies one full byte regardless of
+/// bit-width. At 4-7 bits this wastes the high bits per index but lets
+/// the score kernel read indices with a single byte load instead of
+/// bitstream extraction; on Apple GPUs the tradeoff favours `Fullbyte`
+/// once the inner loop is bandwidth-bound (typical at decode time).
+///
+/// At 8 bits the two modes produce identical storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurboQuantPackMode {
+    /// LSB-first bit-stream packing — `ceil(N · D / 8)` bytes per slot.
+    #[default]
+    Bitstream,
+    /// One byte per centroid index regardless of bit-width — SIMD-friendly.
+    Fullbyte,
+}
+
 /// Per-block outlier mode (Phase E "Variant G") — orthogonal to all other
 /// TurboQuant precision knobs.
 ///
@@ -227,6 +251,10 @@ pub struct TurboQuantConfig {
     /// the K largest-magnitude coords per slot and stores them as
     /// `(channel, value)` pairs that override codebook reconstruction.
     pub outliers: TurboQuantOutlierMode,
+    /// Centroid-index storage layout. `Bitstream` (default) bit-packs
+    /// indices for minimum memory; `Fullbyte` uses one byte per index
+    /// for SIMD-friendly score-kernel reads at non-8-bit widths.
+    pub pack_mode: TurboQuantPackMode,
 }
 
 impl TurboQuantConfig {
@@ -239,6 +267,7 @@ impl TurboQuantConfig {
             qjl: TurboQuantQjlMode::Standard,
             skiplist_threshold: None,
             outliers: TurboQuantOutlierMode::None,
+            pack_mode: TurboQuantPackMode::Bitstream,
         }
     }
 
@@ -266,6 +295,7 @@ impl TurboQuantConfig {
             qjl: TurboQuantQjlMode::Standard,
             skiplist_threshold: None,
             outliers: TurboQuantOutlierMode::None,
+            pack_mode: TurboQuantPackMode::Bitstream,
         }
     }
 
@@ -295,6 +325,12 @@ impl TurboQuantConfig {
     /// [`TurboQuantOutlierMode`].
     pub const fn with_outliers(mut self, mode: TurboQuantOutlierMode) -> Self {
         self.outliers = mode;
+        self
+    }
+
+    /// Override centroid-index storage layout. See [`TurboQuantPackMode`].
+    pub const fn with_pack_mode(mut self, mode: TurboQuantPackMode) -> Self {
+        self.pack_mode = mode;
         self
     }
 

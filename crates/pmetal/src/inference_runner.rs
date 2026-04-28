@@ -1035,6 +1035,7 @@ fn turboquant_config_from_mode(
             qjl: bridge_turboquant_qjl_mode(config.qjl),
             skiplist_threshold: config.skiplist_threshold,
             outliers: bridge_turboquant_outlier_mode(config.outliers),
+            pack_mode: bridge_turboquant_pack_mode(config.pack_mode),
         }),
         _ => None,
     }
@@ -1048,6 +1049,17 @@ fn bridge_turboquant_outlier_mode(
     match mode {
         Src::None => Dst::None,
         Src::PerBlock { k } => Dst::PerBlock { k },
+    }
+}
+
+fn bridge_turboquant_pack_mode(
+    mode: pmetal_mlx::kv_cache::TurboQuantPackMode,
+) -> pmetal_bridge::turboquant::TurboQuantPackMode {
+    use pmetal_mlx::kv_cache::TurboQuantPackMode as Src;
+    use pmetal_bridge::turboquant::TurboQuantPackMode as Dst;
+    match mode {
+        Src::Bitstream => Dst::Bitstream,
+        Src::Fullbyte => Dst::Fullbyte,
     }
 }
 
@@ -1293,6 +1305,7 @@ impl TurboQuantPreset {
             qjl: Default::default(),
             skiplist_threshold: None,
             outliers: Default::default(),
+            pack_mode: Default::default(),
         }
     }
 }
@@ -1850,6 +1863,7 @@ mod tests {
             qjl: Default::default(),
             skiplist_threshold: None,
             outliers: Default::default(),
+            pack_mode: Default::default(),
         };
         assert_eq!(mode, CacheMode::TurboQuant { config: expected });
     }

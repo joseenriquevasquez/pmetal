@@ -164,6 +164,16 @@ pub enum TurboQuantQjlMode {
     NoQjl,
 }
 
+/// Centroid-index storage mode — mirror of `pmetal_bridge::TurboQuantPackMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurboQuantPackMode {
+    /// Bit-packed indices: `ceil(N · D / 8)` bytes per slot at N bits.
+    #[default]
+    Bitstream,
+    /// One byte per index regardless of bit-width.
+    Fullbyte,
+}
+
 /// Per-block outlier mode — mirror of `pmetal_bridge::TurboQuantOutlierMode`.
 /// `None` leaves codebook to absorb heavy-tail values; `PerBlock { k }`
 /// stores the top-K |rotated| coords per slot as `(channel, value)` pairs
@@ -218,6 +228,8 @@ pub struct TurboQuantConfig {
     pub skiplist_threshold: Option<usize>,
     /// Per-block outlier mode (Variant G). See [`TurboQuantOutlierMode`].
     pub outliers: TurboQuantOutlierMode,
+    /// Centroid-index storage layout (Phase D). See [`TurboQuantPackMode`].
+    pub pack_mode: TurboQuantPackMode,
 }
 
 impl TurboQuantConfig {
@@ -230,6 +242,7 @@ impl TurboQuantConfig {
             qjl: TurboQuantQjlMode::Standard,
             skiplist_threshold: None,
             outliers: TurboQuantOutlierMode::None,
+            pack_mode: TurboQuantPackMode::Bitstream,
         }
     }
 
@@ -257,6 +270,7 @@ impl TurboQuantConfig {
             qjl: TurboQuantQjlMode::Standard,
             skiplist_threshold: None,
             outliers: TurboQuantOutlierMode::None,
+            pack_mode: TurboQuantPackMode::Bitstream,
         }
     }
 
@@ -283,6 +297,12 @@ impl TurboQuantConfig {
     /// Override per-block outlier handling. See [`TurboQuantOutlierMode`].
     pub const fn with_outliers(mut self, mode: TurboQuantOutlierMode) -> Self {
         self.outliers = mode;
+        self
+    }
+
+    /// Override centroid-index storage layout. See [`TurboQuantPackMode`].
+    pub const fn with_pack_mode(mut self, mode: TurboQuantPackMode) -> Self {
+        self.pack_mode = mode;
         self
     }
 

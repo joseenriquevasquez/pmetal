@@ -244,6 +244,7 @@ pub fn sanitize_turboquant_config(
         qjl: config.qjl,
         skiplist_threshold: config.skiplist_threshold,
         outliers: config.outliers,
+        pack_mode: config.pack_mode,
     }
 }
 
