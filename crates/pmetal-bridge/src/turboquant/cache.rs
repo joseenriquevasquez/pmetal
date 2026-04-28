@@ -822,6 +822,24 @@ impl QuantizedKvCache {
             });
         }
 
+        // Phase F: Hamming skip-list pre-filter for very long contexts.
+        // Gated on `config.skiplist_threshold`; the encode path only allocates
+        // the sign-hash buffer when the threshold is set, so a missing buffer
+        // here means the user opted out and we fall through to the dense path.
+        // V1 supports cold-only Variant F (NoQjl) without GQA expansion;
+        // mixed/standard/GQA cases fall through to the existing dispatch.
+        if self.hot_offset == 0 {
+            if let Some(output) =
+                self.try_hamming_skiplist_attention(&queries_f32, layout, scale, query_dtype)
+            {
+                return Ok(if query_dtype == 10 || output.dtype_raw() == query_dtype {
+                    output
+                } else {
+                    output.as_dtype(query_dtype)
+                });
+            }
+        }
+
         // Cold-only: optimized GPU TurboQuant kernels. The score-against-cold
         // assumption inside `try_gpu_uniform_attention` is only correct when
         // the hot ring is empty.
@@ -1765,6 +1783,202 @@ impl QuantizedKvCache {
         };
 
         // Output is in the value's rotated frame; inverse-rotate via value_core.
+        let output_rows = value_core.inverse_rotate_output_array(&aggregated_rot, output_dtype)?;
+        Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]))
+    }
+
+    /// Phase F: Hamming skip-list pre-filter dispatch.
+    ///
+    /// Computes a per-query 1-bit sign hash, runs the XOR/popcount Hamming
+    /// distance kernel against the cached sign hashes, picks the M slots with
+    /// the smallest distances, gathers those slots' packed key/value cache
+    /// rows into a contiguous M-length scratch view, and runs the existing
+    /// Variant F (NoQjl) score kernel over that subset. The kernel's
+    /// `cache_seq_capacity` is set to M so its strided indexing addresses the
+    /// gathered scratch buffers correctly.
+    ///
+    /// V1 gates: skiplist_threshold set + cold_offset > threshold + sign_hash
+    /// populated + Variant F (NoQjl) Uniform key/value config + d128 or d256 +
+    /// non-GQA (q_heads == kv_heads). GQA + Standard QJL + Mixed all fall
+    /// through to the dense kernel path.
+    fn try_hamming_skiplist_attention(
+        &self,
+        queries_f32: &InlineArray,
+        layout: CacheLayout,
+        scale: f32,
+        output_dtype: i32,
+    ) -> Option<InlineArray> {
+        let threshold = self.config.skiplist_threshold?;
+        if self.cold_offset <= threshold {
+            return None;
+        }
+        let state = self.state.as_ref()?;
+        if !matches!(state.qjl, super::TurboQuantQjlMode::NoQjl) {
+            return None;
+        }
+        let ks = self.keys.as_ref()?.gpu.as_ref()?;
+        let vs = self.values.as_ref()?.gpu.as_ref()?;
+        let sign_hash = ks.sign_hash.as_ref()?;
+        let (key_core, key_bits) = match &state.keys {
+            TensorRuntime::Uniform {
+                config: TurboQuantTensorConfig::Uniform { bits },
+                core,
+            } => (core, *bits),
+            _ => return None,
+        };
+        let (value_core, value_bits) = match &state.values {
+            TensorRuntime::Uniform {
+                config: TurboQuantTensorConfig::Uniform { bits },
+                core,
+            } => (core, *bits),
+            _ => return None,
+        };
+        if key_bits != 8 || value_bits != 8 {
+            return None;
+        }
+
+        let batch = queries_f32.dim(0);
+        let q_heads = queries_f32.dim(1);
+        let kv_heads = layout.heads as i32;
+        let key_dim = queries_f32.dim(3);
+        let value_dim = layout.value_dim as i32;
+        // V1 restriction: per-q-row gather requires q_heads == kv_heads so the
+        // stored buffers index 1:1 with the query rows. GQA support is V2.
+        if q_heads != kv_heads {
+            return None;
+        }
+        if !((key_dim == 128 && value_dim == 128) || (key_dim == 256 && value_dim == 256)) {
+            return None;
+        }
+
+        let q_rows = batch * q_heads;
+        let n_seq = self.cold_offset as i32;
+        let cache_seq_capacity = ks.cache_seq_capacity();
+        if cache_seq_capacity < n_seq {
+            return None;
+        }
+        let packed_dim = (key_dim + 31) / 32;
+        // Top-M defaults to min(cold_offset, 2048). Once threshold-gating
+        // ships, an explicit knob can override this.
+        // top_m = min(cold_offset, 2048) ⇒ top_m ≤ n_seq by construction; the
+        // equal case still exercises the gather path (no-op selection) and is
+        // allowed so smaller-than-2048 caches near the threshold still go
+        // through the dispatch.
+        let top_m = (self.cold_offset.min(2048)) as i32;
+        if top_m <= 0 {
+            return None;
+        }
+
+        // 1. Rotate query into the same frame as the encoded keys.
+        let query_rows = queries_f32.reshape(&[q_rows, key_dim]);
+        let query_rot = key_core.rotate_array(&query_rows)?;
+
+        // 2. Pack query sign bits → [q_rows, packed_dim] u32.
+        let query_signs = InlineArray::turboquant_pack_sign_bits(
+            &query_rot,
+            key_dim as u32,
+            packed_dim as u32,
+            q_rows as u32,
+        )?;
+
+        // 3. Slice cold sign-hash and reshape to [q_rows, n_seq, packed_dim].
+        // Storage shape is [B, H, S_cap, packed_dim].
+        let sign_hash_active = sign_hash
+            .slice(
+                &[0, 0, 0, 0],
+                &[layout.batch as i32, kv_heads, n_seq, packed_dim],
+            )
+            .reshape(&[q_rows, n_seq, packed_dim]);
+
+        // 4. Hamming distances [q_rows, n_seq] u32.
+        let distances = InlineArray::turboquant_hamming_distances(
+            &query_signs,
+            &sign_hash_active,
+            packed_dim as u32,
+            q_rows as u32,
+            n_seq as u32,
+        )?;
+
+        // 5. argpartition for the M smallest distances. argpartition pivots
+        // such that result[..kth] are <= result[kth]; pivot at top_m - 1 to
+        // place the M smallest in [0..top_m].
+        let part = distances.argpartition(top_m - 1, -1);
+        let top_indices = part.slice(&[0, 0], &[q_rows, top_m]);
+
+        // 6. Gather the packed cache buffers at the selected M slot indices.
+        // Each gather builds a [N, ..., M] tightly-packed scratch buffer; the
+        // kernel then reads it with cache_seq_capacity = M.
+        let kv_rows = (layout.batch * layout.heads) as i32;
+        let key_indices_t = ks
+            .indices_t_array()
+            .reshape(&[kv_rows, key_dim, cache_seq_capacity]);
+        let key_norms = ks
+            .key_norms_array()?
+            .reshape(&[kv_rows, cache_seq_capacity]);
+        let key_slot_scale = ks
+            .key_slot_scale_array()?
+            .reshape(&[kv_rows, cache_seq_capacity]);
+        let value_indices_t = vs
+            .indices_t_array()?
+            .reshape(&[kv_rows, value_dim, cache_seq_capacity]);
+        let value_norms = vs
+            .norms_array()?
+            .reshape(&[kv_rows, cache_seq_capacity]);
+
+        let key_idx_2d = top_indices.reshape(&[q_rows, top_m]);
+        let key_idx_for_dim = key_idx_2d
+            .reshape(&[q_rows, 1, top_m])
+            .broadcast_to(&[q_rows, key_dim, top_m]);
+        let value_idx_for_dim = key_idx_2d
+            .reshape(&[q_rows, 1, top_m])
+            .broadcast_to(&[q_rows, value_dim, top_m]);
+
+        let gathered_key_indices_t = key_indices_t.take_along_axis(&key_idx_for_dim, 2);
+        let gathered_key_norms = key_norms.take_along_axis(&key_idx_2d, 1);
+        let gathered_key_slot_scale = key_slot_scale.take_along_axis(&key_idx_2d, 1);
+        let gathered_value_indices_t = value_indices_t.take_along_axis(&value_idx_for_dim, 2);
+        let gathered_value_norms = value_norms.take_along_axis(&key_idx_2d, 1);
+
+        let key_codebook = key_core.codebook_arr(key_bits)?;
+        let value_codebook = value_core.codebook_arr(value_bits)?;
+
+        // 7. Run the existing Variant F kernel on the gathered subset.
+        let aggregated_rot = if key_dim == 128 {
+            InlineArray::turboquant_attention_q8_d128_no_qjl_2pass(
+                &query_rot,
+                &gathered_key_indices_t,
+                &gathered_key_norms,
+                &gathered_key_slot_scale,
+                key_codebook,
+                &gathered_value_indices_t,
+                &gathered_value_norms,
+                value_codebook,
+                q_rows as u32,
+                top_m as u32,
+                top_m as u32,
+                q_heads as u32,
+                layout.heads as u32,
+                scale,
+            )?
+        } else {
+            InlineArray::turboquant_attention_q8_d256_no_qjl_2pass(
+                &query_rot,
+                &gathered_key_indices_t,
+                &gathered_key_norms,
+                &gathered_key_slot_scale,
+                key_codebook,
+                &gathered_value_indices_t,
+                &gathered_value_norms,
+                value_codebook,
+                q_rows as u32,
+                top_m as u32,
+                top_m as u32,
+                q_heads as u32,
+                layout.heads as u32,
+                scale,
+            )?
+        };
+
         let output_rows = value_core.inverse_rotate_output_array(&aggregated_rot, output_dtype)?;
         Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]))
     }

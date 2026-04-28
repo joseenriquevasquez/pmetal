@@ -793,6 +793,96 @@ mod kvcache {
         );
     }
 
+    // Phase F.4: when skiplist_threshold gates a kv-cache that is below the
+    // 2048-slot top-M cap, the Hamming pre-filter selects ALL cold slots
+    // (top_m == n_seq), so the kernel-on-gathered-subset path produces the
+    // exact same scores as the dense kernel — modulo accumulation order. This
+    // pins the dispatch wiring without requiring a separate quality bench.
+    #[test]
+    fn turboquant_hamming_skiplist_full_slot_scoring_matches_dense() {
+        let dim = 128usize;
+        let heads = 2i32;
+        let prefill = 1024i32;
+        let config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl)
+            .with_skiplist_threshold(Some(512));
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let step_len = (b * h * d) as usize;
+        let prefill_keys =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.2), &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
+        let queries = InlineArray::from_f32_slice(&make_data(step_len, 1.3), &[b, h, 1, d]);
+        let step_keys = InlineArray::from_f32_slice(&make_data(step_len, 1.9), &[b, h, 1, d]);
+        let step_values = InlineArray::from_f32_slice(&make_data(step_len, 2.4), &[b, h, 1, d]);
+
+        let mut seed_cache = QuantizedKvCache::new(config);
+        seed_cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+        // Sanity: skiplist gates require sign_hash population.
+        assert!(
+            seed_cache
+                .keys
+                .as_ref()
+                .and_then(|k| k.gpu.as_ref())
+                .and_then(|g| g.sign_hash.as_ref())
+                .is_some(),
+            "skiplist_threshold=Some must allocate sign_hash on encode"
+        );
+
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("skiplist dispatch attention");
+
+        ref_cache
+            .append(&step_keys, &step_values)
+            .expect("reference append");
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let reference_vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut full_keys,
+            &mut full_values,
+            b,
+            h,
+            (prefill + 1) as i32,
+            d,
+            scale,
+        );
+
+        let direct_vals = direct
+            .to_f32_vec((b * h * d) as usize)
+            .expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        // top_m == cold_offset means the Hamming pre-filter is a no-op
+        // selection (all slots picked), so the score result must match the
+        // dense Variant F kernel within long-context fp32 accumulation drift.
+        assert!(
+            max_abs_diff < 1e-3,
+            "skiplist dispatch (top_m == cold_offset) diverged from dense reference: max_abs_diff={max_abs_diff}"
+        );
+    }
+
     // Pins the no_qjl_2pass d128 kernel fast path. Shares pass 2 with the
     // Standard d128 kernel; both were unblocked by the 2026-04-27 pass-2
     // reduction fix.
