@@ -916,6 +916,24 @@ unsafe extern "C" {
         attn_scale_bits: u32,
     ) -> i32;
 
+    pub(super) fn mlx_inline_turboquant_attention_q8_d256_no_qjl_2pass(
+        out: *mut RawBuf,
+        query_rot: *const RawBuf,
+        key_indices: *const RawBuf,
+        key_norms: *const RawBuf,
+        key_slot_scale: *const RawBuf,
+        key_codebook: *const RawBuf,
+        value_indices: *const RawBuf,
+        value_norms: *const RawBuf,
+        value_codebook: *const RawBuf,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale_bits: u32,
+    ) -> i32;
+
     pub(super) fn mlx_inline_turboquant_attention_q8_d128_packed_keys_2pass(
         out: *mut RawBuf,
         query_rot: *const RawBuf,

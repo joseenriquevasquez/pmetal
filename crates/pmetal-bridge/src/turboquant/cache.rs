@@ -1609,8 +1609,9 @@ impl QuantizedKvCache {
     /// dispatches to the `no_qjl` kernel families that don't read
     /// `qjl_signs` / `residual_norms`. Currently wired:
     ///   - d128/8b/8b uniform (`turboquant_attention_q8_d128_no_qjl_2pass`)
+    ///   - d256/8b/8b uniform (`turboquant_attention_q8_d256_no_qjl_2pass`)
     ///
-    /// Other configs (d256, mixed, packed_keys variants) return None and the
+    /// Other configs (mixed, packed_keys variants) return None and the
     /// outer caller falls through to dequantize + SDPA. New no_qjl kernels
     /// can be wired here as they're added without touching the dispatch.
     fn try_gpu_uniform_attention_no_qjl(
@@ -1646,12 +1647,13 @@ impl QuantizedKvCache {
         let q_rows = batch * q_heads;
         let n_seq = self.cold_offset as i32;
         let cache_seq_capacity = ks.cache_seq_capacity();
-        // Currently only d128/8b/8b is supported. n_seq < 1024 falls back
-        // to dequantize+SDPA which is fine — the kernel is the long-context win.
+        // Currently d128/8b/8b and d256/8b/8b are supported. n_seq < 1024
+        // falls back to dequantize+SDPA which is fine — the kernel is the
+        // long-context win.
+        let dim_supported = (key_dim == 128 && value_dim == 128) || (key_dim == 256 && value_dim == 256);
         if key_bits != 8
             || value_bits != 8
-            || key_dim != 128
-            || value_dim != 128
+            || !dim_supported
             || n_seq < 1024
             || cache_seq_capacity < n_seq
             || q_heads <= 0
@@ -1687,22 +1689,41 @@ impl QuantizedKvCache {
         let key_codebook = key_core.codebook_arr(key_bits)?;
         let value_codebook = value_core.codebook_arr(value_bits)?;
 
-        let aggregated_rot = InlineArray::turboquant_attention_q8_d128_no_qjl_2pass(
-            &query_rot,
-            &key_indices_t,
-            &key_norms,
-            &key_slot_scale,
-            key_codebook,
-            &value_indices_t,
-            &value_norms,
-            value_codebook,
-            q_rows as u32,
-            n_seq as u32,
-            cache_seq_capacity as u32,
-            q_heads as u32,
-            layout.heads as u32,
-            scale,
-        )?;
+        let aggregated_rot = if key_dim == 128 {
+            InlineArray::turboquant_attention_q8_d128_no_qjl_2pass(
+                &query_rot,
+                &key_indices_t,
+                &key_norms,
+                &key_slot_scale,
+                key_codebook,
+                &value_indices_t,
+                &value_norms,
+                value_codebook,
+                q_rows as u32,
+                n_seq as u32,
+                cache_seq_capacity as u32,
+                q_heads as u32,
+                layout.heads as u32,
+                scale,
+            )?
+        } else {
+            InlineArray::turboquant_attention_q8_d256_no_qjl_2pass(
+                &query_rot,
+                &key_indices_t,
+                &key_norms,
+                &key_slot_scale,
+                key_codebook,
+                &value_indices_t,
+                &value_norms,
+                value_codebook,
+                q_rows as u32,
+                n_seq as u32,
+                cache_seq_capacity as u32,
+                q_heads as u32,
+                layout.heads as u32,
+                scale,
+            )?
+        };
 
         // Output is in the value's rotated frame; inverse-rotate via value_core.
         let output_rows = value_core.inverse_rotate_output_array(&aggregated_rot, output_dtype)?;

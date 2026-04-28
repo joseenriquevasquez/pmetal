@@ -1178,6 +1178,55 @@ impl InlineArray {
         }
     }
 
+    /// Variant F (NoQjl) D=256/V=256 q8 2-pass attention. Same shape as the
+    /// d128 no_qjl kernel: full 8-bit codebook for keys, no QJL residual,
+    /// no `query_proj`. Pass 2 reuses the standard d256 merge kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn turboquant_attention_q8_d256_no_qjl_2pass(
+        query_rot: &Self,
+        key_indices: &Self,
+        key_norms: &Self,
+        key_slot_scale: &Self,
+        key_codebook: &Self,
+        value_indices: &Self,
+        value_norms: &Self,
+        value_codebook: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale: f32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_attention_q8_d256_no_qjl_2pass(
+                out.as_mut_ptr(),
+                &query_rot.raw,
+                &key_indices.raw,
+                &key_norms.raw,
+                &key_slot_scale.raw,
+                &key_codebook.raw,
+                &value_indices.raw,
+                &value_norms.raw,
+                &value_codebook.raw,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+                attn_scale.to_bits(),
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
     /// Specialized long-context q8 TurboQuant decode for D=128/V=128 over
     /// packed key bytes stored as `[N, D, S_cap]`.
     ///
