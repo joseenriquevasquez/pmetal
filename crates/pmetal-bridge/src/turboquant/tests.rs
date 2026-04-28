@@ -752,6 +752,93 @@ mod kvcache {
         );
     }
 
+    // GQA flavor of the d128 NoQjl long-context fast path. Variant F has no
+    // separate `packed_keys` kernel — the base `no_qjl_2pass` reads u8 indices
+    // directly (no QJL signs to bit-pack alongside), so it serves the same
+    // role for groups > 8 that `packed_keys_2pass` serves for Standard. This
+    // test proves the kernel handles groups=8 correctly (q_heads=16,
+    // kv_heads=2 → groups=8; threadgroup is 32 simdgroups × 32 lanes = 256
+    // threads, well below the 1024 limit).
+    #[test]
+    fn turboquant_no_qjl_d128_long_context_matches_dequantized_sdpa_gqa() {
+        let dim = 128usize;
+        let q_heads = 16i32;
+        let kv_heads = 2i32;
+        let prefill = 1023i32;
+        let config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl);
+        let b = 1i32;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+
+        let prefill_kv_len = (b * kv_heads * prefill * d) as usize;
+        let step_kv_len = (b * kv_heads * d) as usize;
+        let query_len = (b * q_heads * d) as usize;
+        let prefill_keys = InlineArray::from_f32_slice(
+            &make_data(prefill_kv_len, 0.2),
+            &[b, kv_heads, prefill, d],
+        );
+        let prefill_values = InlineArray::from_f32_slice(
+            &make_data(prefill_kv_len, 0.7),
+            &[b, kv_heads, prefill, d],
+        );
+        let queries = InlineArray::from_f32_slice(&make_data(query_len, 1.3), &[b, q_heads, 1, d]);
+        let step_keys =
+            InlineArray::from_f32_slice(&make_data(step_kv_len, 1.9), &[b, kv_heads, 1, d]);
+        let step_values =
+            InlineArray::from_f32_slice(&make_data(step_kv_len, 2.4), &[b, kv_heads, 1, d]);
+
+        let mut seed_cache = QuantizedKvCache::new(config);
+        seed_cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+
+        ref_cache
+            .append(&step_keys, &step_values)
+            .expect("reference append");
+        let full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let repeated_keys = full_keys.repeat(q_heads / kv_heads, 1);
+        let repeated_values = full_values.repeat(q_heads / kv_heads, 1);
+        let reference_vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut repeated_keys.clone(),
+            &mut repeated_values.clone(),
+            b,
+            q_heads,
+            1024,
+            d,
+            scale,
+        );
+
+        let direct_vals = direct
+            .to_f32_vec((b * q_heads * d) as usize)
+            .expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff < 1e-3,
+            "Variant F d128 GQA fused kernel diverged from dequantized sdpa: max_abs_diff={max_abs_diff}"
+        );
+    }
+
     // Pins the no_qjl_2pass d256 kernel fast path. Mirrors the d128 test
     // above; shares pass 2 with the Standard d256 kernel, so the kernel
     // reduction shape was already correct (the 2026-04-27 fix landed in
