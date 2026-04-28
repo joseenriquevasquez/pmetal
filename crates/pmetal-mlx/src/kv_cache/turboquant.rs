@@ -164,6 +164,38 @@ pub enum TurboQuantQjlMode {
     NoQjl,
 }
 
+/// Per-block outlier mode — mirror of `pmetal_bridge::TurboQuantOutlierMode`.
+/// `None` leaves codebook to absorb heavy-tail values; `PerBlock { k }`
+/// stores the top-K |rotated| coords per slot as `(channel, value)` pairs
+/// that override codebook reconstruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurboQuantOutlierMode {
+    /// No per-block outliers (historical behavior).
+    #[default]
+    None,
+    /// Variant G: store the top-K |rotated| coords per slot as
+    /// `(channel: u8, value: f16)` overrides.
+    PerBlock {
+        /// Number of outlier coords kept per slot. Practical range 4..=16.
+        k: u8,
+    },
+}
+
+impl TurboQuantOutlierMode {
+    /// Number of per-block outliers (0 when mode is `None`).
+    pub const fn k(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::PerBlock { k } => k,
+        }
+    }
+
+    /// Whether per-block outliers are enabled.
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::PerBlock { .. })
+    }
+}
+
 /// Full TurboQuant K/V cache configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TurboQuantConfig {
@@ -184,6 +216,8 @@ pub struct TurboQuantConfig {
     /// just propagates the threshold to `pmetal-bridge` via the FFI mirror
     /// so a single config object covers both backends.
     pub skiplist_threshold: Option<usize>,
+    /// Per-block outlier mode (Variant G). See [`TurboQuantOutlierMode`].
+    pub outliers: TurboQuantOutlierMode,
 }
 
 impl TurboQuantConfig {
@@ -195,6 +229,7 @@ impl TurboQuantConfig {
             recent_window: Some(DEFAULT_RECENT_WINDOW),
             qjl: TurboQuantQjlMode::Standard,
             skiplist_threshold: None,
+            outliers: TurboQuantOutlierMode::None,
         }
     }
 
@@ -221,6 +256,7 @@ impl TurboQuantConfig {
             recent_window: Some(DEFAULT_RECENT_WINDOW),
             qjl: TurboQuantQjlMode::Standard,
             skiplist_threshold: None,
+            outliers: TurboQuantOutlierMode::None,
         }
     }
 
@@ -241,6 +277,12 @@ impl TurboQuantConfig {
     /// to pmetal-bridge). `None` keeps the full-cold score path.
     pub const fn with_skiplist_threshold(mut self, threshold: Option<usize>) -> Self {
         self.skiplist_threshold = threshold;
+        self
+    }
+
+    /// Override per-block outlier handling. See [`TurboQuantOutlierMode`].
+    pub const fn with_outliers(mut self, mode: TurboQuantOutlierMode) -> Self {
+        self.outliers = mode;
         self
     }
 

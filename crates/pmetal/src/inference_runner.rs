@@ -1034,8 +1034,20 @@ fn turboquant_config_from_mode(
             recent_window: config.recent_window,
             qjl: bridge_turboquant_qjl_mode(config.qjl),
             skiplist_threshold: config.skiplist_threshold,
+            outliers: bridge_turboquant_outlier_mode(config.outliers),
         }),
         _ => None,
+    }
+}
+
+fn bridge_turboquant_outlier_mode(
+    mode: pmetal_mlx::kv_cache::TurboQuantOutlierMode,
+) -> pmetal_bridge::turboquant::TurboQuantOutlierMode {
+    use pmetal_mlx::kv_cache::TurboQuantOutlierMode as Src;
+    use pmetal_bridge::turboquant::TurboQuantOutlierMode as Dst;
+    match mode {
+        Src::None => Dst::None,
+        Src::PerBlock { k } => Dst::PerBlock { k },
     }
 }
 
@@ -1280,6 +1292,7 @@ impl TurboQuantPreset {
             recent_window: Some(pmetal_mlx::kv_cache::DEFAULT_RECENT_WINDOW),
             qjl: Default::default(),
             skiplist_threshold: None,
+            outliers: Default::default(),
         }
     }
 }
@@ -1836,6 +1849,7 @@ mod tests {
             recent_window: Some(pmetal_mlx::kv_cache::DEFAULT_RECENT_WINDOW),
             qjl: Default::default(),
             skiplist_threshold: None,
+            outliers: Default::default(),
         };
         assert_eq!(mode, CacheMode::TurboQuant { config: expected });
     }

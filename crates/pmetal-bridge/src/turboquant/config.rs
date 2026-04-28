@@ -108,6 +108,59 @@ impl TurboQuantTensorConfig {
     }
 }
 
+/// Per-block outlier mode (Phase E "Variant G") — orthogonal to all other
+/// TurboQuant precision knobs.
+///
+/// `None` (default): no per-block outlier handling. The full rotated
+/// vector goes to the codebook, and reconstruction error is whatever the
+/// codebook resolution + per-row `slot_scale` deliver.
+///
+/// `PerBlock { k }`: at encode time, find the K coordinates with the
+/// largest |rotated| value per slot, store them as a fp16 value plus a
+/// u8 channel index, then zero those K coords before codebook
+/// quantisation. Decode/score paths add the outlier values back at the
+/// recorded channels, overriding the codebook reconstruction at exactly
+/// those K positions. This is *strictly additive* to Uniform/Mixed and
+/// QJL: K=8 with 4-bit Variant F catches the ~1% heavy-tail-channel keys
+/// that even the best codebook can't represent without burning bits
+/// globally.
+///
+/// Distinct from `TurboQuantTensorConfig::Mixed` — `Mixed` adapts
+/// per-channel statistics across the whole sequence, `PerBlock` adapts
+/// to local slot statistics. Both can be enabled together; `PerBlock`
+/// runs after the regular/outlier split so the per-row top-K search
+/// excludes channels already in the per-channel outlier set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurboQuantOutlierMode {
+    /// No per-block outliers — historical behavior.
+    #[default]
+    None,
+    /// Variant G: store the top-K |rotated| coords per slot as
+    /// `(channel: u8, value: f16)` pairs, override codebook
+    /// reconstruction at those channels at score time.
+    PerBlock {
+        /// Number of outlier coordinates kept per slot. Practical range
+        /// 4..=16; the pack format dedicates 1 byte for the channel
+        /// index, so K is bounded by 255 in any case (≪ realistic).
+        k: u8,
+    },
+}
+
+impl TurboQuantOutlierMode {
+    /// Number of per-block outliers to extract (0 when mode is `None`).
+    pub const fn k(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::PerBlock { k } => k,
+        }
+    }
+
+    /// Whether per-block outliers are enabled.
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::PerBlock { .. })
+    }
+}
+
 /// QJL residual mode — orthogonal to Uniform/Mixed.
 ///
 /// Variant E (`Standard`): `key_bits - 1` go to the codebook, 1 bit per
@@ -169,6 +222,11 @@ pub struct TurboQuantConfig {
     /// Suggested value: ~32_768; anything below `recent_window + threshold`
     /// stays on the existing fast path.
     pub skiplist_threshold: Option<usize>,
+    /// Per-block outlier handling (Variant G). `None` (default) leaves
+    /// the codebook to absorb heavy-tail values; `PerBlock { k }` extracts
+    /// the K largest-magnitude coords per slot and stores them as
+    /// `(channel, value)` pairs that override codebook reconstruction.
+    pub outliers: TurboQuantOutlierMode,
 }
 
 impl TurboQuantConfig {
@@ -180,6 +238,7 @@ impl TurboQuantConfig {
             recent_window: Some(DEFAULT_RECENT_WINDOW),
             qjl: TurboQuantQjlMode::Standard,
             skiplist_threshold: None,
+            outliers: TurboQuantOutlierMode::None,
         }
     }
 
@@ -206,6 +265,7 @@ impl TurboQuantConfig {
             recent_window: Some(DEFAULT_RECENT_WINDOW),
             qjl: TurboQuantQjlMode::Standard,
             skiplist_threshold: None,
+            outliers: TurboQuantOutlierMode::None,
         }
     }
 
@@ -228,6 +288,13 @@ impl TurboQuantConfig {
     /// `None` (default) keeps the full-cold-store score path.
     pub const fn with_skiplist_threshold(mut self, threshold: Option<usize>) -> Self {
         self.skiplist_threshold = threshold;
+        self
+    }
+
+    /// Override per-block outlier handling (Variant G). See
+    /// [`TurboQuantOutlierMode`].
+    pub const fn with_outliers(mut self, mode: TurboQuantOutlierMode) -> Self {
+        self.outliers = mode;
         self
     }
 

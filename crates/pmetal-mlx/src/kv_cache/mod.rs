@@ -243,6 +243,7 @@ pub fn sanitize_turboquant_config(
         recent_window: config.recent_window,
         qjl: config.qjl,
         skiplist_threshold: config.skiplist_threshold,
+        outliers: config.outliers,
     }
 }
 
