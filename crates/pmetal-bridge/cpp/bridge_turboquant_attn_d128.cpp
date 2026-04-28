@@ -44,9 +44,11 @@ static const char* TURBOQUANT_ATTENTION_Q8_D128_2PASS_1_SOURCE = R"(
     constexpr uint kDim = 128u;
     constexpr uint kVec = 4u;
     constexpr uint kQjlWords = 4u;
+    constexpr uint kKeyCentroids = 128u;
+    constexpr uint kValueCentroids = 256u;
     constexpr float kQjlConst = 1.2533141373155003f / 128.0f;
-    threadgroup float shared_k_codebook[256];
-    threadgroup float shared_v_codebook[256];
+    threadgroup float shared_k_codebook[kKeyCentroids];
+    threadgroup float shared_v_codebook[kValueCentroids];
 
     uint kv_head = threadgroup_position_in_grid.x;
     uint batch = threadgroup_position_in_grid.y;
@@ -58,8 +60,10 @@ static const char* TURBOQUANT_ATTENTION_Q8_D128_2PASS_1_SOURCE = R"(
     if (row >= n_rows || block >= blocks) return;
 
     if (simd_gid == 0u) {
-        for (uint c = lane; c < 256u; c += 32u) {
+        for (uint c = lane; c < kKeyCentroids; c += 32u) {
             shared_k_codebook[c] = key_codebook[c];
+        }
+        for (uint c = lane; c < kValueCentroids; c += 32u) {
             shared_v_codebook[c] = value_codebook[c];
         }
     }
@@ -375,21 +379,48 @@ static const char* TURBOQUANT_ATTENTION_Q8_D128_2PASS_2_SOURCE = R"(
         max_ptr += kBlocksPerSimd;
     }
 
-    outputs[simd_lid * kSimds + simd_gid] = acc0;
+    // Cross-simdgroup reduction: each simdgroup g holds per-lane partial
+    // accumulators for blocks {g, g+32, ...} at dim simd_lid*kVec. We need
+    // to sum these across all 32 simdgroups (to fold all blocks together)
+    // such that lane l in simdgroup 0 ends up with the total partial for
+    // dim l*kVec — that's what the final write step expects.
+    //
+    // Storage layout `outputs[simd_gid * kSimds + simd_lid]` (g-major) +
+    // a simdgroup-0-only loop is the d256 pattern; we use it here too.
+    // (The earlier code used a transpose-then-`simd_sum` pattern that
+    // collapsed every output dim to the same total-dim-0 value — see
+    // 2026-04-27 parity debug.)
+    outputs[simd_gid * kSimds + simd_lid] = acc0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    acc0 = simd_sum(outputs[simd_gid * kSimds + simd_lid]);
+    if (simd_gid == 0u) {
+        float sum = 0.0f;
+        for (uint g = 0u; g < kSimds; ++g) sum += outputs[g * kSimds + simd_lid];
+        acc0 = sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    outputs[simd_lid * kSimds + simd_gid] = acc1;
+    outputs[simd_gid * kSimds + simd_lid] = acc1;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    acc1 = simd_sum(outputs[simd_gid * kSimds + simd_lid]);
+    if (simd_gid == 0u) {
+        float sum = 0.0f;
+        for (uint g = 0u; g < kSimds; ++g) sum += outputs[g * kSimds + simd_lid];
+        acc1 = sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    outputs[simd_lid * kSimds + simd_gid] = acc2;
+    outputs[simd_gid * kSimds + simd_lid] = acc2;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    acc2 = simd_sum(outputs[simd_gid * kSimds + simd_lid]);
+    if (simd_gid == 0u) {
+        float sum = 0.0f;
+        for (uint g = 0u; g < kSimds; ++g) sum += outputs[g * kSimds + simd_lid];
+        acc2 = sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    outputs[simd_lid * kSimds + simd_gid] = acc3;
+    outputs[simd_gid * kSimds + simd_lid] = acc3;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    acc3 = simd_sum(outputs[simd_gid * kSimds + simd_lid]);
+    if (simd_gid == 0u) {
+        float sum = 0.0f;
+        for (uint g = 0u; g < kSimds; ++g) sum += outputs[g * kSimds + simd_lid];
+        acc3 = sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float inv_sum = sum_exp_score > 0.0f ? 1.0f / sum_exp_score : 0.0f;
@@ -622,18 +653,11 @@ int mlx_inline_turboquant_attention_q8_d128_2pass(
         const array& value_codebook_arr = as_arr(value_codebook);
 
         if (query_rot_arr.shape(-1) != dim || query_proj_arr.shape(-1) != dim) return 1;
-        // NOTE: this check is `!= 256` even though the Standard dispatch
-        // passes a 128-entry codebook (key_bits.saturating_sub(1) = 7 → 128
-        // centroids). As a result this kernel ALWAYS returns 1 in production
-        // and `try_gpu_uniform_attention` falls through to the dequantize+SDPA
-        // path. This was discovered 2026-04-27 while wiring the no_qjl variant.
-        // Relaxing the check to `!= 128` activates the kernel but exposes a
-        // latent ~O(1) parity bug in the d128 inner-loop math (mirrored in
-        // the new no_qjl kernel — same bug). The d128 kernel family is
-        // therefore dormant pending a focused parity-debug session. Do NOT
-        // relax this check without first fixing the underlying parity bug,
-        // or the long-context d128 tests will break.
-        if (key_codebook_arr.shape(0) != 256 || value_codebook_arr.shape(0) != 256) return 1;
+        // Standard mode keys use the (key_bits-1)-rung Lloyd-Max codebook
+        // (128 centroids at 8b: 7 bits for the centroid index + 1 bit for
+        // the QJL residual sign), while values use the full key_bits rung
+        // (256 centroids at 8b).
+        if (key_codebook_arr.shape(0) != 128 || value_codebook_arr.shape(0) != 256) return 1;
 
         auto& pass1 = get_turboquant_attention_q8_d128_2pass_1_kernel();
         auto pass1_outputs = pass1(

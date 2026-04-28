@@ -1613,13 +1613,6 @@ impl QuantizedKvCache {
     /// Other configs (d256, mixed, packed_keys variants) return None and the
     /// outer caller falls through to dequantize + SDPA. New no_qjl kernels
     /// can be wired here as they're added without touching the dispatch.
-    ///
-    /// Currently dormant — see `try_gpu_uniform_attention`'s NoQjl gate. The
-    /// kernel produces output that diverges from the dequantize+SDPA reference
-    /// by O(1) in absolute units; needs a parity-debug pass before it can be
-    /// re-enabled. The dispatch entry path is preserved here so re-enabling
-    /// is a single-line flip once the kernel matches.
-    #[allow(dead_code)]
     fn try_gpu_uniform_attention_no_qjl(
         &self,
         queries_f32: &InlineArray,
@@ -1726,17 +1719,16 @@ impl QuantizedKvCache {
         let ks = self.keys.as_ref()?.gpu.as_ref()?;
         let vs = self.values.as_ref()?.gpu.as_ref()?;
         let state = self.state.as_ref()?;
-        // Variant F (NoQjl): the no_qjl_2pass d128 kernel exists
-        // (`turboquant_attention_q8_d128_no_qjl_2pass`) but its end-to-end
-        // result currently diverges from the dequantize+SDPA reference by
-        // ~O(1) in absolute units — needs a parity-debug session before
-        // it can be wired to the production dispatch. Until then route
-        // Variant F through the dequantize fallback (correct, ~2-4× slower
-        // at decode). The kernel infrastructure (extern C, FFI, Rust
-        // wrapper, header decl, encode-side Option qjl_signs) is in place
-        // so the follow-up is purely Metal-source debugging.
+        // Variant F (NoQjl): dispatch to the no_qjl fast path. Currently
+        // wired for d128/8b/8b uniform; other configs fall back to
+        // dequantize+SDPA inside the no_qjl helper.
         if matches!(state.qjl, super::TurboQuantQjlMode::NoQjl) {
-            return None;
+            return self.try_gpu_uniform_attention_no_qjl(
+                queries_f32,
+                layout,
+                scale,
+                output_dtype,
+            );
         }
 
         let (key_core, key_bits) = match &state.keys {

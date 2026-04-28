@@ -671,13 +671,10 @@ mod kvcache {
         );
     }
 
-    // Pinning the no_qjl_2pass d128 kernel-fast-path parity is Phase C′
-    // follow-up. The kernel binding is in place; the kernel itself produces
-    // results that currently diverge from the dequantize+SDPA reference by
-    // O(1) — a debug session against the existing q8_d128_2pass kernel
-    // structure is needed to find the discrepancy before re-enabling the
-    // dispatcher route.
-    #[allow(dead_code)]
+    // Pins the no_qjl_2pass d128 kernel fast path. Shares pass 2 with the
+    // Standard d128 kernel; both were unblocked by the 2026-04-27 pass-2
+    // reduction fix.
+    #[test]
     fn turboquant_no_qjl_d128_long_context_matches_dequantized_sdpa() {
         // Exercises the new no_qjl fused d128 fast path (n_seq >= 1024 +
         // d=128 + 8b/8b uniform). The kernel result must match the
@@ -958,6 +955,54 @@ mod kvcache {
         assert!(
             max_abs_diff < 1e-4,
             "d256 gqa direct attention diverged from dequantized sdpa: max_abs_diff={max_abs_diff}"
+        );
+    }
+
+    /// d128 packed_keys GQA fast path: q_heads > 8 routes through
+    /// `turboquant_attention_q8_d128_packed_keys_2pass` (packed key bytes
+    /// instead of separate indices+sign words). Shares pass 2 with the
+    /// d128 base 2pass kernel; pin parity here so the packed_keys variant
+    /// can't silently regress.
+    #[test]
+    fn turboquant_direct_attention_matches_dequantized_sdpa_uniform_q8_d128_long_context_gqa() {
+        let (seed_cache, queries, step_keys, step_values, scale, b, q_heads, kv_heads, d) =
+            make_uniform_gqa_direct_attention_case_with(128, 16, 2, 1023);
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+
+        ref_cache
+            .append(&step_keys, &step_values)
+            .expect("reference append");
+        let full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let repeated_keys = full_keys.repeat(q_heads / kv_heads, 1);
+        let repeated_values = full_values.repeat(q_heads / kv_heads, 1);
+        let reference_vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut repeated_keys.clone(),
+            &mut repeated_values.clone(),
+            b,
+            q_heads,
+            1024,
+            d,
+            scale,
+        );
+
+        let direct_vals = direct
+            .to_f32_vec((b * q_heads * d) as usize)
+            .expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff < 1e-4,
+            "d128 gqa direct attention diverged from dequantized sdpa: max_abs_diff={max_abs_diff}"
         );
     }
 
