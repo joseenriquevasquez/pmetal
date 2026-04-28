@@ -1639,6 +1639,15 @@ impl QuantizedKvCache {
         scale: f32,
         output_dtype: i32,
     ) -> Option<InlineArray> {
+        // Phase E.3: outlier override is applied during gpu_dequantize_keys
+        // but the fused score kernels read codebook + slot_scale only — they
+        // would silently miss the override. Force the dequantize+SDPA path
+        // when PerBlock outliers are enabled so attention sees the full
+        // reconstruction (including outlier scatter). E.4 follow-up wires the
+        // override into the score kernels themselves.
+        if self.config.outliers.is_enabled() {
+            return None;
+        }
         let ks = self.keys.as_ref()?.gpu.as_ref()?;
         let vs = self.values.as_ref()?.gpu.as_ref()?;
         let state = self.state.as_ref()?;
@@ -1810,6 +1819,11 @@ impl QuantizedKvCache {
     ) -> Option<InlineArray> {
         let threshold = self.config.skiplist_threshold?;
         if self.cold_offset <= threshold {
+            return None;
+        }
+        // Phase E.3: see try_gpu_uniform_attention_no_qjl — score kernels
+        // would miss the outlier override. Fall through to dequantize+SDPA.
+        if self.config.outliers.is_enabled() {
             return None;
         }
         let state = self.state.as_ref()?;
@@ -1990,6 +2004,12 @@ impl QuantizedKvCache {
         scale: f32,
         output_dtype: i32,
     ) -> Option<InlineArray> {
+        // Phase E.3: outlier override lives in gpu_dequantize_keys; the fused
+        // score kernels read codebook + slot_scale only and would miss it.
+        // Force dequantize+SDPA so attention sees the full reconstruction.
+        if self.config.outliers.is_enabled() {
+            return None;
+        }
         let ks = self.keys.as_ref()?.gpu.as_ref()?;
         let vs = self.values.as_ref()?.gpu.as_ref()?;
         let state = self.state.as_ref()?;

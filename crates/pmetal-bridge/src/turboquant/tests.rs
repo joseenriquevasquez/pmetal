@@ -977,6 +977,103 @@ mod kvcache {
         );
     }
 
+    // Phase E.3: with PerBlock outlier override, encode zeros the K largest
+    // |rotated| coords before slot_scale + codebook quant, and decode
+    // (gpu_dequantize_keys) scatters the stored f16 values back at those
+    // channels. The expected outcome is that dequantized keys reconstruct
+    // their input more accurately than a baseline run with outliers = None
+    // at the same bit-width — the heavy-tail coords are restored to f16
+    // precision instead of going through the body-fit codebook.
+    #[test]
+    fn turboquant_outliers_per_block_decode_override_improves_reconstruction() {
+        // Use a very low bit-width so the codebook approximation is coarse
+        // enough that the override benefit is unambiguous in the unit-test
+        // tolerance. d=16 keeps the test fast.
+        let dim = 16usize;
+        let heads = 1i32;
+        let prefill = 4i32;
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let k_outliers: u8 = 2;
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        // Mix a smooth body with a few deliberately heavy spikes per slot.
+        // Spikes land in input space and get diffused across rotated channels
+        // by the rotation, so several rotated coords end up large per slot —
+        // exactly the heavy-tail distribution outlier override targets.
+        let mut data = vec![0f32; prefill_len];
+        for slot in 0..(prefill as usize) {
+            for c in 0..dim {
+                let i = slot * dim + c;
+                data[i] = (((i as f32) * 0.07).sin() * 0.3) + (((i as f32) * 0.13).cos() * 0.2);
+            }
+            // Two large spikes per slot at channels (slot, slot+5) — different
+            // per slot to stress per-block extraction (not a fixed channel
+            // mask the codebook could memorise).
+            let s = slot * dim;
+            data[s + slot] += 6.0;
+            data[s + ((slot + 5) % dim)] -= 5.5;
+        }
+        let keys = InlineArray::from_f32_slice(&data, &[b, h, prefill, d]);
+        // Values are arbitrary — only key reconstruction matters here.
+        let values = InlineArray::from_f32_slice(&data, &[b, h, prefill, d]);
+
+        // Baseline: outliers = None. The heavy spikes pass through the
+        // codebook approximation at low bit-width.
+        let off_config = TurboQuantConfig::uniform(4, 4).with_recent_window(None);
+        let mut off_cache = QuantizedKvCache::new(off_config);
+        off_cache.append(&keys, &values).expect("off append");
+        let off_dk = off_cache
+            .dequantize_keys()
+            .expect("off dequantize_keys");
+        assert_eq!(off_dk.shape(), &[b, h, prefill, d]);
+        let total = prefill_len;
+        let off_vals: Vec<f32> = off_dk.reshape(&[total as i32]).to_f32_vec(total).unwrap();
+
+        // With override: the K largest |rotated| coords are reproduced from
+        // the stored f16 values; the body uses the same 4-bit codebook.
+        let on_config = TurboQuantConfig::uniform(4, 4)
+            .with_recent_window(None)
+            .with_outliers(super::config::TurboQuantOutlierMode::PerBlock { k: k_outliers });
+        let mut on_cache = QuantizedKvCache::new(on_config);
+        on_cache.append(&keys, &values).expect("on append");
+        let on_dk = on_cache.dequantize_keys().expect("on dequantize_keys");
+        assert_eq!(on_dk.shape(), &[b, h, prefill, d]);
+        let on_vals: Vec<f32> = on_dk.reshape(&[total as i32]).to_f32_vec(total).unwrap();
+
+        let off_mse: f32 = off_vals
+            .iter()
+            .zip(data.iter())
+            .map(|(r, o)| (r - o) * (r - o))
+            .sum::<f32>()
+            / (total as f32);
+        let on_mse: f32 = on_vals
+            .iter()
+            .zip(data.iter())
+            .map(|(r, o)| (r - o) * (r - o))
+            .sum::<f32>()
+            / (total as f32);
+        assert!(
+            on_mse < off_mse,
+            "outlier override must improve reconstruction MSE: off={off_mse} on={on_mse}"
+        );
+        // The heavy spikes contribute a large fraction of the total error
+        // when the codebook squashes them. Override should cut MSE by at
+        // least 30% on this synthetic workload (typical real-world drop is
+        // larger; this bound is loose to keep the test stable across
+        // floating-point drift).
+        assert!(
+            on_mse < off_mse * 0.7,
+            "outlier override expected to cut MSE by ≥30% on heavy-tail keys: \
+             off={off_mse} on={on_mse} ratio={}",
+            on_mse / off_mse
+        );
+        // Sanity: outputs finite.
+        assert!(on_vals.iter().all(|v| v.is_finite()));
+        assert!(off_vals.iter().all(|v| v.is_finite()));
+    }
+
     // Phase D.2: setting pack_mode = Fullbyte must build the q8_fullbyte_seq
     // shadow buffer at encode time, even when the legacy env-var override
     // (PMETAL_TQ_Q8_FULLBYTE) is unset. Default Bitstream leaves the buffer

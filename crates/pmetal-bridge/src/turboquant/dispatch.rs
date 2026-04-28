@@ -78,6 +78,56 @@ pub(super) fn gpu_quantize_kv(
     //    rotation.T == inverse_rotation, so we matmul with inverse_rotation_arr.
     let k_rot = k_core.rotate_array(&k_norm)?;
 
+    // Phase E (Variant G per-block outliers): extract the top-K |rotated|
+    // channels per slot and store them as (channel: u8, value: f16) pairs.
+    // The extracted (channel, value) pairs are also reused below to (a) zero
+    // the outlier coords in the body of `k_rot` before slot_scale + codebook
+    // quantization (so the codebook fits the body without heavy-tail
+    // contamination), and (b) scatter the exact f16 outlier values back into
+    // `k_mse_recon_rot` after reconstruction (so the residual at outlier
+    // channels is 0 and decode-time reconstruction restores the original
+    // values exactly within f16 precision). When outliers = PerBlock the
+    // GPU score kernels are gated off in cache.rs — attention falls through
+    // to dequantize+SDPA which honours the override via gpu_dequantize_keys.
+    let kv_rows_full = keys.dim(0) * keys.dim(1) * keys.dim(2);
+    let dim_i32 = k_core.dim as i32;
+    let outlier_pre = match config.outliers {
+        super::TurboQuantOutlierMode::None => None,
+        super::TurboQuantOutlierMode::PerBlock { k } => {
+            let k_i32 = k as i32;
+            if k_i32 <= 0 || k_i32 > dim_i32 {
+                None
+            } else {
+                let k_rot_2d = k_rot.reshape(&[kv_rows_full, dim_i32]);
+                // argpartition on negative |rotated| ⇒ first K positions
+                // hold indices of the K largest |rotated| values.
+                let neg_abs = k_rot_2d.abs().negative();
+                let part = neg_abs.argpartition(k_i32 - 1, -1);
+                let channels_2d = part.slice(&[0, 0], &[kv_rows_full, k_i32]);
+                let values_2d = k_rot_2d.take_along_axis(&channels_2d, -1);
+                let shape4 = [keys.dim(0), keys.dim(1), keys.dim(2), k_i32];
+                let channels_4d = channels_2d.reshape(&shape4);
+                let values_4d_f32 = values_2d.reshape(&shape4);
+                Some((channels_4d, values_4d_f32, k_i32))
+            }
+        }
+    };
+
+    // Build k_rot_body: original k_rot with outlier coords zeroed (when
+    // PerBlock is enabled). slot_scale + codebook quantization run against
+    // the body so the codebook's fixed range fits the body's actual extent
+    // rather than being squeezed by heavy-tail outliers.
+    let k_rot_body = if let Some((channels_4d, _, k_i32)) = outlier_pre.as_ref() {
+        let zeros = InlineArray::zeros(
+            &[keys.dim(0), keys.dim(1), keys.dim(2), *k_i32],
+            Dtype::Float32.as_i32(),
+        );
+        let channels_i32 = channels_4d.as_dtype(Dtype::Int32.as_i32());
+        k_rot.put_along_axis_op(&channels_i32, &zeros, -1)
+    } else {
+        k_rot.clone()
+    };
+
     // 4. Per-row slot_scale: max(|rotated|) / centroid_max. Dividing the
     //    rotated values by slot_scale before quantize makes a fixed Beta
     //    codebook adapt to each slot's actual range; reconstruction
@@ -91,12 +141,12 @@ pub(super) fn gpu_quantize_kv(
         .unwrap_or(1.0)
         .abs()
         .max(ZERO_EPSILON);
-    let k_slot_scale_raw = k_rot
+    let k_slot_scale_raw = k_rot_body
         .abs()
         .max_axis(-1, true)
         .divide(&InlineArray::from_f32(k_centroid_max));
     let k_slot_scale = k_slot_scale_raw.maximum(&eps);
-    let k_rot_scaled = k_rot.divide(&k_slot_scale);
+    let k_rot_scaled = k_rot_body.divide(&k_slot_scale);
 
     // 5. GPU nearest-centroid → [B, H, S, D] uint32. Quantises the scaled
     //    rotated values so codebook hits land in [-1, 1].
@@ -104,8 +154,18 @@ pub(super) fn gpu_quantize_kv(
 
     // 6. Reconstruct MSE approximation in the rotated space, then re-scale
     //    by slot_scale to recover the original-magnitude rotated values.
+    //    When outlier override is active, scatter the exact outlier values
+    //    back into the rotated reconstruction so the residual at outlier
+    //    channels is exactly 0 (QJL captures only the body's residual) and
+    //    decode-time reconstruction restores them exactly.
     let k_mse_recon_rot_unit = k_core.gpu_reconstruct_mse(&k_indices, key_mse_bits)?;
-    let k_mse_recon_rot = k_mse_recon_rot_unit.multiply(&k_slot_scale);
+    let k_mse_recon_rot_body = k_mse_recon_rot_unit.multiply(&k_slot_scale);
+    let k_mse_recon_rot = if let Some((channels_4d, values_4d_f32, _)) = outlier_pre.as_ref() {
+        let channels_i32 = channels_4d.as_dtype(Dtype::Int32.as_i32());
+        k_mse_recon_rot_body.put_along_axis_op(&channels_i32, values_4d_f32, -1)
+    } else {
+        k_mse_recon_rot_body
+    };
 
     // 6. Residual norms: rotation-invariant, so compute directly in rotated space.
     //    residual_rot = k_rot - k_mse_recon_rot  →  norm_l2  [B, H, S, 1]
@@ -165,37 +225,19 @@ pub(super) fn gpu_quantize_kv(
         None
     };
 
-    // Phase E (Variant G per-block outliers): extract the top-K |rotated|
-    // channels per slot and store them as (channel: u8, value: f16) pairs.
-    // Decode-time override is NOT yet wired — these buffers are populated for
-    // future use; reconstruction still goes through the codebook path. Storing
-    // without zeroing pre-quant means there is no quality regression today;
-    // when the override path lands we'll also zero the K coords before the
-    // codebook quant so `inv_std` and the codebook fit the body without
-    // outlier contamination (per the Phase E plan).
-    let (outlier_channels, outlier_values) = match config.outliers {
-        super::TurboQuantOutlierMode::None => (None, None),
-        super::TurboQuantOutlierMode::PerBlock { k } => {
-            let kv_rows = keys.dim(0) * keys.dim(1) * keys.dim(2);
-            let dim = k_core.dim as i32;
-            let k_i32 = k as i32;
-            if k_i32 <= 0 || k_i32 > dim {
-                (None, None)
-            } else {
-                let k_rot_2d = k_rot.reshape(&[kv_rows, dim]);
-                // argpartition on negative |rotated| ⇒ first K positions
-                // hold indices of the K largest |rotated| values.
-                let neg_abs = k_rot_2d.abs().negative();
-                let part = neg_abs.argpartition(k_i32 - 1, -1);
-                let channels_2d = part.slice(&[0, 0], &[kv_rows, k_i32]);
-                // Use take_along_axis with the u32 indices (MLX accepts).
-                let values_2d = k_rot_2d.take_along_axis(&channels_2d, -1);
-                let shape4 = [keys.dim(0), keys.dim(1), keys.dim(2), k_i32];
-                let channels_u8 = channels_2d.reshape(&shape4).as_dtype(Dtype::Uint8.as_i32());
-                let values_f16 = values_2d.reshape(&shape4).as_dtype(Dtype::Float16.as_i32());
-                (Some(channels_u8), Some(values_f16))
-            }
+    // Phase E (Variant G per-block outliers): cast the extracted (channel,
+    // value) pairs into their storage dtypes (u8 channel index, f16 value).
+    // The actual extraction + zero pre-quant + encode-side override happened
+    // upstream, before slot_scale computation, so the codebook saw only the
+    // body and the rotated reconstruction has the exact outlier values
+    // scattered back at their original channels.
+    let (outlier_channels, outlier_values) = match outlier_pre.as_ref() {
+        Some((channels_4d, values_4d_f32, _)) => {
+            let channels_u8 = channels_4d.as_dtype(Dtype::Uint8.as_i32());
+            let values_f16 = values_4d_f32.as_dtype(Dtype::Float16.as_i32());
+            (Some(channels_u8), Some(values_f16))
         }
+        None => (None, None),
     };
 
     let (k_qjl_signs, k_qjl_signs_t, q8_keybytes_t, q8_keybytes_seq) = if no_qjl {
@@ -854,10 +896,27 @@ pub(super) fn gpu_dequantize_keys(
 
     // 1b. Re-scale the codebook lookup by the per-row slot_scale to recover
     //     the original-magnitude rotated values.
-    let mse_recon_rot = if let Some(slot_scale) = store.key_slot_scale_array() {
+    let mse_recon_rot_body = if let Some(slot_scale) = store.key_slot_scale_array() {
         mse_recon_rot_unit.multiply(&slot_scale)
     } else {
         mse_recon_rot_unit
+    };
+
+    // 1c. Phase E.3: outlier override. When PerBlock outliers were extracted
+    //     at encode time, scatter the stored f16 values back into the rotated
+    //     reconstruction at their original channels. This restores heavy-tail
+    //     coordinates exactly (within f16 precision) instead of going through
+    //     the body-fit codebook approximation. Encode mirrored this scatter
+    //     into k_mse_recon_rot before computing the residual, so QJL captures
+    //     only the body's residual and the override is consistent end-to-end.
+    let mse_recon_rot = if let (Some(channels_u8), Some(values_f16)) =
+        (store.outlier_channels.as_ref(), store.outlier_values.as_ref())
+    {
+        let channels_i32 = channels_u8.as_dtype(Dtype::Int32.as_i32());
+        let values_f32 = values_f16.as_dtype(Dtype::Float32.as_i32());
+        mse_recon_rot_body.put_along_axis_op(&channels_i32, &values_f32, -1)
+    } else {
+        mse_recon_rot_body
     };
 
     // 2. Inverse-rotate back to input space.
