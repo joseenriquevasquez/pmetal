@@ -34,6 +34,13 @@ use crate::InlineArray;
 ///                                           (max(|rotated|) / centroid_max).
 ///                                           Populated only when q8_slot_scales_seq is None;
 ///                                           otherwise read from component 3 of the pack.
+///   sign_hash:       [B, H, T, ceil(D/32)]  uint32 packed sign words of the
+///                                           rotated key (Phase F Hamming
+///                                           skip-list pre-filter). Populated
+///                                           only when `skiplist_threshold` is
+///                                           set on the active TurboQuantConfig;
+///                                           otherwise None and the pre-filter
+///                                           dispatch path is bypassed.
 #[derive(Debug, Clone)]
 pub(super) struct GpuKeyStore {
     pub(super) indices: InlineArray,
@@ -48,6 +55,7 @@ pub(super) struct GpuKeyStore {
     pub(super) qjl_signs_t: Option<InlineArray>,
     pub(super) residual_norms: Option<InlineArray>,
     pub(super) key_slot_scale: Option<InlineArray>,
+    pub(super) sign_hash: Option<InlineArray>,
 }
 
 impl GpuKeyStore {
@@ -107,6 +115,11 @@ impl GpuKeyStore {
         self.key_slot_scale = match (self.key_slot_scale.take(), new.key_slot_scale) {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
             _ => None,
+        };
+        self.sign_hash = match (self.sign_hash.take(), new.sign_hash) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
+            (None, None) => None,
+            _ => panic!("GpuKeyStore.sign_hash Option-state mismatch on append"),
         };
     }
 
@@ -211,6 +224,9 @@ impl GpuKeyStore {
         }
         if let Some(key_slot_scale) = self.key_slot_scale.as_mut() {
             out.push(key_slot_scale);
+        }
+        if let Some(sign_hash) = self.sign_hash.as_mut() {
+            out.push(sign_hash);
         }
     }
 }

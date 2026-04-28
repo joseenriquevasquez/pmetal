@@ -672,6 +672,68 @@ mod kvcache {
         );
     }
 
+    #[test]
+    fn turboquant_skiplist_threshold_populates_sign_hash() {
+        // Phase F: when skiplist_threshold is set, encode must produce the
+        // per-slot sign-hash buffer used by the Hamming pre-filter. When
+        // unset, the buffer must remain None so the legacy path stays free
+        // of the extra allocation.
+        let dim = 16usize;
+        let heads = 2i32;
+        let prefill = 3i32;
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let make_data = |seed: f32| -> Vec<f32> {
+            (0..prefill_len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin())
+                .collect()
+        };
+        let keys = InlineArray::from_f32_slice(&make_data(0.2), &[b, h, prefill, d]);
+        let values = InlineArray::from_f32_slice(&make_data(0.7), &[b, h, prefill, d]);
+
+        // Off path: sign_hash should be None.
+        let off_config = TurboQuantConfig::uniform(8, 8).with_recent_window(None);
+        let mut off_cache = QuantizedKvCache::new(off_config);
+        off_cache.append(&keys, &values).expect("off append");
+        let off_gpu = off_cache
+            .keys
+            .as_ref()
+            .and_then(|k| k.gpu.as_ref())
+            .expect("uniform should produce a GpuKeyStore");
+        assert!(
+            off_gpu.sign_hash.is_none(),
+            "skiplist_threshold=None must NOT allocate sign_hash"
+        );
+
+        // On path: sign_hash present with shape [B, H, T, ceil(D/32)].
+        let on_config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None)
+            .with_skiplist_threshold(Some(1024));
+        let mut on_cache = QuantizedKvCache::new(on_config);
+        on_cache.append(&keys, &values).expect("on append");
+        let on_gpu = on_cache
+            .keys
+            .as_ref()
+            .and_then(|k| k.gpu.as_ref())
+            .expect("uniform should produce a GpuKeyStore");
+        let sign_hash = on_gpu
+            .sign_hash
+            .as_ref()
+            .expect("skiplist_threshold=Some must allocate sign_hash");
+        assert_eq!(sign_hash.dim(0), b);
+        assert_eq!(sign_hash.dim(1), h);
+        assert_eq!(sign_hash.dim(2), prefill);
+        let expected_words = dim.div_ceil(32) as i32;
+        assert_eq!(
+            sign_hash.dim(3),
+            expected_words,
+            "sign_hash should hold ceil(D/32) packed u32 words per slot"
+        );
+    }
+
     // Pins the no_qjl_2pass d128 kernel fast path. Shares pass 2 with the
     // Standard d128 kernel; both were unblocked by the 2026-04-27 pass-2
     // reduction fix.

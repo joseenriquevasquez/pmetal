@@ -145,6 +145,26 @@ pub(super) fn gpu_quantize_kv(
     let use_q8_seq_shadow = key_bits == 8 && k_core.dim == 256 && v_core.dim == 256;
     let k_indices_t = (!use_q8_seq_shadow).then(|| k_indices.transpose_axes(&[0, 1, 3, 2]));
 
+    // Phase F (Hamming skip-list): pack sign bits of the rotated key into
+    // u32 words for the pre-filter pass. Pre-filter compares with
+    // sign(rotate(query)) via XOR + popcount; Hamming distance on rotated
+    // signs ≈ angular distance, which monotonically tracks dot-product score.
+    // We reuse the QJL packer since its output layout (uint32, packed_dim
+    // words per slot) matches what the Metal popcount intrinsic wants.
+    let sign_hash = if config.skiplist_threshold.is_some() {
+        let kv_rows = (keys.dim(0) * keys.dim(1) * keys.dim(2)) as u32;
+        let k_rot_2d = k_rot.reshape(&[kv_rows as i32, k_core.dim as i32]);
+        let packed = InlineArray::turboquant_pack_sign_bits(
+            &k_rot_2d,
+            k_core.dim as u32,
+            packed_dim as u32,
+            kv_rows,
+        )?;
+        Some(packed.reshape(&[keys.dim(0), keys.dim(1), keys.dim(2), packed_dim]))
+    } else {
+        None
+    };
+
     let (k_qjl_signs, k_qjl_signs_t, q8_keybytes_t, q8_keybytes_seq) = if no_qjl {
         (None, None, None, None)
     } else {
@@ -299,6 +319,7 @@ pub(super) fn gpu_quantize_kv(
             qjl_signs_t: k_qjl_signs_t,
             residual_norms: (!use_q8_seq_shadow).then_some(k_residual_norms),
             key_slot_scale: (!use_q8_seq_shadow).then_some(k_slot_scale),
+            sign_hash,
         },
         GpuValueStore {
             indices: v_indices,
