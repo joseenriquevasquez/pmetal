@@ -1692,7 +1692,13 @@ impl QuantizedKvCache {
         // falls back to dequantize+SDPA which is fine — the kernel is the
         // long-context win.
         let dim_supported = (key_dim == 128 && value_dim == 128) || (key_dim == 256 && value_dim == 256);
-        if key_bits != 8
+        // Phase D.3.1: NoQjl widens to `key_bits in 4..=8` at d128/d256.
+        // The score kernels load 256 codebook entries unconditionally, so we
+        // pass a 256-padded view (entries past `2^bits` zeroed and never
+        // indexed because all stored indices fit in `[0, 2^bits)`). Values
+        // stay 8-bit — the dense-values fast path stores bf16 directly,
+        // and the `no_qjl_2pass` paths still use a 256-entry value codebook.
+        if !(4..=8).contains(&key_bits)
             || value_bits != 8
             || !dim_supported
             || n_seq < 1024
@@ -1709,8 +1715,11 @@ impl QuantizedKvCache {
         let kv_rows = (layout.batch * layout.heads) as i32;
 
         // Variant F uses the full key_bits codebook for keys; values use
-        // their own codebook at value_bits resolution.
-        let key_codebook = key_core.codebook_arr(key_bits)?;
+        // their own codebook at value_bits resolution. Score kernels read a
+        // fixed 256-entry threadgroup codebook regardless of `bits`, so
+        // we pad the key view; the value view is already 256 entries
+        // (value_bits == 8 above).
+        let key_codebook = key_core.codebook_arr_padded_256(key_bits)?;
         let value_codebook = value_core.codebook_arr(value_bits)?;
 
         // d256 fast path: when the cache populated the seq-major shadows

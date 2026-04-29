@@ -1641,6 +1641,182 @@ mod kvcache {
         );
     }
 
+    // Phase D.3.1: NoQjl + d256 fast path widened to key_bits in 4..=8.
+    // Score kernel loads 256 codebook entries unconditionally, so encode +
+    // dispatch must hand it a zero-padded 256-entry codebook. Indices are
+    // u8 in [0, 2^bits) — never index past the real centroids — and the
+    // kernel still recovers the original-magnitude key via per-slot
+    // `key_slot_scale * key_norm`. Tolerance loosens vs the 8-bit pin
+    // because lower-bit codebooks introduce more reconstruction error,
+    // but the GPU fast path must still match the dequantize+SDPA
+    // reference within the codebook's resolution.
+    fn run_no_qjl_d256_long_context_matches_dequantized_sdpa_at_bits(
+        key_bits: u8,
+        max_abs_diff_tol: f32,
+    ) {
+        let dim = 256usize;
+        let heads = 2i32;
+        let prefill = 1023i32;
+        let config = TurboQuantConfig::uniform(key_bits, 8)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl);
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let step_len = (b * h * d) as usize;
+        let prefill_keys =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.2), &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
+        let queries = InlineArray::from_f32_slice(&make_data(step_len, 1.3), &[b, h, 1, d]);
+        let step_keys = InlineArray::from_f32_slice(&make_data(step_len, 1.9), &[b, h, 1, d]);
+        let step_values = InlineArray::from_f32_slice(&make_data(step_len, 2.4), &[b, h, 1, d]);
+
+        let mut seed_cache = QuantizedKvCache::new(config);
+        seed_cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+
+        ref_cache
+            .append(&step_keys, &step_values)
+            .expect("reference append");
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let reference_vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut full_keys,
+            &mut full_values,
+            b,
+            h,
+            1024,
+            d,
+            scale,
+        );
+
+        let direct_vals = direct
+            .to_f32_vec((b * h * d) as usize)
+            .expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff < max_abs_diff_tol,
+            "Variant F d256 fused kernel at {key_bits}b diverged from dequantized sdpa: \
+             max_abs_diff={max_abs_diff} tol={max_abs_diff_tol}"
+        );
+    }
+
+    #[test]
+    fn turboquant_no_qjl_d256_long_context_matches_dequantized_sdpa_5b() {
+        // 5-bit codebook: 32 centroids; widening uses zero-padded 256-entry
+        // view for the score kernel.
+        run_no_qjl_d256_long_context_matches_dequantized_sdpa_at_bits(5, 1e-3);
+    }
+
+    #[test]
+    fn turboquant_no_qjl_d256_long_context_matches_dequantized_sdpa_4b() {
+        // 4-bit codebook: 16 centroids. Looser tolerance because the
+        // codebook itself has lower resolution; still must match the
+        // dequant+SDPA reference (which uses the same 16-entry codebook).
+        run_no_qjl_d256_long_context_matches_dequantized_sdpa_at_bits(4, 1e-3);
+    }
+
+    // d128 sibling of the bits-sweep test above. d128 doesn't trigger
+    // `use_q8_seq_shadow` in encode (its score kernel uses transposed-D
+    // indices, not the seq-major shadow), but the score kernel still loads
+    // 256 codebook entries unconditionally — so the same `_padded_256`
+    // codebook view fix applies. Pinning 5-bit catches both encode (slot
+    // scale + 32-centroid argmin) and dispatch (codebook padding) regressions.
+    #[test]
+    fn turboquant_no_qjl_d128_long_context_matches_dequantized_sdpa_5b() {
+        let dim = 128usize;
+        let heads = 2i32;
+        let prefill = 1023i32;
+        let config = TurboQuantConfig::uniform(5, 8)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl);
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let step_len = (b * h * d) as usize;
+        let prefill_keys =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.2), &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
+        let queries = InlineArray::from_f32_slice(&make_data(step_len, 1.3), &[b, h, 1, d]);
+        let step_keys = InlineArray::from_f32_slice(&make_data(step_len, 1.9), &[b, h, 1, d]);
+        let step_values = InlineArray::from_f32_slice(&make_data(step_len, 2.4), &[b, h, 1, d]);
+
+        let mut seed_cache = QuantizedKvCache::new(config);
+        seed_cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+
+        ref_cache
+            .append(&step_keys, &step_values)
+            .expect("reference append");
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let reference_vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut full_keys,
+            &mut full_values,
+            b,
+            h,
+            1024,
+            d,
+            scale,
+        );
+
+        let direct_vals = direct
+            .to_f32_vec((b * h * d) as usize)
+            .expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff < 1e-3,
+            "Variant F d128 5b fused kernel diverged from dequantized sdpa: \
+             max_abs_diff={max_abs_diff}"
+        );
+    }
+
     #[test]
     fn turboquant_no_qjl_direct_attention_matches_dequantized_sdpa() {
         // Variant F (NoQjl) end-to-end: append → direct attention through the

@@ -72,6 +72,12 @@ pub struct TurboQuantCore {
     /// GPU-side codebook arrays: `codebook_arrs[b]` is a 1-D f32 InlineArray
     /// holding 2^b centroids for b-bit quantisation.  Indexed as codebooks.
     codebook_arrs: Vec<Option<InlineArray>>,
+    /// 256-entry zero-padded codebook arrays for use by fullbyte score
+    /// kernels that load all 256 centroids into threadgroup memory regardless
+    /// of `bits`. `codebook_arrs_padded_256[b]` has the first `2^b` entries
+    /// matching `codebook_arrs[b]`, the rest zeros. Built lazily-eagerly at
+    /// construction for every `b` where the regular codebook exists.
+    codebook_arrs_padded_256: Vec<Option<InlineArray>>,
 }
 
 impl TurboQuantCore {
@@ -176,6 +182,28 @@ impl TurboQuantCore {
             })
             .collect();
 
+        // 256-padded variants for fullbyte score kernels (see field doc).
+        // `b == 8` reuses the regular codebook (already 256 entries); `b < 8`
+        // gets a zero-padded copy. Cost: ≤8 * 1KB = 8KB per core.
+        let codebook_arrs_padded_256: Vec<Option<InlineArray>> = codebooks
+            .iter()
+            .map(|cb| {
+                if cb.is_empty() {
+                    None
+                } else if cb.len() >= 256 {
+                    let arr = InlineArray::from_f32_slice(cb, &[cb.len() as i32]);
+                    arr.eval();
+                    Some(arr)
+                } else {
+                    let mut padded = cb.clone();
+                    padded.resize(256, 0.0f32);
+                    let arr = InlineArray::from_f32_slice(&padded, &[256i32]);
+                    arr.eval();
+                    Some(arr)
+                }
+            })
+            .collect();
+
         Self {
             dim,
             rotation,
@@ -198,6 +226,7 @@ impl TurboQuantCore {
             qjl_wht_left_signs_arr,
             qjl_wht_right_signs_arr,
             codebook_arrs,
+            codebook_arrs_padded_256,
         }
     }
 
@@ -207,6 +236,19 @@ impl TurboQuantCore {
 
     pub(super) fn codebook_arr(&self, bits: u8) -> Option<&InlineArray> {
         self.codebook_arrs.get(usize::from(bits))?.as_ref()
+    }
+
+    /// Codebook arr zero-padded to 256 entries for fullbyte score kernels
+    /// that hardcode `kKeyCentroids = 256u`. Encoder still uses
+    /// `codebook_arr(bits)` because `gpu_quantize_mse` reads
+    /// `n_centroids = cb_arr.shape()[0]` and we want exactly `2^bits`
+    /// candidate centroids during nearest-neighbour search. The padded
+    /// view is read-only by the score kernel; out-of-range entries are
+    /// never indexed because all stored u8 indices are in `[0, 2^bits)`.
+    pub(super) fn codebook_arr_padded_256(&self, bits: u8) -> Option<&InlineArray> {
+        self.codebook_arrs_padded_256
+            .get(usize::from(bits))?
+            .as_ref()
     }
 
     /// GPU-native nearest-centroid quantisation via fused Metal kernel.

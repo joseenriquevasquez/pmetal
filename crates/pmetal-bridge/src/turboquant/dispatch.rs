@@ -202,7 +202,22 @@ pub(super) fn gpu_quantize_kv(
     // path for NoQjl goes through dequantize+SDPA (which is qjl-aware via
     // residual_norms) so the GPU score kernels never read them.
     let packed_dim = packed_qjl_words(k_core.dim) as i32;
-    let use_q8_seq_shadow = key_bits == 8 && k_core.dim == 256 && v_core.dim == 256;
+    // Phase D.3.1: at d256 NoQjl, the existing q8 fullbyte_dense_values_2pass
+    // score kernel is structurally bit-width-agnostic — it indexes a
+    // 256-entry codebook by u8. Widen the seq-shadow gate to cover
+    // `key_bits in 4..=8` for NoQjl so encode produces the same
+    // {ks.indices, q8_slot_scales_seq, vs.d256_rot_values_seq} surface the
+    // 8-bit fast path already consumes. Standard QJL stays 8-bit-only on
+    // this path because `q8_keybytes_seq` packs the QJL sign bit into the
+    // top bit of each byte and depends on a 7-bit codebook. Values stay at
+    // 8-bit (bf16 dense storage) regardless of key_bits.
+    let no_qjl_d256_widened = no_qjl
+        && k_core.dim == 256
+        && v_core.dim == 256
+        && (4..=8).contains(&key_bits)
+        && val_bits == 8;
+    let use_q8_seq_shadow = (key_bits == 8 && k_core.dim == 256 && v_core.dim == 256)
+        || no_qjl_d256_widened;
     let k_indices_t = (!use_q8_seq_shadow).then(|| k_indices.transpose_axes(&[0, 1, 3, 2]));
 
     // Phase F (Hamming skip-list): pack sign bits of the rotated key into
