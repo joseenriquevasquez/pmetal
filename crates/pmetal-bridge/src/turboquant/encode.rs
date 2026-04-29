@@ -14,7 +14,7 @@
 
 use std::f32::consts::PI;
 
-use super::config::{TurboQuantQjlMode, TurboQuantTensorConfig};
+use super::config::{TurboQuantOutlierMode, TurboQuantQjlMode, TurboQuantTensorConfig};
 use super::core::TurboQuantCore;
 use super::math::l2_norm;
 use super::state::TensorRuntime;
@@ -33,6 +33,16 @@ pub(super) struct EncodedKeyRows {
     /// inverse-rotation, so a fixed Beta codebook adapts to each slot's
     /// rotated range. Length == norms.len() (one entry per row).
     pub(super) slot_scale: Vec<f32>,
+    /// Phase E (Variant G per-block outliers): top-K |rotated| channel
+    /// indices per row, flat-packed `[N, k]` u8. `None` when the active
+    /// `TurboQuantOutlierMode` is `None`. Mirrors the GPU
+    /// `outlier_channels` field on `GpuKeyStore`.
+    pub(super) per_block_outlier_channels: Option<Vec<u8>>,
+    /// Original-magnitude rotated values at the outlier channels,
+    /// flat-packed `[N, k]` f32 (the GPU stores f16 — host keeps f32 to
+    /// avoid the half-precision conversion in scalar Rust). Pairs with
+    /// `per_block_outlier_channels`; same gating.
+    pub(super) per_block_outlier_values: Option<Vec<f32>>,
 }
 
 pub(super) struct EncodedValueRows {
@@ -57,6 +67,7 @@ pub(super) fn encode_key_rows(
     total_dim: usize,
     rows: &[f32],
     qjl_mode: TurboQuantQjlMode,
+    outlier_mode: TurboQuantOutlierMode,
 ) -> BatchedKeyRows {
     match runtime {
         TensorRuntime::Uniform { config, core } => {
@@ -64,7 +75,13 @@ pub(super) fn encode_key_rows(
                 unreachable!()
             };
             BatchedKeyRows {
-                regular: encode_key_component_rows(core, rows, *bits, qjl_mode),
+                regular: encode_key_component_rows(
+                    core,
+                    rows,
+                    *bits,
+                    qjl_mode,
+                    per_block_outlier_k(outlier_mode, core.dim),
+                ),
                 outlier_mask: None,
                 outlier: None,
             }
@@ -82,6 +99,11 @@ pub(super) fn encode_key_rows(
             else {
                 unreachable!()
             };
+            // Per-block outliers are only wired for Uniform configs (mirrors the
+            // GPU encode gate in `gpu_quantize_kv`). Mixed (per-channel) outliers
+            // and per-block outliers are deliberately disjoint as of this
+            // landing — combining them needs the per-block search to skip the
+            // mixed-outlier channels, which isn't implemented yet.
             let (mask, regular_rows, outlier_rows) =
                 split_rows_by_outliers(rows, total_dim, *outlier_count);
             BatchedKeyRows {
@@ -90,6 +112,7 @@ pub(super) fn encode_key_rows(
                     &regular_rows,
                     *regular_bits,
                     qjl_mode,
+                    0,
                 ),
                 outlier_mask: Some(mask),
                 outlier: Some(encode_key_component_rows(
@@ -97,8 +120,22 @@ pub(super) fn encode_key_rows(
                     &outlier_rows,
                     *outlier_bits,
                     qjl_mode,
+                    0,
                 )),
             }
+        }
+    }
+}
+
+/// Resolve the `TurboQuantOutlierMode` to a concrete K (rows-per-slot
+/// outlier count) for the host encode path. Mirrors the GPU dispatch's
+/// `k_i32 <= 0 || k_i32 > dim_i32` early-out.
+fn per_block_outlier_k(mode: TurboQuantOutlierMode, dim: usize) -> usize {
+    match mode {
+        TurboQuantOutlierMode::None => 0,
+        TurboQuantOutlierMode::PerBlock { k } => {
+            let k = usize::from(k);
+            if k == 0 || k > dim { 0 } else { k }
         }
     }
 }
@@ -158,12 +195,13 @@ pub(super) fn encode_value_rows(runtime: &TensorRuntime, total_dim: usize, rows:
 /// `qjl_mode = NoQjl` (Variant F): codebook at full `key_bits`, no residual
 /// pack. `qjl_signs` is filled with zeros (so the existing decode short-circuit
 /// on residual_norms ≤ ZERO_EPSILON makes the QJL term contribute 0).
-#[allow(clippy::needless_range_loop)]
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 pub(super) fn encode_key_component_rows(
     core: &TurboQuantCore,
     rows: &[f32],
     key_bits: u8,
     qjl_mode: TurboQuantQjlMode,
+    outlier_k: usize,
 ) -> EncodedKeyRows {
     let num_rows = rows.len() / core.dim;
     let mut norms = vec![0.0f32; num_rows];
@@ -196,6 +234,16 @@ pub(super) fn encode_key_component_rows(
     let mut slot_scale = vec![0.0f32; num_rows];
     let mut decoded_mse = vec![0.0f32; rows.len()];
 
+    // Phase E (Variant G per-block outliers): when `outlier_k > 0` we
+    // extract the top-K |rotated| coords per row and (a) zero them in the
+    // body before slot_scale + codebook quant so the codebook fits the body's
+    // actual extent, (b) scatter the original-magnitude rotated values back
+    // into the rotated reconstruction so the residual at outlier channels is
+    // exactly 0 and decode-time reconstruction restores them within f16
+    // precision. Mirrors the GPU `outlier_pre` block in `dispatch.rs`.
+    let mut per_block_outlier_channels: Option<Vec<u8>> = None;
+    let mut per_block_outlier_values: Option<Vec<f32>> = None;
+
     if mse_bits > 0 {
         // Step 2: Rotate once; per-row max gives the codebook adaptation factor.
         let rotated = core.rotate_rows(&normalized);
@@ -210,6 +258,46 @@ pub(super) fn encode_key_component_rows(
             .abs()
             .max(ZERO_EPSILON);
 
+        // Per-row outlier extraction: argpartition on |rotated| + slice top-K.
+        // We work on a copy because slot_scale + quant must see the body
+        // (outlier coords zeroed) but the residual + scatter need the original.
+        let mut rotated_body = rotated.clone();
+        let outlier_channels_buf: Option<Vec<u8>> = if outlier_k > 0 {
+            let mut chans = vec![0u8; num_rows * outlier_k];
+            let mut vals = vec![0.0f32; num_rows * outlier_k];
+            for row_idx in 0..num_rows {
+                if norms[row_idx] <= ZERO_EPSILON {
+                    continue;
+                }
+                let start = row_idx * core.dim;
+                let end = start + core.dim;
+                // Pick the K indices with the largest |rotated|. Partial sort
+                // via select-K: cheap at small K (typically ≤16) versus a
+                // full sort of D up to 256.
+                let mut idxs: Vec<u16> = (0..core.dim as u16).collect();
+                idxs.sort_unstable_by(|&a, &b| {
+                    rotated[start + b as usize]
+                        .abs()
+                        .partial_cmp(&rotated[start + a as usize].abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let out_base = row_idx * outlier_k;
+                for k in 0..outlier_k {
+                    let chan = idxs[k] as usize;
+                    chans[out_base + k] = chan as u8;
+                    vals[out_base + k] = rotated[start + chan];
+                    // Zero the outlier coord in the body so slot_scale +
+                    // codebook see only the non-outlier residual range.
+                    rotated_body[start + chan] = 0.0;
+                    debug_assert!(start + chan < end);
+                }
+            }
+            per_block_outlier_values = Some(vals);
+            Some(chans)
+        } else {
+            None
+        };
+
         let mut decoded_rot = vec![0.0f32; rows.len()];
         for row_idx in 0..num_rows {
             let start = row_idx * core.dim;
@@ -217,22 +305,37 @@ pub(super) fn encode_key_component_rows(
             if norms[row_idx] <= ZERO_EPSILON {
                 continue;
             }
-            // Step 3: per-row max defines slot_scale. We divide rotated by
-            // slot_scale before quantize so values use the full codebook range.
-            let row_max = rotated[start..end]
+            // Step 3: per-row max over the body defines slot_scale.
+            let row_max = rotated_body[start..end]
                 .iter()
                 .fold(0.0f32, |acc, &v| acc.max(v.abs()));
             let s = (row_max / centroid_max).max(ZERO_EPSILON);
             slot_scale[row_idx] = s;
             let inv_s = 1.0 / s;
             for i in start..end {
-                let scaled = rotated[i] * inv_s;
+                let scaled = rotated_body[i] * inv_s;
                 let idx = nearest_centroid_index(scaled, codebook);
                 mse_indices[i] = idx as u16;
                 // Decoded value in rotated domain: codebook[idx] * slot_scale.
                 decoded_rot[i] = codebook[idx] * s;
             }
+            // Scatter exact outlier values back at their channels so the
+            // rotated reconstruction has them in original magnitude. The
+            // residual at these channels is then 0 (outlier_value -
+            // outlier_value), which makes the QJL signs correctly capture
+            // body residual only.
+            if let (Some(chans), Some(vals)) = (
+                outlier_channels_buf.as_ref(),
+                per_block_outlier_values.as_ref(),
+            ) {
+                let out_base = row_idx * outlier_k;
+                for k in 0..outlier_k {
+                    let chan = chans[out_base + k] as usize;
+                    decoded_rot[start + chan] = vals[out_base + k];
+                }
+            }
         }
+        per_block_outlier_channels = outlier_channels_buf;
         // Step 4: inverse-rotate the rescaled codebook recon to get decoded_mse.
         decoded_mse = core.inverse_rotate_rows(&decoded_rot);
     }
@@ -308,6 +411,8 @@ pub(super) fn encode_key_component_rows(
         norms,
         residual_norms,
         slot_scale,
+        per_block_outlier_channels,
+        per_block_outlier_values,
     }
 }
 
@@ -369,6 +474,9 @@ pub(super) fn decode_key_rows(
                 &store.regular_slot_scale,
                 *bits,
                 qjl_mode,
+                store.regular_per_block_outlier_channels.as_deref(),
+                store.regular_per_block_outlier_values.as_deref(),
+                store.regular_per_block_outlier_k,
             )
         }
         TensorRuntime::Mixed {
@@ -393,6 +501,9 @@ pub(super) fn decode_key_rows(
                 &store.regular_slot_scale,
                 *regular_bits,
                 qjl_mode,
+                None,
+                None,
+                0,
             );
             let outlier = decode_key_component_rows_raw(
                 outlier_core,
@@ -422,6 +533,9 @@ pub(super) fn decode_key_rows(
                     .expect("TurboQuant key outlier slot_scale missing"),
                 *outlier_bits,
                 qjl_mode,
+                None,
+                None,
+                0,
             );
             let mask = unpack_all(
                 store
@@ -510,6 +624,9 @@ pub(super) fn decode_key_component_rows_raw(
     slot_scale: &[f32],
     key_bits: u8,
     qjl_mode: TurboQuantQjlMode,
+    per_block_outlier_channels: Option<&[u8]>,
+    per_block_outlier_values: Option<&[f32]>,
+    per_block_outlier_k: usize,
 ) -> Vec<f32> {
     let total_rows = norms.len();
     let mse_bits = match qjl_mode {
@@ -517,18 +634,37 @@ pub(super) fn decode_key_component_rows_raw(
         TurboQuantQjlMode::NoQjl => key_bits,
     };
 
-    // MSE base reconstruction: codebook[idx] * slot_scale, then inverse-rotate.
-    let mut reconstructed = if mse_bits == 0 {
+    // MSE base reconstruction: codebook[idx] * slot_scale, then scatter
+    // outlier values back at their channels before inverse-rotate so the
+    // rotated reconstruction has the exact extreme-coord values restored.
+    let apply_override = per_block_outlier_k > 0
+        && per_block_outlier_channels.is_some()
+        && per_block_outlier_values.is_some();
+    let mut reconstructed = if mse_bits == 0 && !apply_override {
         vec![0.0; total_rows * core.dim]
     } else {
-        let codebook = core.codebook(mse_bits);
         let mut decoded_rot = vec![0.0f32; total_rows * core.dim];
-        for row_idx in 0..total_rows {
-            let s = slot_scale[row_idx];
-            let start = row_idx * core.dim;
-            let end = start + core.dim;
-            for i in start..end {
-                decoded_rot[i] = codebook[usize::from(indices[i])] * s;
+        if mse_bits > 0 {
+            let codebook = core.codebook(mse_bits);
+            for row_idx in 0..total_rows {
+                let s = slot_scale[row_idx];
+                let start = row_idx * core.dim;
+                let end = start + core.dim;
+                for i in start..end {
+                    decoded_rot[i] = codebook[usize::from(indices[i])] * s;
+                }
+            }
+        }
+        if apply_override {
+            let chans = per_block_outlier_channels.unwrap();
+            let vals = per_block_outlier_values.unwrap();
+            for row_idx in 0..total_rows {
+                let row_off = row_idx * core.dim;
+                let out_base = row_idx * per_block_outlier_k;
+                for k in 0..per_block_outlier_k {
+                    let chan = chans[out_base + k] as usize;
+                    decoded_rot[row_off + chan] = vals[out_base + k];
+                }
             }
         }
         core.inverse_rotate_rows(&decoded_rot)

@@ -209,9 +209,20 @@ impl QuantizedKvCache {
         let keys_f32 = keys.as_dtype(10 /* float32 */);
         let values_f32 = values.as_dtype(10 /* float32 */);
 
-        let ks = self
-            .keys
-            .get_or_insert_with(|| QuantizedKeyStore::new(config.keys, config.qjl));
+        let ks = self.keys.get_or_insert_with(|| {
+            // Phase E (per-block outliers): when outliers are configured,
+            // the host encode path stores the top-K per-row override
+            // alongside the regular sub-vector. Resolve the K from the
+            // active mode + key_dim — same gate as the encode path.
+            let outlier_k = match config.outliers {
+                super::TurboQuantOutlierMode::None => 0,
+                super::TurboQuantOutlierMode::PerBlock { k } => {
+                    let k = usize::from(k);
+                    if k == 0 || k > layout.key_dim { 0 } else { k }
+                }
+            };
+            QuantizedKeyStore::new_with_outliers(config.keys, config.qjl, outlier_k)
+        });
         let vs = self
             .values
             .get_or_insert_with(|| QuantizedValueStore::new(config.values));
@@ -235,18 +246,21 @@ impl QuantizedKvCache {
                 self.cold_offset += seq_len;
                 return Ok(());
             }
-            // GPU path failed — fall through to CPU. But CPU encode does
-            // NOT mirror the Phase E.3 outlier override (the host
-            // encode_key_component_rows has no notion of per-block
-            // outliers). Silently falling through would produce broken
-            // cache state — error explicitly so the caller can either
-            // disable outliers or pin a GPU-supported config.
-            if config.outliers.is_enabled() {
+            // GPU path failed — fall through to CPU. The CPU encode path
+            // now mirrors the Phase E.3 override (extract top-K, zero body
+            // pre-quant, scatter exact f32 values back into the rotated
+            // reconstruction so the residual at outlier channels is 0 and
+            // decode-time reconstruction restores them). PerBlock outliers
+            // are still gated to Uniform configs only — Mixed (per-channel
+            // outlier sub-vector) configs would need the per-block search
+            // to skip the mixed-outlier channels, which isn't wired yet.
+            if config.outliers.is_enabled()
+                && !matches!(config.keys, TurboQuantTensorConfig::Uniform { .. })
+            {
                 return Err(
-                    "TurboQuant outliers (PerBlock) require GPU encode; \
-                     CPU fallback does not mirror the override. Disable \
-                     outliers or use a GPU-supported config (Uniform + \
-                     codebook available)."
+                    "TurboQuant per-block outliers (PerBlock) on a Mixed \
+                     keys config are not yet supported — disable outliers, \
+                     switch to Uniform keys, or use a GPU-encoded config."
                         .to_string(),
                 );
             }
@@ -259,7 +273,13 @@ impl QuantizedKvCache {
         let rows_per_seq = layout.batch * layout.heads;
         debug_assert_eq!(key_rows.len(), rows_per_seq * seq_len * layout.key_dim);
 
-        let encoded_keys = encode_key_rows(&state.keys, layout.key_dim, &key_rows, state.qjl);
+        let encoded_keys = encode_key_rows(
+            &state.keys,
+            layout.key_dim,
+            &key_rows,
+            state.qjl,
+            config.outliers,
+        );
         let encoded_values = encode_value_rows(&state.values, layout.value_dim, &value_rows);
 
         ks.extend(

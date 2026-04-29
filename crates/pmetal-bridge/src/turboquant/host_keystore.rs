@@ -47,9 +47,35 @@ pub struct QuantizedKeyStore {
     pub outlier_norms: Option<Vec<f32>>,
     pub outlier_residual_norms: Option<Vec<f32>>,
     pub outlier_slot_scale: Option<Vec<f32>>,
+
+    // Phase E (Variant G per-block outliers): top-K |rotated| coords per
+    // row stored as flat `[N, k]` u8 channel indices + f32 values. Both
+    // `Some` together when `TurboQuantOutlierMode::PerBlock { k }` is
+    // active, both `None` otherwise. Mirrors GpuKeyStore.outlier_channels
+    // / outlier_values; the host store keeps f32 (not f16) to avoid the
+    // half-precision conversion in scalar Rust. `regular_per_block_k` is
+    // the K width — same for every row, so we don't recompute it from
+    // length/num_rows on each decode.
+    pub regular_per_block_outlier_channels: Option<Vec<u8>>,
+    pub regular_per_block_outlier_values: Option<Vec<f32>>,
+    pub regular_per_block_outlier_k: usize,
 }
 
 impl QuantizedKeyStore {
+    pub(super) fn new_with_outliers(
+        config: TurboQuantTensorConfig,
+        qjl_mode: TurboQuantQjlMode,
+        per_block_outlier_k: usize,
+    ) -> Self {
+        let mut store = Self::new(config, qjl_mode);
+        if per_block_outlier_k > 0 {
+            store.regular_per_block_outlier_channels = Some(Vec::new());
+            store.regular_per_block_outlier_values = Some(Vec::new());
+            store.regular_per_block_outlier_k = per_block_outlier_k;
+        }
+        store
+    }
+
     pub(super) fn new(config: TurboQuantTensorConfig, qjl_mode: TurboQuantQjlMode) -> Self {
         // Variant F (NoQjl) uses full `bits` for the codebook; Variant E uses
         // `bits-1` (1 bit reserved for QJL signs).
@@ -80,6 +106,9 @@ impl QuantizedKeyStore {
             outlier_norms: outlier_bits.map(|_| Vec::new()),
             outlier_residual_norms: outlier_bits.map(|_| Vec::new()),
             outlier_slot_scale: outlier_bits.map(|_| Vec::new()),
+            regular_per_block_outlier_channels: None,
+            regular_per_block_outlier_values: None,
+            regular_per_block_outlier_k: 0,
         }
     }
 
@@ -125,6 +154,36 @@ impl QuantizedKeyStore {
                 .expect("TurboQuant key outlier slot_scale missing")
                 .extend_from_slice(&outlier.slot_scale);
         }
+
+        // Phase E (per-block) outliers: append-only mirror of the regular
+        // sub-vector's per-row top-K. Either both `Some` (encoder produced
+        // them) or both `None` (encoder didn't); intermediate states would
+        // mean the cache and encoder disagree on whether outliers are
+        // active for this layer, which would silently corrupt decode.
+        match (
+            encoded.per_block_outlier_channels.as_ref(),
+            encoded.per_block_outlier_values.as_ref(),
+        ) {
+            (Some(chans), Some(vals)) => {
+                self.regular_per_block_outlier_channels
+                    .get_or_insert_with(Vec::new)
+                    .extend_from_slice(chans);
+                self.regular_per_block_outlier_values
+                    .get_or_insert_with(Vec::new)
+                    .extend_from_slice(vals);
+                if self.regular_per_block_outlier_k == 0 && !chans.is_empty() {
+                    let num_rows = encoded.norms.len();
+                    debug_assert!(num_rows > 0);
+                    self.regular_per_block_outlier_k = chans.len() / num_rows;
+                }
+            }
+            (None, None) => {
+                debug_assert!(self.regular_per_block_outlier_k == 0);
+            }
+            _ => panic!(
+                "TurboQuant per-block outlier (channels, values) Option-state mismatch on extend"
+            ),
+        }
     }
 
     /// Approximate memory usage in bytes.
@@ -144,6 +203,14 @@ impl QuantizedKeyStore {
                 .map_or(0, |v| v.len() * 4)
             + self
                 .outlier_slot_scale
+                .as_ref()
+                .map_or(0, |v| v.len() * 4)
+            + self
+                .regular_per_block_outlier_channels
+                .as_ref()
+                .map_or(0, |v| v.len())
+            + self
+                .regular_per_block_outlier_values
                 .as_ref()
                 .map_or(0, |v| v.len() * 4)
     }

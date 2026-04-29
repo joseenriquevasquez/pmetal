@@ -387,7 +387,7 @@ mod kvcache {
     #[test]
     fn turboquant_handles_zero_rows() {
         let core = TurboQuantCore::new(8, 4);
-        let encoded = encode_key_component_rows(&core, &[0.0; 8], 4, super::config::TurboQuantQjlMode::Standard);
+        let encoded = encode_key_component_rows(&core, &[0.0; 8], 4, super::config::TurboQuantQjlMode::Standard, 0);
         assert_eq!(encoded.norms, vec![0.0]);
         assert_eq!(encoded.residual_norms, vec![0.0]);
         assert!(encoded.mse_indices.iter().all(|&v| v == 0));
@@ -2717,7 +2717,7 @@ mod kvcache {
         let core = TurboQuantCore::new(16, 4);
         let mut row = vec![0.1f32; 16];
         row[0] = f32::NAN;
-        let encoded = encode_key_component_rows(&core, &row, 4, super::config::TurboQuantQjlMode::Standard);
+        let encoded = encode_key_component_rows(&core, &row, 4, super::config::TurboQuantQjlMode::Standard, 0);
         assert_eq!(encoded.residual_norms.len(), 1);
         assert!(
             encoded.residual_norms[0].is_finite(),
@@ -2736,7 +2736,7 @@ mod kvcache {
         let core = TurboQuantCore::new(16, 4);
         let mut row = vec![1.0f32; 16];
         row[5] = f32::INFINITY;
-        let encoded = encode_key_component_rows(&core, &row, 4, super::config::TurboQuantQjlMode::Standard);
+        let encoded = encode_key_component_rows(&core, &row, 4, super::config::TurboQuantQjlMode::Standard, 0);
         assert!(
             encoded.residual_norms[0].is_finite(),
             "Inf input must not leak into residual_norm"
@@ -2803,6 +2803,9 @@ mod kvcache {
             &encoded.slot_scale,
             bits,
             super::config::TurboQuantQjlMode::Standard,
+            None,
+            None,
+            0,
         )
     }
 
@@ -2819,7 +2822,7 @@ mod kvcache {
         let mut errors = Vec::new();
         for &bits in &[3u8, 5u8, 7u8] {
             let core = TurboQuantCore::new(dim, bits);
-            let encoded = encode_key_component_rows(&core, &data, bits, super::config::TurboQuantQjlMode::Standard);
+            let encoded = encode_key_component_rows(&core, &data, bits, super::config::TurboQuantQjlMode::Standard, 0);
             let decoded = decode_cpu_key(&core, &encoded, bits, num_rows);
             // Per-element MSE, averaged across all rows.
             let mse: f32 = data
@@ -2863,6 +2866,95 @@ mod kvcache {
         );
     }
 
+    // Phase E.3 CPU mirror: encode_key_component_rows must extract top-K
+    // |rotated| coords, zero them in the body before slot_scale + codebook
+    // quant, and the decode path must scatter the exact stored values back
+    // at those channels before inverse-rotate. Heavy-tail rows (where ≥1
+    // coord dominates the rest by 10×) make this measurable: the codebook
+    // — built for normalised-rotated-key statistics — wastes resolution on
+    // the heavy tail and mis-fits the body. Carving out the outliers lets
+    // the codebook fit the body, and the override restores the heavy-tail
+    // coords exactly. MSE must drop by a non-trivial margin vs the
+    // outlier-disabled baseline.
+    #[test]
+    fn turboquant_cpu_outliers_per_block_decode_override_improves_reconstruction() {
+        // Mirrors the GPU equivalent at line 1117. Small dim + few rows + 4-bit
+        // codebook makes the override benefit unambiguous in scalar Rust. The
+        // heavy spikes are injected in input space; rotation diffuses them
+        // across rotated channels but the per-row max stays large enough that
+        // top-K still picks meaningful coords.
+        let dim = 16usize;
+        let num_rows = 4usize;
+        let bits = 4u8;
+        let outlier_k = 2usize;
+
+        let mut data = vec![0f32; num_rows * dim];
+        for slot in 0..num_rows {
+            for c in 0..dim {
+                let i = slot * dim + c;
+                data[i] = (((i as f32) * 0.07).sin() * 0.3) + (((i as f32) * 0.13).cos() * 0.2);
+            }
+            // Spikes at slot-dependent channels — same shape as the GPU test.
+            let s = slot * dim;
+            data[s + slot] += 6.0;
+            data[s + ((slot + 5) % dim)] -= 5.5;
+        }
+
+        let core = TurboQuantCore::new(dim, bits);
+        let qjl = super::config::TurboQuantQjlMode::Standard;
+
+        // Baseline: outlier_k = 0 (no per-block override path).
+        let baseline_encoded = encode_key_component_rows(&core, &data, bits, qjl, 0);
+        let baseline_decoded = decode_cpu_key(&core, &baseline_encoded, bits, num_rows);
+
+        // With override: outlier_k = 2 (matches synthetic injected spikes).
+        let override_encoded = encode_key_component_rows(&core, &data, bits, qjl, outlier_k);
+        // Sanity: encoder produced the outlier buffers.
+        assert!(override_encoded.per_block_outlier_channels.is_some());
+        assert!(override_encoded.per_block_outlier_values.is_some());
+        let chans = override_encoded
+            .per_block_outlier_channels
+            .as_ref()
+            .unwrap();
+        let vals = override_encoded
+            .per_block_outlier_values
+            .as_ref()
+            .unwrap();
+        assert_eq!(chans.len(), num_rows * outlier_k);
+        assert_eq!(vals.len(), num_rows * outlier_k);
+        let override_decoded = decode_key_component_rows_raw(
+            &core,
+            &override_encoded.mse_indices,
+            &override_encoded.qjl_signs,
+            &override_encoded.norms,
+            &override_encoded.residual_norms,
+            &override_encoded.slot_scale,
+            bits,
+            qjl,
+            Some(chans.as_slice()),
+            Some(vals.as_slice()),
+            outlier_k,
+        );
+
+        let mse = |decoded: &[f32]| -> f32 {
+            data.iter()
+                .zip(decoded.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f32>()
+                / data.len() as f32
+        };
+        let baseline_mse = mse(&baseline_decoded);
+        let override_mse = mse(&override_decoded);
+        // Override should cut MSE by ≥30% on heavy-tail data — same bound
+        // the GPU equivalent test asserts. If this regresses, the encoder's
+        // zero-pre-quant or the decoder's scatter is broken.
+        assert!(
+            override_mse < baseline_mse * 0.7,
+            "outlier override did not improve reconstruction: \
+             baseline_mse={baseline_mse}, override_mse={override_mse}"
+        );
+    }
+
     #[test]
     fn turboquant_cpu_inner_product_is_approximately_unbiased() {
         // Paper Theorem 2: E[<q, k̂>] = <q, k> for keys encoded via the 2-stage
@@ -2876,7 +2968,7 @@ mod kvcache {
         let keys = seeded_gaussian_rows(num_rows, dim, 0x1111_2222_3333_4444);
         let queries = seeded_gaussian_rows(num_rows, dim, 0x5555_6666_7777_8888);
 
-        let encoded = encode_key_component_rows(&core, &keys, bits, super::config::TurboQuantQjlMode::Standard);
+        let encoded = encode_key_component_rows(&core, &keys, bits, super::config::TurboQuantQjlMode::Standard, 0);
         let decoded = decode_cpu_key(&core, &encoded, bits, num_rows);
 
         let mut sum_gt = 0.0f64;
