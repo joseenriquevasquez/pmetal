@@ -776,6 +776,53 @@ impl InlineArray {
         }
     }
 
+    /// Phase E.4: outlier-bias variant of
+    /// `turboquant_attention_q8_d256_fullbyte_dense_values_2pass`. Adds
+    /// the precomputed `outlier_bias` (`[q_rows, cache_seq_capacity]`
+    /// f32) into the score before the online-softmax exp. Caller passes
+    /// a zeros buffer when per-block outliers are inactive.
+    #[allow(clippy::too_many_arguments)]
+    pub fn turboquant_attention_q8_d256_fullbyte_dense_values_2pass_with_outlier_bias(
+        query_rot: &Self,
+        key_indices: &Self,
+        slot_scales: &Self,
+        key_codebook: &Self,
+        value_dense: &Self,
+        outlier_bias: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale: f32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_with_outlier_bias(
+                out.as_mut_ptr(),
+                &query_rot.raw,
+                &key_indices.raw,
+                &slot_scales.raw,
+                &key_codebook.raw,
+                &value_dense.raw,
+                &outlier_bias.raw,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+                attn_scale.to_bits(),
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
     /// Full-byte D256 long-context pass-1 state output.
     /// Returns `(partials, sums, maxs)`.
     #[allow(clippy::too_many_arguments)]

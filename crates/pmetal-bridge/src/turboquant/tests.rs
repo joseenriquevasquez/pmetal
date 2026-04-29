@@ -1641,6 +1641,120 @@ mod kvcache {
         );
     }
 
+    // Phase E.4 V1: with PerBlock outliers enabled, the d256 fullbyte score
+    // kernel must add the precomputed outlier-bias term so its end-to-end
+    // result matches dequantize+SDPA (which goes through the E.3 scatter).
+    // Heavy-tail prefill data — the scenario outliers were designed for —
+    // exercises both the encode-side zero/scatter and the score-side bias.
+    #[test]
+    fn turboquant_no_qjl_d256_long_context_outliers_match_dequantized_sdpa() {
+        let dim = 256usize;
+        let heads = 2i32;
+        let prefill = 1023i32;
+        let k_outliers: u8 = 4;
+        let config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl)
+            .with_outliers(super::config::TurboQuantOutlierMode::PerBlock { k: k_outliers });
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+        // Inject heavy spikes at varying channels per slot — same shape as
+        // the GPU E.3 test, so the bias path actually has non-trivial work.
+        let inject_spikes = |buf: &mut [f32], dim_i32: i32, prefill_i32: i32, batch_i32: i32, head_i32: i32| {
+            for bh in 0..(batch_i32 * head_i32) as usize {
+                for slot in 0..prefill_i32 as usize {
+                    let row = bh * prefill_i32 as usize + slot;
+                    let row_off = row * dim_i32 as usize;
+                    let dim_u = dim_i32 as usize;
+                    buf[row_off + (slot % dim_u)] += 6.0;
+                    buf[row_off + ((slot + 17) % dim_u)] -= 5.5;
+                    buf[row_off + ((slot + 53) % dim_u)] += 4.7;
+                    buf[row_off + ((slot + 113) % dim_u)] -= 4.3;
+                }
+            }
+        };
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let step_len = (b * h * d) as usize;
+        let mut prefill_keys_data = make_data(prefill_len, 0.2);
+        inject_spikes(&mut prefill_keys_data, d, prefill, b, h);
+        let prefill_keys = InlineArray::from_f32_slice(&prefill_keys_data, &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
+        let queries = InlineArray::from_f32_slice(&make_data(step_len, 1.3), &[b, h, 1, d]);
+        let mut step_keys_data = make_data(step_len, 1.9);
+        // Step token also gets spikes — exercises the cache-grow path.
+        for bh in 0..(b * h) as usize {
+            let row_off = bh * dim;
+            step_keys_data[row_off + 7] += 5.0;
+            step_keys_data[row_off + 41] -= 4.5;
+            step_keys_data[row_off + 99] += 4.0;
+            step_keys_data[row_off + 199] -= 3.5;
+        }
+        let step_keys = InlineArray::from_f32_slice(&step_keys_data, &[b, h, 1, d]);
+        let step_values = InlineArray::from_f32_slice(&make_data(step_len, 2.4), &[b, h, 1, d]);
+
+        let mut seed_cache = QuantizedKvCache::new(config);
+        seed_cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        // Direct path: GPU score kernel with outlier-bias variant.
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+
+        // Reference path: append, then dequantize (which applies the E.3
+        // scatter override) and run manual SDPA.
+        ref_cache
+            .append(&step_keys, &step_values)
+            .expect("reference append");
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let reference_vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut full_keys,
+            &mut full_values,
+            b,
+            h,
+            1024,
+            d,
+            scale,
+        );
+
+        let direct_vals = direct
+            .to_f32_vec((b * h * d) as usize)
+            .expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        // Slightly looser tolerance than the no-outlier 1e-3 because the
+        // bias path adds an extra fp32 reduction pass; values stored as
+        // f16 also round-trip through half-precision in the GPU
+        // outlier_values buffer (versus f32 in the manual reference's
+        // dequant path, which uses gpu_dequantize_keys → also reads
+        // outlier_values as f16 so the dtype mismatch is shared, not
+        // additive). 5e-3 leaves margin for SIMD-reduction order drift.
+        assert!(
+            max_abs_diff < 5e-3,
+            "Variant F d256 fused kernel with outlier-bias diverged from \
+             dequantized sdpa: max_abs_diff={max_abs_diff}"
+        );
+    }
+
     // Phase D.3.1: NoQjl + d256 fast path widened to key_bits in 4..=8.
     // Score kernel loads 256 codebook entries unconditionally, so encode +
     // dispatch must hand it a zero-padded 256-entry codebook. Indices are

@@ -774,6 +774,22 @@ unsafe extern "C" {
         attn_scale_bits: u32,
     ) -> i32;
 
+    pub(super) fn mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_with_outlier_bias(
+        out: *mut RawBuf,
+        query_rot: *const RawBuf,
+        key_indices: *const RawBuf,
+        slot_scales: *const RawBuf,
+        key_codebook: *const RawBuf,
+        value_dense: *const RawBuf,
+        outlier_bias: *const RawBuf,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale_bits: u32,
+    ) -> i32;
+
     pub(super) fn mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_state(
         out_partials: *mut RawBuf,
         out_sums: *mut RawBuf,

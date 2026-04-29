@@ -409,6 +409,30 @@ int mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
     uint32_t                kv_heads,
     uint32_t                attn_scale_bits);
 
+// Phase E.4: outlier-bias variant of fullbyte_dense_values_2pass.
+// Identical to the base function above except for one extra input:
+// - `outlier_bias`: [q_rows, cache_seq_capacity] f32. Precomputed in MLX
+//   as `key_norm[slot] · Σ_k q_rot[row, chan_k] · outlier_value_k` for
+//   each (q-row, slot). Indexed by the kernel as
+//   `outlier_bias[row * cache_seq_capacity + seq]` and added to `score`
+//   before the online-softmax exp. When per-block outliers aren't
+//   active the caller still passes a zeros buffer of the same shape so
+//   the dispatch path is invariant.
+int mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_with_outlier_bias(
+    mlx_inline_array*       out,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* key_indices,
+    const mlx_inline_array* slot_scales,
+    const mlx_inline_array* key_codebook,
+    const mlx_inline_array* value_dense,
+    const mlx_inline_array* outlier_bias,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
+
 // Full-byte D256 pass-1 state output only.
 // Returns:
 // - partials: [N, blocks, 256]

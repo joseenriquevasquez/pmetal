@@ -1673,15 +1673,16 @@ impl QuantizedKvCache {
         scale: f32,
         output_dtype: i32,
     ) -> Option<InlineArray> {
-        // Phase E.3: outlier override is applied during gpu_dequantize_keys
-        // but the fused score kernels read codebook + slot_scale only — they
-        // would silently miss the override. Force the dequantize+SDPA path
-        // when PerBlock outliers are enabled so attention sees the full
-        // reconstruction (including outlier scatter). E.4 follow-up wires the
-        // override into the score kernels themselves.
-        if self.config.outliers.is_enabled() {
-            return None;
-        }
+        // Phase E.3 / E.4: outlier override is applied during
+        // gpu_dequantize_keys; the fused score kernels read codebook +
+        // slot_scale only and would silently miss the override. The d256
+        // fullbyte fast path below has an `_with_outlier_bias` variant
+        // (Phase E.4 V1) that adds a precomputed per-(q-row, slot) bias
+        // term capturing the outlier contribution, so it stays on the
+        // GPU when outliers are enabled. The d128 + d256 base no_qjl_2pass
+        // paths do NOT have outlier-bias variants yet — `outliers_active`
+        // gates them off so attention falls through to dequantize+SDPA.
+        let outliers_active = self.config.outliers.is_enabled();
         let ks = self.keys.as_ref()?.gpu.as_ref()?;
         let vs = self.values.as_ref()?.gpu.as_ref()?;
         let state = self.state.as_ref()?;
@@ -1758,13 +1759,26 @@ impl QuantizedKvCache {
                 let key_indices_seq = ks
                     .indices
                     .reshape(&[kv_rows, cache_seq_capacity, key_dim]);
-                if let Some(aggregated_rot) =
-                    InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
+                let slot_scales_3d = slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]);
+                let value_rot_dense_3d =
+                    value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]);
+                let aggregated_rot = if outliers_active {
+                    let outlier_bias = self.compute_d256_outlier_bias(
+                        ks,
+                        &slot_scales_3d,
+                        &query_rot,
+                        kv_rows,
+                        q_rows,
+                        layout.heads as i32,
+                        cache_seq_capacity,
+                    )?;
+                    InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass_with_outlier_bias(
                         &query_rot,
                         &key_indices_seq,
-                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
+                        &slot_scales_3d,
                         key_codebook,
-                        &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
+                        &value_rot_dense_3d,
+                        &outlier_bias,
                         q_rows as u32,
                         n_seq as u32,
                         cache_seq_capacity as u32,
@@ -1772,12 +1786,34 @@ impl QuantizedKvCache {
                         layout.heads as u32,
                         scale,
                     )
-                {
+                } else {
+                    InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
+                        &query_rot,
+                        &key_indices_seq,
+                        &slot_scales_3d,
+                        key_codebook,
+                        &value_rot_dense_3d,
+                        q_rows as u32,
+                        n_seq as u32,
+                        cache_seq_capacity as u32,
+                        q_heads as u32,
+                        layout.heads as u32,
+                        scale,
+                    )
+                };
+                if let Some(aggregated_rot) = aggregated_rot {
                     let output_rows =
                         value_core.inverse_rotate_output_array(&aggregated_rot, output_dtype)?;
                     return Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]));
                 }
             }
+        }
+
+        // d128 + d256 base no_qjl_2pass paths don't have outlier-bias
+        // variants yet — fall through to dequantize+SDPA when outliers are
+        // active. Phase E.4 V2 will add the bias path to those kernels.
+        if outliers_active {
+            return None;
         }
 
         let key_norms = ks
@@ -1846,6 +1882,82 @@ impl QuantizedKvCache {
     /// the smallest distances, gathers those slots' packed key/value cache
     /// rows into a contiguous M-length scratch view, and runs the existing
     /// Variant F (NoQjl) score kernel over that subset. The kernel's
+    /// Phase E.4: precompute the per-(q-row, slot) outlier bias term that
+    /// the d256 fullbyte score kernel adds to its dense score before
+    /// softmax. The kernel zeros outlier coords during encode (so the
+    /// dense path contributes 0 there), and this bias adds them back at
+    /// their original-magnitude rotated values:
+    ///
+    ///   bias[q_row, slot] = key_norm[kv_row(q_row), slot]
+    ///                     · Σ_k q_rot[q_row, channels[kv_row, slot, k]]
+    ///                          · values[kv_row, slot, k]
+    ///
+    /// Returns a `[q_rows, cache_seq_capacity]` f32 InlineArray. GQA
+    /// resolves via `q_row / groups → kv_row` indexing. Returns None
+    /// when the GpuKeyStore lacks outlier buffers (caller should not
+    /// have entered this path; defensive guard only).
+    #[allow(clippy::too_many_arguments)]
+    fn compute_d256_outlier_bias(
+        &self,
+        ks: &super::gpu_keystore::GpuKeyStore,
+        slot_scales_3d: &InlineArray,
+        query_rot: &InlineArray,
+        kv_rows: i32,
+        q_rows: i32,
+        kv_heads: i32,
+        cache_seq_capacity: i32,
+    ) -> Option<InlineArray> {
+        let outlier_channels = ks.outlier_channels.as_ref()?;
+        let outlier_values = ks.outlier_values.as_ref()?;
+        // outlier_channels stored as [B, H, T, k] u8; reshape to
+        // [kv_rows, cache_seq_capacity, k]. kv_rows = B*H. The cache
+        // capacity along axis 2 equals `cache_seq_capacity` after append.
+        let outlier_k = outlier_channels.dim(3);
+        if outlier_k <= 0 {
+            return None;
+        }
+        let oc_3d =
+            outlier_channels.reshape(&[kv_rows, cache_seq_capacity, outlier_k]);
+        let ov_3d = outlier_values
+            .as_dtype(crate::compat::Dtype::Float32.as_i32())
+            .reshape(&[kv_rows, cache_seq_capacity, outlier_k]);
+
+        // q_row → kv_row mapping: kv_row = q_row / groups. Build a
+        // [q_rows] i32 index buffer and use `take_axis(_, 0)` to expand
+        // outlier buffers from [kv_rows, ...] to [q_rows, ...]. Same
+        // pattern the Hamming skiplist GQA path (V2) uses.
+        let _ = kv_heads; // kv_heads validates groups upstream; expand uses kv_rows
+        let groups = q_rows / kv_rows;
+        let kv_idx_for_q: Vec<i32> = (0..q_rows).map(|q| q / groups).collect();
+        let kv_idx = InlineArray::from_i32_slice(&kv_idx_for_q);
+
+        let oc_q = oc_3d.take_axis(&kv_idx, 0); // [q_rows, S_cap, k]
+        let ov_q = ov_3d.take_axis(&kv_idx, 0); // [q_rows, S_cap, k]
+
+        // Gather q_rot at the outlier channels. q_rot is [q_rows, key_dim];
+        // flatten (S_cap, k) so take_along_axis aligns to last axis:
+        //   index shape [q_rows, S_cap*k] → output [q_rows, S_cap*k].
+        let oc_q_i32 = oc_q.as_dtype(crate::compat::Dtype::Int32.as_i32());
+        let oc_flat = oc_q_i32.reshape(&[q_rows, cache_seq_capacity * outlier_k]);
+        let q_at_chans_flat = query_rot.take_along_axis(&oc_flat, -1);
+        let q_at_chans =
+            q_at_chans_flat.reshape(&[q_rows, cache_seq_capacity, outlier_k]);
+
+        // Σ_k q_rot[chan] · value
+        let products = q_at_chans.multiply(&ov_q); // [q_rows, S_cap, k]
+        let correction = products.sum_axis(-1, false); // [q_rows, S_cap]
+
+        // Multiply by per-(kv_row, slot) key_norm. slot_scales is packed as
+        // [kv_rows, S_cap, 4] with key_norm at component 0; slice and
+        // expand to per-q-row.
+        let key_norms_kv = slot_scales_3d
+            .slice(&[0, 0, 0], &[kv_rows, cache_seq_capacity, 1])
+            .reshape(&[kv_rows, cache_seq_capacity]);
+        let key_norms_q = key_norms_kv.take_axis(&kv_idx, 0); // [q_rows, S_cap]
+
+        Some(correction.multiply(&key_norms_q))
+    }
+
     /// `cache_seq_capacity` is set to M so its strided indexing addresses the
     /// gathered scratch buffers correctly.
     ///
