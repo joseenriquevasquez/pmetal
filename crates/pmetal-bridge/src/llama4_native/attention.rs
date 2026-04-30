@@ -80,6 +80,88 @@ pub(super) fn attn_forward(
     let head_dim = lw.head_dim;
     let scale = lw.attn_scale;
 
+    // Fused-decode fast path: T=1 on the bf16 path. One compiled kernel
+    // covers both layer flavours (RoPE/NoPE) via static flags captured in
+    // the closure — `use_rope`, `use_qk_norm`, `has_biases`, `temp_tuning`.
+    // Each flag combo gets its own compile trace. Quantized/turboquant
+    // caches and prefill (S>1) stay on the per-op paths below.
+    let dtype_for_dummy = normed.dtype_raw();
+    if s == 1
+        && chunk_mask.is_none()
+        && cache.turboquant.is_none()
+        && cache.quant_config.is_none()
+    {
+        // Biases are all-or-none in real Llama 4 configs (audited at load
+        // time). Disallow the mixed case to keep the compiled graph simple
+        // — the per-op path handles oddballs correctly.
+        let has_biases = lw.attn_q_b.is_some()
+            && lw.attn_k_b.is_some()
+            && lw.attn_v_b.is_some()
+            && lw.attn_o_b.is_some();
+        let bias_consistent = has_biases
+            || (lw.attn_q_b.is_none()
+                && lw.attn_k_b.is_none()
+                && lw.attn_v_b.is_none()
+                && lw.attn_o_b.is_none());
+        if bias_consistent {
+            // When biases are absent we still pass four placeholder arrays
+            // so the FFI shape stays stable — the compiled closure ignores
+            // them via the `has_biases` flag.
+            let dummy = InlineArray::scalar_with_dtype(0.0, dtype_for_dummy);
+            let qb = lw.attn_q_b.as_ref().unwrap_or(&dummy);
+            let kb = lw.attn_k_b.as_ref().unwrap_or(&dummy);
+            let vb = lw.attn_v_b.as_ref().unwrap_or(&dummy);
+            let ob = lw.attn_o_b.as_ref().unwrap_or(&dummy);
+
+            let next = cache.offset + s;
+            crate::native_common::kv_cache::alloc_or_grow_kv(
+                crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+                &mut cache.keys,
+                &mut cache.values,
+                b,
+                n_kv_heads,
+                next,
+                head_dim,
+                dtype_for_dummy,
+            );
+            let cache_keys = cache.keys.take().unwrap();
+            let cache_vals = cache.values.take().unwrap();
+            let temp_tuning_enabled = lw.attn_temperature_tuning > 0 && !lw.use_rope;
+            let (output, new_cache_keys, new_cache_vals) =
+                InlineArray::compiled_llama4_attn_layer_fixed(
+                    normed,
+                    &lw.attn_q_w,
+                    &lw.attn_k_w,
+                    &lw.attn_v_w,
+                    &lw.attn_o_w,
+                    qb,
+                    kb,
+                    vb,
+                    ob,
+                    &cache_keys,
+                    &cache_vals,
+                    cache.offset,
+                    rope_offset,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    scale,
+                    lw.rope_base,
+                    lw.rope_scale,
+                    lw.use_rope,
+                    lw.attn_qk_norm,
+                    has_biases,
+                    temp_tuning_enabled,
+                    lw.floor_scale,
+                    lw.layer_attn_scale,
+                );
+            cache.keys = Some(new_cache_keys);
+            cache.values = Some(new_cache_vals);
+            cache.offset = next;
+            return output;
+        }
+    }
+
     // Q, K, V projections
     let mut queries = normed.matmul(&lw.attn_q_w);
     let mut keys = normed.matmul(&lw.attn_k_w);
@@ -350,16 +432,13 @@ pub(super) fn attn_forward(
     } else {
         // ── Standard bf16 path ────────────────────────────────────────────
         //
-        // Fused-decode design note (audit 2026-04-25): Qwen3's
-        // `compiled_attn_layer_fixed` does not generalise to Llama 4 because
-        // every iRoPE invariant differs — RoPE is per-layer (`use_rope` flag),
-        // q/k norm is gated on `attn_qk_norm`, NoPE layers apply temperature
-        // tuning, and the cache append shape varies with chunk-mask presence.
-        // A `compiled_llama4_attn_layer_fixed` kernel would need either two
-        // specialisations (NoPE + RoPE) or a parameterised graph — both larger
-        // than the per-op overhead they would save. Decision: keep the
-        // per-op path for now; revisit once a parity baseline with mlx-lm is
-        // measured and the kernel write is justified by tok/s data.
+        // Single-token decode without a chunk_mask already returned at the
+        // top via `compiled_llama4_attn_layer_fixed`, which uses static
+        // flags (use_rope, use_qk_norm, has_biases, temp_tuning) to fuse
+        // both RoPE and NoPE layer flavours into one parameterised graph.
+        // This block handles the leftover cases: prefill (S>1), prefill
+        // with chunk_mask on local layers, and the bias-mixed config that
+        // the fused path explicitly rejects.
         let dtype = cache
             .keys
             .as_ref()

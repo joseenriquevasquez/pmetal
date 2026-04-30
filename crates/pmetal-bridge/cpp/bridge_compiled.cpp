@@ -387,6 +387,416 @@ void mlx_inline_compiled_attn_layer_fixed(
     }
 }
 
+// ----------------------------------------------------------------------------
+// GPT-OSS fused [T=1] decode attention layer (full attention only).
+//
+// Adapted from `compiled_attn_layer_fixed` to handle GPT-OSS' invariants:
+//   * q/k/v/o biases (always present in real models — caller asserts).
+//   * No q/k norm.
+//   * Traditional=false RoPE over the full head_dim.
+// Sliding-window layers stay on the per-op path; their cache rotation
+// would need a different cache layout to express in a compiled graph.
+// ----------------------------------------------------------------------------
+void mlx_inline_compiled_gptoss_attn_layer_fixed(
+    mlx_inline_array* dst_out,
+    mlx_inline_array* dst_cache_keys,
+    mlx_inline_array* dst_cache_vals,
+    const mlx_inline_array* normed,
+    const mlx_inline_array* q_w,
+    const mlx_inline_array* k_w,
+    const mlx_inline_array* v_w,
+    const mlx_inline_array* o_w,
+    const mlx_inline_array* q_b,
+    const mlx_inline_array* k_b,
+    const mlx_inline_array* v_b,
+    const mlx_inline_array* o_b,
+    const mlx_inline_array* cache_keys_in,
+    const mlx_inline_array* cache_vals_in,
+    int kv_offset,
+    int rope_offset,
+    int n_heads,
+    int n_kv,
+    int head_dim,
+    float scale,
+    float rope_base
+) {
+    struct Entry {
+        int batch;
+        int cache_len;
+        int n_heads;
+        int n_kv;
+        int head_dim;
+        int dtype;
+        CompiledFn compiled;
+    };
+    static auto* entries = new std::vector<Entry>();
+
+    try {
+        int batch = as_arr(normed).shape(0);
+        int cache_len = as_arr(cache_keys_in).shape(2);
+        int dtype = static_cast<int>(as_arr(normed).dtype().val());
+
+        CompiledFn* compiled = nullptr;
+        for (auto& entry : *entries) {
+            if (entry.batch == batch
+                && entry.cache_len == cache_len
+                && entry.n_heads == n_heads
+                && entry.n_kv == n_kv
+                && entry.head_dim == head_dim
+                && entry.dtype == dtype) {
+                compiled = &entry.compiled;
+                break;
+            }
+        }
+
+        if (compiled == nullptr) {
+            int NH = n_heads;
+            int NKV = n_kv;
+            int HD = head_dim;
+            int L = cache_len;
+            float SCALE = scale;
+            float RBASE = rope_base;
+
+            entries->push_back(Entry{
+                batch,
+                cache_len,
+                n_heads,
+                n_kv,
+                head_dim,
+                dtype,
+                *make_compiled_fixed(
+                    [NH, NKV, HD, L, SCALE, RBASE]
+                    (const std::vector<array>& ins) -> std::vector<array> {
+                        using namespace mlx::core;
+
+                        auto& normed = ins[0];
+                        auto& q_w = ins[1];
+                        auto& k_w = ins[2];
+                        auto& v_w = ins[3];
+                        auto& o_w = ins[4];
+                        auto& q_b = ins[5];
+                        auto& k_b = ins[6];
+                        auto& v_b = ins[7];
+                        auto& o_b = ins[8];
+                        auto& cache_keys = ins[9];
+                        auto& cache_vals = ins[10];
+                        auto& kv_offset_arr = ins[11];
+                        auto& rope_offset_arr = ins[12];
+
+                        int B = normed.shape(0);
+                        int S = normed.shape(1);
+
+                        auto q_proj = add(matmul(normed, q_w), q_b);
+                        auto new_k = add(matmul(normed, k_w), k_b);
+                        auto new_v = add(matmul(normed, v_w), v_b);
+
+                        auto queries = reshape(q_proj, {B, S, NH, HD});
+                        auto keys = reshape(new_k, {B, S, NKV, HD});
+                        auto values = reshape(new_v, {B, S, NKV, HD});
+
+                        queries = transpose(queries, {0, 2, 1, 3});
+                        keys = transpose(keys, {0, 2, 1, 3});
+                        values = transpose(values, {0, 2, 1, 3});
+
+                        // Full RoPE over the head, traditional=false (matches
+                        // the per-op path: `q.rope(head_dim, false, ...)`).
+                        queries = fast::rope(queries, HD, false,
+                                             std::optional<float>(RBASE), 1.0f,
+                                             rope_offset_arr);
+                        keys = fast::rope(keys, HD, false,
+                                          std::optional<float>(RBASE), 1.0f,
+                                          rope_offset_arr);
+
+                        auto kv_indices = broadcast_to(
+                            reshape(kv_offset_arr, {1, 1, 1, 1}),
+                            {B, NKV, S, HD});
+                        auto updated_keys = put_along_axis(cache_keys, kv_indices, keys, 2);
+                        auto updated_vals = put_along_axis(cache_vals, kv_indices, values, 2);
+
+                        auto next_offset = add(kv_offset_arr, array(S));
+                        auto positions = reshape(arange(L, int32), {1, 1, 1, L});
+                        auto valid_mask = less(positions, reshape(next_offset, {1, 1, 1, 1}));
+
+                        auto output = fast::scaled_dot_product_attention(
+                            queries, updated_keys, updated_vals, SCALE, "", valid_mask);
+                        output = transpose(output, {0, 2, 1, 3});
+                        output = reshape(output, {B, S, NH * HD});
+
+                        auto result = add(matmul(output, o_w), o_b);
+                        return {result, updated_keys, updated_vals};
+                    })
+            });
+            compiled = &entries->back().compiled;
+        }
+
+        auto result = (*compiled)({
+            as_arr(normed),
+            as_arr(q_w),
+            as_arr(k_w),
+            as_arr(v_w),
+            as_arr(o_w),
+            as_arr(q_b),
+            as_arr(k_b),
+            as_arr(v_b),
+            as_arr(o_b),
+            as_arr(cache_keys_in),
+            as_arr(cache_vals_in),
+            array(kv_offset),
+            array(rope_offset),
+        });
+        new (dst_out->buf) array(result[0]);
+        new (dst_cache_keys->buf) array(result[1]);
+        new (dst_cache_vals->buf) array(result[2]);
+        pmetal_bridge_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_bridge_set_last_error("compiled_gptoss_attn_layer_fixed", e.what());
+        new (dst_out->buf) array(0.0f);
+        new (dst_cache_keys->buf) array(0.0f);
+        new (dst_cache_vals->buf) array(0.0f);
+    } catch (...) {
+        pmetal_bridge_set_last_error("compiled_gptoss_attn_layer_fixed", "unknown C++ exception");
+        new (dst_out->buf) array(0.0f);
+        new (dst_cache_keys->buf) array(0.0f);
+        new (dst_cache_vals->buf) array(0.0f);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Llama 4 iRoPE fused [T=1] decode attention layer.
+//
+// One kernel covers both layer flavours via static flags captured into the
+// compiled closure. The shape signature includes the flag combo so each
+// (RoPE/NoPE × qk_norm × temp_tuning × has_biases) variant gets its own
+// trace.
+//   * use_rope    — `q.rope(head_dim, traditional=true, ...)` on Q and K.
+//   * use_qk_norm — `rms_norm(weight=None, eps=1e-6)` on Q and K.
+//   * has_biases  — add q/k/v/o biases.
+//   * temp_tuning — NoPE-only multiplicative scale on Q built from
+//                   `log(floor((rope_offset+1)/floor_scale)+1) * attn_scale + 1`.
+// ----------------------------------------------------------------------------
+void mlx_inline_compiled_llama4_attn_layer_fixed(
+    mlx_inline_array* dst_out,
+    mlx_inline_array* dst_cache_keys,
+    mlx_inline_array* dst_cache_vals,
+    const mlx_inline_array* normed,
+    const mlx_inline_array* q_w,
+    const mlx_inline_array* k_w,
+    const mlx_inline_array* v_w,
+    const mlx_inline_array* o_w,
+    const mlx_inline_array* q_b,
+    const mlx_inline_array* k_b,
+    const mlx_inline_array* v_b,
+    const mlx_inline_array* o_b,
+    const mlx_inline_array* cache_keys_in,
+    const mlx_inline_array* cache_vals_in,
+    int kv_offset,
+    int rope_offset,
+    int n_heads,
+    int n_kv,
+    int head_dim,
+    float scale,
+    float rope_base,
+    float rope_scale,
+    bool use_rope,
+    bool use_qk_norm,
+    bool has_biases,
+    bool temp_tuning,
+    int floor_scale,
+    float temp_attn_scale
+) {
+    struct Entry {
+        int batch;
+        int cache_len;
+        int n_heads;
+        int n_kv;
+        int head_dim;
+        int use_rope;
+        int use_qk_norm;
+        int has_biases;
+        int temp_tuning;
+        int dtype;
+        CompiledFn compiled;
+    };
+    static auto* entries = new std::vector<Entry>();
+
+    try {
+        int batch = as_arr(normed).shape(0);
+        int cache_len = as_arr(cache_keys_in).shape(2);
+        int dtype = static_cast<int>(as_arr(normed).dtype().val());
+
+        CompiledFn* compiled = nullptr;
+        for (auto& entry : *entries) {
+            if (entry.batch == batch
+                && entry.cache_len == cache_len
+                && entry.n_heads == n_heads
+                && entry.n_kv == n_kv
+                && entry.head_dim == head_dim
+                && entry.use_rope == static_cast<int>(use_rope)
+                && entry.use_qk_norm == static_cast<int>(use_qk_norm)
+                && entry.has_biases == static_cast<int>(has_biases)
+                && entry.temp_tuning == static_cast<int>(temp_tuning)
+                && entry.dtype == dtype) {
+                compiled = &entry.compiled;
+                break;
+            }
+        }
+
+        if (compiled == nullptr) {
+            int NH = n_heads;
+            int NKV = n_kv;
+            int HD = head_dim;
+            int L = cache_len;
+            float SCALE = scale;
+            float RBASE = rope_base;
+            float RSCALE = rope_scale;
+            bool UROPE = use_rope;
+            bool UQKN = use_qk_norm;
+            bool HBIAS = has_biases;
+            bool TTUNE = temp_tuning;
+            int FLOOR = floor_scale;
+            float TSCALE = temp_attn_scale;
+
+            entries->push_back(Entry{
+                batch,
+                cache_len,
+                n_heads,
+                n_kv,
+                head_dim,
+                static_cast<int>(use_rope),
+                static_cast<int>(use_qk_norm),
+                static_cast<int>(has_biases),
+                static_cast<int>(temp_tuning),
+                dtype,
+                *make_compiled_fixed(
+                    [NH, NKV, HD, L, SCALE, RBASE, RSCALE,
+                     UROPE, UQKN, HBIAS, TTUNE, FLOOR, TSCALE]
+                    (const std::vector<array>& ins) -> std::vector<array> {
+                        using namespace mlx::core;
+
+                        auto& normed = ins[0];
+                        auto& q_w = ins[1];
+                        auto& k_w = ins[2];
+                        auto& v_w = ins[3];
+                        auto& o_w = ins[4];
+                        auto& q_b = ins[5];
+                        auto& k_b = ins[6];
+                        auto& v_b = ins[7];
+                        auto& o_b = ins[8];
+                        auto& cache_keys = ins[9];
+                        auto& cache_vals = ins[10];
+                        auto& kv_offset_arr = ins[11];
+                        auto& rope_offset_arr = ins[12];
+
+                        int B = normed.shape(0);
+                        int S = normed.shape(1);
+
+                        auto q_proj = matmul(normed, q_w);
+                        auto new_k = matmul(normed, k_w);
+                        auto new_v = matmul(normed, v_w);
+                        if (HBIAS) {
+                            q_proj = add(q_proj, q_b);
+                            new_k = add(new_k, k_b);
+                            new_v = add(new_v, v_b);
+                        }
+
+                        auto queries = reshape(q_proj, {B, S, NH, HD});
+                        auto keys = reshape(new_k, {B, S, NKV, HD});
+                        auto values = reshape(new_v, {B, S, NKV, HD});
+
+                        queries = transpose(queries, {0, 2, 1, 3});
+                        keys = transpose(keys, {0, 2, 1, 3});
+                        values = transpose(values, {0, 2, 1, 3});
+
+                        if (UROPE) {
+                            // Llama 4 uses traditional=true RoPE.
+                            queries = fast::rope(queries, HD, true,
+                                                 std::optional<float>(RBASE), RSCALE,
+                                                 rope_offset_arr);
+                            keys = fast::rope(keys, HD, true,
+                                              std::optional<float>(RBASE), RSCALE,
+                                              rope_offset_arr);
+                        }
+
+                        if (UQKN) {
+                            // Weight-less RMS norm (eps=1e-6).
+                            queries = fast::rms_norm(queries, std::nullopt, 1e-6f);
+                            keys = fast::rms_norm(keys, std::nullopt, 1e-6f);
+                        }
+
+                        if (TTUNE && !UROPE) {
+                            // For T=1 decode, S=1 — a single scalar position.
+                            // Python:
+                            //   pos = rope_offset + 0 + 1
+                            //   floored = floor(pos / floor_scale)
+                            //   scale = log(floored + 1) * attn_scale + 1
+                            //   queries *= scale
+                            auto pos = add(astype(rope_offset_arr, float32), array(1.0f));
+                            auto floored = floor(divide(pos, array(static_cast<float>(FLOOR))));
+                            auto temp_scale_f32 = add(
+                                multiply(log(add(floored, array(1.0f))),
+                                         array(TSCALE)),
+                                array(1.0f));
+                            auto temp_scale = astype(temp_scale_f32, queries.dtype());
+                            queries = multiply(queries, temp_scale);
+                        }
+
+                        auto kv_indices = broadcast_to(
+                            reshape(kv_offset_arr, {1, 1, 1, 1}),
+                            {B, NKV, S, HD});
+                        auto updated_keys = put_along_axis(cache_keys, kv_indices, keys, 2);
+                        auto updated_vals = put_along_axis(cache_vals, kv_indices, values, 2);
+
+                        auto next_offset = add(kv_offset_arr, array(S));
+                        auto positions = reshape(arange(L, int32), {1, 1, 1, L});
+                        auto valid_mask = less(positions, reshape(next_offset, {1, 1, 1, 1}));
+
+                        auto output = fast::scaled_dot_product_attention(
+                            queries, updated_keys, updated_vals, SCALE, "", valid_mask);
+                        output = transpose(output, {0, 2, 1, 3});
+                        output = reshape(output, {B, S, NH * HD});
+
+                        auto result = matmul(output, o_w);
+                        if (HBIAS) {
+                            result = add(result, o_b);
+                        }
+                        return {result, updated_keys, updated_vals};
+                    })
+            });
+            compiled = &entries->back().compiled;
+        }
+
+        auto result = (*compiled)({
+            as_arr(normed),
+            as_arr(q_w),
+            as_arr(k_w),
+            as_arr(v_w),
+            as_arr(o_w),
+            as_arr(q_b),
+            as_arr(k_b),
+            as_arr(v_b),
+            as_arr(o_b),
+            as_arr(cache_keys_in),
+            as_arr(cache_vals_in),
+            array(kv_offset),
+            array(rope_offset),
+        });
+        new (dst_out->buf) array(result[0]);
+        new (dst_cache_keys->buf) array(result[1]);
+        new (dst_cache_vals->buf) array(result[2]);
+        pmetal_bridge_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_bridge_set_last_error("compiled_llama4_attn_layer_fixed", e.what());
+        new (dst_out->buf) array(0.0f);
+        new (dst_cache_keys->buf) array(0.0f);
+        new (dst_cache_vals->buf) array(0.0f);
+    } catch (...) {
+        pmetal_bridge_set_last_error("compiled_llama4_attn_layer_fixed", "unknown C++ exception");
+        new (dst_out->buf) array(0.0f);
+        new (dst_cache_keys->buf) array(0.0f);
+        new (dst_cache_vals->buf) array(0.0f);
+    }
+}
+
 void mlx_inline_compiled_moe_layer_fixed(
     mlx_inline_array* dst_out,
     const mlx_inline_array* x,

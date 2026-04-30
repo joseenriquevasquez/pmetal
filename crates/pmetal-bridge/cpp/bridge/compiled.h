@@ -175,6 +175,76 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
     const mlx_inline_array* post_norm_w,
     float post_norm_eps);
 
+// Fixed-shape compiled GPT-OSS attention decode layer (shapeless=false).
+// Mirrors `mlx_inline_compiled_attn_layer_fixed` but adapted for GPT-OSS:
+//   * q/k/v/o biases (Qwen3 has none).
+//   * No q/k norm (Qwen3 hardcodes both).
+//   * Full attention only — sliding-window layers stay on the per-op path
+//     because they rotate the cache buffer in place, which would force a
+//     different cache layout to express in a compiled graph.
+// Traces per (batch, cache_len, n_heads, n_kv, head_dim) on first call,
+// then replays.
+void mlx_inline_compiled_gptoss_attn_layer_fixed(
+    mlx_inline_array* dst_out,
+    mlx_inline_array* dst_cache_keys,
+    mlx_inline_array* dst_cache_vals,
+    const mlx_inline_array* normed,
+    const mlx_inline_array* q_w,
+    const mlx_inline_array* k_w,
+    const mlx_inline_array* v_w,
+    const mlx_inline_array* o_w,
+    const mlx_inline_array* q_b,
+    const mlx_inline_array* k_b,
+    const mlx_inline_array* v_b,
+    const mlx_inline_array* o_b,
+    const mlx_inline_array* cache_keys_in,
+    const mlx_inline_array* cache_vals_in,
+    int kv_offset,
+    int rope_offset,
+    int n_heads,
+    int n_kv,
+    int head_dim,
+    float scale,
+    float rope_base);
+
+// Fixed-shape compiled Llama 4 iRoPE attention decode layer (shapeless=false).
+// One kernel covers both layer flavours via captured static flags:
+//   * use_rope     — RoPE layer (traditional=true) vs NoPE (no rotation).
+//   * use_qk_norm  — apply rms_norm(weight=None, eps=1e-6) to Q and K.
+//   * temp_tuning  — NoPE-only attention temperature scaling.
+//   * has_biases   — gate q/k/v/o bias adds (real models keep all-or-none).
+// Cache layout matches the bf16 path: `[B, n_kv, L, head_dim]`, allocated
+// at decode capacity. Traces per (cache_len, flag-combo) signature.
+void mlx_inline_compiled_llama4_attn_layer_fixed(
+    mlx_inline_array* dst_out,
+    mlx_inline_array* dst_cache_keys,
+    mlx_inline_array* dst_cache_vals,
+    const mlx_inline_array* normed,
+    const mlx_inline_array* q_w,
+    const mlx_inline_array* k_w,
+    const mlx_inline_array* v_w,
+    const mlx_inline_array* o_w,
+    const mlx_inline_array* q_b,                // dummy when has_biases=false
+    const mlx_inline_array* k_b,                // dummy when has_biases=false
+    const mlx_inline_array* v_b,                // dummy when has_biases=false
+    const mlx_inline_array* o_b,                // dummy when has_biases=false
+    const mlx_inline_array* cache_keys_in,
+    const mlx_inline_array* cache_vals_in,
+    int kv_offset,
+    int rope_offset,
+    int n_heads,
+    int n_kv,
+    int head_dim,
+    float scale,
+    float rope_base,
+    float rope_scale,
+    bool use_rope,
+    bool use_qk_norm,
+    bool has_biases,
+    bool temp_tuning,
+    int floor_scale,
+    float temp_attn_scale);
+
 // Fixed-shape compiled dense MoE decode block (shapeless=false).
 // Replays the routed-expert + shared-expert graph for T=1 decode.
 void mlx_inline_compiled_moe_layer_fixed(

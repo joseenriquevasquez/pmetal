@@ -20,6 +20,65 @@ pub(super) fn attn_forward(
     let head_dim = lw.attn_head_dim;
     let scale = lw.attn_scale;
 
+    // Fused-decode fast path: T=1 on a full-attention bf16 layer with all
+    // four biases present. Mirrors the qwen3_native pattern — alloc/grow
+    // first so the compiled kernel sees a writable cache buffer, then
+    // call `compiled_gptoss_attn_layer_fixed` which fuses Q/K/V proj +
+    // bias adds + RoPE + cache write + SDPA + o_proj + bias into one
+    // mx.compile graph. Sliding-window layers, turboquant cache, and
+    // zero-overhead-quantized cache stay on the per-op paths below.
+    if s == 1
+        && !lw.attn_is_sliding
+        && cache.turboquant.is_none()
+        && cache.quant_config.is_none()
+    {
+        if let (Some(qb), Some(kb), Some(vb), Some(ob)) = (
+            lw.attn_q_b.as_ref(),
+            lw.attn_k_b.as_ref(),
+            lw.attn_v_b.as_ref(),
+            lw.attn_o_b.as_ref(),
+        ) {
+            let next = cache.offset + s;
+            crate::native_common::kv_cache::alloc_or_grow_kv(
+                crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+                &mut cache.keys,
+                &mut cache.values,
+                b,
+                n_kv_heads,
+                next,
+                head_dim,
+                dtype,
+            );
+            let cache_keys = cache.keys.take().unwrap();
+            let cache_vals = cache.values.take().unwrap();
+            let (output, new_cache_keys, new_cache_vals) =
+                InlineArray::compiled_gptoss_attn_layer_fixed(
+                    normed,
+                    &lw.attn_q_w,
+                    &lw.attn_k_w,
+                    &lw.attn_v_w,
+                    &lw.attn_o_w,
+                    qb,
+                    kb,
+                    vb,
+                    ob,
+                    &cache_keys,
+                    &cache_vals,
+                    cache.offset,
+                    rope_offset,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    scale,
+                    lw.attn_rope_base,
+                );
+            cache.keys = Some(new_cache_keys);
+            cache.values = Some(new_cache_vals);
+            cache.offset = next;
+            return output;
+        }
+    }
+
     // Q, K, V projections — [B, S, n_heads*head_dim]
     let mut q = normed.matmul(&lw.attn_q_w);
     let mut k = normed.matmul(&lw.attn_k_w);
@@ -307,18 +366,13 @@ pub(super) fn attn_forward(
     } else {
         // ── Full attention: standard bf16 path ────────────────────────────
         //
-        // Fused-decode design note (audit 2026-04-25): Qwen3 routes single-token
-        // decode through `compiled_attn_layer_fixed`, a single MLX-compile graph
-        // that fuses Q/K/V proj → q/k norm → RoPE → cache write → SDPA → o_proj.
-        // GPT-OSS cannot reuse that kernel because the per-layer shape differs:
-        //   * GPT-OSS has q/k/v/o **biases** (Qwen3's kernel is bias-less);
-        //   * GPT-OSS has **no** q/k norm (the kernel hardcodes both);
-        //   * GPT-OSS alternates between full attention and **sliding window**
-        //     per layer — sliding-window decode would need bounded cache reads
-        //     baked into the compiled graph.
-        // A dedicated `compiled_gptoss_attn_layer_fixed` would close the gap;
-        // it is omitted here because the per-op path below is correct today
-        // and the kernel write is a multi-day task with no parity baseline yet.
+        // Single-token decode on a full-attention layer with all four biases
+        // present already returned at the top via
+        // `compiled_gptoss_attn_layer_fixed`. This block handles the leftover
+        // cases: prefill (S>1), bias-less layers, and the cold path before
+        // the compiled-trace cache warms up. Sliding-window layers always
+        // reach this file via the earlier branch; their cache rotation
+        // would need a different layout to express in a compiled graph.
         crate::native_common::kv_cache::alloc_or_grow_kv(
             crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
             &mut cache.keys,

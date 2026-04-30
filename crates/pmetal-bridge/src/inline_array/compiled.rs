@@ -157,6 +157,160 @@ impl InlineArray {
         }
     }
 
+    /// Fixed-shape compiled GPT-OSS attention decode layer.
+    ///
+    /// Mirrors [`Self::compiled_attn_layer_fixed`] but tuned for GPT-OSS:
+    /// q/k/v/o biases, no q/k norm, full attention only. Sliding-window
+    /// layers stay on the per-op path because their cache rotation would
+    /// require a different cache layout to express in a compiled graph.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compiled_gptoss_attn_layer_fixed(
+        normed: &Self,
+        q_w: &Self,
+        k_w: &Self,
+        v_w: &Self,
+        o_w: &Self,
+        q_b: &Self,
+        k_b: &Self,
+        v_b: &Self,
+        o_b: &Self,
+        cache_keys_in: &Self,
+        cache_vals_in: &Self,
+        kv_offset: i32,
+        rope_offset: i32,
+        n_heads: i32,
+        n_kv: i32,
+        head_dim: i32,
+        scale: f32,
+        rope_base: f32,
+    ) -> (Self, Self, Self) {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let mut cache_keys = MaybeUninit::<RawBuf>::uninit();
+        let mut cache_vals = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_compiled_gptoss_attn_layer_fixed(
+                out.as_mut_ptr(),
+                cache_keys.as_mut_ptr(),
+                cache_vals.as_mut_ptr(),
+                &normed.raw,
+                &q_w.raw,
+                &k_w.raw,
+                &v_w.raw,
+                &o_w.raw,
+                &q_b.raw,
+                &k_b.raw,
+                &v_b.raw,
+                &o_b.raw,
+                &cache_keys_in.raw,
+                &cache_vals_in.raw,
+                kv_offset,
+                rope_offset,
+                n_heads,
+                n_kv,
+                head_dim,
+                scale,
+                rope_base,
+            );
+            (
+                Self {
+                    raw: out.assume_init(),
+                },
+                Self {
+                    raw: cache_keys.assume_init(),
+                },
+                Self {
+                    raw: cache_vals.assume_init(),
+                },
+            )
+        }
+    }
+
+    /// Fixed-shape compiled Llama 4 iRoPE attention decode layer.
+    ///
+    /// One kernel covers both layer flavours via static flags captured into
+    /// the compiled closure (each combo gets its own trace):
+    ///   * `use_rope`    — traditional=true RoPE on Q/K (vs NoPE).
+    ///   * `use_qk_norm` — weight-less RMS norm (eps=1e-6) on Q and K.
+    ///   * `has_biases`  — gate q/k/v/o bias adds. When false, the four
+    ///     `*_b` slots may be any same-dtype dummy array.
+    ///   * `temp_tuning` — NoPE temperature scaling on Q derived from
+    ///     `rope_offset`, `floor_scale`, and `temp_attn_scale`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compiled_llama4_attn_layer_fixed(
+        normed: &Self,
+        q_w: &Self,
+        k_w: &Self,
+        v_w: &Self,
+        o_w: &Self,
+        q_b: &Self,
+        k_b: &Self,
+        v_b: &Self,
+        o_b: &Self,
+        cache_keys_in: &Self,
+        cache_vals_in: &Self,
+        kv_offset: i32,
+        rope_offset: i32,
+        n_heads: i32,
+        n_kv: i32,
+        head_dim: i32,
+        scale: f32,
+        rope_base: f32,
+        rope_scale: f32,
+        use_rope: bool,
+        use_qk_norm: bool,
+        has_biases: bool,
+        temp_tuning: bool,
+        floor_scale: i32,
+        temp_attn_scale: f32,
+    ) -> (Self, Self, Self) {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let mut cache_keys = MaybeUninit::<RawBuf>::uninit();
+        let mut cache_vals = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_compiled_llama4_attn_layer_fixed(
+                out.as_mut_ptr(),
+                cache_keys.as_mut_ptr(),
+                cache_vals.as_mut_ptr(),
+                &normed.raw,
+                &q_w.raw,
+                &k_w.raw,
+                &v_w.raw,
+                &o_w.raw,
+                &q_b.raw,
+                &k_b.raw,
+                &v_b.raw,
+                &o_b.raw,
+                &cache_keys_in.raw,
+                &cache_vals_in.raw,
+                kv_offset,
+                rope_offset,
+                n_heads,
+                n_kv,
+                head_dim,
+                scale,
+                rope_base,
+                rope_scale,
+                use_rope,
+                use_qk_norm,
+                has_biases,
+                temp_tuning,
+                floor_scale,
+                temp_attn_scale,
+            );
+            (
+                Self {
+                    raw: out.assume_init(),
+                },
+                Self {
+                    raw: cache_keys.assume_init(),
+                },
+                Self {
+                    raw: cache_vals.assume_init(),
+                },
+            )
+        }
+    }
+
     /// Fixed-shape compiled dense MoE decode block (shapeless=false).
     /// Replays the routed-expert + shared-expert graph for T=1 decode.
     #[allow(clippy::too_many_arguments)]
