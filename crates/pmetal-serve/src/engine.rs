@@ -818,10 +818,7 @@ impl InferenceEngine {
     ) -> ServeResult<()> {
         use std::sync::atomic::AtomicBool;
 
-        let mut guard = self
-            .continuous
-            .lock()
-            .map_err(|_| ServeError::Busy)?;
+        let mut guard = self.continuous.lock().map_err(|_| ServeError::Busy)?;
         if guard.is_some() {
             return Ok(());
         }
@@ -888,18 +885,12 @@ impl InferenceEngine {
             logprobs_top_n: params.logprobs_top_n,
         };
 
-        let runtime_guard = self
-            .continuous
-            .lock()
-            .map_err(|_| ServeError::Busy)?;
-        let runtime = runtime_guard
-            .as_ref()
-            .ok_or_else(|| {
-                ServeError::Internal(
-                    "continuous batching not enabled; call enable_continuous_batching first"
-                        .into(),
-                )
-            })?;
+        let runtime_guard = self.continuous.lock().map_err(|_| ServeError::Busy)?;
+        let runtime = runtime_guard.as_ref().ok_or_else(|| {
+            ServeError::Internal(
+                "continuous batching not enabled; call enable_continuous_batching first".into(),
+            )
+        })?;
 
         let mut pump = runtime.pump.lock().map_err(|_| ServeError::Busy)?;
         let (_slot, rx) = pump
@@ -910,10 +901,7 @@ impl InferenceEngine {
 
     /// Whether continuous batching has been enabled on this engine.
     pub fn continuous_batching_enabled(&self) -> bool {
-        self.continuous
-            .lock()
-            .map(|g| g.is_some())
-            .unwrap_or(false)
+        self.continuous.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 
     /// Convenience wrapper that derives the KV-cache config from the
@@ -1369,34 +1357,33 @@ impl InferenceEngine {
         // prefix, restore the KV state and prefill only the suffix.
         // Mamba/GDN/hybrid models can't be snapshot-truncated cleanly,
         // so we skip the cache entirely when `mamba_cache` is populated.
-        let prefix_hit_len: usize = if let (Some(pc), true) =
-            (prefix_cache.as_ref(), mamba_cache.is_none())
-        {
-            let mut guard = match pc.lock() {
-                Ok(g) => g,
-                Err(_) => return Err(ServeError::Busy),
-            };
-            match guard
-                .find_longest_prefix(input_ids, cache.config().clone())
-                .map_err(ServeError::Model)?
-            {
-                Some(hit) => {
-                    // Replace the freshly-allocated cache with the
-                    // restored one from the snapshot.
-                    *cache = hit.restored_cache;
-                    tracing::debug!(
-                        target: "pmetal_serve::prefix_cache",
-                        "prefix cache hit: {}/{} tokens restored",
-                        hit.prefix_len,
-                        input_ids.len()
-                    );
-                    hit.prefix_len
+        let prefix_hit_len: usize =
+            if let (Some(pc), true) = (prefix_cache.as_ref(), mamba_cache.is_none()) {
+                let mut guard = match pc.lock() {
+                    Ok(g) => g,
+                    Err(_) => return Err(ServeError::Busy),
+                };
+                match guard
+                    .find_longest_prefix(input_ids, cache.config().clone())
+                    .map_err(ServeError::Model)?
+                {
+                    Some(hit) => {
+                        // Replace the freshly-allocated cache with the
+                        // restored one from the snapshot.
+                        *cache = hit.restored_cache;
+                        tracing::debug!(
+                            target: "pmetal_serve::prefix_cache",
+                            "prefix cache hit: {}/{} tokens restored",
+                            hit.prefix_len,
+                            input_ids.len()
+                        );
+                        hit.prefix_len
+                    }
+                    None => 0,
                 }
-                None => 0,
-            }
-        } else {
-            0
-        };
+            } else {
+                0
+            };
 
         let prefill_slice: &[u32] = &input_ids[prefix_hit_len..];
 
@@ -1407,12 +1394,11 @@ impl InferenceEngine {
         // prefill also runs on the generation stream. The final chunk's
         // logits are returned lazily so we can fold them into the async
         // decode pipeline without a host sync.
-        let prefill_logits =
-            run_cached_prefill_chunks(prefill_slice, prefill_step_size, |chunk| {
-                let _ctx = StreamContext::new(&stream);
-                model.forward_with_hybrid_cache(chunk, None, Some(cache), mamba_cache.as_mut())
-            })
-            .map_err(ServeError::Model)?;
+        let prefill_logits = run_cached_prefill_chunks(prefill_slice, prefill_step_size, |chunk| {
+            let _ctx = StreamContext::new(&stream);
+            model.forward_with_hybrid_cache(chunk, None, Some(cache), mamba_cache.as_mut())
+        })
+        .map_err(ServeError::Model)?;
 
         // === Cache the full-prompt KV state for future hits ===
         //
@@ -1470,7 +1456,9 @@ impl InferenceEngine {
             // 2. First iteration: force-eval the token so .item() below
             //    gets data (matches the mlx_lm n==0 special-case).
             if i == 0 {
-                current_y.eval();
+                current_y.try_eval().map_err(|e| {
+                    ServeError::Model(pmetal_bridge::compat::Exception::custom(e.to_string()))
+                })?;
             }
 
             // 3. Extract token from GPU — blocks until current_y is ready.
@@ -1743,7 +1731,9 @@ impl InferenceEngine {
             let pooled =
                 pmetal_models::pooling::pool(&hidden, &mask, mode).map_err(ServeError::Model)?;
             let pooled_eval = pooled;
-            pooled_eval.eval();
+            pooled_eval.try_eval().map_err(|e| {
+                ServeError::Model(pmetal_bridge::compat::Exception::custom(e.to_string()))
+            })?;
 
             let hidden_dim = pooled_eval.dim(1) as usize;
             let flat: Vec<f32> = pooled_eval.as_slice::<f32>().to_vec();
@@ -1872,10 +1862,7 @@ impl InferenceEngine {
                 start,
                 |token, logprob| {
                     if tx_inner
-                        .blocking_send(TokenEvent::Token {
-                            id: token,
-                            logprob,
-                        })
+                        .blocking_send(TokenEvent::Token { id: token, logprob })
                         .is_err()
                     {
                         StepOutcome::Cancel

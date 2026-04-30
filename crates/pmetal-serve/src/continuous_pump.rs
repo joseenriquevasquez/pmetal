@@ -284,9 +284,7 @@ impl ContinuousPump {
                         .get(s)
                         .ok_or_else(|| Exception::custom(format!("missing record for {s:?}")))?;
                     let tok = rec.current_token.ok_or_else(|| {
-                        Exception::custom(format!(
-                            "slot {s:?} in Decode without a current token"
-                        ))
+                        Exception::custom(format!("slot {s:?} in Decode without a current token"))
                     })?;
                     histories.push(rec.all_tokens.clone());
                     inputs.push((*s, tok));
@@ -307,9 +305,7 @@ impl ContinuousPump {
                     let logprob = Self::compute_logprob_entry(
                         &out.logits,
                         out.token,
-                        self.records
-                            .get(&out.slot)
-                            .and_then(|r| r.logprobs_top_n),
+                        self.records.get(&out.slot).and_then(|r| r.logprobs_top_n),
                     );
                     let stop_seq_match = self.emit_token(out.slot, out.token, logprob)?;
                     sampled.push((out.slot, out.token, stop_seq_match));
@@ -375,8 +371,7 @@ impl ContinuousPump {
         // Feed the same token into the scheduler so it counts toward
         // `max_new_tokens` and triggers stop-token / stop-sequence
         // retirement.
-        self.batcher
-            .advance_decode([(slot, token, stop_seq_match)]);
+        self.batcher.advance_decode([(slot, token, stop_seq_match)]);
         Ok(())
     }
 
@@ -403,14 +398,10 @@ impl ContinuousPump {
             rec.all_tokens.push(token);
             rec.generated.push(token);
             if rec.first_token_ms.is_none() {
-                rec.first_token_ms =
-                    Some(rec.start.elapsed().as_secs_f64() * 1000.0);
+                rec.first_token_ms = Some(rec.start.elapsed().as_secs_f64() * 1000.0);
             }
 
-            let send_res = rec.tx.try_send(TokenEvent::Token {
-                id: token,
-                logprob,
-            });
+            let send_res = rec.tx.try_send(TokenEvent::Token { id: token, logprob });
             let closed = matches!(send_res, Err(mpsc::error::TrySendError::Closed(_)));
 
             // Stop-sequence detection (skipped when the pump has no
@@ -505,11 +496,7 @@ mod tests {
     }
 
     impl SlotForward for Stub {
-        fn forward(
-            &mut self,
-            tokens: &[u32],
-            cache: &mut KVCache,
-        ) -> Result<Array, Exception> {
+        fn forward(&mut self, tokens: &[u32], cache: &mut KVCache) -> Result<Array, Exception> {
             let (h, d) = {
                 let c = cache.config();
                 (c.num_kv_heads as i32, c.head_dim as i32)
@@ -540,8 +527,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_tick_emits_done_on_length_limit() {
-        let mut pump =
-            ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
+        let mut pump = ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
         let mut next = HashMap::new();
         next.insert(1u32, 42u32); // prompt last tok 1 → sample 42
         next.insert(42u32, 43u32); // 42 → 43 (decode loop)
@@ -584,8 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_token_short_circuits_generation() {
-        let mut pump =
-            ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
+        let mut pump = ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
         let mut next = HashMap::new();
         next.insert(1u32, 7u32); // first decode emits 7 (stop)
         let mut stub = Stub { vocab: 16, next };
@@ -683,8 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_tick_when_no_work() {
-        let mut pump =
-            ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
+        let mut pump = ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
         let mut stub = Stub {
             vocab: 4,
             next: HashMap::new(),
@@ -726,8 +710,7 @@ mod tests {
 
     #[tokio::test]
     async fn logprobs_attached_when_requested() {
-        let mut pump =
-            ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
+        let mut pump = ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
         let mut next = HashMap::new();
         next.insert(1u32, 5u32);
         next.insert(5u32, 6u32);
@@ -783,11 +766,7 @@ mod tests {
             vocab: i32,
         }
         impl SlotForward for BiasedStub {
-            fn forward(
-                &mut self,
-                tokens: &[u32],
-                cache: &mut KVCache,
-            ) -> Result<Array, Exception> {
+            fn forward(&mut self, tokens: &[u32], cache: &mut KVCache) -> Result<Array, Exception> {
                 let (h, d) = {
                     let c = cache.config();
                     (c.num_kv_heads as i32, c.head_dim as i32)
@@ -809,15 +788,12 @@ mod tests {
             }
         }
 
-        let mut pump =
-            ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
+        let mut pump = ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
         let mut stub = BiasedStub { vocab: 8 };
 
         let mut cfg = GenerationConfig::greedy(3);
         cfg.repetition_penalty = 5.0;
-        let (_s, mut rx) = pump
-            .enqueue(vec![3], params(3, vec![]), cfg, 16)
-            .unwrap();
+        let (_s, mut rx) = pump.enqueue(vec![3], params(3, vec![]), cfg, 16).unwrap();
 
         let mut tokens = Vec::new();
         let mut done = false;

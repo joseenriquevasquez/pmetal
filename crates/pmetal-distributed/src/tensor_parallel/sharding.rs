@@ -303,18 +303,9 @@ mod tests {
             // Cross-reference against the canonical placement: the
             // experts in this shard must be exactly what `expert_range`
             // says rank owns.
-            let (start, count) = crate::expert_shard::expert_range(
-                total_experts,
-                rank,
-                world_size,
-            );
+            let (start, count) = crate::expert_shard::expert_range(total_experts, rank, world_size);
             assert_eq!(shard.shape(), &[count as i32, 2]);
-            for (e, slot) in covered
-                .iter_mut()
-                .enumerate()
-                .skip(start)
-                .take(count)
-            {
+            for (e, slot) in covered.iter_mut().enumerate().skip(start).take(count) {
                 assert!(!*slot, "expert {e} covered twice");
                 *slot = true;
             }

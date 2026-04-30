@@ -110,9 +110,7 @@ impl FusedBatchKVCache {
             .map(|_| ops::zeros(&v_shape, config.dtype))
             .collect();
 
-        let offsets = (0..config.num_layers)
-            .map(|_| vec![0; max_slots])
-            .collect();
+        let offsets = (0..config.num_layers).map(|_| vec![0; max_slots]).collect();
         Ok(Self {
             config,
             max_slots,
@@ -297,14 +295,8 @@ impl FusedBatchKVCache {
             .collect();
         let t_max = new_offsets.iter().copied().max().unwrap_or(0);
         let t_max_i32 = t_max as i32;
-        let k_out = k_written.slice(
-            &[0, 0, 0, 0],
-            &[n_active as i32, heads, t_max_i32, d_k],
-        );
-        let v_out = v_written.slice(
-            &[0, 0, 0, 0],
-            &[n_active as i32, heads, t_max_i32, d_v],
-        );
+        let k_out = k_written.slice(&[0, 0, 0, 0], &[n_active as i32, heads, t_max_i32, d_k]);
+        let v_out = v_written.slice(&[0, 0, 0, 0], &[n_active as i32, heads, t_max_i32, d_v]);
 
         // Build additive padding mask: mask[n, 0, 0, t] = 0 if t < new_offset[n] else -inf.
         let new_off_i32: Vec<i32> = new_offsets.iter().map(|&o| o as i32).collect();

@@ -86,10 +86,7 @@ pub(super) fn attn_forward(
     // Each flag combo gets its own compile trace. Quantized/turboquant
     // caches and prefill (S>1) stay on the per-op paths below.
     let dtype_for_dummy = normed.dtype_raw();
-    if s == 1
-        && chunk_mask.is_none()
-        && cache.turboquant.is_none()
-        && cache.quant_config.is_none()
+    if s == 1 && chunk_mask.is_none() && cache.turboquant.is_none() && cache.quant_config.is_none()
     {
         // Biases are all-or-none in real Llama 4 configs (audited at load
         // time). Disallow the mixed case to keep the compiled graph simple

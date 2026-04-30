@@ -170,51 +170,51 @@ impl ServeTab {
             if v.is_empty() { spec.host } else { v }
         };
         spec.port = self.form.value("Port").parse().unwrap_or(spec.port);
-        spec.max_seq_len = self.form.value("Max Seq Len").parse().unwrap_or(spec.max_seq_len);
+        spec.max_seq_len = self
+            .form
+            .value("Max Seq Len")
+            .parse()
+            .unwrap_or(spec.max_seq_len);
         spec.fp8 = self.form.value("FP8 Weights") == "Enabled";
         spec.kv_quant = self.form.value("KV Cache Bits").parse().ok();
         spec.no_kv_quant = self.form.value("Disable KV Quant") == "Enabled";
-        spec.kv_group_size = self.form.value("KV Group Size").parse().unwrap_or(spec.kv_group_size);
+        spec.kv_group_size = self
+            .form
+            .value("KV Group Size")
+            .parse()
+            .unwrap_or(spec.kv_group_size);
         spec.kv_turboquant = self.form.value("TurboQuant KV") == "Enabled";
         let preset = self.form.value("TurboQuant Preset");
-        spec.kv_turboquant_preset = if preset.is_empty() { None } else { Some(preset) };
+        spec.kv_turboquant_preset = if preset.is_empty() {
+            None
+        } else {
+            Some(preset)
+        };
         spec.ane = self.form.value("Use ANE") == "Enabled";
-        spec.ane_max_seq_len = self.form.value("ANE Max Seq Len").parse().unwrap_or(spec.ane_max_seq_len);
+        spec.ane_max_seq_len = self
+            .form
+            .value("ANE Max Seq Len")
+            .parse()
+            .unwrap_or(spec.ane_max_seq_len);
         spec.ane_real_time = self.form.value("ANE Real-Time") == "Enabled";
         spec.continuous_batch = self.form.value("Continuous Batch") == "Enabled";
-        spec.cb_max_slots = self.form.value("CB Max Slots").parse().unwrap_or(spec.cb_max_slots);
-        spec.cb_max_queue_depth = self.form.value("CB Queue Depth").parse().unwrap_or(spec.cb_max_queue_depth);
+        spec.cb_max_slots = self
+            .form
+            .value("CB Max Slots")
+            .parse()
+            .unwrap_or(spec.cb_max_slots);
+        spec.cb_max_queue_depth = self
+            .form
+            .value("CB Queue Depth")
+            .parse()
+            .unwrap_or(spec.cb_max_queue_depth);
         let experts = self.form.value("Experts Dir");
-        spec.experts_dir = if experts.is_empty() { None } else { Some(experts) };
+        spec.experts_dir = if experts.is_empty() {
+            None
+        } else {
+            Some(experts)
+        };
         spec
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ServeTab;
-
-    #[test]
-    fn serve_tab_defaults_to_loopback() {
-        let tab = ServeTab::new();
-        assert_eq!(tab.form.value("Host"), "127.0.0.1");
-    }
-
-    #[test]
-    fn serve_tab_does_not_emit_removed_lora_flag() {
-        let mut tab = ServeTab::new();
-        tab.form.set_value("Model", "/tmp/model");
-        let args = tab.build_cli_args();
-        assert!(!args.iter().any(|arg| arg == "--lora"));
-    }
-
-    #[test]
-    fn serve_tab_emits_model_flag() {
-        let mut tab = ServeTab::new();
-        tab.form.set_value("Model", "/tmp/model");
-        let args = tab.build_cli_args();
-        assert!(args.contains(&"--model".to_string()));
-        assert!(args.contains(&"/tmp/model".to_string()));
     }
 }
 
@@ -291,5 +291,33 @@ fn format_duration(d: Duration) -> String {
         format!("{}m {}s", secs / 60, secs % 60)
     } else {
         format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServeTab;
+
+    #[test]
+    fn serve_tab_defaults_to_loopback() {
+        let tab = ServeTab::new();
+        assert_eq!(tab.form.value("Host"), "127.0.0.1");
+    }
+
+    #[test]
+    fn serve_tab_does_not_emit_removed_lora_flag() {
+        let mut tab = ServeTab::new();
+        tab.form.set_value("Model", "/tmp/model");
+        let args = tab.build_cli_args();
+        assert!(!args.iter().any(|arg| arg == "--lora"));
+    }
+
+    #[test]
+    fn serve_tab_emits_model_flag() {
+        let mut tab = ServeTab::new();
+        tab.form.set_value("Model", "/tmp/model");
+        let args = tab.build_cli_args();
+        assert!(args.contains(&"--model".to_string()));
+        assert!(args.contains(&"/tmp/model".to_string()));
     }
 }

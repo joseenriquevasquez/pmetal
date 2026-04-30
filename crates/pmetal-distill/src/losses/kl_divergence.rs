@@ -670,15 +670,12 @@ mod tests {
 
         // Ground truth: mean over tokens 0 and 2 only. Build a teacher/student
         // containing just those rows and compare to the masked result.
-        let teacher_kept = Array::from_f32_slice(
-            &[1.0, 2.0, 3.0, 0.5, 1.5, 2.5],
-            &[1, 2, 3],
-        );
-        let student_kept = Array::from_f32_slice(
-            &[3.0, 2.0, 1.0, 2.0, 2.5, 1.5],
-            &[1, 2, 3],
-        );
-        let kept_mean: f32 = loss.compute(&teacher_kept, &student_kept, 2.0).unwrap().item();
+        let teacher_kept = Array::from_f32_slice(&[1.0, 2.0, 3.0, 0.5, 1.5, 2.5], &[1, 2, 3]);
+        let student_kept = Array::from_f32_slice(&[3.0, 2.0, 1.0, 2.0, 2.5, 1.5], &[1, 2, 3]);
+        let kept_mean: f32 = loss
+            .compute(&teacher_kept, &student_kept, 2.0)
+            .unwrap()
+            .item();
 
         let mask = Array::from_f32_slice(&[1.0_f32, 0.0, 1.0, 0.0], &[1, 4]);
         let masked: f32 = loss

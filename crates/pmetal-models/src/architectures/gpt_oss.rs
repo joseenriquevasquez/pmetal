@@ -1212,10 +1212,8 @@ impl GptOssForCausalLM {
         let attn_types: Vec<AttentionType> = (0..self.model.layers.len())
             .map(|i| cfg.attention_type_at(i))
             .collect();
-        let mut hidden = pmetal_bridge::compat::Module::forward(
-            &mut self.model.embed_tokens,
-            input_ids,
-        )?;
+        let mut hidden =
+            pmetal_bridge::compat::Module::forward(&mut self.model.embed_tokens, input_ids)?;
         for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
             let attn_cfg = match attn_types[layer_idx] {
                 AttentionType::SlidingAttention => base_cfg.with_sliding_window(window),
@@ -1238,8 +1236,7 @@ impl GptOssForCausalLM {
                 layer_idx,
             )?;
         }
-        let hidden =
-            pmetal_bridge::compat::Module::forward(&mut self.model.norm, &hidden)?;
+        let hidden = pmetal_bridge::compat::Module::forward(&mut self.model.norm, &hidden)?;
         pmetal_bridge::compat::Module::forward(&mut self.lm_head, &hidden)
     }
 }

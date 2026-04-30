@@ -51,14 +51,18 @@ fn emit(path: &std::path::Path) {
 }
 
 fn emit_runtime_rpath() {
-    if let Some(mlx_lib_dir) = find_mlx_lib_dir() {
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", mlx_lib_dir.display());
-        println!(
-            "cargo:warning=Embedding libmlx.dylib runtime search path into pmetal: {}",
-            mlx_lib_dir.display()
-        );
-    } else {
-        println!("cargo:warning=Could not determine libmlx.dylib runtime search path");
+    match find_mlx_linkage() {
+        MlxLinkage::Dynamic(mlx_lib_dir) => {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", mlx_lib_dir.display());
+            println!(
+                "cargo:warning=Embedding libmlx.dylib runtime search path into pmetal: {}",
+                mlx_lib_dir.display()
+            );
+        }
+        MlxLinkage::Static => {}
+        MlxLinkage::Missing => {
+            println!("cargo:warning=Could not determine MLX library runtime search path");
+        }
     }
 }
 
@@ -141,24 +145,44 @@ fn find_metallib() -> Option<PathBuf> {
     None
 }
 
-fn find_mlx_lib_dir() -> Option<PathBuf> {
+enum MlxLinkage {
+    Dynamic(PathBuf),
+    Static,
+    Missing,
+}
+
+fn linkage_in_dir(candidate: PathBuf) -> Option<MlxLinkage> {
+    if candidate.join("libmlx.dylib").is_file() {
+        Some(MlxLinkage::Dynamic(candidate))
+    } else if candidate.join("libmlx.a").is_file() {
+        Some(MlxLinkage::Static)
+    } else {
+        None
+    }
+}
+
+fn find_mlx_linkage() -> MlxLinkage {
     if let Ok(path) = env::var("DEP_PMETAL_BRIDGE_MLX_LIB_DIR") {
-        let candidate = PathBuf::from(path);
-        if candidate.join("libmlx.dylib").is_file() {
-            return Some(candidate);
+        if let Some(linkage) = linkage_in_dir(PathBuf::from(path)) {
+            return linkage;
         }
     }
 
     if let Ok(path) = env::var("PMETAL_MLX_LIB_DIR") {
-        let candidate = PathBuf::from(path);
-        if candidate.join("libmlx.dylib").is_file() {
-            return Some(candidate);
+        if let Some(linkage) = linkage_in_dir(PathBuf::from(path)) {
+            return linkage;
         }
     }
 
-    let out_dir = PathBuf::from(env::var("OUT_DIR").ok()?);
-    let build_dir = out_dir.parent()?.parent()?;
-    let entries = std::fs::read_dir(build_dir).ok()?;
+    let Some(out_dir) = env::var("OUT_DIR").ok().map(PathBuf::from) else {
+        return MlxLinkage::Missing;
+    };
+    let Some(build_dir) = out_dir.parent().and_then(|p| p.parent()) else {
+        return MlxLinkage::Missing;
+    };
+    let Ok(entries) = std::fs::read_dir(build_dir) else {
+        return MlxLinkage::Missing;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -170,10 +194,10 @@ fn find_mlx_lib_dir() -> Option<PathBuf> {
             continue;
         }
         let candidate = path.join("out/build/lib");
-        if candidate.join("libmlx.dylib").is_file() {
-            return Some(candidate);
+        if let Some(linkage) = linkage_in_dir(candidate) {
+            return linkage;
         }
     }
 
-    None
+    MlxLinkage::Missing
 }

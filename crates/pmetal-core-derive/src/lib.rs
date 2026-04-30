@@ -329,35 +329,36 @@ fn parse_field(field: &Field) -> syn::Result<ParsedField> {
 fn classify_type(ty: &Type) -> FieldType {
     let last = type_path_tail(ty);
     let inner = type_option_inner(ty).and_then(|t| type_path_tail(&t));
+    let vec_inner = type_generic_inner_tail(ty, "Vec");
 
-    match (last.as_deref(), inner.as_deref()) {
-        (Some("String"), _) => FieldType::String,
-        (Some("bool"), _) => FieldType::Bool,
-        (Some("f32"), _) => FieldType::F32,
-        (Some("f64"), _) => FieldType::F64,
-        (Some("u8"), _) => FieldType::U8,
-        (Some("u16"), _) => FieldType::U16,
-        (Some("u32"), _) => FieldType::U32,
-        (Some("u64"), _) => FieldType::U64,
-        (Some("usize"), _) => FieldType::Usize,
-        (Some("i8"), _) => FieldType::I8,
-        (Some("i16"), _) => FieldType::I16,
-        (Some("i32"), _) => FieldType::I32,
-        (Some("i64"), _) => FieldType::I64,
-        (Some("Vec"), _) => FieldType::VecString,
-        (Some("Option"), Some("String")) => FieldType::OptionString,
-        (Some("Option"), Some("f32")) => FieldType::OptionF32,
-        (Some("Option"), Some("f64")) => FieldType::OptionF64,
-        (Some("Option"), Some("u8")) => FieldType::OptionU8,
-        (Some("Option"), Some("u16")) => FieldType::OptionU16,
-        (Some("Option"), Some("u32")) => FieldType::OptionU32,
-        (Some("Option"), Some("u64")) => FieldType::OptionU64,
-        (Some("Option"), Some("usize")) => FieldType::OptionUsize,
-        (Some("Option"), Some("i8")) => FieldType::OptionI8,
-        (Some("Option"), Some("i16")) => FieldType::OptionI16,
-        (Some("Option"), Some("i32")) => FieldType::OptionI32,
-        (Some("Option"), Some("i64")) => FieldType::OptionI64,
-        (Some("Option"), Some("bool")) => FieldType::OptionBool,
+    match (last.as_deref(), inner.as_deref(), vec_inner.as_deref()) {
+        (Some("String"), _, _) => FieldType::String,
+        (Some("bool"), _, _) => FieldType::Bool,
+        (Some("f32"), _, _) => FieldType::F32,
+        (Some("f64"), _, _) => FieldType::F64,
+        (Some("u8"), _, _) => FieldType::U8,
+        (Some("u16"), _, _) => FieldType::U16,
+        (Some("u32"), _, _) => FieldType::U32,
+        (Some("u64"), _, _) => FieldType::U64,
+        (Some("usize"), _, _) => FieldType::Usize,
+        (Some("i8"), _, _) => FieldType::I8,
+        (Some("i16"), _, _) => FieldType::I16,
+        (Some("i32"), _, _) => FieldType::I32,
+        (Some("i64"), _, _) => FieldType::I64,
+        (Some("Vec"), _, Some("String")) => FieldType::VecString,
+        (Some("Option"), Some("String"), _) => FieldType::OptionString,
+        (Some("Option"), Some("f32"), _) => FieldType::OptionF32,
+        (Some("Option"), Some("f64"), _) => FieldType::OptionF64,
+        (Some("Option"), Some("u8"), _) => FieldType::OptionU8,
+        (Some("Option"), Some("u16"), _) => FieldType::OptionU16,
+        (Some("Option"), Some("u32"), _) => FieldType::OptionU32,
+        (Some("Option"), Some("u64"), _) => FieldType::OptionU64,
+        (Some("Option"), Some("usize"), _) => FieldType::OptionUsize,
+        (Some("Option"), Some("i8"), _) => FieldType::OptionI8,
+        (Some("Option"), Some("i16"), _) => FieldType::OptionI16,
+        (Some("Option"), Some("i32"), _) => FieldType::OptionI32,
+        (Some("Option"), Some("i64"), _) => FieldType::OptionI64,
+        (Some("Option"), Some("bool"), _) => FieldType::OptionBool,
         _ => FieldType::Other,
     }
 }
@@ -371,9 +372,17 @@ fn type_path_tail(ty: &Type) -> Option<String> {
 }
 
 fn type_option_inner(ty: &Type) -> Option<Type> {
+    type_generic_inner(ty, "Option")
+}
+
+fn type_generic_inner_tail(ty: &Type, wrapper: &str) -> Option<String> {
+    type_generic_inner(ty, wrapper).and_then(|t| type_path_tail(&t))
+}
+
+fn type_generic_inner(ty: &Type, wrapper: &str) -> Option<Type> {
     let Type::Path(p) = ty else { return None };
     let last = p.path.segments.last()?;
-    if last.ident != "Option" {
+    if last.ident != wrapper {
         return None;
     }
     let syn::PathArguments::AngleBracketed(ab) = &last.arguments else {
@@ -629,10 +638,27 @@ fn emit_number_kind(field: &ParsedField) -> TokenStream2 {
 }
 
 fn emit_integer_kind(field: &ParsedField) -> TokenStream2 {
-    let min = field.attrs.min.map(|m| m as i64).unwrap_or(0);
-    let max = field.attrs.max.map(|m| m as i64).unwrap_or(i64::MAX);
+    let (default_min, default_max) = int_descriptor_bounds(field.ty);
+    let min = field.attrs.min.map(|m| m as i64).unwrap_or(default_min);
+    let max = field.attrs.max.map(|m| m as i64).unwrap_or(default_max);
     quote! {
         ::pmetal_core::FieldKind::Integer { min: #min, max: #max }
+    }
+}
+
+fn int_descriptor_bounds(ty: FieldType) -> (i64, i64) {
+    match ty {
+        FieldType::I8 | FieldType::OptionI8 => (i8::MIN as i64, i8::MAX as i64),
+        FieldType::I16 | FieldType::OptionI16 => (i16::MIN as i64, i16::MAX as i64),
+        FieldType::I32 | FieldType::OptionI32 => (i32::MIN as i64, i32::MAX as i64),
+        FieldType::I64 | FieldType::OptionI64 => (i64::MIN, i64::MAX),
+        FieldType::U8 | FieldType::OptionU8 => (0, u8::MAX as i64),
+        FieldType::U16 | FieldType::OptionU16 => (0, u16::MAX as i64),
+        FieldType::U32 | FieldType::OptionU32 => (0, u32::MAX as i64),
+        FieldType::U64 | FieldType::OptionU64 | FieldType::Usize | FieldType::OptionUsize => {
+            (0, i64::MAX)
+        }
+        _ => (0, i64::MAX),
     }
 }
 
@@ -822,13 +848,13 @@ fn emit_validate(field: &ParsedField) -> syn::Result<TokenStream2> {
         } else {
             quote! { ::std::option::Option::Some(self.#name) }
         };
-        let min = attrs.min.map(|m| m as i64);
-        let max = attrs.max.map(|m| m as i64);
+        let min = attrs.min.map(|m| m as i128);
+        let max = attrs.max.map(|m| m as i128);
         if min.is_some() || max.is_some() {
             let min_check = min
                 .map(|m| {
                     quote! {
-                        if (v as i64) < #m {
+                        if (v as i128) < #m {
                             errs.push(::pmetal_core::FieldError::new(
                                 #name_str,
                                 format!("must be ≥ {}", #m),
@@ -840,7 +866,7 @@ fn emit_validate(field: &ParsedField) -> syn::Result<TokenStream2> {
             let max_check = max
                 .map(|m| {
                     quote! {
-                        if (v as i64) > #m {
+                        if (v as i128) > #m {
                             errs.push(::pmetal_core::FieldError::new(
                                 #name_str,
                                 format!("must be ≤ {}", #m),
@@ -889,4 +915,36 @@ fn emit_validate(field: &ParsedField) -> syn::Result<TokenStream2> {
             #(#checks)*
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ty(src: &str) -> Type {
+        syn::parse_str(src).expect("valid type")
+    }
+
+    #[test]
+    fn vec_classification_requires_string_inner_type() {
+        assert_eq!(classify_type(&ty("Vec<String>")), FieldType::VecString);
+        assert_eq!(
+            classify_type(&ty("std::vec::Vec<String>")),
+            FieldType::VecString
+        );
+        assert_eq!(classify_type(&ty("Vec<u32>")), FieldType::Other);
+    }
+
+    #[test]
+    fn signed_integer_descriptors_keep_signed_minimums() {
+        assert_eq!(
+            int_descriptor_bounds(FieldType::I32),
+            (i32::MIN as i64, i32::MAX as i64)
+        );
+        assert_eq!(
+            int_descriptor_bounds(FieldType::OptionI64),
+            (i64::MIN, i64::MAX)
+        );
+        assert_eq!(int_descriptor_bounds(FieldType::U16), (0, u16::MAX as i64));
+    }
 }

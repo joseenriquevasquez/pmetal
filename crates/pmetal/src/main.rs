@@ -211,7 +211,6 @@ enum Commands {
     /// Run inference with a model
     Infer(crate::cli::infer::InferArgs),
 
-
     /// Download a model from HuggingFace
     Download {
         /// Model ID
@@ -2635,14 +2634,14 @@ fn validate_output_path(path: &str, context: &str) -> anyhow::Result<PathBuf> {
 mod argv_roundtrip {
     use super::{Cli, Commands};
     use clap::Parser;
-    use pmetal_core::jobs::{
-        BenchSpec, DflashSpec, DistillSpec, EmbedTrainSpec, EvalSpec, FuseSpec, GrpoSpec,
-        InferSpec, MergeSpec, PackExpertsSpec, PretrainSpec, QuantizeSpec, RlkdSpec,
-        TokenizeSpec, TrainSpec,
-    };
+    use pmetal_core::JobFields;
     #[cfg(feature = "serve")]
     use pmetal_core::jobs::ServeSpec;
-    use pmetal_core::JobFields;
+    use pmetal_core::jobs::{
+        BenchSpec, DflashSpec, DistillSpec, EmbedTrainSpec, EvalSpec, FuseSpec, GrpoSpec,
+        InferSpec, MergeSpec, PackExpertsSpec, PretrainSpec, QuantizeSpec, RlkdSpec, TokenizeSpec,
+        TrainSpec,
+    };
 
     /// Parse an argv slice built from a spec's `to_argv()` output.  Returns
     /// `Err(String)` on failure so the test body can provide a descriptive message.
@@ -2656,9 +2655,11 @@ mod argv_roundtrip {
 
     #[test]
     fn train_spec_round_trip() {
-        let mut spec = TrainSpec::default();
-        spec.model = "Qwen/Qwen3-0.6B".into();
-        spec.dataset = "data/train.jsonl".into();
+        let spec = TrainSpec {
+            model: "Qwen/Qwen3-0.6B".into(),
+            dataset: "data/train.jsonl".into(),
+            ..Default::default()
+        };
         let result = try_parse("train", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2669,10 +2670,12 @@ mod argv_roundtrip {
 
     #[test]
     fn distill_spec_round_trip() {
-        let mut spec = DistillSpec::default();
-        spec.teacher = "Qwen/Qwen3-7B".into();
-        spec.student = "Qwen/Qwen3-0.6B".into();
-        spec.dataset = "data.jsonl".into();
+        let spec = DistillSpec {
+            teacher: "Qwen/Qwen3-7B".into(),
+            student: "Qwen/Qwen3-0.6B".into(),
+            dataset: "data.jsonl".into(),
+            ..Default::default()
+        };
         let result = try_parse("distill", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2683,9 +2686,11 @@ mod argv_roundtrip {
 
     #[test]
     fn grpo_spec_round_trip() {
-        let mut spec = GrpoSpec::default();
-        spec.model = "model".into();
-        spec.dataset = "data.jsonl".into();
+        let spec = GrpoSpec {
+            model: "model".into(),
+            dataset: "data.jsonl".into(),
+            ..Default::default()
+        };
         let result = try_parse("grpo", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2696,10 +2701,12 @@ mod argv_roundtrip {
 
     #[test]
     fn rlkd_spec_round_trip() {
-        let mut spec = RlkdSpec::default();
-        spec.model = "model".into();
-        spec.teacher_model = "teacher".into();
-        spec.dataset = "data.jsonl".into();
+        let spec = RlkdSpec {
+            model: "model".into(),
+            teacher_model: "teacher".into(),
+            dataset: "data.jsonl".into(),
+            ..Default::default()
+        };
         let result = try_parse("rlkd", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2710,9 +2717,11 @@ mod argv_roundtrip {
 
     #[test]
     fn embed_train_spec_round_trip() {
-        let mut spec = EmbedTrainSpec::default();
-        spec.model = "model".into();
-        spec.dataset = "data.jsonl".into();
+        let spec = EmbedTrainSpec {
+            model: "model".into(),
+            dataset: "data.jsonl".into(),
+            ..Default::default()
+        };
         let result = try_parse("embed-train", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2723,8 +2732,10 @@ mod argv_roundtrip {
 
     #[test]
     fn pretrain_spec_round_trip() {
-        let mut spec = PretrainSpec::default();
-        spec.arch = "gpt-oss".into();
+        let spec = PretrainSpec {
+            arch: "gpt-oss".into(),
+            ..Default::default()
+        };
         let result = try_parse("pretrain", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2735,9 +2746,11 @@ mod argv_roundtrip {
 
     #[test]
     fn infer_spec_round_trip() {
-        let mut spec = InferSpec::default();
-        spec.model = "model".into();
-        spec.prompt = "Hello".into();
+        let spec = InferSpec {
+            model: "model".into(),
+            prompt: "Hello".into(),
+            ..Default::default()
+        };
         let result = try_parse("infer", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2750,8 +2763,10 @@ mod argv_roundtrip {
     #[cfg(feature = "serve")]
     #[test]
     fn serve_spec_round_trip() {
-        let mut spec = ServeSpec::default();
-        spec.model = "model".into();
+        let spec = ServeSpec {
+            model: "model".into(),
+            ..Default::default()
+        };
         let result = try_parse("serve", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2773,9 +2788,11 @@ mod argv_roundtrip {
 
     #[test]
     fn eval_spec_round_trip() {
-        let mut spec = EvalSpec::default();
-        spec.model = "model".into();
-        spec.dataset = "data.jsonl".into();
+        let spec = EvalSpec {
+            model: "model".into(),
+            dataset: "data.jsonl".into(),
+            ..Default::default()
+        };
         let result = try_parse("eval", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2786,9 +2803,11 @@ mod argv_roundtrip {
 
     #[test]
     fn quantize_spec_round_trip() {
-        let mut spec = QuantizeSpec::default();
-        spec.model = "model".into();
-        spec.output = "out.gguf".into();
+        let spec = QuantizeSpec {
+            model: "model".into(),
+            output: "out.gguf".into(),
+            ..Default::default()
+        };
         let result = try_parse("quantize", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2802,10 +2821,12 @@ mod argv_roundtrip {
     #[cfg(feature = "merge")]
     #[test]
     fn merge_spec_round_trip() {
-        let mut spec = MergeSpec::default();
-        spec.model_a = "a".into();
-        spec.model_b = "b".into();
-        spec.output = "out".into();
+        let spec = MergeSpec {
+            model_a: "a".into(),
+            model_b: "b".into(),
+            output: "out".into(),
+            ..Default::default()
+        };
         let result = try_parse("merge", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2816,10 +2837,12 @@ mod argv_roundtrip {
 
     #[test]
     fn fuse_spec_round_trip() {
-        let mut spec = FuseSpec::default();
-        spec.model = "model".into();
-        spec.lora = "adapter".into();
-        spec.output = "out".into();
+        let spec = FuseSpec {
+            model: "model".into(),
+            lora: "adapter".into(),
+            output: "out".into(),
+            ..Default::default()
+        };
         let result = try_parse("fuse", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2830,10 +2853,12 @@ mod argv_roundtrip {
 
     #[test]
     fn dflash_spec_round_trip() {
-        let mut spec = DflashSpec::default();
-        spec.target = "target-model".into();
-        spec.draft = "draft-model".into();
-        spec.prompt = "Hello".into();
+        let spec = DflashSpec {
+            target: "target-model".into(),
+            draft: "draft-model".into(),
+            prompt: "Hello".into(),
+            ..Default::default()
+        };
         let result = try_parse("dflash", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2844,8 +2869,10 @@ mod argv_roundtrip {
 
     #[test]
     fn pack_experts_spec_round_trip() {
-        let mut spec = PackExpertsSpec::default();
-        spec.model = "model".into();
+        let spec = PackExpertsSpec {
+            model: "model".into(),
+            ..Default::default()
+        };
         let result = try_parse("pack-experts", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2856,10 +2883,12 @@ mod argv_roundtrip {
 
     #[test]
     fn tokenize_spec_round_trip() {
-        let mut spec = TokenizeSpec::default();
-        spec.input = "corpus.jsonl".into();
-        spec.output = "shards/".into();
-        spec.tokenizer = "Qwen/Qwen3-0.6B".into();
+        let spec = TokenizeSpec {
+            input: "corpus.jsonl".into(),
+            output: "shards/".into(),
+            tokenizer: "Qwen/Qwen3-0.6B".into(),
+            ..Default::default()
+        };
         let result = try_parse("tokenize", spec.to_argv());
         assert!(
             result.is_ok(),
@@ -2873,19 +2902,19 @@ mod argv_roundtrip {
     // have already failed the round-trip test above.
     #[test]
     fn train_spec_no_unexpected_flags() {
-        let mut spec = TrainSpec::default();
-        spec.model = "m".into();
-        spec.dataset = "d".into();
-        // Set every optional flag that the spec supports to ensure they all
-        // appear in to_argv() and clap accepts them.
-        spec.no_flash_attention = true;
-        spec.no_sequence_packing = true;
-        spec.no_jit_compilation = true;
-        spec.no_metal_fused_optimizer = true;
-        spec.cut_cross_entropy = true;
-        spec.no_adaptive_lr = true;
-        spec.ane = true;
-        spec.resume = true;
+        let spec = TrainSpec {
+            model: "m".into(),
+            dataset: "d".into(),
+            no_flash_attention: true,
+            no_sequence_packing: true,
+            no_jit_compilation: true,
+            no_metal_fused_optimizer: true,
+            cut_cross_entropy: true,
+            no_adaptive_lr: true,
+            ane: true,
+            resume: true,
+            ..Default::default()
+        };
         let result = try_parse("train", spec.to_argv());
         assert!(
             result.is_ok(),

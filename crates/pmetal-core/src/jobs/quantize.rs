@@ -8,11 +8,23 @@ use serde::{Deserialize, Serialize};
 #[spec(kind = "Quantize", subcommand = "quantize")]
 #[serde(rename_all = "snake_case")]
 pub struct QuantizeSpec {
-    #[job(label = "Model", group = "Source", argv = "--model", kind = "model_picker", required)]
+    #[job(
+        label = "Model",
+        group = "Source",
+        argv = "--model",
+        kind = "model_picker",
+        required
+    )]
     #[serde(default)]
     pub model: String,
 
-    #[job(label = "Output Path", group = "Output", argv = "--output", kind = "path", required)]
+    #[job(
+        label = "Output Path",
+        group = "Output",
+        argv = "--output",
+        kind = "path",
+        required
+    )]
     #[serde(default)]
     pub output: String,
 
@@ -26,19 +38,43 @@ pub struct QuantizeSpec {
     #[serde(default = "default_method")]
     pub method: String,
 
-    #[job(label = "LoRA Adapter", group = "Source", argv = "--lora", kind = "path")]
+    #[job(
+        label = "LoRA Adapter",
+        group = "Source",
+        argv = "--lora",
+        kind = "path"
+    )]
     #[serde(default)]
     pub lora: Option<String>,
 
-    #[job(label = "KL Calibration", group = "Method", argv = "--kl-calibrate", flag, default_bool = false)]
+    #[job(
+        label = "KL Calibration",
+        group = "Method",
+        argv = "--kl-calibrate",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub kl_calibrate: bool,
 
-    #[job(label = "Target BPW", group = "Method", argv = "--target-bpw", min = 1.0, max = 16.0)]
+    #[job(
+        label = "Target BPW",
+        group = "Method",
+        argv = "--target-bpw",
+        min = 1.0,
+        max = 16.0
+    )]
     #[serde(default)]
     pub target_bpw: Option<f32>,
 
-    #[job(label = "KL Threshold", group = "Method", argv = "--kl-threshold", min = 0.0, max = 1.0, default_float = 0.01)]
+    #[job(
+        label = "KL Threshold",
+        group = "Method",
+        argv = "--kl-threshold",
+        min = 0.0,
+        max = 1.0,
+        default_float = 0.01
+    )]
     #[serde(default = "default_kl_threshold")]
     pub kl_threshold: f64,
 
@@ -51,7 +87,12 @@ pub struct QuantizeSpec {
     #[serde(default = "default_bits")]
     pub bits: i32,
 
-    #[job(label = "MLX Group Size", group = "Output", argv = "--group-size", default_int = 64)]
+    #[job(
+        label = "MLX Group Size",
+        group = "Output",
+        argv = "--group-size",
+        default_int = 64
+    )]
     #[serde(default = "default_group_size")]
     pub group_size: i32,
 }
@@ -77,11 +118,7 @@ impl Default for QuantizeSpec {
 impl QuantizeSpec {
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
         let errs = self.validate_descriptors();
-        if errs.is_empty() {
-            Ok(())
-        } else {
-            Err(errs)
-        }
+        if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }
 
@@ -107,9 +144,11 @@ mod tests {
 
     #[test]
     fn argv_round_trip() {
-        let mut spec = QuantizeSpec::default();
-        spec.model = "m".into();
-        spec.output = "out.gguf".into();
+        let spec = QuantizeSpec {
+            model: "m".into(),
+            output: "out.gguf".into(),
+            ..Default::default()
+        };
         let argv = spec.to_argv();
         assert!(argv.contains(&"--model".to_string()));
         assert!(argv.contains(&"--output".to_string()));

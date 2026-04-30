@@ -112,13 +112,17 @@ fn prepare_cmake_source() -> PathBuf {
     let cmake_content =
         std::fs::read_to_string(&cmake_src).expect("Failed to read cmake/CMakeLists.txt");
 
-    // Inject PATCH_COMMAND into the FetchContent_Declare for MLX (same pattern as mlx-sys)
-    let patched = cmake_content.replace(
-        "GIT_TAG v0.31.1)",
-        concat!(
-            "GIT_TAG v0.31.1\n",
-            "  PATCH_COMMAND git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/metallib-search-path.patch || true)"
-        ),
+    // Inject PATCH_COMMAND into the FetchContent_Declare for MLX (same pattern as mlx-sys).
+    // Keep the tag here tied to BUNDLED_MLX_GIT_TAG so version bumps cannot
+    // accidentally build an unpatched MLX checkout.
+    let search = format!("GIT_TAG {BUNDLED_MLX_GIT_TAG})");
+    let replacement = format!(
+        "GIT_TAG {BUNDLED_MLX_GIT_TAG}\n  PATCH_COMMAND /bin/sh -c \"git apply --check ${{CMAKE_CURRENT_SOURCE_DIR}}/patches/metallib-search-path.patch && git apply ${{CMAKE_CURRENT_SOURCE_DIR}}/patches/metallib-search-path.patch || git apply --reverse --check ${{CMAKE_CURRENT_SOURCE_DIR}}/patches/metallib-search-path.patch\")"
+    );
+    let patched = cmake_content.replace(&search, &replacement);
+    assert_ne!(
+        patched, cmake_content,
+        "failed to inject MLX patch command for {BUNDLED_MLX_GIT_TAG}"
     );
     std::fs::write(staged.join("CMakeLists.txt"), patched)
         .expect("Failed to write patched CMakeLists.txt");
@@ -156,13 +160,19 @@ fn mlx_fingerprint() -> String {
     let metal = cfg!(feature = "metal") as u8;
     let accelerate = cfg!(feature = "accelerate") as u8;
     let debug = cfg!(debug_assertions) as u8;
+    let target = env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
+    let deployment = if cfg!(target_os = "macos") {
+        resolve_deployment_target()
+    } else {
+        "n/a".to_string()
+    };
     let os = if cfg!(target_os = "macos") {
         "macos"
     } else {
         "other"
     };
     format!(
-        "{tag};metal={metal};accelerate={accelerate};debug={debug};os={os}",
+        "{tag};target={target};macos_deployment={deployment};metal={metal};accelerate={accelerate};debug={debug};os={os}",
         tag = BUNDLED_MLX_GIT_TAG
     )
 }

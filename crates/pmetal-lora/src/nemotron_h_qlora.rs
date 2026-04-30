@@ -27,9 +27,8 @@ use pmetal_models::architectures::nemotron_h::{
 use crate::{
     LoraError, QLoraConfig, QLoraLinear, TrainableModel,
     nemotron_h_lora::{
-        NemotronHLoraAttention, NemotronHLoraBlock, NemotronHLoraForCausalLM,
-        NemotronHLoraMLP, NemotronHLoraMixer, NemotronHLoraMoE, NemotronHLoraModel,
-        NemotronHLoraSharedExpert,
+        NemotronHLoraAttention, NemotronHLoraBlock, NemotronHLoraForCausalLM, NemotronHLoraMLP,
+        NemotronHLoraMixer, NemotronHLoraMoE, NemotronHLoraModel, NemotronHLoraSharedExpert,
     },
     qlora::quantize_lora_layer,
 };
@@ -129,9 +128,11 @@ impl NemotronHQloraAttention {
 
         let output = fused_sdpa(&q, &k, &v, &attn_config, mask).map_err(LoraError::Mlx)?;
 
-        let output = output
-            .transpose_axes(&[0, 2, 1, 3])
-            .reshape(&[batch, seq_len, self.num_heads * self.head_dim]);
+        let output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ]);
 
         self.o_proj.forward(&output)
     }
@@ -322,15 +323,11 @@ impl NemotronHQloraMixer {
     fn from_lora(mixer: NemotronHLoraMixer, qcfg: &QLoraConfig) -> Result<Self, LoraError> {
         match mixer {
             NemotronHLoraMixer::Mamba(m) => Ok(Self::Mamba(m)),
-            NemotronHLoraMixer::Attention(a) => {
-                Ok(Self::Attention(NemotronHQloraAttention::from_lora(a, qcfg)?))
-            }
-            NemotronHLoraMixer::Mlp(m) => {
-                Ok(Self::Mlp(NemotronHQloraMLP::from_lora(m, qcfg)?))
-            }
-            NemotronHLoraMixer::MoE(m) => {
-                Ok(Self::MoE(NemotronHQloraMoE::from_lora(m, qcfg)?))
-            }
+            NemotronHLoraMixer::Attention(a) => Ok(Self::Attention(
+                NemotronHQloraAttention::from_lora(a, qcfg)?,
+            )),
+            NemotronHLoraMixer::Mlp(m) => Ok(Self::Mlp(NemotronHQloraMLP::from_lora(m, qcfg)?)),
+            NemotronHLoraMixer::MoE(m) => Ok(Self::MoE(NemotronHQloraMoE::from_lora(m, qcfg)?)),
         }
     }
 
@@ -804,8 +801,10 @@ impl NemotronHQloraForCausalLM {
     /// it, then convert to QLoRA. This reuses the thoroughly-tested weight loading
     /// logic from the unquantized variant.
     pub fn load_base_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), LoraError> {
-        let mut lora =
-            NemotronHLoraForCausalLM::new(self.model.config.clone(), self.model.qlora_config.lora.clone())?;
+        let mut lora = NemotronHLoraForCausalLM::new(
+            self.model.config.clone(),
+            self.model.qlora_config.lora.clone(),
+        )?;
         lora.load_base_weights(weights)?;
         let qlora_cfg = self.model.qlora_config.clone();
         let new_self = Self::from_lora(lora, qlora_cfg)?;
@@ -1024,29 +1023,59 @@ impl ModuleParameters for NemotronHQloraForCausalLM {
                 NemotronHQloraMixer::Mamba(_) => {}
                 NemotronHQloraMixer::Attention(attn) => {
                     let mut q = HashMap::new();
-                    q.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.q_proj.lora_a));
-                    q.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.q_proj.lora_b));
+                    q.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut attn.q_proj.lora_a),
+                    );
+                    q.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut attn.q_proj.lora_b),
+                    );
                     mixer_map.insert(Rc::from("q_proj"), NestedValue::Map(q));
 
                     let mut k = HashMap::new();
-                    k.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.k_proj.lora_a));
-                    k.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.k_proj.lora_b));
+                    k.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut attn.k_proj.lora_a),
+                    );
+                    k.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut attn.k_proj.lora_b),
+                    );
                     mixer_map.insert(Rc::from("k_proj"), NestedValue::Map(k));
 
                     let mut v = HashMap::new();
-                    v.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.v_proj.lora_a));
-                    v.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.v_proj.lora_b));
+                    v.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut attn.v_proj.lora_a),
+                    );
+                    v.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut attn.v_proj.lora_b),
+                    );
                     mixer_map.insert(Rc::from("v_proj"), NestedValue::Map(v));
 
                     let mut o = HashMap::new();
-                    o.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.o_proj.lora_a));
-                    o.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.o_proj.lora_b));
+                    o.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut attn.o_proj.lora_a),
+                    );
+                    o.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut attn.o_proj.lora_b),
+                    );
                     mixer_map.insert(Rc::from("o_proj"), NestedValue::Map(o));
                 }
                 NemotronHQloraMixer::Mlp(mlp) => {
                     let mut up = HashMap::new();
-                    up.insert(Rc::from("lora_a"), NestedValue::Value(&mut mlp.up_proj.lora_a));
-                    up.insert(Rc::from("lora_b"), NestedValue::Value(&mut mlp.up_proj.lora_b));
+                    up.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut mlp.up_proj.lora_a),
+                    );
+                    up.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut mlp.up_proj.lora_b),
+                    );
                     mixer_map.insert(Rc::from("up_proj"), NestedValue::Map(up));
 
                     let mut down = HashMap::new();
@@ -1065,8 +1094,14 @@ impl ModuleParameters for NemotronHQloraForCausalLM {
                         let mut se_map = HashMap::new();
 
                         let mut up = HashMap::new();
-                        up.insert(Rc::from("lora_a"), NestedValue::Value(&mut se.up_proj.lora_a));
-                        up.insert(Rc::from("lora_b"), NestedValue::Value(&mut se.up_proj.lora_b));
+                        up.insert(
+                            Rc::from("lora_a"),
+                            NestedValue::Value(&mut se.up_proj.lora_a),
+                        );
+                        up.insert(
+                            Rc::from("lora_b"),
+                            NestedValue::Value(&mut se.up_proj.lora_b),
+                        );
                         se_map.insert(Rc::from("up_proj"), NestedValue::Map(up));
 
                         let mut down = HashMap::new();
@@ -1254,10 +1289,8 @@ mod tests {
 
     #[test]
     fn test_nemotron_h_qlora_builds() {
-        let model = NemotronHQloraForCausalLM::with_qlora_config(
-            tiny_config(),
-            QLoraConfig::default(),
-        );
+        let model =
+            NemotronHQloraForCausalLM::with_qlora_config(tiny_config(), QLoraConfig::default());
         assert!(model.is_ok(), "QLoRA model construction should succeed");
         let model = model.unwrap();
         assert!(
@@ -1274,8 +1307,7 @@ mod tests {
 
     #[test]
     fn test_layer_type_dispatch() {
-        let model =
-            NemotronHQloraForCausalLM::new(tiny_config(), tiny_lora_config()).unwrap();
+        let model = NemotronHQloraForCausalLM::new(tiny_config(), tiny_lora_config()).unwrap();
 
         // Pattern "M*-": layer 0 = Mamba, layer 1 = Attention, layer 2 = MLP
         assert!(
@@ -1283,7 +1315,10 @@ mod tests {
             "Layer 0 should be Mamba"
         );
         assert!(
-            matches!(model.model.layers[1].mixer, NemotronHQloraMixer::Attention(_)),
+            matches!(
+                model.model.layers[1].mixer,
+                NemotronHQloraMixer::Attention(_)
+            ),
             "Layer 1 should be Attention"
         );
         assert!(
@@ -1294,8 +1329,7 @@ mod tests {
 
     #[test]
     fn test_mamba_layers_have_no_lora_params() {
-        let model =
-            NemotronHQloraForCausalLM::new(tiny_config(), tiny_lora_config()).unwrap();
+        let model = NemotronHQloraForCausalLM::new(tiny_config(), tiny_lora_config()).unwrap();
         let params = model.lora_parameters();
         let mamba_keys: Vec<_> = params
             .keys()
@@ -1310,8 +1344,7 @@ mod tests {
 
     #[test]
     fn test_attention_lora_param_keys() {
-        let model =
-            NemotronHQloraForCausalLM::new(tiny_config(), tiny_lora_config()).unwrap();
+        let model = NemotronHQloraForCausalLM::new(tiny_config(), tiny_lora_config()).unwrap();
         let params = model.lora_parameters();
 
         // Layer 1 is Attention
@@ -1328,8 +1361,7 @@ mod tests {
 
     #[test]
     fn test_mlp_lora_param_keys() {
-        let model =
-            NemotronHQloraForCausalLM::new(tiny_config(), tiny_lora_config()).unwrap();
+        let model = NemotronHQloraForCausalLM::new(tiny_config(), tiny_lora_config()).unwrap();
         let params = model.lora_parameters();
 
         // Layer 2 is MLP — only up_proj/down_proj, no gate_proj
@@ -1351,8 +1383,7 @@ mod tests {
 
     #[test]
     fn test_lora_param_roundtrip() {
-        let mut model =
-            NemotronHQloraForCausalLM::new(tiny_config(), tiny_lora_config()).unwrap();
+        let mut model = NemotronHQloraForCausalLM::new(tiny_config(), tiny_lora_config()).unwrap();
 
         let original = model.lora_parameters();
         model.set_lora_parameters(&original);
@@ -1367,8 +1398,7 @@ mod tests {
 
     #[test]
     fn test_supports_kv_cache_is_false() {
-        let model =
-            NemotronHQloraForCausalLM::new(tiny_config(), tiny_lora_config()).unwrap();
+        let model = NemotronHQloraForCausalLM::new(tiny_config(), tiny_lora_config()).unwrap();
         assert!(
             !TrainableModel::supports_kv_cache(&model),
             "Hybrid model must report supports_kv_cache = false"
@@ -1377,8 +1407,7 @@ mod tests {
 
     #[test]
     fn test_nemotron_h_qlora_forward() {
-        let mut model =
-            NemotronHQloraForCausalLM::new(tiny_config(), tiny_lora_config()).unwrap();
+        let mut model = NemotronHQloraForCausalLM::new(tiny_config(), tiny_lora_config()).unwrap();
 
         let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let result = model.forward(&input_ids, None);
@@ -1399,6 +1428,9 @@ mod tests {
         let savings = model.memory_savings();
         // QLoRA should produce a ratio in (0.0, 1.0] — tiny config has few params
         // so the exact value varies, but should not be negative or > 1.0.
-        assert!(savings > 0.0 && savings <= 1.0, "Unexpected savings: {savings}");
+        assert!(
+            savings > 0.0 && savings <= 1.0,
+            "Unexpected savings: {savings}"
+        );
     }
 }

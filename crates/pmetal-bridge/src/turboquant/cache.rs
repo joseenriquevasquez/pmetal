@@ -23,7 +23,6 @@ use super::{
     turboquant_trace_enabled,
 };
 
-
 /// Compressed KV cache for one attention layer.
 ///
 /// Stores all cached positions as bit-packed indices + f32 metadata.
@@ -321,12 +320,10 @@ impl QuantizedKvCache {
             if config.outliers.is_enabled()
                 && !matches!(config.keys, TurboQuantTensorConfig::Uniform { .. })
             {
-                return Err(
-                    "TurboQuant per-block outliers (PerBlock) on a Mixed \
+                return Err("TurboQuant per-block outliers (PerBlock) on a Mixed \
                      keys config are not yet supported — disable outliers, \
                      switch to Uniform keys, or use a GPU-encoded config."
-                        .to_string(),
-                );
+                    .to_string());
             }
         }
 
@@ -509,7 +506,10 @@ impl QuantizedKvCache {
             );
         }
         {
-            let hot_values = self.hot_values.as_mut().expect("hot_values allocated above");
+            let hot_values = self
+                .hot_values
+                .as_mut()
+                .expect("hot_values allocated above");
             *hot_values = hot_values.slice_set(
                 &values_typed,
                 &[0, 0, start as i32, 0],
@@ -558,12 +558,14 @@ impl QuantizedKvCache {
         // borrows of `hot_keys`/`hot_values` are dropped at the end of this
         // block before any `&mut self` call below.
         let (evict_keys, evict_values, kept) = {
-            let hot_keys = self.hot_keys.as_ref().ok_or_else(|| {
-                "TurboQuant hot keys missing during evict".to_string()
-            })?;
-            let hot_values = self.hot_values.as_ref().ok_or_else(|| {
-                "TurboQuant hot values missing during evict".to_string()
-            })?;
+            let hot_keys = self
+                .hot_keys
+                .as_ref()
+                .ok_or_else(|| "TurboQuant hot keys missing during evict".to_string())?;
+            let hot_values = self
+                .hot_values
+                .as_ref()
+                .ok_or_else(|| "TurboQuant hot values missing during evict".to_string())?;
             let evict_keys = hot_keys.slice(
                 &[0, 0, 0, 0],
                 &[
@@ -648,18 +650,13 @@ impl QuantizedKvCache {
                     .expect("warm Some")
                     .dequantize_values()
                     .ok_or_else(|| {
-                        "TurboQuant warm tier: dequantize_values returned None during \
+                    "TurboQuant warm tier: dequantize_values returned None during \
                          migration to cold"
-                            .to_string()
-                    })?;
+                        .to_string()
+                })?;
                 let warm_count = warm_offset;
                 self.warm.as_mut().expect("warm Some").reset();
-                self.compress_into_cold(
-                    &warm_keys_full,
-                    &warm_values_full,
-                    layout,
-                    warm_count,
-                )?;
+                self.compress_into_cold(&warm_keys_full, &warm_values_full, layout, warm_count)?;
             }
         } else {
             self.compress_into_cold(&evict_keys, &evict_values, layout, evict_seq)?;
@@ -1132,9 +1129,9 @@ impl QuantizedKvCache {
                 let key_indices =
                     ks.indices_t_array()
                         .reshape(&[kv_rows, key_dim, cache_seq_capacity]);
-                let key_qjl_signs = ks
-                    .qjl_signs_t_array()?
-                    .reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
+                let key_qjl_signs =
+                    ks.qjl_signs_t_array()?
+                        .reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
                 let value_indices =
                     vs.indices_t_array()?
                         .reshape(&[kv_rows, value_dim, cache_seq_capacity]);
@@ -1854,7 +1851,8 @@ impl QuantizedKvCache {
         // Currently d128/8b/8b and d256/8b/8b are supported. n_seq < 1024
         // falls back to dequantize+SDPA which is fine — the kernel is the
         // long-context win.
-        let dim_supported = (key_dim == 128 && value_dim == 128) || (key_dim == 256 && value_dim == 256);
+        let dim_supported =
+            (key_dim == 128 && value_dim == 128) || (key_dim == 256 && value_dim == 256);
         // Phase D.3.1 / Phase G: NoQjl supports `key_bits in 2..=8` at
         // d128/d256. The score kernels load 256 codebook entries
         // unconditionally, so we pass a 256-padded view (entries past
@@ -1904,9 +1902,7 @@ impl QuantizedKvCache {
                 ks.q8_slot_scales_seq.as_ref(),
                 vs.d256_rot_values_seq.as_ref(),
             ) {
-                let key_indices_seq = ks
-                    .indices
-                    .reshape(&[kv_rows, cache_seq_capacity, key_dim]);
+                let key_indices_seq = ks.indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]);
                 let slot_scales_3d = slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]);
                 let value_rot_dense_3d =
                     value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]);
@@ -1973,12 +1969,10 @@ impl QuantizedKvCache {
         let key_indices_t = ks
             .indices_t_array()
             .reshape(&[kv_rows, key_dim, cache_seq_capacity]);
-        let value_indices_t = vs
-            .indices_t_array()?
-            .reshape(&[kv_rows, value_dim, cache_seq_capacity]);
-        let value_norms = vs
-            .norms_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
+        let value_indices_t =
+            vs.indices_t_array()?
+                .reshape(&[kv_rows, value_dim, cache_seq_capacity]);
+        let value_norms = vs.norms_array()?.reshape(&[kv_rows, cache_seq_capacity]);
 
         // Phase E.4 V2: outlier-bias siblings of the d128/d256 base
         // no_qjl_2pass kernels. The bias compute is shared with the d256
@@ -2112,8 +2106,7 @@ impl QuantizedKvCache {
         if outlier_k <= 0 {
             return None;
         }
-        let oc_3d =
-            outlier_channels.reshape(&[kv_rows, cache_seq_capacity, outlier_k]);
+        let oc_3d = outlier_channels.reshape(&[kv_rows, cache_seq_capacity, outlier_k]);
         let ov_3d = outlier_values
             .as_dtype(crate::compat::Dtype::Float32.as_i32())
             .reshape(&[kv_rows, cache_seq_capacity, outlier_k]);
@@ -2128,8 +2121,7 @@ impl QuantizedKvCache {
         let oc_q_i32 = oc_q.as_dtype(crate::compat::Dtype::Int32.as_i32());
         let oc_flat = oc_q_i32.reshape(&[q_rows, cache_seq_capacity * outlier_k]);
         let q_at_chans_flat = query_rot.take_along_axis(&oc_flat, -1);
-        let q_at_chans =
-            q_at_chans_flat.reshape(&[q_rows, cache_seq_capacity, outlier_k]);
+        let q_at_chans = q_at_chans_flat.reshape(&[q_rows, cache_seq_capacity, outlier_k]);
 
         let products = q_at_chans.multiply(&ov_q);
         let correction = products.sum_axis(-1, false);
@@ -2310,9 +2302,7 @@ impl QuantizedKvCache {
             .reshape(&[kv_rows * cache_seq_capacity]);
         let gathered_key_slot_scale = key_slot_scale_flat.take_axis(&flat_idx_2d, 0);
 
-        let value_norms_flat = vs
-            .norms_array()?
-            .reshape(&[kv_rows * cache_seq_capacity]);
+        let value_norms_flat = vs.norms_array()?.reshape(&[kv_rows * cache_seq_capacity]);
         let gathered_value_norms = value_norms_flat.take_axis(&flat_idx_2d, 0);
 
         let key_codebook = key_core.codebook_arr(key_bits)?;
@@ -2389,12 +2379,7 @@ impl QuantizedKvCache {
         // wired for d128/8b/8b uniform; other configs fall back to
         // dequantize+SDPA inside the no_qjl helper.
         if matches!(state.qjl, super::TurboQuantQjlMode::NoQjl) {
-            return self.try_gpu_uniform_attention_no_qjl(
-                queries_f32,
-                layout,
-                scale,
-                output_dtype,
-            );
+            return self.try_gpu_uniform_attention_no_qjl(queries_f32, layout, scale, output_dtype);
         }
 
         let (key_core, key_bits) = match &state.keys {
@@ -2615,9 +2600,9 @@ impl QuantizedKvCache {
                     }
                 }
             } else if qjl_words == 4 {
-                let key_qjl_signs = ks
-                    .qjl_signs_t_array()?
-                    .reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
+                let key_qjl_signs =
+                    ks.qjl_signs_t_array()?
+                        .reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
                 if let Some(decoded_rot) = InlineArray::turboquant_attention_q8_d128_2pass(
                     &query_rot,
                     query_proj,
@@ -2763,4 +2748,3 @@ impl QuantizedKvCache {
         Ok(layout)
     }
 }
-

@@ -395,15 +395,17 @@ impl KernelBackend for Metal4Backend {
             BufferUsage::Shared,
         )?;
 
-        if has_lora {
+        if let (Some(gate_lora_a), Some(gate_lora_b), Some(up_lora_a), Some(up_lora_b)) =
+            (gate_lora_a, gate_lora_b, up_lora_a, up_lora_b)
+        {
             dispatcher.execute_lora(
                 input,
                 gate_weight,
                 up_weight,
-                gate_lora_a.unwrap(),
-                gate_lora_b.unwrap(),
-                up_lora_a.unwrap(),
-                up_lora_b.unwrap(),
+                gate_lora_a,
+                gate_lora_b,
+                up_lora_a,
+                up_lora_b,
                 &output,
             )?;
         } else {

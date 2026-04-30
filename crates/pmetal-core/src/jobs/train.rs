@@ -181,12 +181,7 @@ pub struct TrainSpec {
     #[serde(default = "default_lr_schedule")]
     pub lr_schedule: String,
 
-    #[job(
-        label = "Seed",
-        group = "Training",
-        argv = "--seed",
-        default_int = 42
-    )]
+    #[job(label = "Seed", group = "Training", argv = "--seed", default_int = 42)]
     #[serde(default = "default_seed")]
     pub seed: u64,
 
@@ -345,12 +340,7 @@ pub struct TrainSpec {
     pub config_path: Option<String>,
 
     /// Resume from latest checkpoint.
-    #[job(
-        skip_descriptor,
-        argv = "--resume",
-        flag,
-        default_bool = false
-    )]
+    #[job(skip_descriptor, argv = "--resume", flag, default_bool = false)]
     #[serde(default)]
     pub resume: bool,
 }
@@ -402,11 +392,7 @@ impl TrainSpec {
     /// Apply cross-field defaults / sentinels and run descriptor validation.
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
         let errs = self.validate_descriptors();
-        if errs.is_empty() {
-            Ok(())
-        } else {
-            Err(errs)
-        }
+        if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }
 
@@ -470,9 +456,11 @@ mod tests {
 
     #[test]
     fn argv_emits_required_flags() {
-        let mut spec = TrainSpec::default();
-        spec.model = "Qwen/Qwen3-0.6B".into();
-        spec.dataset = "data/train.jsonl".into();
+        let spec = TrainSpec {
+            model: "Qwen/Qwen3-0.6B".into(),
+            dataset: "data/train.jsonl".into(),
+            ..Default::default()
+        };
         let argv = spec.to_argv();
         assert!(argv.contains(&"--model".to_string()));
         assert!(argv.contains(&"Qwen/Qwen3-0.6B".to_string()));
@@ -484,9 +472,11 @@ mod tests {
 
     #[test]
     fn argv_skips_optional_when_none() {
-        let mut spec = TrainSpec::default();
-        spec.model = "m".into();
-        spec.dataset = "d".into();
+        let spec = TrainSpec {
+            model: "m".into(),
+            dataset: "d".into(),
+            ..Default::default()
+        };
         let argv = spec.to_argv();
         assert!(!argv.contains(&"--eval-dataset".to_string()));
         assert!(!argv.contains(&"--quantization".to_string()));
@@ -495,10 +485,12 @@ mod tests {
 
     #[test]
     fn argv_emits_flag_only_when_true() {
-        let mut spec = TrainSpec::default();
-        spec.model = "m".into();
-        spec.dataset = "d".into();
-        spec.ane = true;
+        let spec = TrainSpec {
+            model: "m".into(),
+            dataset: "d".into(),
+            ane: true,
+            ..Default::default()
+        };
         let argv = spec.to_argv();
         assert!(argv.contains(&"--ane".to_string()));
         assert!(!argv.contains(&"--cut-cross-entropy".to_string()));
@@ -514,19 +506,23 @@ mod tests {
 
     #[test]
     fn validate_passes_for_complete_spec() {
-        let mut spec = TrainSpec::default();
-        spec.model = "m".into();
-        spec.dataset = "d".into();
+        let spec = TrainSpec {
+            model: "m".into(),
+            dataset: "d".into(),
+            ..Default::default()
+        };
         let errs = spec.validate_descriptors();
         assert!(errs.is_empty(), "unexpected validation errors: {errs:?}");
     }
 
     #[test]
     fn validate_rejects_out_of_range() {
-        let mut spec = TrainSpec::default();
-        spec.model = "m".into();
-        spec.dataset = "d".into();
-        spec.learning_rate = 10.0;
+        let spec = TrainSpec {
+            model: "m".into(),
+            dataset: "d".into(),
+            learning_rate: 10.0,
+            ..Default::default()
+        };
         let errs = spec.validate_descriptors();
         assert!(errs.iter().any(|e| e.field == "learning_rate"));
     }
@@ -539,9 +535,11 @@ mod tests {
 
     #[test]
     fn argv_round_trip_via_serde() {
-        let mut spec = TrainSpec::default();
-        spec.model = "m".into();
-        spec.dataset = "d".into();
+        let spec = TrainSpec {
+            model: "m".into(),
+            dataset: "d".into(),
+            ..Default::default()
+        };
         let yaml = serde_yaml::to_string(&spec).expect("serialize");
         let back: TrainSpec = serde_yaml::from_str(&yaml).expect("deserialize");
         assert_eq!(back.model, spec.model);

@@ -1309,7 +1309,9 @@ mod tests {
 
         let no_cache = model.forward(&ids, None).unwrap();
         let mut cache = model.create_cache(16);
-        let with_cache = model.forward_with_cache(&ids, None, Some(&mut cache)).unwrap();
+        let with_cache = model
+            .forward_with_cache(&ids, None, Some(&mut cache))
+            .unwrap();
         assert_eq!(no_cache.shape(), with_cache.shape());
         // rope_offset advances by prompt length after the call
         assert_eq!(cache.rope_offset(), 4);

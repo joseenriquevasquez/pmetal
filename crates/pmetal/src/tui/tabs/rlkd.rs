@@ -142,18 +142,46 @@ impl RlkdTab {
         spec.teacher_model = self.form.value("Teacher Model");
         spec.dataset = self.form.value("Dataset");
         spec.output_dir = self.form.value("Output Dir");
-        spec.distill_alpha = self.form.value("Distill α (start)").parse().unwrap_or(spec.distill_alpha);
-        spec.final_alpha = self.form.value("Distill α (final)").parse().unwrap_or(spec.final_alpha);
+        spec.distill_alpha = self
+            .form
+            .value("Distill α (start)")
+            .parse()
+            .unwrap_or(spec.distill_alpha);
+        spec.final_alpha = self
+            .form
+            .value("Distill α (final)")
+            .parse()
+            .unwrap_or(spec.final_alpha);
         spec.anneal_alpha = self.form.value("Anneal α") == "Enabled";
-        spec.distill_temperature = self.form.value("Distill Temperature").parse().unwrap_or(spec.distill_temperature);
-        spec.num_generations = self.form.value("Num Generations").parse().unwrap_or(spec.num_generations);
+        spec.distill_temperature = self
+            .form
+            .value("Distill Temperature")
+            .parse()
+            .unwrap_or(spec.distill_temperature);
+        spec.num_generations = self
+            .form
+            .value("Num Generations")
+            .parse()
+            .unwrap_or(spec.num_generations);
         spec.beta = self.form.value("KL β").parse().unwrap_or(spec.beta);
-        spec.learning_rate = self.form.value("Learning Rate").parse().unwrap_or(spec.learning_rate);
+        spec.learning_rate = self
+            .form
+            .value("Learning Rate")
+            .parse()
+            .unwrap_or(spec.learning_rate);
         spec.epochs = self.form.value("Epochs").parse().unwrap_or(spec.epochs);
         spec.lora_r = self.form.value("LoRA r").parse().unwrap_or(spec.lora_r);
         spec.lora_alpha = self.form.value("LoRA α").parse().unwrap_or(spec.lora_alpha);
-        spec.max_seq_len = self.form.value("Max Seq Len").parse().unwrap_or(spec.max_seq_len);
-        spec.max_completion_length = self.form.value("Max Completion Length").parse().unwrap_or(spec.max_completion_length);
+        spec.max_seq_len = self
+            .form
+            .value("Max Seq Len")
+            .parse()
+            .unwrap_or(spec.max_seq_len);
+        spec.max_completion_length = self
+            .form
+            .value("Max Completion Length")
+            .parse()
+            .unwrap_or(spec.max_completion_length);
         spec.seed = self.form.value("Seed").parse().unwrap_or(spec.seed);
         spec.reasoning_rewards = self.form.value("Reasoning Rewards") == "Enabled";
         spec.no_flash_attention = self.form.value("Disable Flash Attention") == "Enabled";

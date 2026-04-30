@@ -98,18 +98,18 @@ impl TurboQuantCore {
             let inv_qjl = transpose_square_matrix(&qjl, dim);
             (rot, inv_rot, qjl, inv_qjl)
         };
-        let (wht_left_signs, wht_right_signs, qjl_wht_left_signs, qjl_wht_right_signs) =
-            if use_fwht {
-                let mut wht_rng = StdRng::seed_from_u64(TURBOQUANT_SEED ^ 0x5748_5400 ^ dim as u64);
-                (
-                    Some(generate_rademacher_signs(dim, &mut wht_rng)),
-                    Some(generate_rademacher_signs(dim, &mut wht_rng)),
-                    Some(generate_rademacher_signs(dim, &mut wht_rng)),
-                    Some(generate_rademacher_signs(dim, &mut wht_rng)),
-                )
-            } else {
-                (None, None, None, None)
-            };
+        let (wht_left_signs, wht_right_signs, qjl_wht_left_signs, qjl_wht_right_signs) = if use_fwht
+        {
+            let mut wht_rng = StdRng::seed_from_u64(TURBOQUANT_SEED ^ 0x5748_5400 ^ dim as u64);
+            (
+                Some(generate_rademacher_signs(dim, &mut wht_rng)),
+                Some(generate_rademacher_signs(dim, &mut wht_rng)),
+                Some(generate_rademacher_signs(dim, &mut wht_rng)),
+                Some(generate_rademacher_signs(dim, &mut wht_rng)),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
         let mut codebooks = vec![Vec::new(); usize::from(max_mse_bits) + 1];
         for bits in 1..=max_mse_bits {
@@ -456,10 +456,7 @@ impl TurboQuantCore {
     }
 
     /// Experimental inverse signed-FWHT QJL projection path for power-of-two dims.
-    pub(super) fn inverse_project_rows_wht(
-        &self,
-        input_rows: &InlineArray,
-    ) -> Option<InlineArray> {
+    pub(super) fn inverse_project_rows_wht(&self, input_rows: &InlineArray) -> Option<InlineArray> {
         self.apply_signed_fwht_rows(
             input_rows,
             self.qjl_wht_left_signs.as_ref()?,
@@ -485,9 +482,7 @@ impl TurboQuantCore {
         }
         let n_rows = input_rows.dim(0) as usize;
 
-        if let (Some(post_gpu), Some(pre_gpu)) =
-            (post_signs_gpu.as_ref(), pre_signs_gpu.as_ref())
-        {
+        if let (Some(post_gpu), Some(pre_gpu)) = (post_signs_gpu.as_ref(), pre_signs_gpu.as_ref()) {
             if let Some(out) = InlineArray::turboquant_signed_fwht_pow2_rows(
                 input_rows,
                 post_gpu,
@@ -644,4 +639,3 @@ fn try_gpu_matmul_rows(input: &[f32], dim: usize, matrix: &InlineArray) -> Optio
     let result_arr = input_arr.matmul(matrix);
     inline_array_to_f32_vec(&result_arr, n * dim)
 }
-

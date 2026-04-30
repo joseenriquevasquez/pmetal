@@ -134,15 +134,39 @@ impl EmbedTrainTab {
         spec.output_dir = self.form.value("Output Dir");
         spec.loss = self.form.value("Loss");
         spec.pooling = self.form.value("Pooling");
-        spec.temperature = self.form.value("Temperature").parse().unwrap_or(spec.temperature);
+        spec.temperature = self
+            .form
+            .value("Temperature")
+            .parse()
+            .unwrap_or(spec.temperature);
         spec.margin = self.form.value("Margin").parse().unwrap_or(spec.margin);
-        spec.learning_rate = self.form.value("Learning Rate").parse().unwrap_or(spec.learning_rate);
-        spec.batch_size = self.form.value("Batch Size").parse().unwrap_or(spec.batch_size);
+        spec.learning_rate = self
+            .form
+            .value("Learning Rate")
+            .parse()
+            .unwrap_or(spec.learning_rate);
+        spec.batch_size = self
+            .form
+            .value("Batch Size")
+            .parse()
+            .unwrap_or(spec.batch_size);
         spec.epochs = self.form.value("Epochs").parse().unwrap_or(spec.epochs);
-        spec.max_seq_len = self.form.value("Max Seq Len").parse().unwrap_or(spec.max_seq_len);
-        spec.weight_decay = self.form.value("Weight Decay").parse().unwrap_or(spec.weight_decay);
+        spec.max_seq_len = self
+            .form
+            .value("Max Seq Len")
+            .parse()
+            .unwrap_or(spec.max_seq_len);
+        spec.weight_decay = self
+            .form
+            .value("Weight Decay")
+            .parse()
+            .unwrap_or(spec.weight_decay);
         spec.no_normalize = self.form.value("Disable L2 Norm") == "Enabled";
-        spec.log_every = self.form.value("Log Every").parse().unwrap_or(spec.log_every);
+        spec.log_every = self
+            .form
+            .value("Log Every")
+            .parse()
+            .unwrap_or(spec.log_every);
         spec.seed = self.form.value("Seed").parse().unwrap_or(spec.seed);
         spec
     }

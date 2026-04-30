@@ -8,11 +8,11 @@ use tokio::sync::RwLock;
 use turbomcp::prelude::*;
 
 use jobs::JobManager;
+use pmetal_core::JobFields as _;
 use pmetal_core::jobs::{
-    DistillSpec, DflashSpec, EmbedTrainSpec, FuseSpec, GrpoSpec, InferSpec, MergeSpec,
+    DflashSpec, DistillSpec, EmbedTrainSpec, FuseSpec, GrpoSpec, InferSpec, MergeSpec,
     PackExpertsSpec, QuantizeSpec, RlkdSpec, ServeSpec, TokenizeSpec, TrainSpec,
 };
-use pmetal_core::JobFields as _;
 
 /// MCP server exposing all PMetal functionality.
 #[derive(Clone)]
@@ -374,15 +374,11 @@ impl PmetalMcpServer {
         #[description("Profile per-layer latency and print a breakdown")] profile_layers: Option<
             bool,
         >,
-        #[description("Per-key KV cache quantization bits (asymmetric split-bit)")] kv_k_bits: Option<
-            u64,
-        >,
-        #[description("Per-value KV cache quantization bits (asymmetric split-bit)")] kv_v_bits: Option<
-            u64,
-        >,
-        #[description("KV cache quantization group size (default: 64)")] kv_group_size: Option<
-            u64,
-        >,
+        #[description("Per-key KV cache quantization bits (asymmetric split-bit)")]
+        kv_k_bits: Option<u64>,
+        #[description("Per-value KV cache quantization bits (asymmetric split-bit)")]
+        kv_v_bits: Option<u64>,
+        #[description("KV cache quantization group size (default: 64)")] kv_group_size: Option<u64>,
         #[description(
             "Enable TurboQuant mixed-precision KV cache (requires kv_k_bits / kv_v_bits)"
         )]
@@ -511,7 +507,8 @@ impl PmetalMcpServer {
         let mut spec = TrainSpec {
             model,
             dataset,
-            output_dir: output.unwrap_or_else(|| pmetal_core::jobs::TrainSpec::default().output_dir),
+            output_dir: output
+                .unwrap_or_else(|| pmetal_core::jobs::TrainSpec::default().output_dir),
             lora_r: lora_r.unwrap_or(pmetal_core::defaults::LORA_R as u64) as usize,
             lora_alpha: lora_alpha.unwrap_or(f64::from(pmetal_core::defaults::LORA_ALPHA)) as f32,
             learning_rate: learning_rate.unwrap_or(pmetal_core::defaults::LEARNING_RATE),
@@ -522,8 +519,7 @@ impl PmetalMcpServer {
                 .unwrap_or(pmetal_core::defaults::GRADIENT_ACCUMULATION_STEPS as u64)
                 as usize,
             quantization,
-            lr_schedule: lr_schedule
-                .unwrap_or_else(|| "cosine".to_string()),
+            lr_schedule: lr_schedule.unwrap_or_else(|| "cosine".to_string()),
             eval_dataset,
             warmup_steps: warmup_steps.unwrap_or(0) as usize,
             weight_decay: weight_decay.unwrap_or(pmetal_core::defaults::WEIGHT_DECAY),
@@ -1883,13 +1879,10 @@ impl PmetalMcpServer {
 
         if !response.status().is_success() {
             let status = response.status();
-            let text = response
-                .text()
-                .await
-                .map_err(|e| {
-                    tracing::warn!("serve returned {status}: could not read response body: {e}");
-                    McpError::internal(format!("serve returned {status}: <body unreadable: {e}>"))
-                })?;
+            let text = response.text().await.map_err(|e| {
+                tracing::warn!("serve returned {status}: could not read response body: {e}");
+                McpError::internal(format!("serve returned {status}: <body unreadable: {e}>"))
+            })?;
             return Err(McpError::internal(format!(
                 "serve returned {status}: {text}"
             )));

@@ -218,14 +218,17 @@ impl<M: ShardableModel> SpeculativeDecoder<M> {
 
         // ── 3. Verify phase ─────────────────────────────────────────────────
         self.verify_cache.reset();
-        let verify_logits = self.verify_phase(&verify_ids, mask);
-        if let Err(e) = verify_logits {
-            self.verify_cache.reset();
-            return Err(e);
-        }
-        let verify_logits = verify_logits.unwrap();
+        let verify_logits = match self.verify_phase(&verify_ids, mask) {
+            Ok(logits) => logits,
+            Err(e) => {
+                self.verify_cache.reset();
+                return Err(e);
+            }
+        };
         // verify_logits: [1, seq_len_verify, vocab_size]
-        verify_logits.eval();
+        verify_logits
+            .try_eval()
+            .map_err(|e| Exception::custom(e.to_string()))?;
 
         // ── 4. Accept/reject ─────────────────────────────────────────────────
         let accepted = accept_reject(&verify_logits, &draft_tokens)?;
@@ -274,7 +277,9 @@ impl<M: ShardableModel> SpeculativeDecoder<M> {
         let draft_logits = self.model.lm_head(&norm_last)?;
 
         // Sample first draft token.
-        draft_logits.eval();
+        draft_logits
+            .try_eval()
+            .map_err(|e| Exception::custom(e.to_string()))?;
         let first_token = argmax_last(&draft_logits)?;
         draft_tokens.push(first_token);
 
@@ -288,7 +293,9 @@ impl<M: ShardableModel> SpeculativeDecoder<M> {
             let h_last = last_token_hidden(&h)?;
             let h_norm = self.model.normalize(&h_last)?;
             let logits = self.model.lm_head(&h_norm)?;
-            logits.eval();
+            logits
+                .try_eval()
+                .map_err(|e| Exception::custom(e.to_string()))?;
             draft_tokens.push(argmax_last(&logits)?);
         }
 
@@ -350,7 +357,9 @@ fn accept_reject(verify_logits: &Array, draft_tokens: &[u32]) -> Result<Vec<u32>
         let pos = (verify_start + i) as i32;
         let logit_row = pmetal_bridge::compat::ops::slice_axis(verify_logits, 1, pos, pos + 1)
             .squeeze_axes(&[0, 1]);
-        logit_row.eval();
+        logit_row
+            .try_eval()
+            .map_err(|e| Exception::custom(e.to_string()))?;
         let verifier_token = argmax_1d(&logit_row)?;
 
         accepted.push(verifier_token);
@@ -366,7 +375,9 @@ fn accept_reject(verify_logits: &Array, draft_tokens: &[u32]) -> Result<Vec<u32>
     let bonus_row =
         pmetal_bridge::compat::ops::slice_axis(verify_logits, 1, bonus_pos, bonus_pos + 1)
             .squeeze_axes(&[0, 1]);
-    bonus_row.eval();
+    bonus_row
+        .try_eval()
+        .map_err(|e| Exception::custom(e.to_string()))?;
     accepted.push(argmax_1d(&bonus_row)?);
 
     Ok(accepted)
@@ -418,7 +429,8 @@ fn argmax_last(logits: &Array) -> Result<u32, Exception> {
 fn argmax_1d(row: &Array) -> Result<u32, Exception> {
     use pmetal_bridge::compat::indexing::argmax;
     let idx = argmax(row);
-    idx.eval();
+    idx.try_eval()
+        .map_err(|e| Exception::custom(e.to_string()))?;
     Ok(idx.item::<u32>())
 }
 

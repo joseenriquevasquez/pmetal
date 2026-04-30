@@ -314,7 +314,11 @@ impl DynamicQloraModel {
             Self::DeepSeek(m) => {
                 let (quantized, lora, _) = m.memory_usage();
                 let total = quantized + lora;
-                if total == 0 { 1.0 } else { (quantized + lora) as f32 / (total * 2) as f32 }
+                if total == 0 {
+                    1.0
+                } else {
+                    (quantized + lora) as f32 / (total * 2) as f32
+                }
             }
             Self::Phi(m) => m.memory_savings(),
             Self::Cohere(m) => m.memory_savings(),
@@ -662,17 +666,6 @@ mod tests {
         qwen3_next::Qwen3NextConfig,
     };
     use std::fs;
-
-    fn write_config(model_type: &str) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = serde_json::json!({ "model_type": model_type });
-        fs::write(
-            dir.path().join("config.json"),
-            serde_json::to_string(&config).expect("config string"),
-        )
-        .expect("write config");
-        dir
-    }
 
     fn write_json_config(config: serde_json::Value) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");

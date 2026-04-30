@@ -168,8 +168,7 @@ impl Metal4CommandBuffer {
         self.encoder = Some(enc);
         self.state = CbState::Encoding;
         trace!("Metal4CommandBuffer: compute encoder created");
-        // SAFETY: encoder was just set to Some above.
-        Ok(self.encoder.as_deref().unwrap())
+        self.encoder.as_deref().ok_or(MetalError::EncoderCreation)
     }
 
     /// Pin `resource` to prevent deallocation until this struct is dropped.

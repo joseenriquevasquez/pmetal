@@ -20,8 +20,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use pmetal_bridge::compat::{
-    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param, nn,
-    ops,
+    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param, nn, ops,
 };
 
 use pmetal_core::LoraConfig;
@@ -44,12 +43,12 @@ use crate::{LoraError, LoraLinear, impl_trainable_model};
 pub enum DeepSeekLoraQProj {
     /// Two-stage: q_a_proj (hidden→q_lora_rank) then q_b_proj (q_lora_rank→n_heads*q_head_dim).
     LoRa {
-        q_a_proj: LoraLinear,
-        q_a_layernorm: nn::RmsNorm,
-        q_b_proj: LoraLinear,
+        q_a_proj: Box<LoraLinear>,
+        q_a_layernorm: Box<nn::RmsNorm>,
+        q_b_proj: Box<LoraLinear>,
     },
     /// Direct: q_proj (hidden→n_heads*q_head_dim).
-    Direct { q_proj: LoraLinear },
+    Direct { q_proj: Box<LoraLinear> },
 }
 
 impl DeepSeekLoraQProj {
@@ -118,15 +117,23 @@ impl DeepSeekLoraAttention {
                 false,
             )?;
             DeepSeekLoraQProj::LoRa {
-                q_a_proj,
-                q_a_layernorm,
-                q_b_proj,
+                q_a_proj: Box::new(q_a_proj),
+                q_a_layernorm: Box::new(q_a_layernorm),
+                q_b_proj: Box::new(q_b_proj),
             }
         } else {
             let q_rank = crate::effective_rank(lora_config, "q_proj") as i32;
-            let q_proj =
-                LoraLinear::new(hidden, n_heads * q_head_dim, q_rank, alpha, use_rslora, false)?;
-            DeepSeekLoraQProj::Direct { q_proj }
+            let q_proj = LoraLinear::new(
+                hidden,
+                n_heads * q_head_dim,
+                q_rank,
+                alpha,
+                use_rslora,
+                false,
+            )?;
+            DeepSeekLoraQProj::Direct {
+                q_proj: Box::new(q_proj),
+            }
         };
 
         let kv_a_rank = crate::effective_rank(lora_config, "kv_a_proj_with_mqa") as i32;
@@ -185,8 +192,9 @@ impl DeepSeekLoraAttention {
                 q_b_proj,
             } => {
                 let q_a_out = q_a_proj.forward(x)?;
-                let q_a_norm = pmetal_bridge::compat::Module::forward(q_a_layernorm, &q_a_out)
-                    .map_err(LoraError::Mlx)?;
+                let q_a_norm =
+                    pmetal_bridge::compat::Module::forward(q_a_layernorm.as_mut(), &q_a_out)
+                        .map_err(LoraError::Mlx)?;
                 q_b_proj.forward(&q_a_norm)
             }
             DeepSeekLoraQProj::Direct { q_proj } => q_proj.forward(x),
@@ -228,8 +236,9 @@ impl DeepSeekLoraAttention {
             .reshape(&[batch, seq_len, 1, self.config.qk_rope_head_dim])
             .transpose_axes(&[0, 2, 1, 3]);
 
-        let kv_norm = pmetal_bridge::compat::Module::forward(&mut self.kv_a_layernorm, compressed_latent)
-            .map_err(LoraError::Mlx)?;
+        let kv_norm =
+            pmetal_bridge::compat::Module::forward(&mut self.kv_a_layernorm, compressed_latent)
+                .map_err(LoraError::Mlx)?;
         let kv = self.kv_b_proj.forward(&kv_norm)?;
         let kv_dim = self.config.qk_nope_head_dim + self.config.v_head_dim;
         let kv = kv
@@ -264,8 +273,7 @@ impl DeepSeekLoraAttention {
             &k_pe,
             &[batch, self.n_heads, seq_len, self.config.qk_rope_head_dim],
         );
-        let keys =
-            pmetal_bridge::compat::ops::concatenate_axis(&[k_nope, &k_pe_broad], -1);
+        let keys = pmetal_bridge::compat::ops::concatenate_axis(&[k_nope, &k_pe_broad], -1);
         let queries = pmetal_bridge::compat::ops::concatenate_axis(&[q_nope, &q_pe], -1);
 
         let (keys, values) = if let Some((cache, layer_idx)) = cache {
@@ -405,8 +413,8 @@ impl DeepSeekLoraMoE {
 /// Dispatch enum for dense vs MoE MLP.
 #[derive(Debug)]
 pub enum DeepSeekLoraMlpType {
-    Dense(DeepSeekLoraMLP),
-    MoE(DeepSeekLoraMoE),
+    Dense(Box<DeepSeekLoraMLP>),
+    MoE(Box<DeepSeekLoraMoE>),
 }
 
 impl DeepSeekLoraMlpType {
@@ -445,13 +453,13 @@ impl DeepSeekLoraDecoderLayer {
     ) -> Result<Self, LoraError> {
         let self_attn = DeepSeekLoraAttention::new(config, lora_config, layer_id)?;
         let mlp = if config.is_moe_layer(layer_id as i32) {
-            DeepSeekLoraMlpType::MoE(DeepSeekLoraMoE::new(config, lora_config)?)
+            DeepSeekLoraMlpType::MoE(Box::new(DeepSeekLoraMoE::new(config, lora_config)?))
         } else {
-            DeepSeekLoraMlpType::Dense(DeepSeekLoraMLP::new(
+            DeepSeekLoraMlpType::Dense(Box::new(DeepSeekLoraMLP::new(
                 config.hidden_size,
                 config.intermediate_size,
                 lora_config,
-            )?)
+            )?))
         };
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
@@ -481,9 +489,8 @@ impl DeepSeekLoraDecoderLayer {
         let attn_out = self.self_attn.forward(&normed, mask, cache)?;
         let h = x.add(&attn_out);
 
-        let normed =
-            pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)
-                .map_err(LoraError::Mlx)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)
+            .map_err(LoraError::Mlx)?;
         let mlp_out = self.mlp.forward(&normed)?;
         Ok(h.add(&mlp_out))
     }
@@ -499,7 +506,11 @@ impl DeepSeekLoraDecoderLayer {
 impl ModuleParameters for DeepSeekLoraQProj {
     fn parameters(&self) -> ModuleParamRef<'_> {
         match self {
-            Self::LoRa { q_a_proj, q_a_layernorm, q_b_proj } => {
+            Self::LoRa {
+                q_a_proj,
+                q_a_layernorm,
+                q_b_proj,
+            } => {
                 let mut m = ModuleParamRef::new();
                 let mut qa = HashMap::new();
                 qa.insert(Rc::from("lora_a"), NestedValue::Value(&q_a_proj.lora_a));
@@ -529,7 +540,11 @@ impl ModuleParameters for DeepSeekLoraQProj {
 
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         match self {
-            Self::LoRa { q_a_proj, q_a_layernorm, q_b_proj } => {
+            Self::LoRa {
+                q_a_proj,
+                q_a_layernorm,
+                q_b_proj,
+            } => {
                 let mut m = ModuleParamMut::new();
                 let mut qa = HashMap::new();
                 qa.insert(Rc::from("lora_a"), NestedValue::Value(&mut q_a_proj.lora_a));
@@ -555,7 +570,11 @@ impl ModuleParameters for DeepSeekLoraQProj {
 
     fn num_parameters(&self) -> usize {
         match self {
-            Self::LoRa { q_a_proj, q_a_layernorm, q_b_proj } => {
+            Self::LoRa {
+                q_a_proj,
+                q_a_layernorm,
+                q_b_proj,
+            } => {
                 // lora_a + lora_b for each LoraLinear, plus layernorm weight
                 (q_a_proj.lora_a.size() + q_a_proj.lora_b.size())
                     + q_a_layernorm.num_parameters()
@@ -570,9 +589,12 @@ impl ModuleParameters for DeepSeekLoraAttention {
     fn num_parameters(&self) -> usize {
         self.q.num_parameters()
             + self.kv_a_layernorm.num_parameters()
-            + self.kv_a_proj_with_mqa.lora_a.size() + self.kv_a_proj_with_mqa.lora_b.size()
-            + self.kv_b_proj.lora_a.size() + self.kv_b_proj.lora_b.size()
-            + self.o_proj.lora_a.size() + self.o_proj.lora_b.size()
+            + self.kv_a_proj_with_mqa.lora_a.size()
+            + self.kv_a_proj_with_mqa.lora_b.size()
+            + self.kv_b_proj.lora_a.size()
+            + self.kv_b_proj.lora_b.size()
+            + self.o_proj.lora_a.size()
+            + self.o_proj.lora_b.size()
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
@@ -580,12 +602,24 @@ impl ModuleParameters for DeepSeekLoraAttention {
         m.extend(self.kv_a_layernorm.parameters());
         // Inline LoRA arrays for kv_a_proj_with_mqa, kv_b_proj, o_proj
         let mut kva = HashMap::new();
-        kva.insert(Rc::from("lora_a"), NestedValue::Value(&self.kv_a_proj_with_mqa.lora_a));
-        kva.insert(Rc::from("lora_b"), NestedValue::Value(&self.kv_a_proj_with_mqa.lora_b));
+        kva.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&self.kv_a_proj_with_mqa.lora_a),
+        );
+        kva.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&self.kv_a_proj_with_mqa.lora_b),
+        );
         m.insert(Rc::from("kv_a_proj_with_mqa"), NestedValue::Map(kva));
         let mut kvb = HashMap::new();
-        kvb.insert(Rc::from("lora_a"), NestedValue::Value(&self.kv_b_proj.lora_a));
-        kvb.insert(Rc::from("lora_b"), NestedValue::Value(&self.kv_b_proj.lora_b));
+        kvb.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&self.kv_b_proj.lora_a),
+        );
+        kvb.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&self.kv_b_proj.lora_b),
+        );
         m.insert(Rc::from("kv_b_proj"), NestedValue::Map(kvb));
         let mut op = HashMap::new();
         op.insert(Rc::from("lora_a"), NestedValue::Value(&self.o_proj.lora_a));
@@ -597,12 +631,24 @@ impl ModuleParameters for DeepSeekLoraAttention {
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let mut m = self.q.trainable_parameters();
         let mut kva = HashMap::new();
-        kva.insert(Rc::from("lora_a"), NestedValue::Value(&self.kv_a_proj_with_mqa.lora_a));
-        kva.insert(Rc::from("lora_b"), NestedValue::Value(&self.kv_a_proj_with_mqa.lora_b));
+        kva.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&self.kv_a_proj_with_mqa.lora_a),
+        );
+        kva.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&self.kv_a_proj_with_mqa.lora_b),
+        );
         m.insert(Rc::from("kv_a_proj_with_mqa"), NestedValue::Map(kva));
         let mut kvb = HashMap::new();
-        kvb.insert(Rc::from("lora_a"), NestedValue::Value(&self.kv_b_proj.lora_a));
-        kvb.insert(Rc::from("lora_b"), NestedValue::Value(&self.kv_b_proj.lora_b));
+        kvb.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&self.kv_b_proj.lora_a),
+        );
+        kvb.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&self.kv_b_proj.lora_b),
+        );
         m.insert(Rc::from("kv_b_proj"), NestedValue::Map(kvb));
         let mut op = HashMap::new();
         op.insert(Rc::from("lora_a"), NestedValue::Value(&self.o_proj.lora_a));
@@ -615,16 +661,34 @@ impl ModuleParameters for DeepSeekLoraAttention {
         let mut m = self.q.parameters_mut();
         m.extend(self.kv_a_layernorm.parameters_mut());
         let mut kva = HashMap::new();
-        kva.insert(Rc::from("lora_a"), NestedValue::Value(&mut self.kv_a_proj_with_mqa.lora_a));
-        kva.insert(Rc::from("lora_b"), NestedValue::Value(&mut self.kv_a_proj_with_mqa.lora_b));
+        kva.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&mut self.kv_a_proj_with_mqa.lora_a),
+        );
+        kva.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&mut self.kv_a_proj_with_mqa.lora_b),
+        );
         m.insert(Rc::from("kv_a_proj_with_mqa"), NestedValue::Map(kva));
         let mut kvb = HashMap::new();
-        kvb.insert(Rc::from("lora_a"), NestedValue::Value(&mut self.kv_b_proj.lora_a));
-        kvb.insert(Rc::from("lora_b"), NestedValue::Value(&mut self.kv_b_proj.lora_b));
+        kvb.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&mut self.kv_b_proj.lora_a),
+        );
+        kvb.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&mut self.kv_b_proj.lora_b),
+        );
         m.insert(Rc::from("kv_b_proj"), NestedValue::Map(kvb));
         let mut op = HashMap::new();
-        op.insert(Rc::from("lora_a"), NestedValue::Value(&mut self.o_proj.lora_a));
-        op.insert(Rc::from("lora_b"), NestedValue::Value(&mut self.o_proj.lora_b));
+        op.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&mut self.o_proj.lora_a),
+        );
+        op.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&mut self.o_proj.lora_b),
+        );
         m.insert(Rc::from("o_proj"), NestedValue::Map(op));
         m
     }
@@ -632,24 +696,39 @@ impl ModuleParameters for DeepSeekLoraAttention {
 
 impl ModuleParameters for DeepSeekLoraMLP {
     fn num_parameters(&self) -> usize {
-        self.gate_proj.lora_a.size() + self.gate_proj.lora_b.size()
-            + self.up_proj.lora_a.size() + self.up_proj.lora_b.size()
-            + self.down_proj.lora_a.size() + self.down_proj.lora_b.size()
+        self.gate_proj.lora_a.size()
+            + self.gate_proj.lora_b.size()
+            + self.up_proj.lora_a.size()
+            + self.up_proj.lora_b.size()
+            + self.down_proj.lora_a.size()
+            + self.down_proj.lora_b.size()
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
         let mut m = ModuleParamRef::new();
         let mut gp = HashMap::new();
-        gp.insert(Rc::from("lora_a"), NestedValue::Value(&self.gate_proj.lora_a));
-        gp.insert(Rc::from("lora_b"), NestedValue::Value(&self.gate_proj.lora_b));
+        gp.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&self.gate_proj.lora_a),
+        );
+        gp.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&self.gate_proj.lora_b),
+        );
         m.insert(Rc::from("gate_proj"), NestedValue::Map(gp));
         let mut up = HashMap::new();
         up.insert(Rc::from("lora_a"), NestedValue::Value(&self.up_proj.lora_a));
         up.insert(Rc::from("lora_b"), NestedValue::Value(&self.up_proj.lora_b));
         m.insert(Rc::from("up_proj"), NestedValue::Map(up));
         let mut dp = HashMap::new();
-        dp.insert(Rc::from("lora_a"), NestedValue::Value(&self.down_proj.lora_a));
-        dp.insert(Rc::from("lora_b"), NestedValue::Value(&self.down_proj.lora_b));
+        dp.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&self.down_proj.lora_a),
+        );
+        dp.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&self.down_proj.lora_b),
+        );
         m.insert(Rc::from("down_proj"), NestedValue::Map(dp));
         m
     }
@@ -661,16 +740,34 @@ impl ModuleParameters for DeepSeekLoraMLP {
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         let mut m = ModuleParamMut::new();
         let mut gp = HashMap::new();
-        gp.insert(Rc::from("lora_a"), NestedValue::Value(&mut self.gate_proj.lora_a));
-        gp.insert(Rc::from("lora_b"), NestedValue::Value(&mut self.gate_proj.lora_b));
+        gp.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&mut self.gate_proj.lora_a),
+        );
+        gp.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&mut self.gate_proj.lora_b),
+        );
         m.insert(Rc::from("gate_proj"), NestedValue::Map(gp));
         let mut up = HashMap::new();
-        up.insert(Rc::from("lora_a"), NestedValue::Value(&mut self.up_proj.lora_a));
-        up.insert(Rc::from("lora_b"), NestedValue::Value(&mut self.up_proj.lora_b));
+        up.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&mut self.up_proj.lora_a),
+        );
+        up.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&mut self.up_proj.lora_b),
+        );
         m.insert(Rc::from("up_proj"), NestedValue::Map(up));
         let mut dp = HashMap::new();
-        dp.insert(Rc::from("lora_a"), NestedValue::Value(&mut self.down_proj.lora_a));
-        dp.insert(Rc::from("lora_b"), NestedValue::Value(&mut self.down_proj.lora_b));
+        dp.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&mut self.down_proj.lora_a),
+        );
+        dp.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&mut self.down_proj.lora_b),
+        );
         m.insert(Rc::from("down_proj"), NestedValue::Map(dp));
         m
     }
@@ -704,7 +801,10 @@ impl ModuleParameters for DeepSeekLoraMoE {
 
     fn num_parameters(&self) -> usize {
         self.frozen_moe.num_parameters()
-            + self.shared_experts.as_ref().map_or(0, |s| s.num_parameters())
+            + self
+                .shared_experts
+                .as_ref()
+                .map_or(0, |s| s.num_parameters())
     }
 
     fn freeze_parameters(&mut self, recurse: bool) {
@@ -776,7 +876,10 @@ impl ModuleParameters for DeepSeekLoraDecoderLayer {
 
     fn parameters(&self) -> ModuleParamRef<'_> {
         let mut m = ModuleParamRef::new();
-        m.insert(Rc::from("self_attn"), NestedValue::Map(self.self_attn.parameters()));
+        m.insert(
+            Rc::from("self_attn"),
+            NestedValue::Map(self.self_attn.parameters()),
+        );
         m.insert(Rc::from("mlp"), NestedValue::Map(self.mlp.parameters()));
         m.extend(self.input_layernorm.parameters());
         m.extend(self.post_attention_layernorm.parameters());
@@ -785,14 +888,23 @@ impl ModuleParameters for DeepSeekLoraDecoderLayer {
 
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let mut m = ModuleParamRef::new();
-        m.insert(Rc::from("self_attn"), NestedValue::Map(self.self_attn.trainable_parameters()));
-        m.insert(Rc::from("mlp"), NestedValue::Map(self.mlp.trainable_parameters()));
+        m.insert(
+            Rc::from("self_attn"),
+            NestedValue::Map(self.self_attn.trainable_parameters()),
+        );
+        m.insert(
+            Rc::from("mlp"),
+            NestedValue::Map(self.mlp.trainable_parameters()),
+        );
         m
     }
 
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         let mut m = ModuleParamMut::new();
-        m.insert(Rc::from("self_attn"), NestedValue::Map(self.self_attn.parameters_mut()));
+        m.insert(
+            Rc::from("self_attn"),
+            NestedValue::Map(self.self_attn.parameters_mut()),
+        );
         m.insert(Rc::from("mlp"), NestedValue::Map(self.mlp.parameters_mut()));
         m.extend(self.input_layernorm.parameters_mut());
         m.extend(self.post_attention_layernorm.parameters_mut());
@@ -814,8 +926,8 @@ pub struct DeepSeekLoraModel {
 
 impl DeepSeekLoraModel {
     pub fn new(config: DeepSeekConfig, lora_config: LoraConfig) -> Result<Self, LoraError> {
-        let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)
-            .map_err(LoraError::Mlx)?;
+        let embed_tokens =
+            nn::Embedding::new(config.vocab_size, config.hidden_size).map_err(LoraError::Mlx)?;
         let layers = (0..config.num_hidden_layers as usize)
             .map(|i| DeepSeekLoraDecoderLayer::new(&config, &lora_config, i))
             .collect::<Result<Vec<_>, _>>()?;
@@ -896,7 +1008,11 @@ impl DeepSeekLoraModel {
 impl ModuleParameters for DeepSeekLoraModel {
     fn num_parameters(&self) -> usize {
         self.embed_tokens.num_parameters()
-            + self.layers.iter().map(|l| l.num_parameters()).sum::<usize>()
+            + self
+                .layers
+                .iter()
+                .map(|l| l.num_parameters())
+                .sum::<usize>()
             + self.norm.num_parameters()
     }
 
@@ -904,7 +1020,10 @@ impl ModuleParameters for DeepSeekLoraModel {
         let mut m = ModuleParamRef::new();
         m.extend(self.embed_tokens.parameters());
         for (i, layer) in self.layers.iter().enumerate() {
-            m.insert(Rc::from(format!("{}", i)), NestedValue::Map(layer.parameters()));
+            m.insert(
+                Rc::from(format!("{}", i)),
+                NestedValue::Map(layer.parameters()),
+            );
         }
         m.extend(self.norm.parameters());
         m
@@ -913,7 +1032,10 @@ impl ModuleParameters for DeepSeekLoraModel {
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let mut m = ModuleParamRef::new();
         for (i, layer) in self.layers.iter().enumerate() {
-            m.insert(Rc::from(format!("{}", i)), NestedValue::Map(layer.trainable_parameters()));
+            m.insert(
+                Rc::from(format!("{}", i)),
+                NestedValue::Map(layer.trainable_parameters()),
+            );
         }
         m
     }
@@ -922,7 +1044,10 @@ impl ModuleParameters for DeepSeekLoraModel {
         let mut m = ModuleParamMut::new();
         m.extend(self.embed_tokens.parameters_mut());
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            m.insert(Rc::from(format!("{}", i)), NestedValue::Map(layer.parameters_mut()));
+            m.insert(
+                Rc::from(format!("{}", i)),
+                NestedValue::Map(layer.parameters_mut()),
+            );
         }
         m.extend(self.norm.parameters_mut());
         m
@@ -937,8 +1062,10 @@ fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0f32);
     // where mask_bool: 0, else -inf  →  upper-triangular entries are -inf
-    Ok(pmetal_bridge::compat::ops::r#where(&mask_bool, &zero, &neg_inf)
-        .reshape(&[1, 1, seq_len, seq_len]))
+    Ok(
+        pmetal_bridge::compat::ops::r#where(&mask_bool, &zero, &neg_inf)
+            .reshape(&[1, 1, seq_len, seq_len]),
+    )
 }
 
 // ─── LoRA parameter management helpers ───────────────────────────────────────
@@ -1015,10 +1142,7 @@ fn insert_lora(params: &mut HashMap<Rc<str>, Array>, prefix: &str, proj: &LoraLi
     params.insert(Rc::from(format!("{}.lora_b", prefix)), proj.lora_b.clone());
 }
 
-fn set_deepseek_lora_params(
-    model: &mut DeepSeekLoraModel,
-    params: &HashMap<Rc<str>, Array>,
-) {
+fn set_deepseek_lora_params(model: &mut DeepSeekLoraModel, params: &HashMap<Rc<str>, Array>) {
     for (i, layer) in model.layers.iter_mut().enumerate() {
         let lp = format!("layers.{}", i);
 
@@ -1027,16 +1151,8 @@ fn set_deepseek_lora_params(
             DeepSeekLoraQProj::LoRa {
                 q_a_proj, q_b_proj, ..
             } => {
-                apply_lora_keys(
-                    &format!("{}.self_attn.q_a_proj", lp),
-                    params,
-                    q_a_proj,
-                );
-                apply_lora_keys(
-                    &format!("{}.self_attn.q_b_proj", lp),
-                    params,
-                    q_b_proj,
-                );
+                apply_lora_keys(&format!("{}.self_attn.q_a_proj", lp), params, q_a_proj);
+                apply_lora_keys(&format!("{}.self_attn.q_b_proj", lp), params, q_b_proj);
             }
             DeepSeekLoraQProj::Direct { q_proj } => {
                 apply_lora_keys(&format!("{}.self_attn.q_proj", lp), params, q_proj);
@@ -1076,11 +1192,7 @@ fn set_deepseek_lora_params(
     }
 }
 
-fn apply_lora_keys(
-    prefix: &str,
-    params: &HashMap<Rc<str>, Array>,
-    proj: &mut LoraLinear,
-) {
+fn apply_lora_keys(prefix: &str, params: &HashMap<Rc<str>, Array>, proj: &mut LoraLinear) {
     if let Some(v) = params.get(&Rc::from(format!("{}.lora_a", prefix))) {
         proj.lora_a = v.clone();
     }
@@ -1157,11 +1269,7 @@ impl DeepSeekLoraForCausalLM {
         }
     }
 
-    pub fn forward(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-    ) -> Result<Array, LoraError> {
+    pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         let ckpt = self.checkpoint_config.clone();
         let h = self.model.forward(input_ids, mask, ckpt.as_ref())?;
         Ok(self.apply_lm_head(&h))
@@ -1194,11 +1302,8 @@ impl DeepSeekLoraForCausalLM {
         noise_alpha: f32,
     ) -> Result<Array, LoraError> {
         let ckpt = self.checkpoint_config.clone();
-        let mut h = pmetal_bridge::compat::Module::forward(
-            &mut self.model.embed_tokens,
-            input_ids,
-        )
-        .map_err(LoraError::Mlx)?;
+        let mut h = pmetal_bridge::compat::Module::forward(&mut self.model.embed_tokens, input_ids)
+            .map_err(LoraError::Mlx)?;
 
         let seq_len = input_ids.dim(1) as f32;
         let embed_dim = h.dim(2) as f32;
@@ -1218,7 +1323,10 @@ impl DeepSeekLoraForCausalLM {
             mask.cloned()
         };
 
-        let layers_per_block = ckpt.as_ref().map(|c| c.layers_per_block).unwrap_or(usize::MAX);
+        let layers_per_block = ckpt
+            .as_ref()
+            .map(|c| c.layers_per_block)
+            .unwrap_or(usize::MAX);
         let checkpointing = ckpt.as_ref().map(|c| c.enabled).unwrap_or(false);
 
         for (idx, layer) in self.model.layers.iter_mut().enumerate() {
@@ -1322,10 +1430,7 @@ impl DeepSeekLoraForCausalLM {
     /// - `model.layers.{i}.post_attention_layernorm.weight`
     /// - `model.norm.weight`
     /// - `lm_head.weight`
-    pub fn load_base_weights(
-        &mut self,
-        weights: &HashMap<String, Array>,
-    ) -> Result<(), LoraError> {
+    pub fn load_base_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), LoraError> {
         // Embeddings
         if let Some(w) = weights.get("model.embed_tokens.weight") {
             self.model.embed_tokens.weight = Param::new(w.clone());
@@ -1337,41 +1442,31 @@ impl DeepSeekLoraForCausalLM {
             // Attention projections — base weights inside LoraLinear
             match &mut layer.self_attn.q {
                 DeepSeekLoraQProj::LoRa {
-                    q_a_proj, q_b_proj, q_a_layernorm,
+                    q_a_proj,
+                    q_b_proj,
+                    q_a_layernorm,
                 } => {
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.q_a_proj.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.q_a_proj.weight")) {
                         *q_a_proj.weight_mut() = w.clone();
                     }
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.q_a_layernorm.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.q_a_layernorm.weight")) {
                         q_a_layernorm.weight = Param::new(w.clone());
                     }
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.q_b_proj.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.q_b_proj.weight")) {
                         *q_b_proj.weight_mut() = w.clone();
                     }
                 }
                 DeepSeekLoraQProj::Direct { q_proj } => {
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.q_proj.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.q_proj.weight")) {
                         *q_proj.weight_mut() = w.clone();
                     }
                 }
             }
 
-            if let Some(w) =
-                weights.get(&format!("{pfx}.self_attn.kv_a_proj_with_mqa.weight"))
-            {
+            if let Some(w) = weights.get(&format!("{pfx}.self_attn.kv_a_proj_with_mqa.weight")) {
                 *layer.self_attn.kv_a_proj_with_mqa.weight_mut() = w.clone();
             }
-            if let Some(w) =
-                weights.get(&format!("{pfx}.self_attn.kv_a_layernorm.weight"))
-            {
+            if let Some(w) = weights.get(&format!("{pfx}.self_attn.kv_a_layernorm.weight")) {
                 layer.self_attn.kv_a_layernorm.weight = Param::new(w.clone());
             }
             if let Some(w) = weights.get(&format!("{pfx}.self_attn.kv_b_proj.weight")) {
@@ -1385,9 +1480,7 @@ impl DeepSeekLoraForCausalLM {
             if let Some(w) = weights.get(&format!("{pfx}.input_layernorm.weight")) {
                 layer.input_layernorm.weight = Param::new(w.clone());
             }
-            if let Some(w) =
-                weights.get(&format!("{pfx}.post_attention_layernorm.weight"))
-            {
+            if let Some(w) = weights.get(&format!("{pfx}.post_attention_layernorm.weight")) {
                 layer.post_attention_layernorm.weight = Param::new(w.clone());
             }
 
@@ -1409,8 +1502,7 @@ impl DeepSeekLoraForCausalLM {
                     if let Some(w) = weights.get(&format!("{pfx}.mlp.gate.weight")) {
                         moe.frozen_moe.gate.weight.weight = Param::new(w.clone());
                     }
-                    if let Some(b) =
-                        weights.get(&format!("{pfx}.mlp.gate.e_score_correction_bias"))
+                    if let Some(b) = weights.get(&format!("{pfx}.mlp.gate.e_score_correction_bias"))
                     {
                         moe.frozen_moe.gate.e_score_correction_bias = b.clone();
                     }
@@ -1436,18 +1528,18 @@ impl DeepSeekLoraForCausalLM {
 
                     // LoRA-adapted shared expert base weights
                     if let Some(ref mut se) = moe.shared_experts {
-                        if let Some(w) = weights
-                            .get(&format!("{pfx}.mlp.shared_experts.gate_proj.weight"))
+                        if let Some(w) =
+                            weights.get(&format!("{pfx}.mlp.shared_experts.gate_proj.weight"))
                         {
                             *se.gate_proj.weight_mut() = w.clone();
                         }
-                        if let Some(w) = weights
-                            .get(&format!("{pfx}.mlp.shared_experts.up_proj.weight"))
+                        if let Some(w) =
+                            weights.get(&format!("{pfx}.mlp.shared_experts.up_proj.weight"))
                         {
                             *se.up_proj.weight_mut() = w.clone();
                         }
-                        if let Some(w) = weights
-                            .get(&format!("{pfx}.mlp.shared_experts.down_proj.weight"))
+                        if let Some(w) =
+                            weights.get(&format!("{pfx}.mlp.shared_experts.down_proj.weight"))
                         {
                             *se.down_proj.weight_mut() = w.clone();
                         }
@@ -1495,7 +1587,11 @@ impl DeepSeekLoraForCausalLM {
         for layer in &mut self.model.layers {
             // Attention — base weights
             match &layer.self_attn.q {
-                DeepSeekLoraQProj::LoRa { q_a_proj, q_b_proj, q_a_layernorm } => {
+                DeepSeekLoraQProj::LoRa {
+                    q_a_proj,
+                    q_b_proj,
+                    q_a_layernorm,
+                } => {
                     q_a_proj.weight().eval();
                     q_a_proj.lora_a.eval();
                     q_a_proj.lora_b.eval();
@@ -1616,8 +1712,7 @@ impl DeepSeekLoraForCausalLM {
 
 impl ModuleParameters for DeepSeekLoraForCausalLM {
     fn num_parameters(&self) -> usize {
-        self.model.num_parameters()
-            + self.lm_head.as_ref().map_or(0, |h| h.num_parameters())
+        self.model.num_parameters() + self.lm_head.as_ref().map_or(0, |h| h.num_parameters())
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
@@ -1631,13 +1726,19 @@ impl ModuleParameters for DeepSeekLoraForCausalLM {
 
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let mut m = ModuleParamRef::new();
-        m.insert(Rc::from("model"), NestedValue::Map(self.model.trainable_parameters()));
+        m.insert(
+            Rc::from("model"),
+            NestedValue::Map(self.model.trainable_parameters()),
+        );
         m
     }
 
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         let mut m = ModuleParamMut::new();
-        m.insert(Rc::from("model"), NestedValue::Map(self.model.parameters_mut()));
+        m.insert(
+            Rc::from("model"),
+            NestedValue::Map(self.model.parameters_mut()),
+        );
         if let Some(ref mut head) = self.lm_head {
             m.extend(head.parameters_mut());
         }
@@ -1751,7 +1852,7 @@ mod tests {
         model.set_lora_parameters(&zeroed);
 
         let params2 = model.lora_parameters();
-        for (_, arr) in &params2 {
+        for arr in params2.values() {
             arr.eval().unwrap();
         }
         assert_eq!(params2.len(), params.len());
@@ -1776,10 +1877,7 @@ mod tests {
         let has_q_proj = params.keys().any(|k| k.contains("q_proj.lora_a"));
         assert!(has_q_proj, "expected q_proj lora keys for direct variant");
         let has_q_a = params.keys().any(|k| k.contains("q_a_proj.lora_a"));
-        assert!(
-            !has_q_a,
-            "q_a_proj should not appear in direct-q variant"
-        );
+        assert!(!has_q_a, "q_a_proj should not appear in direct-q variant");
     }
 
     #[test]

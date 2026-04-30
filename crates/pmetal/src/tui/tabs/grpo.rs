@@ -118,29 +118,65 @@ impl GrpoTab {
             let v = self.form.value("Output Dir");
             if v.is_empty() { spec.output_dir } else { v }
         };
-        spec.num_generations = self.form.value("Num Generations").parse().unwrap_or(spec.num_generations);
+        spec.num_generations = self
+            .form
+            .value("Num Generations")
+            .parse()
+            .unwrap_or(spec.num_generations);
         spec.beta = self.form.value("KL β").parse().unwrap_or(spec.beta);
-        spec.learning_rate = self.form.value("Learning Rate").parse().unwrap_or(spec.learning_rate);
+        spec.learning_rate = self
+            .form
+            .value("Learning Rate")
+            .parse()
+            .unwrap_or(spec.learning_rate);
         spec.epochs = self.form.value("Epochs").parse().unwrap_or(spec.epochs);
         spec.lora_r = self.form.value("LoRA r").parse().unwrap_or(spec.lora_r);
         spec.lora_alpha = self.form.value("LoRA α").parse().unwrap_or(spec.lora_alpha);
-        spec.max_seq_len = self.form.value("Max Seq Len").parse().unwrap_or(spec.max_seq_len);
-        spec.max_completion_length = self.form.value("Max Completion Length").parse().unwrap_or(spec.max_completion_length);
+        spec.max_seq_len = self
+            .form
+            .value("Max Seq Len")
+            .parse()
+            .unwrap_or(spec.max_seq_len);
+        spec.max_completion_length = self
+            .form
+            .value("Max Completion Length")
+            .parse()
+            .unwrap_or(spec.max_completion_length);
         spec.seed = self.form.value("Seed").parse().unwrap_or(spec.seed);
         spec.dapo = self.form.value("DAPO") == "Enabled";
         spec.reasoning_rewards = self.form.value("Reasoning Rewards") == "Enabled";
         spec.no_flash_attention = self.form.value("Disable Flash Attention") == "Enabled";
         spec.vlm = self.form.value("VLM Mode") == "Enabled";
-        spec.max_image_size = self.form.value("Max Image Size").parse().unwrap_or(spec.max_image_size);
+        spec.max_image_size = self
+            .form
+            .value("Max Image Size")
+            .parse()
+            .unwrap_or(spec.max_image_size);
         spec.speculative = self.form.value("Speculative Decoding") == "Enabled";
-        spec.speculative_draft_tokens = self.form.value("Speculative Draft Tokens").parse().unwrap_or(spec.speculative_draft_tokens);
+        spec.speculative_draft_tokens = self
+            .form
+            .value("Speculative Draft Tokens")
+            .parse()
+            .unwrap_or(spec.speculative_draft_tokens);
         spec.async_rewards = self.form.value("Async Rewards") == "Enabled";
         let rm = self.form.value("Reward Model");
         spec.reward_model = if rm.is_empty() { None } else { Some(rm) };
-        spec.reward_model_max_length = self.form.value("Reward Model Max Length").parse().unwrap_or(spec.reward_model_max_length);
-        spec.reward_model_weight = self.form.value("Reward Model Weight").parse().unwrap_or(spec.reward_model_weight);
+        spec.reward_model_max_length = self
+            .form
+            .value("Reward Model Max Length")
+            .parse()
+            .unwrap_or(spec.reward_model_max_length);
+        spec.reward_model_weight = self
+            .form
+            .value("Reward Model Weight")
+            .parse()
+            .unwrap_or(spec.reward_model_weight);
         let rm_template = self.form.value("Reward Model Template");
-        spec.reward_model_template = if rm_template.is_empty() { None } else { Some(rm_template) };
+        spec.reward_model_template = if rm_template.is_empty() {
+            None
+        } else {
+            Some(rm_template)
+        };
         let kv_bits = self.form.value("GRPO KV Bits");
         spec.grpo_kv_bits = kv_bits.parse().ok();
         spec

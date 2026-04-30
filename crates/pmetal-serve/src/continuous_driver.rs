@@ -288,7 +288,9 @@ pub fn drive_prefill_step<F: SlotForward>(
     } else {
         // Non-final chunk: we don't need the logits at all, but we
         // must evaluate the forward to materialize the cache update.
-        logits.eval();
+        logits
+            .try_eval()
+            .map_err(|e| Exception::custom(e.to_string()))?;
         Ok(None)
     }
 }
@@ -480,7 +482,9 @@ fn extract_last_logits(logits: &Array) -> Result<Array, Exception> {
         )));
     }
     let idx = Array::from_i32_slice(&[seq_len - 1]);
-    Ok(logits.take_axis(&idx, seq_axis as i32).squeeze_axes(&[seq_axis as i32]))
+    Ok(logits
+        .take_axis(&idx, seq_axis as i32)
+        .squeeze_axes(&[seq_axis as i32]))
 }
 
 #[cfg(test)]
@@ -543,11 +547,7 @@ mod tests {
     }
 
     impl SlotForward for StubForward {
-        fn forward(
-            &mut self,
-            tokens: &[u32],
-            cache: &mut KVCache,
-        ) -> Result<Array, Exception> {
+        fn forward(&mut self, tokens: &[u32], cache: &mut KVCache) -> Result<Array, Exception> {
             self.calls += 1;
             // Extend the cache a tiny bit so seq_len advances — mirrors
             // the real forward's side effect.
@@ -678,8 +678,7 @@ mod tests {
             calls: 0,
         };
         let empty: &[u32] = &[];
-        let err =
-            drive_decode_step(&mut stub, &mut state, &[(SlotId(99), 1, empty)]).unwrap_err();
+        let err = drive_decode_step(&mut stub, &mut state, &[(SlotId(99), 1, empty)]).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("not admitted"), "unexpected error: {msg}");
     }

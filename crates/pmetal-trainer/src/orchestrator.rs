@@ -748,7 +748,10 @@ fn run_qlora_path(
     phase_cb: Option<&dyn PhaseCallback>,
     has_metrics_cb: bool,
 ) -> anyhow::Result<(f64, usize, usize)> {
-    let qlora_cfg = config.qlora.as_ref().unwrap();
+    let qlora_cfg = config
+        .qlora
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("QLoRA path requires qlora config"))?;
     let quant_scheme = match qlora_cfg.scheme {
         QuantizationScheme::Nf4 => QuantScheme::NF4,
         QuantizationScheme::Fp4 => QuantScheme::FP4,

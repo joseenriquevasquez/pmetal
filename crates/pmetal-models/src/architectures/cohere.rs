@@ -14,9 +14,7 @@ use pmetal_bridge::compat::{
 };
 use pmetal_bridge::impl_module_params;
 
-use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope,
-};
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 
 use serde::{Deserialize, Serialize};
@@ -311,14 +309,13 @@ impl CohereAttention {
             (k, v)
         };
 
-        let attn_config =
-            FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
-                .with_scale(self.scale)
-                .with_mask_type(if mask.is_some() {
-                    AttentionMaskType::None
-                } else {
-                    AttentionMaskType::Causal
-                });
+        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
+            .with_scale(self.scale)
+            .with_mask_type(if mask.is_some() {
+                AttentionMaskType::None
+            } else {
+                AttentionMaskType::Causal
+            });
         let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
 
         let output = output

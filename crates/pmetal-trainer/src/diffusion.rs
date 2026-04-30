@@ -938,7 +938,7 @@ impl DiffusionSampler {
                         let mut indexed: Vec<(usize, f32)> = (prompt_len..total_len)
                             .map(|i| (i, confidences[i]))
                             .collect();
-                        indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                        indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
 
                         for entry in indexed.iter().take(num_to_remask) {
                             let idx = entry.0;

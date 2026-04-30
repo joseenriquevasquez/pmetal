@@ -971,9 +971,7 @@ impl GemmaForCausalLM {
         active_indices: &[usize],
         cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
     ) -> Result<Array, Exception> {
-        use crate::common::{
-            BatchedGqaAttnCfg, batched_perinorm_layer, batched_prenorm_layer,
-        };
+        use crate::common::{BatchedGqaAttnCfg, batched_perinorm_layer, batched_prenorm_layer};
 
         let cfg = &self.model.config;
         let head_dim = cfg.get_head_dim();

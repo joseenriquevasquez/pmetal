@@ -212,8 +212,16 @@ impl OllamaTab {
 
         for (i, field) in self.fields.iter().enumerate() {
             let is_sel = i == self.selected;
-            let label_style = if is_sel { THEME.kv_key } else { THEME.text_muted };
-            let val_style = if is_sel { THEME.table_selected } else { THEME.kv_value };
+            let label_style = if is_sel {
+                THEME.kv_key
+            } else {
+                THEME.text_muted
+            };
+            let val_style = if is_sel {
+                THEME.table_selected
+            } else {
+                THEME.kv_value
+            };
 
             let display_val = if field.editing {
                 format!("{}_", field.edit_buf)

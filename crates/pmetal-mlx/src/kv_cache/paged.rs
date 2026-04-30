@@ -1,6 +1,7 @@
 //! Paged KV cache - block-based memory management for batched inference.
 
 use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
+use tracing::warn;
 
 use super::dtype_size;
 
@@ -39,7 +40,7 @@ impl PagedKVCacheConfig {
         head_dim: usize,
         max_seq_len: usize,
     ) -> Self {
-        let max_blocks = (max_seq_len + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
+        let max_blocks = max_seq_len.div_ceil(DEFAULT_BLOCK_SIZE);
         Self {
             num_layers,
             num_kv_heads,
@@ -52,8 +53,10 @@ impl PagedKVCacheConfig {
 
     /// Set the block size.
     pub fn with_block_size(mut self, block_size: usize) -> Self {
+        let previous_capacity = self.max_blocks.saturating_mul(self.block_size);
+        let block_size = block_size.max(1);
         self.block_size = block_size;
-        self.max_blocks = (self.max_blocks * DEFAULT_BLOCK_SIZE + block_size - 1) / block_size;
+        self.max_blocks = previous_capacity.div_ceil(block_size);
         self
     }
 
@@ -79,6 +82,10 @@ pub struct BlockAllocator {
     total_blocks: usize,
     /// Block size in tokens.
     block_size: usize,
+    /// Authoritative count of free blocks.
+    free_count: usize,
+    /// Whether each physical block is currently free.
+    is_free: Vec<bool>,
 }
 
 impl BlockAllocator {
@@ -88,26 +95,63 @@ impl BlockAllocator {
             free_blocks: (0..num_blocks).rev().collect(), // Stack-like for LIFO reuse
             total_blocks: num_blocks,
             block_size,
+            free_count: num_blocks,
+            is_free: vec![true; num_blocks],
         }
     }
 
     /// Allocate a block, returning its index.
     pub fn allocate(&mut self) -> Option<usize> {
-        self.free_blocks.pop()
+        while let Some(block_idx) = self.free_blocks.pop() {
+            if block_idx >= self.total_blocks {
+                warn!(block_idx, "ignoring out-of-range free KV cache block");
+                continue;
+            }
+            if !self.is_free[block_idx] {
+                warn!(block_idx, "ignoring duplicate free KV cache block entry");
+                continue;
+            }
+
+            self.is_free[block_idx] = false;
+            self.free_count = self.free_count.saturating_sub(1);
+            return Some(block_idx);
+        }
+
+        None
     }
 
     /// Allocate multiple blocks.
     pub fn allocate_n(&mut self, n: usize) -> Option<Vec<usize>> {
-        if self.free_blocks.len() < n {
+        if self.free_count < n {
             return None;
         }
-        let blocks: Vec<usize> = (0..n).map(|_| self.free_blocks.pop().unwrap()).collect();
+
+        let mut blocks = Vec::with_capacity(n);
+        for _ in 0..n {
+            if let Some(block_idx) = self.allocate() {
+                blocks.push(block_idx);
+            } else {
+                self.free_all(&blocks);
+                return None;
+            }
+        }
+
         Some(blocks)
     }
 
     /// Free a block.
     pub fn free(&mut self, block_idx: usize) {
-        debug_assert!(block_idx < self.total_blocks);
+        if block_idx >= self.total_blocks {
+            warn!(block_idx, "ignoring out-of-range KV cache block free");
+            return;
+        }
+        if self.is_free[block_idx] {
+            warn!(block_idx, "ignoring duplicate KV cache block free");
+            return;
+        }
+
+        self.is_free[block_idx] = true;
+        self.free_count = self.free_count.saturating_add(1).min(self.total_blocks);
         self.free_blocks.push(block_idx);
     }
 
@@ -120,12 +164,12 @@ impl BlockAllocator {
 
     /// Get the number of free blocks.
     pub fn num_free(&self) -> usize {
-        self.free_blocks.len()
+        self.free_count
     }
 
     /// Get the number of allocated blocks.
     pub fn num_allocated(&self) -> usize {
-        self.total_blocks - self.free_blocks.len()
+        self.total_blocks - self.free_count
     }
 
     /// Get the block size.
@@ -156,7 +200,7 @@ impl BlockTable {
         Self {
             block_indices: Vec::new(),
             num_tokens: 0,
-            block_size,
+            block_size: block_size.max(1),
         }
     }
 
@@ -182,9 +226,9 @@ impl BlockTable {
 
     /// Add tokens to the table, returning number of new blocks needed.
     pub fn add_tokens(&mut self, num_tokens: usize) -> usize {
-        let old_blocks = (self.num_tokens + self.block_size - 1) / self.block_size;
-        self.num_tokens += num_tokens;
-        let new_blocks = (self.num_tokens + self.block_size - 1) / self.block_size;
+        let old_blocks = self.num_tokens.div_ceil(self.block_size);
+        self.num_tokens = self.num_tokens.saturating_add(num_tokens);
+        let new_blocks = self.num_tokens.div_ceil(self.block_size);
         new_blocks.saturating_sub(old_blocks)
     }
 
@@ -240,6 +284,12 @@ pub struct PagedKVCache {
 impl PagedKVCache {
     /// Create a new paged KV cache.
     pub fn new(config: PagedKVCacheConfig) -> Self {
+        let mut config = config;
+        if config.block_size == 0 {
+            warn!("paged KV cache block size of zero requested; using block size 1");
+            config.block_size = 1;
+        }
+
         let num_layers = config.num_layers;
         let max_blocks = config.max_blocks;
 
@@ -264,51 +314,66 @@ impl PagedKVCache {
     /// # Arguments
     /// * `initial_tokens` - Number of tokens to allocate initially (typically prompt length)
     pub fn allocate_sequence(&mut self, initial_tokens: usize) -> Result<u64, Exception> {
-        let num_blocks = (initial_tokens + self.config.block_size - 1) / self.config.block_size;
+        let seq_id = self.next_seq_id;
+        let next_seq_id = self
+            .next_seq_id
+            .checked_add(1)
+            .ok_or_else(|| Exception::custom("KV cache sequence ID overflow"))?;
+
+        let num_blocks = initial_tokens.div_ceil(self.config.block_size);
         let blocks = self
             .allocator
             .allocate_n(num_blocks)
             .ok_or_else(|| Exception::custom("Out of KV cache blocks"))?;
 
-        let seq_id = self.next_seq_id;
-        self.next_seq_id += 1;
+        for &block_idx in &blocks {
+            if let Err(err) = self.ensure_block_allocated(block_idx) {
+                self.allocator.free_all(&blocks);
+                return Err(err);
+            }
+        }
 
         let mut table = BlockTable::new(self.config.block_size);
         for block_idx in blocks {
             table.add_block(block_idx);
-            // Lazy allocation: initialize block arrays on first use
-            self.ensure_block_allocated(block_idx)?;
         }
         table.num_tokens = initial_tokens;
 
+        self.next_seq_id = next_seq_id;
         self.block_tables.insert(seq_id, table);
         Ok(seq_id)
     }
 
     /// Extend a sequence with additional tokens.
     pub fn extend_sequence(&mut self, seq_id: u64, num_tokens: usize) -> Result<(), Exception> {
-        // Calculate new blocks needed without holding borrow
-        let new_blocks_needed = {
+        let (new_tokens, new_blocks_needed) = {
             let table = self
                 .block_tables
-                .get_mut(&seq_id)
+                .get(&seq_id)
                 .ok_or_else(|| Exception::custom("Sequence not found"))?;
-            table.add_tokens(num_tokens)
+            let new_tokens = table
+                .num_tokens
+                .checked_add(num_tokens)
+                .ok_or_else(|| Exception::custom("KV cache token count overflow"))?;
+            let old_blocks = table.num_tokens.div_ceil(self.config.block_size);
+            let new_blocks = new_tokens.div_ceil(self.config.block_size);
+            (new_tokens, new_blocks.saturating_sub(old_blocks))
         };
 
-        // Allocate and ensure blocks
-        let mut new_block_indices = Vec::new();
-        for _ in 0..new_blocks_needed {
-            let block_idx = self
-                .allocator
-                .allocate()
-                .ok_or_else(|| Exception::custom("Out of KV cache blocks"))?;
-            self.ensure_block_allocated(block_idx)?;
-            new_block_indices.push(block_idx);
+        let new_block_indices = self
+            .allocator
+            .allocate_n(new_blocks_needed)
+            .ok_or_else(|| Exception::custom("Out of KV cache blocks"))?;
+
+        for &block_idx in &new_block_indices {
+            if let Err(err) = self.ensure_block_allocated(block_idx) {
+                self.allocator.free_all(&new_block_indices);
+                return Err(err);
+            }
         }
 
-        // Add blocks to table
         if let Some(table) = self.block_tables.get_mut(&seq_id) {
+            table.num_tokens = new_tokens;
             for block_idx in new_block_indices {
                 table.add_block(block_idx);
             }
@@ -340,6 +405,8 @@ impl PagedKVCache {
         new_values: &Array,
         start_pos: usize,
     ) -> Result<(), Exception> {
+        self.validate_layer(layer_idx)?;
+        self.validate_update_inputs(new_keys, new_values)?;
         let num_new_tokens = new_keys.dim(2) as usize;
 
         // Collect all block/offset pairs first to avoid holding table borrow
@@ -351,7 +418,7 @@ impl PagedKVCache {
 
             (0..num_new_tokens)
                 .map(|i| {
-                    let token_pos = start_pos + i;
+                    let token_pos = start_pos.checked_add(i)?;
                     table.get_block_and_offset(token_pos)
                 })
                 .collect::<Option<Vec<_>>>()
@@ -385,6 +452,7 @@ impl PagedKVCache {
     ///
     /// Returns concatenated K/V arrays for all tokens in the sequence.
     pub fn fetch(&self, seq_id: u64, layer_idx: usize) -> Result<(Array, Array), Exception> {
+        self.validate_layer(layer_idx)?;
         let table = self
             .block_tables
             .get(&seq_id)
@@ -493,6 +561,10 @@ impl PagedKVCache {
 
     /// Ensure a block is allocated (lazy allocation).
     fn ensure_block_allocated(&mut self, block_idx: usize) -> Result<(), Exception> {
+        if block_idx >= self.config.max_blocks {
+            return Err(Exception::custom("KV cache block index out of range"));
+        }
+
         let shape = [
             self.config.num_kv_heads as i32,
             self.config.block_size as i32,
@@ -517,6 +589,14 @@ impl PagedKVCache {
         key: &Array,
         value: &Array,
     ) -> Result<(), Exception> {
+        self.validate_layer(layer_idx)?;
+        if block_idx >= self.config.max_blocks {
+            return Err(Exception::custom("KV cache block index out of range"));
+        }
+        if offset >= self.config.block_size {
+            return Err(Exception::custom("KV cache block offset out of range"));
+        }
+
         // Get or create the block
         let k_block = self.key_blocks[layer_idx][block_idx]
             .take()
@@ -547,6 +627,50 @@ impl PagedKVCache {
 
         self.key_blocks[layer_idx][block_idx] = Some(new_k);
         self.value_blocks[layer_idx][block_idx] = Some(new_v);
+
+        Ok(())
+    }
+
+    fn validate_layer(&self, layer_idx: usize) -> Result<(), Exception> {
+        if layer_idx >= self.config.num_layers {
+            return Err(Exception::custom("KV cache layer index out of range"));
+        }
+        Ok(())
+    }
+
+    fn validate_update_inputs(
+        &self,
+        new_keys: &Array,
+        new_values: &Array,
+    ) -> Result<(), Exception> {
+        if new_keys.ndim() != 4 || new_values.ndim() != 4 {
+            return Err(Exception::custom(
+                "Paged KV cache update expects key/value tensors shaped [1, heads, seq, dim]",
+            ));
+        }
+
+        let key_shape = new_keys.shape();
+        let value_shape = new_values.shape();
+        if key_shape[0] != 1 || value_shape[0] != 1 {
+            return Err(Exception::custom(
+                "Paged KV cache update only supports batch size 1",
+            ));
+        }
+        if key_shape[1] != self.config.num_kv_heads as i32
+            || value_shape[1] != self.config.num_kv_heads as i32
+        {
+            return Err(Exception::custom("Paged KV cache head count mismatch"));
+        }
+        if key_shape[2] != value_shape[2] {
+            return Err(Exception::custom(
+                "Paged KV cache key/value sequence length mismatch",
+            ));
+        }
+        if key_shape[3] != self.config.head_dim as i32
+            || value_shape[3] != self.config.head_dim as i32
+        {
+            return Err(Exception::custom("Paged KV cache head dimension mismatch"));
+        }
 
         Ok(())
     }

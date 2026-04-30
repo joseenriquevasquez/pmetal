@@ -12,7 +12,6 @@
 // Re-export the parent module's surface into tests scope so the nested
 // `mod tests { use super::*; }` block picks up everything the original
 // inline test module saw via its `super::*` import.
-use super::*;
 use super::config::HOT_EVICTION_CHUNK;
 use super::dispatch::{
     gpu_compute_outlier_partition, gpu_dequantize_key_subvector, gpu_dequantize_keys,
@@ -26,6 +25,7 @@ use super::encode::{
 };
 use super::math::{build_beta_codebook, l2_norm};
 use super::state::TensorRuntime;
+use super::*;
 use crate::compat::Dtype;
 
 #[cfg(test)]
@@ -387,7 +387,13 @@ mod kvcache {
     #[test]
     fn turboquant_handles_zero_rows() {
         let core = TurboQuantCore::new(8, 4);
-        let encoded = encode_key_component_rows(&core, &[0.0; 8], 4, super::config::TurboQuantQjlMode::Standard, 0);
+        let encoded = encode_key_component_rows(
+            &core,
+            &[0.0; 8],
+            4,
+            super::config::TurboQuantQjlMode::Standard,
+            0,
+        );
         assert_eq!(encoded.norms, vec![0.0]);
         assert_eq!(encoded.residual_norms, vec![0.0]);
         assert!(encoded.mse_indices.iter().all(|&v| v == 0));
@@ -650,10 +656,8 @@ mod kvcache {
                 .map(|i| ((i as f32) * 0.07 + seed).sin())
                 .collect()
         };
-        let prefill_keys =
-            InlineArray::from_f32_slice(&make_data(0.2), &[b, h, prefill, d]);
-        let prefill_values =
-            InlineArray::from_f32_slice(&make_data(0.7), &[b, h, prefill, d]);
+        let prefill_keys = InlineArray::from_f32_slice(&make_data(0.2), &[b, h, prefill, d]);
+        let prefill_values = InlineArray::from_f32_slice(&make_data(0.7), &[b, h, prefill, d]);
 
         let mut cache = QuantizedKvCache::new(config);
         cache
@@ -700,10 +704,8 @@ mod kvcache {
                 .map(|i| ((i as f32) * 0.07 + seed).sin())
                 .collect()
         };
-        let prefill_keys =
-            InlineArray::from_f32_slice(&make_data(0.2), &[b, h, prefill, d]);
-        let prefill_values =
-            InlineArray::from_f32_slice(&make_data(0.7), &[b, h, prefill, d]);
+        let prefill_keys = InlineArray::from_f32_slice(&make_data(0.2), &[b, h, prefill, d]);
+        let prefill_values = InlineArray::from_f32_slice(&make_data(0.7), &[b, h, prefill, d]);
 
         let mut cache = QuantizedKvCache::new(config);
         cache
@@ -743,14 +745,9 @@ mod kvcache {
             .map(|i| (i as u32).wrapping_mul(0xCC9E2D51).rotate_left(13) ^ 0xC2B2AE35)
             .collect();
 
-        let query_arr = InlineArray::from_u32_slice(
-            &query,
-            &[n_rows as i32, packed_dim as i32],
-        );
-        let keys_arr = InlineArray::from_u32_slice(
-            &keys,
-            &[n_rows as i32, n_seq as i32, packed_dim as i32],
-        );
+        let query_arr = InlineArray::from_u32_slice(&query, &[n_rows as i32, packed_dim as i32]);
+        let keys_arr =
+            InlineArray::from_u32_slice(&keys, &[n_rows as i32, n_seq as i32, packed_dim as i32]);
 
         // Non-GQA case (groups=1): row → kv_row identity, behaviour is the
         // same as the original kernel.
@@ -803,12 +800,9 @@ mod kvcache {
             .map(|i| (i as u32).wrapping_mul(0xCC9E2D51).rotate_left(7) ^ 0x12345678)
             .collect();
 
-        let query_arr =
-            InlineArray::from_u32_slice(&query, &[q_rows as i32, packed_dim as i32]);
-        let keys_arr = InlineArray::from_u32_slice(
-            &keys,
-            &[kv_rows as i32, n_seq as i32, packed_dim as i32],
-        );
+        let query_arr = InlineArray::from_u32_slice(&query, &[q_rows as i32, packed_dim as i32]);
+        let keys_arr =
+            InlineArray::from_u32_slice(&keys, &[kv_rows as i32, n_seq as i32, packed_dim as i32]);
 
         let distances = InlineArray::turboquant_hamming_distances(
             &query_arr,
@@ -863,10 +857,8 @@ mod kvcache {
                 .map(|i| ((i as f32) * 0.05 + seed).sin())
                 .collect()
         };
-        let seed_keys =
-            InlineArray::from_f32_slice(&make_data(0.1), &[b, kv_heads, prefill, d]);
-        let seed_values =
-            InlineArray::from_f32_slice(&make_data(0.7), &[b, kv_heads, prefill, d]);
+        let seed_keys = InlineArray::from_f32_slice(&make_data(0.1), &[b, kv_heads, prefill, d]);
+        let seed_values = InlineArray::from_f32_slice(&make_data(0.7), &[b, kv_heads, prefill, d]);
 
         // Variant F (NoQjl) + skiplist threshold of 0 so the path engages
         // immediately at any cold size. Recent window None so all tokens
@@ -879,14 +871,14 @@ mod kvcache {
         cache.append(&seed_keys, &seed_values).expect("seed append");
 
         // 1-step decode: query has q_heads, step_keys/values have kv_heads.
-        let q_len = (b * q_heads * 1 * d) as usize;
-        let kv_step_len = (b * kv_heads * 1 * d) as usize;
+        let q_len = (b * q_heads * d) as usize;
+        let kv_step_len = (b * kv_heads * d) as usize;
         let query_data: Vec<f32> = (0..q_len).map(|i| ((i as f32) * 0.03).cos()).collect();
-        let kv_step_data: Vec<f32> =
-            (0..kv_step_len).map(|i| ((i as f32) * 0.04).sin()).collect();
+        let kv_step_data: Vec<f32> = (0..kv_step_len)
+            .map(|i| ((i as f32) * 0.04).sin())
+            .collect();
         let query = InlineArray::from_f32_slice(&query_data, &[b, q_heads, 1, d]);
-        let step_keys =
-            InlineArray::from_f32_slice(&kv_step_data, &[b, kv_heads, 1, d]);
+        let step_keys = InlineArray::from_f32_slice(&kv_step_data, &[b, kv_heads, 1, d]);
         let step_values = InlineArray::from_f32_slice(
             &kv_step_data.iter().map(|v| v * 0.5).collect::<Vec<_>>(),
             &[b, kv_heads, 1, d],
@@ -897,7 +889,7 @@ mod kvcache {
             .append_and_compute_attention(&query, &step_keys, &step_values, scale)
             .expect("attention");
         assert_eq!(output.shape(), &[b, q_heads, 1, d]);
-        let total = (b * q_heads * 1 * d) as usize;
+        let total = (b * q_heads * d) as usize;
         let vals: Vec<f32> = output
             .reshape(&[total as i32])
             .to_f32_vec(total)
@@ -1038,7 +1030,7 @@ mod kvcache {
             &mut full_values,
             b,
             h,
-            (prefill + 1) as i32,
+            prefill + 1,
             d,
             scale,
         );
@@ -1201,9 +1193,7 @@ mod kvcache {
         let off_config = TurboQuantConfig::uniform(4, 4).with_recent_window(None);
         let mut off_cache = QuantizedKvCache::new(off_config);
         off_cache.append(&keys, &values).expect("off append");
-        let off_dk = off_cache
-            .dequantize_keys()
-            .expect("off dequantize_keys");
+        let off_dk = off_cache.dequantize_keys().expect("off dequantize_keys");
         assert_eq!(off_dk.shape(), &[b, h, prefill, d]);
         let total = prefill_len;
         let off_vals: Vec<f32> = off_dk.reshape(&[total as i32]).to_f32_vec(total).unwrap();
@@ -1422,7 +1412,13 @@ mod kvcache {
         // codebook step) and clips high-magnitude rows (idx saturates at the
         // codebook extremes), so the resulting attention output diverges
         // from dequantize+SDPA by orders of magnitude on this fixture.
-        let make_data = |len: usize, seed: f32, prefill_i32: i32, d_i32: i32, b_i32: i32, h_i32: i32| -> Vec<f32> {
+        let make_data = |len: usize,
+                         seed: f32,
+                         prefill_i32: i32,
+                         d_i32: i32,
+                         b_i32: i32,
+                         h_i32: i32|
+         -> Vec<f32> {
             let mut buf = vec![0.0f32; len];
             for bh in 0..(b_i32 * h_i32) as usize {
                 for slot in 0..prefill_i32 as usize {
@@ -1849,19 +1845,20 @@ mod kvcache {
         };
         // Inject heavy spikes at varying channels per slot — same shape as
         // the GPU E.3 test, so the bias path actually has non-trivial work.
-        let inject_spikes = |buf: &mut [f32], dim_i32: i32, prefill_i32: i32, batch_i32: i32, head_i32: i32| {
-            for bh in 0..(batch_i32 * head_i32) as usize {
-                for slot in 0..prefill_i32 as usize {
-                    let row = bh * prefill_i32 as usize + slot;
-                    let row_off = row * dim_i32 as usize;
-                    let dim_u = dim_i32 as usize;
-                    buf[row_off + (slot % dim_u)] += 6.0;
-                    buf[row_off + ((slot + 17) % dim_u)] -= 5.5;
-                    buf[row_off + ((slot + 53) % dim_u)] += 4.7;
-                    buf[row_off + ((slot + 113) % dim_u)] -= 4.3;
+        let inject_spikes =
+            |buf: &mut [f32], dim_i32: i32, prefill_i32: i32, batch_i32: i32, head_i32: i32| {
+                for bh in 0..(batch_i32 * head_i32) as usize {
+                    for slot in 0..prefill_i32 as usize {
+                        let row = bh * prefill_i32 as usize + slot;
+                        let row_off = row * dim_i32 as usize;
+                        let dim_u = dim_i32 as usize;
+                        buf[row_off + (slot % dim_u)] += 6.0;
+                        buf[row_off + ((slot + 17) % dim_u)] -= 5.5;
+                        buf[row_off + ((slot + 53) % dim_u)] += 4.7;
+                        buf[row_off + ((slot + 113) % dim_u)] -= 4.3;
+                    }
                 }
-            }
-        };
+            };
 
         let prefill_len = (b * h * prefill * d) as usize;
         let step_len = (b * h * d) as usize;
@@ -2189,23 +2186,24 @@ mod kvcache {
                 .collect()
         };
         // Heavy-tail spikes per slot — mirrors the 8b outliers test.
-        let inject_spikes = |buf: &mut [f32], dim_i32: i32, prefill_i32: i32, batch_i32: i32, head_i32: i32| {
-            for bh in 0..(batch_i32 * head_i32) as usize {
-                for slot in 0..prefill_i32 as usize {
-                    let row = bh * prefill_i32 as usize + slot;
-                    let row_off = row * dim_i32 as usize;
-                    let dim_u = dim_i32 as usize;
-                    buf[row_off + (slot % dim_u)] += 6.0;
-                    buf[row_off + ((slot + 17) % dim_u)] -= 5.5;
-                    buf[row_off + ((slot + 53) % dim_u)] += 4.7;
-                    buf[row_off + ((slot + 113) % dim_u)] -= 4.3;
-                    buf[row_off + ((slot + 7) % dim_u)] += 3.9;
-                    buf[row_off + ((slot + 31) % dim_u)] -= 3.5;
-                    buf[row_off + ((slot + 67) % dim_u)] += 3.1;
-                    buf[row_off + ((slot + 191) % dim_u)] -= 2.7;
+        let inject_spikes =
+            |buf: &mut [f32], dim_i32: i32, prefill_i32: i32, batch_i32: i32, head_i32: i32| {
+                for bh in 0..(batch_i32 * head_i32) as usize {
+                    for slot in 0..prefill_i32 as usize {
+                        let row = bh * prefill_i32 as usize + slot;
+                        let row_off = row * dim_i32 as usize;
+                        let dim_u = dim_i32 as usize;
+                        buf[row_off + (slot % dim_u)] += 6.0;
+                        buf[row_off + ((slot + 17) % dim_u)] -= 5.5;
+                        buf[row_off + ((slot + 53) % dim_u)] += 4.7;
+                        buf[row_off + ((slot + 113) % dim_u)] -= 4.3;
+                        buf[row_off + ((slot + 7) % dim_u)] += 3.9;
+                        buf[row_off + ((slot + 31) % dim_u)] -= 3.5;
+                        buf[row_off + ((slot + 67) % dim_u)] += 3.1;
+                        buf[row_off + ((slot + 191) % dim_u)] -= 2.7;
+                    }
                 }
-            }
-        };
+            };
 
         let prefill_len = (b * h * prefill * d) as usize;
         let step_len = (b * h * d) as usize;
@@ -3225,17 +3223,25 @@ mod kvcache {
             InlineArray::from_f32_slice(&make_data(new_kv_len, 1.4), &[b, heads, new_len, d]);
         let new_values =
             InlineArray::from_f32_slice(&make_data(new_kv_len, 1.9), &[b, heads, new_len, d]);
-        let queries =
-            InlineArray::from_f32_slice(&make_data(q_len, 0.31), &[b, heads, new_len, d]);
+        let queries = InlineArray::from_f32_slice(&make_data(q_len, 0.31), &[b, heads, new_len, d]);
 
         // Disable the recent-fp16 window so the dequantize fallback exercises
         // the cold compressed store, not the hot ring.
         let config = TurboQuantConfig::uniform(8, 8).with_recent_window(None);
         let mut cache = QuantizedKvCache::new(config);
-        cache.append(&prev_keys, &prev_values).expect("seed prefill");
+        cache
+            .append(&prev_keys, &prev_values)
+            .expect("seed prefill");
 
-        let mut output =
-            turboquant_attention_step(&mut cache, &queries, &new_keys, &new_values, scale, prev_len, "TEST");
+        let mut output = turboquant_attention_step(
+            &mut cache,
+            &queries,
+            &new_keys,
+            &new_values,
+            scale,
+            prev_len,
+            "TEST",
+        );
         let actual = output
             .to_f32_vec((b * heads * new_len * d) as usize)
             .expect("output to_f32");
@@ -3379,9 +3385,7 @@ mod kvcache {
         let d = dim as i32;
         let prefill = 32i32;
         let total = (b * h * prefill * d) as usize;
-        let data: Vec<f32> = (0..total)
-            .map(|i| ((i as f32) * 0.07).sin())
-            .collect();
+        let data: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.07).sin()).collect();
         let keys = InlineArray::from_f32_slice(&data, &[b, h, prefill, d]);
         let values = InlineArray::from_f32_slice(&data, &[b, h, prefill, d]);
 
@@ -3392,7 +3396,10 @@ mod kvcache {
         assert_eq!(cache.cold_len(), 0);
         assert_eq!(cache.offset, prefill as usize);
         assert!(cache.keys.is_none(), "cold key store should not exist yet");
-        assert!(cache.values.is_none(), "cold value store should not exist yet");
+        assert!(
+            cache.values.is_none(),
+            "cold value store should not exist yet"
+        );
 
         let dk = cache.dequantize_keys().expect("dequantize_keys");
         assert_eq!(dk.shape(), &[b, h, prefill, d]);
@@ -3414,9 +3421,7 @@ mod kvcache {
         let d = dim as i32;
         let total_tokens = 1100i32; // > window + HOT_EVICTION_CHUNK
         let total = (b * h * total_tokens * d) as usize;
-        let data: Vec<f32> = (0..total)
-            .map(|i| ((i as f32) * 0.05).sin())
-            .collect();
+        let data: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.05).sin()).collect();
         let keys = InlineArray::from_f32_slice(&data, &[b, h, total_tokens, d]);
         let values = InlineArray::from_f32_slice(&data, &[b, h, total_tokens, d]);
 
@@ -3477,7 +3482,13 @@ mod kvcache {
         let core = TurboQuantCore::new(16, 4);
         let mut row = vec![0.1f32; 16];
         row[0] = f32::NAN;
-        let encoded = encode_key_component_rows(&core, &row, 4, super::config::TurboQuantQjlMode::Standard, 0);
+        let encoded = encode_key_component_rows(
+            &core,
+            &row,
+            4,
+            super::config::TurboQuantQjlMode::Standard,
+            0,
+        );
         assert_eq!(encoded.residual_norms.len(), 1);
         assert!(
             encoded.residual_norms[0].is_finite(),
@@ -3496,7 +3507,13 @@ mod kvcache {
         let core = TurboQuantCore::new(16, 4);
         let mut row = vec![1.0f32; 16];
         row[5] = f32::INFINITY;
-        let encoded = encode_key_component_rows(&core, &row, 4, super::config::TurboQuantQjlMode::Standard, 0);
+        let encoded = encode_key_component_rows(
+            &core,
+            &row,
+            4,
+            super::config::TurboQuantQjlMode::Standard,
+            0,
+        );
         assert!(
             encoded.residual_norms[0].is_finite(),
             "Inf input must not leak into residual_norm"
@@ -3582,7 +3599,13 @@ mod kvcache {
         let mut errors = Vec::new();
         for &bits in &[3u8, 5u8, 7u8] {
             let core = TurboQuantCore::new(dim, bits);
-            let encoded = encode_key_component_rows(&core, &data, bits, super::config::TurboQuantQjlMode::Standard, 0);
+            let encoded = encode_key_component_rows(
+                &core,
+                &data,
+                bits,
+                super::config::TurboQuantQjlMode::Standard,
+                0,
+            );
             let decoded = decode_cpu_key(&core, &encoded, bits, num_rows);
             // Per-element MSE, averaged across all rows.
             let mse: f32 = data
@@ -3676,10 +3699,7 @@ mod kvcache {
             .per_block_outlier_channels
             .as_ref()
             .unwrap();
-        let vals = override_encoded
-            .per_block_outlier_values
-            .as_ref()
-            .unwrap();
+        let vals = override_encoded.per_block_outlier_values.as_ref().unwrap();
         assert_eq!(chans.len(), num_rows * outlier_k);
         assert_eq!(vals.len(), num_rows * outlier_k);
         let override_decoded = decode_key_component_rows_raw(
@@ -3728,7 +3748,13 @@ mod kvcache {
         let keys = seeded_gaussian_rows(num_rows, dim, 0x1111_2222_3333_4444);
         let queries = seeded_gaussian_rows(num_rows, dim, 0x5555_6666_7777_8888);
 
-        let encoded = encode_key_component_rows(&core, &keys, bits, super::config::TurboQuantQjlMode::Standard, 0);
+        let encoded = encode_key_component_rows(
+            &core,
+            &keys,
+            bits,
+            super::config::TurboQuantQjlMode::Standard,
+            0,
+        );
         let decoded = decode_cpu_key(&core, &encoded, bits, num_rows);
 
         let mut sum_gt = 0.0f64;
@@ -3789,11 +3815,11 @@ mod kvcache {
         let config = TurboQuantConfig::preset_q3_5(dim).with_recent_window(None);
         let state = TurboQuantState::new(dim, dim, config);
 
-        let (kstore, vstore) = gpu_quantize_kv_mixed(&state, &arr, &arr, config)
-            .expect("gpu_quantize_kv_mixed");
+        let (kstore, vstore) =
+            gpu_quantize_kv_mixed(&state, &arr, &arr, config).expect("gpu_quantize_kv_mixed");
 
-        let mut dec_keys = gpu_dequantize_keys_mixed(&kstore, &state.keys, &config)
-            .expect("dequantize keys");
+        let mut dec_keys =
+            gpu_dequantize_keys_mixed(&kstore, &state.keys, &config).expect("dequantize keys");
         let mut dec_vals = gpu_dequantize_values_mixed(&vstore, &state.values, &config)
             .expect("dequantize values");
         let recon_keys = dec_keys.to_f32_vec(total).expect("dec keys to_f32");
@@ -3836,8 +3862,7 @@ mod kvcache {
             .collect();
         let arr = InlineArray::from_f32_slice(&data, &[b, h, s, d]);
 
-        let (reg_src, out_src) =
-            gpu_compute_outlier_partition(&arr, 32, 128).expect("partition");
+        let (reg_src, out_src) = gpu_compute_outlier_partition(&arr, 32, 128).expect("partition");
         let reg = arr.take_along_axis(&reg_src, -1);
         let out = arr.take_along_axis(&out_src, -1);
 
@@ -3898,13 +3923,9 @@ mod kvcache {
         let recon_uni = dec_uni.to_f32_vec(total).expect("dec uni to_f32");
 
         // Mixed sub-vector path on the SAME core
-        let enc_mix = gpu_encode_key_subvector(
-            &rows,
-            core,
-            3,
-            super::config::TurboQuantQjlMode::Standard,
-        )
-        .expect("mix encode");
+        let enc_mix =
+            gpu_encode_key_subvector(&rows, core, 3, super::config::TurboQuantQjlMode::Standard)
+                .expect("mix encode");
         let mut dec_mix = gpu_dequantize_key_subvector(
             &enc_mix.indices,
             enc_mix.qjl_signs.as_ref(),
@@ -3964,8 +3985,14 @@ mod kvcache {
 
         let kstore_cpu = cache.keys.as_ref().expect("keys");
         let vstore_cpu = cache.values.as_ref().expect("values");
-        let kstore_gpu = kstore_cpu.gpu_mixed.as_ref().expect("gpu_mixed keys populated");
-        let vstore_gpu = vstore_cpu.gpu_mixed.as_ref().expect("gpu_mixed values populated");
+        let kstore_gpu = kstore_cpu
+            .gpu_mixed
+            .as_ref()
+            .expect("gpu_mixed keys populated");
+        let vstore_gpu = vstore_cpu
+            .gpu_mixed
+            .as_ref()
+            .expect("gpu_mixed values populated");
         let state = cache.state.as_ref().expect("state");
 
         let mut cpu_keys = cache.dequantize_keys().expect("CPU dequantize_keys");
@@ -3981,7 +4008,8 @@ mod kvcache {
         let gpu_values_vec = gpu_values.to_f32_vec(total).expect("gpu values to_f32");
 
         let max_err = |recon: &[f32], orig: &[f32]| {
-            recon.iter()
+            recon
+                .iter()
                 .zip(orig.iter())
                 .map(|(r, o)| (r - o).abs())
                 .fold(0.0f32, f32::max)
@@ -3997,7 +4025,10 @@ mod kvcache {
         // chain re-evaluates inconsistently and gpu_err_k goes from ~0.75 to
         // ~5.5. This test is the regression gate for that fix.
         assert!(gpu_err_k < 1.5, "GPU keys reconstruction error {gpu_err_k}");
-        assert!(gpu_err_v < 1.5, "GPU values reconstruction error {gpu_err_v}");
+        assert!(
+            gpu_err_v < 1.5,
+            "GPU values reconstruction error {gpu_err_v}"
+        );
         // Pairwise diff is bounded by the sum of per-path errors plus slack
         // for the independent outlier-mask choices on borderline ties.
         let pairwise_k = max_err(&cpu_keys_vec, &gpu_keys_vec);
@@ -4041,9 +4072,7 @@ mod kvcache {
                 phase.sin() + outlier_kick
             })
             .collect();
-        let q_data: Vec<f32> = (0..q_total)
-            .map(|i| ((i as f32) * 0.211).cos())
-            .collect();
+        let q_data: Vec<f32> = (0..q_total).map(|i| ((i as f32) * 0.211).cos()).collect();
         let keys_arr = InlineArray::from_f32_slice(&key_data, &[b, h, s, d]);
         let vals_arr = InlineArray::from_f32_slice(&key_data, &[b, h, s, d]);
         let queries_arr = InlineArray::from_f32_slice(&q_data, &[b, h, 1, d]);
@@ -4060,8 +4089,9 @@ mod kvcache {
         let state = cache.state.as_ref().expect("state");
 
         let scale = 1.0f32 / (dim as f32).sqrt();
-        let mut gpu_scores = try_gpu_mixed_score(state, &config, kstore, &queries_arr, h, h, s, scale)
-            .expect("try_gpu_mixed_score");
+        let mut gpu_scores =
+            try_gpu_mixed_score(state, &config, kstore, &queries_arr, h, h, s, scale)
+                .expect("try_gpu_mixed_score");
 
         // Reference: dequantise K → recon_keys [B, H, T, D]; then
         // scores[n, t] = sum_d Q[n, d] * recon_keys[kv_row, t, d] * scale
@@ -4148,11 +4178,19 @@ mod kvcache {
         // Wiring gate: gpu_mixed must be populated, otherwise the new path
         // can't run.
         assert!(
-            cache.keys.as_ref().and_then(|k| k.gpu_mixed.as_ref()).is_some(),
+            cache
+                .keys
+                .as_ref()
+                .and_then(|k| k.gpu_mixed.as_ref())
+                .is_some(),
             "Phase 3a regressed — gpu_mixed key store missing"
         );
         assert!(
-            cache.values.as_ref().and_then(|v| v.gpu_mixed.as_ref()).is_some(),
+            cache
+                .values
+                .as_ref()
+                .and_then(|v| v.gpu_mixed.as_ref())
+                .is_some(),
             "Phase 3a regressed — gpu_mixed value store missing"
         );
 
@@ -4164,7 +4202,8 @@ mod kvcache {
         let recon_v = dec_v.to_f32_vec(total).expect("dec_v to_f32");
 
         let max_err = |recon: &[f32], orig: &[f32]| {
-            recon.iter()
+            recon
+                .iter()
                 .zip(orig.iter())
                 .map(|(r, o)| (r - o).abs())
                 .fold(0.0f32, f32::max)

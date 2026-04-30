@@ -274,7 +274,10 @@ where
     let start = Instant::now();
     let out = f();
     let ms = start.elapsed().as_secs_f64() * 1000.0;
-    tracing::debug!(target = "pmetal_serve::prefix_cache", "{label} took {ms:.2}ms");
+    tracing::debug!(
+        target = "pmetal_serve::prefix_cache",
+        "{label} took {ms:.2}ms"
+    );
     out
 }
 

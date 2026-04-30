@@ -215,11 +215,7 @@ impl ServeSpec {
     /// Run descriptor validation.
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
         let errs = self.validate_descriptors();
-        if errs.is_empty() {
-            Ok(())
-        } else {
-            Err(errs)
-        }
+        if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }
 
@@ -251,15 +247,19 @@ mod tests {
 
     #[test]
     fn defaults_are_valid() {
-        let mut spec = ServeSpec::default();
-        spec.model = "model".into();
+        let spec = ServeSpec {
+            model: "model".into(),
+            ..Default::default()
+        };
         assert!(spec.validate_descriptors().is_empty());
     }
 
     #[test]
     fn argv_emits_required_fields() {
-        let mut spec = ServeSpec::default();
-        spec.model = "model".into();
+        let spec = ServeSpec {
+            model: "model".into(),
+            ..Default::default()
+        };
         let argv = spec.to_argv();
         assert!(argv.contains(&"--model".to_string()));
         assert!(argv.contains(&"--port".to_string()));
@@ -268,8 +268,10 @@ mod tests {
 
     #[test]
     fn flags_omitted_by_default() {
-        let mut spec = ServeSpec::default();
-        spec.model = "m".into();
+        let spec = ServeSpec {
+            model: "m".into(),
+            ..Default::default()
+        };
         let argv = spec.to_argv();
         assert!(!argv.contains(&"--fp8".to_string()));
         assert!(!argv.contains(&"--ane".to_string()));

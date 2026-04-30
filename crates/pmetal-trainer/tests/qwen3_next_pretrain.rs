@@ -4,35 +4,36 @@ use pmetal_models::architectures::{Qwen3NextConfig, RopeParameters};
 use pmetal_trainer::pretrain::{PretrainModel, create_model};
 
 fn tiny_qwen3_next_config() -> Qwen3NextConfig {
-    let mut config = Qwen3NextConfig::default();
-    config.model_type = "qwen3_5_moe_text".to_string();
-    config.vocab_size = 128;
-    config.hidden_size = 64;
-    config.intermediate_size = 128;
-    config.num_hidden_layers = 2;
-    config.num_attention_heads = 4;
-    config.num_key_value_heads = Some(2);
-    config.head_dim = Some(16);
-    config.max_position_embeddings = 256;
-    config.linear_num_value_heads = 2;
-    config.linear_num_key_heads = 2;
-    config.linear_key_head_dim = 16;
-    config.linear_value_head_dim = 16;
-    config.linear_conv_kernel_dim = 2;
-    config.full_attention_interval = 1;
-    config.num_experts = 0;
-    config.num_experts_per_tok = 0;
-    config.decoder_sparse_step = 1;
-    config.moe_intermediate_size = 0;
-    config.shared_expert_intermediate_size = 128;
-    config.rope_parameters = Some(RopeParameters {
-        rope_theta: Some(12_345.0),
-        partial_rotary_factor: Some(0.5),
-        rope_type: Some("default".to_string()),
-        mrope_interleaved: None,
-        mrope_section: None,
-    });
-    config
+    Qwen3NextConfig {
+        model_type: "qwen3_5_moe_text".to_string(),
+        vocab_size: 128,
+        hidden_size: 64,
+        intermediate_size: 128,
+        num_hidden_layers: 2,
+        num_attention_heads: 4,
+        num_key_value_heads: Some(2),
+        head_dim: Some(16),
+        max_position_embeddings: 256,
+        linear_num_value_heads: 2,
+        linear_num_key_heads: 2,
+        linear_key_head_dim: 16,
+        linear_value_head_dim: 16,
+        linear_conv_kernel_dim: 2,
+        full_attention_interval: 1,
+        num_experts: 0,
+        num_experts_per_tok: 0,
+        decoder_sparse_step: 1,
+        moe_intermediate_size: 0,
+        shared_expert_intermediate_size: 128,
+        rope_parameters: Some(RopeParameters {
+            rope_theta: Some(12_345.0),
+            partial_rotary_factor: Some(0.5),
+            rope_type: Some("default".to_string()),
+            mrope_interleaved: None,
+            mrope_section: None,
+        }),
+        ..Default::default()
+    }
 }
 
 #[test]

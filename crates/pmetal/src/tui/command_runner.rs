@@ -449,8 +449,7 @@ async fn run_command(
                 // Use `unwrap_or_else` so a poisoned mutex (from a panicking
                 // sibling task) never kills the metrics-streaming task.
                 {
-                    let mut buf =
-                        stderr_capture.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut buf = stderr_capture.lock().unwrap_or_else(|e| e.into_inner());
                     buf.push(line.clone());
                     if buf.len() > MAX_STDERR_LINES {
                         buf.remove(0);

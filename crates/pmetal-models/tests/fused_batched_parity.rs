@@ -16,15 +16,15 @@
 use pmetal_bridge::compat::Array;
 use pmetal_mlx::kv_cache::{FusedBatchKVCache, KVCache, KVCacheConfig};
 
-use pmetal_models::architectures::llama::{LlamaConfig, LlamaForCausalLM};
-use pmetal_models::architectures::mistral::{MistralConfig, MistralForCausalLM};
-use pmetal_models::architectures::qwen2::{Qwen2Config, Qwen2ForCausalLM};
-use pmetal_models::architectures::qwen3::{Qwen3Config, Qwen3ForCausalLM};
+use pmetal_models::architectures::cohere::{CohereConfig, CohereForCausalLM};
 use pmetal_models::architectures::gemma::{GemmaConfig, GemmaForCausalLM};
 use pmetal_models::architectures::gpt_oss::{AttentionType, GptOssConfig, GptOssForCausalLM};
-use pmetal_models::architectures::phi::{PhiConfig, PhiForCausalLM};
-use pmetal_models::architectures::cohere::{CohereConfig, CohereForCausalLM};
 use pmetal_models::architectures::granite::{GraniteConfig, GraniteForCausalLM};
+use pmetal_models::architectures::llama::{LlamaConfig, LlamaForCausalLM};
+use pmetal_models::architectures::mistral::{MistralConfig, MistralForCausalLM};
+use pmetal_models::architectures::phi::{PhiConfig, PhiForCausalLM};
+use pmetal_models::architectures::qwen2::{Qwen2Config, Qwen2ForCausalLM};
+use pmetal_models::architectures::qwen3::{Qwen3Config, Qwen3ForCausalLM};
 use pmetal_models::architectures::qwen3_moe::{Qwen3MoE, Qwen3MoEConfig};
 use pmetal_models::traits::ModelConfig;
 
@@ -50,14 +50,13 @@ fn tiny_config() -> LlamaConfig {
 /// Compute last-position f32 logits from a `[B, S, V]` tensor.
 fn last_logits(logits: &Array) -> Vec<f32> {
     let shape = logits.shape();
-    assert!(
-        shape.len() >= 2,
-        "expected rank>=2 logits, got {shape:?}"
-    );
+    assert!(shape.len() >= 2, "expected rank>=2 logits, got {shape:?}");
     let seq_axis = shape.len() - 2;
     let seq_len = shape[seq_axis];
     let idx = Array::from_i32_slice(&[seq_len - 1]);
-    let last = logits.take_axis(&idx, seq_axis as i32).squeeze_axes(&[seq_axis as i32]);
+    let last = logits
+        .take_axis(&idx, seq_axis as i32)
+        .squeeze_axes(&[seq_axis as i32]);
     // Flatten to a Vec<f32> for comparison. last has shape [B, V]; we
     // evaluate and copy out.
     let v = shape[shape.len() - 1] as usize;
@@ -110,18 +109,14 @@ fn q_proj_stable_across_calls() {
     let mut model = LlamaForCausalLM::new(config.clone()).unwrap();
     let x = Array::from_i32_slice(&[7_i32]).reshape(&[1, 1]);
     let emb1 = pmetal_bridge::compat::Module::forward(&mut model.model.embed_tokens, &x).unwrap();
-    let out1 = pmetal_bridge::compat::Module::forward(
-        &mut model.model.layers[0].self_attn.q_proj,
-        &emb1,
-    )
-    .unwrap();
+    let out1 =
+        pmetal_bridge::compat::Module::forward(&mut model.model.layers[0].self_attn.q_proj, &emb1)
+            .unwrap();
     out1.eval();
     let emb2 = pmetal_bridge::compat::Module::forward(&mut model.model.embed_tokens, &x).unwrap();
-    let out2 = pmetal_bridge::compat::Module::forward(
-        &mut model.model.layers[0].self_attn.q_proj,
-        &emb2,
-    )
-    .unwrap();
+    let out2 =
+        pmetal_bridge::compat::Module::forward(&mut model.model.layers[0].self_attn.q_proj, &emb2)
+            .unwrap();
     out2.eval();
     let v1 = out1.as_slice::<f32>();
     let v2 = out2.as_slice::<f32>();
@@ -408,7 +403,9 @@ fn fused_vs_serial_mistral_single_token() {
 
     let mut fused = FusedBatchKVCache::new(kv_cfg(nl, max_seq, hkv, hd), 1).unwrap();
     fused.admit(0).unwrap();
-    let f = model.forward_batched_impl(&input, &[0], &mut fused).unwrap();
+    let f = model
+        .forward_batched_impl(&input, &[0], &mut fused)
+        .unwrap();
     let fv = last_logits(&f);
 
     let diff = max_abs_diff(&sv, &fv);
@@ -433,7 +430,9 @@ fn fused_vs_serial_qwen2_single_token() {
 
     let mut fused = FusedBatchKVCache::new(kv_cfg(nl, max_seq, hkv, hd), 1).unwrap();
     fused.admit(0).unwrap();
-    let f = model.forward_batched_impl(&input, &[0], &mut fused).unwrap();
+    let f = model
+        .forward_batched_impl(&input, &[0], &mut fused)
+        .unwrap();
     let fv = last_logits(&f);
 
     let diff = max_abs_diff(&sv, &fv);
@@ -514,7 +513,9 @@ fn fused_vs_serial_qwen3_single_token() {
 
     let mut fused = FusedBatchKVCache::new(kv_cfg(nl, max_seq, hkv, hd), 1).unwrap();
     fused.admit(0).unwrap();
-    let f = model.forward_batched_impl(&input, &[0], &mut fused).unwrap();
+    let f = model
+        .forward_batched_impl(&input, &[0], &mut fused)
+        .unwrap();
     let fv = last_logits(&f);
 
     let diff = max_abs_diff(&sv, &fv);
@@ -563,7 +564,9 @@ fn fused_vs_serial_qwen3_moe_single_token() {
 
     let mut fused = FusedBatchKVCache::new(kv_cfg(nl, max_seq, hkv, hd), 1).unwrap();
     fused.admit(0).unwrap();
-    let f = model.forward_batched_impl(&input, &[0], &mut fused).unwrap();
+    let f = model
+        .forward_batched_impl(&input, &[0], &mut fused)
+        .unwrap();
     let fv = last_logits(&f);
 
     let diff = max_abs_diff(&sv, &fv);
@@ -593,7 +596,10 @@ fn fused_vs_serial_qwen3_moe_multi_step() {
         let s = model.forward(&inp, None, Some(&mut cs)).unwrap();
         let f = model.forward_batched_impl(&inp, &[0], &mut cf).unwrap();
         let d = max_abs_diff(&last_logits(&s), &last_logits(&f));
-        assert!(d < 5e-4, "Qwen3MoE step {step} (token {tok}) divergence: {d}");
+        assert!(
+            d < 5e-4,
+            "Qwen3MoE step {step} (token {tok}) divergence: {d}"
+        );
     }
 }
 
@@ -723,7 +729,9 @@ fn fused_vs_serial_gemma_single_token() {
 
     let mut fused = FusedBatchKVCache::new(kv_cfg(nl, max_seq, hkv, hd), 1).unwrap();
     fused.admit(0).unwrap();
-    let f = model.forward_batched_impl(&input, &[0], &mut fused).unwrap();
+    let f = model
+        .forward_batched_impl(&input, &[0], &mut fused)
+        .unwrap();
     let fv = last_logits(&f);
 
     let diff = max_abs_diff(&sv, &fv);
@@ -749,15 +757,10 @@ fn fused_vs_serial_gemma_multi_step() {
 
     for (step, tok) in [5_i32, 8, 11, 14].iter().enumerate() {
         let inp = Array::from_i32_slice(&[*tok]).reshape(&[1, 1]);
-        let s = model
-            .forward_with_cache(&inp, None, Some(&mut cs))
-            .unwrap();
+        let s = model.forward_with_cache(&inp, None, Some(&mut cs)).unwrap();
         let f = model.forward_batched_impl(&inp, &[0], &mut cf).unwrap();
         let d = max_abs_diff(&last_logits(&s), &last_logits(&f));
-        assert!(
-            d < 5e-4,
-            "Gemma step {step} (token {tok}) divergence: {d}"
-        );
+        assert!(d < 5e-4, "Gemma step {step} (token {tok}) divergence: {d}");
     }
 }
 
@@ -808,7 +811,9 @@ fn fused_vs_serial_phi_single_token() {
 
     let mut fused = FusedBatchKVCache::new(kv_cfg(nl, max_seq, hkv, hd), 1).unwrap();
     fused.admit(0).unwrap();
-    let f = model.forward_batched_impl(&input, &[0], &mut fused).unwrap();
+    let f = model
+        .forward_batched_impl(&input, &[0], &mut fused)
+        .unwrap();
     let fv = last_logits(&f);
 
     let diff = max_abs_diff(&sv, &fv);
@@ -833,9 +838,7 @@ fn fused_vs_serial_phi_multi_step() {
 
     for (step, tok) in [4_i32, 7, 11, 13, 19].iter().enumerate() {
         let inp = Array::from_i32_slice(&[*tok]).reshape(&[1, 1]);
-        let s = model
-            .forward_with_cache(&inp, None, Some(&mut cs))
-            .unwrap();
+        let s = model.forward_with_cache(&inp, None, Some(&mut cs)).unwrap();
         let f = model.forward_batched_impl(&inp, &[0], &mut cf).unwrap();
         let d = max_abs_diff(&last_logits(&s), &last_logits(&f));
         assert!(d < 5e-4, "Phi step {step} (token {tok}) divergence: {d}");
@@ -898,7 +901,9 @@ fn fused_vs_serial_gemma2_single_token() {
 
     let mut fused = FusedBatchKVCache::new(kv_cfg(nl, max_seq, hkv, hd), 1).unwrap();
     fused.admit(0).unwrap();
-    let f = model.forward_batched_impl(&input, &[0], &mut fused).unwrap();
+    let f = model
+        .forward_batched_impl(&input, &[0], &mut fused)
+        .unwrap();
     let fv = last_logits(&f);
 
     let diff = max_abs_diff(&sv, &fv);
@@ -928,9 +933,7 @@ fn fused_vs_serial_gemma2_multi_step() {
 
     for (step, &tok) in token_stream.iter().enumerate() {
         let inp = Array::from_i32_slice(&[tok]).reshape(&[1, 1]);
-        let s = model
-            .forward_with_cache(&inp, None, Some(&mut cs))
-            .unwrap();
+        let s = model.forward_with_cache(&inp, None, Some(&mut cs)).unwrap();
         let f = model.forward_batched_impl(&inp, &[0], &mut cf).unwrap();
         let d = max_abs_diff(&last_logits(&s), &last_logits(&f));
         assert!(d < 5e-4, "Gemma2 step {step} (token {tok}) divergence: {d}");
@@ -956,9 +959,7 @@ fn fused_vs_serial_gemma3_multi_step() {
 
     for (step, &tok) in token_stream.iter().enumerate() {
         let inp = Array::from_i32_slice(&[tok]).reshape(&[1, 1]);
-        let s = model
-            .forward_with_cache(&inp, None, Some(&mut cs))
-            .unwrap();
+        let s = model.forward_with_cache(&inp, None, Some(&mut cs)).unwrap();
         let f = model.forward_batched_impl(&inp, &[0], &mut cf).unwrap();
         let d = max_abs_diff(&last_logits(&s), &last_logits(&f));
         assert!(d < 5e-4, "Gemma3 step {step} (token {tok}) divergence: {d}");
@@ -1002,7 +1003,9 @@ fn fused_vs_serial_cohere_single_token() {
 
     let mut fused = FusedBatchKVCache::new(kv_cfg(nl, max_seq, hkv, hd), 1).unwrap();
     fused.admit(0).unwrap();
-    let f = model.forward_batched_impl(&input, &[0], &mut fused).unwrap();
+    let f = model
+        .forward_batched_impl(&input, &[0], &mut fused)
+        .unwrap();
     let fv = last_logits(&f);
 
     let diff = max_abs_diff(&sv, &fv);
@@ -1027,9 +1030,7 @@ fn fused_vs_serial_cohere_multi_step() {
 
     for (step, tok) in [3_i32, 9, 12, 18, 23].iter().enumerate() {
         let inp = Array::from_i32_slice(&[*tok]).reshape(&[1, 1]);
-        let s = model
-            .forward_with_cache(&inp, None, Some(&mut cs))
-            .unwrap();
+        let s = model.forward_with_cache(&inp, None, Some(&mut cs)).unwrap();
         let f = model.forward_batched_impl(&inp, &[0], &mut cf).unwrap();
         let d = max_abs_diff(&last_logits(&s), &last_logits(&f));
         assert!(d < 5e-4, "Cohere step {step} (token {tok}) divergence: {d}");
@@ -1051,9 +1052,7 @@ fn fused_vs_serial_phi4_qkv_bias_multi_step() {
 
     for (step, tok) in [2_i32, 6, 10, 15].iter().enumerate() {
         let inp = Array::from_i32_slice(&[*tok]).reshape(&[1, 1]);
-        let s = model
-            .forward_with_cache(&inp, None, Some(&mut cs))
-            .unwrap();
+        let s = model.forward_with_cache(&inp, None, Some(&mut cs)).unwrap();
         let f = model.forward_batched_impl(&inp, &[0], &mut cf).unwrap();
         let d = max_abs_diff(&last_logits(&s), &last_logits(&f));
         assert!(d < 5e-4, "Phi-4 step {step} (token {tok}) divergence: {d}");
@@ -1102,7 +1101,9 @@ fn fused_vs_serial_granite_single_token() {
 
     let mut fused = FusedBatchKVCache::new(kv_cfg(nl, max_seq, hkv, hd), 1).unwrap();
     fused.admit(0).unwrap();
-    let f = model.forward_batched_impl(&input, &[0], &mut fused).unwrap();
+    let f = model
+        .forward_batched_impl(&input, &[0], &mut fused)
+        .unwrap();
     let fv = last_logits(&f);
 
     let diff = max_abs_diff(&sv, &fv);
@@ -1128,11 +1129,12 @@ fn fused_vs_serial_granite_multi_step() {
 
     for (step, tok) in [3_i32, 5, 11, 17, 23].iter().enumerate() {
         let inp = Array::from_i32_slice(&[*tok]).reshape(&[1, 1]);
-        let s = model
-            .forward_with_cache(&inp, None, Some(&mut cs))
-            .unwrap();
+        let s = model.forward_with_cache(&inp, None, Some(&mut cs)).unwrap();
         let f = model.forward_batched_impl(&inp, &[0], &mut cf).unwrap();
         let d = max_abs_diff(&last_logits(&s), &last_logits(&f));
-        assert!(d < 5e-4, "Granite step {step} (token {tok}) divergence: {d}");
+        assert!(
+            d < 5e-4,
+            "Granite step {step} (token {tok}) divergence: {d}"
+        );
     }
 }

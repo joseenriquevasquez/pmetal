@@ -220,9 +220,7 @@ pub fn build_state(
 /// Look up the dispatch reason for a particular state — returned to callers
 /// who want to surface "your config is on the slow path" diagnostics in
 /// model-load logs without re-implementing the predicate.
-pub fn gpu_attention_unsupported_reason_for(
-    state: &TurboQuantState,
-) -> Option<&'static str> {
+pub fn gpu_attention_unsupported_reason_for(state: &TurboQuantState) -> Option<&'static str> {
     if state.has_gpu_attention_support() {
         None
     } else {

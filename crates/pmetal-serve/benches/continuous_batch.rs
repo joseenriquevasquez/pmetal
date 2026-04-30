@@ -103,41 +103,33 @@ fn bench_decode_step(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n_active as u64));
 
         // Serial: `n_active` independent forward_with_cache calls.
-        group.bench_with_input(
-            BenchmarkId::new("serial", n_active),
-            &n_active,
-            |b, &n| {
-                b.iter(|| {
-                    for (slot, cache) in serial_caches.iter_mut().enumerate().take(n) {
-                        let tok = ((slot as i32) % 17) + 3;
-                        let inp = Array::from_i32_slice(&[tok]).reshape(&[1, 1]);
-                        let logits = serial_model
-                            .forward_with_cache(&inp, None, Some(cache))
-                            .unwrap();
-                        logits.eval();
-                        black_box(logits);
-                    }
-                });
-            },
-        );
-
-        // Fused: one forward_batched_impl call.
-        group.bench_with_input(
-            BenchmarkId::new("fused", n_active),
-            &n_active,
-            |b, &n| {
-                b.iter(|| {
-                    let toks: Vec<i32> = (0..n as i32).map(|i| (i % 17) + 3).collect();
-                    let inp = Array::from_i32_slice(&toks).reshape(&[n as i32, 1]);
-                    let active: Vec<usize> = (0..n).collect();
-                    let logits = fused_model
-                        .forward_batched_impl(&inp, &active, &mut fused_cache)
+        group.bench_with_input(BenchmarkId::new("serial", n_active), &n_active, |b, &n| {
+            b.iter(|| {
+                for (slot, cache) in serial_caches.iter_mut().enumerate().take(n) {
+                    let tok = ((slot as i32) % 17) + 3;
+                    let inp = Array::from_i32_slice(&[tok]).reshape(&[1, 1]);
+                    let logits = serial_model
+                        .forward_with_cache(&inp, None, Some(cache))
                         .unwrap();
                     logits.eval();
                     black_box(logits);
-                });
-            },
-        );
+                }
+            });
+        });
+
+        // Fused: one forward_batched_impl call.
+        group.bench_with_input(BenchmarkId::new("fused", n_active), &n_active, |b, &n| {
+            b.iter(|| {
+                let toks: Vec<i32> = (0..n as i32).map(|i| (i % 17) + 3).collect();
+                let inp = Array::from_i32_slice(&toks).reshape(&[n as i32, 1]);
+                let active: Vec<usize> = (0..n).collect();
+                let logits = fused_model
+                    .forward_batched_impl(&inp, &active, &mut fused_cache)
+                    .unwrap();
+                logits.eval();
+                black_box(logits);
+            });
+        });
     }
 
     group.finish();

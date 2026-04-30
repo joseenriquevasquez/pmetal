@@ -64,11 +64,7 @@ pub enum GrowthPolicy {
 /// Compute the target capacity for a cache that must hold `next` tokens given
 /// `allocated` already in place. See [`GrowthPolicy`] for behaviour.
 #[inline]
-pub fn next_capacity(
-    policy: GrowthPolicy,
-    allocated: Option<i32>,
-    next: i32,
-) -> Option<i32> {
+pub fn next_capacity(policy: GrowthPolicy, allocated: Option<i32>, next: i32) -> Option<i32> {
     match policy {
         GrowthPolicy::Exact => match allocated {
             None => Some(next),
@@ -125,7 +121,9 @@ pub fn alloc_or_grow_kv(
         Some(alloc) => {
             let extend = target - alloc;
             let old_k = keys.take().expect("keys present when allocated is Some");
-            let old_v = values.take().expect("values present when allocated is Some");
+            let old_v = values
+                .take()
+                .expect("values present when allocated is Some");
             let ext_k = InlineArray::zeros(&[batch, head_count, extend, head_dim], dtype);
             let ext_v = InlineArray::zeros(&[batch, head_count, extend, head_dim], dtype);
             *keys = Some(old_k.kv_cache_append(&ext_k, 2));
@@ -201,7 +199,10 @@ mod tests {
         assert_eq!(next_capacity(p, None, 0), Some(0));
         assert_eq!(next_capacity(p, None, 1), Some(CHUNK_TOKENS));
         assert_eq!(next_capacity(p, None, CHUNK_TOKENS), Some(CHUNK_TOKENS));
-        assert_eq!(next_capacity(p, None, CHUNK_TOKENS + 1), Some(2 * CHUNK_TOKENS));
+        assert_eq!(
+            next_capacity(p, None, CHUNK_TOKENS + 1),
+            Some(2 * CHUNK_TOKENS)
+        );
     }
 
     #[test]

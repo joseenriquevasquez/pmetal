@@ -582,12 +582,33 @@ impl InferenceTab {
     ///
     /// `InferSpec` has no `--show-thinking` flag (TUI-only); the caller
     /// appends it directly to argv after calling `spec.to_argv()`.
-    pub fn build_infer_spec(&self, model: String, prompt: String, lora: Option<String>) -> InferSpec {
+    pub fn build_infer_spec(
+        &self,
+        model: String,
+        prompt: String,
+        lora: Option<String>,
+    ) -> InferSpec {
         // Resolve optional sampling params (only set when non-default).
-        let temperature = if self.temperature > 0.0 { Some(self.temperature) } else { None };
-        let top_k = if self.top_k > 0 { Some(self.top_k) } else { None };
-        let top_p = if self.top_p < 1.0 { Some(self.top_p) } else { None };
-        let min_p = if self.min_p > 0.0 { Some(self.min_p) } else { None };
+        let temperature = if self.temperature > 0.0 {
+            Some(self.temperature)
+        } else {
+            None
+        };
+        let top_k = if self.top_k > 0 {
+            Some(self.top_k)
+        } else {
+            None
+        };
+        let top_p = if self.top_p < 1.0 {
+            Some(self.top_p)
+        } else {
+            None
+        };
+        let min_p = if self.min_p > 0.0 {
+            Some(self.min_p)
+        } else {
+            None
+        };
         let repetition_penalty = if self.repetition_penalty > 1.0 {
             Some(self.repetition_penalty)
         } else {
@@ -606,16 +627,15 @@ impl InferenceTab {
 
         // KV quant mode — map sidebar's combined byte to spec fields.
         // 0=auto (omit), 255=fp16 (disable), 4/8=Q4/Q8, 104/108=TQ4/TQ8, 125=TQ2.5, 135=TQ3.5
-        let (kv_quant, kv_turboquant, kv_quant_preset, no_kv_quant) =
-            match self.kv_quant_mode {
-                255 => (None, false, None, true),
-                bits @ (4 | 8) => (Some(bits), false, None, false),
-                108 => (Some(8), true, None, false),
-                104 => (Some(4), true, None, false),
-                125 => (None, false, Some("q2_5".to_string()), false),
-                135 => (None, false, Some("q3_5".to_string()), false),
-                _ => (None, false, None, false), // 0 = auto
-            };
+        let (kv_quant, kv_turboquant, kv_quant_preset, no_kv_quant) = match self.kv_quant_mode {
+            255 => (None, false, None, true),
+            bits @ (4 | 8) => (Some(bits), false, None, false),
+            108 => (Some(8), true, None, false),
+            104 => (Some(4), true, None, false),
+            125 => (None, false, Some("q2_5".to_string()), false),
+            135 => (None, false, Some("q3_5".to_string()), false),
+            _ => (None, false, None, false), // 0 = auto
+        };
 
         let backend = if self.backend != InferenceBackend::Auto {
             self.backend.as_str().to_string()

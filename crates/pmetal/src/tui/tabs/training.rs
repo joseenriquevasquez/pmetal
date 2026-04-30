@@ -359,8 +359,7 @@ impl TrainingTab {
         let cut_cross_entropy = self.form.value("Cut Cross-Entropy") == "Enabled";
         // ANE: spec uses a bool flag; old TUI used Enum("Disabled"/"Enabled"),
         // new spec uses Toggle which stores "Enabled"/"Disabled".
-        let ane = self.form.value("Use ANE") == "Enabled"
-            || self.form.value("ANE") == "Enabled";
+        let ane = self.form.value("Use ANE") == "Enabled" || self.form.value("ANE") == "Enabled";
 
         let eval_dataset = {
             let v = self.form.value("Eval Dataset");
@@ -384,7 +383,11 @@ impl TrainingTab {
             eval_dataset,
             output_dir: {
                 let v = self.form.value("Output Dir");
-                if v.is_empty() { TrainSpec::default().output_dir } else { v }
+                if v.is_empty() {
+                    TrainSpec::default().output_dir
+                } else {
+                    v
+                }
             },
             learning_rate: self
                 .form
@@ -431,7 +434,11 @@ impl TrainingTab {
                 .unwrap_or(TrainSpec::default().weight_decay),
             lr_schedule: {
                 let v = self.form.value("LR Schedule");
-                if v.is_empty() { TrainSpec::default().lr_schedule } else { v }
+                if v.is_empty() {
+                    TrainSpec::default().lr_schedule
+                } else {
+                    v
+                }
             },
             seed: self
                 .form
@@ -446,13 +453,21 @@ impl TrainingTab {
             lora_r: {
                 // Accept both the spec label "LoRA r" and the legacy "LoRA Rank".
                 let v = self.form.value("LoRA r");
-                let v = if v.is_empty() { self.form.value("LoRA Rank") } else { v };
+                let v = if v.is_empty() {
+                    self.form.value("LoRA Rank")
+                } else {
+                    v
+                };
                 v.parse().unwrap_or(TrainSpec::default().lora_r)
             },
             lora_alpha: {
                 // Accept both the spec label "LoRA α" and the legacy "LoRA Alpha".
                 let v = self.form.value("LoRA α");
-                let v = if v.is_empty() { self.form.value("LoRA Alpha") } else { v };
+                let v = if v.is_empty() {
+                    self.form.value("LoRA Alpha")
+                } else {
+                    v
+                };
                 v.parse().unwrap_or(TrainSpec::default().lora_alpha)
             },
             quantization,

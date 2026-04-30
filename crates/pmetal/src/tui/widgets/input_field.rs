@@ -324,8 +324,8 @@ fn core_kind_to_tui(kind: &pmetal_core::FieldKind) -> FieldKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_core::jobs::TrainSpec;
     use pmetal_core::JobFields;
+    use pmetal_core::jobs::TrainSpec;
 
     /// Collect descriptor-built fields for a spec, filtering out flag-only
     /// fields (Toggle defaults = Disabled/false) to match the hand-built
@@ -382,7 +382,10 @@ mod tests {
         let batch_desc = descs.iter().find(|d| d.name == "batch_size").unwrap();
         let field = FormField::from_descriptor(batch_desc, None);
         assert!(matches!(field.kind, FieldKind::Integer { min: 1, .. }));
-        let v: i64 = field.value.parse().expect("batch_size default should parse");
+        let v: i64 = field
+            .value
+            .parse()
+            .expect("batch_size default should parse");
         assert!(v >= 1);
     }
 
@@ -403,7 +406,10 @@ mod tests {
     fn from_descriptor_toggle_values_are_enabled_disabled() {
         let descs = TrainSpec::field_descriptors();
         // cut_cross_entropy is a Toggle / flag field with default false
-        let cce_desc = descs.iter().find(|d| d.name == "cut_cross_entropy").unwrap();
+        let cce_desc = descs
+            .iter()
+            .find(|d| d.name == "cut_cross_entropy")
+            .unwrap();
         let field = FormField::from_descriptor(cce_desc, None);
         // default false → "Disabled"
         assert_eq!(field.value, "Disabled");

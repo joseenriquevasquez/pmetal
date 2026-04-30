@@ -85,7 +85,10 @@ pub fn plan_attention(
         ),
         // O bias is applied *after* allreduce — it must be the full
         // hidden-dim vector on every rank.
-        (format!("{prefix}.o_proj.bias"), ShardingDirective::Replicated),
+        (
+            format!("{prefix}.o_proj.bias"),
+            ShardingDirective::Replicated,
+        ),
     ]
 }
 
@@ -135,10 +138,7 @@ pub fn plan_attention(
 ///
 /// `pmetal-models/src/architectures/deepseek.rs::DeepSeekAttention` —
 /// the ground-truth weight layout.
-pub fn plan_mla(
-    prefix: &str,
-    q_lora_rank: Option<usize>,
-) -> Vec<(String, ShardingDirective)> {
+pub fn plan_mla(prefix: &str, q_lora_rank: Option<usize>) -> Vec<(String, ShardingDirective)> {
     let mut directives = Vec::new();
 
     match q_lora_rank {
@@ -384,10 +384,7 @@ pub fn plan_qwen_moe(prefix: &str, total_experts: usize) -> Vec<(String, Shardin
 /// # Reference
 ///
 /// `pmetal-bridge/src/llama4_native/weights.rs`.
-pub fn plan_llama4_moe(
-    prefix: &str,
-    total_experts: usize,
-) -> Vec<(String, ShardingDirective)> {
+pub fn plan_llama4_moe(prefix: &str, total_experts: usize) -> Vec<(String, ShardingDirective)> {
     let mut directives = Vec::new();
 
     // Router: replicated.
@@ -434,10 +431,7 @@ pub fn plan_llama4_moe(
 /// # Reference
 ///
 /// `pmetal-bridge/src/gpt_oss_native/weights.rs`.
-pub fn plan_gpt_oss_moe(
-    prefix: &str,
-    total_experts: usize,
-) -> Vec<(String, ShardingDirective)> {
+pub fn plan_gpt_oss_moe(prefix: &str, total_experts: usize) -> Vec<(String, ShardingDirective)> {
     let mut directives = Vec::new();
 
     // Router: replicated.
@@ -530,9 +524,7 @@ pub fn build_plan(
     // MoE family detection. Every family has its own block name, router
     // key, and expert-stacking convention — see the per-arch planners.
     let is_llama4 = arch.contains("Llama4") || model_type == "llama4";
-    let is_gpt_oss = arch.contains("GptOss")
-        || arch.contains("gpt_oss")
-        || model_type == "gpt_oss";
+    let is_gpt_oss = arch.contains("GptOss") || arch.contains("gpt_oss") || model_type == "gpt_oss";
     // Qwen-family MoE covers Qwen2-MoE, Qwen3-MoE, and Qwen3-Next's sparse
     // block. `is_hybrid_gdn` already routes Qwen3-Next's recurrent layers.
     let is_qwen_moe = arch.contains("Qwen2Moe")
@@ -675,13 +667,10 @@ pub fn build_plan(
             // DeepSeek: dense FFN for the first `first_k_dense_replace`
             // layers, MoE for layers where (layer % moe_layer_freq == 0)
             // AFTER the dense prefix.
-            let is_moe_layer =
-                layer >= deepseek_first_dense && layer % deepseek_moe_freq == 0;
+            let is_moe_layer = layer >= deepseek_first_dense && layer % deepseek_moe_freq == 0;
             let block = format!("{layer_prefix}.mlp");
             if is_moe_layer && num_experts > 0 {
-                for (name, dir) in
-                    plan_deepseek_moe(&block, num_experts, deepseek_has_shared)
-                {
+                for (name, dir) in plan_deepseek_moe(&block, num_experts, deepseek_has_shared) {
                     plan.add(name, dir);
                 }
             } else {
@@ -763,10 +752,7 @@ mod tests {
     use super::*;
 
     /// Look up a directive by name, panicking with context if missing.
-    fn expect<'a>(
-        dirs: &'a [(String, ShardingDirective)],
-        name: &str,
-    ) -> &'a ShardingDirective {
+    fn expect<'a>(dirs: &'a [(String, ShardingDirective)], name: &str) -> &'a ShardingDirective {
         dirs.iter()
             .find_map(|(n, d)| (n == name).then_some(d))
             .unwrap_or_else(|| {
@@ -856,7 +842,11 @@ mod tests {
             ShardingDirective::ShardedToAll { axis } => assert_eq!(*axis, 1),
             other => panic!("shared_expert.down_proj expected ShardedToAll axis=1, got {other:?}"),
         }
-        assert!(directives.iter().all(|(n, _)| !n.contains("shared_experts.")));
+        assert!(
+            directives
+                .iter()
+                .all(|(n, _)| !n.contains("shared_experts."))
+        );
     }
 
     #[test]
@@ -1072,7 +1062,8 @@ mod tests {
             "GDN block should be `linear_attn`, not `gdn`"
         );
         assert!(
-            !plan.directives
+            !plan
+                .directives
                 .contains_key("model.layers.0.gdn.in_proj_qkv.weight"),
             "`gdn` block name is stale and must not appear in the plan"
         );
@@ -1082,7 +1073,8 @@ mod tests {
                 .contains_key("model.layers.3.self_attn.q_proj.weight")
         );
         assert!(
-            !plan.directives
+            !plan
+                .directives
                 .contains_key("model.layers.3.linear_attn.in_proj_qkv.weight")
         );
     }
@@ -1115,7 +1107,8 @@ mod tests {
                 .contains_key("model.layers.1.self_attn.q_proj.weight")
         );
         assert!(
-            !plan.directives
+            !plan
+                .directives
                 .contains_key("model.layers.1.linear_attn.in_proj_qkv.weight")
         );
         // Layer 3, which would be attention by interval math, is now
@@ -1125,7 +1118,8 @@ mod tests {
                 .contains_key("model.layers.3.linear_attn.in_proj_qkv.weight")
         );
         assert!(
-            !plan.directives
+            !plan
+                .directives
                 .contains_key("model.layers.3.self_attn.q_proj.weight")
         );
     }
@@ -1187,14 +1181,19 @@ mod tests {
                 .contains_key("model.layers.0.self_attn.kv_b_proj.weight")
         );
         assert!(
-            !plan.directives
+            !plan
+                .directives
                 .contains_key("model.layers.0.self_attn.k_proj.weight")
         );
 
         // Layer 0: dense FFN (no switch_mlp).
-        assert!(plan.directives.contains_key("model.layers.0.mlp.down_proj.weight"));
         assert!(
-            !plan.directives
+            plan.directives
+                .contains_key("model.layers.0.mlp.down_proj.weight")
+        );
+        assert!(
+            !plan
+                .directives
                 .contains_key("model.layers.0.mlp.switch_mlp.gate_proj.weight")
         );
 
@@ -1207,7 +1206,10 @@ mod tests {
             plan.directives
                 .contains_key("model.layers.1.mlp.shared_experts.down_proj.weight")
         );
-        assert!(plan.directives.contains_key("model.layers.1.mlp.gate.weight"));
+        assert!(
+            plan.directives
+                .contains_key("model.layers.1.mlp.gate.weight")
+        );
     }
 
     #[test]
@@ -1235,7 +1237,8 @@ mod tests {
                 .contains_key("model.layers.0.self_attn.q_proj.weight")
         );
         assert!(
-            !plan.directives
+            !plan
+                .directives
                 .contains_key("model.layers.0.self_attn.q_a_proj.weight")
         );
     }
@@ -1258,7 +1261,8 @@ mod tests {
                 .contains_key("model.layers.0.mlp.down_proj.weight")
         );
         assert!(
-            !plan.directives
+            !plan
+                .directives
                 .contains_key("model.layers.0.mlp.switch_mlp.gate_proj.weight")
         );
 
@@ -1305,15 +1309,18 @@ mod tests {
         );
         // No Qwen-style `gate.weight` router, no switch_mlp, no scalar gate.
         assert!(
-            !plan.directives
+            !plan
+                .directives
                 .contains_key("model.layers.0.feed_forward.gate.weight")
         );
         assert!(
-            !plan.directives
+            !plan
+                .directives
                 .contains_key("model.layers.0.feed_forward.switch_mlp.gate_proj.weight")
         );
         assert!(
-            !plan.directives
+            !plan
+                .directives
                 .contains_key("model.layers.0.feed_forward.shared_expert_gate.weight")
         );
 
@@ -1323,7 +1330,8 @@ mod tests {
                 .contains_key("model.layers.1.mlp.down_proj.weight")
         );
         assert!(
-            !plan.directives
+            !plan
+                .directives
                 .contains_key("model.layers.1.feed_forward.router.weight")
         );
     }
@@ -1343,10 +1351,7 @@ mod tests {
         for proj in ["gate_proj", "up_proj", "down_proj"] {
             for kind in ["weight", "bias"] {
                 let key = format!("model.layers.0.mlp.experts.{proj}.{kind}");
-                assert!(
-                    plan.directives.contains_key(&key),
-                    "missing {key} in plan"
-                );
+                assert!(plan.directives.contains_key(&key), "missing {key} in plan");
                 assert!(
                     matches!(
                         plan.directives[&key],
@@ -1358,18 +1363,15 @@ mod tests {
         }
 
         // No shared expert / shared_expert_gate anywhere.
-        assert!(
-            plan.directives
-                .keys()
-                .all(|k| !k.contains("shared_expert"))
-        );
+        assert!(plan.directives.keys().all(|k| !k.contains("shared_expert")));
         // Router name is `router`, not `gate`.
         assert!(
             plan.directives
                 .contains_key("model.layers.0.mlp.router.weight")
         );
         assert!(
-            !plan.directives
+            !plan
+                .directives
                 .contains_key("model.layers.0.mlp.gate.weight")
         );
     }

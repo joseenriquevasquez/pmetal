@@ -201,10 +201,7 @@ impl QuantizedKeyStore {
                 .outlier_residual_norms
                 .as_ref()
                 .map_or(0, |v| v.len() * 4)
-            + self
-                .outlier_slot_scale
-                .as_ref()
-                .map_or(0, |v| v.len() * 4)
+            + self.outlier_slot_scale.as_ref().map_or(0, |v| v.len() * 4)
             + self
                 .regular_per_block_outlier_channels
                 .as_ref()
@@ -291,4 +288,3 @@ impl QuantizedValueStore {
             + self.outlier_norms.as_ref().map_or(0, |v| v.len() * 4)
     }
 }
-

@@ -108,7 +108,11 @@ impl ModuleParameters for CohereQloraAttention {
 }
 
 impl CohereQloraAttention {
-    pub fn new(config: &CohereConfig, layer_idx: usize, qlora_config: &QLoraConfig) -> Result<Self, LoraError> {
+    pub fn new(
+        config: &CohereConfig,
+        layer_idx: usize,
+        qlora_config: &QLoraConfig,
+    ) -> Result<Self, LoraError> {
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim;
@@ -167,10 +171,24 @@ impl CohereQloraAttention {
         let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // Apply RoPE BEFORE transpose — [B, S, H, D] matches apply_rope convention
-        let q = pmetal_mlx::kernels::rope::apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, 0)
-            .map_err(LoraError::Mlx)?;
-        let k = pmetal_mlx::kernels::rope::apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, 0)
-            .map_err(LoraError::Mlx)?;
+        let q = pmetal_mlx::kernels::rope::apply_rope(
+            &q,
+            self.head_dim,
+            false,
+            self.rope_theta,
+            1.0,
+            0,
+        )
+        .map_err(LoraError::Mlx)?;
+        let k = pmetal_mlx::kernels::rope::apply_rope(
+            &k,
+            self.head_dim,
+            false,
+            self.rope_theta,
+            1.0,
+            0,
+        )
+        .map_err(LoraError::Mlx)?;
 
         // Transpose to [B, H, S, D]
         let q = q.transpose_axes(&[0, 2, 1, 3]);
@@ -310,7 +328,11 @@ impl CohereQloraMLP {
         down_cfg.lora.r = crate::effective_rank(&qlora_config.lora, "down_proj");
         let down_proj = QLoraLinear::new(inter, hidden, &down_cfg, false)?;
 
-        Ok(Self { gate_proj, up_proj, down_proj })
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
     }
 
     /// SwiGLU forward: `silu(gate) * up → down`.
@@ -351,14 +373,23 @@ pub struct CohereQloraDecoderLayer {
 }
 
 impl CohereQloraDecoderLayer {
-    pub fn new(config: &CohereConfig, layer_idx: usize, qlora_config: &QLoraConfig) -> Result<Self, LoraError> {
+    pub fn new(
+        config: &CohereConfig,
+        layer_idx: usize,
+        qlora_config: &QLoraConfig,
+    ) -> Result<Self, LoraError> {
         let self_attn = CohereQloraAttention::new(config, layer_idx, qlora_config)?;
         let mlp = CohereQloraMLP::new(config, qlora_config)?;
         let input_layernorm = nn::LayerNormBuilder::new(config.hidden_size)
             .eps(config.layer_norm_eps)
             .build()
             .map_err(LoraError::Mlx)?;
-        Ok(Self { layer_idx, self_attn, mlp, input_layernorm })
+        Ok(Self {
+            layer_idx,
+            self_attn,
+            mlp,
+            input_layernorm,
+        })
     }
 
     /// Parallel residual forward: `x + attn(norm(x)) + ffn(norm(x))`.
@@ -397,8 +428,8 @@ pub struct CohereQloraModel {
 
 impl CohereQloraModel {
     pub fn new(config: CohereConfig, qlora_config: QLoraConfig) -> Result<Self, LoraError> {
-        let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)
-            .map_err(LoraError::Mlx)?;
+        let embed_tokens =
+            nn::Embedding::new(config.vocab_size, config.hidden_size).map_err(LoraError::Mlx)?;
 
         let layers = (0..config.num_hidden_layers)
             .map(|i| CohereQloraDecoderLayer::new(&config, i as usize, &qlora_config))
@@ -409,11 +440,18 @@ impl CohereQloraModel {
             .build()
             .map_err(LoraError::Mlx)?;
 
-        Ok(Self { config, qlora_config, embed_tokens, layers, norm })
+        Ok(Self {
+            config,
+            qlora_config,
+            embed_tokens,
+            layers,
+            norm,
+        })
     }
 
     pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
-        let mut hidden = Module::forward(&mut self.embed_tokens, input_ids).map_err(LoraError::Mlx)?;
+        let mut hidden =
+            Module::forward(&mut self.embed_tokens, input_ids).map_err(LoraError::Mlx)?;
 
         // Build causal mask when none is provided
         let owned_mask: Option<Array>;
@@ -465,7 +503,10 @@ impl CohereQloraForCausalLM {
     }
 
     /// Construct with explicit QLoRA configuration.
-    pub fn with_qlora_config(config: CohereConfig, qlora_config: QLoraConfig) -> Result<Self, LoraError> {
+    pub fn with_qlora_config(
+        config: CohereConfig,
+        qlora_config: QLoraConfig,
+    ) -> Result<Self, LoraError> {
         let tie_weights = config.tie_word_embeddings;
 
         let lm_head = if !tie_weights {
@@ -480,7 +521,11 @@ impl CohereQloraForCausalLM {
         };
 
         let model = CohereQloraModel::new(config, qlora_config)?;
-        Ok(Self { model, lm_head, checkpoint_config: None })
+        Ok(Self {
+            model,
+            lm_head,
+            checkpoint_config: None,
+        })
     }
 
     /// Enable gradient checkpointing.
@@ -551,20 +596,62 @@ impl CohereQloraForCausalLM {
                     }
                 };
             }
-            maybe_set!(layer.self_attn.q_proj.lora_a, format!("{}.self_attn.q_proj.lora_A.weight", prefix));
-            maybe_set!(layer.self_attn.q_proj.lora_b, format!("{}.self_attn.q_proj.lora_B.weight", prefix));
-            maybe_set!(layer.self_attn.k_proj.lora_a, format!("{}.self_attn.k_proj.lora_A.weight", prefix));
-            maybe_set!(layer.self_attn.k_proj.lora_b, format!("{}.self_attn.k_proj.lora_B.weight", prefix));
-            maybe_set!(layer.self_attn.v_proj.lora_a, format!("{}.self_attn.v_proj.lora_A.weight", prefix));
-            maybe_set!(layer.self_attn.v_proj.lora_b, format!("{}.self_attn.v_proj.lora_B.weight", prefix));
-            maybe_set!(layer.self_attn.o_proj.lora_a, format!("{}.self_attn.o_proj.lora_A.weight", prefix));
-            maybe_set!(layer.self_attn.o_proj.lora_b, format!("{}.self_attn.o_proj.lora_B.weight", prefix));
-            maybe_set!(layer.mlp.gate_proj.lora_a, format!("{}.mlp.gate_proj.lora_A.weight", prefix));
-            maybe_set!(layer.mlp.gate_proj.lora_b, format!("{}.mlp.gate_proj.lora_B.weight", prefix));
-            maybe_set!(layer.mlp.up_proj.lora_a, format!("{}.mlp.up_proj.lora_A.weight", prefix));
-            maybe_set!(layer.mlp.up_proj.lora_b, format!("{}.mlp.up_proj.lora_B.weight", prefix));
-            maybe_set!(layer.mlp.down_proj.lora_a, format!("{}.mlp.down_proj.lora_A.weight", prefix));
-            maybe_set!(layer.mlp.down_proj.lora_b, format!("{}.mlp.down_proj.lora_B.weight", prefix));
+            maybe_set!(
+                layer.self_attn.q_proj.lora_a,
+                format!("{}.self_attn.q_proj.lora_A.weight", prefix)
+            );
+            maybe_set!(
+                layer.self_attn.q_proj.lora_b,
+                format!("{}.self_attn.q_proj.lora_B.weight", prefix)
+            );
+            maybe_set!(
+                layer.self_attn.k_proj.lora_a,
+                format!("{}.self_attn.k_proj.lora_A.weight", prefix)
+            );
+            maybe_set!(
+                layer.self_attn.k_proj.lora_b,
+                format!("{}.self_attn.k_proj.lora_B.weight", prefix)
+            );
+            maybe_set!(
+                layer.self_attn.v_proj.lora_a,
+                format!("{}.self_attn.v_proj.lora_A.weight", prefix)
+            );
+            maybe_set!(
+                layer.self_attn.v_proj.lora_b,
+                format!("{}.self_attn.v_proj.lora_B.weight", prefix)
+            );
+            maybe_set!(
+                layer.self_attn.o_proj.lora_a,
+                format!("{}.self_attn.o_proj.lora_A.weight", prefix)
+            );
+            maybe_set!(
+                layer.self_attn.o_proj.lora_b,
+                format!("{}.self_attn.o_proj.lora_B.weight", prefix)
+            );
+            maybe_set!(
+                layer.mlp.gate_proj.lora_a,
+                format!("{}.mlp.gate_proj.lora_A.weight", prefix)
+            );
+            maybe_set!(
+                layer.mlp.gate_proj.lora_b,
+                format!("{}.mlp.gate_proj.lora_B.weight", prefix)
+            );
+            maybe_set!(
+                layer.mlp.up_proj.lora_a,
+                format!("{}.mlp.up_proj.lora_A.weight", prefix)
+            );
+            maybe_set!(
+                layer.mlp.up_proj.lora_b,
+                format!("{}.mlp.up_proj.lora_B.weight", prefix)
+            );
+            maybe_set!(
+                layer.mlp.down_proj.lora_a,
+                format!("{}.mlp.down_proj.lora_A.weight", prefix)
+            );
+            maybe_set!(
+                layer.mlp.down_proj.lora_b,
+                format!("{}.mlp.down_proj.lora_B.weight", prefix)
+            );
         }
     }
 
@@ -619,7 +706,10 @@ impl CohereQloraForCausalLM {
         crate::save_safetensors_map(path, &params)
     }
 
-    pub fn load_lora_weights(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
+    pub fn load_lora_weights(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(), LoraError> {
         let path = path.as_ref();
         let file_path = if path.is_dir() {
             path.join("lora_weights.safetensors")
@@ -627,8 +717,10 @@ impl CohereQloraForCausalLM {
             path.to_path_buf()
         };
         let loaded = crate::load_safetensors_map(&file_path)?;
-        let params: HashMap<Rc<str>, Array> =
-            loaded.into_iter().map(|(k, v)| (Rc::from(k.as_str()), v)).collect();
+        let params: HashMap<Rc<str>, Array> = loaded
+            .into_iter()
+            .map(|(k, v)| (Rc::from(k.as_str()), v))
+            .collect();
         self.set_lora_parameters(&params);
         Ok(())
     }

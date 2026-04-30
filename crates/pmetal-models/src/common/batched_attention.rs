@@ -28,8 +28,7 @@
 
 use pmetal_bridge::compat::{Array, Dtype, Exception, Module, nn, ops};
 use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::apply_rope_with_per_batch_positions,
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope_with_per_batch_positions,
 };
 use pmetal_mlx::kv_cache::FusedBatchKVCache;
 
@@ -260,9 +259,8 @@ pub fn batched_gqa_attn(
             .iter()
             .map(|&idx| cache.offset_for(layer_idx, idx) as i32 - window)
             .collect();
-        let lower =
-            Array::from_i32_slice_shaped(&lower_bounds, &[n_active, 1, 1, 1])
-                .as_dtype(Dtype::Float32.as_i32());
+        let lower = Array::from_i32_slice_shaped(&lower_bounds, &[n_active, 1, 1, 1])
+            .as_dtype(Dtype::Float32.as_i32());
         let t_range = ops::arange_range(0, t_max_i32).reshape(&[1, 1, 1, t_max_i32]);
         let invalid = ops::less(&t_range, &lower);
         let zero = Array::from_f32(0.0);

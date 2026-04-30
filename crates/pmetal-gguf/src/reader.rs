@@ -70,6 +70,12 @@ pub const MAX_TENSOR_COUNT: usize = 100_000;
 /// Maximum allowed metadata count (100,000 entries).
 pub const MAX_METADATA_COUNT: usize = 100_000;
 
+/// Maximum allowed tensor rank.
+///
+/// GGUF model tensors are normally rank <= 4. Keeping a modest upper bound
+/// prevents malicious headers from forcing excessive dimension reads.
+pub const MAX_TENSOR_DIMS: u32 = 16;
+
 /// Error type for GGUF reading.
 #[derive(Debug, thiserror::Error)]
 pub enum GgufReadError {
@@ -129,6 +135,22 @@ pub enum GgufReadError {
         /// Maximum allowed.
         max: usize,
     },
+    /// Tensor has too many dimensions.
+    #[error("Tensor {name} has {n_dims} dimensions, exceeding maximum of {max}")]
+    TooManyTensorDimensions {
+        /// Tensor name.
+        name: String,
+        /// Actual dimension count.
+        n_dims: u32,
+        /// Maximum allowed dimensions.
+        max: u32,
+    },
+    /// Duplicate metadata key.
+    #[error("Duplicate GGUF metadata key: {0}")]
+    DuplicateMetadataKey(String),
+    /// Duplicate tensor name.
+    #[error("Duplicate GGUF tensor name: {0}")]
+    DuplicateTensorName(String),
     /// Metadata array nesting depth exceeded the safety limit.
     #[error("Metadata array nesting depth exceeded limit of {max}")]
     ArrayNestingTooDeep {
@@ -171,8 +193,7 @@ impl GgufContent {
     pub fn read<R: Read + Seek>(reader: &mut R) -> Result<Self, GgufReadError> {
         // Read and validate magic
         let magic = reader.read_u32::<LittleEndian>()?;
-        if magic != GGUF_MAGIC && magic != 0x47475546 {
-            // Also accept big-endian "GGUF"
+        if magic != GGUF_MAGIC {
             return Err(GgufReadError::InvalidMagic(magic));
         }
 
@@ -232,7 +253,9 @@ impl GgufContent {
             let key = read_string(reader, &version)?;
             let value_type_num = reader.read_u32::<LittleEndian>()?;
             let value = read_value(reader, value_type_num, &version, 0)?;
-            metadata.insert(key, value);
+            if metadata.insert(key.clone(), value).is_some() {
+                return Err(GgufReadError::DuplicateMetadataKey(key));
+            }
         }
 
         // Read tensor infos
@@ -240,6 +263,13 @@ impl GgufContent {
         for _ in 0..tensor_count {
             let name = read_string(reader, &version)?;
             let n_dims = reader.read_u32::<LittleEndian>()?;
+            if n_dims > MAX_TENSOR_DIMS {
+                return Err(GgufReadError::TooManyTensorDimensions {
+                    name,
+                    n_dims,
+                    max: MAX_TENSOR_DIMS,
+                });
+            }
 
             // Read dimensions (stored in reverse order in GGUF)
             let mut dims: Vec<u64> = match version {
@@ -258,16 +288,18 @@ impl GgufContent {
 
             let offset = reader.read_u64::<LittleEndian>()?;
 
-            tensor_infos.insert(
-                name.clone(),
-                TensorInfo {
-                    name,
-                    n_dimensions: n_dims,
-                    dimensions: dims,
-                    dtype,
-                    offset,
-                },
-            );
+            let info = TensorInfo {
+                name: name.clone(),
+                n_dimensions: n_dims,
+                dimensions: dims,
+                dtype,
+                offset,
+            };
+            validate_tensor_size(&info)?;
+
+            if tensor_infos.insert(name.clone(), info).is_some() {
+                return Err(GgufReadError::DuplicateTensorName(name));
+            }
         }
 
         // Calculate tensor data offset with alignment
@@ -286,7 +318,7 @@ impl GgufContent {
             return Err(GgufReadError::InvalidAlignment(alignment));
         }
 
-        let tensor_data_offset = position.div_ceil(alignment) * alignment;
+        let tensor_data_offset = align_offset_checked(position, alignment)?;
 
         Ok(Self {
             version,
@@ -360,6 +392,10 @@ impl GgufContent {
             .tensor_data_offset
             .checked_add(info.offset)
             .ok_or(GgufReadError::IntegerOverflow)?;
+        let byte_size_u64 = u64::try_from(byte_size).map_err(|_| GgufReadError::IntegerOverflow)?;
+        let _end_pos = seek_pos
+            .checked_add(byte_size_u64)
+            .ok_or(GgufReadError::IntegerOverflow)?;
         reader.seek(SeekFrom::Start(seek_pos))?;
         reader.read_exact(&mut data)?;
 
@@ -382,6 +418,29 @@ impl GgufContent {
 
         Ok(tensors)
     }
+}
+
+fn align_offset_checked(offset: u64, alignment: u64) -> Result<u64, GgufReadError> {
+    let remainder = offset % alignment;
+    if remainder == 0 {
+        Ok(offset)
+    } else {
+        offset
+            .checked_add(alignment - remainder)
+            .ok_or(GgufReadError::IntegerOverflow)
+    }
+}
+
+fn validate_tensor_size(info: &TensorInfo) -> Result<(), GgufReadError> {
+    info.byte_size_checked().map(|_| ()).map_err(|e| match e {
+        crate::TensorSizeError::ElementCountOverflow | crate::TensorSizeError::ByteSizeOverflow => {
+            GgufReadError::IntegerOverflow
+        }
+        crate::TensorSizeError::ElementCountTooLarge(n) => GgufReadError::TensorTooLarge {
+            n_elements: n,
+            dtype: format!("{:?}", info.dtype),
+        },
+    })
 }
 
 /// Read a GGUF string with size validation.
@@ -537,6 +596,13 @@ impl TryFrom<u32> for GgmlType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use byteorder::WriteBytesExt;
+    use std::io::Cursor;
+
+    fn write_string_v3(bytes: &mut Vec<u8>, s: &str) {
+        bytes.write_u64::<LittleEndian>(s.len() as u64).unwrap();
+        bytes.extend_from_slice(s.as_bytes());
+    }
 
     #[test]
     fn test_ggml_type_conversion() {
@@ -553,5 +619,41 @@ mod tests {
         assert_eq!(GgufVersion::V1.to_string(), "v1");
         assert_eq!(GgufVersion::V2.to_string(), "v2");
         assert_eq!(GgufVersion::V3.to_string(), "v3");
+    }
+
+    #[test]
+    fn duplicate_metadata_keys_are_rejected() {
+        let mut bytes = Vec::new();
+        bytes.write_u32::<LittleEndian>(GGUF_MAGIC).unwrap();
+        bytes.write_u32::<LittleEndian>(3).unwrap();
+        bytes.write_u64::<LittleEndian>(0).unwrap();
+        bytes.write_u64::<LittleEndian>(2).unwrap();
+        write_string_v3(&mut bytes, "dup");
+        bytes.write_u32::<LittleEndian>(4).unwrap();
+        bytes.write_u32::<LittleEndian>(1).unwrap();
+        write_string_v3(&mut bytes, "dup");
+        bytes.write_u32::<LittleEndian>(4).unwrap();
+        bytes.write_u32::<LittleEndian>(2).unwrap();
+
+        let err = GgufContent::read(&mut Cursor::new(bytes)).unwrap_err();
+        assert!(matches!(err, GgufReadError::DuplicateMetadataKey(key) if key == "dup"));
+    }
+
+    #[test]
+    fn excessive_tensor_rank_is_rejected_before_dimension_allocation() {
+        let mut bytes = Vec::new();
+        bytes.write_u32::<LittleEndian>(GGUF_MAGIC).unwrap();
+        bytes.write_u32::<LittleEndian>(3).unwrap();
+        bytes.write_u64::<LittleEndian>(1).unwrap();
+        bytes.write_u64::<LittleEndian>(0).unwrap();
+        write_string_v3(&mut bytes, "bad.weight");
+        bytes
+            .write_u32::<LittleEndian>(MAX_TENSOR_DIMS + 1)
+            .unwrap();
+
+        let err = GgufContent::read(&mut Cursor::new(bytes)).unwrap_err();
+        assert!(
+            matches!(err, GgufReadError::TooManyTensorDimensions { name, .. } if name == "bad.weight")
+        );
     }
 }

@@ -8,15 +8,33 @@ use serde::{Deserialize, Serialize};
 #[spec(kind = "PackExperts", subcommand = "pack-experts")]
 #[serde(rename_all = "snake_case")]
 pub struct PackExpertsSpec {
-    #[job(label = "Model", group = "Source", argv = "--model", kind = "model_picker", required)]
+    #[job(
+        label = "Model",
+        group = "Source",
+        argv = "--model",
+        kind = "model_picker",
+        required
+    )]
     #[serde(default)]
     pub model: String,
 
-    #[job(label = "Output Dir", group = "Output", argv = "--output", kind = "path", default = "./packed_experts")]
+    #[job(
+        label = "Output Dir",
+        group = "Output",
+        argv = "--output",
+        kind = "path",
+        default = "./packed_experts"
+    )]
     #[serde(default = "default_output")]
     pub output: String,
 
-    #[job(label = "Bits", group = "Quantization", argv = "--bits", min = 2, max = 8)]
+    #[job(
+        label = "Bits",
+        group = "Quantization",
+        argv = "--bits",
+        min = 2,
+        max = 8
+    )]
     #[serde(default)]
     pub bits: Option<u8>,
 }
@@ -34,11 +52,7 @@ impl Default for PackExpertsSpec {
 impl PackExpertsSpec {
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
         let errs = self.validate_descriptors();
-        if errs.is_empty() {
-            Ok(())
-        } else {
-            Err(errs)
-        }
+        if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }
 
@@ -52,8 +66,10 @@ mod tests {
 
     #[test]
     fn argv_round_trip() {
-        let mut spec = PackExpertsSpec::default();
-        spec.model = "m".into();
+        let spec = PackExpertsSpec {
+            model: "m".into(),
+            ..Default::default()
+        };
         let argv = spec.to_argv();
         assert!(argv.contains(&"--model".to_string()));
         assert!(argv.contains(&"--output".to_string()));

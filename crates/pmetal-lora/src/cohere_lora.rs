@@ -79,14 +79,38 @@ impl CohereLoraAttention {
         let v_rank = crate::effective_rank(lora_config, "v_proj") as i32;
         let o_rank = crate::effective_rank(lora_config, "o_proj") as i32;
 
-        let q_proj =
-            LoraLinear::new(hidden_size, n_heads * head_dim, q_rank, alpha, use_rslora, false)?;
-        let k_proj =
-            LoraLinear::new(hidden_size, n_kv_heads * head_dim, k_rank, alpha, use_rslora, false)?;
-        let v_proj =
-            LoraLinear::new(hidden_size, n_kv_heads * head_dim, v_rank, alpha, use_rslora, false)?;
-        let o_proj =
-            LoraLinear::new(n_heads * head_dim, hidden_size, o_rank, alpha, use_rslora, false)?;
+        let q_proj = LoraLinear::new(
+            hidden_size,
+            n_heads * head_dim,
+            q_rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
+        let k_proj = LoraLinear::new(
+            hidden_size,
+            n_kv_heads * head_dim,
+            k_rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
+        let v_proj = LoraLinear::new(
+            hidden_size,
+            n_kv_heads * head_dim,
+            v_rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
+        let o_proj = LoraLinear::new(
+            n_heads * head_dim,
+            hidden_size,
+            o_rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
 
         let use_sliding_window =
             config.use_sliding_window && !config.uses_global_attention(layer_idx as i32);
@@ -152,7 +176,9 @@ impl CohereLoraAttention {
         let probs = ops::softmax_axis(&scores, -1);
         let out = probs.matmul(&v);
 
-        let out = out.transpose_axes(&[0, 2, 1, 3]).reshape(&[batch, seq_len, -1]);
+        let out = out
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
         self.o_proj.forward(&out)
     }
 
@@ -218,7 +244,9 @@ impl CohereLoraAttention {
         }
         let probs = ops::softmax_axis(&scores, -1);
         let out = probs.matmul(&v);
-        let out = out.transpose_axes(&[0, 2, 1, 3]).reshape(&[batch, seq_len, -1]);
+        let out = out
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
         self.o_proj.forward(&out)
     }
 
@@ -877,10 +905,7 @@ impl CohereLoraForCausalLM {
         self.load_base_weights(&all_weights)
     }
 
-    pub fn load_base_weights(
-        &mut self,
-        weights: &HashMap<String, Array>,
-    ) -> Result<(), LoraError> {
+    pub fn load_base_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), LoraError> {
         // Embeddings
         if let Some(w) = weights.get("model.embed_tokens.weight") {
             self.model.embed_tokens.weight = Param::new(w.clone());

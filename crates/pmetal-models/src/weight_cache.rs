@@ -68,7 +68,12 @@ impl WeightCache {
     /// `max_resident`: maximum number of layers to keep in memory (the "window size").
     /// `num_layers`: total number of decoder layers in the model.
     pub fn new(model_dir: PathBuf, max_resident: usize, num_layers: usize) -> Self {
-        assert!(max_resident > 0, "window size must be at least 1");
+        let max_resident = if max_resident == 0 {
+            tracing::warn!("WeightCache max_resident=0 requested; using 1");
+            1
+        } else {
+            max_resident
+        };
         Self {
             model_dir,
             max_resident,
@@ -159,7 +164,9 @@ impl WeightCache {
             self.load_layer(layer_idx)?;
         }
 
-        Ok(self.resident.get(&layer_idx).unwrap())
+        self.resident
+            .get(&layer_idx)
+            .ok_or_else(|| Exception::custom(format!("Layer {layer_idx} was not cached")))
     }
 
     /// Prefetch a layer's weights (hint: will be needed soon).
@@ -189,10 +196,11 @@ impl WeightCache {
     /// evicted and this method returns without modifying the cache.
     pub fn evict(&mut self, layer_idx: usize) {
         if self.references.get(&layer_idx).copied().unwrap_or(0) > 0 {
+            let reference_count = self.reference_count(layer_idx);
             tracing::warn!(
                 "Refused to evict layer {} — it has {} active reference(s)",
                 layer_idx,
-                self.references[&layer_idx]
+                reference_count
             );
             self.stats.reference_held_eviction_skips += 1;
             return;
@@ -220,7 +228,9 @@ impl WeightCache {
                 .position(|&idx| self.references.get(&idx).copied().unwrap_or(0) == 0);
 
             if let Some(pos) = evict_pos {
-                let evict_idx = self.lru_order.remove(pos).unwrap();
+                let evict_idx = self.lru_order.remove(pos).ok_or_else(|| {
+                    Exception::custom("Weight cache LRU order changed during eviction")
+                })?;
                 self.resident.remove(&evict_idx);
                 self.stats.evictions += 1;
                 tracing::debug!("Evicted layer {} from weight cache", evict_idx);
@@ -279,6 +289,12 @@ pub fn load_layer_weights(
         .into_iter()
         .filter(|(name, _)| name.starts_with(&prefix) || name.starts_with(&alt_prefix))
         .collect();
+
+    if layer_weights.is_empty() {
+        return Err(Exception::custom(format!(
+            "No weights found for layer {layer_idx}"
+        )));
+    }
 
     Ok(layer_weights)
 }
@@ -374,6 +390,13 @@ mod tests {
         // Extra decrease must not underflow.
         cache.decrease_reference(7);
         assert_eq!(cache.reference_count(7), 0);
+    }
+
+    #[test]
+    fn zero_window_size_is_clamped() {
+        let dir = PathBuf::from("/nonexistent");
+        let cache = WeightCache::new(dir, 0, 32);
+        assert_eq!(cache.max_resident, 1);
     }
 
     #[test]

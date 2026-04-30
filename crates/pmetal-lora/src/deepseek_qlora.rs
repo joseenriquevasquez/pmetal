@@ -20,8 +20,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use pmetal_bridge::compat::{
-    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param, nn,
-    ops,
+    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param, nn, ops,
 };
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
@@ -38,19 +37,16 @@ use crate::{LoraError, QLoraConfig, QLoraLinear};
 pub enum DeepSeekQloraQProj {
     /// Two-stage: q_a_proj (hidden → q_lora_rank) then q_b_proj (q_lora_rank → n_heads*q_head_dim).
     LoRa {
-        q_a_proj: QLoraLinear,
-        q_a_layernorm: nn::RmsNorm,
-        q_b_proj: QLoraLinear,
+        q_a_proj: Box<QLoraLinear>,
+        q_a_layernorm: Box<nn::RmsNorm>,
+        q_b_proj: Box<QLoraLinear>,
     },
     /// Direct: q_proj (hidden → n_heads*q_head_dim).
-    Direct { q_proj: QLoraLinear },
+    Direct { q_proj: Box<QLoraLinear> },
 }
 
 impl DeepSeekQloraQProj {
-    fn new(
-        config: &DeepSeekConfig,
-        qcfg: &QLoraConfig,
-    ) -> Result<Self, LoraError> {
+    fn new(config: &DeepSeekConfig, qcfg: &QLoraConfig) -> Result<Self, LoraError> {
         let hidden = config.hidden_size;
         let n_heads = config.num_attention_heads;
         let q_head_dim = config.q_head_dim();
@@ -67,25 +63,33 @@ impl DeepSeekQloraQProj {
 
             let mut qb_cfg = qcfg.clone();
             qb_cfg.lora.r = crate::effective_rank(&qcfg.lora, "q_b_proj");
-            let q_b_proj =
-                QLoraLinear::new(q_lora_rank, n_heads * q_head_dim, &qb_cfg, false)?;
+            let q_b_proj = QLoraLinear::new(q_lora_rank, n_heads * q_head_dim, &qb_cfg, false)?;
 
-            Ok(Self::LoRa { q_a_proj, q_a_layernorm, q_b_proj })
+            Ok(Self::LoRa {
+                q_a_proj: Box::new(q_a_proj),
+                q_a_layernorm: Box::new(q_a_layernorm),
+                q_b_proj: Box::new(q_b_proj),
+            })
         } else {
             let mut qp_cfg = qcfg.clone();
             qp_cfg.lora.r = crate::effective_rank(&qcfg.lora, "q_proj");
-            let q_proj =
-                QLoraLinear::new(hidden, n_heads * q_head_dim, &qp_cfg, false)?;
-            Ok(Self::Direct { q_proj })
+            let q_proj = QLoraLinear::new(hidden, n_heads * q_head_dim, &qp_cfg, false)?;
+            Ok(Self::Direct {
+                q_proj: Box::new(q_proj),
+            })
         }
     }
 
     fn project(&mut self, x: &Array) -> Result<Array, LoraError> {
         match self {
-            Self::LoRa { q_a_proj, q_a_layernorm, q_b_proj } => {
+            Self::LoRa {
+                q_a_proj,
+                q_a_layernorm,
+                q_b_proj,
+            } => {
                 let q_a_out = q_a_proj.forward(x)?;
                 let q_a_norm =
-                    pmetal_bridge::compat::Module::forward(q_a_layernorm, &q_a_out)
+                    pmetal_bridge::compat::Module::forward(q_a_layernorm.as_mut(), &q_a_out)
                         .map_err(LoraError::Mlx)?;
                 q_b_proj.forward(&q_a_norm)
             }
@@ -95,16 +99,18 @@ impl DeepSeekQloraQProj {
 
     fn num_trainable_params(&self) -> usize {
         match self {
-            Self::LoRa { q_a_proj, q_b_proj, .. } => {
-                q_a_proj.num_trainable_params() + q_b_proj.num_trainable_params()
-            }
+            Self::LoRa {
+                q_a_proj, q_b_proj, ..
+            } => q_a_proj.num_trainable_params() + q_b_proj.num_trainable_params(),
             Self::Direct { q_proj } => q_proj.num_trainable_params(),
         }
     }
 
     fn memory_usage(&self) -> (usize, usize, usize) {
         match self {
-            Self::LoRa { q_a_proj, q_b_proj, .. } => {
+            Self::LoRa {
+                q_a_proj, q_b_proj, ..
+            } => {
                 let (aq, al, at) = q_a_proj.memory_usage();
                 let (bq, bl, bt) = q_b_proj.memory_usage();
                 (aq + bq, al + bl, at + bt)
@@ -293,7 +299,11 @@ impl DeepSeekQloraAttention {
         let (kaq, kal, kat) = self.kv_a_proj_with_mqa.memory_usage();
         let (kbq, kbl, kbt) = self.kv_b_proj.memory_usage();
         let (oq, ol, ot) = self.o_proj.memory_usage();
-        (qq + kaq + kbq + oq, ql + kal + kbl + ol, qt + kat + kbt + ot)
+        (
+            qq + kaq + kbq + oq,
+            ql + kal + kbl + ol,
+            qt + kat + kbt + ot,
+        )
     }
 }
 
@@ -379,7 +389,10 @@ impl DeepSeekQloraMoE {
             None
         };
 
-        Ok(Self { frozen_moe, shared_experts })
+        Ok(Self {
+            frozen_moe,
+            shared_experts,
+        })
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
@@ -408,8 +421,8 @@ impl DeepSeekQloraMoE {
 
 #[derive(Debug)]
 pub enum DeepSeekQloraMlpType {
-    Dense(DeepSeekQloraMLP),
-    MoE(DeepSeekQloraMoE),
+    Dense(Box<DeepSeekQloraMLP>),
+    MoE(Box<DeepSeekQloraMoE>),
 }
 
 impl DeepSeekQloraMlpType {
@@ -455,13 +468,13 @@ impl DeepSeekQloraDecoderLayer {
     ) -> Result<Self, LoraError> {
         let self_attn = DeepSeekQloraAttention::new(config, qcfg, layer_id)?;
         let mlp = if config.is_moe_layer(layer_id as i32) {
-            DeepSeekQloraMlpType::MoE(DeepSeekQloraMoE::new(config, qcfg)?)
+            DeepSeekQloraMlpType::MoE(Box::new(DeepSeekQloraMoE::new(config, qcfg)?))
         } else {
-            DeepSeekQloraMlpType::Dense(DeepSeekQloraMLP::new(
+            DeepSeekQloraMlpType::Dense(Box::new(DeepSeekQloraMLP::new(
                 config.hidden_size,
                 config.intermediate_size,
                 qcfg,
-            )?)
+            )?))
         };
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
@@ -471,7 +484,13 @@ impl DeepSeekQloraDecoderLayer {
             .eps(config.rms_norm_eps)
             .build()
             .map_err(LoraError::Mlx)?;
-        Ok(Self { layer_id, self_attn, mlp, input_layernorm, post_attention_layernorm })
+        Ok(Self {
+            layer_id,
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        })
     }
 
     pub fn forward(
@@ -480,15 +499,13 @@ impl DeepSeekQloraDecoderLayer {
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, LoraError> {
-        let normed =
-            pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)
-                .map_err(LoraError::Mlx)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)
+            .map_err(LoraError::Mlx)?;
         let attn_out = self.self_attn.forward(&normed, mask, cache)?;
         let h = x.add(&attn_out);
 
-        let normed =
-            pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)
-                .map_err(LoraError::Mlx)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)
+            .map_err(LoraError::Mlx)?;
         let mlp_out = self.mlp.forward(&normed)?;
         Ok(h.add(&mlp_out))
     }
@@ -509,7 +526,11 @@ impl DeepSeekQloraDecoderLayer {
 impl ModuleParameters for DeepSeekQloraQProj {
     fn parameters(&self) -> ModuleParamRef<'_> {
         match self {
-            Self::LoRa { q_a_proj, q_a_layernorm, q_b_proj } => {
+            Self::LoRa {
+                q_a_proj,
+                q_a_layernorm,
+                q_b_proj,
+            } => {
                 let mut m = ModuleParamRef::new();
                 let mut qa = HashMap::new();
                 qa.insert(Rc::from("lora_a"), NestedValue::Value(&q_a_proj.lora_a));
@@ -539,7 +560,11 @@ impl ModuleParameters for DeepSeekQloraQProj {
 
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         match self {
-            Self::LoRa { q_a_proj, q_a_layernorm, q_b_proj } => {
+            Self::LoRa {
+                q_a_proj,
+                q_a_layernorm,
+                q_b_proj,
+            } => {
                 let mut m = ModuleParamMut::new();
                 let mut qa = HashMap::new();
                 qa.insert(Rc::from("lora_a"), NestedValue::Value(&mut q_a_proj.lora_a));
@@ -565,7 +590,11 @@ impl ModuleParameters for DeepSeekQloraQProj {
 
     fn num_parameters(&self) -> usize {
         match self {
-            Self::LoRa { q_a_proj, q_a_layernorm, q_b_proj } => {
+            Self::LoRa {
+                q_a_proj,
+                q_a_layernorm,
+                q_b_proj,
+            } => {
                 (q_a_proj.lora_a.size() + q_a_proj.lora_b.size())
                     + q_a_layernorm.num_parameters()
                     + (q_b_proj.lora_a.size() + q_b_proj.lora_b.size())
@@ -591,12 +620,24 @@ impl ModuleParameters for DeepSeekQloraAttention {
         let mut m = self.q.parameters();
         m.extend(self.kv_a_layernorm.parameters());
         let mut kva = HashMap::new();
-        kva.insert(Rc::from("lora_a"), NestedValue::Value(&self.kv_a_proj_with_mqa.lora_a));
-        kva.insert(Rc::from("lora_b"), NestedValue::Value(&self.kv_a_proj_with_mqa.lora_b));
+        kva.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&self.kv_a_proj_with_mqa.lora_a),
+        );
+        kva.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&self.kv_a_proj_with_mqa.lora_b),
+        );
         m.insert(Rc::from("kv_a_proj_with_mqa"), NestedValue::Map(kva));
         let mut kvb = HashMap::new();
-        kvb.insert(Rc::from("lora_a"), NestedValue::Value(&self.kv_b_proj.lora_a));
-        kvb.insert(Rc::from("lora_b"), NestedValue::Value(&self.kv_b_proj.lora_b));
+        kvb.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&self.kv_b_proj.lora_a),
+        );
+        kvb.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&self.kv_b_proj.lora_b),
+        );
         m.insert(Rc::from("kv_b_proj"), NestedValue::Map(kvb));
         let mut op = HashMap::new();
         op.insert(Rc::from("lora_a"), NestedValue::Value(&self.o_proj.lora_a));
@@ -608,12 +649,24 @@ impl ModuleParameters for DeepSeekQloraAttention {
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let mut m = self.q.trainable_parameters();
         let mut kva = HashMap::new();
-        kva.insert(Rc::from("lora_a"), NestedValue::Value(&self.kv_a_proj_with_mqa.lora_a));
-        kva.insert(Rc::from("lora_b"), NestedValue::Value(&self.kv_a_proj_with_mqa.lora_b));
+        kva.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&self.kv_a_proj_with_mqa.lora_a),
+        );
+        kva.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&self.kv_a_proj_with_mqa.lora_b),
+        );
         m.insert(Rc::from("kv_a_proj_with_mqa"), NestedValue::Map(kva));
         let mut kvb = HashMap::new();
-        kvb.insert(Rc::from("lora_a"), NestedValue::Value(&self.kv_b_proj.lora_a));
-        kvb.insert(Rc::from("lora_b"), NestedValue::Value(&self.kv_b_proj.lora_b));
+        kvb.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&self.kv_b_proj.lora_a),
+        );
+        kvb.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&self.kv_b_proj.lora_b),
+        );
         m.insert(Rc::from("kv_b_proj"), NestedValue::Map(kvb));
         let mut op = HashMap::new();
         op.insert(Rc::from("lora_a"), NestedValue::Value(&self.o_proj.lora_a));
@@ -636,12 +689,24 @@ impl ModuleParameters for DeepSeekQloraAttention {
         );
         m.insert(Rc::from("kv_a_proj_with_mqa"), NestedValue::Map(kva));
         let mut kvb = HashMap::new();
-        kvb.insert(Rc::from("lora_a"), NestedValue::Value(&mut self.kv_b_proj.lora_a));
-        kvb.insert(Rc::from("lora_b"), NestedValue::Value(&mut self.kv_b_proj.lora_b));
+        kvb.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&mut self.kv_b_proj.lora_a),
+        );
+        kvb.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&mut self.kv_b_proj.lora_b),
+        );
         m.insert(Rc::from("kv_b_proj"), NestedValue::Map(kvb));
         let mut op = HashMap::new();
-        op.insert(Rc::from("lora_a"), NestedValue::Value(&mut self.o_proj.lora_a));
-        op.insert(Rc::from("lora_b"), NestedValue::Value(&mut self.o_proj.lora_b));
+        op.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&mut self.o_proj.lora_a),
+        );
+        op.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&mut self.o_proj.lora_b),
+        );
         m.insert(Rc::from("o_proj"), NestedValue::Map(op));
         m
     }
@@ -660,16 +725,28 @@ impl ModuleParameters for DeepSeekQloraMLP {
     fn parameters(&self) -> ModuleParamRef<'_> {
         let mut m = ModuleParamRef::new();
         let mut gp = HashMap::new();
-        gp.insert(Rc::from("lora_a"), NestedValue::Value(&self.gate_proj.lora_a));
-        gp.insert(Rc::from("lora_b"), NestedValue::Value(&self.gate_proj.lora_b));
+        gp.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&self.gate_proj.lora_a),
+        );
+        gp.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&self.gate_proj.lora_b),
+        );
         m.insert(Rc::from("gate_proj"), NestedValue::Map(gp));
         let mut up = HashMap::new();
         up.insert(Rc::from("lora_a"), NestedValue::Value(&self.up_proj.lora_a));
         up.insert(Rc::from("lora_b"), NestedValue::Value(&self.up_proj.lora_b));
         m.insert(Rc::from("up_proj"), NestedValue::Map(up));
         let mut dp = HashMap::new();
-        dp.insert(Rc::from("lora_a"), NestedValue::Value(&self.down_proj.lora_a));
-        dp.insert(Rc::from("lora_b"), NestedValue::Value(&self.down_proj.lora_b));
+        dp.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&self.down_proj.lora_a),
+        );
+        dp.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&self.down_proj.lora_b),
+        );
         m.insert(Rc::from("down_proj"), NestedValue::Map(dp));
         m
     }
@@ -681,16 +758,34 @@ impl ModuleParameters for DeepSeekQloraMLP {
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         let mut m = ModuleParamMut::new();
         let mut gp = HashMap::new();
-        gp.insert(Rc::from("lora_a"), NestedValue::Value(&mut self.gate_proj.lora_a));
-        gp.insert(Rc::from("lora_b"), NestedValue::Value(&mut self.gate_proj.lora_b));
+        gp.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&mut self.gate_proj.lora_a),
+        );
+        gp.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&mut self.gate_proj.lora_b),
+        );
         m.insert(Rc::from("gate_proj"), NestedValue::Map(gp));
         let mut up = HashMap::new();
-        up.insert(Rc::from("lora_a"), NestedValue::Value(&mut self.up_proj.lora_a));
-        up.insert(Rc::from("lora_b"), NestedValue::Value(&mut self.up_proj.lora_b));
+        up.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&mut self.up_proj.lora_a),
+        );
+        up.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&mut self.up_proj.lora_b),
+        );
         m.insert(Rc::from("up_proj"), NestedValue::Map(up));
         let mut dp = HashMap::new();
-        dp.insert(Rc::from("lora_a"), NestedValue::Value(&mut self.down_proj.lora_a));
-        dp.insert(Rc::from("lora_b"), NestedValue::Value(&mut self.down_proj.lora_b));
+        dp.insert(
+            Rc::from("lora_a"),
+            NestedValue::Value(&mut self.down_proj.lora_a),
+        );
+        dp.insert(
+            Rc::from("lora_b"),
+            NestedValue::Value(&mut self.down_proj.lora_b),
+        );
         m.insert(Rc::from("down_proj"), NestedValue::Map(dp));
         m
     }
@@ -723,7 +818,10 @@ impl ModuleParameters for DeepSeekQloraMoE {
 
     fn num_parameters(&self) -> usize {
         self.frozen_moe.num_parameters()
-            + self.shared_experts.as_ref().map_or(0, |s| s.num_parameters())
+            + self
+                .shared_experts
+                .as_ref()
+                .map_or(0, |s| s.num_parameters())
     }
 
     fn freeze_parameters(&mut self, recurse: bool) {
@@ -795,7 +893,10 @@ impl ModuleParameters for DeepSeekQloraDecoderLayer {
 
     fn parameters(&self) -> ModuleParamRef<'_> {
         let mut m = ModuleParamRef::new();
-        m.insert(Rc::from("self_attn"), NestedValue::Map(self.self_attn.parameters()));
+        m.insert(
+            Rc::from("self_attn"),
+            NestedValue::Map(self.self_attn.parameters()),
+        );
         m.insert(Rc::from("mlp"), NestedValue::Map(self.mlp.parameters()));
         m.extend(self.input_layernorm.parameters());
         m.extend(self.post_attention_layernorm.parameters());
@@ -804,14 +905,23 @@ impl ModuleParameters for DeepSeekQloraDecoderLayer {
 
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let mut m = ModuleParamRef::new();
-        m.insert(Rc::from("self_attn"), NestedValue::Map(self.self_attn.trainable_parameters()));
-        m.insert(Rc::from("mlp"), NestedValue::Map(self.mlp.trainable_parameters()));
+        m.insert(
+            Rc::from("self_attn"),
+            NestedValue::Map(self.self_attn.trainable_parameters()),
+        );
+        m.insert(
+            Rc::from("mlp"),
+            NestedValue::Map(self.mlp.trainable_parameters()),
+        );
         m
     }
 
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         let mut m = ModuleParamMut::new();
-        m.insert(Rc::from("self_attn"), NestedValue::Map(self.self_attn.parameters_mut()));
+        m.insert(
+            Rc::from("self_attn"),
+            NestedValue::Map(self.self_attn.parameters_mut()),
+        );
         m.insert(Rc::from("mlp"), NestedValue::Map(self.mlp.parameters_mut()));
         m.extend(self.input_layernorm.parameters_mut());
         m.extend(self.post_attention_layernorm.parameters_mut());
@@ -842,7 +952,13 @@ impl DeepSeekQloraModel {
             .eps(config.rms_norm_eps)
             .build()
             .map_err(LoraError::Mlx)?;
-        Ok(Self { config, qlora_config: qcfg, embed_tokens, layers, norm })
+        Ok(Self {
+            config,
+            qlora_config: qcfg,
+            embed_tokens,
+            layers,
+            norm,
+        })
     }
 
     pub fn forward(
@@ -916,7 +1032,11 @@ impl DeepSeekQloraModel {
 impl ModuleParameters for DeepSeekQloraModel {
     fn num_parameters(&self) -> usize {
         self.embed_tokens.num_parameters()
-            + self.layers.iter().map(|l| l.num_parameters()).sum::<usize>()
+            + self
+                .layers
+                .iter()
+                .map(|l| l.num_parameters())
+                .sum::<usize>()
             + self.norm.num_parameters()
     }
 
@@ -924,7 +1044,10 @@ impl ModuleParameters for DeepSeekQloraModel {
         let mut m = ModuleParamRef::new();
         m.extend(self.embed_tokens.parameters());
         for (i, layer) in self.layers.iter().enumerate() {
-            m.insert(Rc::from(format!("{}", i)), NestedValue::Map(layer.parameters()));
+            m.insert(
+                Rc::from(format!("{}", i)),
+                NestedValue::Map(layer.parameters()),
+            );
         }
         m.extend(self.norm.parameters());
         m
@@ -933,7 +1056,10 @@ impl ModuleParameters for DeepSeekQloraModel {
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let mut m = ModuleParamRef::new();
         for (i, layer) in self.layers.iter().enumerate() {
-            m.insert(Rc::from(format!("{}", i)), NestedValue::Map(layer.trainable_parameters()));
+            m.insert(
+                Rc::from(format!("{}", i)),
+                NestedValue::Map(layer.trainable_parameters()),
+            );
         }
         m
     }
@@ -942,7 +1068,10 @@ impl ModuleParameters for DeepSeekQloraModel {
         let mut m = ModuleParamMut::new();
         m.extend(self.embed_tokens.parameters_mut());
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            m.insert(Rc::from(format!("{}", i)), NestedValue::Map(layer.parameters_mut()));
+            m.insert(
+                Rc::from(format!("{}", i)),
+                NestedValue::Map(layer.parameters_mut()),
+            );
         }
         m.extend(self.norm.parameters_mut());
         m
@@ -957,7 +1086,9 @@ fn collect_qlora_lora_params(model: &DeepSeekQloraModel) -> HashMap<Rc<str>, Arr
         let lp = format!("layers.{}", i);
         let attn = &layer.self_attn;
         match &attn.q {
-            DeepSeekQloraQProj::LoRa { q_a_proj, q_b_proj, .. } => {
+            DeepSeekQloraQProj::LoRa {
+                q_a_proj, q_b_proj, ..
+            } => {
                 insert_q(&mut params, &format!("{}.self_attn.q_a_proj", lp), q_a_proj);
                 insert_q(&mut params, &format!("{}.self_attn.q_b_proj", lp), q_b_proj);
             }
@@ -970,8 +1101,16 @@ fn collect_qlora_lora_params(model: &DeepSeekQloraModel) -> HashMap<Rc<str>, Arr
             &format!("{}.self_attn.kv_a_proj_with_mqa", lp),
             &attn.kv_a_proj_with_mqa,
         );
-        insert_q(&mut params, &format!("{}.self_attn.kv_b_proj", lp), &attn.kv_b_proj);
-        insert_q(&mut params, &format!("{}.self_attn.o_proj", lp), &attn.o_proj);
+        insert_q(
+            &mut params,
+            &format!("{}.self_attn.kv_b_proj", lp),
+            &attn.kv_b_proj,
+        );
+        insert_q(
+            &mut params,
+            &format!("{}.self_attn.o_proj", lp),
+            &attn.o_proj,
+        );
         match &layer.mlp {
             DeepSeekQloraMlpType::Dense(m) => {
                 insert_q(&mut params, &format!("{}.mlp.gate_proj", lp), &m.gate_proj);
@@ -1001,7 +1140,9 @@ fn set_qlora_lora_params(model: &mut DeepSeekQloraModel, params: &HashMap<Rc<str
         let lp = format!("layers.{}", i);
         let attn = &mut layer.self_attn;
         match &mut attn.q {
-            DeepSeekQloraQProj::LoRa { q_a_proj, q_b_proj, .. } => {
+            DeepSeekQloraQProj::LoRa {
+                q_a_proj, q_b_proj, ..
+            } => {
                 apply_q_keys(&format!("{}.self_attn.q_a_proj", lp), params, q_a_proj);
                 apply_q_keys(&format!("{}.self_attn.q_b_proj", lp), params, q_b_proj);
             }
@@ -1014,8 +1155,16 @@ fn set_qlora_lora_params(model: &mut DeepSeekQloraModel, params: &HashMap<Rc<str
             params,
             &mut attn.kv_a_proj_with_mqa,
         );
-        apply_q_keys(&format!("{}.self_attn.kv_b_proj", lp), params, &mut attn.kv_b_proj);
-        apply_q_keys(&format!("{}.self_attn.o_proj", lp), params, &mut attn.o_proj);
+        apply_q_keys(
+            &format!("{}.self_attn.kv_b_proj", lp),
+            params,
+            &mut attn.kv_b_proj,
+        );
+        apply_q_keys(
+            &format!("{}.self_attn.o_proj", lp),
+            params,
+            &mut attn.o_proj,
+        );
         match &mut layer.mlp {
             DeepSeekQloraMlpType::Dense(m) => {
                 apply_q_keys(&format!("{}.mlp.gate_proj", lp), params, &mut m.gate_proj);
@@ -1062,8 +1211,10 @@ fn load_qlora_lora_weights(
         path.to_path_buf()
     };
     let loaded = crate::load_safetensors_map(&file_path)?;
-    let params: HashMap<Rc<str>, Array> =
-        loaded.into_iter().map(|(k, v)| (Rc::from(k.as_str()), v)).collect();
+    let params: HashMap<Rc<str>, Array> = loaded
+        .into_iter()
+        .map(|(k, v)| (Rc::from(k.as_str()), v))
+        .collect();
     set_qlora_lora_params(model, &params);
     Ok(())
 }
@@ -1075,8 +1226,10 @@ fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
     let mask_bool = row.less_equal(&col);
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0f32);
-    Ok(pmetal_bridge::compat::ops::r#where(&mask_bool, &zero, &neg_inf)
-        .reshape(&[1, 1, seq_len, seq_len]))
+    Ok(
+        pmetal_bridge::compat::ops::r#where(&mask_bool, &zero, &neg_inf)
+            .reshape(&[1, 1, seq_len, seq_len]),
+    )
 }
 
 // ─── ForCausalLM ─────────────────────────────────────────────────────────────
@@ -1102,10 +1255,7 @@ impl DeepSeekQloraForCausalLM {
     }
 
     /// Build with an explicit `QLoraConfig`.
-    pub fn with_qlora_config(
-        config: DeepSeekConfig,
-        qcfg: QLoraConfig,
-    ) -> Result<Self, LoraError> {
+    pub fn with_qlora_config(config: DeepSeekConfig, qcfg: QLoraConfig) -> Result<Self, LoraError> {
         let tie = config.tie_word_embeddings;
         let lm_head = if !tie {
             Some(
@@ -1118,7 +1268,11 @@ impl DeepSeekQloraForCausalLM {
             None
         };
         let model = DeepSeekQloraModel::new(config, qcfg)?;
-        Ok(Self { model, lm_head, checkpoint_config: None })
+        Ok(Self {
+            model,
+            lm_head,
+            checkpoint_config: None,
+        })
     }
 
     fn apply_lm_head(&mut self, h: &Array) -> Array {
@@ -1129,11 +1283,7 @@ impl DeepSeekQloraForCausalLM {
         }
     }
 
-    pub fn forward(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-    ) -> Result<Array, LoraError> {
+    pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         let ckpt = self.checkpoint_config.clone();
         let h = self.model.forward(input_ids, mask, ckpt.as_ref())?;
         Ok(self.apply_lm_head(&h))
@@ -1165,9 +1315,8 @@ impl DeepSeekQloraForCausalLM {
         noise_alpha: f32,
     ) -> Result<Array, LoraError> {
         let ckpt = self.checkpoint_config.clone();
-        let mut h =
-            pmetal_bridge::compat::Module::forward(&mut self.model.embed_tokens, input_ids)
-                .map_err(LoraError::Mlx)?;
+        let mut h = pmetal_bridge::compat::Module::forward(&mut self.model.embed_tokens, input_ids)
+            .map_err(LoraError::Mlx)?;
 
         let seq_len = input_ids.dim(1) as f32;
         let embed_dim = h.dim(2) as f32;
@@ -1187,8 +1336,10 @@ impl DeepSeekQloraForCausalLM {
             mask.cloned()
         };
 
-        let layers_per_block =
-            ckpt.as_ref().map(|c| c.layers_per_block).unwrap_or(usize::MAX);
+        let layers_per_block = ckpt
+            .as_ref()
+            .map(|c| c.layers_per_block)
+            .unwrap_or(usize::MAX);
         let checkpointing = ckpt.as_ref().map(|c| c.enabled).unwrap_or(false);
 
         for (idx, layer) in self.model.layers.iter_mut().enumerate() {
@@ -1286,10 +1437,7 @@ impl DeepSeekQloraForCausalLM {
     /// - `model.layers.{i}.post_attention_layernorm.weight`
     /// - `model.norm.weight`
     /// - `lm_head.weight`
-    pub fn load_base_weights(
-        &mut self,
-        weights: &HashMap<String, Array>,
-    ) -> Result<(), LoraError> {
+    pub fn load_base_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), LoraError> {
         let qcfg = self.model.qlora_config.clone();
 
         // Embeddings (kept in full precision)
@@ -1302,31 +1450,30 @@ impl DeepSeekQloraForCausalLM {
 
             // Attention projections — re-quantize from loaded full-precision weights
             match &mut layer.self_attn.q {
-                DeepSeekQloraQProj::LoRa { q_a_proj, q_b_proj, q_a_layernorm } => {
+                DeepSeekQloraQProj::LoRa {
+                    q_a_proj,
+                    q_b_proj,
+                    q_a_layernorm,
+                } => {
                     if let Some(w) = weights.get(&format!("{pfx}.self_attn.q_a_proj.weight")) {
-                        *q_a_proj = QLoraLinear::from_weight(w, None, &qcfg)?;
+                        **q_a_proj = QLoraLinear::from_weight(w, None, &qcfg)?;
                     }
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.q_a_layernorm.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.q_a_layernorm.weight")) {
                         q_a_layernorm.weight = Param::new(w.clone());
                     }
                     if let Some(w) = weights.get(&format!("{pfx}.self_attn.q_b_proj.weight")) {
-                        *q_b_proj = QLoraLinear::from_weight(w, None, &qcfg)?;
+                        **q_b_proj = QLoraLinear::from_weight(w, None, &qcfg)?;
                     }
                 }
                 DeepSeekQloraQProj::Direct { q_proj } => {
                     if let Some(w) = weights.get(&format!("{pfx}.self_attn.q_proj.weight")) {
-                        *q_proj = QLoraLinear::from_weight(w, None, &qcfg)?;
+                        **q_proj = QLoraLinear::from_weight(w, None, &qcfg)?;
                     }
                 }
             }
 
-            if let Some(w) =
-                weights.get(&format!("{pfx}.self_attn.kv_a_proj_with_mqa.weight"))
-            {
-                layer.self_attn.kv_a_proj_with_mqa =
-                    QLoraLinear::from_weight(w, None, &qcfg)?;
+            if let Some(w) = weights.get(&format!("{pfx}.self_attn.kv_a_proj_with_mqa.weight")) {
+                layer.self_attn.kv_a_proj_with_mqa = QLoraLinear::from_weight(w, None, &qcfg)?;
             }
             if let Some(w) = weights.get(&format!("{pfx}.self_attn.kv_a_layernorm.weight")) {
                 layer.self_attn.kv_a_layernorm.weight = Param::new(w.clone());
@@ -1342,9 +1489,7 @@ impl DeepSeekQloraForCausalLM {
             if let Some(w) = weights.get(&format!("{pfx}.input_layernorm.weight")) {
                 layer.input_layernorm.weight = Param::new(w.clone());
             }
-            if let Some(w) =
-                weights.get(&format!("{pfx}.post_attention_layernorm.weight"))
-            {
+            if let Some(w) = weights.get(&format!("{pfx}.post_attention_layernorm.weight")) {
                 layer.post_attention_layernorm.weight = Param::new(w.clone());
             }
 
@@ -1366,8 +1511,7 @@ impl DeepSeekQloraForCausalLM {
                     if let Some(w) = weights.get(&format!("{pfx}.mlp.gate.weight")) {
                         moe.frozen_moe.gate.weight.weight = Param::new(w.clone());
                     }
-                    if let Some(b) =
-                        weights.get(&format!("{pfx}.mlp.gate.e_score_correction_bias"))
+                    if let Some(b) = weights.get(&format!("{pfx}.mlp.gate.e_score_correction_bias"))
                     {
                         moe.frozen_moe.gate.e_score_correction_bias = b.clone();
                     }
@@ -1443,7 +1587,11 @@ impl DeepSeekQloraForCausalLM {
 
         for layer in &mut self.model.layers {
             match &layer.self_attn.q {
-                DeepSeekQloraQProj::LoRa { q_a_proj, q_b_proj, q_a_layernorm } => {
+                DeepSeekQloraQProj::LoRa {
+                    q_a_proj,
+                    q_b_proj,
+                    q_a_layernorm,
+                } => {
                     q_a_proj.lora_a.eval();
                     q_a_proj.lora_b.eval();
                     q_a_layernorm.weight.value.eval();
@@ -1531,8 +1679,7 @@ impl DeepSeekQloraForCausalLM {
 
 impl ModuleParameters for DeepSeekQloraForCausalLM {
     fn num_parameters(&self) -> usize {
-        self.model.num_parameters()
-            + self.lm_head.as_ref().map_or(0, |h| h.num_parameters())
+        self.model.num_parameters() + self.lm_head.as_ref().map_or(0, |h| h.num_parameters())
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
@@ -1546,13 +1693,19 @@ impl ModuleParameters for DeepSeekQloraForCausalLM {
 
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let mut m = ModuleParamRef::new();
-        m.insert(Rc::from("model"), NestedValue::Map(self.model.trainable_parameters()));
+        m.insert(
+            Rc::from("model"),
+            NestedValue::Map(self.model.trainable_parameters()),
+        );
         m
     }
 
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         let mut m = ModuleParamMut::new();
-        m.insert(Rc::from("model"), NestedValue::Map(self.model.parameters_mut()));
+        m.insert(
+            Rc::from("model"),
+            NestedValue::Map(self.model.parameters_mut()),
+        );
         if let Some(ref mut head) = self.lm_head {
             m.extend(head.parameters_mut());
         }
@@ -1668,16 +1821,19 @@ mod tests {
     #[test]
     fn test_deepseek_qlora_forward_with_cache() {
         let config = tiny_moe_config();
-        let mut model =
-            DeepSeekQloraForCausalLM::new(config, default_lora_config()).unwrap();
+        let mut model = DeepSeekQloraForCausalLM::new(config, default_lora_config()).unwrap();
         let mut cache = model.create_cache(32);
 
         let tok1 = Array::from_slice(&[1i32], &[1, 1]);
-        let logits1 = model.forward_with_cache(&tok1, None, Some(&mut cache)).unwrap();
+        let logits1 = model
+            .forward_with_cache(&tok1, None, Some(&mut cache))
+            .unwrap();
         logits1.eval().unwrap();
 
         let tok2 = Array::from_slice(&[2i32], &[1, 1]);
-        let logits2 = model.forward_with_cache(&tok2, None, Some(&mut cache)).unwrap();
+        let logits2 = model
+            .forward_with_cache(&tok2, None, Some(&mut cache))
+            .unwrap();
         logits2.eval().unwrap();
 
         assert_eq!(logits2.dim(1), 1);

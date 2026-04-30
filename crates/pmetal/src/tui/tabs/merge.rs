@@ -211,7 +211,11 @@ impl MergeTab {
             if v.is_empty() { spec.dtype } else { v }
         };
         let base = self.form.value("Base Model");
-        spec.base = if base.is_empty() || base == "(not selected)" { None } else { Some(base) };
+        spec.base = if base.is_empty() || base == "(not selected)" {
+            None
+        } else {
+            Some(base)
+        };
         spec.t = self.form.value("SLERP t").parse().unwrap_or(spec.t);
         spec.weight_a = self.form.value("Weight A").parse().unwrap_or(spec.weight_a);
         spec.weight_b = self.form.value("Weight B").parse().unwrap_or(spec.weight_b);

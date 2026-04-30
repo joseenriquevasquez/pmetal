@@ -27,11 +27,7 @@ pub(super) fn attn_forward(
     // bias adds + RoPE + cache write + SDPA + o_proj + bias into one
     // mx.compile graph. Sliding-window layers, turboquant cache, and
     // zero-overhead-quantized cache stay on the per-op paths below.
-    if s == 1
-        && !lw.attn_is_sliding
-        && cache.turboquant.is_none()
-        && cache.quant_config.is_none()
-    {
+    if s == 1 && !lw.attn_is_sliding && cache.turboquant.is_none() && cache.quant_config.is_none() {
         if let (Some(qb), Some(kb), Some(vb), Some(ob)) = (
             lw.attn_q_b.as_ref(),
             lw.attn_k_b.as_ref(),

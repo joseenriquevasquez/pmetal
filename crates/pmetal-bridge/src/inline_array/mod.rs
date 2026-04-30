@@ -99,15 +99,44 @@ pub struct InlineArray {
     pub(crate) raw: RawBuf,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct EvalToken;
+#[derive(Clone, Debug)]
+pub struct EvalToken {
+    prior: crate::error::BridgeResult<()>,
+}
+
+impl Default for EvalToken {
+    fn default() -> Self {
+        Self { prior: Ok(()) }
+    }
+}
 
 impl EvalToken {
     #[inline]
-    pub fn unwrap(self) {}
+    pub(crate) fn new(prior: crate::error::BridgeResult<()>) -> Self {
+        Self { prior }
+    }
 
     #[inline]
-    pub fn expect(self, _msg: &str) {}
+    pub fn into_result(self) -> crate::error::BridgeResult<()> {
+        let after = crate::error::check_last_error();
+        match self.prior {
+            Ok(()) => after,
+            Err(err) => {
+                let _ = after;
+                Err(err)
+            }
+        }
+    }
+
+    #[inline]
+    pub fn unwrap(self) {
+        self.into_result().unwrap();
+    }
+
+    #[inline]
+    pub fn expect(self, msg: &str) {
+        self.into_result().expect(msg);
+    }
 }
 
 impl Drop for InlineArray {
@@ -269,6 +298,26 @@ mod tests {
         c.eval();
         let v = c.item_f32();
         assert!((v - 5.0).abs() < 1e-6, "expected 5.0, got {v}");
+    }
+
+    #[test]
+    fn eval_token_surfaces_pending_bridge_error() {
+        let a = InlineArray::from_f32_slice(&[1.0; 6], &[2, 3]);
+        let b = InlineArray::from_f32_slice(&[1.0; 20], &[4, 5]);
+        let sentinel = a.matmul(&b);
+
+        let err = sentinel
+            .eval()
+            .into_result()
+            .expect_err("matmul shape error should survive eval");
+        match err {
+            crate::BridgeError::CxxException(msg) => {
+                assert!(msg.contains("[matmul]"), "expected op tag, got {msg}");
+            }
+            crate::BridgeError::Unknown(msg) => {
+                panic!("expected CxxException, got Unknown: {msg}");
+            }
+        }
     }
 
     #[test]

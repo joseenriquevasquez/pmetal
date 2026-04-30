@@ -8,15 +8,35 @@ use serde::{Deserialize, Serialize};
 #[spec(kind = "Bench", subcommand = "bench")]
 #[serde(rename_all = "snake_case")]
 pub struct BenchSpec {
-    #[job(label = "Model", group = "Model", argv = "--model", kind = "model_picker", default = "meta-llama/Llama-3.2-1B")]
+    #[job(
+        label = "Model",
+        group = "Model",
+        argv = "--model",
+        kind = "model_picker",
+        default = "meta-llama/Llama-3.2-1B"
+    )]
     #[serde(default = "default_model")]
     pub model: String,
 
-    #[job(label = "Batch Size", group = "Bench", argv = "--batch-size", min = 1, max = 4096, default_int = 1)]
+    #[job(
+        label = "Batch Size",
+        group = "Bench",
+        argv = "--batch-size",
+        min = 1,
+        max = 4096,
+        default_int = 1
+    )]
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 
-    #[job(label = "Seq Len", group = "Bench", argv = "--seq-len", min = 1, max = 1_048_576, default_int = 512)]
+    #[job(
+        label = "Seq Len",
+        group = "Bench",
+        argv = "--seq-len",
+        min = 1,
+        max = 1_048_576,
+        default_int = 512
+    )]
     #[serde(default = "default_seq_len")]
     pub seq_len: usize,
 }
@@ -34,11 +54,7 @@ impl Default for BenchSpec {
 impl BenchSpec {
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
         let errs = self.validate_descriptors();
-        if errs.is_empty() {
-            Ok(())
-        } else {
-            Err(errs)
-        }
+        if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }
 

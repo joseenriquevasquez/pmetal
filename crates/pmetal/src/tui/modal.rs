@@ -382,9 +382,7 @@ impl Modal {
                     let filtered = filtered_datasets(datasets, search);
                     let count = filtered.len();
                     if count > 0 {
-                        let i = list_state
-                            .selected()
-                            .map_or(0, |i| (i + count - 1) % count);
+                        let i = list_state.selected().map_or(0, |i| (i + count - 1) % count);
                         list_state.select(Some(i));
                     }
                     None

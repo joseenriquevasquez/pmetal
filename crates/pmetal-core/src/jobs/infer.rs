@@ -9,11 +9,22 @@ use serde::{Deserialize, Serialize};
 #[spec(kind = "Infer", subcommand = "infer")]
 #[serde(rename_all = "snake_case")]
 pub struct InferSpec {
-    #[job(label = "Model", group = "Model", argv = "--model", kind = "model_picker", required)]
+    #[job(
+        label = "Model",
+        group = "Model",
+        argv = "--model",
+        kind = "model_picker",
+        required
+    )]
     #[serde(default)]
     pub model: String,
 
-    #[job(label = "LoRA Adapter", group = "Model", argv = "--lora", kind = "path")]
+    #[job(
+        label = "LoRA Adapter",
+        group = "Model",
+        argv = "--lora",
+        kind = "path"
+    )]
     #[serde(default)]
     pub lora: Option<String>,
 
@@ -21,27 +32,64 @@ pub struct InferSpec {
     #[serde(default)]
     pub prompt: String,
 
-    #[job(label = "Max Tokens", group = "Sampling", argv = "--max-tokens", min = 1, max = 1_048_576, default_int = 256)]
+    #[job(
+        label = "Max Tokens",
+        group = "Sampling",
+        argv = "--max-tokens",
+        min = 1,
+        max = 1_048_576,
+        default_int = 256
+    )]
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
 
-    #[job(label = "Temperature", group = "Sampling", argv = "--temperature", min = 0.0, max = 5.0)]
+    #[job(
+        label = "Temperature",
+        group = "Sampling",
+        argv = "--temperature",
+        min = 0.0,
+        max = 5.0
+    )]
     #[serde(default)]
     pub temperature: Option<f32>,
 
-    #[job(label = "Top-k", group = "Sampling", argv = "--top-k", min = 0, max = 1_000_000)]
+    #[job(
+        label = "Top-k",
+        group = "Sampling",
+        argv = "--top-k",
+        min = 0,
+        max = 1_000_000
+    )]
     #[serde(default)]
     pub top_k: Option<usize>,
 
-    #[job(label = "Top-p", group = "Sampling", argv = "--top-p", min = 0.0, max = 1.0)]
+    #[job(
+        label = "Top-p",
+        group = "Sampling",
+        argv = "--top-p",
+        min = 0.0,
+        max = 1.0
+    )]
     #[serde(default)]
     pub top_p: Option<f32>,
 
-    #[job(label = "Min-p", group = "Sampling", argv = "--min-p", min = 0.0, max = 1.0)]
+    #[job(
+        label = "Min-p",
+        group = "Sampling",
+        argv = "--min-p",
+        min = 0.0,
+        max = 1.0
+    )]
     #[serde(default)]
     pub min_p: Option<f32>,
 
-    #[job(label = "Repetition Penalty", group = "Sampling", argv = "--repetition-penalty", min = 0.0, max = 10.0)]
+    #[job(
+        label = "Repetition Penalty",
+        group = "Sampling",
+        argv = "--repetition-penalty",
+        min = 0.0,
+        max = 10.0
+    )]
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
 
@@ -57,7 +105,13 @@ pub struct InferSpec {
     #[serde(default)]
     pub seed: Option<u64>,
 
-    #[job(label = "Chat Mode", group = "Input", argv = "--chat", flag, default_bool = false)]
+    #[job(
+        label = "Chat Mode",
+        group = "Input",
+        argv = "--chat",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub chat: bool,
 
@@ -65,11 +119,23 @@ pub struct InferSpec {
     #[serde(default)]
     pub system: Option<String>,
 
-    #[job(label = "No Thinking", group = "Input", argv = "--no-thinking", flag, default_bool = false)]
+    #[job(
+        label = "No Thinking",
+        group = "Input",
+        argv = "--no-thinking",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub no_thinking: bool,
 
-    #[job(label = "Hide Thinking", group = "Output", argv = "--hide-thinking", flag, default_bool = false)]
+    #[job(
+        label = "Hide Thinking",
+        group = "Output",
+        argv = "--hide-thinking",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub hide_thinking: bool,
 
@@ -95,23 +161,52 @@ pub struct InferSpec {
     #[serde(default = "default_backend")]
     pub backend: String,
 
-    #[job(label = "Draft Model", group = "Compute", argv = "--draft-model", kind = "model_picker")]
+    #[job(
+        label = "Draft Model",
+        group = "Compute",
+        argv = "--draft-model",
+        kind = "model_picker"
+    )]
     #[serde(default)]
     pub draft_model: Option<String>,
 
-    #[job(label = "Compiled Sampling", group = "Compute", argv = "--compiled", flag, default_bool = false)]
+    #[job(
+        label = "Compiled Sampling",
+        group = "Compute",
+        argv = "--compiled",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub compiled: bool,
 
-    #[job(label = "Metal Sampler", group = "Compute", argv = "--metal-sampler", flag, default_bool = false)]
+    #[job(
+        label = "Metal Sampler",
+        group = "Compute",
+        argv = "--metal-sampler",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub metal_sampler: bool,
 
-    #[job(label = "Stream", group = "Compute", argv = "--stream", flag, default_bool = false)]
+    #[job(
+        label = "Stream",
+        group = "Compute",
+        argv = "--stream",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub stream: bool,
 
-    #[job(label = "Minimal Path", group = "Compute", argv = "--minimal", flag, default_bool = false)]
+    #[job(
+        label = "Minimal Path",
+        group = "Compute",
+        argv = "--minimal",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub minimal: bool,
 
@@ -119,43 +214,99 @@ pub struct InferSpec {
     #[serde(default)]
     pub tools: Option<String>,
 
-    #[job(label = "FP8 Weights", group = "Quantization", argv = "--fp8", flag, default_bool = false)]
+    #[job(
+        label = "FP8 Weights",
+        group = "Quantization",
+        argv = "--fp8",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub fp8: bool,
 
-    #[job(label = "Experts Dir", group = "Model", argv = "--experts-dir", kind = "path")]
+    #[job(
+        label = "Experts Dir",
+        group = "Model",
+        argv = "--experts-dir",
+        kind = "path"
+    )]
     #[serde(default)]
     pub experts_dir: Option<String>,
 
-    #[job(label = "Use ANE", group = "Compute", argv = "--ane", flag, default_bool = false)]
+    #[job(
+        label = "Use ANE",
+        group = "Compute",
+        argv = "--ane",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub ane: bool,
 
-    #[job(label = "ANE Max Seq Len", group = "Compute", argv = "--ane-max-seq-len", default_int = 1024)]
+    #[job(
+        label = "ANE Max Seq Len",
+        group = "Compute",
+        argv = "--ane-max-seq-len",
+        default_int = 1024
+    )]
     #[serde(default = "default_ane_max_seq_len")]
     pub ane_max_seq_len: usize,
 
-    #[job(label = "ANE Real-Time", group = "Compute", argv = "--ane-real-time", flag, default_bool = false)]
+    #[job(
+        label = "ANE Real-Time",
+        group = "Compute",
+        argv = "--ane-real-time",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub ane_real_time: bool,
 
-    #[job(label = "Benchmark", group = "Benchmark", argv = "--benchmark", flag, default_bool = false)]
+    #[job(
+        label = "Benchmark",
+        group = "Benchmark",
+        argv = "--benchmark",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub benchmark: bool,
 
-    #[job(label = "Benchmark Iters", group = "Benchmark", argv = "--benchmark-iters", min = 1, max = 1_000_000, default_int = 5)]
+    #[job(
+        label = "Benchmark Iters",
+        group = "Benchmark",
+        argv = "--benchmark-iters",
+        min = 1,
+        max = 1_000_000,
+        default_int = 5
+    )]
     #[serde(default = "default_benchmark_iters")]
     pub benchmark_iters: usize,
 
-    #[job(label = "Benchmark Prompt Tokens", group = "Benchmark", argv = "--benchmark-prompt-tokens")]
+    #[job(
+        label = "Benchmark Prompt Tokens",
+        group = "Benchmark",
+        argv = "--benchmark-prompt-tokens"
+    )]
     #[serde(default)]
     pub benchmark_prompt_tokens: Option<usize>,
 
-    #[job(label = "Profile Layers", group = "Benchmark", argv = "--profile-layers", flag, default_bool = false)]
+    #[job(
+        label = "Profile Layers",
+        group = "Benchmark",
+        argv = "--profile-layers",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub profile_layers: bool,
 
-    #[job(label = "Profile Output", group = "Benchmark", argv = "--profile-output", kind = "path")]
+    #[job(
+        label = "Profile Output",
+        group = "Benchmark",
+        argv = "--profile-output",
+        kind = "path"
+    )]
     #[serde(default)]
     pub profile_output: Option<String>,
 
@@ -171,11 +322,22 @@ pub struct InferSpec {
     #[serde(default)]
     pub kv_v_bits: Option<u8>,
 
-    #[job(label = "KV Group Size", group = "Quantization", argv = "--kv-group-size", default_int = 64)]
+    #[job(
+        label = "KV Group Size",
+        group = "Quantization",
+        argv = "--kv-group-size",
+        default_int = 64
+    )]
     #[serde(default = "default_kv_group_size")]
     pub kv_group_size: usize,
 
-    #[job(label = "KV TurboQuant", group = "Quantization", argv = "--kv-turboquant", flag, default_bool = false)]
+    #[job(
+        label = "KV TurboQuant",
+        group = "Quantization",
+        argv = "--kv-turboquant",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub kv_turboquant: bool,
 
@@ -187,15 +349,33 @@ pub struct InferSpec {
     #[serde(default)]
     pub kv_quant_preset: Option<String>,
 
-    #[job(label = "Disable KV Quant", group = "Quantization", argv = "--no-kv-quant", flag, default_bool = false)]
+    #[job(
+        label = "Disable KV Quant",
+        group = "Quantization",
+        argv = "--no-kv-quant",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub no_kv_quant: bool,
 
-    #[job(label = "KV QJL Correction", group = "Quantization", argv = "--kv-qjl", flag, default_bool = false)]
+    #[job(
+        label = "KV QJL Correction",
+        group = "Quantization",
+        argv = "--kv-qjl",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub kv_qjl: bool,
 
-    #[job(label = "Detect Repetition", group = "Sampling", argv = "--detect-repetition", flag, default_bool = false)]
+    #[job(
+        label = "Detect Repetition",
+        group = "Sampling",
+        argv = "--detect-repetition",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub detect_repetition: bool,
 }
@@ -261,11 +441,7 @@ impl InferSpec {
                 "required when backend = dflash",
             ));
         }
-        if errs.is_empty() {
-            Ok(())
-        } else {
-            Err(errs)
-        }
+        if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }
 
@@ -294,9 +470,11 @@ mod tests {
 
     #[test]
     fn argv_round_trip() {
-        let mut spec = InferSpec::default();
-        spec.model = "m".into();
-        spec.prompt = "hi".into();
+        let spec = InferSpec {
+            model: "m".into(),
+            prompt: "hi".into(),
+            ..Default::default()
+        };
         let argv = spec.to_argv();
         assert!(argv.contains(&"--model".to_string()));
         assert!(argv.contains(&"--prompt".to_string()));
@@ -304,10 +482,12 @@ mod tests {
 
     #[test]
     fn dflash_requires_draft() {
-        let mut spec = InferSpec::default();
-        spec.model = "m".into();
-        spec.prompt = "hi".into();
-        spec.backend = "dflash".into();
+        let mut spec = InferSpec {
+            model: "m".into(),
+            prompt: "hi".into(),
+            backend: "dflash".into(),
+            ..Default::default()
+        };
         let res = spec.normalize();
         assert!(res.is_err());
     }

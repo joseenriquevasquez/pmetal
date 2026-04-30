@@ -16,9 +16,7 @@ use pmetal_bridge::compat::{
 };
 use pmetal_bridge::impl_module_params;
 
-use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope,
-};
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 
 use serde::{Deserialize, Serialize};

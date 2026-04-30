@@ -23,10 +23,7 @@ use pmetal_bridge::compat::{
 };
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
-use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::apply_rope,
-};
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::llama4::{
     Llama4Expert, Llama4ModRouter, Llama4Router, Llama4TextConfig,
@@ -35,8 +32,8 @@ use pmetal_models::architectures::llama4::{
 use crate::{
     LoraError, QLoraConfig, QLoraLinear,
     llama4_lora::{
-        Llama4LoraAttention, Llama4LoraDecoderLayer, Llama4LoraForCausalLM,
-        Llama4LoraMLP, Llama4LoraMoE, Llama4LoraModel, Llama4LoraSharedExpert,
+        Llama4LoraAttention, Llama4LoraDecoderLayer, Llama4LoraForCausalLM, Llama4LoraMLP,
+        Llama4LoraMoE, Llama4LoraModel, Llama4LoraSharedExpert,
     },
     qlora::quantize_lora_layer,
 };
@@ -157,10 +154,24 @@ impl Llama4QloraAttention {
             let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
             let q_t = q.transpose_axes(&[0, 2, 1, 3]);
             let k_t = k.transpose_axes(&[0, 2, 1, 3]);
-            let q_r = apply_rope(&q_t, self.head_dim, false, self.rope_theta, self.rope_scale, offset)
-                .map_err(LoraError::Mlx)?;
-            let k_r = apply_rope(&k_t, self.head_dim, false, self.rope_theta, self.rope_scale, offset)
-                .map_err(LoraError::Mlx)?;
+            let q_r = apply_rope(
+                &q_t,
+                self.head_dim,
+                false,
+                self.rope_theta,
+                self.rope_scale,
+                offset,
+            )
+            .map_err(LoraError::Mlx)?;
+            let k_r = apply_rope(
+                &k_t,
+                self.head_dim,
+                false,
+                self.rope_theta,
+                self.rope_scale,
+                offset,
+            )
+            .map_err(LoraError::Mlx)?;
             q = q_r.transpose_axes(&[0, 2, 1, 3]);
             k = k_r.transpose_axes(&[0, 2, 1, 3]);
         }
@@ -195,8 +206,7 @@ impl Llama4QloraAttention {
                 AttentionMaskType::Causal
             });
 
-        let output = fused_sdpa(&q, &keys, &values, &attn_config, mask)
-            .map_err(LoraError::Mlx)?;
+        let output = fused_sdpa(&q, &keys, &values, &attn_config, mask).map_err(LoraError::Mlx)?;
 
         let output = output
             .transpose_axes(&[0, 2, 1, 3])
@@ -321,8 +331,7 @@ impl Llama4QloraMoE {
             .collect();
         let routing_weights: Vec<f32> = expert_weights.as_slice().to_vec();
 
-        let mut expert_assignments: Vec<Vec<(usize, f32)>> =
-            vec![Vec::new(); self.experts.len()];
+        let mut expert_assignments: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.experts.len()];
         for token_idx in 0..n_tokens {
             for slot in 0..top_k {
                 let flat_idx = token_idx * top_k + slot;
@@ -335,15 +344,13 @@ impl Llama4QloraMoE {
         }
 
         let input_dtype = flat_x.dtype();
-        let mut combined_out =
-            ops::zeros_dtype(&[total_tokens, hidden_size], input_dtype);
+        let mut combined_out = ops::zeros_dtype(&[total_tokens, hidden_size], input_dtype);
 
         for (expert_idx, assignments) in expert_assignments.iter().enumerate() {
             if assignments.is_empty() {
                 continue;
             }
-            let token_indices: Vec<i32> =
-                assignments.iter().map(|&(idx, _)| idx as i32).collect();
+            let token_indices: Vec<i32> = assignments.iter().map(|&(idx, _)| idx as i32).collect();
             let weights: Vec<f32> = assignments.iter().map(|&(_, w)| w).collect();
 
             let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
@@ -570,7 +577,10 @@ impl Llama4QloraModel {
     }
 
     fn num_trainable_params(&self) -> usize {
-        self.layers.iter().map(Llama4QloraDecoderLayer::num_trainable_params).sum()
+        self.layers
+            .iter()
+            .map(Llama4QloraDecoderLayer::num_trainable_params)
+            .sum()
     }
 
     fn memory_usage(&self) -> (usize, usize, usize) {
@@ -826,31 +836,79 @@ impl Llama4QloraForCausalLM {
         }
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
             let attn_prefix = format!("layers.{i}.self_attn");
-            set_param!(layer.self_attn.q_proj.lora_a, format!("{attn_prefix}.q_proj.lora_a"));
-            set_param!(layer.self_attn.q_proj.lora_b, format!("{attn_prefix}.q_proj.lora_b"));
-            set_param!(layer.self_attn.k_proj.lora_a, format!("{attn_prefix}.k_proj.lora_a"));
-            set_param!(layer.self_attn.k_proj.lora_b, format!("{attn_prefix}.k_proj.lora_b"));
-            set_param!(layer.self_attn.v_proj.lora_a, format!("{attn_prefix}.v_proj.lora_a"));
-            set_param!(layer.self_attn.v_proj.lora_b, format!("{attn_prefix}.v_proj.lora_b"));
-            set_param!(layer.self_attn.o_proj.lora_a, format!("{attn_prefix}.o_proj.lora_a"));
-            set_param!(layer.self_attn.o_proj.lora_b, format!("{attn_prefix}.o_proj.lora_b"));
+            set_param!(
+                layer.self_attn.q_proj.lora_a,
+                format!("{attn_prefix}.q_proj.lora_a")
+            );
+            set_param!(
+                layer.self_attn.q_proj.lora_b,
+                format!("{attn_prefix}.q_proj.lora_b")
+            );
+            set_param!(
+                layer.self_attn.k_proj.lora_a,
+                format!("{attn_prefix}.k_proj.lora_a")
+            );
+            set_param!(
+                layer.self_attn.k_proj.lora_b,
+                format!("{attn_prefix}.k_proj.lora_b")
+            );
+            set_param!(
+                layer.self_attn.v_proj.lora_a,
+                format!("{attn_prefix}.v_proj.lora_a")
+            );
+            set_param!(
+                layer.self_attn.v_proj.lora_b,
+                format!("{attn_prefix}.v_proj.lora_b")
+            );
+            set_param!(
+                layer.self_attn.o_proj.lora_a,
+                format!("{attn_prefix}.o_proj.lora_a")
+            );
+            set_param!(
+                layer.self_attn.o_proj.lora_b,
+                format!("{attn_prefix}.o_proj.lora_b")
+            );
             let mlp_prefix = format!("layers.{i}.mlp");
             if layer.is_moe {
                 let se = &mut layer.moe.as_mut().unwrap().shared_expert;
-                set_param!(se.gate_proj.lora_a, format!("{mlp_prefix}.gate_proj.lora_a"));
-                set_param!(se.gate_proj.lora_b, format!("{mlp_prefix}.gate_proj.lora_b"));
+                set_param!(
+                    se.gate_proj.lora_a,
+                    format!("{mlp_prefix}.gate_proj.lora_a")
+                );
+                set_param!(
+                    se.gate_proj.lora_b,
+                    format!("{mlp_prefix}.gate_proj.lora_b")
+                );
                 set_param!(se.up_proj.lora_a, format!("{mlp_prefix}.up_proj.lora_a"));
                 set_param!(se.up_proj.lora_b, format!("{mlp_prefix}.up_proj.lora_b"));
-                set_param!(se.down_proj.lora_a, format!("{mlp_prefix}.down_proj.lora_a"));
-                set_param!(se.down_proj.lora_b, format!("{mlp_prefix}.down_proj.lora_b"));
+                set_param!(
+                    se.down_proj.lora_a,
+                    format!("{mlp_prefix}.down_proj.lora_a")
+                );
+                set_param!(
+                    se.down_proj.lora_b,
+                    format!("{mlp_prefix}.down_proj.lora_b")
+                );
             } else {
                 let mlp = layer.mlp.as_mut().unwrap();
-                set_param!(mlp.gate_proj.lora_a, format!("{mlp_prefix}.gate_proj.lora_a"));
-                set_param!(mlp.gate_proj.lora_b, format!("{mlp_prefix}.gate_proj.lora_b"));
+                set_param!(
+                    mlp.gate_proj.lora_a,
+                    format!("{mlp_prefix}.gate_proj.lora_a")
+                );
+                set_param!(
+                    mlp.gate_proj.lora_b,
+                    format!("{mlp_prefix}.gate_proj.lora_b")
+                );
                 set_param!(mlp.up_proj.lora_a, format!("{mlp_prefix}.up_proj.lora_a"));
                 set_param!(mlp.up_proj.lora_b, format!("{mlp_prefix}.up_proj.lora_b"));
-                set_param!(mlp.down_proj.lora_a, format!("{mlp_prefix}.down_proj.lora_a"));
-                set_param!(mlp.down_proj.lora_b, format!("{mlp_prefix}.down_proj.lora_b"));
+                set_param!(
+                    mlp.down_proj.lora_a,
+                    format!("{mlp_prefix}.down_proj.lora_a")
+                );
+                set_param!(
+                    mlp.down_proj.lora_b,
+                    format!("{mlp_prefix}.down_proj.lora_b")
+                );
             }
         }
     }
@@ -955,10 +1013,7 @@ impl Llama4QloraForCausalLM {
     /// - `model.layers.{i}.post_attention_layernorm.weight`
     /// - `model.norm.weight`
     /// - `lm_head.weight`
-    pub fn load_base_weights(
-        &mut self,
-        weights: &HashMap<String, Array>,
-    ) -> Result<(), LoraError> {
+    pub fn load_base_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), LoraError> {
         use pmetal_bridge::compat::Param;
 
         let try_get = |key: &str| -> Option<&Array> {
@@ -1029,10 +1084,7 @@ impl Llama4QloraForCausalLM {
                             ("up_proj", &mut expert.up_proj),
                             ("down_proj", &mut expert.down_proj),
                         ] {
-                            let key = format!(
-                                "{}.feed_forward.experts.{}.{}.weight",
-                                p, j, name
-                            );
+                            let key = format!("{}.feed_forward.experts.{}.{}.weight", p, j, name);
                             if let Some(w) = try_get(&key) {
                                 proj.weight = Param::new(w.clone());
                             }
@@ -1044,10 +1096,7 @@ impl Llama4QloraForCausalLM {
                         ("up_proj", &mut moe.shared_expert.up_proj),
                         ("down_proj", &mut moe.shared_expert.down_proj),
                     ] {
-                        let key = format!(
-                            "{}.feed_forward.shared_expert.{}.weight",
-                            p, name
-                        );
+                        let key = format!("{}.feed_forward.shared_expert.{}.weight", p, name);
                         if let Some(w) = try_get(&key) {
                             *proj = QLoraLinear::from_weight(w, None, &qcfg)?;
                         }
@@ -1156,10 +1205,26 @@ impl ModuleParameters for Llama4QloraForCausalLM {
             // Attention LoRA params.
             let mut attn_params = HashMap::new();
             for (name, lora_a, lora_b) in [
-                ("q_proj", &layer.self_attn.q_proj.lora_a, &layer.self_attn.q_proj.lora_b),
-                ("k_proj", &layer.self_attn.k_proj.lora_a, &layer.self_attn.k_proj.lora_b),
-                ("v_proj", &layer.self_attn.v_proj.lora_a, &layer.self_attn.v_proj.lora_b),
-                ("o_proj", &layer.self_attn.o_proj.lora_a, &layer.self_attn.o_proj.lora_b),
+                (
+                    "q_proj",
+                    &layer.self_attn.q_proj.lora_a,
+                    &layer.self_attn.q_proj.lora_b,
+                ),
+                (
+                    "k_proj",
+                    &layer.self_attn.k_proj.lora_a,
+                    &layer.self_attn.k_proj.lora_b,
+                ),
+                (
+                    "v_proj",
+                    &layer.self_attn.v_proj.lora_a,
+                    &layer.self_attn.v_proj.lora_b,
+                ),
+                (
+                    "o_proj",
+                    &layer.self_attn.o_proj.lora_a,
+                    &layer.self_attn.o_proj.lora_b,
+                ),
             ] {
                 let mut m = HashMap::new();
                 m.insert(Rc::from("lora_a"), NestedValue::Value(lora_a));
@@ -1210,26 +1275,50 @@ impl ModuleParameters for Llama4QloraForCausalLM {
             let mut attn_params = HashMap::new();
             {
                 let mut m = HashMap::new();
-                m.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.self_attn.q_proj.lora_a));
-                m.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.self_attn.q_proj.lora_b));
+                m.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut layer.self_attn.q_proj.lora_a),
+                );
+                m.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut layer.self_attn.q_proj.lora_b),
+                );
                 attn_params.insert(Rc::from("q_proj"), NestedValue::Map(m));
             }
             {
                 let mut m = HashMap::new();
-                m.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.self_attn.k_proj.lora_a));
-                m.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.self_attn.k_proj.lora_b));
+                m.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut layer.self_attn.k_proj.lora_a),
+                );
+                m.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut layer.self_attn.k_proj.lora_b),
+                );
                 attn_params.insert(Rc::from("k_proj"), NestedValue::Map(m));
             }
             {
                 let mut m = HashMap::new();
-                m.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.self_attn.v_proj.lora_a));
-                m.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.self_attn.v_proj.lora_b));
+                m.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut layer.self_attn.v_proj.lora_a),
+                );
+                m.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut layer.self_attn.v_proj.lora_b),
+                );
                 attn_params.insert(Rc::from("v_proj"), NestedValue::Map(m));
             }
             {
                 let mut m = HashMap::new();
-                m.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.self_attn.o_proj.lora_a));
-                m.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.self_attn.o_proj.lora_b));
+                m.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut layer.self_attn.o_proj.lora_a),
+                );
+                m.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut layer.self_attn.o_proj.lora_b),
+                );
                 attn_params.insert(Rc::from("o_proj"), NestedValue::Map(m));
             }
             layer_params.insert(Rc::from("self_attn"), NestedValue::Map(attn_params));
@@ -1240,40 +1329,76 @@ impl ModuleParameters for Llama4QloraForCausalLM {
                 let se = &mut layer.moe.as_mut().unwrap().shared_expert;
                 {
                     let mut m = HashMap::new();
-                    m.insert(Rc::from("lora_a"), NestedValue::Value(&mut se.gate_proj.lora_a));
-                    m.insert(Rc::from("lora_b"), NestedValue::Value(&mut se.gate_proj.lora_b));
+                    m.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut se.gate_proj.lora_a),
+                    );
+                    m.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut se.gate_proj.lora_b),
+                    );
                     mlp_params.insert(Rc::from("gate_proj"), NestedValue::Map(m));
                 }
                 {
                     let mut m = HashMap::new();
-                    m.insert(Rc::from("lora_a"), NestedValue::Value(&mut se.up_proj.lora_a));
-                    m.insert(Rc::from("lora_b"), NestedValue::Value(&mut se.up_proj.lora_b));
+                    m.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut se.up_proj.lora_a),
+                    );
+                    m.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut se.up_proj.lora_b),
+                    );
                     mlp_params.insert(Rc::from("up_proj"), NestedValue::Map(m));
                 }
                 {
                     let mut m = HashMap::new();
-                    m.insert(Rc::from("lora_a"), NestedValue::Value(&mut se.down_proj.lora_a));
-                    m.insert(Rc::from("lora_b"), NestedValue::Value(&mut se.down_proj.lora_b));
+                    m.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut se.down_proj.lora_a),
+                    );
+                    m.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut se.down_proj.lora_b),
+                    );
                     mlp_params.insert(Rc::from("down_proj"), NestedValue::Map(m));
                 }
             } else {
                 let mlp = layer.mlp.as_mut().unwrap();
                 {
                     let mut m = HashMap::new();
-                    m.insert(Rc::from("lora_a"), NestedValue::Value(&mut mlp.gate_proj.lora_a));
-                    m.insert(Rc::from("lora_b"), NestedValue::Value(&mut mlp.gate_proj.lora_b));
+                    m.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut mlp.gate_proj.lora_a),
+                    );
+                    m.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut mlp.gate_proj.lora_b),
+                    );
                     mlp_params.insert(Rc::from("gate_proj"), NestedValue::Map(m));
                 }
                 {
                     let mut m = HashMap::new();
-                    m.insert(Rc::from("lora_a"), NestedValue::Value(&mut mlp.up_proj.lora_a));
-                    m.insert(Rc::from("lora_b"), NestedValue::Value(&mut mlp.up_proj.lora_b));
+                    m.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut mlp.up_proj.lora_a),
+                    );
+                    m.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut mlp.up_proj.lora_b),
+                    );
                     mlp_params.insert(Rc::from("up_proj"), NestedValue::Map(m));
                 }
                 {
                     let mut m = HashMap::new();
-                    m.insert(Rc::from("lora_a"), NestedValue::Value(&mut mlp.down_proj.lora_a));
-                    m.insert(Rc::from("lora_b"), NestedValue::Value(&mut mlp.down_proj.lora_b));
+                    m.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut mlp.down_proj.lora_a),
+                    );
+                    m.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut mlp.down_proj.lora_b),
+                    );
                     mlp_params.insert(Rc::from("down_proj"), NestedValue::Map(m));
                 }
             }
@@ -1311,12 +1436,7 @@ crate::impl_trainable_model!(Llama4QloraForCausalLM);
 // =============================================================================
 
 /// Apply temperature scaling to Q for NoPE long-context layers.
-fn apply_temperature_scaling(
-    q: Array,
-    seq_len: i32,
-    floor_scale: f32,
-    attn_scale: f32,
-) -> Array {
+fn apply_temperature_scaling(q: Array, seq_len: i32, floor_scale: f32, attn_scale: f32) -> Array {
     let ones = ops::ones(&[seq_len], pmetal_bridge::compat::Dtype::Float32);
     let positions =
         ops::arange_from(0, seq_len).as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
@@ -1402,9 +1522,8 @@ mod tests {
 
     #[test]
     fn test_llama4_qlora_builds_moe_only() {
-        let model =
-            Llama4QloraForCausalLM::with_qlora_config(small_config(), small_qlora_config())
-                .unwrap();
+        let model = Llama4QloraForCausalLM::with_qlora_config(small_config(), small_qlora_config())
+            .unwrap();
         // Both layers are MoE (interleave_moe_layer_step == 1).
         assert!(model.model.layers[0].is_moe);
         assert!(model.model.layers[1].is_moe);
@@ -1442,15 +1561,16 @@ mod tests {
                 .unwrap();
         let mut cache = model.create_cache(128);
         let input_ids = Array::from_i32_slice(&[1_i32, 2, 3]).reshape(&[1, 3]);
-        let logits = model.forward_with_cache(&input_ids, None, Some(&mut cache)).unwrap();
+        let logits = model
+            .forward_with_cache(&input_ids, None, Some(&mut cache))
+            .unwrap();
         assert_eq!(logits.shape(), &[1, 3, 512]);
     }
 
     #[test]
     fn test_llama4_qlora_param_count() {
-        let model =
-            Llama4QloraForCausalLM::with_qlora_config(small_config(), small_qlora_config())
-                .unwrap();
+        let model = Llama4QloraForCausalLM::with_qlora_config(small_config(), small_qlora_config())
+            .unwrap();
         assert!(model.num_trainable_params() > 0);
         let params = model.lora_parameters();
         assert!(!params.is_empty());
@@ -1477,9 +1597,8 @@ mod tests {
 
     #[test]
     fn test_llama4_qlora_memory_usage() {
-        let model =
-            Llama4QloraForCausalLM::with_qlora_config(small_config(), small_qlora_config())
-                .unwrap();
+        let model = Llama4QloraForCausalLM::with_qlora_config(small_config(), small_qlora_config())
+            .unwrap();
         let (quantized, lora, total) = model.memory_usage();
         assert!(quantized > 0);
         assert!(lora > 0);

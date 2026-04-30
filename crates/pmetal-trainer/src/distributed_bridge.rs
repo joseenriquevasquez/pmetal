@@ -120,9 +120,13 @@ impl DistributedGradientSync {
             if let Some(arr) = grads.get(name) {
                 // Evaluate the gradient array to materialized f32 values
                 let mut arr_eval = arr.clone();
-                arr_eval.eval();
+                arr_eval
+                    .try_eval()
+                    .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
                 let mut arr_f32 = arr_eval.as_dtype(Dtype::Float32.as_i32());
-                arr_f32.eval();
+                arr_f32
+                    .try_eval()
+                    .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
                 // Copy data from MLX Array into our flat buffer
                 let data = arr_f32.as_slice::<f32>();
@@ -190,7 +194,11 @@ impl DistributedGradientSync {
             // Vec<f32> is guaranteed to have alignment >= 4, satisfying the
             // ring backend's alignment check for f32 operations.
             let len = self.buffer.len();
-            let byte_len = len * 4;
+            let byte_len = len.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
+                SftError::Mlx(Exception::custom(
+                    "distributed gradient buffer byte length overflow",
+                ))
+            })?;
             let byte_ptr = self.buffer.as_mut_ptr().cast::<u8>();
             // SAFETY: Vec<f32> guarantees 4-byte alignment and contiguous layout.
             // The slice borrows self.buffer mutably for the duration of all_reduce.
@@ -217,7 +225,7 @@ impl DistributedGradientSync {
     pub async fn sync_loss(&self, loss: f32) -> Result<f32> {
         // Use a Vec<f32> for guaranteed 4-byte alignment (ring backend requires it).
         let mut aligned = vec![loss];
-        let byte_len = 4;
+        let byte_len = std::mem::size_of::<f32>();
         let byte_ptr = aligned.as_mut_ptr().cast::<u8>();
         #[allow(unsafe_code)]
         let buf = unsafe { std::slice::from_raw_parts_mut(byte_ptr, byte_len) };

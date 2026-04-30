@@ -230,11 +230,7 @@ impl InlineArray {
     }
 
     /// Checked constant-pad. `pad_widths_flat` must have length `2 * ndim`.
-    pub fn try_pad_constant(
-        &self,
-        pad_widths_flat: &[i32],
-        fill_value: f32,
-    ) -> BridgeResult<Self> {
+    pub fn try_pad_constant(&self, pad_widths_flat: &[i32], fill_value: f32) -> BridgeResult<Self> {
         let out = self.pad_constant(pad_widths_flat, fill_value);
         check_last_error()?;
         Ok(out)
@@ -281,7 +277,9 @@ impl InlineArray {
         dil_w: i32,
         groups: i32,
     ) -> BridgeResult<Self> {
-        let out = self.conv2d(weight, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups);
+        let out = self.conv2d(
+            weight, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups,
+        );
         check_last_error()?;
         Ok(out)
     }

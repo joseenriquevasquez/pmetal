@@ -1040,6 +1040,23 @@ fn test_block_allocator_batch() {
 }
 
 #[test]
+fn test_block_allocator_ignores_duplicate_and_invalid_free() {
+    let mut allocator = BlockAllocator::new(2, 32);
+
+    let block = allocator.allocate().unwrap();
+    allocator.free(block);
+    allocator.free(block);
+    allocator.free(99);
+
+    assert_eq!(allocator.num_free(), 2);
+    assert_eq!(allocator.num_allocated(), 0);
+
+    let blocks = allocator.allocate_n(2).unwrap();
+    assert_eq!(blocks.len(), 2);
+    assert!(allocator.allocate().is_none());
+}
+
+#[test]
 fn test_block_table() {
     let mut table = BlockTable::new(32);
 
@@ -1113,6 +1130,28 @@ fn test_paged_cache_extend() {
     cache.extend_sequence(seq_id, 20).unwrap();
     let table = cache.get_block_table(seq_id).unwrap();
     assert_eq!(table.num_tokens(), 36);
+}
+
+#[test]
+fn test_paged_cache_update_rejects_bad_layer_and_shapes() {
+    let config = PagedKVCacheConfig::new(1, 4, 64, 256);
+    let mut cache = PagedKVCache::new(config);
+    let seq_id = cache.allocate_sequence(1).unwrap();
+
+    let keys = ops::zeros(&[1, 4, 1, 64], Dtype::Float32);
+    let values = ops::zeros(&[1, 4, 1, 64], Dtype::Float32);
+    assert!(cache.fetch(seq_id, 1).is_err());
+    assert!(cache.update(seq_id, 1, &keys, &values, 0).is_err());
+
+    let batched_keys = ops::zeros(&[2, 4, 1, 64], Dtype::Float32);
+    assert!(cache.update(seq_id, 0, &batched_keys, &values, 0).is_err());
+
+    let mismatched_values = ops::zeros(&[1, 4, 1, 32], Dtype::Float32);
+    assert!(
+        cache
+            .update(seq_id, 0, &keys, &mismatched_values, 0)
+            .is_err()
+    );
 }
 
 #[test]

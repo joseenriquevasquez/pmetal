@@ -134,7 +134,11 @@ impl TokenizeTab {
         spec.output = self.form.value("Output Dir");
         spec.tokenizer = self.form.value("Tokenizer Model");
         spec.text_column = self.form.value("Text Column");
-        spec.docs_per_shard = self.form.value("Docs Per Shard").parse().unwrap_or(spec.docs_per_shard);
+        spec.docs_per_shard = self
+            .form
+            .value("Docs Per Shard")
+            .parse()
+            .unwrap_or(spec.docs_per_shard);
         spec
     }
 }

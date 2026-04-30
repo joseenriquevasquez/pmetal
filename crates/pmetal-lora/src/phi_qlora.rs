@@ -227,14 +227,11 @@ impl PhiQLoraAttention {
             let offset = cache_ref.rope_offset();
 
             let (q_rope, q_pass) = split_rotary_last(&queries, self.rope_dim);
-            let q_rope =
-                apply_rope(&q_rope, self.rope_dim, false, self.rope.base, 1.0, offset)?;
-            let queries =
-                pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1);
+            let q_rope = apply_rope(&q_rope, self.rope_dim, false, self.rope.base, 1.0, offset)?;
+            let queries = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1);
 
             let (k_rope, k_pass) = split_rotary_last(&keys, self.rope_dim);
-            let k_rope =
-                apply_rope(&k_rope, self.rope_dim, false, self.rope.base, 1.0, offset)?;
+            let k_rope = apply_rope(&k_rope, self.rope_dim, false, self.rope.base, 1.0, offset)?;
             let keys = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1);
 
             (queries, keys, values)
@@ -245,8 +242,7 @@ impl PhiQLoraAttention {
             let q_rope = Module::forward(&mut self.rope, &q_rope)?;
             let k_rope = Module::forward(&mut self.rope, &k_rope)?;
 
-            let queries =
-                pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1);
+            let queries = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1);
             let keys = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1);
 
             (queries, keys, values)
@@ -264,8 +260,8 @@ impl PhiQLoraAttention {
             .with_scale(self.scale)
             .with_mask_type(AttentionMaskType::Causal);
 
-        let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)
-            .map_err(LoraError::Mlx)?;
+        let output =
+            fused_sdpa(&queries, &keys, &values, &attn_config, mask).map_err(LoraError::Mlx)?;
 
         let output = output
             .transpose_axes(&[0, 2, 1, 3])
@@ -288,7 +284,11 @@ impl PhiQLoraAttention {
         let (k_q, k_l, k_t) = self.k_proj.memory_usage();
         let (v_q, v_l, v_t) = self.v_proj.memory_usage();
         let (o_q, o_l, o_t) = self.o_proj.memory_usage();
-        (q_q + k_q + v_q + o_q, q_l + k_l + v_l + o_l, q_t + k_t + v_t + o_t)
+        (
+            q_q + k_q + v_q + o_q,
+            q_l + k_l + v_l + o_l,
+            q_t + k_t + v_t + o_t,
+        )
     }
 }
 
@@ -302,8 +302,7 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
     let shape = x.shape();
     let (batch, n_kv, seq, hd) = (shape[0], shape[1], shape[2], shape[3]);
     let x = x.reshape(&[batch, n_kv, 1, seq, hd]);
-    let x =
-        pmetal_bridge::compat::ops::broadcast_to(&x, &[batch, n_kv, repeats, seq, hd]);
+    let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[batch, n_kv, repeats, seq, hd]);
     Ok(x.reshape(&[batch, n_kv * repeats, seq, hd]))
 }
 
@@ -333,13 +332,16 @@ impl PhiQloraMLP {
 
         let mut gate_up_config = qlora_config.clone();
         gate_up_config.lora.r = crate::effective_rank(&qlora_config.lora, "gate_proj");
-        let gate_up_proj =
-            QLoraLinear::new(config.hidden_size, proj_size, &gate_up_config, false)?;
+        let gate_up_proj = QLoraLinear::new(config.hidden_size, proj_size, &gate_up_config, false)?;
 
         let mut down_config = qlora_config.clone();
         down_config.lora.r = crate::effective_rank(&qlora_config.lora, "down_proj");
-        let down_proj =
-            QLoraLinear::new(config.intermediate_size, config.hidden_size, &down_config, false)?;
+        let down_proj = QLoraLinear::new(
+            config.intermediate_size,
+            config.hidden_size,
+            &down_config,
+            false,
+        )?;
 
         Ok(Self {
             gate_up_proj,
@@ -403,10 +405,7 @@ impl PhiQloraDecoderLayer {
             self_attn: PhiQLoraAttention::new(config, qlora_config)?,
             mlp: PhiQloraMLP::new(config, qlora_config)?,
             input_layernorm: PhiQloraRmsNorm::new(config.hidden_size, config.rms_norm_eps),
-            post_attention_layernorm: PhiQloraRmsNorm::new(
-                config.hidden_size,
-                config.rms_norm_eps,
-            ),
+            post_attention_layernorm: PhiQloraRmsNorm::new(config.hidden_size, config.rms_norm_eps),
         })
     }
 
@@ -572,7 +571,10 @@ impl PhiQloraForCausalLM {
     }
 
     /// Create with an explicit `QLoraConfig`.
-    pub fn with_qlora_config(config: PhiConfig, qlora_config: QLoraConfig) -> Result<Self, LoraError> {
+    pub fn with_qlora_config(
+        config: PhiConfig,
+        qlora_config: QLoraConfig,
+    ) -> Result<Self, LoraError> {
         let lm_head = nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
             .bias(false)
             .build()
@@ -874,8 +876,7 @@ impl PhiQloraForCausalLM {
 
         let single = model_dir.join("model.safetensors");
         if single.exists() {
-            let weights =
-                crate::sanitize_loaded_weights(crate::load_safetensors_map(&single)?)?;
+            let weights = crate::sanitize_loaded_weights(crate::load_safetensors_map(&single)?)?;
             return self.load_and_quantize_weights(&weights);
         }
 
@@ -1112,7 +1113,9 @@ impl crate::TrainableModel for PhiQloraForCausalLM {
         input_ids: &Array,
         mask: Option<&Array>,
     ) -> Option<Result<Array, LoraError>> {
-        Some(PhiQloraForCausalLM::forward_hidden_states(self, input_ids, mask))
+        Some(PhiQloraForCausalLM::forward_hidden_states(
+            self, input_ids, mask,
+        ))
     }
 
     fn forward_hidden_with_positions(
@@ -1220,7 +1223,10 @@ mod tests {
 
         // Base (frozen) params should be inaccessible via lora_parameters()
         let lora_params = model.lora_parameters();
-        assert!(!lora_params.is_empty(), "lora_parameters should not be empty");
+        assert!(
+            !lora_params.is_empty(),
+            "lora_parameters should not be empty"
+        );
 
         // Every value in lora_parameters is a LoRA adapter (not a frozen quantized weight)
         for (key, arr) in &lora_params {
@@ -1237,7 +1243,8 @@ mod tests {
     fn test_phi_qlora_forward() {
         let config = small_config();
         let qlora_config = small_qlora_config();
-        let mut model = PhiQloraForCausalLM::with_qlora_config(config.clone(), qlora_config).unwrap();
+        let mut model =
+            PhiQloraForCausalLM::with_qlora_config(config.clone(), qlora_config).unwrap();
 
         let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
@@ -1250,7 +1257,8 @@ mod tests {
 
         let config = small_config();
         let qlora_config = small_qlora_config();
-        let mut model = PhiQloraForCausalLM::with_qlora_config(config.clone(), qlora_config).unwrap();
+        let mut model =
+            PhiQloraForCausalLM::with_qlora_config(config.clone(), qlora_config).unwrap();
 
         assert!(model.supports_kv_cache());
 

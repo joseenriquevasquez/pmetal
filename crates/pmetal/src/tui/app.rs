@@ -1170,7 +1170,8 @@ impl App {
                             self.modal_stack.push(Modal::model_picker(entries));
                         }
                         FormAction::OpenDatasetPicker { .. } => {
-                            self.pending_modal_context = Some(PendingModalTarget::EmbedTrainDataset);
+                            self.pending_modal_context =
+                                Some(PendingModalTarget::EmbedTrainDataset);
                             let entries = self.dataset_picker_entries();
                             self.modal_stack.push(Modal::dataset_picker(entries));
                         }
@@ -2830,7 +2831,9 @@ impl App {
 
         // Build inference command via InferSpec::to_argv() for spec parity.
         // --show-thinking is a TUI-only flag (not in InferSpec) appended afterward.
-        let spec = self.inference.build_infer_spec(effective_model, prompt, lora_path);
+        let spec = self
+            .inference
+            .build_infer_spec(effective_model, prompt, lora_path);
         let mut args = vec!["infer".to_string()];
         args.extend(spec.to_argv());
         // Always show thinking content so TUI can display it separately.
@@ -2988,7 +2991,12 @@ impl App {
         let dash_throughput;
         let needs_metrics = matches!(
             self.active_tab,
-            Tab::Training | Tab::Pretrain | Tab::Distillation | Tab::Grpo | Tab::EmbedTrain | Tab::Rlkd
+            Tab::Training
+                | Tab::Pretrain
+                | Tab::Distillation
+                | Tab::Grpo
+                | Tab::EmbedTrain
+                | Tab::Rlkd
         );
         if needs_metrics {
             dash_samples = self.dashboard.samples.clone();

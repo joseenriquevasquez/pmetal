@@ -11,7 +11,6 @@
 
 use crate::InlineArray;
 
-
 /// GPU-resident quantised key data for the Uniform (non-outlier) path.
 ///
 /// All tensors live entirely on the GPU — no CPU round-trips during normal
@@ -160,9 +159,11 @@ impl GpuKeyStore {
     /// Returns the score-friendly transposed QJL sign view, or `None` when
     /// the cache was built with `qjl_mode = NoQjl` (no residual to project).
     pub(super) fn qjl_signs_t_array(&self) -> Option<InlineArray> {
-        self.qjl_signs_t
-            .clone()
-            .or_else(|| self.qjl_signs.as_ref().map(|s| s.transpose_axes(&[0, 1, 3, 2])))
+        self.qjl_signs_t.clone().or_else(|| {
+            self.qjl_signs
+                .as_ref()
+                .map(|s| s.transpose_axes(&[0, 1, 3, 2]))
+        })
     }
 
     /// Number of packed sign words, or `0` when `qjl_signs` is absent.
@@ -365,7 +366,9 @@ pub(super) struct GpuMixedKeyStore {
 
 impl GpuMixedKeyStore {
     pub(super) fn append(&mut self, new: GpuMixedKeyStore) {
-        self.regular_indices = self.regular_indices.kv_cache_append(&new.regular_indices, 2);
+        self.regular_indices = self
+            .regular_indices
+            .kv_cache_append(&new.regular_indices, 2);
         self.regular_indices_t = match (self.regular_indices_t.take(), new.regular_indices_t) {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
             _ => None,
@@ -387,8 +390,12 @@ impl GpuMixedKeyStore {
         self.regular_slot_scale = self
             .regular_slot_scale
             .kv_cache_append(&new.regular_slot_scale, 2);
-        self.regular_src_dim = self.regular_src_dim.kv_cache_append(&new.regular_src_dim, 2);
-        self.outlier_indices = self.outlier_indices.kv_cache_append(&new.outlier_indices, 2);
+        self.regular_src_dim = self
+            .regular_src_dim
+            .kv_cache_append(&new.regular_src_dim, 2);
+        self.outlier_indices = self
+            .outlier_indices
+            .kv_cache_append(&new.outlier_indices, 2);
         self.outlier_indices_t = match (self.outlier_indices_t.take(), new.outlier_indices_t) {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
             _ => None,
@@ -410,7 +417,9 @@ impl GpuMixedKeyStore {
         self.outlier_slot_scale = self
             .outlier_slot_scale
             .kv_cache_append(&new.outlier_slot_scale, 2);
-        self.outlier_src_dim = self.outlier_src_dim.kv_cache_append(&new.outlier_src_dim, 2);
+        self.outlier_src_dim = self
+            .outlier_src_dim
+            .kv_cache_append(&new.outlier_src_dim, 2);
     }
 
     pub(super) fn collect_for_detach<'a>(&'a mut self, out: &mut Vec<&'a mut InlineArray>) {
@@ -459,20 +468,28 @@ pub(super) struct GpuMixedValueStore {
 
 impl GpuMixedValueStore {
     pub(super) fn append(&mut self, new: GpuMixedValueStore) {
-        self.regular_indices = self.regular_indices.kv_cache_append(&new.regular_indices, 2);
+        self.regular_indices = self
+            .regular_indices
+            .kv_cache_append(&new.regular_indices, 2);
         self.regular_indices_t = match (self.regular_indices_t.take(), new.regular_indices_t) {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
             _ => None,
         };
         self.regular_norms = self.regular_norms.kv_cache_append(&new.regular_norms, 2);
-        self.regular_src_dim = self.regular_src_dim.kv_cache_append(&new.regular_src_dim, 2);
-        self.outlier_indices = self.outlier_indices.kv_cache_append(&new.outlier_indices, 2);
+        self.regular_src_dim = self
+            .regular_src_dim
+            .kv_cache_append(&new.regular_src_dim, 2);
+        self.outlier_indices = self
+            .outlier_indices
+            .kv_cache_append(&new.outlier_indices, 2);
         self.outlier_indices_t = match (self.outlier_indices_t.take(), new.outlier_indices_t) {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
             _ => None,
         };
         self.outlier_norms = self.outlier_norms.kv_cache_append(&new.outlier_norms, 2);
-        self.outlier_src_dim = self.outlier_src_dim.kv_cache_append(&new.outlier_src_dim, 2);
+        self.outlier_src_dim = self
+            .outlier_src_dim
+            .kv_cache_append(&new.outlier_src_dim, 2);
     }
 
     pub(super) fn collect_for_detach<'a>(&'a mut self, out: &mut Vec<&'a mut InlineArray>) {
@@ -490,4 +507,3 @@ impl GpuMixedValueStore {
         out.push(&mut self.outlier_src_dim);
     }
 }
-

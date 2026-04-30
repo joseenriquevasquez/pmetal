@@ -282,8 +282,7 @@ impl GraniteLoraAttention {
 
         let (queries, keys, values) = if let Some((ref cache_ref, _layer_idx)) = cache {
             let offset = cache_ref.rope_offset();
-            let queries =
-                apply_rope(&queries, self.head_dim, false, self.rope.base, 1.0, offset)?;
+            let queries = apply_rope(&queries, self.head_dim, false, self.rope.base, 1.0, offset)?;
             let keys = apply_rope(&keys, self.head_dim, false, self.rope.base, 1.0, offset)?;
             (queries, keys, values)
         } else {
@@ -1155,9 +1154,7 @@ impl GraniteLoraForCausalLM {
             if let Some(w) = weights.get(&format!("{}.input_layernorm.weight", prefix)) {
                 layer.input_layernorm.weight = Param::new(w.clone());
             }
-            if let Some(w) =
-                weights.get(&format!("{}.post_attention_layernorm.weight", prefix))
-            {
+            if let Some(w) = weights.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
                 layer.post_attention_layernorm.weight = Param::new(w.clone());
             }
         }
@@ -1290,14 +1287,8 @@ impl ModuleParameters for GraniteLoraForCausalLM {
                     ("o_proj", &attn.o_proj),
                 ] {
                     let mut p = HashMap::new();
-                    p.insert(
-                        Rc::from("lora_a"),
-                        NestedValue::Value(proj.lora_a()),
-                    );
-                    p.insert(
-                        Rc::from("lora_b"),
-                        NestedValue::Value(proj.lora_b()),
-                    );
+                    p.insert(Rc::from("lora_a"), NestedValue::Value(proj.lora_a()));
+                    p.insert(Rc::from("lora_b"), NestedValue::Value(proj.lora_b()));
                     // Include magnitude for DoRA.
                     for (extra_name, extra_val) in proj.extra_params() {
                         p.insert(Rc::from(extra_name), NestedValue::Value(extra_val));
@@ -1316,14 +1307,8 @@ impl ModuleParameters for GraniteLoraForCausalLM {
                 ("down_proj", &layer.mlp.down_proj),
             ] {
                 let mut p = HashMap::new();
-                p.insert(
-                    Rc::from("lora_a"),
-                    NestedValue::Value(proj.lora_a()),
-                );
-                p.insert(
-                    Rc::from("lora_b"),
-                    NestedValue::Value(proj.lora_b()),
-                );
+                p.insert(Rc::from("lora_a"), NestedValue::Value(proj.lora_a()));
+                p.insert(Rc::from("lora_b"), NestedValue::Value(proj.lora_b()));
                 mlp_params.insert(Rc::from(name), NestedValue::Map(p));
             }
             layer_params.insert(Rc::from("mlp"), NestedValue::Map(mlp_params));

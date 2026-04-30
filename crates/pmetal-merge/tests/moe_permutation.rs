@@ -87,9 +87,13 @@ fn ties_merge_is_permutation_sensitive_across_experts() {
     // Merge expert 0 slot across (A, B).
     let task_a0 = a0.subtract(&base0);
     let task_b0 = b0.subtract(&base0);
-    let merged_0_ordered =
-        TiesMerge::merge_task_vectors(&[task_a0.clone(), task_b0.clone()], &densities, &weights, 1.0)
-            .expect("ordered merge");
+    let merged_0_ordered = TiesMerge::merge_task_vectors(
+        &[task_a0.clone(), task_b0.clone()],
+        &densities,
+        &weights,
+        1.0,
+    )
+    .expect("ordered merge");
 
     // Merge expert 0 slot across (A, B_permuted) — i.e. A's expert 0 is now
     // paired with B's *expert 1*.
@@ -121,9 +125,13 @@ fn ties_merge_is_permutation_sensitive_across_experts() {
     // permutation reproduces the complementary difference — not mandatory,
     // just a coherence check.
     let task_a1 = a1.subtract(&base1);
-    let merged_1_ordered =
-        TiesMerge::merge_task_vectors(&[task_a1.clone(), b1.subtract(&base1)], &densities, &weights, 1.0)
-            .expect("ordered merge 1");
+    let merged_1_ordered = TiesMerge::merge_task_vectors(
+        &[task_a1.clone(), b1.subtract(&base1)],
+        &densities,
+        &weights,
+        1.0,
+    )
+    .expect("ordered merge 1");
     let merged_1_permuted =
         TiesMerge::merge_task_vectors(&[task_a1, b0.subtract(&base1)], &densities, &weights, 1.0)
             .expect("permuted merge 1");
@@ -136,5 +144,8 @@ fn ties_merge_is_permutation_sensitive_across_experts() {
         .zip(permuted1.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    assert!(diff1 > 0.1, "symmetry check: expert-1 slot also permutation-sensitive");
+    assert!(
+        diff1 > 0.1,
+        "symmetry check: expert-1 slot also permutation-sensitive"
+    );
 }

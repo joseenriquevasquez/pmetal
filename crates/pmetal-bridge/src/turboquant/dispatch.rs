@@ -25,7 +25,6 @@ use super::math::inline_array_to_f32_vec;
 use super::state::{TensorRuntime, TurboQuantState};
 use super::{MAX_RESIDUAL_NORM, ZERO_EPSILON, dim_uses_fwht, turboquant_q8_fullbyte_enabled};
 
-
 /// Quantise keys and values entirely on GPU.
 ///
 /// Returns `None` if the GPU path is unavailable (e.g. missing codebook arr).
@@ -221,8 +220,8 @@ pub(super) fn gpu_quantize_kv(
         && v_core.dim == 256
         && (2..=8).contains(&key_bits)
         && val_bits == 8;
-    let use_q8_seq_shadow = (key_bits == 8 && k_core.dim == 256 && v_core.dim == 256)
-        || no_qjl_d256_widened;
+    let use_q8_seq_shadow =
+        (key_bits == 8 && k_core.dim == 256 && v_core.dim == 256) || no_qjl_d256_widened;
     let k_indices_t = (!use_q8_seq_shadow).then(|| k_indices.transpose_axes(&[0, 1, 3, 2]));
 
     // Phase F (Hamming skip-list): pack sign bits of the rotated key into
@@ -287,8 +286,7 @@ pub(super) fn gpu_quantize_kv(
             packed_shape.push(packed_dim);
             k_qjl_signs.reshape(&packed_shape)
         };
-        let k_qjl_signs_t =
-            (!use_q8_seq_shadow).then(|| k_qjl_signs.transpose_axes(&[0, 1, 3, 2]));
+        let k_qjl_signs_t = (!use_q8_seq_shadow).then(|| k_qjl_signs.transpose_axes(&[0, 1, 3, 2]));
         let q8_pack_inputs = if key_bits == 8 {
             let kv_rows = (keys.dim(0) * keys.dim(1)) as u32;
             let seq = keys.dim(2) as u32;
@@ -316,8 +314,7 @@ pub(super) fn gpu_quantize_kv(
         };
         let q8_keybytes_t = if use_q8_seq_shadow {
             None
-        } else if let Some((kv_rows, seq, indices_t_3d, qjl_signs_t_3d)) = q8_pack_inputs.as_ref()
-        {
+        } else if let Some((kv_rows, seq, indices_t_3d, qjl_signs_t_3d)) = q8_pack_inputs.as_ref() {
             InlineArray::turboquant_pack_q8_keybytes(
                 indices_t_3d,
                 qjl_signs_t_3d,
@@ -345,14 +342,18 @@ pub(super) fn gpu_quantize_kv(
                         *seq,
                     )
                     .map(|packed| {
-                        packed
-                            .reshape(&[keys.dim(0), keys.dim(1), keys.dim(2), k_core.dim as i32])
+                        packed.reshape(&[keys.dim(0), keys.dim(1), keys.dim(2), k_core.dim as i32])
                     })
                 })
         } else {
             None
         };
-        (Some(k_qjl_signs), k_qjl_signs_t, q8_keybytes_t, q8_keybytes_seq)
+        (
+            Some(k_qjl_signs),
+            k_qjl_signs_t,
+            q8_keybytes_t,
+            q8_keybytes_seq,
+        )
     };
     // Phase D.2: build the q8 fullbyte shadow when EITHER (a) the
     // PMETAL_TQ_Q8_FULLBYTE env-var is set (debug override), or (b) the
@@ -374,18 +375,16 @@ pub(super) fn gpu_quantize_kv(
     // identical to ks.indices at 8b, and a separate 8b view at 4..=7b widths
     // (still unconsumed). Dropping the allocation saves D bytes per slot
     // for the NoQjl + d256 + 4..=8b configs that would otherwise pay it.
-    let pack_mode_fullbyte =
-        matches!(config.pack_mode, super::TurboQuantPackMode::Fullbyte);
-    let q8_fullbyte_seq = if use_q8_seq_shadow
-        && !no_qjl
-        && (turboquant_q8_fullbyte_enabled() || pack_mode_fullbyte)
-    {
-        k_core
-            .gpu_quantize_mse(&k_rot_scaled, 8)
-            .map(|indices| indices.as_dtype(Dtype::Uint8.as_i32()))
-    } else {
-        None
-    };
+    let pack_mode_fullbyte = matches!(config.pack_mode, super::TurboQuantPackMode::Fullbyte);
+    let q8_fullbyte_seq =
+        if use_q8_seq_shadow && !no_qjl && (turboquant_q8_fullbyte_enabled() || pack_mode_fullbyte)
+        {
+            k_core
+                .gpu_quantize_mse(&k_rot_scaled, 8)
+                .map(|indices| indices.as_dtype(Dtype::Uint8.as_i32()))
+        } else {
+            None
+        };
 
     // ── Values ────────────────────────────────────────────────────────────
     let (v_indices, v_indices_t, val_norms, d256_rot_values_seq) = if use_q8_seq_shadow {
@@ -944,9 +943,10 @@ pub(super) fn gpu_dequantize_keys(
     //     the body-fit codebook approximation. Encode mirrored this scatter
     //     into k_mse_recon_rot before computing the residual, so QJL captures
     //     only the body's residual and the override is consistent end-to-end.
-    let mse_recon_rot = if let (Some(channels_u8), Some(values_f16)) =
-        (store.outlier_channels.as_ref(), store.outlier_values.as_ref())
-    {
+    let mse_recon_rot = if let (Some(channels_u8), Some(values_f16)) = (
+        store.outlier_channels.as_ref(),
+        store.outlier_values.as_ref(),
+    ) {
         let channels_i32 = channels_u8.as_dtype(Dtype::Int32.as_i32());
         let values_f32 = values_f16.as_dtype(Dtype::Float32.as_i32());
         mse_recon_rot_body.put_along_axis_op(&channels_i32, &values_f32, -1)
@@ -1056,11 +1056,11 @@ pub(super) fn gpu_dequantize_values(
 /// parameterised by an arbitrary `TurboQuantCore` and stored arrays.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn gpu_dequantize_key_subvector(
-    indices_u8: &InlineArray,           // [B, H, T, D_sub] u8
-    qjl_signs: Option<&InlineArray>,    // [B, H, T, ceil(D_sub/32)] u32, or None for Variant F
-    norms: &InlineArray,                // [B, H, T, 1] f32
-    residual_norms: &InlineArray,       // [B, H, T, 1] f32 (zero for Variant F)
-    slot_scale: &InlineArray,           // [B, H, T, 1] f32
+    indices_u8: &InlineArray,        // [B, H, T, D_sub] u8
+    qjl_signs: Option<&InlineArray>, // [B, H, T, ceil(D_sub/32)] u32, or None for Variant F
+    norms: &InlineArray,             // [B, H, T, 1] f32
+    residual_norms: &InlineArray,    // [B, H, T, 1] f32 (zero for Variant F)
+    slot_scale: &InlineArray,        // [B, H, T, 1] f32
     core: &TurboQuantCore,
     key_bits: u8,
     qjl_mode: super::TurboQuantQjlMode,
@@ -1211,10 +1211,18 @@ pub(super) fn gpu_dequantize_values_mixed(
         _ => return None,
     };
 
-    let regular_recon =
-        gpu_dequantize_value_subvector(&store.regular_indices, &store.regular_norms, reg_core, regular_bits)?;
-    let outlier_recon =
-        gpu_dequantize_value_subvector(&store.outlier_indices, &store.outlier_norms, out_core, outlier_bits)?;
+    let regular_recon = gpu_dequantize_value_subvector(
+        &store.regular_indices,
+        &store.regular_norms,
+        reg_core,
+        regular_bits,
+    )?;
+    let outlier_recon = gpu_dequantize_value_subvector(
+        &store.outlier_indices,
+        &store.outlier_norms,
+        out_core,
+        outlier_bits,
+    )?;
 
     let b = store.regular_indices.dim(0);
     let h = store.regular_indices.dim(1);
@@ -1231,4 +1239,3 @@ pub(super) fn gpu_dequantize_values_mixed(
     let merged = with_regular.put_along_axis_op(&outlier_src_i32, &outlier_recon, -1);
     Some(merged)
 }
-

@@ -5,9 +5,11 @@ use crate::{
     TensorInfo,
 };
 use byteorder::{LittleEndian, WriteBytesExt};
-use pmetal_core::Result;
+use pmetal_core::{PMetalError, Result};
 use std::collections::BTreeMap;
 use std::io::{Seek, Write};
+
+use crate::reader::{MAX_ARRAY_LENGTH, MAX_STRING_LENGTH};
 
 /// Builder for creating GGUF files.
 #[derive(Debug)]
@@ -176,6 +178,8 @@ impl GgufBuilder {
 
     /// Build and write the GGUF file to the given writer.
     pub fn write<W: Write + Seek>(&self, writer: &mut W) -> Result<()> {
+        self.validate()?;
+
         // Write header
         self.write_header(writer)?;
 
@@ -186,7 +190,7 @@ impl GgufBuilder {
         }
 
         // Calculate tensor data offsets
-        let tensor_infos = self.calculate_tensor_offsets();
+        let tensor_infos = self.calculate_tensor_offsets()?;
 
         // Write tensor infos
         for info in &tensor_infos {
@@ -197,12 +201,8 @@ impl GgufBuilder {
         let current_pos = writer.stream_position().map_err(|e| {
             pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
         })?;
-        let padding = align_offset(current_pos, self.alignment as u64) - current_pos;
-        for _ in 0..padding {
-            writer.write_u8(0).map_err(|e| {
-                pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
-            })?;
-        }
+        let aligned = align_offset_checked(current_pos, self.alignment as u64)?;
+        write_padding(writer, aligned - current_pos)?;
 
         // Write tensor data
         for (i, (_, data)) in self.tensors.iter().enumerate() {
@@ -215,12 +215,62 @@ impl GgufBuilder {
                 let current_pos = writer.stream_position().map_err(|e| {
                     pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
                 })?;
-                let padding = align_offset(current_pos, self.alignment as u64) - current_pos;
-                for _ in 0..padding {
-                    writer.write_u8(0).map_err(|e| {
-                        pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
-                    })?;
-                }
+                let aligned = align_offset_checked(current_pos, self.alignment as u64)?;
+                write_padding(writer, aligned - current_pos)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.alignment == 0 || self.alignment > 1_048_576 {
+            return Err(PMetalError::InvalidArgument(format!(
+                "GGUF alignment must be in 1..=1048576, got {}",
+                self.alignment
+            )));
+        }
+
+        for (key, value) in &self.metadata {
+            if key.len() > MAX_STRING_LENGTH {
+                return Err(PMetalError::InvalidArgument(format!(
+                    "GGUF metadata key {} exceeds {} bytes",
+                    key, MAX_STRING_LENGTH
+                )));
+            }
+            validate_metadata_value(value)?;
+        }
+
+        for (info, data) in &self.tensors {
+            if info.name.len() > MAX_STRING_LENGTH {
+                return Err(PMetalError::InvalidArgument(format!(
+                    "GGUF tensor name {} exceeds {} bytes",
+                    info.name, MAX_STRING_LENGTH
+                )));
+            }
+            if info.n_dimensions as usize != info.dimensions.len() {
+                return Err(PMetalError::InvalidArgument(format!(
+                    "GGUF tensor {} declares {} dimensions but stores {}",
+                    info.name,
+                    info.n_dimensions,
+                    info.dimensions.len()
+                )));
+            }
+            let expected = info.byte_size_checked().map_err(|e| {
+                PMetalError::InvalidArgument(format!(
+                    "GGUF tensor {} has invalid dimensions or dtype: {}",
+                    info.name, e
+                ))
+            })?;
+            if expected != data.len() {
+                return Err(PMetalError::InvalidArgument(format!(
+                    "GGUF tensor {} has {} bytes but {:?} shape {:?} requires {} bytes",
+                    info.name,
+                    data.len(),
+                    info.dtype,
+                    info.dimensions,
+                    expected
+                )));
             }
         }
 
@@ -323,6 +373,7 @@ impl GgufBuilder {
                 pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
             })?,
             MetadataValue::Array(arr) => {
+                validate_array_elements(arr)?;
                 // Write array element type
                 let elem_type = arr
                     .first()
@@ -392,6 +443,7 @@ impl GgufBuilder {
                 pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
             })?,
             MetadataValue::Array(inner) => {
+                validate_array_elements(inner)?;
                 // Nested arrays — write array header then element data (no per-element type prefix).
                 // The GGUF spec requires array elements to omit individual type codes; the element
                 // type is given once in the outer array header.
@@ -442,7 +494,7 @@ impl GgufBuilder {
     }
 
     /// Calculate tensor offsets.
-    fn calculate_tensor_offsets(&self) -> Vec<TensorInfo> {
+    fn calculate_tensor_offsets(&self) -> Result<Vec<TensorInfo>> {
         let mut infos = Vec::with_capacity(self.tensors.len());
         let mut offset: u64 = 0;
 
@@ -452,17 +504,93 @@ impl GgufBuilder {
             infos.push(new_info);
 
             // Next offset is current + data size, aligned
-            offset += data.len() as u64;
-            offset = align_offset(offset, self.alignment as u64);
+            let len = u64::try_from(data.len()).map_err(|_| {
+                PMetalError::InvalidArgument(format!(
+                    "GGUF tensor {} byte length exceeds u64",
+                    info.name
+                ))
+            })?;
+            offset = offset.checked_add(len).ok_or_else(|| {
+                PMetalError::InvalidArgument("GGUF tensor offsets overflow u64".into())
+            })?;
+            offset = align_offset_checked(offset, self.alignment as u64)?;
         }
 
-        infos
+        Ok(infos)
+    }
+}
+
+fn validate_metadata_value(value: &MetadataValue) -> Result<()> {
+    match value {
+        MetadataValue::String(s) if s.len() > MAX_STRING_LENGTH => {
+            Err(PMetalError::InvalidArgument(format!(
+                "GGUF string metadata value exceeds {} bytes",
+                MAX_STRING_LENGTH
+            )))
+        }
+        MetadataValue::Array(arr) => {
+            validate_array_elements(arr)?;
+            for elem in arr {
+                validate_metadata_value(elem)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_array_elements(arr: &[MetadataValue]) -> Result<()> {
+    if arr.len() > MAX_ARRAY_LENGTH {
+        return Err(PMetalError::InvalidArgument(format!(
+            "GGUF metadata array has {} elements, exceeding {}",
+            arr.len(),
+            MAX_ARRAY_LENGTH
+        )));
+    }
+    if let Some(first) = arr.first() {
+        let expected = first.value_type();
+        if arr.iter().any(|elem| elem.value_type() != expected) {
+            return Err(PMetalError::InvalidArgument(
+                "GGUF metadata arrays must contain a single value type".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_padding<W: Write>(writer: &mut W, len: u64) -> Result<()> {
+    const ZEROES: [u8; 1024] = [0; 1024];
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk = remaining.min(ZEROES.len() as u64) as usize;
+        writer.write_all(&ZEROES[..chunk]).map_err(|e| {
+            pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
+        })?;
+        remaining -= chunk as u64;
+    }
+    Ok(())
+}
+
+fn align_offset_checked(offset: u64, alignment: u64) -> Result<u64> {
+    if alignment == 0 {
+        return Err(PMetalError::InvalidArgument(
+            "GGUF alignment must be greater than zero".into(),
+        ));
+    }
+    let remainder = offset % alignment;
+    if remainder == 0 {
+        Ok(offset)
+    } else {
+        offset
+            .checked_add(alignment - remainder)
+            .ok_or_else(|| PMetalError::InvalidArgument("GGUF aligned offset overflows u64".into()))
     }
 }
 
 /// Calculate aligned offset.
+#[cfg(test)]
 fn align_offset(offset: u64, alignment: u64) -> u64 {
-    offset + (alignment - (offset % alignment)) % alignment
+    align_offset_checked(offset, alignment).expect("valid GGUF alignment and offset")
 }
 
 #[cfg(test)]
@@ -525,5 +653,31 @@ mod tests {
 
         let bytes = builder.build_to_bytes().unwrap();
         assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn zero_alignment_is_rejected() {
+        let builder = GgufBuilder::with_model("llama", "test-model").alignment(0);
+        assert!(builder.build_to_bytes().is_err());
+    }
+
+    #[test]
+    fn heterogeneous_metadata_array_is_rejected() {
+        let mut builder = GgufBuilder::with_model("llama", "test-model");
+        builder.add_metadata(
+            "bad.array",
+            MetadataValue::Array(vec![
+                MetadataValue::Uint32(1),
+                MetadataValue::String("two".into()),
+            ]),
+        );
+        assert!(builder.build_to_bytes().is_err());
+    }
+
+    #[test]
+    fn tensor_byte_size_mismatch_is_rejected() {
+        let mut builder = GgufBuilder::with_model("llama", "test-model");
+        builder.add_raw_tensor("bad.weight", vec![2], GgmlType::F32, vec![0; 4]);
+        assert!(builder.build_to_bytes().is_err());
     }
 }

@@ -548,11 +548,7 @@ impl TurboValueStore {
 }
 
 impl TurboKeyStore {
-    fn new(
-        config: TurboQuantTensorConfig,
-        _total_dim: usize,
-        qjl_mode: TurboQuantQjlMode,
-    ) -> Self {
+    fn new(config: TurboQuantTensorConfig, _total_dim: usize, qjl_mode: TurboQuantQjlMode) -> Self {
         // Variant E: indices use `bits-1` (1 bit reserved for QJL sign).
         // Variant F: indices use full `bits` (no QJL).
         let codebook_bits = |b: u8| match qjl_mode {
@@ -787,19 +783,18 @@ impl TurboQuantCore {
             (rot, inv_rot, qjl, inv_qjl)
         };
 
-        let (wht_left_signs, wht_right_signs, qjl_wht_left_signs, qjl_wht_right_signs) =
-            if use_fwht {
-                let mut wht_rng =
-                    StdRng::seed_from_u64(TURBOQUANT_SEED ^ 0x5748_5400 ^ dim as u64);
-                (
-                    Some(local_rademacher_signs(dim, &mut wht_rng)),
-                    Some(local_rademacher_signs(dim, &mut wht_rng)),
-                    Some(local_rademacher_signs(dim, &mut wht_rng)),
-                    Some(local_rademacher_signs(dim, &mut wht_rng)),
-                )
-            } else {
-                (None, None, None, None)
-            };
+        let (wht_left_signs, wht_right_signs, qjl_wht_left_signs, qjl_wht_right_signs) = if use_fwht
+        {
+            let mut wht_rng = StdRng::seed_from_u64(TURBOQUANT_SEED ^ 0x5748_5400 ^ dim as u64);
+            (
+                Some(local_rademacher_signs(dim, &mut wht_rng)),
+                Some(local_rademacher_signs(dim, &mut wht_rng)),
+                Some(local_rademacher_signs(dim, &mut wht_rng)),
+                Some(local_rademacher_signs(dim, &mut wht_rng)),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
         let mut codebooks = vec![Vec::new(); usize::from(max_mse_bits) + 1];
         for bits in 1..=max_mse_bits {
@@ -855,9 +850,7 @@ impl TurboQuantCore {
     fn rotate_rows(&self, input: &[f32]) -> Vec<f32> {
         // FWHT applies `D_left · H · D_right` — the *forward* rotation maps
         // the input through (right_signs, left_signs).
-        if let Some(out) =
-            self.try_fwht_rows(input, &self.wht_right_signs, &self.wht_left_signs)
-        {
+        if let Some(out) = self.try_fwht_rows(input, &self.wht_right_signs, &self.wht_left_signs) {
             return out;
         }
         self.apply_rows(
@@ -870,9 +863,7 @@ impl TurboQuantCore {
 
     fn inverse_rotate_rows(&self, input: &[f32]) -> Vec<f32> {
         // Inverse swaps the two diagonal sign matrices: (left_signs, right_signs).
-        if let Some(out) =
-            self.try_fwht_rows(input, &self.wht_left_signs, &self.wht_right_signs)
-        {
+        if let Some(out) = self.try_fwht_rows(input, &self.wht_left_signs, &self.wht_right_signs) {
             return out;
         }
         self.apply_rows(
@@ -884,11 +875,9 @@ impl TurboQuantCore {
     }
 
     fn project_rows(&self, input: &[f32]) -> Vec<f32> {
-        if let Some(out) = self.try_fwht_rows(
-            input,
-            &self.qjl_wht_right_signs,
-            &self.qjl_wht_left_signs,
-        ) {
+        if let Some(out) =
+            self.try_fwht_rows(input, &self.qjl_wht_right_signs, &self.qjl_wht_left_signs)
+        {
             return out;
         }
         self.apply_rows(
@@ -900,11 +889,9 @@ impl TurboQuantCore {
     }
 
     fn inverse_project_rows(&self, input: &[f32]) -> Vec<f32> {
-        if let Some(out) = self.try_fwht_rows(
-            input,
-            &self.qjl_wht_left_signs,
-            &self.qjl_wht_right_signs,
-        ) {
+        if let Some(out) =
+            self.try_fwht_rows(input, &self.qjl_wht_left_signs, &self.qjl_wht_right_signs)
+        {
             return out;
         }
         self.apply_rows(
@@ -997,8 +984,7 @@ impl TurboQuantRuntime {
                 .clone()
         };
 
-        let keys =
-            build_tensor_runtime(key_dim, config.keys, true, config.qjl, &mut get_core);
+        let keys = build_tensor_runtime(key_dim, config.keys, true, config.qjl, &mut get_core);
         let values =
             build_tensor_runtime(value_dim, config.values, false, config.qjl, &mut get_core);
 
@@ -1224,9 +1210,9 @@ impl TurboQuantKvCache {
         let encoded_values =
             encode_value_rows_for_runtime(&runtime.values, layout.value_dim, value_rows);
 
-        let key_store = self
-            .keys
-            .get_or_insert_with(|| TurboKeyStore::new(self.config.keys, layout.key_dim, self.config.qjl));
+        let key_store = self.keys.get_or_insert_with(|| {
+            TurboKeyStore::new(self.config.keys, layout.key_dim, self.config.qjl)
+        });
         key_store.extend(&encoded_keys);
 
         let value_store = self
@@ -1681,10 +1667,7 @@ impl TurboQuantKvCache {
                 let elems_per_seq = layout.batch * layout.heads;
                 let key_dim = layout.key_dim;
                 let value_dim = layout.value_dim;
-                let key_buffer_seq = self
-                    .hot_keys
-                    .as_ref()
-                    .map_or(0, |arr| arr.dim(2) as usize);
+                let key_buffer_seq = self.hot_keys.as_ref().map_or(0, |arr| arr.dim(2) as usize);
                 let value_buffer_seq = self
                     .hot_values
                     .as_ref()
@@ -1811,9 +1794,10 @@ impl TurboQuantKvCache {
         };
 
         match (cold_part, hot_part) {
-            (Some(cold), Some(hot)) => {
-                Ok(pmetal_bridge::compat::ops::concatenate_axis(&[&cold, &hot], 2))
-            }
+            (Some(cold), Some(hot)) => Ok(pmetal_bridge::compat::ops::concatenate_axis(
+                &[&cold, &hot],
+                2,
+            )),
             (Some(cold), None) => Ok(cold),
             (None, Some(hot)) => Ok(hot),
             (None, None) => Err(Exception::custom("TurboQuant cache is empty")),
@@ -1872,9 +1856,10 @@ impl TurboQuantKvCache {
         };
 
         match (cold_part, hot_part) {
-            (Some(cold), Some(hot)) => {
-                Ok(pmetal_bridge::compat::ops::concatenate_axis(&[&cold, &hot], 2))
-            }
+            (Some(cold), Some(hot)) => Ok(pmetal_bridge::compat::ops::concatenate_axis(
+                &[&cold, &hot],
+                2,
+            )),
             (Some(cold), None) => Ok(cold),
             (None, Some(hot)) => Ok(hot),
             (None, None) => Err(Exception::custom("TurboQuant cache is empty")),
@@ -3156,7 +3141,9 @@ mod tests {
             assert!(super::dim_uses_fwht(dim), "dim {dim} should use FWHT");
             let core = super::TurboQuantCore::new(dim, 4);
             let mut rng = StdRng::seed_from_u64(0xC0FFEE);
-            let input: Vec<f32> = (0..dim).map(|_| super::sample_standard_normal(&mut rng)).collect();
+            let input: Vec<f32> = (0..dim)
+                .map(|_| super::sample_standard_normal(&mut rng))
+                .collect();
             let input_norm: f32 = input.iter().map(|v| v * v).sum::<f32>().sqrt();
 
             let rotated = core.rotate_rows(&input);
@@ -3325,12 +3312,8 @@ mod tests {
         // dequantize path then short-circuits the QJL correction term entirely.
         let core = super::TurboQuantCore::new(32, 4);
         let row: Vec<f32> = (0..32).map(|i| (i as f32 * 0.13).sin()).collect();
-        let encoded = super::encode_key_component_rows(
-            &core,
-            &row,
-            4,
-            super::TurboQuantQjlMode::NoQjl,
-        );
+        let encoded =
+            super::encode_key_component_rows(&core, &row, 4, super::TurboQuantQjlMode::NoQjl);
         assert!(
             encoded.residual_norms.iter().all(|&rn| rn == 0.0),
             "NoQjl must zero residual_norms; got {:?}",
@@ -3435,7 +3418,10 @@ mod tests {
             assert!(core.inverse_rotation.is_empty());
             assert!(core.qjl_projection.is_empty());
             assert!(core.inverse_qjl_projection.is_empty());
-            assert!(core.metal.is_none(), "dim={dim} pre-built Metal matrices leaked");
+            assert!(
+                core.metal.is_none(),
+                "dim={dim} pre-built Metal matrices leaked"
+            );
             assert!(core.wht_left_signs.is_some());
         }
     }

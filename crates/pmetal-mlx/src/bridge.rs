@@ -33,6 +33,34 @@ use pmetal_metal::{
 pub struct MlxMetalBridge;
 
 impl MlxMetalBridge {
+    fn eval_for_metal(array: &Array, context: &str) -> MetalResult<()> {
+        array.eval().into_result().map_err(|err| {
+            MetalError::InvalidConfig(format!("{context}: MLX evaluation failed: {err}"))
+        })
+    }
+
+    fn validate_shape_elements(shape: &[i32], n_elements: usize) -> MetalResult<()> {
+        let mut product = 1usize;
+        for &dim in shape {
+            if dim < 0 {
+                return Err(MetalError::InvalidConfig(format!(
+                    "shape contains negative dimension {dim}: {shape:?}"
+                )));
+            }
+            product = product.checked_mul(dim as usize).ok_or_else(|| {
+                MetalError::InvalidConfig(format!("shape element count overflow: {shape:?}"))
+            })?;
+        }
+
+        if product != n_elements {
+            return Err(MetalError::InvalidConfig(format!(
+                "shape {shape:?} has {product} elements but buffer has {n_elements}"
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Dequantize Q4_0 data directly into an MLX Array (Metal-accelerated).
     pub fn dequantize_q4_0(
         ctx: &MetalContext,
@@ -40,6 +68,7 @@ impl MlxMetalBridge {
         n_elements: usize,
         shape: &[i32],
     ) -> MetalResult<Array> {
+        Self::validate_shape_elements(shape, n_elements)?;
         let dequant = DequantKernels::new(ctx)?;
         let in_buf = MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)?;
         let out_buf = MetalBuffer::<f32>::new(ctx, n_elements, BufferUsage::Shared)?;
@@ -61,6 +90,7 @@ impl MlxMetalBridge {
         n_elements: usize,
         shape: &[i32],
     ) -> MetalResult<Array> {
+        Self::validate_shape_elements(shape, n_elements)?;
         let dequant = DequantKernels::new(ctx)?;
         let in_buf = MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)?;
         let out_buf = MetalBuffer::<f32>::new(ctx, n_elements, BufferUsage::Shared)?;
@@ -104,20 +134,18 @@ impl MlxMetalBridge {
             )));
         }
 
-        // Ensure array is evaluated before accessing data pointer
-        let evaled = array.clone();
-        evaled.eval();
+        // Ensure the source array is evaluated before accessing data pointer.
+        Self::eval_for_metal(array, "view_f32")?;
 
         // Get pointer to array data
-        let ptr = evaled.data_ptr() as *mut f32;
+        let ptr = array.data_ptr() as *mut f32;
         if ptr.is_null() {
             return Err(MetalError::InvalidConfig(
                 "MLX array data pointer is null".into(),
             ));
         }
 
-        // Create a view — the pointer remains valid while `evaled` is live,
-        // but view lifetime is tied to `array` parameter.
+        // Create a view — the pointer remains valid while `array` is live.
         unsafe { metal_buffer_from_ptr(ctx, ptr, array.size()) }
     }
 
@@ -134,10 +162,9 @@ impl MlxMetalBridge {
             )));
         }
 
-        let evaled = array.clone();
-        evaled.eval();
+        Self::eval_for_metal(array, "view_f16")?;
 
-        let ptr = evaled.data_ptr() as *mut f16;
+        let ptr = array.data_ptr() as *mut f16;
         if ptr.is_null() {
             return Err(MetalError::InvalidConfig(
                 "MLX array data pointer is null".into(),
@@ -159,10 +186,9 @@ impl MlxMetalBridge {
             )));
         }
 
-        let evaled = array.clone();
-        evaled.eval();
+        Self::eval_for_metal(array, "view_u32")?;
 
-        let ptr = evaled.data_ptr() as *mut u32;
+        let ptr = array.data_ptr() as *mut u32;
         if ptr.is_null() {
             return Err(MetalError::InvalidConfig(
                 "MLX array data pointer is null".into(),
@@ -182,9 +208,14 @@ impl MlxMetalBridge {
         } else {
             array.clone()
         };
-        converted.eval();
+        Self::eval_for_metal(&converted, "copy_as_f32")?;
         let n = converted.size();
         let ptr = converted.data_ptr() as *const f32;
+        if ptr.is_null() {
+            return Err(MetalError::InvalidConfig(
+                "MLX array data pointer is null".into(),
+            ));
+        }
         let data: &[f32] = unsafe { std::slice::from_raw_parts(ptr, n) };
         MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)
     }
@@ -196,9 +227,14 @@ impl MlxMetalBridge {
         } else {
             array.clone()
         };
-        converted.eval();
+        Self::eval_for_metal(&converted, "copy_as_f16")?;
         let n = converted.size();
         let ptr = converted.data_ptr() as *const f16;
+        if ptr.is_null() {
+            return Err(MetalError::InvalidConfig(
+                "MLX array data pointer is null".into(),
+            ));
+        }
         let data: &[f16] = unsafe { std::slice::from_raw_parts(ptr, n) };
         MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)
     }
@@ -208,7 +244,13 @@ impl MlxMetalBridge {
     /// Copies data from the Metal buffer into a new MLX array.
     pub fn buffer_into_array_f32(buffer: MetalBuffer<f32>, shape: &[i32]) -> MetalResult<Array> {
         let n = buffer.len();
+        Self::validate_shape_elements(shape, n)?;
         let ptr = buffer.contents_ptr() as *const f32;
+        if ptr.is_null() {
+            return Err(MetalError::InvalidConfig(
+                "Metal buffer contents pointer is null".into(),
+            ));
+        }
         let data: &[f32] = unsafe { std::slice::from_raw_parts(ptr, n) };
         Ok(Array::from_f32_slice(data, shape))
     }
@@ -218,7 +260,13 @@ impl MlxMetalBridge {
     /// Converts f16 data to f32, then creates an MLX array.
     pub fn buffer_into_array_f16(buffer: MetalBuffer<f16>, shape: &[i32]) -> MetalResult<Array> {
         let n = buffer.len();
+        Self::validate_shape_elements(shape, n)?;
         let ptr = buffer.contents_ptr() as *const f16;
+        if ptr.is_null() {
+            return Err(MetalError::InvalidConfig(
+                "Metal buffer contents pointer is null".into(),
+            ));
+        }
         let data_f16: &[f16] = unsafe { std::slice::from_raw_parts(ptr, n) };
         // Convert f16 → f32 then create array and cast back to f16
         let data_f32: Vec<f32> = data_f16.iter().map(|x| x.to_f32()).collect();
@@ -251,5 +299,15 @@ mod tests {
 
         let result = MlxMetalBridge::view_f32(&ctx, &array);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn buffer_into_array_rejects_shape_element_mismatch() {
+        let ctx = MetalContext::new().unwrap();
+        let buffer =
+            MetalBuffer::from_slice(&ctx, &[1.0f32, 2.0, 3.0, 4.0], BufferUsage::Shared).unwrap();
+
+        let err = MlxMetalBridge::buffer_into_array_f32(buffer, &[3]).unwrap_err();
+        assert!(err.to_string().contains("buffer has 4"));
     }
 }

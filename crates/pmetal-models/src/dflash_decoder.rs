@@ -1229,10 +1229,7 @@ impl DFlashTarget for DynamicModel {
     }
 
     fn target_needs_mamba_cache(&self) -> bool {
-        matches!(
-            self,
-            Self::Qwen3Next(_) | Self::NemotronH(_)
-        )
+        matches!(self, Self::Qwen3Next(_) | Self::NemotronH(_))
     }
 
     fn make_kv_cache(&self, max_seq_len: usize) -> KVCache {

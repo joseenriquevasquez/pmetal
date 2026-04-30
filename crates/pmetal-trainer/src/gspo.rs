@@ -317,7 +317,7 @@ impl GspoGroup {
             return 0.0;
         }
         let mut rewards: Vec<f64> = self.rewards();
-        rewards.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        rewards.sort_by(|a, b| a.total_cmp(b));
         let n = rewards.len();
         if n % 2 == 0 {
             (rewards[n / 2 - 1] + rewards[n / 2]) / 2.0
@@ -332,7 +332,7 @@ impl GspoGroup {
             return self.mean_reward();
         }
         let mut rewards = self.rewards();
-        rewards.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        rewards.sort_by(|a, b| a.total_cmp(b));
         let trim_count = (rewards.len() as f64 * 0.1).ceil() as usize;
         let trimmed: Vec<f64> = rewards
             .iter()

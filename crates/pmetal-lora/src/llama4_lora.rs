@@ -24,13 +24,10 @@ use pmetal_bridge::compat::{
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
-use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::apply_rope,
-};
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::llama4::{
-    Llama4Expert, Llama4ModRouter, Llama4MoE, Llama4Router, Llama4TextConfig,
+    Llama4Expert, Llama4MoE, Llama4ModRouter, Llama4Router, Llama4TextConfig,
 };
 
 use crate::lora::LoraProjection;
@@ -271,7 +268,9 @@ impl Llama4LoraAttention {
         let output = probs.matmul(&v);
 
         // [B, H, T, D] -> [B, T, H*D]
-        let output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[batch, seq_len, -1]);
+        let output = output
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
         self.o_proj.forward(&output)
     }
 
@@ -300,17 +299,28 @@ impl Llama4LoraAttention {
 
         // Determine RoPE offset from cache and apply positional encoding.
         if self.uses_rope {
-            let offset = cache
-                .as_ref()
-                .map(|(c, _)| c.rope_offset())
-                .unwrap_or(0);
+            let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
             // Transpose to [B, H, T, D] for rope_apply, then back.
             let q_t = q.transpose_axes(&[0, 2, 1, 3]);
             let k_t = k.transpose_axes(&[0, 2, 1, 3]);
-            let q_r = apply_rope(&q_t, self.head_dim, false, self.rope_theta, self.rope_scale, offset)
-                .map_err(LoraError::Mlx)?;
-            let k_r = apply_rope(&k_t, self.head_dim, false, self.rope_theta, self.rope_scale, offset)
-                .map_err(LoraError::Mlx)?;
+            let q_r = apply_rope(
+                &q_t,
+                self.head_dim,
+                false,
+                self.rope_theta,
+                self.rope_scale,
+                offset,
+            )
+            .map_err(LoraError::Mlx)?;
+            let k_r = apply_rope(
+                &k_t,
+                self.head_dim,
+                false,
+                self.rope_theta,
+                self.rope_scale,
+                offset,
+            )
+            .map_err(LoraError::Mlx)?;
             q = q_r.transpose_axes(&[0, 2, 1, 3]);
             k = k_r.transpose_axes(&[0, 2, 1, 3]);
         }
@@ -334,8 +344,7 @@ impl Llama4LoraAttention {
             .with_scale(self.scale)
             .with_mask_type(AttentionMaskType::Causal);
 
-        let output = fused_sdpa(&q, &keys, &values, &attn_config, mask)
-            .map_err(LoraError::Mlx)?;
+        let output = fused_sdpa(&q, &keys, &values, &attn_config, mask).map_err(LoraError::Mlx)?;
 
         let output = output
             .transpose_axes(&[0, 2, 1, 3])
@@ -538,8 +547,7 @@ impl Llama4LoraMoE {
             .collect();
         let routing_weights: Vec<f32> = expert_weights.as_slice().to_vec();
 
-        let mut expert_assignments: Vec<Vec<(usize, f32)>> =
-            vec![Vec::new(); self.experts.len()];
+        let mut expert_assignments: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.experts.len()];
         for token_idx in 0..n_tokens {
             for slot in 0..top_k {
                 let flat_idx = token_idx * top_k + slot;
@@ -559,12 +567,10 @@ impl Llama4LoraMoE {
             if assignments.is_empty() {
                 continue;
             }
-            let token_indices: Vec<i32> =
-                assignments.iter().map(|&(idx, _)| idx as i32).collect();
+            let token_indices: Vec<i32> = assignments.iter().map(|&(idx, _)| idx as i32).collect();
             let weights: Vec<f32> = assignments.iter().map(|&(_, w)| w).collect();
 
-            let idx_array =
-                Array::from_slice(&token_indices, &[token_indices.len() as i32]);
+            let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
             let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
 
             let expert_input = flat_x.take_axis(&idx_array, 0);
@@ -573,8 +579,7 @@ impl Llama4LoraMoE {
                 .map_err(LoraError::Mlx)?;
             let weighted_out = expert_out.multiply(&weight_array);
 
-            let updates =
-                weighted_out.reshape(&[token_indices.len() as i32, 1, hidden_size]);
+            let updates = weighted_out.reshape(&[token_indices.len() as i32, 1, hidden_size]);
             combined_out = pmetal_bridge::compat::indexing::scatter_add_single(
                 &combined_out,
                 &idx_array,
@@ -676,8 +681,7 @@ impl Llama4LoraDecoderLayer {
     /// Standard full-sequence forward.
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         // Attention with residual.
-        let normed =
-            pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward(&normed, mask)?;
         let h = x.add(&attn_out);
 
@@ -699,8 +703,7 @@ impl Llama4LoraDecoderLayer {
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, LoraError> {
-        let normed =
-            pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
         let h = x.add(&attn_out);
 
@@ -746,8 +749,8 @@ pub struct Llama4LoraModel {
 
 impl Llama4LoraModel {
     pub fn new(config: Llama4TextConfig, lora_config: LoraConfig) -> Result<Self, LoraError> {
-        let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)
-            .map_err(LoraError::Mlx)?;
+        let embed_tokens =
+            nn::Embedding::new(config.vocab_size, config.hidden_size).map_err(LoraError::Mlx)?;
 
         let layers = (0..config.num_hidden_layers)
             .map(|i| Llama4LoraDecoderLayer::new(&config, i as usize, &lora_config))
@@ -932,7 +935,11 @@ impl LoraDecoderStack for Llama4LoraModel {
         let l = &self.layers[layer];
         if l.is_moe {
             let se = l.moe.as_ref().unwrap();
-            vec![&se.shared_expert.gate_proj, &se.shared_expert.up_proj, &se.shared_expert.down_proj]
+            vec![
+                &se.shared_expert.gate_proj,
+                &se.shared_expert.up_proj,
+                &se.shared_expert.down_proj,
+            ]
         } else {
             let mlp = l.mlp.as_ref().unwrap();
             vec![&mlp.gate_proj, &mlp.up_proj, &mlp.down_proj]
@@ -1008,8 +1015,13 @@ impl Llama4LoraForCausalLM {
         mask: Option<&Array>,
         checkpoint_config: Option<&CheckpointConfig>,
     ) -> Result<Array, LoraError> {
-        let hidden = self.model.forward_with_checkpoint(input_ids, mask, checkpoint_config)?;
-        Ok(pmetal_bridge::compat::Module::forward(&mut self.lm_head, &hidden)?)
+        let hidden = self
+            .model
+            .forward_with_checkpoint(input_ids, mask, checkpoint_config)?;
+        Ok(pmetal_bridge::compat::Module::forward(
+            &mut self.lm_head,
+            &hidden,
+        )?)
     }
 
     /// Hidden states before LM head (for Cut Cross-Entropy).
@@ -1019,7 +1031,8 @@ impl Llama4LoraForCausalLM {
         mask: Option<&Array>,
     ) -> Result<Array, LoraError> {
         let cc = self.checkpoint_config.clone();
-        self.model.forward_with_checkpoint(input_ids, mask, cc.as_ref())
+        self.model
+            .forward_with_checkpoint(input_ids, mask, cc.as_ref())
     }
 
     /// Hidden states with position IDs (packed sequence training).
@@ -1047,7 +1060,10 @@ impl Llama4LoraForCausalLM {
         let hidden = self
             .model
             .forward_noised(input_ids, mask, noise_alpha, cc.as_ref())?;
-        Ok(pmetal_bridge::compat::Module::forward(&mut self.lm_head, &hidden)?)
+        Ok(pmetal_bridge::compat::Module::forward(
+            &mut self.lm_head,
+            &hidden,
+        )?)
     }
 
     /// Forward with KV cache.
@@ -1058,7 +1074,10 @@ impl Llama4LoraForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, LoraError> {
         let hidden = self.model.forward_with_cache(input_ids, mask, cache)?;
-        Ok(pmetal_bridge::compat::Module::forward(&mut self.lm_head, &hidden)?)
+        Ok(pmetal_bridge::compat::Module::forward(
+            &mut self.lm_head,
+            &hidden,
+        )?)
     }
 
     /// Create a KV cache for this model.
@@ -1349,9 +1368,7 @@ impl Llama4LoraForCausalLM {
             if layer.is_moe {
                 if let Some(moe) = &mut layer.moe {
                     // Router.
-                    if let Some(w) =
-                        try_get(&format!("{}.feed_forward.router.gate.weight", p))
-                    {
+                    if let Some(w) = try_get(&format!("{}.feed_forward.router.gate.weight", p)) {
                         moe.router.gate.weight = Param::new(w.clone());
                     }
                     // Routed experts (frozen base weights).
@@ -1361,8 +1378,7 @@ impl Llama4LoraForCausalLM {
                             ("up_proj", &mut expert.up_proj),
                             ("down_proj", &mut expert.down_proj),
                         ] {
-                            let key =
-                                format!("{}.feed_forward.experts.{}.{}.weight", p, j, name);
+                            let key = format!("{}.feed_forward.experts.{}.{}.weight", p, j, name);
                             if let Some(w) = try_get(&key) {
                                 proj.weight = Param::new(w.clone());
                             }
@@ -1374,10 +1390,7 @@ impl Llama4LoraForCausalLM {
                         ("up_proj", &mut moe.shared_expert.up_proj),
                         ("down_proj", &mut moe.shared_expert.down_proj),
                     ] {
-                        let key = format!(
-                            "{}.feed_forward.shared_expert.{}.weight",
-                            p, name
-                        );
+                        let key = format!("{}.feed_forward.shared_expert.{}.weight", p, name);
                         if let Some(w) = try_get(&key) {
                             *proj.weight_mut() = w.clone();
                         }
@@ -1649,42 +1662,29 @@ crate::impl_trainable_model!(Llama4LoraForCausalLM);
 fn expand_kv_heads(x: &Array, repeat: i32) -> Result<Array, Exception> {
     let shape = x.shape();
     let (b, n_kv, t, d) = (shape[0], shape[1], shape[2], shape[3]);
-    let expanded = ops::broadcast_to(
-        &x.reshape(&[b, n_kv, 1, t, d]),
-        &[b, n_kv, repeat, t, d],
-    );
+    let expanded = ops::broadcast_to(&x.reshape(&[b, n_kv, 1, t, d]), &[b, n_kv, repeat, t, d]);
     Ok(expanded.reshape(&[b, n_kv * repeat, t, d]))
 }
 
 /// Apply temperature scaling to Q for NoPE long-context layers.
 ///
 /// `scale_i = log(floor((i + 1) / floor_scale) + 1) * attn_scale + 1`
-fn apply_temperature_scaling(
-    q: Array,
-    seq_len: i32,
-    floor_scale: f32,
-    attn_scale: f32,
-) -> Array {
+fn apply_temperature_scaling(q: Array, seq_len: i32, floor_scale: f32, attn_scale: f32) -> Array {
     let ones = ops::ones(&[seq_len], pmetal_bridge::compat::Dtype::Float32);
-    let positions = ops::arange_from(0, seq_len).as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+    let positions =
+        ops::arange_from(0, seq_len).as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
     let pos_plus_one = positions.add(&ones);
     let floored = ops::floor(&pos_plus_one.divide(&Array::from_f32(floor_scale)));
     let log_vals = ops::log(&floored.add(&ones));
-    let scales = log_vals
-        .multiply(&Array::from_f32(attn_scale))
-        .add(&ones);
+    let scales = log_vals.multiply(&Array::from_f32(attn_scale)).add(&ones);
     let scales = scales.reshape(&[1, 1, seq_len, 1]);
     q.multiply(&scales)
 }
 
 /// Build a standard causal attention mask of shape `[seq_len, seq_len]`.
 fn create_causal_mask(seq_len: i32) -> Result<Array, LoraError> {
-    let mask = pmetal_bridge::compat::ops::tri(
-        seq_len,
-        seq_len,
-        0,
-        pmetal_bridge::compat::Dtype::Float32,
-    );
+    let mask =
+        pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
     Ok(pmetal_bridge::compat::ops::where_fn(

@@ -13,6 +13,9 @@ use rand::{Rng, rngs::StdRng};
 
 use crate::InlineArray;
 
+type BetaCodebookKey = (usize, u8);
+type BetaCodebookCache = Mutex<HashMap<BetaCodebookKey, Arc<Vec<f32>>>>;
+
 /// Lloyd-Max iteration cap.
 const LLOYD_MAX_ITERS: usize = 64;
 /// Lloyd-Max convergence threshold.
@@ -33,9 +36,13 @@ const LLOYD_GRID_POINTS: usize = 8192;
 /// every TurboQuant core that shares the same head dim and bit-width. This
 /// also lets `pmetal-mlx` reuse the bridge's tables instead of recomputing.
 pub fn beta_codebook(dim: usize, bits: u8) -> Arc<Vec<f32>> {
-    static CACHE: OnceLock<Mutex<HashMap<(usize, u8), Arc<Vec<f32>>>>> = OnceLock::new();
+    static CACHE: OnceLock<BetaCodebookCache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(hit) = cache.lock().expect("beta_codebook cache poisoned").get(&(dim, bits)) {
+    if let Some(hit) = cache
+        .lock()
+        .expect("beta_codebook cache poisoned")
+        .get(&(dim, bits))
+    {
         return Arc::clone(hit);
     }
     let computed = Arc::new(build_beta_codebook(dim, bits));

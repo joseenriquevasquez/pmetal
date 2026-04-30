@@ -8,19 +8,43 @@ use serde::{Deserialize, Serialize};
 #[spec(kind = "Distill", subcommand = "distill")]
 #[serde(rename_all = "snake_case")]
 pub struct DistillSpec {
-    #[job(label = "Teacher", group = "Models", argv = "--teacher", kind = "model_picker", required)]
+    #[job(
+        label = "Teacher",
+        group = "Models",
+        argv = "--teacher",
+        kind = "model_picker",
+        required
+    )]
     #[serde(default)]
     pub teacher: String,
 
-    #[job(label = "Student", group = "Models", argv = "--student", kind = "model_picker", required)]
+    #[job(
+        label = "Student",
+        group = "Models",
+        argv = "--student",
+        kind = "model_picker",
+        required
+    )]
     #[serde(default)]
     pub student: String,
 
-    #[job(label = "Dataset", group = "Data", argv = "--dataset", kind = "dataset_picker", required)]
+    #[job(
+        label = "Dataset",
+        group = "Data",
+        argv = "--dataset",
+        kind = "dataset_picker",
+        required
+    )]
     #[serde(default)]
     pub dataset: String,
 
-    #[job(label = "Output Dir", group = "Output", argv = "--output", kind = "path", default = "./output/distilled")]
+    #[job(
+        label = "Output Dir",
+        group = "Output",
+        argv = "--output",
+        kind = "path",
+        default = "./output/distilled"
+    )]
     #[serde(default = "default_output")]
     pub output_dir: String,
 
@@ -29,15 +53,32 @@ pub struct DistillSpec {
     #[serde(default = "default_method")]
     pub method: String,
 
-    #[job(label = "Offline Shortcut", group = "Distillation", argv = "--offline", flag, default_bool = false)]
+    #[job(
+        label = "Offline Shortcut",
+        group = "Distillation",
+        argv = "--offline",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub offline: bool,
 
-    #[job(label = "Offline Cache", group = "Distillation", argv = "--offline-cache", kind = "path")]
+    #[job(
+        label = "Offline Cache",
+        group = "Distillation",
+        argv = "--offline-cache",
+        kind = "path"
+    )]
     #[serde(default)]
     pub offline_cache: Option<String>,
 
-    #[job(label = "Generate Offline Logits", group = "Distillation", argv = "--offline-generate", flag, default_bool = false)]
+    #[job(
+        label = "Generate Offline Logits",
+        group = "Distillation",
+        argv = "--offline-generate",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub offline_generate: bool,
 
@@ -46,7 +87,14 @@ pub struct DistillSpec {
     #[serde(default = "default_compression")]
     pub offline_compression: String,
 
-    #[job(label = "Offline Top-k", group = "Distillation", argv = "--offline-top-k", min = 1, max = 65536, default_int = 128)]
+    #[job(
+        label = "Offline Top-k",
+        group = "Distillation",
+        argv = "--offline-top-k",
+        min = 1,
+        max = 65536,
+        default_int = 128
+    )]
     #[serde(default = "default_offline_top_k")]
     pub offline_top_k: usize,
 
@@ -55,43 +103,110 @@ pub struct DistillSpec {
     #[serde(default = "default_loss_type")]
     pub loss_type: String,
 
-    #[job(label = "Temperature", group = "Distillation", argv = "--temperature", min = 0.1, max = 20.0, default_float = 2.0)]
+    #[job(
+        label = "Temperature",
+        group = "Distillation",
+        argv = "--temperature",
+        min = 0.1,
+        max = 20.0,
+        default_float = 2.0
+    )]
     #[serde(default = "default_temperature")]
     pub temperature: f32,
 
-    #[job(label = "Alpha (hard/soft)", group = "Distillation", argv = "--alpha", min = 0.0, max = 1.0, default_float = 0.5)]
+    #[job(
+        label = "Alpha (hard/soft)",
+        group = "Distillation",
+        argv = "--alpha",
+        min = 0.0,
+        max = 1.0,
+        default_float = 0.5
+    )]
     #[serde(default = "default_alpha")]
     pub alpha: f32,
 
-    #[job(label = "Rationale Distillation", group = "Distillation", argv = "--rationale", flag, default_bool = false)]
+    #[job(
+        label = "Rationale Distillation",
+        group = "Distillation",
+        argv = "--rationale",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub rationale: bool,
 
-    #[job(label = "Rationale Weight", group = "Distillation", argv = "--rationale-weight", min = 0.0, max = 100.0, default_float = 1.0)]
+    #[job(
+        label = "Rationale Weight",
+        group = "Distillation",
+        argv = "--rationale-weight",
+        min = 0.0,
+        max = 100.0,
+        default_float = 1.0
+    )]
     #[serde(default = "default_rationale_weight")]
     pub rationale_weight: f32,
 
-    #[job(label = "LoRA r", group = "LoRA", argv = "--lora-r", min = 1, max = 1024, default_int = 16)]
+    #[job(
+        label = "LoRA r",
+        group = "LoRA",
+        argv = "--lora-r",
+        min = 1,
+        max = 1024,
+        default_int = 16
+    )]
     #[serde(default = "default_lora_r")]
     pub lora_r: usize,
 
-    #[job(label = "LoRA α", group = "LoRA", argv = "--lora-alpha", min = 1.0, max = 1024.0, default_float = 32.0)]
+    #[job(
+        label = "LoRA α",
+        group = "LoRA",
+        argv = "--lora-alpha",
+        min = 1.0,
+        max = 1024.0,
+        default_float = 32.0
+    )]
     #[serde(default = "default_lora_alpha")]
     pub lora_alpha: f32,
 
-    #[job(label = "Learning Rate", group = "Optimization", argv = "--learning-rate", min = 1e-8, max = 1.0, default_float = 0.00002)]
+    #[job(
+        label = "Learning Rate",
+        group = "Optimization",
+        argv = "--learning-rate",
+        min = 1e-8,
+        max = 1.0,
+        default_float = 0.00002
+    )]
     #[serde(default = "default_lr")]
     pub learning_rate: f32,
 
-    #[job(label = "Batch Size", group = "Training", argv = "--batch-size", min = 1, max = 1024, default_int = 1)]
+    #[job(
+        label = "Batch Size",
+        group = "Training",
+        argv = "--batch-size",
+        min = 1,
+        max = 1024,
+        default_int = 1
+    )]
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 
-    #[job(label = "Epochs", group = "Training", argv = "--epochs", min = 1, max = 1000, default_int = 1)]
+    #[job(
+        label = "Epochs",
+        group = "Training",
+        argv = "--epochs",
+        min = 1,
+        max = 1000,
+        default_int = 1
+    )]
     #[serde(default = "default_epochs")]
     pub epochs: usize,
 
-    #[job(label = "Max Seq Len", group = "Training", argv = "--max-seq-len", default_int = 1024)]
+    #[job(
+        label = "Max Seq Len",
+        group = "Training",
+        argv = "--max-seq-len",
+        default_int = 1024
+    )]
     #[serde(default = "default_max_seq_len")]
     pub max_seq_len: usize,
 
@@ -107,7 +222,11 @@ pub struct DistillSpec {
     #[serde(default)]
     pub text_columns: Option<String>,
 
-    #[job(label = "Column Separator", group = "Data", argv = "--column-separator")]
+    #[job(
+        label = "Column Separator",
+        group = "Data",
+        argv = "--column-separator"
+    )]
     #[serde(default)]
     pub column_separator: Option<String>,
 
@@ -119,7 +238,12 @@ pub struct DistillSpec {
     #[serde(default)]
     pub response_column: Option<String>,
 
-    #[job(label = "Log Metrics Path", group = "Output", argv = "--log-metrics", kind = "path")]
+    #[job(
+        label = "Log Metrics Path",
+        group = "Output",
+        argv = "--log-metrics",
+        kind = "path"
+    )]
     #[serde(default)]
     pub log_metrics: Option<String>,
 }
@@ -162,11 +286,7 @@ impl Default for DistillSpec {
 impl DistillSpec {
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
         let errs = self.validate_descriptors();
-        if errs.is_empty() {
-            Ok(())
-        } else {
-            Err(errs)
-        }
+        if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }
 
@@ -222,10 +342,12 @@ mod tests {
 
     #[test]
     fn argv_round_trip() {
-        let mut spec = DistillSpec::default();
-        spec.teacher = "t".into();
-        spec.student = "s".into();
-        spec.dataset = "d".into();
+        let spec = DistillSpec {
+            teacher: "t".into(),
+            student: "s".into(),
+            dataset: "d".into(),
+            ..Default::default()
+        };
         let argv = spec.to_argv();
         assert!(argv.contains(&"--teacher".to_string()));
         assert!(argv.contains(&"--student".to_string()));

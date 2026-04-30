@@ -283,13 +283,12 @@ impl MllamaLoraSelfAttention {
             (keys, values)
         };
 
-        let attn_config =
-            FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
-                .with_scale(self.scale)
-                .with_mask_type(AttentionMaskType::Causal);
+        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
+            .with_scale(self.scale)
+            .with_mask_type(AttentionMaskType::Causal);
 
-        let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)
-            .map_err(LoraError::Mlx)?;
+        let output =
+            fused_sdpa(&queries, &keys, &values, &attn_config, mask).map_err(LoraError::Mlx)?;
 
         let output = output
             .transpose_axes(&[0, 2, 1, 3])
@@ -463,12 +462,30 @@ impl MllamaLoraMLP {
         let up_rank = crate::effective_rank(lora_config, "up_proj") as i32;
         let down_rank = crate::effective_rank(lora_config, "down_proj") as i32;
 
-        let gate_proj =
-            LoraLinear::new(tc.hidden_size, tc.intermediate_size, gate_rank, alpha, use_rslora, false)?;
-        let up_proj =
-            LoraLinear::new(tc.hidden_size, tc.intermediate_size, up_rank, alpha, use_rslora, false)?;
-        let down_proj =
-            LoraLinear::new(tc.intermediate_size, tc.hidden_size, down_rank, alpha, use_rslora, false)?;
+        let gate_proj = LoraLinear::new(
+            tc.hidden_size,
+            tc.intermediate_size,
+            gate_rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
+        let up_proj = LoraLinear::new(
+            tc.hidden_size,
+            tc.intermediate_size,
+            up_rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
+        let down_proj = LoraLinear::new(
+            tc.intermediate_size,
+            tc.hidden_size,
+            down_rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
 
         Ok(Self {
             gate_proj,
@@ -530,9 +547,7 @@ impl MllamaLoraDecoderLayer {
             .build()
             .unwrap();
 
-        let has_cross = config
-            .cross_attention_layers
-            .contains(&(layer_id as i32));
+        let has_cross = config.cross_attention_layers.contains(&(layer_id as i32));
 
         let (cross_attn, cross_attention_layernorm) = if has_cross {
             let ca = MllamaLoraCrossAttention::new(config, lora_config)?;
@@ -570,8 +585,7 @@ impl MllamaLoraDecoderLayer {
             cross_states,
             self.cross_attention_layernorm.as_mut(),
         ) {
-            let normed =
-                pmetal_bridge::compat::Module::forward(cn, &h)?;
+            let normed = pmetal_bridge::compat::Module::forward(cn, &h)?;
             let cross_out = ca.forward(&normed, cs)?;
             h = h.add(&cross_out);
         }
@@ -906,11 +920,7 @@ impl MllamaLoraForCausalLM {
     }
 
     /// Standard forward (text-only; cross_states = None).
-    pub fn forward(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-    ) -> Result<Array, LoraError> {
+    pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         self.forward_multimodal(input_ids, mask, None)
     }
 
@@ -925,9 +935,9 @@ impl MllamaLoraForCausalLM {
         cross_states: Option<&Array>,
     ) -> Result<Array, LoraError> {
         let ckpt = self.checkpoint_config.clone();
-        let hidden = self
-            .model
-            .forward_with_checkpoint(input_ids, mask, cross_states, ckpt.as_ref())?;
+        let hidden =
+            self.model
+                .forward_with_checkpoint(input_ids, mask, cross_states, ckpt.as_ref())?;
         self.apply_lm_head(hidden)
     }
 
@@ -1103,10 +1113,7 @@ impl MllamaLoraForCausalLM {
     /// - `language_model.model.layers.{i}.cross_attention_layernorm.weight`
     /// - `language_model.model.norm.weight`
     /// - `language_model.lm_head.weight`
-    pub fn load_base_weights(
-        &mut self,
-        weights: &HashMap<String, Array>,
-    ) -> Result<(), LoraError> {
+    pub fn load_base_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), LoraError> {
         use pmetal_bridge::compat::Param;
 
         let lm_prefix = "language_model.model";
@@ -1126,23 +1133,31 @@ impl MllamaLoraForCausalLM {
                 };
             }
 
-            load!(layer.self_attn.q_proj.weight_mut(), "self_attn.q_proj.weight");
-            load!(layer.self_attn.k_proj.weight_mut(), "self_attn.k_proj.weight");
-            load!(layer.self_attn.v_proj.weight_mut(), "self_attn.v_proj.weight");
-            load!(layer.self_attn.o_proj.weight_mut(), "self_attn.o_proj.weight");
+            load!(
+                layer.self_attn.q_proj.weight_mut(),
+                "self_attn.q_proj.weight"
+            );
+            load!(
+                layer.self_attn.k_proj.weight_mut(),
+                "self_attn.k_proj.weight"
+            );
+            load!(
+                layer.self_attn.v_proj.weight_mut(),
+                "self_attn.v_proj.weight"
+            );
+            load!(
+                layer.self_attn.o_proj.weight_mut(),
+                "self_attn.o_proj.weight"
+            );
 
             load!(layer.mlp.gate_proj.weight_mut(), "mlp.gate_proj.weight");
             load!(layer.mlp.up_proj.weight_mut(), "mlp.up_proj.weight");
             load!(layer.mlp.down_proj.weight_mut(), "mlp.down_proj.weight");
 
-            if let Some(w) =
-                weights.get(&format!("{}.input_layernorm.weight", pfx))
-            {
+            if let Some(w) = weights.get(&format!("{}.input_layernorm.weight", pfx)) {
                 layer.input_layernorm.weight = Param::new(w.clone());
             }
-            if let Some(w) =
-                weights.get(&format!("{}.post_attention_layernorm.weight", pfx))
-            {
+            if let Some(w) = weights.get(&format!("{}.post_attention_layernorm.weight", pfx)) {
                 layer.post_attention_layernorm.weight = Param::new(w.clone());
             }
 
@@ -1153,9 +1168,7 @@ impl MllamaLoraForCausalLM {
                 load!(ca.o_proj.weight_mut(), "cross_attn.o_proj.weight");
             }
             if let Some(ref mut cn) = layer.cross_attention_layernorm {
-                if let Some(w) =
-                    weights.get(&format!("{}.cross_attention_layernorm.weight", pfx))
-                {
+                if let Some(w) = weights.get(&format!("{}.cross_attention_layernorm.weight", pfx)) {
                     cn.weight = Param::new(w.clone());
                 }
             }
@@ -1181,8 +1194,7 @@ impl MllamaLoraForCausalLM {
         let model_dir = model_dir.as_ref();
         let single = model_dir.join("model.safetensors");
         if single.exists() {
-            let weights =
-                crate::sanitize_loaded_weights(crate::load_safetensors_map(&single)?)?;
+            let weights = crate::sanitize_loaded_weights(crate::load_safetensors_map(&single)?)?;
             return self.load_base_weights(&weights);
         }
 
@@ -1207,9 +1219,9 @@ impl MllamaLoraForCausalLM {
         let shard_files: std::collections::HashSet<&String> = index.weight_map.values().collect();
         let mut all_weights = HashMap::new();
         for shard_file in shard_files {
-            let shard_weights = crate::sanitize_loaded_weights(
-                crate::load_safetensors_map(&model_dir.join(shard_file))?,
-            )?;
+            let shard_weights = crate::sanitize_loaded_weights(crate::load_safetensors_map(
+                &model_dir.join(shard_file),
+            )?)?;
             all_weights.extend(shard_weights);
         }
 
@@ -1352,9 +1364,7 @@ impl ModuleParameters for MllamaLoraForCausalLM {
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         let mut params = ModuleParamMut::new();
 
-        fn adapter_mut<'a>(
-            a: &'a mut LinearAdapter,
-        ) -> HashMap<Rc<str>, NestedValue<&'a mut Array>> {
+        fn adapter_mut(a: &mut LinearAdapter) -> HashMap<Rc<str>, NestedValue<&mut Array>> {
             let mut m = HashMap::new();
             match a {
                 LinearAdapter::Lora(l) => {
@@ -1370,9 +1380,7 @@ impl ModuleParameters for MllamaLoraForCausalLM {
             m
         }
 
-        fn lora_linear_mut<'a>(
-            l: &'a mut LoraLinear,
-        ) -> HashMap<Rc<str>, NestedValue<&'a mut Array>> {
+        fn lora_linear_mut(l: &mut LoraLinear) -> HashMap<Rc<str>, NestedValue<&mut Array>> {
             let mut m = HashMap::new();
             m.insert(Rc::from("lora_a"), NestedValue::Value(&mut l.lora_a));
             m.insert(Rc::from("lora_b"), NestedValue::Value(&mut l.lora_b));
@@ -1477,7 +1485,9 @@ impl crate::TrainableModel for MllamaLoraForCausalLM {
         position_ids: &Array,
     ) -> Result<Array, LoraError> {
         let ckpt = self.checkpoint_config.clone();
-        let hidden = self.model.forward_with_positions(input_ids, mask, None, position_ids)?;
+        let hidden = self
+            .model
+            .forward_with_positions(input_ids, mask, None, position_ids)?;
         let _ = ckpt;
         self.apply_lm_head(hidden)
     }
@@ -1585,11 +1595,7 @@ impl crate::TrainableModel for MllamaLoraForCausalLM {
 // Utilities
 // ---------------------------------------------------------------------------
 
-fn expand_kv_heads_if_needed(
-    x: &Array,
-    n_heads: i32,
-    n_kv_heads: i32,
-) -> Result<Array, LoraError> {
+fn expand_kv_heads_if_needed(x: &Array, n_heads: i32, n_kv_heads: i32) -> Result<Array, LoraError> {
     if n_kv_heads < n_heads {
         let repeats = n_heads / n_kv_heads;
         Ok(expand_kv_heads(x, repeats).map_err(LoraError::Mlx)?)
@@ -1614,12 +1620,8 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
 }
 
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = pmetal_bridge::compat::ops::tri(
-        seq_len,
-        seq_len,
-        0,
-        pmetal_bridge::compat::Dtype::Float32,
-    );
+    let mask =
+        pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
     Ok(pmetal_bridge::compat::ops::where_fn(
@@ -1763,13 +1765,10 @@ mod tests {
         assert!(!params.is_empty());
 
         // Cross-attention LoRA params should be present for layers 1 and 3.
-        assert!(params
-            .contains_key(&Rc::from("layers.1.cross_attn.q_proj.lora_a") as &Rc<str>));
-        assert!(params
-            .contains_key(&Rc::from("layers.3.cross_attn.v_proj.lora_b") as &Rc<str>));
+        assert!(params.contains_key(&Rc::from("layers.1.cross_attn.q_proj.lora_a") as &Rc<str>));
+        assert!(params.contains_key(&Rc::from("layers.3.cross_attn.v_proj.lora_b") as &Rc<str>));
         // Layer 0 has no cross-attn.
-        assert!(!params
-            .contains_key(&Rc::from("layers.0.cross_attn.q_proj.lora_a") as &Rc<str>));
+        assert!(!params.contains_key(&Rc::from("layers.0.cross_attn.q_proj.lora_a") as &Rc<str>));
     }
 
     #[test]

@@ -147,13 +147,25 @@ impl DflashTab {
         spec.target = self.form.value("Target Model");
         spec.draft = self.form.value("Draft Model");
         spec.prompt = self.form.value("Prompt");
-        spec.max_new_tokens = self.form.value("Max New Tokens").parse().unwrap_or(spec.max_new_tokens);
-        spec.temperature = self.form.value("Temperature").parse().unwrap_or(spec.temperature);
+        spec.max_new_tokens = self
+            .form
+            .value("Max New Tokens")
+            .parse()
+            .unwrap_or(spec.max_new_tokens);
+        spec.temperature = self
+            .form
+            .value("Temperature")
+            .parse()
+            .unwrap_or(spec.temperature);
         spec.speculative_tokens = self.form.value("Speculative Tokens").parse().ok();
         spec.draft_fp8 = self.form.value("Draft FP8") == "Enabled";
         spec.json = self.form.value("JSON Output") == "Enabled";
         spec.no_chat = self.form.value("No Chat Template") == "Enabled";
-        spec.tree_budget = self.form.value("Tree Budget").parse().unwrap_or(spec.tree_budget);
+        spec.tree_budget = self
+            .form
+            .value("Tree Budget")
+            .parse()
+            .unwrap_or(spec.tree_budget);
         spec
     }
 }
@@ -197,7 +209,10 @@ impl DflashTab {
             DflashStatus::Idle => {
                 lines.push(status_line(StatusTone::Idle, "Idle", None));
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("  [S] Run  [x] Cancel", THEME.text_muted)));
+                lines.push(Line::from(Span::styled(
+                    "  [S] Run  [x] Cancel",
+                    THEME.text_muted,
+                )));
             }
             DflashStatus::Running => {
                 lines.push(status_line(StatusTone::Running, "Running", None));
@@ -225,6 +240,8 @@ fn parse_token_count(line: &str) -> Option<usize> {
     let idx = lower.find("generated")?;
     let rest = &line[idx + "generated".len()..];
     let rest = rest.trim_start();
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     rest[..end].parse().ok()
 }

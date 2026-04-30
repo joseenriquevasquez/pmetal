@@ -306,10 +306,7 @@ impl ContinuousBatcher {
 
         // Transition any Pending slot to Prefilling, unless another
         // slot is already prefilling (D.1 policy: serial prefill).
-        let any_prefilling = self
-            .slots
-            .iter()
-            .any(|s| s.state == SlotState::Prefilling);
+        let any_prefilling = self.slots.iter().any(|s| s.state == SlotState::Prefilling);
         if !any_prefilling {
             for slot in self.slots.iter_mut() {
                 if slot.state == SlotState::Pending {
@@ -331,11 +328,7 @@ impl ContinuousBatcher {
 
         // Serve prefills first. D.1 policy: one slot prefills at a time,
         // so there's at most one match here.
-        if let Some(slot) = self
-            .slots
-            .iter()
-            .find(|s| s.state == SlotState::Prefilling)
-        {
+        if let Some(slot) = self.slots.iter().find(|s| s.state == SlotState::Prefilling) {
             let start = slot.prefilled;
             let step = slot.params.prefill_step_size.max(1);
             let end = (start + step).min(slot.prompt.len());
@@ -534,9 +527,7 @@ mod tests {
         // Third tick: [9..=10] — final chunk.
         match b.next_instruction() {
             StepInstruction::Prefill {
-                chunk,
-                final_chunk,
-                ..
+                chunk, final_chunk, ..
             } => {
                 assert_eq!(chunk, vec![9, 10]);
                 assert!(final_chunk);
@@ -575,11 +566,7 @@ mod tests {
         b.advance_decode([(a, 99u32, false)]);
         // generated.len() == 1 == max_new_tokens → Finished.
         assert_eq!(
-            b.slots()
-                .iter()
-                .find(|s| s.id == a)
-                .unwrap()
-                .finish_reason,
+            b.slots().iter().find(|s| s.id == a).unwrap().finish_reason,
             Some(FinishReason::Length)
         );
         let retired = b.drain_retired();

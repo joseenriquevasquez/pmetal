@@ -129,7 +129,9 @@ impl AttentionTransferLoss {
         match self.loss_type {
             AttentionLossType::Mse => self.mse_loss(&teacher, &student),
             AttentionLossType::Kl => self.kl_loss(&teacher, &student),
-            AttentionLossType::AttentionTransfer => self.attention_transfer_loss(&teacher, &student),
+            AttentionLossType::AttentionTransfer => {
+                self.attention_transfer_loss(&teacher, &student)
+            }
         }
     }
 
@@ -256,8 +258,8 @@ mod tests {
         assert!(exact.is_err(), "exact must fail on head mismatch");
 
         // MeanOverHeads succeeds.
-        let loss = AttentionTransferLoss::mse()
-            .with_head_reduction(AttentionHeadReduction::MeanOverHeads);
+        let loss =
+            AttentionTransferLoss::mse().with_head_reduction(AttentionHeadReduction::MeanOverHeads);
         let v: f32 = loss.compute(&teacher, &student).unwrap().item();
         assert!(v.is_finite());
     }

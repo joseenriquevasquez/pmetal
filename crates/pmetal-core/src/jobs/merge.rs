@@ -8,15 +8,33 @@ use serde::{Deserialize, Serialize};
 #[spec(kind = "Merge", subcommand = "merge")]
 #[serde(rename_all = "snake_case")]
 pub struct MergeSpec {
-    #[job(label = "Model A", group = "Models", argv = "--model-a", kind = "model_picker", required)]
+    #[job(
+        label = "Model A",
+        group = "Models",
+        argv = "--model-a",
+        kind = "model_picker",
+        required
+    )]
     #[serde(default)]
     pub model_a: String,
 
-    #[job(label = "Model B", group = "Models", argv = "--model-b", kind = "model_picker", required)]
+    #[job(
+        label = "Model B",
+        group = "Models",
+        argv = "--model-b",
+        kind = "model_picker",
+        required
+    )]
     #[serde(default)]
     pub model_b: String,
 
-    #[job(label = "Output Dir", group = "Output", argv = "--output", kind = "path", required)]
+    #[job(
+        label = "Output Dir",
+        group = "Output",
+        argv = "--output",
+        kind = "path",
+        required
+    )]
     #[serde(default)]
     pub output: String,
 
@@ -28,23 +46,56 @@ pub struct MergeSpec {
     #[serde(default = "default_method")]
     pub method: String,
 
-    #[job(label = "Base Model", group = "Models", argv = "--base", kind = "model_picker")]
+    #[job(
+        label = "Base Model",
+        group = "Models",
+        argv = "--base",
+        kind = "model_picker"
+    )]
     #[serde(default)]
     pub base: Option<String>,
 
-    #[job(label = "SLERP t", group = "Method", argv = "--t", min = 0.0, max = 1.0, default_float = 0.5)]
+    #[job(
+        label = "SLERP t",
+        group = "Method",
+        argv = "--t",
+        min = 0.0,
+        max = 1.0,
+        default_float = 0.5
+    )]
     #[serde(default = "default_t")]
     pub t: f32,
 
-    #[job(label = "Weight A", group = "Method", argv = "--weight-a", min = 0.0, max = 10.0, default_float = 0.5)]
+    #[job(
+        label = "Weight A",
+        group = "Method",
+        argv = "--weight-a",
+        min = 0.0,
+        max = 10.0,
+        default_float = 0.5
+    )]
     #[serde(default = "default_weight")]
     pub weight_a: f32,
 
-    #[job(label = "Weight B", group = "Method", argv = "--weight-b", min = 0.0, max = 10.0, default_float = 0.5)]
+    #[job(
+        label = "Weight B",
+        group = "Method",
+        argv = "--weight-b",
+        min = 0.0,
+        max = 10.0,
+        default_float = 0.5
+    )]
     #[serde(default = "default_weight")]
     pub weight_b: f32,
 
-    #[job(label = "Density", group = "Method", argv = "--density", min = 0.0, max = 1.0, default_float = 0.5)]
+    #[job(
+        label = "Density",
+        group = "Method",
+        argv = "--density",
+        min = 0.0,
+        max = 1.0,
+        default_float = 0.5
+    )]
     #[serde(default = "default_density")]
     pub density: f32,
 
@@ -74,11 +125,7 @@ impl Default for MergeSpec {
 impl MergeSpec {
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
         let errs = self.validate_descriptors();
-        if errs.is_empty() {
-            Ok(())
-        } else {
-            Err(errs)
-        }
+        if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }
 
@@ -104,10 +151,12 @@ mod tests {
 
     #[test]
     fn argv_round_trip() {
-        let mut spec = MergeSpec::default();
-        spec.model_a = "a".into();
-        spec.model_b = "b".into();
-        spec.output = "o".into();
+        let spec = MergeSpec {
+            model_a: "a".into(),
+            model_b: "b".into(),
+            output: "o".into(),
+            ..Default::default()
+        };
         let argv = spec.to_argv();
         assert!(argv.contains(&"--model-a".to_string()));
         assert!(argv.contains(&"--model-b".to_string()));

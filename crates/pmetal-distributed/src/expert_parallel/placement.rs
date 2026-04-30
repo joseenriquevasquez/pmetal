@@ -301,9 +301,8 @@ mod tests {
     #[test]
     fn per_rank_stacked_assignment_follows_expert_ownership() {
         let p = ExpertPlacement::uniform(8, 2, 2);
-        let map = p.per_rank_stacked_assignment(
-            ["layer.0.switch_mlp.gate_proj.weight".to_string()],
-        );
+        let map =
+            p.per_rank_stacked_assignment(["layer.0.switch_mlp.gate_proj.weight".to_string()]);
         // Rank 0 owns experts 0..4, rank 1 owns 4..8.
         for eid in 0..4 {
             let key = format!("layer.0.switch_mlp.gate_proj.weight#expert={eid}");

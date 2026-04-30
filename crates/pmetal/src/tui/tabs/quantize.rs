@@ -268,11 +268,23 @@ impl QuantizeTab {
         spec.kl_calibrate = self.form.value("KL Calibration") == "Enabled";
         let bpw = self.form.value("Target BPW");
         spec.target_bpw = bpw.parse().ok();
-        spec.kl_threshold = self.form.value("KL Threshold").parse().unwrap_or(spec.kl_threshold);
+        spec.kl_threshold = self
+            .form
+            .value("KL Threshold")
+            .parse()
+            .unwrap_or(spec.kl_threshold);
         spec.bits = self.form.value("MLX Bits").parse().unwrap_or(spec.bits);
-        spec.group_size = self.form.value("MLX Group Size").parse().unwrap_or(spec.group_size);
+        spec.group_size = self
+            .form
+            .value("MLX Group Size")
+            .parse()
+            .unwrap_or(spec.group_size);
         let imatrix = self.form.value("IMatrix");
-        spec.imatrix = if imatrix.is_empty() { None } else { Some(imatrix) };
+        spec.imatrix = if imatrix.is_empty() {
+            None
+        } else {
+            Some(imatrix)
+        };
         spec
     }
 }

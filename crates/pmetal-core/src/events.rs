@@ -668,7 +668,8 @@ impl<S: JobEventSink> TrainingCallbackToSink<S> {
 
 impl<S: JobEventSink> crate::TrainingCallback for TrainingCallbackToSink<S> {
     fn on_train_start(&mut self) {
-        self.sink.emit(JobEvent::started(&self.job_id, JobKind::Train));
+        self.sink
+            .emit(JobEvent::started(&self.job_id, JobKind::Train));
     }
 
     fn on_train_end(&mut self) {
@@ -758,11 +759,13 @@ mod tests {
 
     #[test]
     fn step_metric_round_trip() {
-        let mut step = StepMetrics::default();
-        step.step = 7;
-        step.loss = 2.31;
-        step.lr = 1e-4;
-        step.tok_sec = 1234.5;
+        let step = StepMetrics {
+            step: 7,
+            loss: 2.31,
+            lr: 1e-4,
+            tok_sec: 1234.5,
+            ..Default::default()
+        };
         let ev = JobEvent::Metric {
             job_id: "j".into(),
             payload: MetricPayload::Step(step),
@@ -816,10 +819,7 @@ mod tests {
             write_event(&mut buf, e).unwrap();
         }
         let s = std::str::from_utf8(&buf).unwrap();
-        let parsed: Vec<_> = s
-            .lines()
-            .map(|l| parse_event(l).expect("parse"))
-            .collect();
+        let parsed: Vec<_> = s.lines().map(|l| parse_event(l).expect("parse")).collect();
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0].job_id(), "j");
     }
@@ -836,8 +836,10 @@ mod tests {
         });
         assert!(matches!(status, JobStatus::Starting { .. }));
 
-        let mut step = StepMetrics::default();
-        step.step = 1;
+        let step = StepMetrics {
+            step: 1,
+            ..Default::default()
+        };
         status.apply_event(&JobEvent::Metric {
             job_id: "j".into(),
             payload: MetricPayload::Step(step),

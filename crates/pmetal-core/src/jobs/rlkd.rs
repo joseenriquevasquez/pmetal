@@ -8,67 +8,170 @@ use serde::{Deserialize, Serialize};
 #[spec(kind = "Rlkd", subcommand = "rlkd")]
 #[serde(rename_all = "snake_case")]
 pub struct RlkdSpec {
-    #[job(label = "Policy Model", group = "Models", argv = "--model", kind = "model_picker", required)]
+    #[job(
+        label = "Policy Model",
+        group = "Models",
+        argv = "--model",
+        kind = "model_picker",
+        required
+    )]
     #[serde(default)]
     pub model: String,
 
-    #[job(label = "Teacher Model", group = "Models", argv = "--teacher-model", kind = "model_picker", required)]
+    #[job(
+        label = "Teacher Model",
+        group = "Models",
+        argv = "--teacher-model",
+        kind = "model_picker",
+        required
+    )]
     #[serde(default)]
     pub teacher_model: String,
 
-    #[job(label = "Dataset", group = "Data", argv = "--dataset", kind = "dataset_picker", required)]
+    #[job(
+        label = "Dataset",
+        group = "Data",
+        argv = "--dataset",
+        kind = "dataset_picker",
+        required
+    )]
     #[serde(default)]
     pub dataset: String,
 
-    #[job(label = "Output Dir", group = "Output", argv = "--output", kind = "path", default = "./output/rlkd")]
+    #[job(
+        label = "Output Dir",
+        group = "Output",
+        argv = "--output",
+        kind = "path",
+        default = "./output/rlkd"
+    )]
     #[serde(default = "default_output")]
     pub output_dir: String,
 
-    #[job(label = "Distill α (start)", group = "Distillation", argv = "--distill-alpha", min = 0.0, max = 1.0, default_float = 0.3)]
+    #[job(
+        label = "Distill α (start)",
+        group = "Distillation",
+        argv = "--distill-alpha",
+        min = 0.0,
+        max = 1.0,
+        default_float = 0.3
+    )]
     #[serde(default = "default_distill_alpha")]
     pub distill_alpha: f32,
 
-    #[job(label = "Distill α (final)", group = "Distillation", argv = "--final-alpha", min = 0.0, max = 1.0, default_float = 0.05)]
+    #[job(
+        label = "Distill α (final)",
+        group = "Distillation",
+        argv = "--final-alpha",
+        min = 0.0,
+        max = 1.0,
+        default_float = 0.05
+    )]
     #[serde(default = "default_final_alpha")]
     pub final_alpha: f32,
 
-    #[job(label = "Anneal α", group = "Distillation", argv = "--anneal-alpha", flag, default_bool = false)]
+    #[job(
+        label = "Anneal α",
+        group = "Distillation",
+        argv = "--anneal-alpha",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub anneal_alpha: bool,
 
-    #[job(label = "Distill Temperature", group = "Distillation", argv = "--distill-temperature", min = 0.1, max = 20.0, default_float = 2.0)]
+    #[job(
+        label = "Distill Temperature",
+        group = "Distillation",
+        argv = "--distill-temperature",
+        min = 0.1,
+        max = 20.0,
+        default_float = 2.0
+    )]
     #[serde(default = "default_temperature")]
     pub distill_temperature: f32,
 
-    #[job(label = "Num Generations", group = "GRPO", argv = "--num-generations", min = 1, max = 1024, default_int = 8)]
+    #[job(
+        label = "Num Generations",
+        group = "GRPO",
+        argv = "--num-generations",
+        min = 1,
+        max = 1024,
+        default_int = 8
+    )]
     #[serde(default = "default_num_generations")]
     pub num_generations: usize,
 
-    #[job(label = "KL β", group = "GRPO", argv = "--beta", min = 0.0, max = 1.0, default_float = 0.001)]
+    #[job(
+        label = "KL β",
+        group = "GRPO",
+        argv = "--beta",
+        min = 0.0,
+        max = 1.0,
+        default_float = 0.001
+    )]
     #[serde(default = "default_beta")]
     pub beta: f64,
 
-    #[job(label = "Learning Rate", group = "Optimization", argv = "--learning-rate", min = 1e-8, max = 1.0, default_float = 0.000005)]
+    #[job(
+        label = "Learning Rate",
+        group = "Optimization",
+        argv = "--learning-rate",
+        min = 1e-8,
+        max = 1.0,
+        default_float = 0.000005
+    )]
     #[serde(default = "default_lr")]
     pub learning_rate: f64,
 
-    #[job(label = "Epochs", group = "Training", argv = "--epochs", min = 1, max = 1000, default_int = 1)]
+    #[job(
+        label = "Epochs",
+        group = "Training",
+        argv = "--epochs",
+        min = 1,
+        max = 1000,
+        default_int = 1
+    )]
     #[serde(default = "default_epochs")]
     pub epochs: usize,
 
-    #[job(label = "LoRA r", group = "LoRA", argv = "--lora-r", min = 1, max = 1024, default_int = 16)]
+    #[job(
+        label = "LoRA r",
+        group = "LoRA",
+        argv = "--lora-r",
+        min = 1,
+        max = 1024,
+        default_int = 16
+    )]
     #[serde(default = "default_lora_r")]
     pub lora_r: usize,
 
-    #[job(label = "LoRA α", group = "LoRA", argv = "--lora-alpha", min = 1.0, max = 1024.0, default_float = 32.0)]
+    #[job(
+        label = "LoRA α",
+        group = "LoRA",
+        argv = "--lora-alpha",
+        min = 1.0,
+        max = 1024.0,
+        default_float = 32.0
+    )]
     #[serde(default = "default_lora_alpha")]
     pub lora_alpha: f32,
 
-    #[job(label = "Max Seq Len", group = "Training", argv = "--max-seq-len", default_int = 512)]
+    #[job(
+        label = "Max Seq Len",
+        group = "Training",
+        argv = "--max-seq-len",
+        default_int = 512
+    )]
     #[serde(default = "default_max_seq_len")]
     pub max_seq_len: usize,
 
-    #[job(label = "Max Completion Length", group = "GRPO", argv = "--max-completion-length", default_int = 512)]
+    #[job(
+        label = "Max Completion Length",
+        group = "GRPO",
+        argv = "--max-completion-length",
+        default_int = 512
+    )]
     #[serde(default = "default_max_completion")]
     pub max_completion_length: usize,
 
@@ -76,11 +179,23 @@ pub struct RlkdSpec {
     #[serde(default = "default_seed")]
     pub seed: u64,
 
-    #[job(label = "Reasoning Rewards", group = "GRPO", argv = "--reasoning-rewards", flag, default_bool = false)]
+    #[job(
+        label = "Reasoning Rewards",
+        group = "GRPO",
+        argv = "--reasoning-rewards",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub reasoning_rewards: bool,
 
-    #[job(label = "Disable Flash Attention", group = "Compute", argv = "--no-flash-attention", flag, default_bool = false)]
+    #[job(
+        label = "Disable Flash Attention",
+        group = "Compute",
+        argv = "--no-flash-attention",
+        flag,
+        default_bool = false
+    )]
     #[serde(default)]
     pub no_flash_attention: bool,
 
@@ -92,7 +207,11 @@ pub struct RlkdSpec {
     #[serde(default)]
     pub text_columns: Option<String>,
 
-    #[job(label = "Column Separator", group = "Data", argv = "--column-separator")]
+    #[job(
+        label = "Column Separator",
+        group = "Data",
+        argv = "--column-separator"
+    )]
     #[serde(default)]
     pub column_separator: Option<String>,
 
@@ -104,7 +223,12 @@ pub struct RlkdSpec {
     #[serde(default)]
     pub response_column: Option<String>,
 
-    #[job(label = "Log Metrics Path", group = "Output", argv = "--log-metrics", kind = "path")]
+    #[job(
+        label = "Log Metrics Path",
+        group = "Output",
+        argv = "--log-metrics",
+        kind = "path"
+    )]
     #[serde(default)]
     pub log_metrics: Option<String>,
 }
@@ -144,11 +268,7 @@ impl Default for RlkdSpec {
 impl RlkdSpec {
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
         let errs = self.validate_descriptors();
-        if errs.is_empty() {
-            Ok(())
-        } else {
-            Err(errs)
-        }
+        if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }
 
@@ -198,10 +318,12 @@ mod tests {
 
     #[test]
     fn argv_round_trip() {
-        let mut spec = RlkdSpec::default();
-        spec.model = "m".into();
-        spec.teacher_model = "t".into();
-        spec.dataset = "d".into();
+        let spec = RlkdSpec {
+            model: "m".into(),
+            teacher_model: "t".into(),
+            dataset: "d".into(),
+            ..Default::default()
+        };
         let argv = spec.to_argv();
         assert!(argv.contains(&"--model".to_string()));
         assert!(argv.contains(&"--teacher-model".to_string()));

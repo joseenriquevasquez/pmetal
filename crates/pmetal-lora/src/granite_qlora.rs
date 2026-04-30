@@ -15,8 +15,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use pmetal_bridge::compat::{
-    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param, nn,
-    ops,
+    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param, nn, ops,
 };
 
 use pmetal_core::LoraConfig;
@@ -116,10 +115,7 @@ impl GraniteQLoraAttention {
         // Expand KV heads for GQA if needed
         let (k, v) = if self.n_kv_heads < self.n_heads {
             let repeats = self.n_heads / self.n_kv_heads;
-            (
-                expand_kv_heads(&k, repeats)?,
-                expand_kv_heads(&v, repeats)?,
-            )
+            (expand_kv_heads(&k, repeats)?, expand_kv_heads(&v, repeats)?)
         } else {
             (k, v)
         };
@@ -158,7 +154,11 @@ impl GraniteQLoraAttention {
         let (k_q, k_l, k_t) = self.k_proj.memory_usage();
         let (v_q, v_l, v_t) = self.v_proj.memory_usage();
         let (o_q, o_l, o_t) = self.o_proj.memory_usage();
-        (q_q + k_q + v_q + o_q, q_l + k_l + v_l + o_l, q_t + k_t + v_t + o_t)
+        (
+            q_q + k_q + v_q + o_q,
+            q_l + k_l + v_l + o_l,
+            q_t + k_t + v_t + o_t,
+        )
     }
 }
 
@@ -274,7 +274,10 @@ impl GraniteQloraDecoderLayer {
         let layer_type = config.layer_type(layer_idx);
 
         let (attention, mamba) = match layer_type {
-            GraniteLayerType::Attention => (Some(GraniteQLoraAttention::new(config, qlora_config)?), None),
+            GraniteLayerType::Attention => (
+                Some(GraniteQLoraAttention::new(config, qlora_config)?),
+                None,
+            ),
             GraniteLayerType::Mamba2 => (
                 None,
                 Some(GraniteMamba2::new(config).map_err(LoraError::Mlx)?),
@@ -305,9 +308,8 @@ impl GraniteQloraDecoderLayer {
     /// Forward pass.
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         // Pre-norm
-        let normed =
-            pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)
-                .map_err(LoraError::Mlx)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)
+            .map_err(LoraError::Mlx)?;
 
         // Mixer: QLoRA attention or frozen Mamba2
         let mixer_out = match self.layer_type {
@@ -327,9 +329,8 @@ impl GraniteQloraDecoderLayer {
         let h = x.add(&mixer_out);
 
         // FFN pre-norm + QLoRA MLP + residual
-        let normed =
-            pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)
-                .map_err(LoraError::Mlx)?;
+        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)
+            .map_err(LoraError::Mlx)?;
         let ffn_out = self.mlp.forward(&normed)?;
         Ok(h.add(&ffn_out))
     }
@@ -382,8 +383,8 @@ pub struct GraniteQloraModel {
 impl GraniteQloraModel {
     /// Create a new QLoRA Granite model with random weights.
     pub fn new(config: GraniteConfig, qlora_config: QLoraConfig) -> Result<Self, LoraError> {
-        let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)
-            .map_err(LoraError::Mlx)?;
+        let embed_tokens =
+            nn::Embedding::new(config.vocab_size, config.hidden_size).map_err(LoraError::Mlx)?;
 
         let layers = (0..config.num_hidden_layers)
             .map(|i| GraniteQloraDecoderLayer::new(&config, &qlora_config, i as usize))
@@ -404,11 +405,7 @@ impl GraniteQloraModel {
     }
 
     /// Forward pass.
-    pub fn forward(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-    ) -> Result<Array, LoraError> {
+    pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         self.forward_with_checkpoint(input_ids, mask, None)
     }
 
@@ -535,11 +532,7 @@ impl GraniteQloraForCausalLM {
     }
 
     /// Forward pass producing logits [batch, seq_len, vocab_size].
-    pub fn forward(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-    ) -> Result<Array, LoraError> {
+    pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         let checkpoint_config = self.checkpoint_config.clone();
         self.forward_with_checkpoint(input_ids, mask, checkpoint_config.as_ref())
     }
@@ -556,8 +549,7 @@ impl GraniteQloraForCausalLM {
                 .forward_with_checkpoint(input_ids, mask, checkpoint_config)?;
 
         if let Some(ref mut lm_head) = self.lm_head {
-            pmetal_bridge::compat::Module::forward(lm_head, &hidden_states)
-                .map_err(LoraError::Mlx)
+            pmetal_bridge::compat::Module::forward(lm_head, &hidden_states).map_err(LoraError::Mlx)
         } else {
             Ok(self.model.embed_tokens.as_linear(&hidden_states))
         }
@@ -633,21 +625,63 @@ impl GraniteQloraForCausalLM {
 
             let prefix = format!("layers.{}", i);
 
-            set_param!(attn.q_proj.lora_a, format!("{}.self_attn.q_proj.lora_a", prefix));
-            set_param!(attn.q_proj.lora_b, format!("{}.self_attn.q_proj.lora_b", prefix));
-            set_param!(attn.k_proj.lora_a, format!("{}.self_attn.k_proj.lora_a", prefix));
-            set_param!(attn.k_proj.lora_b, format!("{}.self_attn.k_proj.lora_b", prefix));
-            set_param!(attn.v_proj.lora_a, format!("{}.self_attn.v_proj.lora_a", prefix));
-            set_param!(attn.v_proj.lora_b, format!("{}.self_attn.v_proj.lora_b", prefix));
-            set_param!(attn.o_proj.lora_a, format!("{}.self_attn.o_proj.lora_a", prefix));
-            set_param!(attn.o_proj.lora_b, format!("{}.self_attn.o_proj.lora_b", prefix));
+            set_param!(
+                attn.q_proj.lora_a,
+                format!("{}.self_attn.q_proj.lora_a", prefix)
+            );
+            set_param!(
+                attn.q_proj.lora_b,
+                format!("{}.self_attn.q_proj.lora_b", prefix)
+            );
+            set_param!(
+                attn.k_proj.lora_a,
+                format!("{}.self_attn.k_proj.lora_a", prefix)
+            );
+            set_param!(
+                attn.k_proj.lora_b,
+                format!("{}.self_attn.k_proj.lora_b", prefix)
+            );
+            set_param!(
+                attn.v_proj.lora_a,
+                format!("{}.self_attn.v_proj.lora_a", prefix)
+            );
+            set_param!(
+                attn.v_proj.lora_b,
+                format!("{}.self_attn.v_proj.lora_b", prefix)
+            );
+            set_param!(
+                attn.o_proj.lora_a,
+                format!("{}.self_attn.o_proj.lora_a", prefix)
+            );
+            set_param!(
+                attn.o_proj.lora_b,
+                format!("{}.self_attn.o_proj.lora_b", prefix)
+            );
 
-            set_param!(layer.mlp.gate_proj.lora_a, format!("{}.mlp.gate_proj.lora_a", prefix));
-            set_param!(layer.mlp.gate_proj.lora_b, format!("{}.mlp.gate_proj.lora_b", prefix));
-            set_param!(layer.mlp.up_proj.lora_a, format!("{}.mlp.up_proj.lora_a", prefix));
-            set_param!(layer.mlp.up_proj.lora_b, format!("{}.mlp.up_proj.lora_b", prefix));
-            set_param!(layer.mlp.down_proj.lora_a, format!("{}.mlp.down_proj.lora_a", prefix));
-            set_param!(layer.mlp.down_proj.lora_b, format!("{}.mlp.down_proj.lora_b", prefix));
+            set_param!(
+                layer.mlp.gate_proj.lora_a,
+                format!("{}.mlp.gate_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.mlp.gate_proj.lora_b,
+                format!("{}.mlp.gate_proj.lora_b", prefix)
+            );
+            set_param!(
+                layer.mlp.up_proj.lora_a,
+                format!("{}.mlp.up_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.mlp.up_proj.lora_b,
+                format!("{}.mlp.up_proj.lora_b", prefix)
+            );
+            set_param!(
+                layer.mlp.down_proj.lora_a,
+                format!("{}.mlp.down_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.mlp.down_proj.lora_b,
+                format!("{}.mlp.down_proj.lora_b", prefix)
+            );
         }
     }
 
@@ -669,13 +703,17 @@ impl GraniteQloraForCausalLM {
             .layers
             .iter()
             .map(|l| {
-                let attn_fp = l.attention.as_ref().map(|a| {
-                    (a.q_proj.num_frozen_params()
-                        + a.k_proj.num_frozen_params()
-                        + a.v_proj.num_frozen_params()
-                        + a.o_proj.num_frozen_params())
-                        * 4
-                }).unwrap_or(0);
+                let attn_fp = l
+                    .attention
+                    .as_ref()
+                    .map(|a| {
+                        (a.q_proj.num_frozen_params()
+                            + a.k_proj.num_frozen_params()
+                            + a.v_proj.num_frozen_params()
+                            + a.o_proj.num_frozen_params())
+                            * 4
+                    })
+                    .unwrap_or(0);
                 let mlp_fp = (l.mlp.gate_proj.num_frozen_params()
                     + l.mlp.up_proj.num_frozen_params()
                     + l.mlp.down_proj.num_frozen_params())
@@ -737,21 +775,63 @@ impl GraniteQloraForCausalLM {
 
             let prefix = format!("layers.{}", i);
 
-            load_param!(attn.q_proj.lora_a, format!("{}.self_attn.q_proj.lora_a", prefix));
-            load_param!(attn.q_proj.lora_b, format!("{}.self_attn.q_proj.lora_b", prefix));
-            load_param!(attn.k_proj.lora_a, format!("{}.self_attn.k_proj.lora_a", prefix));
-            load_param!(attn.k_proj.lora_b, format!("{}.self_attn.k_proj.lora_b", prefix));
-            load_param!(attn.v_proj.lora_a, format!("{}.self_attn.v_proj.lora_a", prefix));
-            load_param!(attn.v_proj.lora_b, format!("{}.self_attn.v_proj.lora_b", prefix));
-            load_param!(attn.o_proj.lora_a, format!("{}.self_attn.o_proj.lora_a", prefix));
-            load_param!(attn.o_proj.lora_b, format!("{}.self_attn.o_proj.lora_b", prefix));
+            load_param!(
+                attn.q_proj.lora_a,
+                format!("{}.self_attn.q_proj.lora_a", prefix)
+            );
+            load_param!(
+                attn.q_proj.lora_b,
+                format!("{}.self_attn.q_proj.lora_b", prefix)
+            );
+            load_param!(
+                attn.k_proj.lora_a,
+                format!("{}.self_attn.k_proj.lora_a", prefix)
+            );
+            load_param!(
+                attn.k_proj.lora_b,
+                format!("{}.self_attn.k_proj.lora_b", prefix)
+            );
+            load_param!(
+                attn.v_proj.lora_a,
+                format!("{}.self_attn.v_proj.lora_a", prefix)
+            );
+            load_param!(
+                attn.v_proj.lora_b,
+                format!("{}.self_attn.v_proj.lora_b", prefix)
+            );
+            load_param!(
+                attn.o_proj.lora_a,
+                format!("{}.self_attn.o_proj.lora_a", prefix)
+            );
+            load_param!(
+                attn.o_proj.lora_b,
+                format!("{}.self_attn.o_proj.lora_b", prefix)
+            );
 
-            load_param!(layer.mlp.gate_proj.lora_a, format!("{}.mlp.gate_proj.lora_a", prefix));
-            load_param!(layer.mlp.gate_proj.lora_b, format!("{}.mlp.gate_proj.lora_b", prefix));
-            load_param!(layer.mlp.up_proj.lora_a, format!("{}.mlp.up_proj.lora_a", prefix));
-            load_param!(layer.mlp.up_proj.lora_b, format!("{}.mlp.up_proj.lora_b", prefix));
-            load_param!(layer.mlp.down_proj.lora_a, format!("{}.mlp.down_proj.lora_a", prefix));
-            load_param!(layer.mlp.down_proj.lora_b, format!("{}.mlp.down_proj.lora_b", prefix));
+            load_param!(
+                layer.mlp.gate_proj.lora_a,
+                format!("{}.mlp.gate_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.mlp.gate_proj.lora_b,
+                format!("{}.mlp.gate_proj.lora_b", prefix)
+            );
+            load_param!(
+                layer.mlp.up_proj.lora_a,
+                format!("{}.mlp.up_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.mlp.up_proj.lora_b,
+                format!("{}.mlp.up_proj.lora_b", prefix)
+            );
+            load_param!(
+                layer.mlp.down_proj.lora_a,
+                format!("{}.mlp.down_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.mlp.down_proj.lora_b,
+                format!("{}.mlp.down_proj.lora_b", prefix)
+            );
         }
 
         Ok(())
@@ -761,10 +841,7 @@ impl GraniteQloraForCausalLM {
     ///
     /// Quantizes attention and MLP projection weights to NF4.
     /// Layer norms, embeddings, and Mamba2 weights stay in full precision.
-    pub fn load_base_weights(
-        &mut self,
-        weights: &HashMap<String, Array>,
-    ) -> Result<(), LoraError> {
+    pub fn load_base_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), LoraError> {
         // Embeddings (full precision)
         if let Some(w) = weights.get("model.embed_tokens.weight") {
             self.model.embed_tokens.weight = Param::new(w.clone());
@@ -783,16 +860,37 @@ impl GraniteQloraForCausalLM {
 
             // Attention projections (only for attention-type layers)
             if let Some(ref mut attn) = layer.attention {
-                quantize_weight!(&mut attn.q_proj, format!("{}.self_attn.q_proj.weight", prefix));
-                quantize_weight!(&mut attn.k_proj, format!("{}.self_attn.k_proj.weight", prefix));
-                quantize_weight!(&mut attn.v_proj, format!("{}.self_attn.v_proj.weight", prefix));
-                quantize_weight!(&mut attn.o_proj, format!("{}.self_attn.o_proj.weight", prefix));
+                quantize_weight!(
+                    &mut attn.q_proj,
+                    format!("{}.self_attn.q_proj.weight", prefix)
+                );
+                quantize_weight!(
+                    &mut attn.k_proj,
+                    format!("{}.self_attn.k_proj.weight", prefix)
+                );
+                quantize_weight!(
+                    &mut attn.v_proj,
+                    format!("{}.self_attn.v_proj.weight", prefix)
+                );
+                quantize_weight!(
+                    &mut attn.o_proj,
+                    format!("{}.self_attn.o_proj.weight", prefix)
+                );
             }
 
             // MLP projections
-            quantize_weight!(&mut layer.mlp.gate_proj, format!("{}.mlp.gate_proj.weight", prefix));
-            quantize_weight!(&mut layer.mlp.up_proj, format!("{}.mlp.up_proj.weight", prefix));
-            quantize_weight!(&mut layer.mlp.down_proj, format!("{}.mlp.down_proj.weight", prefix));
+            quantize_weight!(
+                &mut layer.mlp.gate_proj,
+                format!("{}.mlp.gate_proj.weight", prefix)
+            );
+            quantize_weight!(
+                &mut layer.mlp.up_proj,
+                format!("{}.mlp.up_proj.weight", prefix)
+            );
+            quantize_weight!(
+                &mut layer.mlp.down_proj,
+                format!("{}.mlp.down_proj.weight", prefix)
+            );
 
             // Layer norms (full precision)
             if let Some(w) = weights.get(&format!("{}.input_layernorm.weight", prefix)) {
@@ -973,23 +1071,47 @@ impl ModuleParameters for GraniteQloraForCausalLM {
             let mut attn_params = HashMap::new();
 
             let mut q_p = HashMap::new();
-            q_p.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.q_proj.lora_a));
-            q_p.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.q_proj.lora_b));
+            q_p.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut attn.q_proj.lora_a),
+            );
+            q_p.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut attn.q_proj.lora_b),
+            );
             attn_params.insert(Rc::from("q_proj"), NestedValue::Map(q_p));
 
             let mut k_p = HashMap::new();
-            k_p.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.k_proj.lora_a));
-            k_p.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.k_proj.lora_b));
+            k_p.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut attn.k_proj.lora_a),
+            );
+            k_p.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut attn.k_proj.lora_b),
+            );
             attn_params.insert(Rc::from("k_proj"), NestedValue::Map(k_p));
 
             let mut v_p = HashMap::new();
-            v_p.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.v_proj.lora_a));
-            v_p.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.v_proj.lora_b));
+            v_p.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut attn.v_proj.lora_a),
+            );
+            v_p.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut attn.v_proj.lora_b),
+            );
             attn_params.insert(Rc::from("v_proj"), NestedValue::Map(v_p));
 
             let mut o_p = HashMap::new();
-            o_p.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.o_proj.lora_a));
-            o_p.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.o_proj.lora_b));
+            o_p.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut attn.o_proj.lora_a),
+            );
+            o_p.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut attn.o_proj.lora_b),
+            );
             attn_params.insert(Rc::from("o_proj"), NestedValue::Map(o_p));
 
             layer_params.insert(Rc::from("self_attn"), NestedValue::Map(attn_params));
@@ -998,18 +1120,36 @@ impl ModuleParameters for GraniteQloraForCausalLM {
             let mut mlp_params = HashMap::new();
 
             let mut gate_p = HashMap::new();
-            gate_p.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.mlp.gate_proj.lora_a));
-            gate_p.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.mlp.gate_proj.lora_b));
+            gate_p.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.mlp.gate_proj.lora_a),
+            );
+            gate_p.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.mlp.gate_proj.lora_b),
+            );
             mlp_params.insert(Rc::from("gate_proj"), NestedValue::Map(gate_p));
 
             let mut up_p = HashMap::new();
-            up_p.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.mlp.up_proj.lora_a));
-            up_p.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.mlp.up_proj.lora_b));
+            up_p.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.mlp.up_proj.lora_a),
+            );
+            up_p.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.mlp.up_proj.lora_b),
+            );
             mlp_params.insert(Rc::from("up_proj"), NestedValue::Map(up_p));
 
             let mut down_p = HashMap::new();
-            down_p.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.mlp.down_proj.lora_a));
-            down_p.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.mlp.down_proj.lora_b));
+            down_p.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.mlp.down_proj.lora_a),
+            );
+            down_p.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.mlp.down_proj.lora_b),
+            );
             mlp_params.insert(Rc::from("down_proj"), NestedValue::Map(down_p));
 
             layer_params.insert(Rc::from("mlp"), NestedValue::Map(mlp_params));
@@ -1117,12 +1257,7 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, LoraError> {
 
 /// Build a causal attention mask of shape [seq_len, seq_len].
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = ops::tri(
-        seq_len,
-        seq_len,
-        0,
-        pmetal_bridge::compat::Dtype::Float32,
-    );
+    let mask = ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
     let equal_zero = mask.equal(&zero);

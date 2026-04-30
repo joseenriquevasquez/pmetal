@@ -9,19 +9,32 @@
 use super::dtype::BridgeScalar;
 use super::ffi::*;
 use super::{EvalToken, InlineArray};
+use crate::error::{BridgeResult, check_last_error};
 
 impl InlineArray {
     // ── Eval ─────────────────────────────────────────────────────────────
 
     pub fn eval(&self) -> EvalToken {
+        let prior = check_last_error();
         // MLX array handles are internally mutable; eval materializes the backing
         // graph state but does not change the logical Rust ownership model.
         unsafe { mlx_inline_eval(std::ptr::from_ref(&self.raw).cast_mut()) }
-        EvalToken
+        EvalToken::new(prior)
     }
     pub fn async_eval(&self) -> EvalToken {
+        let prior = check_last_error();
         unsafe { mlx_inline_async_eval(std::ptr::from_ref(&self.raw).cast_mut()) }
-        EvalToken
+        EvalToken::new(prior)
+    }
+
+    /// Evaluate and return any bridge-side exception as a Rust error.
+    pub fn try_eval(&self) -> BridgeResult<()> {
+        self.eval().into_result()
+    }
+
+    /// Asynchronously evaluate and return any bridge-side exception as a Rust error.
+    pub fn try_async_eval(&self) -> BridgeResult<()> {
+        self.async_eval().into_result()
     }
 
     /// Eval two arrays in one call (avoids two FFI round-trips).
@@ -75,11 +88,11 @@ impl InlineArray {
     // const→mut pointer cast (matches `eval()` above).
 
     pub fn item_f32(&self) -> f32 {
-        self.eval();
+        self.eval().expect("item_f32 eval failed");
         unsafe { mlx_inline_item_f32(std::ptr::from_ref(&self.raw).cast_mut()) }
     }
     pub fn item_u32(&self) -> u32 {
-        self.eval();
+        self.eval().expect("item_u32 eval failed");
         unsafe { mlx_inline_item_u32(std::ptr::from_ref(&self.raw).cast_mut()) }
     }
 
@@ -88,7 +101,7 @@ impl InlineArray {
     /// Extract the scalar value from a 0-d array. Evaluates lazily if needed.
     /// `T` must be `f32`, `u32`, or `i32` (the bridge-exported scalar types).
     pub fn item<T: BridgeScalar>(&self) -> T {
-        self.eval();
+        self.eval().expect("item eval failed");
         T::extract(self)
     }
 }

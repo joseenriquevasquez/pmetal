@@ -117,7 +117,10 @@ mod tests {
                 covered += count;
                 last_end = start + count;
             }
-            assert_eq!(covered, total, "total {total} world {world} not fully covered");
+            assert_eq!(
+                covered, total,
+                "total {total} world {world} not fully covered"
+            );
             assert_eq!(last_end, total);
         }
     }

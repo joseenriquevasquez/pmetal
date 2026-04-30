@@ -71,12 +71,48 @@ const CELLS: &[Cell] = &[
     // Cover the dims the GPU score kernels actually take: 128 + 256.
     // Bits sweep matches the plan's 4b / 3b / 2b — we round 3b down to the
     // smallest viable codebook (mse_bits = bits - 1 = 2).
-    Cell { head_dim: 128, bits: 4, seq: 1024, q_heads: 4, kv_heads: 4 },
-    Cell { head_dim: 128, bits: 3, seq: 1024, q_heads: 4, kv_heads: 4 },
-    Cell { head_dim: 128, bits: 2, seq: 1024, q_heads: 4, kv_heads: 4 },
-    Cell { head_dim: 256, bits: 4, seq: 1024, q_heads: 4, kv_heads: 4 },
-    Cell { head_dim: 256, bits: 3, seq: 1024, q_heads: 4, kv_heads: 4 },
-    Cell { head_dim: 256, bits: 2, seq: 1024, q_heads: 4, kv_heads: 4 },
+    Cell {
+        head_dim: 128,
+        bits: 4,
+        seq: 1024,
+        q_heads: 4,
+        kv_heads: 4,
+    },
+    Cell {
+        head_dim: 128,
+        bits: 3,
+        seq: 1024,
+        q_heads: 4,
+        kv_heads: 4,
+    },
+    Cell {
+        head_dim: 128,
+        bits: 2,
+        seq: 1024,
+        q_heads: 4,
+        kv_heads: 4,
+    },
+    Cell {
+        head_dim: 256,
+        bits: 4,
+        seq: 1024,
+        q_heads: 4,
+        kv_heads: 4,
+    },
+    Cell {
+        head_dim: 256,
+        bits: 3,
+        seq: 1024,
+        q_heads: 4,
+        kv_heads: 4,
+    },
+    Cell {
+        head_dim: 256,
+        bits: 2,
+        seq: 1024,
+        q_heads: 4,
+        kv_heads: 4,
+    },
 ];
 
 fn synthetic_gaussian(shape: &[i32], seed: u64) -> InlineArray {
@@ -85,7 +121,9 @@ fn synthetic_gaussian(shape: &[i32], seed: u64) -> InlineArray {
     // across runs without pulling in the rand crate's distribution code.
     let mut state = seed;
     let mut step = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((state >> 33) as u32) as f32 / (u32::MAX as f32)
     };
     let mut data = Vec::with_capacity(n as usize);
@@ -117,8 +155,7 @@ fn run_cell(cell: Cell, qjl_disabled: bool) -> InlineArray {
 
     let b: i32 = 1;
     let d: i32 = cell.head_dim as i32;
-    let config = TurboQuantConfig::uniform(cell.bits, cell.bits)
-        .with_recent_window(None);
+    let config = TurboQuantConfig::uniform(cell.bits, cell.bits).with_recent_window(None);
     let mut cache = QuantizedKvCache::new(config);
 
     // Prefill with seq tokens then run a single decode-style query step.

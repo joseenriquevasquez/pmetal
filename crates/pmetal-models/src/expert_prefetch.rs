@@ -27,7 +27,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 
 use pmetal_bridge::compat::indexing::IndexOp;
@@ -127,11 +127,19 @@ impl PrefetchedAlignedBuffer {
     }
 
     pub fn into_inner(mut self) -> AlignedBuffer {
-        self.buffer.take().unwrap()
+        self.buffer
+            .take()
+            .expect("prefetched aligned buffer was already taken")
     }
 
     pub fn to_vec(&self, len: usize) -> Vec<u8> {
-        self.buffer.as_ref().unwrap().as_bytes()[..len].to_vec()
+        match self.buffer.as_ref() {
+            Some(buffer) => {
+                let bytes = buffer.as_bytes();
+                bytes[..len.min(bytes.len())].to_vec()
+            }
+            None => Vec::new(),
+        }
     }
 }
 
@@ -191,7 +199,7 @@ fn complete_prefetch(
     if generation.load(AtomicOrdering::Relaxed) != request_generation {
         return;
     }
-    let mut pending = pending.lock().unwrap();
+    let mut pending = lock_unpoisoned(pending);
     pending.insert(
         layer_idx,
         PrefetchResult {
@@ -244,7 +252,7 @@ fn try_mark_inflight(
     layer_idx: usize,
     generation: u64,
 ) -> bool {
-    let mut inflight = inflight.lock().unwrap();
+    let mut inflight = lock_unpoisoned(inflight);
     if inflight.get(&layer_idx).copied() == Some(generation) {
         return false;
     }
@@ -253,7 +261,7 @@ fn try_mark_inflight(
 }
 
 fn clear_inflight(inflight: &Mutex<HashMap<usize, u64>>, layer_idx: usize, generation: u64) {
-    let mut inflight = inflight.lock().unwrap();
+    let mut inflight = lock_unpoisoned(inflight);
     if inflight.get(&layer_idx).copied() == Some(generation) {
         inflight.remove(&layer_idx);
     }
@@ -280,7 +288,7 @@ impl PrefetchIoWorkerPool {
                 .spawn(move || {
                     loop {
                         let request = {
-                            let rx = request_rx.lock().unwrap();
+                            let rx = lock_unpoisoned(&request_rx);
                             rx.recv()
                         };
                         let Ok(request) = request else {
@@ -339,9 +347,13 @@ impl PrefetchIoWorkerPool {
                         );
                         clear_inflight(&inflight_layers, request.layer_idx, request.generation);
                     }
-                })
-                .expect("Failed to spawn prefetch-io worker");
-            joins.push(join);
+                });
+            match join {
+                Ok(join) => joins.push(join),
+                Err(err) => {
+                    tracing::warn!("failed to spawn prefetch-io worker {}: {}", worker_idx, err)
+                }
+            }
         }
 
         Self {
@@ -352,7 +364,7 @@ impl PrefetchIoWorkerPool {
     }
 
     fn enqueue(&self, request: PrefetchRequest) -> bool {
-        let tx = self.request_tx.lock().unwrap();
+        let tx = lock_unpoisoned(&self.request_tx);
         if let Some(tx) = tx.as_ref() {
             tx.send(request).is_ok()
         } else {
@@ -363,8 +375,8 @@ impl PrefetchIoWorkerPool {
 
 impl Drop for PrefetchIoWorkerPool {
     fn drop(&mut self) {
-        let _ = self.request_tx.lock().unwrap().take();
-        for join in self.joins.lock().unwrap().drain(..) {
+        let _ = lock_unpoisoned(&self.request_tx).take();
+        for join in lock_unpoisoned(&self.joins).drain(..) {
             let _ = join.join();
         }
     }
@@ -388,7 +400,7 @@ impl std::fmt::Debug for ExpertPrefetcher {
             .field("aligned_pool", &self.aligned_pool.is_some())
             .field(
                 "inflight_layers",
-                &self.inflight_layers.lock().unwrap().len(),
+                &lock_unpoisoned(&self.inflight_layers).len(),
             )
             .field("worker_pool", &self.worker_pool)
             .finish()
@@ -494,10 +506,10 @@ impl ExpertPrefetcher {
         layer_idx: usize,
         expert_indices: &[usize],
     ) -> Vec<Option<PrefetchedExpert>> {
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = lock_unpoisoned(&self.pending);
         let prefetch = pending.remove(&layer_idx);
 
-        let mut stats = self.stats.lock().unwrap();
+        let mut stats = lock_unpoisoned(&self.stats);
 
         match prefetch {
             Some(mut result) => {
@@ -538,19 +550,19 @@ impl ExpertPrefetcher {
 
     /// Get current prefetch statistics.
     pub fn stats(&self) -> PrefetchStats {
-        self.stats.lock().unwrap().clone()
+        lock_unpoisoned(&self.stats).clone()
     }
 
     /// Reset statistics counters.
     pub fn reset_stats(&self) {
-        *self.stats.lock().unwrap() = PrefetchStats::default();
+        *lock_unpoisoned(&self.stats) = PrefetchStats::default();
     }
 
     /// Drop any cached / in-flight prefetch state from a previous phase.
     pub fn reset_pending(&self) {
         self.generation.fetch_add(1, AtomicOrdering::Relaxed);
-        self.pending.lock().unwrap().clear();
-        self.inflight_layers.lock().unwrap().clear();
+        lock_unpoisoned(&self.pending).clear();
+        lock_unpoisoned(&self.inflight_layers).clear();
     }
 
     /// CPU-side top-k prediction over logically extracted gate rows.
@@ -593,6 +605,13 @@ impl ExpertPrefetcher {
             .map(|(_, expert_idx)| expert_idx)
             .collect())
     }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("recovering from poisoned ExpertPrefetcher mutex");
+        poisoned.into_inner()
+    })
 }
 
 fn prefetch_worker_count() -> usize {

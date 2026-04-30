@@ -29,7 +29,9 @@ pub fn array_to_metal_buffer_f16(ctx: &MetalContext, array: &Array) -> Result<Me
     // Convert to f32, then cast each element to f16.
     // This avoids unsafe raw-pointer access; the copy is acceptable for Metal buffer creation.
     let mut f32_arr = array.as_dtype(Dtype::Float32.as_i32());
-    f32_arr.eval();
+    f32_arr
+        .try_eval()
+        .map_err(|e| MlxError::Metal(format!("failed to evaluate f32 array: {e}")))?;
     let n = f32_arr.size();
     let f32_data = f32_arr
         .to_f32_vec(n)
@@ -63,7 +65,9 @@ pub fn array_to_metal_buffer_f32(ctx: &MetalContext, array: &Array) -> Result<Me
     } else {
         array.clone()
     };
-    converted.eval();
+    converted
+        .try_eval()
+        .map_err(|e| MlxError::Metal(format!("failed to evaluate f32 array: {e}")))?;
 
     let n = converted.size();
     let data = converted

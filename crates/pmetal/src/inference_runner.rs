@@ -1048,8 +1048,8 @@ fn turboquant_config_from_mode(
 fn bridge_turboquant_outlier_mode(
     mode: pmetal_mlx::kv_cache::TurboQuantOutlierMode,
 ) -> pmetal_bridge::turboquant::TurboQuantOutlierMode {
-    use pmetal_mlx::kv_cache::TurboQuantOutlierMode as Src;
     use pmetal_bridge::turboquant::TurboQuantOutlierMode as Dst;
+    use pmetal_mlx::kv_cache::TurboQuantOutlierMode as Src;
     match mode {
         Src::None => Dst::None,
         Src::PerBlock { k } => Dst::PerBlock { k },
@@ -1059,8 +1059,8 @@ fn bridge_turboquant_outlier_mode(
 fn bridge_turboquant_pack_mode(
     mode: pmetal_mlx::kv_cache::TurboQuantPackMode,
 ) -> pmetal_bridge::turboquant::TurboQuantPackMode {
-    use pmetal_mlx::kv_cache::TurboQuantPackMode as Src;
     use pmetal_bridge::turboquant::TurboQuantPackMode as Dst;
+    use pmetal_mlx::kv_cache::TurboQuantPackMode as Src;
     match mode {
         Src::Bitstream => Dst::Bitstream,
         Src::Fullbyte => Dst::Fullbyte,

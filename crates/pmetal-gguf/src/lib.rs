@@ -46,7 +46,7 @@ mod writer;
 
 pub use reader::{
     GgufContent, GgufReadError, GgufVersion, MAX_ARRAY_LENGTH, MAX_METADATA_COUNT,
-    MAX_STRING_LENGTH, MAX_TENSOR_COUNT,
+    MAX_STRING_LENGTH, MAX_TENSOR_COUNT, MAX_TENSOR_DIMS,
 };
 pub use types::*;
 pub use writer::*;

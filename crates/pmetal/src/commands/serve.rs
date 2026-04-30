@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 /// Start the OpenAI-compatible inference server.
 #[cfg(feature = "serve")]
 pub(crate) async fn run_serve(

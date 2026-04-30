@@ -14,14 +14,13 @@
 
 use std::f32::consts::PI;
 
+use super::bits::unpack_all;
 use super::config::{TurboQuantOutlierMode, TurboQuantQjlMode, TurboQuantTensorConfig};
 use super::core::TurboQuantCore;
+use super::host_keystore::{QuantizedKeyStore, QuantizedValueStore};
 use super::math::l2_norm;
 use super::state::TensorRuntime;
-use super::host_keystore::{QuantizedKeyStore, QuantizedValueStore};
-use super::bits::unpack_all;
 use super::{MAX_RESIDUAL_NORM, ZERO_EPSILON};
-
 
 pub(super) struct EncodedKeyRows {
     pub(super) mse_indices: Vec<u16>,
@@ -140,7 +139,11 @@ fn per_block_outlier_k(mode: TurboQuantOutlierMode, dim: usize) -> usize {
     }
 }
 
-pub(super) fn encode_value_rows(runtime: &TensorRuntime, total_dim: usize, rows: &[f32]) -> BatchedValueRows {
+pub(super) fn encode_value_rows(
+    runtime: &TensorRuntime,
+    total_dim: usize,
+    rows: &[f32],
+) -> BatchedValueRows {
     match runtime {
         TensorRuntime::Uniform { config, core } => {
             let TurboQuantTensorConfig::Uniform { bits } = config else {
@@ -453,7 +456,6 @@ pub(super) fn encode_value_component_rows(
     EncodedValueRows { indices, norms }
 }
 
-
 pub(super) fn decode_key_rows(
     runtime: &TensorRuntime,
     total_dim: usize,
@@ -739,7 +741,6 @@ pub(super) fn decode_value_component_rows_raw(
     reconstructed
 }
 
-
 /// Rotate then nearest-centroid quantise: returns a per-coordinate index.
 pub(super) fn quantize_mse_rows(core: &TurboQuantCore, normalized: &[f32], bits: u8) -> Vec<u16> {
     if bits == 0 {
@@ -780,7 +781,6 @@ pub(super) fn nearest_centroid_index(value: f32, codebook: &[f32]) -> usize {
         }
     }
 }
-
 
 /// Identify the top-k highest-magnitude coordinates as outliers.
 pub(super) fn select_outlier_mask(row: &[f32], outlier_count: usize) -> Vec<u16> {

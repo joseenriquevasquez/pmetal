@@ -150,16 +150,40 @@ impl DistillationTab {
             let v = self.form.value("Loss Type");
             if v.is_empty() { spec.loss_type } else { v }
         };
-        spec.temperature = self.form.value("Temperature").parse().unwrap_or(spec.temperature);
-        spec.alpha = self.form.value("Alpha (hard/soft)").parse().unwrap_or(spec.alpha);
+        spec.temperature = self
+            .form
+            .value("Temperature")
+            .parse()
+            .unwrap_or(spec.temperature);
+        spec.alpha = self
+            .form
+            .value("Alpha (hard/soft)")
+            .parse()
+            .unwrap_or(spec.alpha);
         spec.rationale = self.form.value("Rationale Distillation") == "Enabled";
-        spec.rationale_weight = self.form.value("Rationale Weight").parse().unwrap_or(spec.rationale_weight);
+        spec.rationale_weight = self
+            .form
+            .value("Rationale Weight")
+            .parse()
+            .unwrap_or(spec.rationale_weight);
         spec.lora_r = self.form.value("LoRA r").parse().unwrap_or(spec.lora_r);
         spec.lora_alpha = self.form.value("LoRA α").parse().unwrap_or(spec.lora_alpha);
-        spec.learning_rate = self.form.value("Learning Rate").parse().unwrap_or(spec.learning_rate);
-        spec.batch_size = self.form.value("Batch Size").parse().unwrap_or(spec.batch_size);
+        spec.learning_rate = self
+            .form
+            .value("Learning Rate")
+            .parse()
+            .unwrap_or(spec.learning_rate);
+        spec.batch_size = self
+            .form
+            .value("Batch Size")
+            .parse()
+            .unwrap_or(spec.batch_size);
         spec.epochs = self.form.value("Epochs").parse().unwrap_or(spec.epochs);
-        spec.max_seq_len = self.form.value("Max Seq Len").parse().unwrap_or(spec.max_seq_len);
+        spec.max_seq_len = self
+            .form
+            .value("Max Seq Len")
+            .parse()
+            .unwrap_or(spec.max_seq_len);
         spec.seed = self.form.value("Seed").parse().unwrap_or(spec.seed);
         spec
     }

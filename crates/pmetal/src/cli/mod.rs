@@ -5,6 +5,7 @@
 
 pub mod bench;
 pub mod dflash;
+pub mod distill;
 pub mod embed_train;
 pub mod eval;
 pub mod fuse;
@@ -18,4 +19,3 @@ pub mod rlkd;
 pub mod serve;
 pub mod tokenize;
 pub mod train;
-pub mod distill;

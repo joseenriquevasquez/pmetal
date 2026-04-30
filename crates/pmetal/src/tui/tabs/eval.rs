@@ -171,8 +171,16 @@ impl EvalTab {
         let mut spec = EvalSpec::default();
         spec.model = self.form.value("Model");
         spec.dataset = self.form.value("Dataset");
-        spec.max_seq_len = self.form.value("Max Seq Len").parse().unwrap_or(spec.max_seq_len);
-        spec.num_samples = self.form.value("Num Samples").parse().unwrap_or(spec.num_samples);
+        spec.max_seq_len = self
+            .form
+            .value("Max Seq Len")
+            .parse()
+            .unwrap_or(spec.max_seq_len);
+        spec.num_samples = self
+            .form
+            .value("Num Samples")
+            .parse()
+            .unwrap_or(spec.num_samples);
         spec.json = self.form.value("JSON Output") == "Enabled";
         let lora = self.form.value("LoRA Adapter");
         spec.lora = if lora.is_empty() { None } else { Some(lora) };

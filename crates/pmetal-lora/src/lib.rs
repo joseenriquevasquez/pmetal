@@ -41,14 +41,14 @@
 mod adapter;
 pub mod arch_config;
 pub mod autograd;
-mod dora;
-mod dynamic;
-mod dynamic_qlora;
-pub mod galore;
 pub mod cohere_lora;
 pub mod cohere_qlora;
 pub mod deepseek_lora;
 pub mod deepseek_qlora;
+mod dora;
+mod dynamic;
+mod dynamic_qlora;
+pub mod galore;
 pub mod gemma4_lora;
 pub mod gemma4_qlora;
 pub mod gemma_lora;
@@ -87,16 +87,16 @@ pub use autograd::{
     AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext, LoraGrads, MlpForwardSaved,
     MlpLoraGrads, fused_mlp_backward, fused_mlp_forward, lora_backward, lora_forward_with_grad,
 };
+pub use cohere_lora::*;
+pub use cohere_qlora::*;
+pub use deepseek_lora::*;
+pub use deepseek_qlora::*;
 pub use dora::*;
 pub use dynamic::*;
 pub use dynamic_qlora::DynamicQloraModel;
 pub use galore::{
     GaloreConfig, GaloreParamState, GaloreProjectionState, GaloreProjectionType, GaloreProjector,
 };
-pub use cohere_lora::*;
-pub use cohere_qlora::*;
-pub use deepseek_lora::*;
-pub use deepseek_qlora::*;
 pub use gemma_lora::*;
 pub use gemma_qlora::*;
 pub use gemma4_lora::*;
@@ -105,10 +105,10 @@ pub use gpt_oss_lora::*;
 pub use gpt_oss_qlora::*;
 pub use granite_lora::*;
 pub use granite_qlora::*;
-pub use llama4_lora::*;
-pub use llama4_qlora::*;
 pub use llama_lora::*;
 pub use llama_qlora::*;
+pub use llama4_lora::*;
+pub use llama4_qlora::*;
 pub use lora::*;
 pub use lora_helpers::{
     LoraDecoderStack, collect_lora_parameters, count_trainable_params, load_lora_weights_impl,

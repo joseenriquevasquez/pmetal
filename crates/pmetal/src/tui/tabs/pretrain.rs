@@ -93,30 +93,70 @@ impl PretrainTab {
         let mut spec = PretrainSpec::default();
         spec.arch = self.form.value("Architecture");
         let shards = self.form.value("Shards (csv)");
-        spec.shards = if shards.is_empty() { None } else { Some(shards) };
+        spec.shards = if shards.is_empty() {
+            None
+        } else {
+            Some(shards)
+        };
         spec.seq_len = self.form.value("Seq Len").parse().unwrap_or(spec.seq_len);
-        spec.batch_size = self.form.value("Batch Size").parse().unwrap_or(spec.batch_size);
+        spec.batch_size = self
+            .form
+            .value("Batch Size")
+            .parse()
+            .unwrap_or(spec.batch_size);
         spec.steps = self.form.value("Steps").parse().unwrap_or(spec.steps);
-        spec.learning_rate = self.form.value("Learning Rate").parse().unwrap_or(spec.learning_rate);
+        spec.learning_rate = self
+            .form
+            .value("Learning Rate")
+            .parse()
+            .unwrap_or(spec.learning_rate);
         spec.min_lr = self.form.value("Min LR").parse().unwrap_or(spec.min_lr);
-        spec.warmup_steps = self.form.value("Warmup Steps").parse().unwrap_or(spec.warmup_steps);
+        spec.warmup_steps = self
+            .form
+            .value("Warmup Steps")
+            .parse()
+            .unwrap_or(spec.warmup_steps);
         spec.lr_schedule = {
             let v = self.form.value("LR Schedule");
             if v.is_empty() { spec.lr_schedule } else { v }
         };
-        spec.weight_decay = self.form.value("Weight Decay").parse().unwrap_or(spec.weight_decay);
-        spec.max_grad_norm = self.form.value("Max Grad Norm").parse().unwrap_or(spec.max_grad_norm);
-        spec.eos_token_id = self.form.value("EOS Token ID").parse().unwrap_or(spec.eos_token_id);
+        spec.weight_decay = self
+            .form
+            .value("Weight Decay")
+            .parse()
+            .unwrap_or(spec.weight_decay);
+        spec.max_grad_norm = self
+            .form
+            .value("Max Grad Norm")
+            .parse()
+            .unwrap_or(spec.max_grad_norm);
+        spec.eos_token_id = self
+            .form
+            .value("EOS Token ID")
+            .parse()
+            .unwrap_or(spec.eos_token_id);
         spec.output_dir = {
             let v = self.form.value("Output Dir");
             if v.is_empty() { spec.output_dir } else { v }
         };
-        spec.checkpoint_every = self.form.value("Checkpoint Every").parse().unwrap_or(spec.checkpoint_every);
-        spec.gradient_accumulation_steps = self.form.value("Grad Accum Steps").parse().unwrap_or(spec.gradient_accumulation_steps);
+        spec.checkpoint_every = self
+            .form
+            .value("Checkpoint Every")
+            .parse()
+            .unwrap_or(spec.checkpoint_every);
+        spec.gradient_accumulation_steps = self
+            .form
+            .value("Grad Accum Steps")
+            .parse()
+            .unwrap_or(spec.gradient_accumulation_steps);
         spec.z_loss = self.form.value("MoE z-loss").parse().unwrap_or(spec.z_loss);
         spec.seed = self.form.value("Seed").parse().unwrap_or(spec.seed);
         let model_config = self.form.value("Model Config");
-        spec.model_config = if model_config.is_empty() { None } else { Some(model_config) };
+        spec.model_config = if model_config.is_empty() {
+            None
+        } else {
+            Some(model_config)
+        };
         spec
     }
 }

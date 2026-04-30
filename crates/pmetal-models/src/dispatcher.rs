@@ -14,7 +14,8 @@ use pmetal_bridge::compat::{
     ModuleParametersExt, nn, transforms,
 };
 use pmetal_mlx::kv_cache::{
-    CacheMode, FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache, sanitize_cache_mode_for_config,
+    CacheMode, FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache,
+    sanitize_cache_mode_for_config,
 };
 use std::path::Path;
 

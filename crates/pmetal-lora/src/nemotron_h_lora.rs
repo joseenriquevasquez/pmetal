@@ -24,8 +24,8 @@ use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache, MambaCacheEntry};
 use pmetal_models::architectures::nemotron_h::{
-    Expert, MambaRMSNormGated, MoELayer, NemotronHConfig, NemotronHMixer,
-    load_nemotron_weights, ssm_attention, ssm_update_single,
+    Expert, MambaRMSNormGated, MoELayer, NemotronHConfig, NemotronHMixer, load_nemotron_weights,
+    ssm_attention, ssm_update_single,
 };
 
 use crate::{LoraError, LoraLinear};
@@ -174,9 +174,11 @@ impl NemotronHLoraAttention {
 
         let output = fused_sdpa(&q, &k, &v, &attn_config, mask).map_err(LoraError::Mlx)?;
 
-        let output = output
-            .transpose_axes(&[0, 2, 1, 3])
-            .reshape(&[batch, seq_len, self.num_heads * self.head_dim]);
+        let output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ]);
 
         self.o_proj.forward(&output)
     }
@@ -318,8 +320,7 @@ impl NemotronHLoraMoE {
         .map_err(LoraError::Mlx)?;
 
         let shared_expert = if use_shared_expert {
-            let intermediate =
-                shared_intermediate_size.unwrap_or(moe_intermediate_size);
+            let intermediate = shared_intermediate_size.unwrap_or(moe_intermediate_size);
             Some(NemotronHLoraSharedExpert::new(
                 config.hidden_size,
                 intermediate,
@@ -829,38 +830,14 @@ impl NemotronHLoraForCausalLM {
             match &mut layer.mixer {
                 NemotronHLoraMixer::Mamba(_) => {}
                 NemotronHLoraMixer::Attention(attn) => {
-                    set_param!(
-                        attn.q_proj.lora_a,
-                        format!("{prefix}.mixer.q_proj.lora_a")
-                    );
-                    set_param!(
-                        attn.q_proj.lora_b,
-                        format!("{prefix}.mixer.q_proj.lora_b")
-                    );
-                    set_param!(
-                        attn.k_proj.lora_a,
-                        format!("{prefix}.mixer.k_proj.lora_a")
-                    );
-                    set_param!(
-                        attn.k_proj.lora_b,
-                        format!("{prefix}.mixer.k_proj.lora_b")
-                    );
-                    set_param!(
-                        attn.v_proj.lora_a,
-                        format!("{prefix}.mixer.v_proj.lora_a")
-                    );
-                    set_param!(
-                        attn.v_proj.lora_b,
-                        format!("{prefix}.mixer.v_proj.lora_b")
-                    );
-                    set_param!(
-                        attn.o_proj.lora_a,
-                        format!("{prefix}.mixer.o_proj.lora_a")
-                    );
-                    set_param!(
-                        attn.o_proj.lora_b,
-                        format!("{prefix}.mixer.o_proj.lora_b")
-                    );
+                    set_param!(attn.q_proj.lora_a, format!("{prefix}.mixer.q_proj.lora_a"));
+                    set_param!(attn.q_proj.lora_b, format!("{prefix}.mixer.q_proj.lora_b"));
+                    set_param!(attn.k_proj.lora_a, format!("{prefix}.mixer.k_proj.lora_a"));
+                    set_param!(attn.k_proj.lora_b, format!("{prefix}.mixer.k_proj.lora_b"));
+                    set_param!(attn.v_proj.lora_a, format!("{prefix}.mixer.v_proj.lora_a"));
+                    set_param!(attn.v_proj.lora_b, format!("{prefix}.mixer.v_proj.lora_b"));
+                    set_param!(attn.o_proj.lora_a, format!("{prefix}.mixer.o_proj.lora_a"));
+                    set_param!(attn.o_proj.lora_b, format!("{prefix}.mixer.o_proj.lora_b"));
                 }
                 NemotronHLoraMixer::Mlp(mlp) => {
                     set_param!(mlp.up_proj.lora_a, format!("{prefix}.mixer.up_proj.lora_a"));
@@ -934,10 +911,7 @@ impl NemotronHLoraForCausalLM {
     /// Prefix: `backbone.layers.{i}.mixer.{component}.weight`
     pub fn load_base_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), LoraError> {
         // Embeddings
-        for key in &[
-            "backbone.embeddings.weight",
-            "model.embed_tokens.weight",
-        ] {
+        for key in &["backbone.embeddings.weight", "model.embed_tokens.weight"] {
             if let Some(w) = weights.get(*key) {
                 self.model.embeddings.weight = Param::new(w.clone());
                 break;
@@ -1026,14 +1000,14 @@ impl NemotronHLoraForCausalLM {
                     }
                     // Frozen routed experts
                     for (idx, expert) in moe.moe_layer.experts.iter_mut().enumerate() {
-                        if let Some(w) = weights.get(&format!(
-                            "{pfx}.mixer.experts.{idx}.up_proj.weight"
-                        )) {
+                        if let Some(w) =
+                            weights.get(&format!("{pfx}.mixer.experts.{idx}.up_proj.weight"))
+                        {
                             expert.up_proj.weight = Param::new(w.clone());
                         }
-                        if let Some(w) = weights.get(&format!(
-                            "{pfx}.mixer.experts.{idx}.down_proj.weight"
-                        )) {
+                        if let Some(w) =
+                            weights.get(&format!("{pfx}.mixer.experts.{idx}.down_proj.weight"))
+                        {
                             expert.down_proj.weight = Param::new(w.clone());
                         }
                     }
@@ -1082,7 +1056,8 @@ impl NemotronHLoraForCausalLM {
 
         let single_file = model_dir.join("model.safetensors");
         if single_file.exists() {
-            let weights = crate::sanitize_loaded_weights(crate::load_safetensors_map(&single_file)?)?;
+            let weights =
+                crate::sanitize_loaded_weights(crate::load_safetensors_map(&single_file)?)?;
             return self.load_base_weights(&weights);
         }
 
@@ -1256,8 +1231,7 @@ impl ModuleParameters for NemotronHLoraForCausalLM {
                             p.insert(Rc::from("lora_b"), NestedValue::Value(&lora.lora_b));
                             se_map.insert(Rc::from(proj_name), NestedValue::Map(p));
                         }
-                        mixer_map
-                            .insert(Rc::from("shared_expert"), NestedValue::Map(se_map));
+                        mixer_map.insert(Rc::from("shared_expert"), NestedValue::Map(se_map));
                     }
                 }
             }
@@ -1283,34 +1257,70 @@ impl ModuleParameters for NemotronHLoraForCausalLM {
                 NemotronHLoraMixer::Mamba(_) => {}
                 NemotronHLoraMixer::Attention(attn) => {
                     let mut q = HashMap::new();
-                    q.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.q_proj.lora_a));
-                    q.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.q_proj.lora_b));
+                    q.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut attn.q_proj.lora_a),
+                    );
+                    q.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut attn.q_proj.lora_b),
+                    );
                     mixer_map.insert(Rc::from("q_proj"), NestedValue::Map(q));
 
                     let mut k = HashMap::new();
-                    k.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.k_proj.lora_a));
-                    k.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.k_proj.lora_b));
+                    k.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut attn.k_proj.lora_a),
+                    );
+                    k.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut attn.k_proj.lora_b),
+                    );
                     mixer_map.insert(Rc::from("k_proj"), NestedValue::Map(k));
 
                     let mut v = HashMap::new();
-                    v.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.v_proj.lora_a));
-                    v.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.v_proj.lora_b));
+                    v.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut attn.v_proj.lora_a),
+                    );
+                    v.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut attn.v_proj.lora_b),
+                    );
                     mixer_map.insert(Rc::from("v_proj"), NestedValue::Map(v));
 
                     let mut o = HashMap::new();
-                    o.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.o_proj.lora_a));
-                    o.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.o_proj.lora_b));
+                    o.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut attn.o_proj.lora_a),
+                    );
+                    o.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut attn.o_proj.lora_b),
+                    );
                     mixer_map.insert(Rc::from("o_proj"), NestedValue::Map(o));
                 }
                 NemotronHLoraMixer::Mlp(mlp) => {
                     let mut up = HashMap::new();
-                    up.insert(Rc::from("lora_a"), NestedValue::Value(&mut mlp.up_proj.lora_a));
-                    up.insert(Rc::from("lora_b"), NestedValue::Value(&mut mlp.up_proj.lora_b));
+                    up.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut mlp.up_proj.lora_a),
+                    );
+                    up.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut mlp.up_proj.lora_b),
+                    );
                     mixer_map.insert(Rc::from("up_proj"), NestedValue::Map(up));
 
                     let mut down = HashMap::new();
-                    down.insert(Rc::from("lora_a"), NestedValue::Value(&mut mlp.down_proj.lora_a));
-                    down.insert(Rc::from("lora_b"), NestedValue::Value(&mut mlp.down_proj.lora_b));
+                    down.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut mlp.down_proj.lora_a),
+                    );
+                    down.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut mlp.down_proj.lora_b),
+                    );
                     mixer_map.insert(Rc::from("down_proj"), NestedValue::Map(down));
                 }
                 NemotronHLoraMixer::MoE(moe) => {
@@ -1318,8 +1328,14 @@ impl ModuleParameters for NemotronHLoraForCausalLM {
                         let mut se_map = HashMap::new();
 
                         let mut up = HashMap::new();
-                        up.insert(Rc::from("lora_a"), NestedValue::Value(&mut se.up_proj.lora_a));
-                        up.insert(Rc::from("lora_b"), NestedValue::Value(&mut se.up_proj.lora_b));
+                        up.insert(
+                            Rc::from("lora_a"),
+                            NestedValue::Value(&mut se.up_proj.lora_a),
+                        );
+                        up.insert(
+                            Rc::from("lora_b"),
+                            NestedValue::Value(&mut se.up_proj.lora_b),
+                        );
                         se_map.insert(Rc::from("up_proj"), NestedValue::Map(up));
 
                         let mut down = HashMap::new();
@@ -1333,8 +1349,7 @@ impl ModuleParameters for NemotronHLoraForCausalLM {
                         );
                         se_map.insert(Rc::from("down_proj"), NestedValue::Map(down));
 
-                        mixer_map
-                            .insert(Rc::from("shared_expert"), NestedValue::Map(se_map));
+                        mixer_map.insert(Rc::from("shared_expert"), NestedValue::Map(se_map));
                     }
                 }
             }
