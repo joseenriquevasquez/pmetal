@@ -53,6 +53,8 @@ mod loader;
 pub mod lora_merge;
 mod merge;
 pub mod methods;
+pub mod moe_align;
+pub mod sanity;
 mod sparsify;
 
 pub use async_merge::{AsyncMergeConfig, AsyncMergePipeline, DoubleBufferManager, PipelineStats};
@@ -67,6 +69,7 @@ pub use gpu_merge::{GpuMergeConfig, GpuMerger};
 pub use loader::*;
 pub use lora_merge::{AccurateMergeConfig, LoraMergeStats, streaming_lora_merge};
 pub use merge::*;
+pub use sanity::{MergedTensorReport, SanityLevel, check_tensor};
 pub use sparsify::*;
 
 /// Re-export merge methods for convenience

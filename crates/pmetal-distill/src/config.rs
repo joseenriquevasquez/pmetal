@@ -141,6 +141,60 @@ pub enum LossType {
 
     /// Mean Squared Error on logits.
     MseLoss,
+
+    /// Skewed Jensen-Shannon (DistiLLM-2, Ko et al. 2024) with mixing
+    /// weight `alpha`. `alpha = 0.5` matches symmetric JSD; values closer
+    /// to `1.0` weight the teacher term more heavily.
+    JsdSkewed {
+        /// Mixing weight, clamped to `[ε, 1-ε]` at construction time.
+        #[serde(default = "default_jsd_skewed_alpha")]
+        alpha: f32,
+    },
+
+    /// Universal Logit Distillation (Boizard et al. 2024). Cross-tokenizer
+    /// KD via Wasserstein-1 over sorted probability vectors. Use this when
+    /// teacher and student have different tokenizers and standard KL is
+    /// ill-defined.
+    UniversalLogit {
+        /// Optional truncation to top-K entries before sorting; useful for
+        /// vocabularies ≫ 32K.
+        #[serde(default)]
+        top_k: Option<usize>,
+    },
+
+    /// MiniLLM-style reverse-KL (Gu et al. 2024) with optional teacher
+    /// mixing. `mix = 1.0` is plain reverse-KL; smaller values blend in
+    /// the student's own distribution to stabilize early training.
+    MiniLlm {
+        /// Teacher-mix weight, clamped to `[0, 1]`.
+        #[serde(default = "default_minillm_mix")]
+        mix: f32,
+    },
+
+    /// Generalized Knowledge Distillation (Agarwal et al. 2024). Loss-only
+    /// variant: callers should use `GkdLoss::compute_full` directly when
+    /// they have on-policy student samples available.
+    Gkd {
+        /// On-policy weight `λ ∈ [0, 1]`.
+        #[serde(default = "default_gkd_lambda")]
+        lambda: f32,
+        /// Sampler temperature for the on-policy draw.
+        #[serde(default = "default_gkd_sampler_temp")]
+        sampler_temperature: f32,
+    },
+}
+
+fn default_jsd_skewed_alpha() -> f32 {
+    0.5
+}
+fn default_minillm_mix() -> f32 {
+    1.0
+}
+fn default_gkd_lambda() -> f32 {
+    0.5
+}
+fn default_gkd_sampler_temp() -> f32 {
+    1.0
 }
 
 /// Hidden state distillation configuration.
@@ -310,6 +364,13 @@ pub struct TrainingConfig {
     /// Maximum sequence length.
     #[serde(default = "default_max_seq_len")]
     pub max_seq_len: usize,
+
+    /// Label value used to mark "ignore this token" positions in the hard-loss
+    /// path. PyTorch's cross-entropy default is `-100`; HuggingFace pipelines
+    /// also use `-100` for label masking. Tokens whose label equals
+    /// `ignore_index` contribute zero loss and are excluded from the divisor.
+    #[serde(default = "default_ignore_index")]
+    pub ignore_index: i32,
 }
 
 impl Default for TrainingConfig {
@@ -321,8 +382,13 @@ impl Default for TrainingConfig {
             warmup_steps: 0,
             gradient_accumulation_steps: default_grad_accum(),
             max_seq_len: default_max_seq_len(),
+            ignore_index: default_ignore_index(),
         }
     }
+}
+
+fn default_ignore_index() -> i32 {
+    -100
 }
 
 fn default_batch_size() -> usize {

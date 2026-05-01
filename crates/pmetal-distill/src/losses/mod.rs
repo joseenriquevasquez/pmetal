@@ -30,24 +30,32 @@
 //! ```
 
 mod attention_transfer;
+mod gkd;
 pub mod hidden_state;
 mod hinge_ranking;
 mod jensen_shannon;
+mod jsd_skewed;
 mod kl_divergence;
 mod logistic_ranking;
+mod minillm;
 mod mse;
 mod soft_cross_entropy;
 mod tvd;
+mod universal_logit;
 
 pub use attention_transfer::AttentionTransferLoss;
+pub use gkd::{GkdLoss, GreedySampler, OnPolicySampler};
 pub use hidden_state::HiddenStateLoss;
 pub use hinge_ranking::HingeRankingLoss;
 pub use jensen_shannon::JensenShannonLoss;
+pub use jsd_skewed::JsdSkewedLoss;
 pub use kl_divergence::KlDivergenceLoss;
 pub use logistic_ranking::LogisticRankingLoss;
+pub use minillm::MiniLlmLoss;
 pub use mse::MseLoss;
 pub use soft_cross_entropy::SoftCrossEntropyLoss;
 pub use tvd::TvdLoss;
+pub use universal_logit::UniversalLogitLoss;
 
 use crate::Result;
 use pmetal_bridge::compat::{Array, Dtype, ops};

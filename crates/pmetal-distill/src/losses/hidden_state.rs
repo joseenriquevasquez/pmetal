@@ -104,9 +104,36 @@ impl HiddenStateLoss {
     pub fn compute(&self, teacher_hidden: &Array, student_hidden: &Array) -> Result<Array> {
         // Apply projection if dimensions don't match
         let student_aligned = if let Some(proj) = &self.projection {
-            // student_hidden @ projection -> [batch, seq, hidden_teacher]
+            // Validate the matmul shape contract before reaching MLX so the
+            // failure surfaces with a precise message instead of an opaque
+            // backend error.
+            //
+            //   student_hidden  : [..., hidden_student]
+            //   projection      : [hidden_student, hidden_teacher]
+            //   result          : [..., hidden_teacher]
+            let s_last = student_hidden.dim(-1);
+            let p_first = proj.dim(-2);
+            if s_last != p_first {
+                return Err(crate::DistillError::InvalidConfig(format!(
+                    "hidden-state projection shape mismatch: student.dim(-1) = {} but \
+                     projection.dim(-2) = {}; projection must be [hidden_student, hidden_teacher]",
+                    s_last, p_first
+                )));
+            }
             student_hidden.matmul(proj)
         } else {
+            // Without a projection the shapes must already align on the
+            // hidden axis; otherwise the loss kernel would fail with a
+            // shape-broadcast error.
+            let t_last = teacher_hidden.dim(-1);
+            let s_last = student_hidden.dim(-1);
+            if t_last != s_last {
+                return Err(crate::DistillError::InvalidConfig(format!(
+                    "hidden-state alignment requires matching last dim or a projection: \
+                     teacher.dim(-1) = {}, student.dim(-1) = {}",
+                    t_last, s_last
+                )));
+            }
             student_hidden.clone()
         };
 
@@ -570,6 +597,63 @@ mod tests {
     fn test_gpu_acceleration_available() {
         let loss = HiddenStateLoss::mse();
         println!("GPU available: {}", loss.is_gpu_available());
+    }
+
+    /// Mismatched hidden dimensions without a projection must surface a
+    /// descriptive `InvalidConfig` error before the matmul kernel runs.
+    #[test]
+    #[serial]
+    fn unprojected_hidden_dim_mismatch_errors_clearly() {
+        let teacher = Array::from_f32_slice(&[1.0_f32; 8], &[1, 2, 4]);
+        let student = Array::from_f32_slice(&[1.0_f32; 4], &[1, 2, 2]);
+
+        let loss = HiddenStateLoss::mse();
+        let err = loss
+            .compute(&teacher, &student)
+            .expect_err("must reject mismatched dims with no projection");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("matching last dim or a projection"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("teacher.dim(-1) = 4"), "got: {msg}");
+        assert!(msg.contains("student.dim(-1) = 2"), "got: {msg}");
+    }
+
+    /// A wrong-shape projection must error with shape numbers in the message
+    /// rather than escalating to an opaque MLX matmul error.
+    #[test]
+    #[serial]
+    fn projection_shape_mismatch_errors_clearly() {
+        let teacher = Array::from_f32_slice(&[1.0_f32; 8], &[1, 2, 4]);
+        let student = Array::from_f32_slice(&[1.0_f32; 4], &[1, 2, 2]);
+        // student is dim 2 but projection's leading dim is 3 — a real bug shape.
+        let bad_proj = Array::from_f32_slice(&[1.0_f32; 12], &[3, 4]);
+
+        let loss = HiddenStateLoss::mse().with_projection(bad_proj);
+        let err = loss
+            .compute(&teacher, &student)
+            .expect_err("must reject mismatched projection");
+        let msg = err.to_string();
+        assert!(msg.contains("projection shape mismatch"), "got: {msg}");
+        assert!(msg.contains("student.dim(-1) = 2"), "got: {msg}");
+        assert!(msg.contains("projection.dim(-2) = 3"), "got: {msg}");
+    }
+
+    /// A correctly-shaped projection must let the loss run and return a
+    /// finite, non-negative value.
+    #[test]
+    #[serial]
+    fn correct_projection_runs_loss_pathway() {
+        let teacher = Array::from_f32_slice(&[1.0_f32; 8], &[1, 2, 4]);
+        let student = Array::from_f32_slice(&[0.5_f32; 4], &[1, 2, 2]);
+        // [hidden_student=2, hidden_teacher=4]; identity-style.
+        let proj = Array::from_f32_slice(&[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], &[2, 4]);
+
+        let loss = HiddenStateLoss::mse().with_projection(proj);
+        let result = loss.compute(&teacher, &student).unwrap();
+        let value: f32 = result.item();
+        assert!(value.is_finite() && value >= 0.0);
     }
 
     #[test]

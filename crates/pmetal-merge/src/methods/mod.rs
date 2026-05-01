@@ -14,12 +14,14 @@
 mod breadcrumbs;
 mod dare;
 mod della;
+mod fisher;
 mod linear;
 mod model_stock;
 mod multislerp;
 mod nearswap;
 mod passthrough;
 mod ram;
+mod regmean;
 mod slerp;
 mod souper;
 mod task_arithmetic;
@@ -28,12 +30,14 @@ mod ties;
 pub use breadcrumbs::BreadcrumbsMerge;
 pub use dare::DareMerge;
 pub use della::DellaMerge;
+pub use fisher::FisherMerge;
 pub use linear::LinearMerge;
 pub use model_stock::ModelStockMerge;
 pub use multislerp::MultiSlerpMerge;
 pub use nearswap::NearswapMerge;
 pub use passthrough::PassthroughMerge;
 pub use ram::RamMerge;
+pub use regmean::RegMeanMerge;
 pub use slerp::SlerpMerge;
 pub use souper::SouperMerge;
 pub use task_arithmetic::TaskArithmeticMerge;
@@ -67,4 +71,19 @@ pub trait MergeMethod: Send + Sync {
         params: &[MergeParameters],
         global_params: &MergeParameters,
     ) -> Result<Array>;
+
+    /// Name-aware merge entry. The default implementation forwards to
+    /// [`merge`], discarding the name; methods that need per-tensor side
+    /// data (Fisher information, RegMean Gram matrices) override this to
+    /// look up that state.
+    fn merge_named(
+        &self,
+        _name: &str,
+        tensors: &[Array],
+        base_tensor: Option<&Array>,
+        params: &[MergeParameters],
+        global_params: &MergeParameters,
+    ) -> Result<Array> {
+        self.merge(tensors, base_tensor, params, global_params)
+    }
 }

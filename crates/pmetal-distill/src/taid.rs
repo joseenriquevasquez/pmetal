@@ -556,11 +556,19 @@ impl TaidDistiller {
         // this into their own graph without forcing a GPU-CPU sync here.
         let mean_alpha = alpha.mean_all();
 
+        // Variance of per-sample alpha. When `difficulty_aware` is `false`
+        // every sample shares the schedule alpha so this is exactly zero;
+        // when on, it surfaces how spread-out the difficulty signal is for
+        // the current batch — useful for spotting collapse (var → 0) or
+        // schedule misconfiguration (var → max_alpha²).
+        let alpha_var = alpha.subtract(&mean_alpha).square().mean_all();
+
         Ok(TaidLossOutput {
             total: total_loss,
             distillation: scaled_distill_loss,
             hard_target: hard_loss,
             mean_alpha,
+            alpha_var,
             base_alpha: base_alpha as f32,
         })
     }
@@ -584,6 +592,10 @@ pub struct TaidLossOutput {
     /// it without forcing a GPU-CPU sync before the backward pass.
     /// Call `.item::<f32>()` when you need the scalar value for logging.
     pub mean_alpha: Array,
+    /// Variance of per-sample alpha across the batch — zero when
+    /// `difficulty_aware` is off; rises with batch heterogeneity when it
+    /// is on. Lazy `Array`, same telemetry contract as `mean_alpha`.
+    pub alpha_var: Array,
     /// Base alpha from temporal schedule (scalar, cheap to extract).
     pub base_alpha: f32,
 }

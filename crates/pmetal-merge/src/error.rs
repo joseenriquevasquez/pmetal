@@ -71,6 +71,22 @@ pub enum MergeError {
         /// Actual number of models.
         actual: usize,
     },
+
+    /// Unsupported or unparseable dtype string.
+    #[error("Unsupported dtype: {0}")]
+    UnsupportedDtype(String),
+
+    /// Dtypes disagree across input models for the same tensor.
+    #[error(
+        "Dtype mismatch for tensor '{name}': models report {dtypes:?}; \
+         set `allow_mixed_dtype: true` to upcast to f32"
+    )]
+    DtypeMismatch {
+        /// Tensor name.
+        name: String,
+        /// Per-model dtype labels (one per model).
+        dtypes: Vec<String>,
+    },
 }
 
 /// Result type for merge operations.

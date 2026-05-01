@@ -177,6 +177,37 @@ pub struct MergeConfig {
     /// one or more source model layer ranges.
     #[serde(default)]
     pub slices: Option<Vec<OutputSlice>>,
+
+    /// Allow merging tensors whose source dtypes disagree across models.
+    /// When `false` (default), a per-tensor dtype mismatch surfaces as
+    /// [`crate::MergeError::DtypeMismatch`]. When `true`, all sources are
+    /// upcast to f32 in-memory and merging proceeds.
+    #[serde(default)]
+    pub allow_mixed_dtype: bool,
+
+    /// How aggressively to validate each merged tensor before writing it.
+    /// Default is `Quick` (NaN/inf detection only — adds essentially no
+    /// cost on top of the f32 materialization the writer performs anyway).
+    #[serde(default)]
+    pub sanity: crate::sanity::SanityLevel,
+
+    /// When `true`, run the merge pipeline through `verify_shapes` /
+    /// `verify_source_dtypes` / sanity checks but **skip** writing any
+    /// tensors. Useful for catching shape or dtype mismatches and
+    /// enumerating outputs before committing to a long write. Sidecar
+    /// files are also not copied.
+    #[serde(default)]
+    pub dry_run: bool,
+
+    /// Run MoE expert permutation alignment as a pre-pass. When enabled,
+    /// each non-base model's expert ordering is solved against the base
+    /// model via Hungarian assignment on flattened expert fingerprints,
+    /// and tensor names are remapped accordingly during the per-tensor
+    /// merge. Applies only when MoE structure is detected. Off by
+    /// default to avoid changing behavior of existing flows that target
+    /// non-MoE merges.
+    #[serde(default)]
+    pub align_moe_experts: bool,
 }
 
 fn default_dtype() -> String {
@@ -244,6 +275,52 @@ pub enum MergeMethodConfig {
 
     /// No-op passthrough (for frankenmerging).
     Passthrough,
+
+    /// Fisher-weighted averaging (Matena & Raffel, 2022). Each model
+    /// contributes its parameters proportional to a precomputed diagonal
+    /// Fisher information tensor stored alongside its weights as
+    /// `fisher.safetensors`.
+    Fisher {
+        /// Per-model paths to a `fisher.safetensors` directory. Length
+        /// must match the number of models being merged.
+        #[serde(default)]
+        fisher_paths: Vec<PathBuf>,
+        /// Numerical-stability ridge added to the denominator.
+        #[serde(default = "default_fisher_eps")]
+        eps: f32,
+        /// When `true`, tensors absent from a model's Fisher file fall
+        /// back to a plain weighted mean instead of erroring out.
+        #[serde(default = "default_fisher_fallback")]
+        fallback_to_mean: bool,
+    },
+
+    /// RegMean closed-form merge (Jin et al., 2023). 2-D weight matrices
+    /// are merged via `(Σ G_i)⁻¹ Σ G_i W_i` where each `G_i` is a
+    /// per-model Gram matrix `XᵀX` precomputed on a calibration batch.
+    RegMean {
+        /// Per-model paths to a `regmean_grams.safetensors` directory.
+        #[serde(default)]
+        gram_paths: Vec<PathBuf>,
+        /// Tikhonov ridge for `(Σ G + ridge·I)`.
+        #[serde(default = "default_regmean_ridge")]
+        ridge: f32,
+        /// Mean fallback for tensors without a Gram entry.
+        #[serde(default = "default_regmean_fallback")]
+        fallback_to_mean: bool,
+    },
+}
+
+fn default_fisher_eps() -> f32 {
+    1e-8
+}
+fn default_fisher_fallback() -> bool {
+    true
+}
+fn default_regmean_ridge() -> f32 {
+    1e-3
+}
+fn default_regmean_fallback() -> bool {
+    true
 }
 
 /// Parameters for merge operations.
@@ -636,6 +713,10 @@ impl Default for MergeConfig {
             parameters: MergeParameters::default(),
             tokenizer: None,
             slices: None,
+            allow_mixed_dtype: false,
+            sanity: crate::sanity::SanityLevel::default(),
+            dry_run: false,
+            align_moe_experts: false,
         }
     }
 }

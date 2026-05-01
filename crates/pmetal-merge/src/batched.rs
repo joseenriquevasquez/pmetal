@@ -288,10 +288,17 @@ impl<'a> BatchedMerger<'a> {
             let params = &batch.params[i];
             let base = batch.base_tensors[i].as_ref();
 
-            // Run the merge
-            let result = self
-                .method
-                .merge(tensors, base, params, &self.merge_config.parameters)?;
+            // Route through `merge_named` so name-aware methods (Fisher,
+            // RegMean) reach their per-tensor side data. Methods that
+            // don't override `merge_named` get the existing behavior via
+            // the default-impl forward to `merge`.
+            let result = self.method.merge_named(
+                name,
+                tensors,
+                base,
+                params,
+                &self.merge_config.parameters,
+            )?;
 
             merged.insert(name.clone(), result);
         }

@@ -89,15 +89,71 @@ pub fn run_merge(config: &MergeConfig) -> Result<std::path::PathBuf> {
     let base_loader = load_base_model(config)?;
 
     // Get all tensor names (union across all models)
-    let tensor_names = collect_tensor_names(&loaders, &base_loader)?;
+    let mut tensor_names = collect_tensor_names(&loaders, &base_loader)?;
     info!("Found {} tensors to merge", tensor_names.len());
 
-    if contains_moe_experts(&tensor_names) {
+    let moe_present = contains_moe_experts(&tensor_names);
+    if moe_present && !config.align_moe_experts {
         warn!(
             method = method.name(),
             "MoE routed experts detected in merge set — {}",
             moe_merge_caveat()
         );
+    }
+
+    // MoE expert permutation alignment (Phase 4.4). When the user opts in
+    // and MoE structure is present, compute the per-(model, layer)
+    // permutation table and use it to remap tensor names per-model
+    // during the merge. The base model uses the identity permutation; if
+    // there's no `base_model`, the first model in the merge set is the
+    // alignment reference.
+    let alignment = if moe_present && config.align_moe_experts {
+        // Build the loader pointer set: `base` first, then `loaders[..]`.
+        let mut all_loaders: Vec<&dyn TensorLoader> = Vec::with_capacity(loaders.len() + 1);
+        let base_alignment_loader = base_loader.as_ref();
+        if let Some(b) = base_alignment_loader {
+            all_loaders.push(b);
+        }
+        for l in &loaders {
+            all_loaders.push(l);
+        }
+        match crate::moe_align::align_experts(&all_loaders) {
+            Ok(a) => {
+                info!(
+                    "MoE alignment computed: {} layer entries across {} models",
+                    a.permutations
+                        .iter()
+                        .map(|p| p.per_layer.len())
+                        .sum::<usize>(),
+                    a.permutations.len()
+                );
+                Some(a)
+            }
+            Err(e) => {
+                warn!(
+                    "MoE alignment failed: {}; falling back to name-only merge",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Tied lm_head ↔ embed_tokens: when `config.json` advertises the tie
+    // AND both tensors live on disk, drop the alias so we merge once.
+    // HF loaders re-tie at `from_pretrained()`.
+    if let Some(skip) = pick_sidecar_source(config).and_then(|src| {
+        let names: std::collections::HashSet<String> = tensor_names.iter().cloned().collect();
+        crate::loader::detect_tied_embeddings(&src, &names)
+    }) {
+        let (canonical, alias) = skip;
+        info!(
+            "tied embeddings detected: keeping {}, skipping alias {}",
+            canonical, alias
+        );
+        tensor_names.retain(|n| n != &alias);
     }
 
     // Determine output path
@@ -106,8 +162,13 @@ pub fn run_merge(config: &MergeConfig) -> Result<std::path::PathBuf> {
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("merged_model"));
 
-    // Create output writer
-    let mut writer = TensorWriter::new(&output_path)?;
+    // Create output writer at the configured dtype.
+    let target_dtype = crate::loader::parse_dtype(&config.dtype)?;
+    let mut writer_opt = if config.dry_run {
+        None
+    } else {
+        Some(TensorWriter::with_dtype(&output_path, target_dtype)?)
+    };
 
     // Process each tensor
     let total = tensor_names.len();
@@ -116,16 +177,73 @@ pub fn run_merge(config: &MergeConfig) -> Result<std::path::PathBuf> {
             info!("Processing tensor {}/{}: {}", idx + 1, total, name);
         }
 
-        let merged = merge_tensor(name, &loaders, base_loader.as_ref(), &*method, config)?;
+        let merged = merge_tensor(
+            name,
+            &loaders,
+            base_loader.as_ref(),
+            &*method,
+            config,
+            alignment.as_ref(),
+        )?;
+        // Sanity-check before writing — turns silent NaN/inf corruption into
+        // a hard error before a poisoned shard hits disk.
+        let _ = crate::sanity::check_tensor(name, &merged, config.sanity)?;
 
-        writer.write_tensor(name, &merged)?;
+        if let Some(writer) = writer_opt.as_mut() {
+            writer.write_tensor(name, &merged)?;
+        }
+    }
+
+    if config.dry_run {
+        info!(
+            "Dry-run merge complete: {} tensors verified, no output written",
+            total
+        );
+        return Ok(output_path);
     }
 
     // Finalize output
-    writer.finalize()?;
+    if let Some(writer) = writer_opt {
+        writer.finalize()?;
+    }
+
+    // Copy tokenizer / config sidecars from the canonical source so the
+    // output dir is a self-contained HF model. Source priority:
+    //   1. `base_model` (if set — task-vector / TIES / DARE flows)
+    //   2. first model in the merge set
+    if let Some(src) = pick_sidecar_source(config) {
+        if let Err(e) = crate::loader::copy_side_files(&src, &output_path) {
+            warn!("sidecar copy from {:?} failed: {}", src, e);
+        } else {
+            // Best-effort: align config.json's `torch_dtype` with the actual
+            // on-disk weight dtype so downstream loaders cast correctly.
+            let _ = crate::loader::patch_config_dtype(&output_path, target_dtype);
+        }
+    } else {
+        warn!("no sidecar source resolvable from config; output dir will lack tokenizer/config");
+    }
+
     info!("Merge complete! Output saved to: {:?}", output_path);
 
     Ok(output_path)
+}
+
+/// Resolve the source directory for tokenizer / config sidecars. Local
+/// paths win immediately; Hub specs are skipped (the resolved local cache
+/// directory is opaque from the config alone, so we'd need an extra
+/// resolution step we don't currently take here).
+fn pick_sidecar_source(config: &MergeConfig) -> Option<std::path::PathBuf> {
+    let candidates: Vec<&str> = std::iter::once(config.base_model.as_deref())
+        .flatten()
+        .chain(config.models.iter().map(|m| m.model.as_str()))
+        .collect();
+    for cand in candidates {
+        let p = std::path::PathBuf::from(cand);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Run a model merge using batched processing for improved throughput.
@@ -185,8 +303,9 @@ pub fn run_merge_batched(
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("merged_model"));
 
-    // Create output writer
-    let writer = TensorWriter::new(&output_path)?;
+    // Create output writer at the configured dtype.
+    let target_dtype = crate::loader::parse_dtype(&config.dtype)?;
+    let writer = TensorWriter::with_dtype(&output_path, target_dtype)?;
 
     // Create batched merger
     let merger = BatchedMerger::new(
@@ -228,6 +347,24 @@ fn create_merge_method(method: &MergeMethodConfig) -> Box<dyn MergeMethod> {
         MergeMethodConfig::RamPlus => Box::new(RamMerge::plus()),
         MergeMethodConfig::MultiSlerp => Box::new(MultiSlerpMerge::new()),
         MergeMethodConfig::Passthrough => Box::new(PassthroughMerge::new()),
+        MergeMethodConfig::Fisher {
+            fisher_paths,
+            eps,
+            fallback_to_mean,
+        } => Box::new(
+            crate::methods::FisherMerge::new(fisher_paths.clone())
+                .with_eps(*eps)
+                .with_fallback_to_mean(*fallback_to_mean),
+        ),
+        MergeMethodConfig::RegMean {
+            gram_paths,
+            ridge,
+            fallback_to_mean,
+        } => Box::new(
+            crate::methods::RegMeanMerge::new(gram_paths.clone())
+                .with_ridge(*ridge)
+                .with_fallback_to_mean(*fallback_to_mean),
+        ),
     }
 }
 
@@ -318,21 +455,43 @@ fn collect_tensor_names(
     Ok(names)
 }
 
-/// Merge a single tensor across all models.
+/// Merge a single tensor across all models. When `alignment` is `Some`,
+/// per-model expert tensor names are remapped via the precomputed
+/// permutation table before loading — i.e., model `i`'s `experts.K.…`
+/// is rewritten to `experts.π(K).…` where π is the alignment to the
+/// base. The `merge_tensor` signature stays oblivious to MoE structure;
+/// the rewrite happens at the loader-name level.
 fn merge_tensor(
     name: &str,
     loaders: &[SafetensorsLoader],
     base_loader: Option<&SafetensorsLoader>,
     method: &dyn MergeMethod,
     config: &MergeConfig,
+    alignment: Option<&crate::moe_align::MoeAlignment>,
 ) -> Result<Array> {
-    // Load tensors from each model
+    // Verify the source dtypes agree across the models that hold this tensor.
+    // We do this *before* loading because `load_tensor` upcasts to f32, which
+    // would erase the source dtype distinction.
+    if !config.allow_mixed_dtype {
+        verify_source_dtypes(name, loaders, base_loader)?;
+    }
+
+    // Load tensors from each model. With MoE alignment, the loader-side
+    // name for model `i` is `alignment.remap_tensor_name(i + base_offset, name)`.
+    // The base model (if present) sits at index 0 in the alignment, so
+    // `loaders[i]` corresponds to alignment index `i + 1` when a base is
+    // configured, or `i` when there isn't one.
     let mut tensors = Vec::with_capacity(loaders.len());
     let mut params = Vec::with_capacity(loaders.len());
+    let base_offset = if base_loader.is_some() { 1 } else { 0 };
 
     for (idx, loader) in loaders.iter().enumerate() {
-        if loader.tensor_names().contains(&name.to_string()) {
-            let tensor = loader.load_tensor(name)?;
+        let lookup_name = match alignment {
+            Some(a) => a.remap_tensor_name(idx + base_offset, name),
+            None => name.to_string(),
+        };
+        if loader.tensor_names().contains(&lookup_name) {
+            let tensor = loader.load_tensor(&lookup_name)?;
             tensors.push(tensor);
 
             // Get per-model parameters
@@ -373,8 +532,59 @@ fn merge_tensor(
     // Verify shapes match
     verify_shapes(name, &tensors, base_tensor.as_ref())?;
 
-    // Run the merge
-    method.merge(&tensors, base_tensor.as_ref(), &params, &config.parameters)
+    // Run the merge — `merge_named` is the dispatch entry; methods that
+    // don't care about the name fall through to `merge` via the default impl.
+    method.merge_named(
+        name,
+        &tensors,
+        base_tensor.as_ref(),
+        &params,
+        &config.parameters,
+    )
+}
+
+/// Verify that the source dtype of `name` agrees across every loader that
+/// holds it (and the base loader, if present). Loaders that lack the tensor
+/// are skipped silently — that's a different error class handled elsewhere.
+///
+/// We compare the dtype reported by the safetensors header rather than
+/// reading the materialized tensor, so this is cheap (no I/O of the data
+/// payload).
+fn verify_source_dtypes(
+    name: &str,
+    loaders: &[SafetensorsLoader],
+    base_loader: Option<&SafetensorsLoader>,
+) -> Result<()> {
+    let mut seen: Vec<safetensors::Dtype> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+
+    for (idx, loader) in loaders.iter().enumerate() {
+        if loader.tensor_names().contains(&name.to_string()) {
+            let dt = loader.tensor_dtype(name)?;
+            seen.push(dt);
+            labels.push(format!("model[{}]={:?}", idx, dt));
+        }
+    }
+    if let Some(base) = base_loader {
+        if base.tensor_names().contains(&name.to_string()) {
+            let dt = base.tensor_dtype(name)?;
+            seen.push(dt);
+            labels.push(format!("base={:?}", dt));
+        }
+    }
+
+    if seen.is_empty() {
+        return Ok(());
+    }
+
+    let first = seen[0];
+    if seen.iter().any(|d| *d != first) {
+        return Err(MergeError::DtypeMismatch {
+            name: name.to_string(),
+            dtypes: labels,
+        });
+    }
+    Ok(())
 }
 
 /// Verify that all tensor shapes match.
@@ -462,7 +672,8 @@ pub fn run_merge_sliced(config: &MergeConfig) -> Result<std::path::PathBuf> {
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("merged_model"));
 
-    let mut writer = TensorWriter::new(&output_path)?;
+    let target_dtype = crate::loader::parse_dtype(&config.dtype)?;
+    let mut writer = TensorWriter::with_dtype(&output_path, target_dtype)?;
 
     // Track which non-layer tensors we've already written so we don't duplicate
     let mut written_non_layer: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -618,7 +829,10 @@ pub fn run_merge_sliced(config: &MergeConfig) -> Result<std::path::PathBuf> {
 
                 verify_shapes(&out_name, &tensors, base_tensor.as_ref())?;
 
-                let merged = method.merge(
+                // Route through `merge_named` so name-aware methods
+                // (Fisher, RegMean) work in the slice pipeline too.
+                let merged = method.merge_named(
+                    &out_name,
                     &tensors,
                     base_tensor.as_ref(),
                     &per_src_params,
@@ -661,6 +875,20 @@ pub fn run_merge_sliced(config: &MergeConfig) -> Result<std::path::PathBuf> {
     }
 
     writer.finalize()?;
+
+    // Copy sidecars (tokenizer/config) so the output dir is self-contained.
+    if let Some(src) = pick_sidecar_source(config) {
+        if let Err(e) = crate::loader::copy_side_files(&src, &output_path) {
+            warn!("sidecar copy from {:?} failed: {}", src, e);
+        } else {
+            let _ = crate::loader::patch_config_dtype(&output_path, target_dtype);
+        }
+    } else {
+        warn!(
+            "no sidecar source resolvable from config; sliced output dir will lack tokenizer/config"
+        );
+    }
+
     info!(
         "Slice-based merge complete! Output saved to: {:?}",
         output_path
@@ -766,6 +994,7 @@ pub struct MergeBuilder {
     output_path: Option<std::path::PathBuf>,
     parameters: MergeParameters,
     per_model_params: HashMap<usize, MergeParameters>,
+    dtype: Option<String>,
 }
 
 impl MergeBuilder {
@@ -834,6 +1063,13 @@ impl MergeBuilder {
         self
     }
 
+    /// Set output dtype ("float16" / "bfloat16" / "float32"). When unset the
+    /// `MergeConfig` default applies (`bfloat16`).
+    pub fn dtype(mut self, dtype: impl Into<String>) -> Self {
+        self.dtype = Some(dtype.into());
+        self
+    }
+
     /// Build the merge configuration.
     pub fn build(self) -> Result<MergeConfig> {
         let method = self
@@ -857,15 +1093,26 @@ impl MergeBuilder {
             })
             .collect();
 
+        // Honor the builder's dtype if set; fall back to the same default the
+        // YAML deserializer uses (`bfloat16`) so programmatic and YAML
+        // construction agree.
+        let dtype = self.dtype.unwrap_or_else(|| "bfloat16".to_string());
+        // Validate eagerly so the failure surfaces here rather than at save time.
+        let _ = crate::loader::parse_dtype(&dtype)?;
+
         Ok(MergeConfig {
             merge_method: method,
             models,
             base_model: self.base_model,
             output_path: self.output_path,
-            dtype: "float16".to_string(),
+            dtype,
             parameters: self.parameters,
             tokenizer: None,
             slices: None,
+            allow_mixed_dtype: false,
+            sanity: crate::sanity::SanityLevel::default(),
+            dry_run: false,
+            align_moe_experts: false,
         })
     }
 

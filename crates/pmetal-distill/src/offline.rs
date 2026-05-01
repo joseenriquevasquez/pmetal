@@ -222,7 +222,17 @@ pub enum CompressedLogits {
         /// K value.
         k: usize,
     },
-    /// Quantized to int8 (stored as unsigned bytes; range [0, 255] via affine mapping).
+    /// Legacy quantized-int8 representation kept for read-back compatibility.
+    ///
+    /// Two on-disk layouts encode through this variant:
+    ///   1. *Pre-2026 global-scale*: `scale` is finite, `data.len() == n`,
+    ///      decode is `(q[i] as f32) * scale + zero_point`.
+    ///   2. *Per-token via NaN sentinel*: `scale.is_nan()` flagged that
+    ///      `data` carried `[quant; n] ++ [(scale_t, zp_t); num_tokens]` —
+    ///      the very pattern Phase 1.3 (Apr 2026) replaces because a real
+    ///      input NaN could be misclassified as the sentinel.
+    ///
+    /// New caches must use [`CompressedLogits::Int8PerToken`] instead.
     Int8 {
         /// Quantized values (unsigned 8-bit, zero_point-shifted affine encoding).
         data: Vec<u8>,
@@ -242,6 +252,21 @@ pub enum CompressedLogits {
         /// Zero point.
         zero_point: f32,
         /// Shape.
+        shape: Vec<i32>,
+    },
+    /// Quantized to int8 with explicit per-token (scale, zero_point) metadata.
+    ///
+    /// Layout: `quant` holds `n = product(shape)` u8 values; `per_token_meta`
+    /// holds `2 * num_tokens` f32s laid out as `[scale_0, zp_0, scale_1, zp_1, …]`
+    /// where `num_tokens = product(shape[..-1])`. This variant supersedes the
+    /// NaN-sentinel scheme inside [`CompressedLogits::Int8`] and is robust
+    /// against real NaN values in the input distribution.
+    Int8PerToken {
+        /// Quantized values, length `product(shape)`.
+        quant: Vec<u8>,
+        /// Per-token (scale, zero_point) pairs, length `2 * num_tokens`.
+        per_token_meta: Vec<f32>,
+        /// Shape of the original tensor; the trailing axis is the per-token axis.
         shape: Vec<i32>,
     },
 }
@@ -275,6 +300,43 @@ impl CompressedLogits {
                         num_tokens,
                         k,
                         indices.len(),
+                    )));
+                }
+                Ok(())
+            }
+            CompressedLogits::Int8PerToken {
+                quant,
+                per_token_meta,
+                shape,
+            } => {
+                if shape.is_empty() {
+                    return Err(DistillError::LogitCache(
+                        "Int8PerToken shape must have at least 1 axis".to_string(),
+                    ));
+                }
+                let token_size: usize = shape[shape.len() - 1] as usize;
+                let num_tokens: usize = shape[..shape.len() - 1]
+                    .iter()
+                    .map(|&s| s as usize)
+                    .product::<usize>()
+                    .max(1);
+                let expected_quant = num_tokens * token_size;
+                if quant.len() != expected_quant {
+                    return Err(DistillError::LogitCache(format!(
+                        "Int8PerToken quant length mismatch: expected {} (num_tokens={} * token_size={}), got {}",
+                        expected_quant,
+                        num_tokens,
+                        token_size,
+                        quant.len(),
+                    )));
+                }
+                let expected_meta = num_tokens * 2;
+                if per_token_meta.len() != expected_meta {
+                    return Err(DistillError::LogitCache(format!(
+                        "Int8PerToken per_token_meta length mismatch: expected {} (2*num_tokens={}), got {}",
+                        expected_meta,
+                        num_tokens,
+                        per_token_meta.len(),
                     )));
                 }
                 Ok(())
@@ -331,6 +393,11 @@ impl LogitCompressor {
                 zero_point,
                 shape,
             } => self.decompress_int4(data, *scale, *zero_point, shape),
+            CompressedLogits::Int8PerToken {
+                quant,
+                per_token_meta,
+                shape,
+            } => self.decompress_int8_per_token(quant, per_token_meta, shape),
         }
     }
 
@@ -461,7 +528,7 @@ impl LogitCompressor {
             .product();
         let token_size = data.len() / num_tokens.max(1);
 
-        let mut quantized: Vec<u8> = Vec::with_capacity(data.len() + num_tokens * 8);
+        let mut quantized: Vec<u8> = Vec::with_capacity(data.len());
         let mut per_token_meta: Vec<f32> = Vec::with_capacity(num_tokens * 2);
 
         for t in 0..num_tokens {
@@ -486,18 +553,68 @@ impl LogitCompressor {
             }
         }
 
-        // Append per-token (scale, zero_point) pairs as raw f32 LE bytes.
-        for &f in &per_token_meta {
-            quantized.extend_from_slice(&f.to_le_bytes());
-        }
-
-        Ok(CompressedLogits::Int8 {
-            data: quantized,
-            // NaN sentinel signals that per-token metadata is embedded in `data`.
-            scale: f32::NAN,
-            zero_point: 0.0,
+        // New format (Phase 1.3): explicit Int8PerToken — `quant` and
+        // `per_token_meta` ride in typed fields, no NaN sentinel, no byte
+        // re-interpretation. The legacy NaN-flagged `Int8` variant is kept
+        // for read-back of pre-2026 caches but is never produced here.
+        Ok(CompressedLogits::Int8PerToken {
+            quant: quantized,
+            per_token_meta,
             shape,
         })
+    }
+
+    /// Decompress the new Phase 1.3 Int8PerToken variant. The (scale, zp)
+    /// metadata travels alongside the quantized payload in a typed `Vec<f32>`,
+    /// so there's no sentinel-overload risk for inputs containing real NaNs.
+    fn decompress_int8_per_token(
+        &self,
+        quant: &[u8],
+        per_token_meta: &[f32],
+        shape: &[i32],
+    ) -> Result<Array> {
+        if shape.is_empty() {
+            return Err(DistillError::LogitCache(
+                "Int8PerToken shape must have at least 1 axis".to_string(),
+            ));
+        }
+        let token_size: usize = shape[shape.len() - 1] as usize;
+        let num_tokens: usize = shape[..shape.len() - 1]
+            .iter()
+            .map(|&s| s as usize)
+            .product::<usize>()
+            .max(1);
+
+        let expected_quant = num_tokens * token_size;
+        if quant.len() != expected_quant {
+            return Err(DistillError::LogitCache(format!(
+                "Int8PerToken quant length mismatch: expected {} (num_tokens={} * token_size={}), got {}",
+                expected_quant,
+                num_tokens,
+                token_size,
+                quant.len(),
+            )));
+        }
+        let expected_meta = num_tokens * 2;
+        if per_token_meta.len() != expected_meta {
+            return Err(DistillError::LogitCache(format!(
+                "Int8PerToken per_token_meta length mismatch: expected {} (2 * num_tokens={}), got {}",
+                expected_meta,
+                num_tokens,
+                per_token_meta.len(),
+            )));
+        }
+
+        let mut dequantized = Vec::with_capacity(num_tokens * token_size);
+        for t in 0..num_tokens {
+            let sc = per_token_meta[t * 2];
+            let zp = per_token_meta[t * 2 + 1];
+            for &q in &quant[t * token_size..(t + 1) * token_size] {
+                dequantized.push((q as f32) * sc + zp);
+            }
+        }
+
+        Ok(Array::from_f32_slice(&dequantized, shape))
     }
 
     fn decompress_int8(
@@ -723,6 +840,78 @@ mod tests {
         // Should be close (within quantization error)
         for (o, r) in original.iter().zip(recovered.iter()) {
             assert!((o - r).abs() < 0.1, "Int8 roundtrip error: {} vs {}", o, r);
+        }
+    }
+
+    /// New Int8 path always emits the per-token variant — no NaN sentinel.
+    /// This is the regression test for Phase 1.3: prior to the fix, a NaN
+    /// computed at write time (or already in the input) would silently flip
+    /// decompress into the wrong code path.
+    #[test]
+    #[serial]
+    fn int8_compression_emits_per_token_variant() {
+        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
+        let compressor = LogitCompressor::new(CompressionMethod::Int8, 128);
+        let compressed = compressor.compress(&logits).unwrap();
+        match compressed {
+            CompressedLogits::Int8PerToken {
+                ref quant,
+                ref per_token_meta,
+                ref shape,
+            } => {
+                assert_eq!(shape, &vec![2, 4]);
+                assert_eq!(quant.len(), 8);
+                assert_eq!(per_token_meta.len(), 4); // 2 tokens * (scale, zp)
+                assert!(
+                    per_token_meta.iter().all(|f| f.is_finite()),
+                    "per-token metadata must be finite"
+                );
+            }
+            other => panic!("expected Int8PerToken, got {:?}", other),
+        }
+    }
+
+    /// Legacy Int8 with a NaN scale must round-trip via the per-token tail
+    /// of `data` (the pre-Phase-1.3 sentinel path) so existing on-disk caches
+    /// still decode bit-exact.
+    #[test]
+    #[serial]
+    fn legacy_int8_nan_sentinel_still_decodes() {
+        // Build a synthetic "old format" cache by hand for [2, 4] logits.
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let shape: Vec<i32> = vec![2, 4];
+        let token_size = 4_usize;
+        let num_tokens = 2_usize;
+
+        let mut quant = Vec::with_capacity(num_tokens * token_size);
+        let mut meta = Vec::with_capacity(num_tokens * 2);
+        for t in 0..num_tokens {
+            let chunk = &values[t * token_size..(t + 1) * token_size];
+            let lo = chunk.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let scale = (hi - lo) / 255.0;
+            for &v in chunk {
+                quant.push((((v - lo) / scale).round() as i32).clamp(0, 255) as u8);
+            }
+            meta.push(scale);
+            meta.push(lo);
+        }
+        let mut data = quant;
+        for &f in &meta {
+            data.extend_from_slice(&f.to_le_bytes());
+        }
+
+        let compressed = CompressedLogits::Int8 {
+            data,
+            scale: f32::NAN,
+            zero_point: 0.0,
+            shape,
+        };
+        let compressor = LogitCompressor::new(CompressionMethod::Int8, 128);
+        let arr = compressor.decompress(&compressed, 4).unwrap();
+        let got: Vec<f32> = arr.clone().to_f32_vec(8).unwrap();
+        for (a, b) in values.iter().zip(got.iter()) {
+            assert!((a - b).abs() < 0.05, "{} vs {}", a, b);
         }
     }
 

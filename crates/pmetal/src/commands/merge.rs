@@ -94,6 +94,10 @@ pub(crate) async fn run_merge_command(
             source: "first".to_string(),
         }),
         slices: None,
+        allow_mixed_dtype: false,
+        sanity: pmetal_merge::SanityLevel::default(),
+        dry_run: false,
+        align_moe_experts: false,
     };
 
     println!("Running merge...");

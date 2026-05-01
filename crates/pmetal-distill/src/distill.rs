@@ -6,31 +6,31 @@
 use std::path::PathBuf;
 
 use pmetal_bridge::compat::{Array, Dtype, ops};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::{
-    CompressionMethod, DistillConfig, DistillError, DistillMethod, LossType, Result,
+    DistillConfig, DistillError, DistillMethod, LossType, Result,
     losses::{
         DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, MseLoss,
         SoftCrossEntropyLoss,
     },
-    offline::{LogitCache, LogitCompressor},
 };
 
-/// Run knowledge distillation with the given configuration.
+/// Loss-only entry point. End-to-end orchestration (model loading, dataset
+/// iteration, optimizer steps, checkpointing) lives in `pmetal-trainer` —
+/// this crate intentionally exposes only the loss math + per-batch
+/// `Distiller::compute_loss`. Calling this returns a descriptive error so the
+/// caller is steered to the trainer crate or the `pmetal distill` CLI.
 pub fn run_distillation(config: &DistillConfig) -> Result<PathBuf> {
-    info!("Starting knowledge distillation");
-    info!("  Teacher: {}", config.teacher);
-    info!("  Student: {}", config.student);
-    info!("  Method: {:?}", config.method);
-
     config.validate()?;
-
-    let distiller = DistillerBuilder::new()
-        .with_config(config.clone())
-        .build()?;
-
-    distiller.run()
+    let _ = config; // accepted but not consumed — the validation above is the
+    // only effect inside this crate.
+    Err(DistillError::InvalidConfig(
+        "end-to-end distillation orchestration is not available in `pmetal-distill` alone; \
+         use the `pmetal distill` CLI or `pmetal_trainer::DistillationTrainer` with \
+         model, dataset, and adapter configuration"
+            .to_string(),
+    ))
 }
 
 /// Builder for creating a Distiller instance.
@@ -95,7 +95,7 @@ impl DistillerBuilder {
                     ))
                 }
             } else {
-                match config.loss.loss_type {
+                match config.loss.loss_type.clone() {
                     LossType::KlDivergence => {
                         if config.loss.reverse_kl {
                             Box::new(KlDivergenceLoss::reverse())
@@ -106,6 +106,21 @@ impl DistillerBuilder {
                     LossType::JensenShannon => Box::new(JensenShannonLoss::new()),
                     LossType::SoftCrossEntropy => Box::new(SoftCrossEntropyLoss::new()),
                     LossType::MseLoss => Box::new(MseLoss::new()),
+                    LossType::JsdSkewed { alpha } => {
+                        Box::new(crate::losses::JsdSkewedLoss::new(alpha))
+                    }
+                    LossType::UniversalLogit { top_k } => {
+                        let mut loss = crate::losses::UniversalLogitLoss::new();
+                        if let Some(k) = top_k {
+                            loss = loss.with_top_k(k);
+                        }
+                        Box::new(loss)
+                    }
+                    LossType::MiniLlm { mix } => Box::new(crate::losses::MiniLlmLoss::new(mix)),
+                    LossType::Gkd {
+                        lambda,
+                        sampler_temperature,
+                    } => Box::new(crate::losses::GkdLoss::new(lambda, sampler_temperature)),
                 }
             }
         });
@@ -138,81 +153,6 @@ impl Distiller {
     /// Create a new distiller with default settings.
     pub fn new(config: DistillConfig) -> Result<Self> {
         DistillerBuilder::new().with_config(config).build()
-    }
-
-    /// Run the distillation process.
-    pub fn run(&self) -> Result<PathBuf> {
-        match &self.config.method {
-            DistillMethod::Online => self.run_online(),
-            DistillMethod::Offline => self.run_offline(),
-            DistillMethod::Progressive => self.run_progressive(),
-        }
-    }
-
-    fn unsupported_orchestration(&self) -> Result<PathBuf> {
-        Err(DistillError::InvalidConfig(
-            "end-to-end distillation orchestration is not available in `pmetal-distill` alone; \
-             use the `pmetal distill` CLI or `pmetal_trainer::DistillationTrainer` with \
-             model, dataset, and adapter configuration"
-                .to_string(),
-        ))
-    }
-
-    /// Run online distillation.
-    ///
-    /// Both teacher and student are loaded and run during training.
-    fn run_online(&self) -> Result<PathBuf> {
-        self.unsupported_orchestration()
-    }
-
-    /// Run offline distillation.
-    ///
-    /// Uses pre-computed teacher logits from cache.
-    fn run_offline(&self) -> Result<PathBuf> {
-        if self.config.offline.is_none() {
-            return Err(DistillError::InvalidConfig(
-                "offline config required for offline distillation".to_string(),
-            ));
-        }
-        self.unsupported_orchestration()
-    }
-
-    /// Generate and cache teacher logits.
-    fn generate_logits(&self, offline_config: &crate::OfflineConfig) -> Result<()> {
-        info!(
-            "Generating teacher logits to {:?}",
-            offline_config.logits_path
-        );
-
-        let mut cache = LogitCache::new(
-            &offline_config.logits_path,
-            offline_config.compression.clone(),
-            offline_config.top_k,
-        )?;
-
-        // This would:
-        // 1. Load teacher model
-        // 2. Load dataset
-        // 3. For each sequence in dataset:
-        //    a. Forward through teacher
-        //    b. Compress and cache logits
-
-        cache.set_metadata(
-            self.config.teacher.clone(),
-            0, // Would be set from model
-            self.config.training.max_seq_len,
-        );
-        cache.save_metadata()?;
-
-        info!("Logit generation complete");
-        Ok(())
-    }
-
-    /// Run progressive distillation.
-    ///
-    /// Gradually reduces temperature and teacher influence over training.
-    fn run_progressive(&self) -> Result<PathBuf> {
-        self.unsupported_orchestration()
     }
 
     /// Compute distillation loss for a batch.
@@ -249,13 +189,18 @@ impl Distiller {
             self.loss
                 .compute_weighted(teacher_logits, student_logits, temperature, weights)?;
 
-        // Scale by temperature squared (to maintain gradient magnitude)
+        // Scale by T². Hinton et al. 2015 (§2.2): when teacher/student logits
+        // are softened by `T`, the gradient with respect to student logits is
+        // attenuated by 1/T². Multiplying the loss by T² restores the
+        // gradient magnitude so a single optimizer step has the same effect
+        // regardless of the temperature setting.
         let t_squared = temperature * temperature;
         let soft_scaled = soft_loss.multiply(&Array::from_f32(t_squared));
 
         // Combined with hard labels if provided
         let (total_loss, hard_loss_opt) = if let Some(labels) = labels {
-            let hard_loss = compute_hard_loss(student_logits, labels)?;
+            let hard_loss =
+                compute_hard_loss(student_logits, labels, self.config.training.ignore_index)?;
 
             // total = alpha * soft + (1 - alpha) * hard
             let soft_weighted = soft_scaled.multiply(&Array::from_f32(alpha));
@@ -272,6 +217,7 @@ impl Distiller {
             soft: soft_scaled.clone(),
             hard: hard_loss_opt,
             hidden: None,
+            metrics: std::collections::HashMap::new(),
         })
     }
 
@@ -337,6 +283,11 @@ impl Distiller {
 }
 
 /// Output from distillation loss computation.
+///
+/// `total` / `soft` / `hard` / `hidden` are MLX arrays that stay lazy until a
+/// caller materializes them with `.item()`. The `metrics` map carries opt-in,
+/// already-evaluated f32 scalars suitable for JSONL logging or TUI streaming;
+/// callers that don't want the eval cost simply leave it empty (the default).
 #[derive(Debug)]
 pub struct DistillLossOutput {
     /// Total combined loss.
@@ -347,12 +298,78 @@ pub struct DistillLossOutput {
     pub hard: Option<Array>,
     /// Hidden state loss component.
     pub hidden: Option<Array>,
+    /// Auxiliary scalar metrics, populated on demand via
+    /// [`DistillLossOutput::with_metrics`]. Keys come from a small fixed
+    /// vocabulary ("teacher_entropy", "student_entropy", "top1_agreement",
+    /// "kl_per_token") so consumers can pattern-match without parsing.
+    pub metrics: std::collections::HashMap<&'static str, f32>,
 }
 
-/// Compute hard cross-entropy loss with labels.
-fn compute_hard_loss(logits: &Array, labels: &Array) -> Result<Array> {
-    // All operations stay in the MLX graph so gradients flow correctly.
+impl DistillLossOutput {
+    /// Compute and attach observability scalars from the teacher/student
+    /// logit pair used for this loss. This forces an eval on small reductions
+    /// — only call it when you actually need to emit telemetry (e.g. once per
+    /// log step, not on every micro-batch).
+    ///
+    /// Populated keys:
+    /// - `teacher_entropy`: mean H(softmax(teacher / T)) in nats.
+    /// - `student_entropy`: mean H(softmax(student / T)) in nats.
+    /// - `top1_agreement`: fraction of tokens where argmax agrees.
+    /// - `kl_per_token`: mean fwd-KL(teacher || student) in nats.
+    pub fn with_metrics(
+        mut self,
+        teacher_logits: &Array,
+        student_logits: &Array,
+        temperature: f32,
+    ) -> Self {
+        // Probabilities (and clamp for log) at the configured temperature.
+        let inv_t = 1.0_f32 / temperature.max(1e-6);
+        let t_scaled = teacher_logits.multiply(&Array::from_f32(inv_t));
+        let s_scaled = student_logits.multiply(&Array::from_f32(inv_t));
+        let t_log_p = t_scaled.log_softmax(-1);
+        let s_log_p = s_scaled.log_softmax(-1);
+        let t_p = t_log_p.exp();
+        let s_p = s_log_p.exp();
 
+        // Per-token entropies, then mean over all axes except the last
+        // (which is the vocab axis we already summed across).
+        let neg = Array::from_f32(-1.0);
+        let h_teacher = t_p.multiply(&t_log_p).sum_axis(-1, false).multiply(&neg);
+        let h_student = s_p.multiply(&s_log_p).sum_axis(-1, false).multiply(&neg);
+
+        // Forward-KL(teacher || student) per token, then mean.
+        let kl = t_p
+            .multiply(&t_log_p.subtract(&s_log_p))
+            .sum_axis(-1, false);
+
+        // top-1 agreement: fraction where argmax(teacher) == argmax(student).
+        let t_top = teacher_logits.argmax(-1);
+        let s_top = student_logits.argmax(-1);
+        let agree = t_top
+            .equal(&s_top)
+            .as_dtype(Dtype::Float32.as_i32())
+            .mean_all();
+
+        let h_t_mean: f32 = h_teacher.mean_all().item();
+        let h_s_mean: f32 = h_student.mean_all().item();
+        let kl_mean: f32 = kl.mean_all().item();
+        let agree_f: f32 = agree.item();
+
+        self.metrics.insert("teacher_entropy", h_t_mean);
+        self.metrics.insert("student_entropy", h_s_mean);
+        self.metrics.insert("kl_per_token", kl_mean);
+        self.metrics.insert("top1_agreement", agree_f);
+        self
+    }
+}
+
+/// Compute hard cross-entropy loss with labels, masking positions whose label
+/// equals `ignore_index` (PyTorch convention: `-100`).
+///
+/// All ops stay in the MLX graph so gradients flow correctly. The mask is the
+/// indicator `labels != ignore_index`; ignored positions contribute zero loss
+/// and are excluded from the divisor. This matches `torch.nn.functional.cross_entropy(reduction='mean')`.
+fn compute_hard_loss(logits: &Array, labels: &Array, ignore_index: i32) -> Result<Array> {
     // Log-softmax for numerical stability
     let log_probs = logits.log_softmax(-1);
 
@@ -361,14 +378,18 @@ fn compute_hard_loss(logits: &Array, labels: &Array) -> Result<Array> {
     let log_probs_flat = log_probs.reshape(&[-1, vocab_size]);
     let labels_flat = labels.reshape(&[-1]);
 
-    // Build ignore mask: labels >= 0 (ignore_index = -100 or any negative)
-    let zero_i = Array::from_i32(0);
+    // Build ignore mask: 1 where label != ignore_index, else 0.
+    let ignore_arr = Array::from_i32(ignore_index);
     let valid_mask = labels_flat
-        .greater_equal(&zero_i)
+        .not_equal(&ignore_arr)
         .as_dtype(Dtype::Float32.as_i32());
 
-    // Clamp labels to valid range for gather (ignored positions won't contribute to loss)
-    let labels_clamped = ops::maximum(&labels_flat, &zero_i)
+    // Clamp labels to a safe gather range. Ignored positions get `0` for the
+    // gather lookup; their contribution is zeroed by `valid_mask` afterwards.
+    // Negative labels (e.g. -100) would otherwise crash gather.
+    let zero_i = Array::from_i32(0);
+    let upper = Array::from_i32((vocab_size - 1) as i32);
+    let labels_clamped = ops::minimum(&ops::maximum(&labels_flat, &zero_i), &upper)
         .as_dtype(Dtype::Int32.as_i32())
         .reshape(&[-1, 1]);
 
@@ -492,5 +513,170 @@ mod tests {
             err.to_string()
                 .contains("end-to-end distillation orchestration is not available")
         );
+    }
+
+    /// `compute_hard_loss` must obey `TrainingConfig.ignore_index`. The two
+    /// canonical conventions in the wild are PyTorch's `-100` (default) and
+    /// `255` from some HF segmentation pipelines. With one valid token at
+    /// position 0 and the rest set to the chosen ignore value, the masked
+    /// loss must equal the loss of the single remaining token — i.e. the
+    /// ignored positions are excluded from both numerator and divisor.
+    #[test]
+    #[serial]
+    fn hard_loss_respects_ignore_index_minus100() {
+        let mut config = test_config();
+        config.training.ignore_index = -100;
+        let distiller = Distiller::new(config).unwrap();
+
+        // [batch=1, seq=4, vocab=3]
+        let logits = Array::from_f32_slice(
+            &[
+                0.0_f32, 1.0, 2.0, // token 0
+                0.0, 1.0, 2.0, // token 1 (ignored)
+                0.0, 1.0, 2.0, // token 2 (ignored)
+                0.0, 1.0, 2.0, // token 3 (ignored)
+            ],
+            &[1, 4, 3],
+        );
+        let labels = Array::from_i32_slice_shaped(&[2, -100, -100, -100], &[1, 4]);
+        let teacher = Array::from_f32_slice(
+            &[
+                0.0_f32, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+            ],
+            &[1, 4, 3],
+        );
+
+        let output = distiller
+            .compute_loss(&teacher, &logits, Some(&labels), None, 0, 1000)
+            .unwrap();
+        let hard = output.hard.expect("hard loss should be present");
+        let value: f32 = hard.item();
+
+        // Reference: −log_softmax(logits[2])[2] for a single token. logits=[0,1,2]
+        // → softmax denom = e^0 + e^1 + e^2 ≈ 11.1073, log_softmax[2] ≈ 2 - log(11.1073) ≈ -0.4076
+        // → hard loss ≈ 0.4076.
+        let expected = 0.40760598_f32;
+        assert!(
+            (value - expected).abs() < 1e-3,
+            "expected ~{}, got {}",
+            expected,
+            value
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn hard_loss_respects_ignore_index_255() {
+        let mut config = test_config();
+        config.training.ignore_index = 255;
+        let distiller = Distiller::new(config).unwrap();
+
+        let logits = Array::from_f32_slice(
+            &[
+                0.0_f32, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+            ],
+            &[1, 4, 3],
+        );
+        // Same setup but with 255 as the ignore marker.
+        let labels = Array::from_i32_slice_shaped(&[2, 255, 255, 255], &[1, 4]);
+        let teacher = Array::from_f32_slice(
+            &[
+                0.0_f32, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+            ],
+            &[1, 4, 3],
+        );
+
+        let output = distiller
+            .compute_loss(&teacher, &logits, Some(&labels), None, 0, 1000)
+            .unwrap();
+        let value: f32 = output.hard.unwrap().item();
+        let expected = 0.40760598_f32;
+        assert!(
+            (value - expected).abs() < 1e-3,
+            "expected ~{}, got {}",
+            expected,
+            value
+        );
+    }
+
+    /// `with_metrics` populates the four telemetry scalars. For identical
+    /// teacher/student logits we expect: KL ≈ 0, top-1 agreement = 1.0, and
+    /// teacher_entropy == student_entropy.
+    #[test]
+    #[serial]
+    fn with_metrics_populates_all_keys() {
+        let config = test_config();
+        let distiller = Distiller::new(config).unwrap();
+
+        let teacher =
+            Array::from_f32_slice(&[1.0_f32, 2.0, 0.5, 4.0, 1.0, 2.0, 0.5, 4.0], &[1, 2, 4]);
+        let student = teacher.clone();
+
+        let out = distiller
+            .compute_loss(&teacher, &student, None, None, 0, 1)
+            .unwrap()
+            .with_metrics(&teacher, &student, 1.0);
+
+        for key in [
+            "teacher_entropy",
+            "student_entropy",
+            "kl_per_token",
+            "top1_agreement",
+        ] {
+            assert!(out.metrics.contains_key(key), "missing metric {}", key);
+        }
+        let kl = out.metrics["kl_per_token"];
+        let agree = out.metrics["top1_agreement"];
+        let h_t = out.metrics["teacher_entropy"];
+        let h_s = out.metrics["student_entropy"];
+        assert!(
+            kl.abs() < 1e-4,
+            "kl should be ~0 for identical inputs, got {}",
+            kl
+        );
+        assert!(
+            (agree - 1.0).abs() < 1e-6,
+            "agree should be 1.0, got {}",
+            agree
+        );
+        assert!(
+            (h_t - h_s).abs() < 1e-4,
+            "entropies should match, got {} vs {}",
+            h_t,
+            h_s
+        );
+        assert!(h_t.is_finite() && h_t > 0.0);
+    }
+
+    /// All-ignored labels must yield a finite, non-negative loss (zero) — no
+    /// division-by-zero, no NaN. The implementation guards the divisor with
+    /// `max(num_valid, 1.0)`.
+    #[test]
+    #[serial]
+    fn hard_loss_all_ignored_is_zero_finite() {
+        let mut config = test_config();
+        config.training.ignore_index = -100;
+        let distiller = Distiller::new(config).unwrap();
+
+        let logits = Array::from_f32_slice(
+            &[
+                0.0_f32, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+            ],
+            &[1, 4, 3],
+        );
+        let labels = Array::from_i32_slice_shaped(&[-100, -100, -100, -100], &[1, 4]);
+        let teacher = Array::from_f32_slice(
+            &[
+                0.0_f32, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+            ],
+            &[1, 4, 3],
+        );
+
+        let output = distiller
+            .compute_loss(&teacher, &logits, Some(&labels), None, 0, 1000)
+            .unwrap();
+        let value: f32 = output.hard.unwrap().item();
+        assert!(value.is_finite(), "loss must be finite");
+        assert!(value.abs() < 1e-6, "all-ignored loss must be zero");
     }
 }

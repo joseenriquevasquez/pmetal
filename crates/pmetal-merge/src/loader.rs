@@ -24,7 +24,7 @@ use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::FromBytes;
 
 use crate::{MergeError, Result};
 
@@ -641,25 +641,218 @@ impl ModelSource {
     }
 }
 
+/// Detect a tied lm_head ↔ embed_tokens pair on disk. HuggingFace models
+/// signal this in `config.json` via `tie_word_embeddings: true` and
+/// (importantly) ship only one of the two tensors in the safetensors —
+/// usually `model.embed_tokens.weight`, sometimes `lm_head.weight`. When
+/// the merge target is tied, the writer should emit the canonical name
+/// once and let the consumer's `from_pretrained()` re-tie at load time.
+///
+/// Returns `Some((canonical_name, alias_name))` if a tied pair is detected
+/// and `alias_name` should be skipped on save; otherwise `None`. The
+/// canonical choice favors the embedding name because that's what HF
+/// tries first when re-tying.
+pub fn detect_tied_embeddings(
+    model_dir: &std::path::Path,
+    available_names: &std::collections::HashSet<String>,
+) -> Option<(String, String)> {
+    // Read `tie_word_embeddings` from config.json. Absent / false → no tie.
+    let cfg_path = model_dir.join("config.json");
+    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let tied = value
+        .get("tie_word_embeddings")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !tied {
+        return None;
+    }
+
+    // Common variants. We bias toward the form HF saves under.
+    let embed = available_names
+        .iter()
+        .find(|n| n.ends_with("embed_tokens.weight"))
+        .cloned();
+    let head = available_names
+        .iter()
+        .find(|n| n.ends_with("lm_head.weight"))
+        .cloned();
+
+    match (embed, head) {
+        (Some(e), Some(h)) => {
+            // Both present → keep `embed_tokens`, drop the `lm_head` alias.
+            Some((e, h))
+        }
+        // Only one present → already canonical, no work to do.
+        _ => None,
+    }
+}
+
+/// Copy every non-weight, non-index sidecar file from `src_dir` to `dst_dir`.
+///
+/// Preserves `config.json`, `tokenizer.json`, `tokenizer_config.json`,
+/// `special_tokens_map.json`, `generation_config.json`, and any other
+/// metadata HF loaders expect to find next to the safetensors weights.
+/// Skips:
+///   * `*.safetensors` — these are written by [`TensorWriter`].
+///   * `model.safetensors.index.json` — same reason.
+///
+/// Returns an `Io` error on any copy failure so partial directories surface
+/// loudly instead of silently shipping a half-merged model.
+pub fn copy_side_files(src_dir: &Path, dst_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst_dir).map_err(|e| {
+        MergeError::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to create {}: {}", dst_dir.display(), e),
+        ))
+    })?;
+
+    for entry in std::fs::read_dir(src_dir)? {
+        let entry = entry?;
+        let src = entry.path();
+        if !src.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.ends_with(".safetensors") || name_str == "model.safetensors.index.json" {
+            continue;
+        }
+        let dst = dst_dir.join(&name);
+        std::fs::copy(&src, &dst).map_err(|e| {
+            MergeError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to copy {} to {}: {}",
+                    src.display(),
+                    dst.display(),
+                    e
+                ),
+            ))
+        })?;
+        debug!("copied side file {}", name_str);
+    }
+
+    Ok(())
+}
+
+/// Patch the `torch_dtype` field in a `config.json` next to the merged weights
+/// so HF loaders apply the right cast on load. Best-effort: silently no-ops if
+/// the file is missing, malformed, or doesn't contain the field.
+pub fn patch_config_dtype(dst_dir: &Path, dtype: safetensors::Dtype) -> Result<()> {
+    let path = dst_dir.join("config.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+    let mut value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    let label = match dtype {
+        safetensors::Dtype::F32 => "float32",
+        safetensors::Dtype::F16 => "float16",
+        safetensors::Dtype::BF16 => "bfloat16",
+        _ => return Ok(()),
+    };
+    if let Some(map) = value.as_object_mut() {
+        map.insert(
+            "torch_dtype".to_string(),
+            serde_json::Value::String(label.to_string()),
+        );
+        let pretty = serde_json::to_string_pretty(&value)?;
+        std::fs::write(&path, pretty)?;
+    }
+    Ok(())
+}
+
+/// Parse a dtype string ("float16" / "bfloat16" / "float32" and common aliases)
+/// into a [`safetensors::Dtype`]. Case-insensitive.
+pub fn parse_dtype(s: &str) -> Result<safetensors::Dtype> {
+    match s.to_ascii_lowercase().as_str() {
+        "f32" | "fp32" | "float32" => Ok(safetensors::Dtype::F32),
+        "f16" | "fp16" | "float16" | "half" => Ok(safetensors::Dtype::F16),
+        "bf16" | "bfloat16" => Ok(safetensors::Dtype::BF16),
+        other => Err(MergeError::UnsupportedDtype(other.to_string())),
+    }
+}
+
+/// Element size in bytes for the supported writer dtypes.
+fn dtype_elem_bytes(dt: safetensors::Dtype) -> usize {
+    match dt {
+        safetensors::Dtype::F32 => 4,
+        safetensors::Dtype::F16 | safetensors::Dtype::BF16 => 2,
+        _ => 4,
+    }
+}
+
+/// Materialize an f32 slice as packed bytes in the requested target dtype.
+/// Used by [`TensorWriter`] on the save path.
+fn pack_f32_to_dtype(src: &[f32], dt: safetensors::Dtype) -> Vec<u8> {
+    match dt {
+        safetensors::Dtype::F32 => {
+            // Reinterpret as little-endian bytes.
+            src.iter().flat_map(|f| f.to_le_bytes()).collect()
+        }
+        safetensors::Dtype::F16 => src
+            .iter()
+            .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+            .collect(),
+        safetensors::Dtype::BF16 => src
+            .iter()
+            .flat_map(|f| half::bf16::from_f32(*f).to_le_bytes())
+            .collect(),
+        // Other dtypes are not supported by the writer; caller should reject upstream.
+        _ => src.iter().flat_map(|f| f.to_le_bytes()).collect(),
+    }
+}
+
 /// Writer for saving merged tensors.
 pub struct TensorWriter {
     /// Output path.
     output_path: PathBuf,
-    /// Accumulated tensors for current shard.
-    current_shard: HashMap<String, (Vec<i32>, Vec<f32>)>,
+    /// Accumulated tensors for current shard. Stored as packed bytes already in
+    /// the target dtype so `flush_shard` is a thin marshal step.
+    current_shard: HashMap<String, (Vec<i32>, Vec<u8>)>,
     /// Current shard size in bytes.
     current_size: usize,
     /// Maximum shard size (default 5GB).
     max_shard_size: usize,
     /// Number of shards written.
     shard_count: usize,
+    /// Target on-disk dtype.
+    target_dtype: safetensors::Dtype,
 }
 
 impl TensorWriter {
-    /// Create a new tensor writer.
+    /// Create a new tensor writer with default dtype `F16` (legacy default).
+    /// Prefer [`TensorWriter::with_dtype`] for new call-sites.
     pub fn new(output_path: impl AsRef<Path>) -> Result<Self> {
+        Self::with_dtype(output_path, safetensors::Dtype::F16)
+    }
+
+    /// Create a new tensor writer with an explicit target dtype.
+    pub fn with_dtype(
+        output_path: impl AsRef<Path>,
+        target_dtype: safetensors::Dtype,
+    ) -> Result<Self> {
         let output_path = output_path.as_ref().to_path_buf();
         std::fs::create_dir_all(&output_path)?;
+
+        // Reject unsupported dtypes early so we never accumulate a shard we
+        // cannot serialize.
+        match target_dtype {
+            safetensors::Dtype::F32 | safetensors::Dtype::F16 | safetensors::Dtype::BF16 => {}
+            other => {
+                return Err(MergeError::UnsupportedDtype(format!(
+                    "TensorWriter does not support {:?}",
+                    other
+                )));
+            }
+        }
 
         Ok(Self {
             output_path,
@@ -667,6 +860,7 @@ impl TensorWriter {
             current_size: 0,
             max_shard_size: 5 * 1024 * 1024 * 1024, // 5GB
             shard_count: 0,
+            target_dtype,
         })
     }
 
@@ -676,21 +870,28 @@ impl TensorWriter {
         self
     }
 
-    /// Write a tensor.
+    /// Target on-disk dtype for this writer.
+    pub fn target_dtype(&self) -> safetensors::Dtype {
+        self.target_dtype
+    }
+
+    /// Write a tensor. The array is materialized via f32 (the canonical
+    /// in-memory dtype during merging) and then packed into bytes at the
+    /// writer's target dtype.
     pub fn write_tensor(&mut self, name: &str, tensor: &Array) -> Result<()> {
-        // Convert to f32 for storage
         let mut tensor = tensor.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
         let shape = tensor.shape().to_vec();
         let n = shape.iter().map(|&s| s as usize).product();
         let data: Vec<f32> = tensor.to_f32_vec(n).unwrap_or_default();
-        let size = data.len() * 4;
+        let bytes = pack_f32_to_dtype(&data, self.target_dtype);
+        let size = bytes.len();
 
         // Check if we need to flush current shard
         if self.current_size + size > self.max_shard_size && !self.current_shard.is_empty() {
             self.flush_shard()?;
         }
 
-        self.current_shard.insert(name.to_string(), (shape, data));
+        self.current_shard.insert(name.to_string(), (shape, bytes));
         self.current_size += size;
 
         Ok(())
@@ -710,18 +911,29 @@ impl TensorWriter {
         };
 
         let shard_path = self.output_path.join(&shard_name);
-        info!("Writing shard: {:?}", shard_path);
+        info!(
+            "Writing shard: {:?} (dtype={:?})",
+            shard_path, self.target_dtype
+        );
 
-        // Convert to safetensors format
+        // Sanity: every payload's length must be a multiple of the element size.
+        let elem = dtype_elem_bytes(self.target_dtype);
         let tensors: Vec<_> = self
             .current_shard
             .iter()
-            .map(|(name, (shape, data))| {
+            .map(|(name, (shape, bytes))| {
+                debug_assert!(
+                    bytes.len() % elem == 0,
+                    "tensor {} byte length {} not aligned to element size {}",
+                    name,
+                    bytes.len(),
+                    elem
+                );
                 let shape: Vec<usize> = shape.iter().map(|&s| s as usize).collect();
                 let tensor_view = safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::F32,
+                    self.target_dtype,
                     shape,
-                    data.as_bytes(),
+                    bytes.as_slice(),
                 )
                 .map_err(|e| {
                     MergeError::ModelLoad(format!("Failed to create TensorView: {}", e))
@@ -811,6 +1023,67 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("No safetensors files found"));
+    }
+
+    #[test]
+    fn parse_dtype_aliases() {
+        use safetensors::Dtype;
+        assert_eq!(parse_dtype("float16").unwrap(), Dtype::F16);
+        assert_eq!(parse_dtype("FP16").unwrap(), Dtype::F16);
+        assert_eq!(parse_dtype("half").unwrap(), Dtype::F16);
+        assert_eq!(parse_dtype("bfloat16").unwrap(), Dtype::BF16);
+        assert_eq!(parse_dtype("BF16").unwrap(), Dtype::BF16);
+        assert_eq!(parse_dtype("float32").unwrap(), Dtype::F32);
+        assert_eq!(parse_dtype("fp32").unwrap(), Dtype::F32);
+        assert!(parse_dtype("float8").is_err());
+        assert!(parse_dtype("").is_err());
+    }
+
+    /// Round-trip a tensor through every supported writer dtype and verify the
+    /// on-disk representation reports the right safetensors::Dtype and decodes
+    /// back to the original f32 values within each dtype's precision.
+    #[test]
+    fn dtype_round_trip_f32_f16_bf16() {
+        use pmetal_bridge::compat::Array;
+        use safetensors::Dtype;
+
+        let values: Vec<f32> = (0..32).map(|i| (i as f32) * 0.125 - 2.0).collect();
+        let shape: Vec<i32> = vec![4, 8];
+
+        for (label, dtype, tol) in [
+            ("float32", Dtype::F32, 0.0_f32),
+            ("float16", Dtype::F16, 1e-3_f32),
+            ("bfloat16", Dtype::BF16, 1e-2_f32),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut writer = TensorWriter::with_dtype(dir.path(), dtype).unwrap();
+            let tensor = Array::from_f32_slice(&values, &shape);
+            writer.write_tensor("t", &tensor).unwrap();
+            let out_dir = writer.finalize().unwrap();
+
+            // Reload via SafetensorsLoader and confirm dtype + values.
+            let loader = SafetensorsLoader::new(&out_dir).unwrap();
+            assert_eq!(
+                loader.tensor_dtype("t").unwrap(),
+                dtype,
+                "wrong on-disk dtype for {}",
+                label
+            );
+
+            let mut arr = loader.load_tensor("t").unwrap();
+            let got = arr.to_f32_vec(values.len()).unwrap();
+            for (i, (a, b)) in values.iter().zip(got.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= tol,
+                    "{}: idx {} mismatch {} vs {} (tol {})",
+                    label,
+                    i,
+                    a,
+                    b,
+                    tol
+                );
+            }
+        }
     }
 
     #[test]

@@ -48,6 +48,7 @@ use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use crate::loader::copy_side_files;
 use crate::{MergeError, Result};
 
 // ---------------------------------------------------------------------------
@@ -1371,55 +1372,9 @@ pub fn streaming_lora_merge(config: &AccurateMergeConfig) -> Result<LoraMergeSta
     Ok(stats)
 }
 
-// ---------------------------------------------------------------------------
-// Side-file copy helpers
-// ---------------------------------------------------------------------------
-
-/// Copy all non-safetensors and non-index files from `src_dir` to `dst_dir`.
-///
-/// This preserves `config.json`, `tokenizer.json`, `tokenizer_config.json`,
-/// `special_tokens_map.json`, and similar metadata files that are needed for
-/// a complete model directory.
-fn copy_side_files(src_dir: &Path, dst_dir: &Path) -> Result<()> {
-    fs::create_dir_all(dst_dir).map_err(|e| {
-        MergeError::Io(std::io::Error::new(
-            e.kind(),
-            format!("failed to create {}: {}", dst_dir.display(), e),
-        ))
-    })?;
-
-    for entry in fs::read_dir(src_dir)? {
-        let entry = entry?;
-        let src = entry.path();
-        if !src.is_file() {
-            continue;
-        }
-
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        // Skip files that we write ourselves.
-        if name_str.ends_with(".safetensors") || name_str == "model.safetensors.index.json" {
-            continue;
-        }
-
-        let dst = dst_dir.join(&name);
-        fs::copy(&src, &dst).map_err(|e| {
-            MergeError::Io(std::io::Error::new(
-                e.kind(),
-                format!(
-                    "failed to copy {} to {}: {}",
-                    src.display(),
-                    dst.display(),
-                    e
-                ),
-            ))
-        })?;
-        debug!("copied {}", name_str);
-    }
-
-    Ok(())
-}
+// `copy_side_files` lives in `loader.rs` (factored Phase 2.2 — now shared with
+// the full-model merge path). It is imported via the `use` block at the top
+// of this file; `lora_merge.rs` is a pure consumer.
 
 // ---------------------------------------------------------------------------
 // Tests
