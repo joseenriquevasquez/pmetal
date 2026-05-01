@@ -4,6 +4,8 @@
 //! metadata.  See `README.md` in this directory for the full migration pattern.
 
 pub mod bench;
+#[cfg(feature = "distributed")]
+pub mod cluster;
 pub mod dflash;
 pub mod distill;
 pub mod embed_train;

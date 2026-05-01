@@ -15,7 +15,11 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli", "dashboard", "trainer", "lora", "merge", "ane"]
+# `distributed` is on-by-default so a stock `pmetal` binary ships the
+# `pmetal cluster` subcommand and the trainer's `--distributed-auto` flag.
+# Library consumers who don't want libp2p in their dependency tree can
+# opt out via `pmetal = { version = "x", default-features = false, features = [...] }`.
+default = ["cli", "dashboard", "trainer", "lora", "merge", "ane", "distributed"]
 
 # Foundation crates (no mlx-rs dependency)
 core = ["dep:pmetal-core"]

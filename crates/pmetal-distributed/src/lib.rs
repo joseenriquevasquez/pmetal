@@ -102,9 +102,11 @@ pub enum ReduceOp {
 // Core modules
 pub mod auto;
 pub mod cloud_bridge;
+pub mod cluster_runtime;
 pub mod config;
 pub mod discovery;
 pub mod error;
+pub mod fabric;
 pub mod identity;
 pub mod ring;
 pub mod topology;
@@ -128,6 +130,7 @@ pub mod activation_codec;
 pub mod activation_transport;
 pub mod layer_assignment;
 pub mod pipeline;
+pub mod pipeline_harness;
 pub mod solver;
 pub mod ultrafusion;
 
@@ -166,6 +169,10 @@ pub use compression::{CompressionStrategy, GradientCompressor, QuantizationType}
 pub use config::DistributedConfig;
 pub use election::{ElectionConfig, ElectionEvent, ElectionManager, ElectionState};
 pub use error::{DistributedError, DistributedResult};
+pub use fabric::{
+    InterfaceInfo, InterfaceKind, LinkScore, LocalFabric, is_link_local_ipv4, nominal_score,
+    probe_local_fabric, score_link,
+};
 pub use health::{HealthConfig, HealthEvent, HealthMonitor, HealthStatus, HealthSummary};
 pub use identity::NodeIdentity;
 pub use layer_assignment::{assign_layers_bandwidth_aware, assign_layers_proportional};

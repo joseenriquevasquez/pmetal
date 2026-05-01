@@ -5,6 +5,7 @@
 //! nodes (typical Apple Silicon home clusters), exhaustive search
 //! is both feasible and optimal.
 
+use crate::fabric::InterfaceKind;
 use crate::topology::ClusterTopology;
 use std::ops::Range;
 
@@ -55,16 +56,20 @@ pub fn solve(topology: &ClusterTopology, num_layers: usize) -> SolverResult {
     let has_thunderbolt = topology.has_thunderbolt_ring();
 
     if has_thunderbolt || bandwidth > 0 {
-        // Use bandwidth-aware solver
+        // Use bandwidth-aware solver. Per-edge bandwidth comes from the
+        // classified fabric kind on each node's best advertised address —
+        // not a chip-name heuristic. At 64 MiB activation chunks, transfer
+        // time dominates link latency by ~3 orders of magnitude, so we feed
+        // the layer-assignment helper raw nominal bandwidth and reserve
+        // [`score_link`] for a future latency-aware solver path.
         let bw_per_node: Vec<u64> = nodes
             .iter()
             .map(|n| {
-                // Rough estimate: if thunderbolt, 40Gbps; wifi ~100Mbps; ethernet 1Gbps
-                if n.profile.chip_name.contains("Ultra") || n.profile.chip_name.contains("Max") {
-                    40_000_000_000u64 // 40 GB/s Thunderbolt
-                } else {
-                    5_000_000_000u64 // 5 GB/s conservative
-                }
+                let kind = n
+                    .best_addr()
+                    .map(|(_, k)| k)
+                    .unwrap_or(InterfaceKind::Unknown);
+                kind.nominal_bandwidth_bps()
             })
             .collect();
 

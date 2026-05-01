@@ -21,6 +21,7 @@
 
 use crate::discovery::{DiscoveryEvent, DiscoveryService};
 use crate::error::DistributedError;
+use crate::fabric::{InterfaceKind, LocalFabric, probe_local_fabric};
 use crate::identity::NodeIdentity;
 use crate::topology::{NodeProfile, SharedTopology, new_shared_topology};
 use crate::transport::{TcpTransport, TransportReceiver, TransportSender};
@@ -78,6 +79,9 @@ pub struct AutoDiscoveryBackend {
     identity: NodeIdentity,
     /// Configuration.
     config: AutoDiscoveryConfig,
+    /// Local network fabric snapshot (Thunderbolt / Ethernet / Wi-Fi NICs).
+    /// Used to classify peer addresses and pick the best fabric per ring edge.
+    fabric: Arc<LocalFabric>,
     /// Cluster topology.
     topology: SharedTopology,
     /// Discovery state.
@@ -101,38 +105,61 @@ impl AutoDiscoveryBackend {
     /// Create a new auto-discovery backend with custom configuration.
     pub async fn with_config(config: AutoDiscoveryConfig) -> Result<Self> {
         let identity = NodeIdentity::load_or_generate()?;
+        let fabric = Arc::new(probe_local_fabric());
         let topology = new_shared_topology(*identity.peer_id(), config.profile.clone());
 
-        // Create event channel
+        // Seed the local node's advertised addresses from the fabric probe so
+        // that peer-side ring formation can prefer Thunderbolt right away.
+        {
+            let mut t = topology.write();
+            let local_addrs: Vec<_> = fabric
+                .advertised_addrs()
+                .into_iter()
+                .map(|(ip, kind)| (SocketAddr::new(ip, config.gradient_port), kind))
+                .collect();
+            t.set_local_addrs(local_addrs);
+        }
+
         let (event_tx, event_rx) = mpsc::channel(256);
 
-        // Create and spawn discovery service
         let discovery = DiscoveryService::new(identity.clone(), config.discovery_port, event_tx);
         let discovery_state = discovery.state();
 
-        // Spawn discovery in background
         tokio::spawn(async move {
             if let Err(e) = discovery.run().await {
                 error!("Discovery service error: {}", e);
             }
         });
 
+        let tb_count = fabric
+            .interfaces()
+            .iter()
+            .filter(|i| i.kind == InterfaceKind::Thunderbolt)
+            .count();
         info!(
-            "AutoDiscoveryBackend initialized: peer_id={}, gradient_port={}, discovery_port={}",
+            "AutoDiscoveryBackend initialized: peer_id={}, gradient_port={}, discovery_port={}, tb_ifaces={}",
             identity.peer_id(),
             config.gradient_port,
-            config.discovery_port
+            config.discovery_port,
+            tb_count,
         );
 
         Ok(Self {
             identity,
             config,
+            fabric,
             topology,
             discovery_state,
             ring_connections: Mutex::new(None),
             event_rx: Mutex::new(event_rx),
             ring_init: OnceCell::new(),
         })
+    }
+
+    /// Snapshot of this node's network fabric (NICs and their kinds).
+    /// Used by `pmetal cluster status` and for fabric-aware routing decisions.
+    pub fn fabric(&self) -> Arc<LocalFabric> {
+        Arc::clone(&self.fabric)
     }
 
     /// Get the local node's peer ID.
@@ -208,10 +235,29 @@ impl AutoDiscoveryBackend {
                 debug!("Discovered peer: {} at {:?}", peer_id, addresses);
             }
             DiscoveryEvent::PeerConnected { peer_id, address } => {
-                info!("Connected to peer: {} at {}", peer_id, address);
+                let kind = self.fabric.classify_peer(&address.ip());
+                info!(
+                    "Connected to peer: {} at {} via {}",
+                    peer_id,
+                    address,
+                    kind.tag()
+                );
+
+                // Pull every fabric path the peer advertised (one multiaddr
+                // per local NIC the peer is willing to accept connections
+                // on). Classify each against our local fabric so the topology
+                // has the full set of fallback addresses, not just the one
+                // libp2p happened to dial first.
+                let extra = self
+                    .discovery_state
+                    .read()
+                    .get_peer(&peer_id)
+                    .map(|p| p.all_socket_addrs())
+                    .unwrap_or_default();
+                let all_addrs = compose_peer_addrs(&self.fabric, address, kind, &extra);
 
                 let mut topology = self.topology.write();
-                topology.add_node(peer_id, Some(address));
+                topology.add_node(peer_id, all_addrs);
             }
             DiscoveryEvent::PeerDisconnected { peer_id } => {
                 warn!("Disconnected from peer: {}", peer_id);
@@ -237,7 +283,7 @@ impl AutoDiscoveryBackend {
     /// Called at most once via `ring_init.get_or_init(...)`.
     async fn establish_ring_inner(&self) -> Result<()> {
         // Collect all needed data from topology while holding the lock
-        let (local_rank, world_size, node_addrs, peer_ids) = {
+        let (local_rank, world_size, endpoints, peer_ids) = {
             let topology = self.topology.read();
 
             if !topology.can_form_ring() {
@@ -251,17 +297,24 @@ impl AutoDiscoveryBackend {
             let local_rank = topology.local_rank();
             let world_size = ring_order.len();
 
-            // Collect socket addresses in ring order
-            let node_addrs: Vec<SocketAddr> = ring_order
-                .iter()
-                .filter_map(|n| n.socket_addr)
-                .map(|a| SocketAddr::new(a.ip(), self.config.gradient_port))
-                .collect();
+            // Collect every fabric path per peer in ring order, best first.
+            // The transport will try them in order on connect failure, so a
+            // disconnected Thunderbolt cable falls back to Ethernet without
+            // reforming the ring.
+            let mut endpoints: Vec<Vec<SocketAddr>> = Vec::with_capacity(ring_order.len());
+            for n in &ring_order {
+                let v: Vec<SocketAddr> = n
+                    .addrs
+                    .iter()
+                    .map(|(a, _)| SocketAddr::new(a.ip(), self.config.gradient_port))
+                    .collect();
+                endpoints.push(v);
+            }
 
             // Collect peer IDs for logging
             let peer_ids: Vec<String> = ring_order.iter().map(|n| n.peer_id.to_base58()).collect();
 
-            (local_rank, world_size, node_addrs, peer_ids)
+            (local_rank, world_size, endpoints, peer_ids)
         }; // topology lock released here
 
         info!(
@@ -269,16 +322,27 @@ impl AutoDiscoveryBackend {
             local_rank, world_size, peer_ids
         );
 
-        if node_addrs.len() < 2 {
+        let reachable_count = endpoints.iter().filter(|e| !e.is_empty()).count();
+        if reachable_count < 2 {
             return Err(DistributedError::Protocol(
                 "Not enough peers with known addresses to form ring".into(),
             )
             .into());
         }
 
-        // Create configuration for TCP transport
         let config = crate::config::DistributedConfig {
-            nodes: node_addrs,
+            nodes: endpoints
+                .iter()
+                .map(|e| {
+                    e.first().copied().unwrap_or_else(|| {
+                        "0.0.0.0:0".parse().expect("placeholder addr always valid")
+                    })
+                })
+                .collect(),
+            fallback_addrs: endpoints
+                .iter()
+                .map(|e| e.iter().skip(1).copied().collect())
+                .collect(),
             rank: local_rank,
             connection_timeout_ms: 30000,
             max_retries: 50,
@@ -451,6 +515,30 @@ impl DistributedBackend for AutoDiscoveryBackend {
     }
 }
 
+/// Build the deduplicated `(addr, kind)` list for a freshly-connected peer.
+///
+/// `primary` / `primary_kind` come from libp2p's actual dialed connection;
+/// `extra` is every other multiaddr the peer advertised. We classify each
+/// `extra` against our local fabric snapshot and append it if it's not
+/// already present in the list. The output is suitable to pass straight to
+/// [`crate::topology::ClusterTopology::add_node`].
+fn compose_peer_addrs(
+    fabric: &LocalFabric,
+    primary: SocketAddr,
+    primary_kind: InterfaceKind,
+    extra: &[SocketAddr],
+) -> Vec<(SocketAddr, InterfaceKind)> {
+    let mut all_addrs: Vec<(SocketAddr, InterfaceKind)> = vec![(primary, primary_kind)];
+    for sa in extra {
+        if all_addrs.iter().any(|(existing, _)| *existing == *sa) {
+            continue;
+        }
+        let k = fabric.classify_peer(&sa.ip());
+        all_addrs.push((*sa, k));
+    }
+    all_addrs
+}
+
 impl std::fmt::Debug for AutoDiscoveryBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AutoDiscoveryBackend")
@@ -458,5 +546,99 @@ impl std::fmt::Debug for AutoDiscoveryBackend {
             .field("peer_count", &self.peer_count())
             .field("ring_ready", &self.is_ring_ready())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fabric::InterfaceInfo;
+    use std::net::Ipv4Addr;
+
+    fn fabric_with(ifaces: Vec<(&str, InterfaceKind, Vec<Ipv4Addr>)>) -> LocalFabric {
+        let interfaces = ifaces
+            .into_iter()
+            .map(|(name, kind, ips)| InterfaceInfo {
+                name: name.to_string(),
+                addrs: ips.into_iter().map(std::net::IpAddr::V4).collect(),
+                kind,
+                link_speed: None,
+            })
+            .collect();
+        LocalFabric::from_interfaces(interfaces)
+    }
+
+    #[test]
+    fn compose_peer_addrs_classifies_extra_multiaddrs() {
+        // Local fabric: TB on 169.254.1.10, Ethernet on 192.168.1.5.
+        let fabric = fabric_with(vec![
+            (
+                "bridge0",
+                InterfaceKind::Thunderbolt,
+                vec![Ipv4Addr::new(169, 254, 1, 10)],
+            ),
+            (
+                "en0",
+                InterfaceKind::Ethernet,
+                vec![Ipv4Addr::new(192, 168, 1, 5)],
+            ),
+        ]);
+
+        // Peer dialed in over Ethernet first; their TB address is in `extra`.
+        let primary: SocketAddr = "192.168.1.42:52415".parse().unwrap();
+        let extra: Vec<SocketAddr> = vec![
+            "169.254.1.42:52415".parse().unwrap(), // TB path
+            "192.168.1.42:52415".parse().unwrap(), // duplicate of primary — dedup
+        ];
+
+        let out = compose_peer_addrs(&fabric, primary, InterfaceKind::Ethernet, &extra);
+
+        // Primary first, then the TB addr; dedup drops the duplicate.
+        assert_eq!(out.len(), 2, "got {:?}", out);
+        assert_eq!(out[0], (primary, InterfaceKind::Ethernet));
+        assert_eq!(out[1].1, InterfaceKind::Thunderbolt);
+    }
+
+    #[test]
+    fn compose_peer_addrs_empty_extra() {
+        let fabric = fabric_with(vec![]);
+        let primary: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let out = compose_peer_addrs(&fabric, primary, InterfaceKind::Unknown, &[]);
+        assert_eq!(out, vec![(primary, InterfaceKind::Unknown)]);
+    }
+
+    #[test]
+    fn topology_set_local_addrs_seeds_local_node_for_advertise() {
+        // This test exercises the topology integration path that
+        // AutoDiscoveryBackend::with_config uses at startup: probe fabric →
+        // build advertised addrs → set on local node. We verify that the
+        // local node's primary fabric is the highest-ranked interface.
+        let local_id = libp2p::PeerId::random();
+        let mut topo =
+            crate::topology::ClusterTopology::new(local_id, crate::topology::NodeProfile::default());
+
+        let fabric = fabric_with(vec![
+            (
+                "bridge0",
+                InterfaceKind::Thunderbolt,
+                vec![Ipv4Addr::new(169, 254, 1, 1)],
+            ),
+            (
+                "en0",
+                InterfaceKind::Ethernet,
+                vec![Ipv4Addr::new(192, 168, 1, 50)],
+            ),
+        ]);
+
+        let local_addrs: Vec<_> = fabric
+            .advertised_addrs()
+            .into_iter()
+            .map(|(ip, kind)| (SocketAddr::new(ip, 52416), kind))
+            .collect();
+        topo.set_local_addrs(local_addrs);
+
+        let local = topo.get_node(&local_id).expect("local node present");
+        assert_eq!(local.addrs.len(), 2);
+        assert_eq!(local.best_addr().unwrap().1, InterfaceKind::Thunderbolt);
     }
 }

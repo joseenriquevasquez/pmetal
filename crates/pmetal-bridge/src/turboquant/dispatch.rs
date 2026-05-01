@@ -561,6 +561,43 @@ pub(super) fn gpu_encode_key_subvector(
     })
 }
 
+impl MixedKeySubvectorEncoding {
+    /// Force materialisation of every output tensor in a single batched
+    /// `eval+detach`, severing the lazy graph at this consistent point.
+    ///
+    /// **Required when consumed standalone** (i.e. fed straight into
+    /// `gpu_dequantize_key_subvector` without going through
+    /// [`gpu_quantize_kv_mixed`]'s trailing barrier). Without this, the
+    /// MLX scheduler can re-drive `gpu_quantize_mse`'s argmin under f32
+    /// codebook-distance noise, so the stored `indices` and the
+    /// `residual_norms` derived from `recon = take(codebook, indices)`
+    /// can come from different materialisations — manifesting as a
+    /// large reconstruction error vs the equivalent Uniform path.
+    ///
+    /// Callers that route through [`gpu_quantize_kv_mixed`] do **not**
+    /// need to call this — that function's `collect_for_detach` barrier
+    /// already covers every output, and re-barriering here would
+    /// serialise the four parallel encode chains.
+    #[allow(dead_code)] // currently only used by tests
+    pub(super) fn eval_and_detach(&mut self) {
+        let mut to_eval: Vec<&mut InlineArray> = Vec::new();
+        to_eval.push(&mut self.indices);
+        if let Some(t) = self.indices_t.as_mut() {
+            to_eval.push(t);
+        }
+        if let Some(q) = self.qjl_signs.as_mut() {
+            to_eval.push(q);
+        }
+        if let Some(q) = self.qjl_signs_t.as_mut() {
+            to_eval.push(q);
+        }
+        to_eval.push(&mut self.norms);
+        to_eval.push(&mut self.residual_norms);
+        to_eval.push(&mut self.slot_scale);
+        crate::inline_array::eval_and_detach_many(&mut to_eval);
+    }
+}
+
 pub(super) struct MixedKeySubvectorEncoding {
     pub(super) indices: InlineArray,
     pub(super) indices_t: Option<InlineArray>,
@@ -598,6 +635,21 @@ pub(super) fn gpu_encode_value_subvector(
         indices_t: Some(indices_t),
         norms,
     })
+}
+
+impl MixedValueSubvectorEncoding {
+    /// See [`MixedKeySubvectorEncoding::eval_and_detach`] — same rationale,
+    /// only `indices`/`indices_t`/`norms` need detaching for the value path.
+    #[allow(dead_code)]
+    pub(super) fn eval_and_detach(&mut self) {
+        let mut to_eval: Vec<&mut InlineArray> = Vec::new();
+        to_eval.push(&mut self.indices);
+        if let Some(t) = self.indices_t.as_mut() {
+            to_eval.push(t);
+        }
+        to_eval.push(&mut self.norms);
+        crate::inline_array::eval_and_detach_many(&mut to_eval);
+    }
 }
 
 pub(super) struct MixedValueSubvectorEncoding {

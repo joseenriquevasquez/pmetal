@@ -83,12 +83,25 @@ pub struct PMetalBehaviour {
 pub struct PeerInfo {
     /// The peer's ID.
     pub peer_id: PeerId,
-    /// Known addresses for this peer.
+    /// Known multiaddrs for this peer (includes every interface the peer
+    /// advertised via mDNS).
     pub addresses: Vec<Multiaddr>,
-    /// Socket address for direct TCP communication.
+    /// Socket address libp2p actually used to reach this peer.
     pub socket_addr: Option<SocketAddr>,
     /// Whether we have an active connection.
     pub connected: bool,
+}
+
+impl PeerInfo {
+    /// All advertised TCP socket addresses extracted from `addresses`.
+    /// Used by [`crate::auto::AutoDiscoveryBackend`] to discover *all*
+    /// fabric paths to a peer (not just the one libp2p picked to dial).
+    pub fn all_socket_addrs(&self) -> Vec<SocketAddr> {
+        self.addresses
+            .iter()
+            .filter_map(multiaddr_to_socket_addr)
+            .collect()
+    }
 }
 
 /// Shared state for discovered peers.

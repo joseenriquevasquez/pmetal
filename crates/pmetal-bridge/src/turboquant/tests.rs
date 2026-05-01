@@ -3922,10 +3922,15 @@ mod kvcache {
         .expect("uniform decode");
         let recon_uni = dec_uni.to_f32_vec(total).expect("dec uni to_f32");
 
-        // Mixed sub-vector path on the SAME core
-        let enc_mix =
+        // Mixed sub-vector path on the SAME core. The helper does NOT
+        // auto-barrier (gpu_quantize_kv_mixed does that downstream); when
+        // consumed standalone we must detach manually so the indices and
+        // the residual_norms / qjl_signs come from the same materialisation
+        // of gpu_quantize_mse's argmin.
+        let mut enc_mix =
             gpu_encode_key_subvector(&rows, core, 3, super::config::TurboQuantQjlMode::Standard)
                 .expect("mix encode");
+        enc_mix.eval_and_detach();
         let mut dec_mix = gpu_dequantize_key_subvector(
             &enc_mix.indices,
             enc_mix.qjl_signs.as_ref(),

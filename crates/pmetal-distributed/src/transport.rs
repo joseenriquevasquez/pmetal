@@ -6,6 +6,7 @@
 use crate::config::DistributedConfig;
 use crate::error::DistributedError;
 use anyhow::Result;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -228,6 +229,12 @@ impl TransportSender {
             inner: TransportSenderInner::Memory(sender),
         }
     }
+
+    /// Crate-internal: wrap an already-split TCP write half. Used by the
+    /// pipeline harness which builds extra TCP rings outside `TcpTransport`.
+    pub(crate) fn from_owned_write(stream: OwnedWriteHalf) -> Self {
+        Self::from_tcp(stream)
+    }
 }
 
 impl TransportReceiver {
@@ -241,6 +248,10 @@ impl TransportReceiver {
         Self {
             inner: TransportReceiverInner::Memory(receiver),
         }
+    }
+
+    pub(crate) fn from_owned_read(stream: OwnedReadHalf) -> Self {
+        Self::from_tcp(stream)
     }
 }
 
@@ -260,10 +271,17 @@ pub fn in_memory_channel(capacity: usize) -> (TransportSender, TransportReceiver
 pub struct TcpTransport;
 
 impl TcpTransport {
-    /// Connect to peers in a ring topology.
+    /// Connect to peers in a ring topology, with fabric-aware fallback.
     ///
-    /// Each node connects to its next peer and accepts a connection
-    /// from its previous peer, forming a bidirectional ring.
+    /// Each rank:
+    ///   1. Binds the listener on `0.0.0.0:<my_port>`. Listening on the
+    ///      unspecified address means peers can dial in over *any* fabric
+    ///      we have an interface on — Thunderbolt or Ethernet — without
+    ///      forcing us to pick one at bind time.
+    ///   2. Connects to the next peer by trying each address in
+    ///      `addrs_for(next_rank)` in priority order (best fabric first).
+    ///      Each address gets `max_retries / addrs.len()` retry budget;
+    ///      we exhaust one before falling back to the next.
     pub async fn connect(
         config: &DistributedConfig,
     ) -> Result<(TransportSender, TransportReceiver)> {
@@ -271,54 +289,36 @@ impl TcpTransport {
         let rank = config.rank;
         let my_addr = config.nodes[rank];
         let connection_timeout = Duration::from_millis(config.connection_timeout_ms);
-        let max_retries = config.max_retries;
 
-        info!("Node {} listening on {}", rank, my_addr);
-        let listener = TcpListener::bind(my_addr).await?;
+        // Bind on 0.0.0.0:<my_port> so we accept on every local interface.
+        // Falling back to a specific address would mean a TB cable disconnect
+        // breaks the listener even though Ethernet is still up.
+        let bind_addr: std::net::SocketAddr =
+            SocketAddr::new("0.0.0.0".parse().expect("0.0.0.0 always parses"), my_addr.port());
+        info!("Node {} listening on {} (advertised as {})", rank, bind_addr, my_addr);
+        let listener = TcpListener::bind(bind_addr).await?;
 
         let next_rank = (rank + 1) % world_size;
-        let next_addr = config.nodes[next_rank];
+        let next_endpoints = config.addrs_for(next_rank);
+        if next_endpoints.is_empty() {
+            return Err(DistributedError::Config(format!(
+                "no addresses configured for next peer rank {}",
+                next_rank
+            ))
+            .into());
+        }
 
-        // Connect to next peer with exponential backoff
-        let connect_fut = async {
-            let mut retries = 0u32;
-            loop {
-                if retries >= max_retries {
-                    return Err(DistributedError::MaxRetriesExceeded {
-                        addr: next_addr,
-                        max_retries,
-                    });
-                }
+        // Walk fabrics in priority order, retrying each before falling through.
+        let connect_fut = Self::connect_with_fallback(
+            next_rank,
+            &next_endpoints,
+            config.max_retries,
+        );
 
-                match TcpStream::connect(next_addr).await {
-                    Ok(stream) => {
-                        // Enable TCP_NODELAY for low-latency gradient exchange
-                        if let Err(e) = stream.set_nodelay(true) {
-                            warn!("Failed to set TCP_NODELAY: {}", e);
-                        }
-                        info!("Connected to next peer {} at {}", next_rank, next_addr);
-                        return Ok(stream);
-                    }
-                    Err(e) => {
-                        if retries == 0 {
-                            debug!("Waiting for peer {} at {} ({})", next_rank, next_addr, e);
-                        }
-                        retries += 1;
-
-                        // Exponential backoff with jitter
-                        let backoff =
-                            (INITIAL_BACKOFF_MS * 2u64.pow(retries.min(6))).min(MAX_BACKOFF_MS);
-                        tokio::time::sleep(Duration::from_millis(backoff)).await;
-                    }
-                }
-            }
-        };
-
-        // Accept connection from previous peer
+        // Accept connection from previous peer.
         let accept_fut = async {
             match timeout(connection_timeout, listener.accept()).await {
                 Ok(Ok((stream, addr))) => {
-                    // Enable TCP_NODELAY
                     if let Err(e) = stream.set_nodelay(true) {
                         warn!("Failed to set TCP_NODELAY on incoming: {}", e);
                     }
@@ -333,7 +333,6 @@ impl TcpTransport {
             }
         };
 
-        // Run both concurrently - order doesn't matter since it's symmetric
         let (next_peer, prev_peer) = tokio::try_join!(
             async {
                 connect_fut
@@ -347,7 +346,6 @@ impl TcpTransport {
             }
         )?;
 
-        // We send to next_peer, receive from prev_peer
         let (_, write_next) = next_peer.into_split();
         let (read_prev, _) = prev_peer.into_split();
 
@@ -355,6 +353,75 @@ impl TcpTransport {
             TransportSender::from_tcp(write_next),
             TransportReceiver::from_tcp(read_prev),
         ))
+    }
+
+    /// Round-robin connect: try each address once per round with shared
+    /// exponential backoff between rounds. A transient outage on the
+    /// best-fabric (e.g. a Thunderbolt cable jiggle) falls back to the
+    /// next fabric within a few seconds rather than after the entire
+    /// per-fabric budget is exhausted.
+    ///
+    /// `max_retries` caps the total number of *connect attempts across all
+    /// fabrics*, not per fabric. With 2 endpoints and `max_retries = 50`,
+    /// each address is tried up to ~25 times.
+    async fn connect_with_fallback(
+        next_rank: usize,
+        endpoints: &[SocketAddr],
+        max_retries: u32,
+    ) -> std::result::Result<TcpStream, DistributedError> {
+        if endpoints.is_empty() {
+            return Err(DistributedError::Config(format!(
+                "no endpoints configured for next peer rank {next_rank}"
+            )));
+        }
+        let mut last_err: Option<std::io::Error> = None;
+        let mut attempts: u32 = 0;
+        let mut round: u32 = 0;
+
+        while attempts < max_retries {
+            for (idx, addr) in endpoints.iter().enumerate() {
+                if attempts >= max_retries {
+                    break;
+                }
+                attempts += 1;
+
+                match TcpStream::connect(addr).await {
+                    Ok(stream) => {
+                        if let Err(e) = stream.set_nodelay(true) {
+                            warn!("Failed to set TCP_NODELAY: {}", e);
+                        }
+                        info!(
+                            "Connected to next peer {} at {} (fabric {}/{}, round {})",
+                            next_rank,
+                            addr,
+                            idx + 1,
+                            endpoints.len(),
+                            round + 1,
+                        );
+                        return Ok(stream);
+                    }
+                    Err(e) => {
+                        if round == 0 {
+                            debug!("Waiting for peer {} at {} ({})", next_rank, addr, e);
+                        }
+                        last_err = Some(e);
+                    }
+                }
+            }
+
+            // Finished one round across every fabric — sleep before retrying.
+            round += 1;
+            let backoff = (INITIAL_BACKOFF_MS * 2u64.pow(round.min(6))).min(MAX_BACKOFF_MS);
+            tokio::time::sleep(Duration::from_millis(backoff)).await;
+        }
+
+        if let Some(ioe) = last_err {
+            debug!("Final connect error to rank {}: {}", next_rank, ioe);
+        }
+        Err(DistributedError::MaxRetriesExceeded {
+            addr: endpoints[0],
+            max_retries,
+        })
     }
 }
 
@@ -389,5 +456,34 @@ mod tests {
         let mut buf = [0u8; 3];
         let err = receiver.recv(&mut buf).await.expect_err("length mismatch");
         assert!(err.to_string().contains("Expected 3 bytes, got 7"));
+    }
+
+    #[tokio::test]
+    async fn connect_falls_back_when_first_fabric_unreachable() {
+        // Bind a real listener on 127.0.0.1; this is the *fallback* address.
+        // The "primary" address points at a black-hole port we know is closed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let working_addr = listener.local_addr().unwrap();
+
+        let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap(); // port 1 always refuses
+
+        let endpoints = vec![unreachable, working_addr];
+
+        // Spawn the connect side in a task, accept in the test body.
+        let connect_task = tokio::spawn(async move {
+            // Tight retry budget so the unreachable fabric exhausts quickly.
+            TcpTransport::connect_with_fallback(0, &endpoints, /*max_retries=*/ 4).await
+        });
+
+        let (_inbound, _from) = listener.accept().await.unwrap();
+
+        let conn = connect_task.await.expect("task").expect("connect");
+        let peer = conn.peer_addr().expect("peer_addr");
+        assert_eq!(
+            peer.port(),
+            working_addr.port(),
+            "should have connected to the working fallback fabric, got {}",
+            peer
+        );
     }
 }

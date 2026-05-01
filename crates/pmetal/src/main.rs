@@ -506,6 +506,11 @@ enum Commands {
     #[command(name = "embed-train")]
     #[cfg(feature = "trainer")]
     EmbedTrain(crate::cli::embed_train::EmbedTrainArgs),
+
+    /// Multi-machine cluster operations: discover peers, form a Thunderbolt-
+    /// preferred ring, and run distributed training or inference.
+    #[cfg(feature = "distributed")]
+    Cluster(crate::cli::cluster::ClusterArgs),
 }
 
 /// Dataset subcommands for data preparation.
@@ -2508,6 +2513,11 @@ async fn tokio_main() -> anyhow::Result<()> {
                     last,
                 );
             }
+        }
+
+        #[cfg(feature = "distributed")]
+        Commands::Cluster(args) => {
+            commands::cluster::run(args.command).await?;
         }
     }
 

@@ -134,6 +134,46 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `bench-workload` | Benchmark real cached inference/training workloads |
 | `bench-corpus` | Structured kernel benchmarking with JSON reporting |
 | `mcp` | Start MCP server (45 tools for Claude Desktop / MCP clients) |
+| `cluster` | Multi-Mac cluster: discover peers, train across machines, run all-reduce / pipeline benchmarks |
+
+### Multi-Mac Cluster (Thunderbolt-aware)
+
+Connect two or more Apple Silicon Macs into a "home cluster" for distributed training and inference. PMetal auto-detects every NIC on the box (Thunderbolt-Bridge, Ethernet, Wi-Fi), advertises them via mDNS, and forms a ring biased toward the fastest fabric — Thunderbolt cables are picked over Ethernet, Ethernet over Wi-Fi, all without configuration.
+
+```bash
+# 1. Connect the Macs (Thunderbolt-4/5 cable recommended; Ethernet works too).
+# 2. On every Mac:
+pmetal cluster status        # Show local NICs + any peers already announcing.
+pmetal cluster up            # Join the cluster, hold connection open.
+
+# 3. On every Mac at the same time:
+pmetal cluster bench --mb 64 --iters 10                  # All-reduce throughput per fabric.
+pmetal cluster pipeline-bench --tokens 16 --layers 32    # Pipeline activation transport bench.
+
+# 4. Distributed training (each Mac runs the same command simultaneously):
+pmetal train --model Qwen/Qwen3-0.6B \
+             --dataset train.jsonl   \
+             --distributed-auto        # mDNS-discovers peers, all-reduce gradients.
+```
+
+`pmetal cluster status` example output:
+
+```
+Local peer: 12D3KooW…XyZ  (rank 0/2)
+Thunderbolt ring: yes
+
+Local interfaces:
+  bridge0    thunderbolt   169.254.42.1
+  en0        ethernet      192.168.1.10
+  lo0        loopback      127.0.0.1, ::1
+
+Cluster peers:
+  peer-id                                   local  primary-addr           fabric        paths
+  12D3KooW…XyZ                              yes    169.254.42.1:52416     thunderbolt   2
+  12D3KooW…AbC                              no     169.254.42.2:52416     thunderbolt   2
+```
+
+What's wired today: gradient all-reduce (multi-machine training, real), fabric-aware ring formation with Thunderbolt > Ethernet > Wi-Fi priority, automatic fabric fallback when a cable is unplugged mid-job, gradient compression (TopK, FP16/BF16/INT8 quantization, error feedback), and a transport-tested pipeline harness with multi-process integration tests. Per-architecture partial-layer execution (the prerequisite for serving a model that doesn't fit on one Mac) is the next step — the harness is ready, the model API is the bottleneck.
 
 ## SDK
 

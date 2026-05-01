@@ -66,6 +66,9 @@ parking_lot = "0.12"
 half = { workspace = true }
 ordered-float = "5"
 
+# Local NIC enumeration for fabric detection (Thunderbolt / Ethernet / WiFi).
+if-addrs = "0.13"
+
 # MLX bridge (optional — gated behind mlx-collectives feature)
 pmetal-bridge = { workspace = true, optional = true }
 

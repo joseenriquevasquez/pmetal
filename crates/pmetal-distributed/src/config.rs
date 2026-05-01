@@ -7,9 +7,17 @@ use std::net::SocketAddr;
 /// Configuration for distributed training.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistributedConfig {
-    /// List of all nodes in the cluster (IP:Port).
-    /// The order must be consistent across all nodes.
+    /// Primary address per node (one per rank). The order must be consistent
+    /// across the cluster. Entry `i` is the preferred fabric for rank `i`
+    /// (typically Thunderbolt, populated by [`crate::auto::AutoDiscoveryBackend`]).
     pub nodes: Vec<SocketAddr>,
+
+    /// Optional fallback addresses, indexed by rank. `fallback_addrs[i]`
+    /// is the list of *additional* socket addrs to try for rank `i` if
+    /// `nodes[i]` is unreachable (e.g. TB cable disconnected ⇒ try Ethernet).
+    /// Entries are tried in order. Empty / absent ⇒ no fallback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_addrs: Vec<Vec<SocketAddr>>,
 
     /// Rank of this node (index into nodes list).
     pub rank: usize,
@@ -32,14 +40,51 @@ fn default_max_retries() -> u32 {
 }
 
 impl DistributedConfig {
-    /// Create a new configuration.
+    /// Create a new configuration with one address per node.
     pub fn new(nodes: Vec<SocketAddr>, rank: usize) -> Self {
         Self {
             nodes,
+            fallback_addrs: Vec::new(),
             rank,
             connection_timeout_ms: default_connection_timeout_ms(),
             max_retries: default_max_retries(),
         }
+    }
+
+    /// Create a configuration with primary + fallback addresses per node.
+    /// `endpoints[i]` is rank `i`'s ranked list (best first); `endpoints[i][0]`
+    /// becomes the primary, the remainder become fallbacks.
+    pub fn with_endpoints(endpoints: Vec<Vec<SocketAddr>>, rank: usize) -> Self {
+        let mut nodes = Vec::with_capacity(endpoints.len());
+        let mut fallback_addrs = Vec::with_capacity(endpoints.len());
+        for endpoint_list in endpoints {
+            let mut iter = endpoint_list.into_iter();
+            // Empty endpoint lists become a placeholder; validate() will reject.
+            nodes.push(iter.next().unwrap_or_else(|| {
+                "0.0.0.0:0".parse().expect("placeholder addr always valid")
+            }));
+            fallback_addrs.push(iter.collect());
+        }
+        Self {
+            nodes,
+            fallback_addrs,
+            rank,
+            connection_timeout_ms: default_connection_timeout_ms(),
+            max_retries: default_max_retries(),
+        }
+    }
+
+    /// All addresses to try for rank `r`, in priority order
+    /// (primary first, then any fallbacks).
+    pub fn addrs_for(&self, r: usize) -> Vec<SocketAddr> {
+        let mut out = Vec::with_capacity(1 + self.fallback_addrs.get(r).map_or(0, Vec::len));
+        if let Some(primary) = self.nodes.get(r) {
+            out.push(*primary);
+        }
+        if let Some(extras) = self.fallback_addrs.get(r) {
+            out.extend(extras.iter().copied());
+        }
+        out
     }
 
     /// Validate the configuration.

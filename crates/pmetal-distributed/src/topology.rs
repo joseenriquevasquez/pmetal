@@ -15,6 +15,7 @@
 //! - Detecting when the cluster can perform distributed training
 
 use crate::error::DistributedError;
+use crate::fabric::InterfaceKind;
 use anyhow::Result;
 use libp2p::PeerId;
 use parking_lot::RwLock;
@@ -61,8 +62,10 @@ impl Default for NodeProfile {
 pub struct NodeInfo {
     /// The node's peer ID.
     pub peer_id: PeerId,
-    /// Socket address for direct communication.
-    pub socket_addr: Option<SocketAddr>,
+    /// All known addresses for this node, ranked best-fabric-first.
+    /// Populated by discovery from peer-advertised multiaddrs, classified
+    /// against our local fabric snapshot in [`crate::fabric`].
+    pub addrs: Vec<(SocketAddr, InterfaceKind)>,
     /// Performance profile.
     pub profile: NodeProfile,
     /// When this node was last seen.
@@ -71,83 +74,120 @@ pub struct NodeInfo {
     pub is_local: bool,
 }
 
+impl NodeInfo {
+    /// Best (fastest fabric) address for this peer, if any.
+    pub fn best_addr(&self) -> Option<(SocketAddr, InterfaceKind)> {
+        self.addrs.first().copied()
+    }
+
+    /// Best socket address — convenience wrapper for callers that don't
+    /// need the fabric tag.
+    pub fn socket_addr(&self) -> Option<SocketAddr> {
+        self.addrs.first().map(|(a, _)| *a)
+    }
+
+    /// Best socket address rebound to `port` (used when discovery's port
+    /// differs from the gradient port).
+    pub fn socket_addr_with_port(&self, port: u16) -> Option<SocketAddr> {
+        self.socket_addr().map(|a| SocketAddr::new(a.ip(), port))
+    }
+
+    /// Insert/upgrade an address. If `addr` is already present its kind is
+    /// updated; otherwise it's pushed. Re-sorts so the best fabric is first.
+    pub fn upsert_addr(&mut self, addr: SocketAddr, kind: InterfaceKind) {
+        if let Some(slot) = self.addrs.iter_mut().find(|(a, _)| *a == addr) {
+            if kind > slot.1 {
+                slot.1 = kind;
+            }
+        } else {
+            self.addrs.push((addr, kind));
+        }
+        // Best fabric first — Thunderbolt > Ethernet > Wifi > Unknown > Loopback.
+        // Loopback drops to the bottom because we never want to reach a remote
+        // peer over our own loopback (same-host tests handle that explicitly).
+        let priority = |k: InterfaceKind| -> i32 {
+            match k {
+                InterfaceKind::Loopback => -1,
+                _ => k as i32,
+            }
+        };
+        self.addrs
+            .sort_by_key(|(_, k)| std::cmp::Reverse(priority(*k)));
+    }
+}
+
 /// Connection profile between two nodes.
 #[derive(Debug, Clone)]
 pub struct ConnectionProfile {
+    /// Classified link type (Thunderbolt > Ethernet > Wi-Fi > …).
+    pub kind: InterfaceKind,
     /// Measured latency (round-trip time).
     pub latency: Duration,
     /// Estimated bandwidth in bytes/second.
     pub bandwidth: u64,
-    /// Whether this is a Thunderbolt connection (link-local address 169.254.x.x).
-    pub is_thunderbolt: bool,
-    /// RDMA interface name if available (e.g., "rdma_en2").
+    /// RDMA interface name if available (e.g., "rdma_en2"). Reserved for
+    /// the RDMA transport seam in Phase 2.
     pub rdma_interface: Option<String>,
 }
 
 impl Default for ConnectionProfile {
     fn default() -> Self {
-        Self {
-            latency: Duration::from_millis(10),
-            bandwidth: 1_000_000_000, // 1 Gbps default
-            is_thunderbolt: false,
-            rdma_interface: None,
-        }
+        Self::from_kind(InterfaceKind::Unknown)
     }
 }
 
 impl ConnectionProfile {
-    /// Create a profile for a Thunderbolt connection.
-    ///
-    /// Thunderbolt 4 provides ~40 Gbps bandwidth and sub-microsecond latency.
+    /// Build a profile from an interface kind using its nominal numbers.
+    /// Override `latency` / `bandwidth` afterward to use real measurements.
+    pub fn from_kind(kind: InterfaceKind) -> Self {
+        Self {
+            kind,
+            latency: Duration::from_micros(kind.nominal_latency_us()),
+            bandwidth: kind.nominal_bandwidth_bps(),
+            rdma_interface: None,
+        }
+    }
+
     pub fn thunderbolt(interface_name: Option<String>) -> Self {
-        Self {
-            latency: Duration::from_micros(10), // ~10µs for Thunderbolt
-            bandwidth: 5_000_000_000,           // ~40 Gbps / 8 = 5 GB/s
-            is_thunderbolt: true,
-            rdma_interface: interface_name.map(|n| format!("rdma_{}", n)),
-        }
+        let mut p = Self::from_kind(InterfaceKind::Thunderbolt);
+        p.rdma_interface = interface_name.map(|n| format!("rdma_{}", n));
+        p
     }
 
-    /// Create a profile for a WiFi connection.
     pub fn wifi() -> Self {
-        Self {
-            latency: Duration::from_millis(5),
-            bandwidth: 100_000_000, // ~800 Mbps typical
-            is_thunderbolt: false,
-            rdma_interface: None,
-        }
+        Self::from_kind(InterfaceKind::Wifi)
     }
 
-    /// Create a profile for an Ethernet connection.
     pub fn ethernet() -> Self {
-        Self {
-            latency: Duration::from_micros(500),
-            bandwidth: 1_000_000_000, // 1 Gbps
-            is_thunderbolt: false,
-            rdma_interface: None,
-        }
+        Self::from_kind(InterfaceKind::Ethernet)
+    }
+
+    /// True if this profile represents a Thunderbolt-bridge link.
+    /// Kept for backwards compatibility with callers that only care about
+    /// the binary "is it TB" question — new code should match on `kind`.
+    pub fn is_thunderbolt(&self) -> bool {
+        self.kind == InterfaceKind::Thunderbolt
     }
 }
 
 /// Check if an IP address is a Thunderbolt link-local address.
 ///
 /// Thunderbolt networking uses the 169.254.x.x range (link-local).
+/// Re-exported from [`crate::fabric::is_link_local_ipv4`] for backwards
+/// compatibility.
 pub fn is_thunderbolt_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(ipv4) => {
-            let octets = ipv4.octets();
-            octets[0] == 169 && octets[1] == 254
-        }
-        _ => false,
-    }
+    crate::fabric::is_link_local_ipv4(ip)
 }
 
 /// Detect connection type from socket address.
+///
+/// Heuristic: link-local 169.254/16 ⇒ Thunderbolt; otherwise Ethernet.
+/// Real fabric detection requires a [`crate::fabric::LocalFabric`] snapshot —
+/// this single-address fallback is for callers that don't have one.
 pub fn detect_connection_type(addr: &SocketAddr) -> ConnectionProfile {
-    if is_thunderbolt_ip(&addr.ip()) {
+    if crate::fabric::is_link_local_ipv4(&addr.ip()) {
         ConnectionProfile::thunderbolt(None)
     } else {
-        // Default to ethernet; could be refined with interface detection
         ConnectionProfile::ethernet()
     }
 }
@@ -171,7 +211,7 @@ impl ClusterTopology {
         // Add local node
         let local_info = NodeInfo {
             peer_id: local_peer_id,
-            socket_addr: None,
+            addrs: Vec::new(),
             profile: local_profile,
             last_seen: Instant::now(),
             is_local: true,
@@ -188,28 +228,63 @@ impl ClusterTopology {
     }
 
     /// Add or update a node in the topology.
-    pub fn add_node(&mut self, peer_id: PeerId, socket_addr: Option<SocketAddr>) -> NodeIndex {
+    ///
+    /// `addrs` is a fabric-classified list of socket addresses for this peer,
+    /// already ranked best-first. Pass an empty Vec when only the peer-id is
+    /// known; addresses can be filled in later via [`Self::upsert_node_addr`].
+    pub fn add_node(
+        &mut self,
+        peer_id: PeerId,
+        addrs: Vec<(SocketAddr, InterfaceKind)>,
+    ) -> NodeIndex {
         if let Some(&idx) = self.peer_to_node.get(&peer_id) {
-            // Update existing node
+            // Update existing node — merge any new addresses in.
             if let Some(node) = self.graph.node_weight_mut(idx) {
-                node.socket_addr = socket_addr;
+                for (a, k) in addrs {
+                    node.upsert_addr(a, k);
+                }
                 node.last_seen = Instant::now();
             }
             idx
         } else {
-            // Add new node
-            let info = NodeInfo {
+            let mut info = NodeInfo {
                 peer_id,
-                socket_addr,
+                addrs: Vec::new(),
                 profile: NodeProfile::default(),
                 last_seen: Instant::now(),
                 is_local: false,
             };
+            for (a, k) in addrs {
+                info.upsert_addr(a, k);
+            }
 
             let idx = self.graph.add_node(info);
             self.peer_to_node.insert(peer_id, idx);
             debug!("Added node {} to topology", peer_id);
             idx
+        }
+    }
+
+    /// Upsert a single address for a peer. Used by discovery as it learns
+    /// about additional fabric paths to the same node.
+    pub fn upsert_node_addr(&mut self, peer_id: &PeerId, addr: SocketAddr, kind: InterfaceKind) {
+        if let Some(&idx) = self.peer_to_node.get(peer_id)
+            && let Some(node) = self.graph.node_weight_mut(idx)
+        {
+            node.upsert_addr(addr, kind);
+            node.last_seen = Instant::now();
+        }
+    }
+
+    /// Replace the local node's advertised addresses.
+    pub fn set_local_addrs(&mut self, addrs: Vec<(SocketAddr, InterfaceKind)>) {
+        if let Some(&idx) = self.peer_to_node.get(&self.local_peer_id)
+            && let Some(node) = self.graph.node_weight_mut(idx)
+        {
+            node.addrs.clear();
+            for (a, k) in addrs {
+                node.upsert_addr(a, k);
+            }
         }
     }
 
@@ -283,9 +358,9 @@ impl ClusterTopology {
             .and_then(|idx| self.graph.node_weight(*idx))
     }
 
-    /// Get socket addresses of all remote nodes.
+    /// Get socket addresses of all remote nodes (best fabric per peer).
     pub fn remote_socket_addrs(&self) -> Vec<SocketAddr> {
-        self.remote_nodes().filter_map(|n| n.socket_addr).collect()
+        self.remote_nodes().filter_map(|n| n.socket_addr()).collect()
     }
 
     /// Check if the topology forms a valid ring for all-reduce.
@@ -359,10 +434,8 @@ impl ClusterTopology {
         }
     }
 
-    /// Check if all connections in the ring are Thunderbolt.
-    ///
-    /// Returns true if every node has at least one Thunderbolt connection
-    /// to the next node in ring order.
+    /// Check if every node in the ring has a Thunderbolt-classified primary
+    /// address. Used for routing decisions and `pmetal cluster status`.
     pub fn has_thunderbolt_ring(&self) -> bool {
         let order = self.ring_order();
         if order.len() < 2 {
@@ -370,44 +443,35 @@ impl ClusterTopology {
         }
 
         for node in &order {
-            if let Some(addr) = node.socket_addr {
-                if !is_thunderbolt_ip(&addr.ip()) {
-                    return false;
-                }
-            } else {
-                return false;
+            match node.best_addr() {
+                Some((_, InterfaceKind::Thunderbolt)) => {}
+                _ => return false,
             }
         }
 
         true
     }
 
-    /// Get nodes with Thunderbolt connections.
+    /// Get nodes whose best address is a Thunderbolt link.
     pub fn thunderbolt_nodes(&self) -> Vec<&NodeInfo> {
         self.graph
             .node_weights()
-            .filter(|n| {
-                n.socket_addr
-                    .map(|a| is_thunderbolt_ip(&a.ip()))
-                    .unwrap_or(false)
-            })
+            .filter(|n| matches!(n.best_addr(), Some((_, InterfaceKind::Thunderbolt))))
             .collect()
     }
 
-    /// Get the estimated total bandwidth for the ring.
-    ///
-    /// This is the minimum bandwidth of any link in the ring.
+    /// Get the estimated total bandwidth for the ring — i.e. the minimum
+    /// link bandwidth in best-fabric ring order.
     pub fn ring_bandwidth(&self) -> u64 {
         let order = self.ring_order();
         if order.is_empty() {
             return 0;
         }
 
-        // Estimate based on connection types
         order
             .iter()
-            .filter_map(|n| n.socket_addr)
-            .map(|a| detect_connection_type(&a).bandwidth)
+            .filter_map(|n| n.best_addr())
+            .map(|(_, kind)| kind.nominal_bandwidth_bps())
             .min()
             .unwrap_or(0)
     }
@@ -438,7 +502,7 @@ impl ClusterTopology {
                     let right = (local_rank + 1) % world_size;
 
                     if idx == left || idx == right {
-                        node.socket_addr
+                        node.socket_addr()
                             .map(|a| (a.ip(), port))
                             .unwrap_or((placeholder, 0))
                     } else {
@@ -503,7 +567,7 @@ mod tests {
 
         let remote_id = PeerId::random();
         let addr: SocketAddr = "192.168.1.100:5000".parse().unwrap();
-        topology.add_node(remote_id, Some(addr));
+        topology.add_node(remote_id, vec![(addr, InterfaceKind::Ethernet)]);
 
         assert_eq!(topology.node_count(), 2);
         assert_eq!(topology.remote_node_count(), 1);
@@ -517,7 +581,7 @@ mod tests {
 
         // Add some remote nodes
         for _ in 0..3 {
-            topology.add_node(PeerId::random(), None);
+            topology.add_node(PeerId::random(), Vec::new());
         }
 
         let order = topology.ring_order();
@@ -536,8 +600,8 @@ mod tests {
 
         let peer1 = PeerId::random();
         let peer2 = PeerId::random();
-        topology.add_node(peer1, None);
-        topology.add_node(peer2, None);
+        topology.add_node(peer1, Vec::new());
+        topology.add_node(peer2, Vec::new());
 
         let order = topology.ring_order();
         let first = &order[0].peer_id;
@@ -578,17 +642,17 @@ mod tests {
     #[test]
     fn test_connection_profiles() {
         let tb = ConnectionProfile::thunderbolt(Some("en2".to_string()));
-        assert!(tb.is_thunderbolt);
+        assert!(tb.is_thunderbolt());
         assert_eq!(tb.rdma_interface, Some("rdma_en2".to_string()));
         assert!(tb.bandwidth >= 5_000_000_000); // 5 GB/s
 
         let wifi = ConnectionProfile::wifi();
-        assert!(!wifi.is_thunderbolt);
+        assert!(!wifi.is_thunderbolt());
         assert!(wifi.rdma_interface.is_none());
 
         let eth = ConnectionProfile::ethernet();
-        assert!(!eth.is_thunderbolt);
-        assert_eq!(eth.bandwidth, 1_000_000_000); // 1 Gbps
+        assert!(!eth.is_thunderbolt());
+        assert_eq!(eth.bandwidth, InterfaceKind::Ethernet.nominal_bandwidth_bps());
     }
 
     #[test]
@@ -596,23 +660,43 @@ mod tests {
         let local_id = PeerId::random();
         let mut topology = ClusterTopology::new(local_id, test_profile());
 
-        // Add nodes with Thunderbolt addresses
         let peer1 = PeerId::random();
         let tb_addr1: SocketAddr = "169.254.1.100:5000".parse().unwrap();
-        topology.add_node(peer1, Some(tb_addr1));
+        topology.add_node(peer1, vec![(tb_addr1, InterfaceKind::Thunderbolt)]);
 
-        // One node without Thunderbolt - ring should not be Thunderbolt
+        // Local node has no addresses yet — ring is incomplete.
         assert!(!topology.has_thunderbolt_ring());
 
-        // Update local node with Thunderbolt address
-        if let Some(idx) = topology.peer_to_node.get(&local_id)
-            && let Some(node) = topology.graph.node_weight_mut(*idx)
-        {
-            node.socket_addr = Some("169.254.1.1:5000".parse().unwrap());
-        }
+        topology.set_local_addrs(vec![(
+            "169.254.1.1:5000".parse().unwrap(),
+            InterfaceKind::Thunderbolt,
+        )]);
 
-        // Now should be a Thunderbolt ring
         assert!(topology.has_thunderbolt_ring());
         assert_eq!(topology.thunderbolt_nodes().len(), 2);
+    }
+
+    #[test]
+    fn test_upsert_addr_prefers_better_fabric() {
+        let mut node = NodeInfo {
+            peer_id: PeerId::random(),
+            addrs: Vec::new(),
+            profile: NodeProfile::default(),
+            last_seen: Instant::now(),
+            is_local: false,
+        };
+        let wifi: SocketAddr = "192.168.1.50:5000".parse().unwrap();
+        let tb: SocketAddr = "169.254.1.50:5000".parse().unwrap();
+        node.upsert_addr(wifi, InterfaceKind::Wifi);
+        node.upsert_addr(tb, InterfaceKind::Thunderbolt);
+
+        // Best (Thunderbolt) is first.
+        assert_eq!(node.best_addr().unwrap().1, InterfaceKind::Thunderbolt);
+        assert_eq!(node.best_addr().unwrap().0, tb);
+
+        // Upserting a known addr with a stronger kind upgrades it.
+        node.upsert_addr(wifi, InterfaceKind::Ethernet);
+        let w = node.addrs.iter().find(|(a, _)| *a == wifi).unwrap();
+        assert_eq!(w.1, InterfaceKind::Ethernet);
     }
 }
