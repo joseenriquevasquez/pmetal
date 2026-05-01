@@ -7,9 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-04-08
+## [0.5.0] - 2026-05-01
 
 ### Added
+
+#### Distributed inference & training
+
+- **`pmetal-distributed` crate (Phases 1-4 + 7)**: Thunderbolt-fabric-aware multi-Mac cluster runtime with feature-gated tensor, expert, context, ZeRO, and pipeline parallelism modules
+  - `pmetal cluster` CLI: per-node launch, ring/mesh topology discovery, fabric handshake
+  - Pipeline harness with overlap of computation and Thunderbolt transfers
+  - Canonical expert-rank mapping + per-architecture MoE/MLA tensor-parallel plans
+  - Ring all-reduce / all-gather with corrected chunk indexing
+
+#### TurboQuant KV cache (production-ready)
+
+- **TurboQuant KV cache quantization**: Provably near-optimal KV cache compression based on random rotation + Lloyd-Max scalar quantization + QJL residual for unbiased inner products (arXiv:2504.19874). Achieves 4-6x KV cache compression with near-zero quality loss. Available via `--kv-turboquant` or presets `--kv-turboquant-preset q3_5` (near-lossless) / `q2_5` (6.4x compression)
+  - Separate key/value runtimes with independent bit widths and outlier-aware mixed-precision
+  - Direct attention path for single-token decode avoids full cache dequantization
+  - Data-oblivious (no calibration data required) — quantizes KV entries online as generated
+  - Precomputed codebooks via Lloyd-Max algorithm for Beta distribution (deterministic from seed)
+  - Metal kernel backend with CPU fallback
+  - **Phase 0**: split monolithic `mod.rs` (6101 → 222 LOC) into config/core/state/bits/math submodules
+  - **Phase 3**: GPU-resident hot/cold pipeline + Mixed K/V storage; `mixed_score` as layout oracle
+  - **Phase A/B**: QJL ablation harness (feature-gated) + per-row `key_slot_scale` codebook adaptation
+  - **Phase C/C′**: Variant F drop-QJL opt-in path; d128/d256 `no_qjl_2pass` fast paths (4..=8 bits)
+  - **Phase D**: `TurboQuantPackMode` config + Fullbyte dense-values kernel
+  - **Phase E**: `TurboQuantOutlierMode` — encode-side top-K outlier storage, zero pre-quant + decode override, outlier-bias on d128/d256 fullbyte score kernel; CPU mirror in scalar encode/decode
+  - **Phase F**: Hamming skip-list dispatch — `skiplist_threshold` config, GPU `sign_hash` buffer, Metal Hamming-distances kernel + FFI, GQA support
+  - Mixed-precision attention parity baseline; defensive residual-norm clamp + NaN-safe encode
+
+- **Asymmetric K/V head dimensions**: KV cache, TurboQuant, and fused attention now support models where key and value projections have different widths (e.g. DeepSeek MLA with `qk_head_dim != v_head_dim`)
+
+- **`pmetal serve --kv-turboquant`**: TurboQuant KV cache in the serving engine with `--kv-turboquant-preset q3_5` for near-lossless 4.6x KV compression in production
+
+#### Inference server (OpenAI- + Anthropic-compatible)
+
+- **Continuous batching with shared prefix cache** in `pmetal-serve`: per-request slot scheduling, KV-cache prefix sharing, concurrent decode for many simultaneous chats
+- **Anthropic-compatible `/v1/messages` endpoint**: streaming `message_start` → `content_block_start` → `content_block_delta*` → `content_block_stop` → `message_delta` → `message_stop` events; non-streaming JSON path
+- **`/v1/embeddings` endpoint**: 20 architectures supported via `forward_hidden` (Llama/Llama4/Qwen2/Qwen3/Qwen3MoE/Qwen3Next/Mistral/Gemma/Gemma4/Phi/Phi4/DeepSeek/Cohere/Granite/GptOss/StarCoder2/NemotronH/FalconH1/RecurrentGemma/Jamba/BERT) — pooling via `pmetal_models::pooling`
+- **Token logprobs**: `SamplingParams.logprobs_top_n` plumbed end-to-end through non-streaming and SSE streaming on both `/v1/chat/completions` and `/v1/completions`. New `pmetal_models::generation::token_logprobs` primitive; ANE/CPU paths emit `logprob: None`
+- **Best-effort tool calling on `/v1/chat/completions`**: `try_parse_tool_calls` accepts `{name, arguments}` or `{tool_calls: [...]}`. `ChatCompletionRequest.tools` gates the attempt; chat templating threads tool defs into the rendered prompt
+- **`IncrementalDecoder<Aux>` SSE buffer**: shared UTF-8 boundary buffer + per-token aux pipelining (used for logprobs alignment) across chat/completions/anthropic streams
+
+#### Job orchestration substrate (TUI / GUI / MCP / CLI parity)
+
+- **`JobSpec` substrate**: 16 canonical spec types in `pmetal-core` (Train, Distill, GRPO, Bench, Eval, Pretrain, Tokenize, Serve, Generate, RLKD, EmbedTrain, DFlash, Memory, Ollama, …) with `#[derive(JobSpec)]` proc-macro
+- **`JobEvent` canonical streaming protocol**: progress / metric / log / artefact / complete / failed events emitted by all 4 surfaces (CLI, TUI, GUI, MCP)
+- **CLI**: 8 specced `Commands` variants flattened — 613 LOC removed from `main.rs`; `cli/<sub>.rs` Args structs and JobSpec argv round-trip tests; `--log-events` flag stub
+- **TUI**: 14 tabs with full CLI parity, `?`-key help overlay, `Ctrl+1..9` tab jump, active-job footer badge, descriptor-driven forms with shared `FormTabState` primitive; channel-based metrics streaming (`ChannelMetricsCallback`) for direct-path train/distill/grpo/bench/eval/pretrain
+- **GUI (Tauri)**: complete 9-DTO frontend-lockstep migration to `*Spec` types; Serve, Bench, Eval, Jobs, Pretrain pages; embed-train + rlkd + ollama routes; channel-based metrics streaming
+- **MCP**: 9 tools migrated + 11 generate flags + tokenize/memory/dflash; `train` tool migrated with JobEvent JSONL consumer
+
+#### SOTA distillation (`pmetal-distill`)
+
+- **Universal Logit Distillation (ULD)** — Wasserstein-1 over sorted logit distributions for cross-tokenizer KD (Boizard et al. 2024); optional `top_k` truncation; permutation-invariant by design
+- **Generalized Knowledge Distillation (GKD)** — λ-weighted off-policy + on-policy KL blend (Agarwal et al. 2024); `OnPolicySampler` trait with `GreedySampler` reference impl; `compute_full(t_off, s_off, t_on, s_on, T)`
+- **MiniLLM** — reverse-KL with optional teacher-mix `target = mix·T + (1-mix)·S` (Gu et al. 2024)
+- **Skewed JSD (DistiLLM-2)** — `α·KL(T||M_α) + (1-α)·KL(S||M_α)` with `M_α = α·T + (1-α)·S`, log-sum-exp computation; α=0.5 reduces to standard symmetric JSD (Ko et al. 2024)
+- **Attention-transfer loss + weighted Metal path** for hidden-state distillation
+- **Offline teacher-logit caching**: `pmetal distill --offline-cache <path>` precomputes teacher logits to disk; new `Int8PerToken` compressed-block variant replaces NaN-sentinel scheme with explicit `per_token_meta` field (legacy `Int8` variant retained for read-back)
+- **`DistillLossOutput.metrics: HashMap<&'static str, f32>`**: lazily-evaluated `teacher_entropy`, `student_entropy`, `kl_per_token`, `top1_agreement` exposed to trainer JSONL/TUI streaming
+- **TAID difficulty-aware** observability: `alpha_var` surfaced for per-step monitoring
+- **Configurable `ignore_index`**: PyTorch-standard `-100` default on `TrainingConfig`; safe label clamping before gather
+- **Hidden-state shape assertions** before matmul (clear error vs. silent broadcast bug)
+
+#### SOTA model merging (`pmetal-merge`)
+
+- **Fisher merging** (Matena & Raffel 2022): diagonal-Fisher-weighted average `θ = Σ F_i⊙θ_i / (Σ F_i + ε)`; lazy-loaded Fisher safetensors; `fallback_to_mean` for tensors without Fisher entries
+- **RegMean** (Jin et al. 2023): closed-form linear-layer merge `W = (Σ G_i)⁻¹ · (Σ G_i W_i)` via hand-rolled Gauss-Jordan `pseudo_inverse_2d` with Tikhonov ridge; falls back to mean for non-2D weights
+- **MoE expert permutation alignment**: per-(model, layer) Hungarian solver (Jonker-Volgenant style, O(N³)) over L2-normalized cosine similarity of expert fingerprints; tensor-name remapping `experts.{i}.` → `experts.{π(i)}.` before merge; gated by `align_moe_experts`
+- **Honor `config.dtype` in save path**: `MergeBuilder.dtype` builder, `TensorWriter::with_dtype` plumbing, per-dtype byte packing for F16/BF16/F32; previously hardcoded to F16
+- **Cross-model dtype consistency check**: `verify_source_dtypes` errors on mismatch unless `allow_mixed_dtype` is set
+- **Tied-embedding detection**: `lm_head.weight` and `embed_tokens.weight` aliasing detected and merged once under canonical name
+- **Tokenizer + config sidecar copy**: `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`, `config.json`, `generation_config.json` copied on full-model merge; `config.json.torch_dtype` patched to match output dtype
+- **Post-merge sanity sweep** (`SanityLevel::{Off,Quick,Full}`, default `Quick`): NaN/inf detection aborts save; full mode reports per-tensor `mean/std/abs_max/sparsity`
+- **`MergeConfig.dry_run`**: short-circuits write phase, logs would-write summary
+
+#### LoRA / QLoRA — full text-architecture coverage
+
+- New LoRA adapters: **Granite, Llama4, DeepSeek, NemotronH, MLlama, Cohere, Phi, Gemma4, GPT-OSS, Qwen3-MoE, Qwen3-Next**
+- New QLoRA adapters: **Granite, Llama4, DeepSeek, NemotronH, Cohere, Phi, Gemma4, GPT-OSS, Qwen3-MoE, Qwen3-Next**
+- **LoRA+** wired into `run_compiled` training path; Gemma4 QLoRA KV-cache path
+- **DeepSeek `merge_lora`** properly implemented; Phi4 dispatched to existing `PhiLoraForCausalLM`
+- Interface-parity gradient-checkpointing hooks across 7 adapters
+
+#### Bridge & native paths
+
+- **Fused [T=1] decode kernels** for `gpt_oss` and `llama4` (Bridge Phase 4)
+- **Fused [N,1] batched-decode** path for Tier-1/2 architectures
+- **`BRIDGE_TRY_{DST,VOID}` error coverage**: thread-local exception slot replaces process-abort across most ops; `pmetal_bridge::check_last_error()?` surfaces `BridgeError::CxxException` after any op; `InlineArray::try_*` variants for matmul/softmax/reshape/sdpa/gather_mm/dequantize/etc.
+- **Scalar dtype footgun fix**: `InlineArray::scalar_like(value, peer)` + `mul_scalar`/`add_scalar`/`sub_scalar`/`div_scalar` eliminate manual `.as_dtype(model_dtype)` calls
+- **`async_eval` actually async**: prior implementation blocked the calling thread
+- Bridge file splits: `bridge.h` and `bridge.cpp` carved into `cpp/bridge/` sub-headers + 6 source files; `bridge_turboquant.cpp` split by kernel family; `inline_array.rs`, `qwen3_native.rs`, `deepseek_native.rs`, `llama4_native.rs`, `gpt_oss_native.rs` split into submodule directories
+- **`forward_hidden`** for 20 architectures (embeddings + retrieval support)
+
+#### Preference & RL trainers (`pmetal-trainer`)
+
+- **`PairedPreferenceTrainer<L>` trait + `DpoLoss` kernel**: `DpoTrainer::train` and `OnlineDpoTrainer::train_step` now delegate to the shared trainer; `ReferenceStrategy::{StopGradient, Zero, Precomputed}` covers the three reference-logp sources
+- **Shared log-prob helpers** fanned out to KTO/ORPO/GRPO/OnlineDPO via `logprob_utils::{compute_log_probs, compute_log_probs_with_avg, shifted_selective_log_softmax}`
 
 - **`pmetal-bridge` crate**: Zero-allocation MLX C++ bridge replacing mlx-rs as the core runtime. Native inference at 201 tok/s (Qwen3.5 0.8B), 4-bit quantized inference (28 tok/s on 27B), compiled attention, KV cache trimming, and full training ops (autograd, optimizer, random, math, reduction, comparison) — all without mlx-rs overhead
 
@@ -79,6 +174,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Split `compat.rs` (3620 lines) into 7-file `compat/` module directory
 - Split `bridge.cpp` (6749 lines) into 6 C++ source files with shared `bridge_internal.h`
 - `Array::id()` replaces `data_ptr()` for weight change detection — safe with lazy evaluation
+- **Persistent MLX build cache** in CI and `build.rs`: skips redundant cmake compilation across CI runs
+- **`pmetal_hub::resolve_model_path`** adopted across `core`, `cli`, and `gui` for consistent local-cache → Hub-ID resolution
+- **Distillation orchestration stubs removed**: `Distiller::run_online`/`run_offline`/`run_progressive` deleted — orchestration now lives entirely in `pmetal-trainer`
+- **MLX MoE routing audit**: confirmed no `argpartition(-scores, -k)` anti-top-k regressions remain; documented as a permanent footgun
+- **`MergeMethod` trait** extended with `merge_named(name, …)` (default forwards to `merge`); Fisher and RegMean dispatch through name-aware path
 
 ### Fixed
 
@@ -91,6 +191,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **select_axis parameter order**: standardized (data, index, axis) across all call sites
 - **Lazy array segfaults**: diffusion sampler now evals sigmas/timesteps before slice access
 - **Sampling penalties**: correctly wired through native bridge decode path
+- **Qwen3-Next MoE routing**: corrected anti-top-k expert selection bug (sign/slice pair)
+- **Qwen3-Next hybrid cache flag** in LoRA + distillation paths
+- **TurboQuant d128 pass-2** cross-simdgroup reduction; lazy-transpose footgun in mixed-precision attention
+- **GKD `compute_weighted`** no longer scales by `(1-λ)` (silently zeroed training at λ=1.0)
+- **`pmetal_serve::sse::IncrementalDecoder`** prevents UTF-8 boundary panics on partial codepoint emission
 - Zero clippy warnings across entire workspace
 - Stale `pmetal-mlx-sys` metallib path in release workflow (renamed to `pmetal-bridge`)
 
@@ -99,6 +204,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **mlx-rs dependency**: Fully replaced by `pmetal-bridge` — removes ~15K lines of Rust FFI bindings
 - 1065 lines of dead code: `qwen3_train.rs`, unused LoRA functions in `qwen3_native.rs`
 - 5 superseded LoRA training modules
+- **Dropped support for StarCoder2 (training-side), FalconH1, RecurrentGemma, Jamba**: hybrid attention+SSM architectures with insufficient MLX support remain inference-only or removed entirely
+- **`Distiller::run_*` orchestration stubs** (now lives in `pmetal-trainer`)
 
 ## [0.4.0] - 2026-03-23
 

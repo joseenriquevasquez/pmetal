@@ -139,8 +139,7 @@ impl PipelineHarness {
                         .collect()
                 })
                 .collect();
-            let profiles: Vec<NodeProfile> =
-                order.iter().map(|n| n.profile.clone()).collect();
+            let profiles: Vec<NodeProfile> = order.iter().map(|n| n.profile.clone()).collect();
             (peer_addrs, profiles, local_rank, world_size)
         };
 
@@ -223,9 +222,7 @@ impl PipelineHarness {
             let result_listener_addr: SocketAddr = ([0, 0, 0, 0], cfg.result_port).into();
             let listener = tokio::net::TcpListener::bind(result_listener_addr)
                 .await
-                .map_err(|e| {
-                    DistributedError::Protocol(format!("bind result_port: {e}"))
-                })?;
+                .map_err(|e| DistributedError::Protocol(format!("bind result_port: {e}")))?;
             let timeout = std::time::Duration::from_millis(cfg.connection_timeout_ms);
             let (stream, _from) = tokio::time::timeout(timeout, listener.accept())
                 .await

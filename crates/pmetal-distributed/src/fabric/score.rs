@@ -114,12 +114,7 @@ mod tests {
 
     #[test]
     fn zero_bandwidth_is_infinity_cost() {
-        let s = score_link(
-            InterfaceKind::Ethernet,
-            Duration::from_micros(500),
-            0,
-            MB,
-        );
+        let s = score_link(InterfaceKind::Ethernet, Duration::from_micros(500), 0, MB);
         assert!(s.cost_us.is_infinite());
     }
 }

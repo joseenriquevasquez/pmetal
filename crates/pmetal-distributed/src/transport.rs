@@ -293,9 +293,14 @@ impl TcpTransport {
         // Bind on 0.0.0.0:<my_port> so we accept on every local interface.
         // Falling back to a specific address would mean a TB cable disconnect
         // breaks the listener even though Ethernet is still up.
-        let bind_addr: std::net::SocketAddr =
-            SocketAddr::new("0.0.0.0".parse().expect("0.0.0.0 always parses"), my_addr.port());
-        info!("Node {} listening on {} (advertised as {})", rank, bind_addr, my_addr);
+        let bind_addr: std::net::SocketAddr = SocketAddr::new(
+            "0.0.0.0".parse().expect("0.0.0.0 always parses"),
+            my_addr.port(),
+        );
+        info!(
+            "Node {} listening on {} (advertised as {})",
+            rank, bind_addr, my_addr
+        );
         let listener = TcpListener::bind(bind_addr).await?;
 
         let next_rank = (rank + 1) % world_size;
@@ -309,11 +314,8 @@ impl TcpTransport {
         }
 
         // Walk fabrics in priority order, retrying each before falling through.
-        let connect_fut = Self::connect_with_fallback(
-            next_rank,
-            &next_endpoints,
-            config.max_retries,
-        );
+        let connect_fut =
+            Self::connect_with_fallback(next_rank, &next_endpoints, config.max_retries);
 
         // Accept connection from previous peer.
         let accept_fut = async {

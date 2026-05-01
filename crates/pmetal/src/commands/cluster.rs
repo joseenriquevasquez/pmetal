@@ -19,9 +19,7 @@ use pmetal_distributed::topology::NodeProfile;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cli::cluster::{
-    BenchArgs, ClusterSubcommand, PipelineBenchArgs, StatusArgs, UpArgs,
-};
+use crate::cli::cluster::{BenchArgs, ClusterSubcommand, PipelineBenchArgs, StatusArgs, UpArgs};
 
 pub async fn run(cmd: ClusterSubcommand) -> Result<()> {
     match cmd {
@@ -148,9 +146,12 @@ async fn run_status(args: StatusArgs) -> Result<()> {
                     })
                 })
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "local_interfaces": local,
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "local_interfaces": local,
+                }))?
+            );
         } else {
             println!("Local fabric (no discovery):");
             for i in fabric.interfaces() {
@@ -195,16 +196,14 @@ async fn run_bench(args: BenchArgs) -> Result<()> {
         profile: NodeProfile::default(),
     };
 
-    println!("pmetal cluster bench — discovering peers (timeout {}s, min={})",
-        args.timeout_secs, args.min_peers);
+    println!(
+        "pmetal cluster bench — discovering peers (timeout {}s, min={})",
+        args.timeout_secs, args.min_peers
+    );
 
-    let backend = join_cluster(
-        cfg,
-        args.min_peers,
-        Duration::from_secs(args.timeout_secs),
-    )
-    .await
-    .context("failed to join cluster for bench")?;
+    let backend = join_cluster(cfg, args.min_peers, Duration::from_secs(args.timeout_secs))
+        .await
+        .context("failed to join cluster for bench")?;
 
     let world = backend.world_size();
     println!(
@@ -221,7 +220,10 @@ async fn run_bench(args: BenchArgs) -> Result<()> {
             .context("all-reduce bench failed")?;
 
     let median = median_gbps(&samples);
-    let min = samples.iter().map(|s| s.gbps()).fold(f64::INFINITY, f64::min);
+    let min = samples
+        .iter()
+        .map(|s| s.gbps())
+        .fold(f64::INFINITY, f64::min);
     let max = samples
         .iter()
         .map(|s| s.gbps())
@@ -283,13 +285,9 @@ async fn run_pipeline_bench(args: PipelineBenchArgs) -> Result<()> {
         args.timeout_secs, args.min_peers
     );
 
-    let backend = join_cluster(
-        cfg,
-        args.min_peers,
-        Duration::from_secs(args.timeout_secs),
-    )
-    .await
-    .context("failed to join cluster for pipeline bench")?;
+    let backend = join_cluster(cfg, args.min_peers, Duration::from_secs(args.timeout_secs))
+        .await
+        .context("failed to join cluster for pipeline bench")?;
 
     let world = backend.world_size();
     if world < 2 {
@@ -319,8 +317,7 @@ async fn run_pipeline_bench(args: PipelineBenchArgs) -> Result<()> {
     );
 
     if local_rank == 0 {
-        let mut gen_loop =
-            PipelineGenerationLoop::new(harness.stage, args.tokens, vec![u32::MAX]);
+        let mut gen_loop = PipelineGenerationLoop::new(harness.stage, args.tokens, vec![u32::MAX]);
 
         // Stub hidden state: zero-filled f32 [1, 1, hidden_dim].
         let hidden: Vec<u8> = vec![0u8; args.hidden_dim * 4];
@@ -375,8 +372,7 @@ async fn run_pipeline_bench(args: PipelineBenchArgs) -> Result<()> {
                     .await
                     .context("send_result")?;
             } else {
-                let last_layer =
-                    gen_loop.stage.config().layer_range.end.saturating_sub(1) as u32;
+                let last_layer = gen_loop.stage.config().layer_range.end.saturating_sub(1) as u32;
                 gen_loop
                     .stage
                     .send_to_next(&logits, &[1, 1, vocab as u32], nonce, last_layer)

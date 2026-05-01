@@ -360,7 +360,9 @@ impl ClusterTopology {
 
     /// Get socket addresses of all remote nodes (best fabric per peer).
     pub fn remote_socket_addrs(&self) -> Vec<SocketAddr> {
-        self.remote_nodes().filter_map(|n| n.socket_addr()).collect()
+        self.remote_nodes()
+            .filter_map(|n| n.socket_addr())
+            .collect()
     }
 
     /// Check if the topology forms a valid ring for all-reduce.
@@ -652,7 +654,10 @@ mod tests {
 
         let eth = ConnectionProfile::ethernet();
         assert!(!eth.is_thunderbolt());
-        assert_eq!(eth.bandwidth, InterfaceKind::Ethernet.nominal_bandwidth_bps());
+        assert_eq!(
+            eth.bandwidth,
+            InterfaceKind::Ethernet.nominal_bandwidth_bps()
+        );
     }
 
     #[test]

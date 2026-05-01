@@ -614,8 +614,10 @@ mod tests {
         // build advertised addrs → set on local node. We verify that the
         // local node's primary fabric is the highest-ranked interface.
         let local_id = libp2p::PeerId::random();
-        let mut topo =
-            crate::topology::ClusterTopology::new(local_id, crate::topology::NodeProfile::default());
+        let mut topo = crate::topology::ClusterTopology::new(
+            local_id,
+            crate::topology::NodeProfile::default(),
+        );
 
         let fabric = fabric_with(vec![
             (

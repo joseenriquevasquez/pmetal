@@ -39,12 +39,9 @@ const STOP_TOKEN: u32 = 9999;
 async fn run_worker() {
     use std::str::FromStr;
 
-    let rank: usize =
-        usize::from_str(&std::env::var(ENV_RANK).expect("rank")).expect("parse rank");
-    let port_0: u16 =
-        u16::from_str(&std::env::var(ENV_ACT0).expect("act0")).expect("parse act0");
-    let port_1: u16 =
-        u16::from_str(&std::env::var(ENV_ACT1).expect("act1")).expect("parse act1");
+    let rank: usize = usize::from_str(&std::env::var(ENV_RANK).expect("rank")).expect("parse rank");
+    let port_0: u16 = u16::from_str(&std::env::var(ENV_ACT0).expect("act0")).expect("parse act0");
+    let port_1: u16 = u16::from_str(&std::env::var(ENV_ACT1).expect("act1")).expect("parse act1");
     let result_port: u16 =
         u16::from_str(&std::env::var(ENV_RESULT).expect("res")).expect("parse res");
 
@@ -55,8 +52,14 @@ async fn run_worker() {
     // on loopback. The harness binds 0.0.0.0:port internally.
     let peer_addrs = vec![vec![addr_0], vec![addr_1]];
     let profiles = vec![
-        NodeProfile { available_ram: 1 << 30, ..NodeProfile::default() },
-        NodeProfile { available_ram: 1 << 30, ..NodeProfile::default() },
+        NodeProfile {
+            available_ram: 1 << 30,
+            ..NodeProfile::default()
+        },
+        NodeProfile {
+            available_ram: 1 << 30,
+            ..NodeProfile::default()
+        },
     ];
 
     let cfg = PipelineHarnessConfig {
@@ -81,11 +84,8 @@ async fn run_worker() {
     );
 
     if rank == 0 {
-        let mut gen_loop = PipelineGenerationLoop::new(
-            harness.stage,
-            TOKENS_TO_GENERATE,
-            vec![STOP_TOKEN],
-        );
+        let mut gen_loop =
+            PipelineGenerationLoop::new(harness.stage, TOKENS_TO_GENERATE, vec![STOP_TOKEN]);
 
         let hidden: Vec<u8> = vec![0u8; HIDDEN_DIM * 4];
         let shape = [1u32, 1, HIDDEN_DIM as u32];
@@ -175,9 +175,7 @@ fn pipeline_harness_two_process_smoke() {
     let port_1 = grab_free_port();
     let result_port = grab_free_port();
 
-    eprintln!(
-        "parent: spawning ranks (act0={port_0}, act1={port_1}, result={result_port})"
-    );
+    eprintln!("parent: spawning ranks (act0={port_0}, act1={port_1}, result={result_port})");
 
     let mut child_0 = std::process::Command::new(&bin)
         .env(ENV_RANK, "0")

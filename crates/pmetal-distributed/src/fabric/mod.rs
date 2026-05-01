@@ -54,10 +54,10 @@ impl InterfaceKind {
     /// starting weight before measured probes refine it.
     pub fn nominal_bandwidth_bps(self) -> u64 {
         match self {
-            InterfaceKind::Loopback => 50_000_000_000,    // 50 GB/s memcpy-ish
-            InterfaceKind::Thunderbolt => 5_000_000_000,  // 40 Gbps / 8
-            InterfaceKind::Ethernet => 125_000_000,       // 1 Gbps / 8 (conservative)
-            InterfaceKind::Wifi => 100_000_000,           // 800 Mbps / 8
+            InterfaceKind::Loopback => 50_000_000_000, // 50 GB/s memcpy-ish
+            InterfaceKind::Thunderbolt => 5_000_000_000, // 40 Gbps / 8
+            InterfaceKind::Ethernet => 125_000_000,    // 1 Gbps / 8 (conservative)
+            InterfaceKind::Wifi => 100_000_000,        // 800 Mbps / 8
             InterfaceKind::Unknown => 50_000_000,
         }
     }

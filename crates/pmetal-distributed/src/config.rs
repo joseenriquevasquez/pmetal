@@ -60,9 +60,10 @@ impl DistributedConfig {
         for endpoint_list in endpoints {
             let mut iter = endpoint_list.into_iter();
             // Empty endpoint lists become a placeholder; validate() will reject.
-            nodes.push(iter.next().unwrap_or_else(|| {
-                "0.0.0.0:0".parse().expect("placeholder addr always valid")
-            }));
+            nodes
+                .push(iter.next().unwrap_or_else(|| {
+                    "0.0.0.0:0".parse().expect("placeholder addr always valid")
+                }));
             fallback_addrs.push(iter.collect());
         }
         Self {

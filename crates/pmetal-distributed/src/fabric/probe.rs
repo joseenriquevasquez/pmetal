@@ -123,9 +123,9 @@ impl LocalFabric {
 
     /// True if at least one Thunderbolt-classified interface has a link-local IP.
     pub fn has_active_thunderbolt(&self) -> bool {
-        self.interfaces.iter().any(|i| {
-            i.kind == InterfaceKind::Thunderbolt && i.addrs.iter().any(is_link_local_ipv4)
-        })
+        self.interfaces
+            .iter()
+            .any(|i| i.kind == InterfaceKind::Thunderbolt && i.addrs.iter().any(is_link_local_ipv4))
     }
 }
 
@@ -158,9 +158,18 @@ pub fn probe_local_fabric() -> LocalFabric {
     interfaces.sort_by_key(|i| std::cmp::Reverse(i.kind));
 
     debug!(
-        thunderbolt = interfaces.iter().filter(|i| i.kind == InterfaceKind::Thunderbolt).count(),
-        ethernet   = interfaces.iter().filter(|i| i.kind == InterfaceKind::Ethernet).count(),
-        wifi       = interfaces.iter().filter(|i| i.kind == InterfaceKind::Wifi).count(),
+        thunderbolt = interfaces
+            .iter()
+            .filter(|i| i.kind == InterfaceKind::Thunderbolt)
+            .count(),
+        ethernet = interfaces
+            .iter()
+            .filter(|i| i.kind == InterfaceKind::Ethernet)
+            .count(),
+        wifi = interfaces
+            .iter()
+            .filter(|i| i.kind == InterfaceKind::Wifi)
+            .count(),
         "local fabric probe complete"
     );
 
@@ -330,6 +339,11 @@ mod tests {
     fn probe_runs_without_panicking() {
         let fabric = probe_local_fabric();
         // Loopback is always present.
-        assert!(fabric.interfaces().iter().any(|i| i.kind == InterfaceKind::Loopback));
+        assert!(
+            fabric
+                .interfaces()
+                .iter()
+                .any(|i| i.kind == InterfaceKind::Loopback)
+        );
     }
 }

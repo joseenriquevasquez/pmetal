@@ -48,7 +48,11 @@ impl ClusterStatus {
         ));
         s.push_str(&format!(
             "Thunderbolt ring: {}\n\n",
-            if self.has_thunderbolt_ring { "yes" } else { "no" }
+            if self.has_thunderbolt_ring {
+                "yes"
+            } else {
+                "no"
+            }
         ));
 
         s.push_str("Local interfaces:\n");
@@ -123,11 +127,7 @@ pub fn snapshot_status(backend: &AutoDiscoveryBackend) -> ClusterStatus {
         .interfaces()
         .iter()
         .map(|i| {
-            let addrs: Vec<SocketAddr> = i
-                .addrs
-                .iter()
-                .map(|ip| SocketAddr::new(*ip, 0))
-                .collect();
+            let addrs: Vec<SocketAddr> = i.addrs.iter().map(|ip| SocketAddr::new(*ip, 0)).collect();
             (i.name.clone(), i.kind, addrs)
         })
         .collect();
@@ -259,11 +259,15 @@ pub async fn join_cluster(
 }
 
 /// Iterate every peer's preferred fabric and aggregate counts.
-pub fn count_fabrics_in_ring(topo: &ClusterTopology) -> std::collections::BTreeMap<InterfaceKind, usize>
-{
+pub fn count_fabrics_in_ring(
+    topo: &ClusterTopology,
+) -> std::collections::BTreeMap<InterfaceKind, usize> {
     let mut counts = std::collections::BTreeMap::new();
     for n in topo.ring_order() {
-        let kind = n.best_addr().map(|(_, k)| k).unwrap_or(InterfaceKind::Unknown);
+        let kind = n
+            .best_addr()
+            .map(|(_, k)| k)
+            .unwrap_or(InterfaceKind::Unknown);
         *counts.entry(kind).or_insert(0) += 1;
     }
     counts
@@ -324,6 +328,10 @@ mod tests {
     #[test]
     fn local_fabric_snapshot_includes_loopback() {
         let f = crate::fabric::probe_local_fabric();
-        assert!(f.interfaces().iter().any(|i| i.kind == InterfaceKind::Loopback));
+        assert!(
+            f.interfaces()
+                .iter()
+                .any(|i| i.kind == InterfaceKind::Loopback)
+        );
     }
 }
