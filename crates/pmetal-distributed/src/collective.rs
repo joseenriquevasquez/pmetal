@@ -270,10 +270,12 @@ pub mod ring {
         }
 
         // === ALL-GATHER PHASE ===
-        for step in 0..(world_size - 1) {
-            let send_idx = (rank + world_size - step) % world_size;
-            let recv_idx = (rank + world_size - step - 1) % world_size;
-
+        // After scatter-reduce, rank r owns fully-reduced chunk
+        // (r + 1) % world_size. Forward that chunk first, then forward
+        // each chunk received in the previous all-gather step.
+        let mut send_idx = (rank + 1) % world_size;
+        let mut recv_idx = rank;
+        for _ in 0..(world_size - 1) {
             let (send_start, send_end) = get_chunk_range(send_idx);
             let (recv_start, recv_end) = get_chunk_range(recv_idx);
 
@@ -294,6 +296,9 @@ pub mod ring {
                 let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 buffer[recv_start + i] = val;
             }
+
+            send_idx = recv_idx;
+            recv_idx = (recv_idx + world_size - 1) % world_size;
         }
 
         debug!("Ring all-reduce complete: {} elements", len);

@@ -5,6 +5,7 @@
 
 use crate::config::DistributedConfig;
 use crate::error::DistributedError;
+use crate::namespace::NetworkNamespace;
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -20,6 +21,10 @@ const MAX_BACKOFF_MS: u64 = 5000;
 
 /// Initial backoff delay between connection retries.
 const INITIAL_BACKOFF_MS: u64 = 100;
+const NAMESPACE_HANDSHAKE_MAGIC: &[u8; 8] = b"PMETALD1";
+const NAMESPACE_HANDSHAKE_OK: u8 = 1;
+const NAMESPACE_HANDSHAKE_BAD: u8 = 0;
+const NAMESPACE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Sender half of the transport.
 pub struct TransportSender {
@@ -285,6 +290,13 @@ impl TcpTransport {
     pub async fn connect(
         config: &DistributedConfig,
     ) -> Result<(TransportSender, TransportReceiver)> {
+        Self::connect_with_namespace(config, Some(*NetworkNamespace::default().psk())).await
+    }
+
+    pub(crate) async fn connect_with_namespace(
+        config: &DistributedConfig,
+        namespace_psk: Option<[u8; 32]>,
+    ) -> Result<(TransportSender, TransportReceiver)> {
         let world_size = config.nodes.len();
         let rank = config.rank;
         let my_addr = config.nodes[rank];
@@ -314,20 +326,35 @@ impl TcpTransport {
         }
 
         // Walk fabrics in priority order, retrying each before falling through.
-        let connect_fut =
-            Self::connect_with_fallback(next_rank, &next_endpoints, config.max_retries);
+        let connect_fut = Self::connect_with_fallback(
+            next_rank,
+            &next_endpoints,
+            config.max_retries,
+            namespace_psk,
+        );
 
         // Accept connection from previous peer.
         let accept_fut = async {
-            match timeout(connection_timeout, listener.accept()).await {
-                Ok(Ok((stream, addr))) => {
+            match timeout(connection_timeout, async {
+                loop {
+                    let (mut stream, addr) =
+                        listener.accept().await.map_err(DistributedError::Io)?;
                     if let Err(e) = stream.set_nodelay(true) {
                         warn!("Failed to set TCP_NODELAY on incoming: {}", e);
                     }
+                    if let Some(psk) = namespace_psk.as_ref()
+                        && let Err(e) = server_namespace_handshake(&mut stream, psk).await
+                    {
+                        warn!("Rejected incoming connection from {}: {}", addr, e);
+                        continue;
+                    }
                     info!("Accepted connection from {}", addr);
-                    Ok(stream)
+                    return Ok(stream);
                 }
-                Ok(Err(e)) => Err(DistributedError::Io(e)),
+            })
+            .await
+            {
+                Ok(result) => result,
                 Err(_) => Err(DistributedError::Protocol(format!(
                     "Timeout waiting for incoming connection ({}ms)",
                     config.connection_timeout_ms
@@ -370,13 +397,14 @@ impl TcpTransport {
         next_rank: usize,
         endpoints: &[SocketAddr],
         max_retries: u32,
+        namespace_psk: Option<[u8; 32]>,
     ) -> std::result::Result<TcpStream, DistributedError> {
         if endpoints.is_empty() {
             return Err(DistributedError::Config(format!(
                 "no endpoints configured for next peer rank {next_rank}"
             )));
         }
-        let mut last_err: Option<std::io::Error> = None;
+        let mut last_err: Option<String> = None;
         let mut attempts: u32 = 0;
         let mut round: u32 = 0;
 
@@ -388,9 +416,19 @@ impl TcpTransport {
                 attempts += 1;
 
                 match TcpStream::connect(addr).await {
-                    Ok(stream) => {
+                    Ok(mut stream) => {
                         if let Err(e) = stream.set_nodelay(true) {
                             warn!("Failed to set TCP_NODELAY: {}", e);
+                        }
+                        if let Some(psk) = namespace_psk.as_ref()
+                            && let Err(e) = client_namespace_handshake(&mut stream, psk).await
+                        {
+                            debug!(
+                                "Namespace handshake with peer {} at {} failed: {}",
+                                next_rank, addr, e
+                            );
+                            last_err = Some(e.to_string());
+                            continue;
                         }
                         info!(
                             "Connected to next peer {} at {} (fabric {}/{}, round {})",
@@ -406,7 +444,7 @@ impl TcpTransport {
                         if round == 0 {
                             debug!("Waiting for peer {} at {} ({})", next_rank, addr, e);
                         }
-                        last_err = Some(e);
+                        last_err = Some(e.to_string());
                     }
                 }
             }
@@ -417,12 +455,76 @@ impl TcpTransport {
             tokio::time::sleep(Duration::from_millis(backoff)).await;
         }
 
-        if let Some(ioe) = last_err {
-            debug!("Final connect error to rank {}: {}", next_rank, ioe);
+        if let Some(err) = last_err {
+            debug!("Final connect error to rank {}: {}", next_rank, err);
         }
         Err(DistributedError::MaxRetriesExceeded {
             addr: endpoints[0],
             max_retries,
+        })
+    }
+}
+
+fn psk_matches(local: &[u8; 32], received: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for (a, b) in local.iter().zip(received.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+async fn client_namespace_handshake(
+    stream: &mut TcpStream,
+    psk: &[u8; 32],
+) -> std::result::Result<(), DistributedError> {
+    let mut payload = [0u8; 40];
+    payload[..8].copy_from_slice(NAMESPACE_HANDSHAKE_MAGIC);
+    payload[8..].copy_from_slice(psk);
+
+    timeout(NAMESPACE_HANDSHAKE_TIMEOUT, stream.write_all(&payload))
+        .await
+        .map_err(|_| DistributedError::Protocol("namespace handshake write timed out".into()))??;
+
+    let mut ack = [0u8; 1];
+    timeout(NAMESPACE_HANDSHAKE_TIMEOUT, stream.read_exact(&mut ack))
+        .await
+        .map_err(|_| DistributedError::Protocol("namespace handshake ack timed out".into()))??;
+
+    if ack[0] == NAMESPACE_HANDSHAKE_OK {
+        Ok(())
+    } else {
+        Err(DistributedError::NamespaceMismatch {
+            expected: "local namespace PSK".into(),
+            actual: "remote rejection".into(),
+        })
+    }
+}
+
+async fn server_namespace_handshake(
+    stream: &mut TcpStream,
+    psk: &[u8; 32],
+) -> std::result::Result<(), DistributedError> {
+    let mut payload = [0u8; 40];
+    timeout(NAMESPACE_HANDSHAKE_TIMEOUT, stream.read_exact(&mut payload))
+        .await
+        .map_err(|_| DistributedError::Protocol("namespace handshake read timed out".into()))??;
+
+    let mut received_psk = [0u8; 32];
+    received_psk.copy_from_slice(&payload[8..]);
+    let valid = &payload[..8] == NAMESPACE_HANDSHAKE_MAGIC && psk_matches(psk, &received_psk);
+    let ack = if valid {
+        NAMESPACE_HANDSHAKE_OK
+    } else {
+        NAMESPACE_HANDSHAKE_BAD
+    };
+    let _ = timeout(NAMESPACE_HANDSHAKE_TIMEOUT, stream.write_all(&[ack])).await;
+
+    if valid {
+        Ok(())
+    } else {
+        Err(DistributedError::NamespaceMismatch {
+            expected: "local namespace PSK".into(),
+            actual: "remote namespace PSK".into(),
         })
     }
 }
@@ -474,7 +576,7 @@ mod tests {
         // Spawn the connect side in a task, accept in the test body.
         let connect_task = tokio::spawn(async move {
             // Tight retry budget so the unreachable fabric exhausts quickly.
-            TcpTransport::connect_with_fallback(0, &endpoints, /*max_retries=*/ 4).await
+            TcpTransport::connect_with_fallback(0, &endpoints, /*max_retries=*/ 4, None).await
         });
 
         let (_inbound, _from) = listener.accept().await.unwrap();
@@ -487,5 +589,36 @@ mod tests {
             "should have connected to the working fallback fabric, got {}",
             peer
         );
+    }
+
+    #[tokio::test]
+    async fn namespace_handshake_rejects_wrong_psk() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let good = [7u8; 32];
+        let bad = [9u8; 32];
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            server_namespace_handshake(&mut stream, &good).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client_err = client_namespace_handshake(&mut client, &bad)
+            .await
+            .expect_err("client should see namespace rejection");
+        assert!(matches!(
+            client_err,
+            DistributedError::NamespaceMismatch { .. }
+        ));
+
+        let server_err = server
+            .await
+            .expect("server task")
+            .expect_err("server should reject wrong namespace");
+        assert!(matches!(
+            server_err,
+            DistributedError::NamespaceMismatch { .. }
+        ));
     }
 }

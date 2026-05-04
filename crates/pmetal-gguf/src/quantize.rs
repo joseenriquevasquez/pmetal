@@ -172,12 +172,12 @@ fn quantize_q5_0(data: &[f32]) -> Vec<u8> {
         let mut qh = 0u32;
         let mut qs = [0u8; QK5_0 / 2];
 
-        for i in 0..16 {
+        for (i, qs_byte) in qs.iter_mut().enumerate() {
             let x0 = block_data.get(i).copied().unwrap_or(0.0);
             let x1 = block_data.get(i + 16).copied().unwrap_or(0.0);
             let q0 = nearest_int(x0 * iscale + 16.5).clamp(0, 31) as u8;
             let q1 = nearest_int(x1 * iscale + 16.5).clamp(0, 31) as u8;
-            qs[i] = (q0 & 0x0f) | ((q1 & 0x0f) << 4);
+            *qs_byte = (q0 & 0x0f) | ((q1 & 0x0f) << 4);
             qh |= u32::from((q0 & 0x10) >> 4) << i;
             qh |= u32::from((q1 & 0x10) >> 4) << (i + 16);
         }
@@ -206,12 +206,12 @@ fn quantize_q5_1(data: &[f32]) -> Vec<u8> {
         let mut qh = 0u32;
         let mut qs = [0u8; QK5_1 / 2];
 
-        for i in 0..16 {
+        for (i, qs_byte) in qs.iter_mut().enumerate() {
             let x0 = block_data.get(i).copied().unwrap_or(0.0);
             let x1 = block_data.get(i + 16).copied().unwrap_or(0.0);
             let q0 = nearest_int((x0 - min) * iscale).clamp(0, 31) as u8;
             let q1 = nearest_int((x1 - min) * iscale).clamp(0, 31) as u8;
-            qs[i] = (q0 & 0x0f) | ((q1 & 0x0f) << 4);
+            *qs_byte = (q0 & 0x0f) | ((q1 & 0x0f) << 4);
             qh |= u32::from((q0 & 0x10) >> 4) << i;
             qh |= u32::from((q1 & 0x10) >> 4) << (i + 16);
         }
@@ -447,7 +447,7 @@ fn ternary_quant(value: f32, inverse_scale: f32) -> u8 {
 #[inline]
 fn encode_five_trits(mut q: u8) -> u8 {
     q = q.saturating_mul(3);
-    ((u16::from(q) * 256 + 242) / 243) as u8
+    (u16::from(q) * 256).div_ceil(243) as u8
 }
 
 fn quantize_tq1_0(data: &[f32]) -> Vec<u8> {
@@ -480,7 +480,7 @@ fn quantize_tq1_0(data: &[f32]) -> Vec<u8> {
                     let value = block_data.get(base + m + n * 32).copied().unwrap_or(0.0);
                     q = q * 3 + ternary_quant(value, inverse_scale);
                 }
-                qs[j + m] = ((u16::from(q) * 256 + 242) / 243) as u8;
+                qs[j + m] = (u16::from(q) * 256).div_ceil(243) as u8;
             }
             base += 5 * 32;
         }
@@ -492,7 +492,7 @@ fn quantize_tq1_0(data: &[f32]) -> Vec<u8> {
                     let value = block_data.get(base + m + n * 16).copied().unwrap_or(0.0);
                     q = q * 3 + ternary_quant(value, inverse_scale);
                 }
-                qs[j + m] = ((u16::from(q) * 256 + 242) / 243) as u8;
+                qs[j + m] = (u16::from(q) * 256).div_ceil(243) as u8;
             }
             base += 5 * 16;
         }

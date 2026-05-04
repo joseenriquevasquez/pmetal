@@ -1047,6 +1047,11 @@ impl InferenceEngine {
         Ok(())
     }
 
+    /// Validate sampling parameters against this engine's serving limits.
+    pub fn validate_sampling_params(&self, params: &SamplingParams) -> ServeResult<()> {
+        Self::validate_params(params, self.max_seq_len)
+    }
+
     /// Build a `GenerationConfig` from API request sampling parameters.
     ///
     /// Temperature == 0.0 or unset maps to greedy decoding (`do_sample = false`).

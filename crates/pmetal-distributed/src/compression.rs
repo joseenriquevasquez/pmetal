@@ -181,7 +181,9 @@ impl GradientCompressor {
             CompressedData::Sparse { indices, values } => {
                 let mut result = vec![0.0f32; compressed.original_size];
                 for (&idx, &val) in indices.iter().zip(values.iter()) {
-                    result[idx as usize] = val;
+                    if let Some(slot) = result.get_mut(idx as usize) {
+                        *slot = val;
+                    }
                 }
                 result
             }
@@ -387,6 +389,10 @@ pub fn deserialize_compressed(bytes: &[u8]) -> Option<CompressedGradient> {
     let data = match strategy_id {
         0 => {
             // Full
+            let expected = original_size.checked_mul(4)?;
+            if bytes.len() != 5usize.checked_add(expected)? {
+                return None;
+            }
             let floats: Vec<f32> = bytes[5..]
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -395,12 +401,23 @@ pub fn deserialize_compressed(bytes: &[u8]) -> Option<CompressedGradient> {
         }
         1 => {
             // Sparse
+            if bytes.len() < 9 {
+                return None;
+            }
             let num_indices = u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize;
-            let indices_end = 9 + num_indices * 4;
+            let index_bytes = num_indices.checked_mul(4)?;
+            let indices_end = 9usize.checked_add(index_bytes)?;
+            let values_end = indices_end.checked_add(index_bytes)?;
+            if bytes.len() != values_end {
+                return None;
+            }
             let indices: Vec<u32> = bytes[9..indices_end]
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
+            if indices.iter().any(|&idx| idx as usize >= original_size) {
+                return None;
+            }
             let values: Vec<f32> = bytes[indices_end..]
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -409,6 +426,10 @@ pub fn deserialize_compressed(bytes: &[u8]) -> Option<CompressedGradient> {
         }
         2 => {
             // FP16
+            let expected = original_size.checked_mul(2)?;
+            if bytes.len() != 5usize.checked_add(expected)? {
+                return None;
+            }
             let data: Vec<u16> = bytes[5..]
                 .chunks_exact(2)
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -417,6 +438,10 @@ pub fn deserialize_compressed(bytes: &[u8]) -> Option<CompressedGradient> {
         }
         3 => {
             // BF16
+            let expected = original_size.checked_mul(2)?;
+            if bytes.len() != 5usize.checked_add(expected)? {
+                return None;
+            }
             let data: Vec<u16> = bytes[5..]
                 .chunks_exact(2)
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -425,12 +450,21 @@ pub fn deserialize_compressed(bytes: &[u8]) -> Option<CompressedGradient> {
         }
         4 => {
             // INT8
+            let expected = 9usize.checked_add(original_size)?;
+            if bytes.len() != expected {
+                return None;
+            }
             let scale = f32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
             let data: Vec<i8> = bytes[9..].iter().map(|&x| x as i8).collect();
             CompressedData::INT8 { data, scale }
         }
         5 => {
             // OneBit
+            let expected_sign_bytes = original_size.div_ceil(8);
+            let expected = 9usize.checked_add(expected_sign_bytes)?;
+            if bytes.len() != expected {
+                return None;
+            }
             let scale = f32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
             let signs = bytes[9..].to_vec();
             CompressedData::OneBit { signs, scale }
@@ -532,6 +566,28 @@ mod tests {
         // Should match original sparse decompression
         assert!(decompressed[1] == 4.0);
         assert!(decompressed[3] == 3.0);
+    }
+
+    #[test]
+    fn malformed_sparse_deserialization_returns_none() {
+        // Header says sparse with one index, but the index/value payload is
+        // truncated. This used to index past the end of the byte slice.
+        let bytes = vec![4, 0, 0, 0, 1, 1, 0, 0, 0, 0];
+        assert!(deserialize_compressed(&bytes).is_none());
+    }
+
+    #[test]
+    fn sparse_decompress_ignores_out_of_range_indices() {
+        let compressor = GradientCompressor::new(CompressionStrategy::None, false);
+        let compressed = CompressedGradient {
+            original_size: 2,
+            strategy: CompressionStrategy::TopK { ratio: 0.5 },
+            data: CompressedData::Sparse {
+                indices: vec![99],
+                values: vec![1.0],
+            },
+        };
+        assert_eq!(compressor.decompress(&compressed), vec![0.0, 0.0]);
     }
 
     #[test]

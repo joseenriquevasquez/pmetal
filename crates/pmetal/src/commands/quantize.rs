@@ -1019,11 +1019,7 @@ fn llama_style_tensor_type(
     let n_kv_heads = config_json
         .and_then(|json| json_usize(json, "num_key_value_heads"))
         .unwrap_or(n_heads.max(1));
-    let n_gqa = if n_kv_heads > 0 {
-        n_heads / n_kv_heads
-    } else {
-        1
-    };
+    let n_gqa = n_heads.checked_div(n_kv_heads).unwrap_or(1);
     let layer = parse_layer_from_gguf_name(gguf_name).unwrap_or(0);
 
     if gguf_name == "output.weight" || gguf_name == "token_embd.weight" {

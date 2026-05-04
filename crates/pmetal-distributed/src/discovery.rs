@@ -18,6 +18,7 @@
 
 use crate::error::DistributedError;
 use crate::identity::NodeIdentity;
+use crate::namespace::{NetworkNamespace, validate_peer_namespace};
 use anyhow::Result;
 use futures::StreamExt;
 use libp2p::{
@@ -31,9 +32,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
-
-/// Version string for network namespace isolation.
-const NETWORK_VERSION: &str = "pmetal/0.1.0";
 
 /// Service discovery TTL in seconds.
 const MDNS_TTL_SECS: u64 = 300;
@@ -146,6 +144,8 @@ impl DiscoveryState {
 pub struct DiscoveryService {
     /// Our node identity.
     identity: NodeIdentity,
+    /// Namespace used for libp2p identify and gossipsub isolation.
+    namespace: NetworkNamespace,
     /// Shared discovery state.
     state: Arc<RwLock<DiscoveryState>>,
     /// Event sender.
@@ -164,11 +164,13 @@ impl DiscoveryService {
     /// * `event_tx` - Channel to send discovery events
     pub fn new(
         identity: NodeIdentity,
+        namespace: NetworkNamespace,
         listen_port: u16,
         event_tx: mpsc::Sender<DiscoveryEvent>,
     ) -> Self {
         Self {
             identity,
+            namespace,
             state: Arc::new(RwLock::new(DiscoveryState::default())),
             event_tx,
             listen_port,
@@ -199,7 +201,7 @@ impl DiscoveryService {
         );
 
         // Subscribe to the gradient sync topic
-        let topic = gossipsub::IdentTopic::new("pmetal/gradients");
+        let topic = gossipsub::IdentTopic::new(self.namespace.gossipsub_topic("gradients"));
         swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
         // Event loop
@@ -212,7 +214,7 @@ impl DiscoveryService {
                     self.handle_gossipsub_event(event).await;
                 }
                 SwarmEvent::Behaviour(PMetalBehaviourEvent::Identify(event)) => {
-                    self.handle_identify_event(event).await;
+                    self.handle_identify_event(&mut swarm, event).await;
                 }
                 SwarmEvent::Behaviour(PMetalBehaviourEvent::Ping(event)) => {
                     trace!("Ping event: {:?}", event);
@@ -295,7 +297,7 @@ impl DiscoveryService {
 
         // Create identify behaviour
         let identify = identify::Behaviour::new(identify::Config::new(
-            format!("/pmetal/{}", NETWORK_VERSION),
+            self.namespace.protocol_id(),
             self.identity.keypair().public(),
         ));
 
@@ -414,16 +416,23 @@ impl DiscoveryService {
     }
 
     /// Handle identify events.
-    async fn handle_identify_event(&self, event: identify::Event) {
+    async fn handle_identify_event(
+        &self,
+        swarm: &mut Swarm<PMetalBehaviour>,
+        event: identify::Event,
+    ) {
         if let identify::Event::Received { peer_id, info, .. } = event {
             debug!(
                 "Identified peer {}: {} ({})",
                 peer_id, info.protocol_version, info.agent_version
             );
 
-            // Verify it's an pmetal node
-            if !info.protocol_version.starts_with("/pmetal/") {
-                warn!("Peer {} is not an pmetal node, ignoring", peer_id);
+            if !validate_peer_namespace(&self.namespace, &info.protocol_version) {
+                warn!(
+                    "Peer {} has incompatible namespace protocol {}, disconnecting",
+                    peer_id, info.protocol_version
+                );
+                let _ = swarm.disconnect_peer_id(peer_id);
             }
         }
     }

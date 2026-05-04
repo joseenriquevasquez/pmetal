@@ -74,6 +74,7 @@ impl InlineArray {
 
     /// Quantized matmul in a specific MLX quantization mode.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn quantized_matmul_mode(
         &self,
         w: &Self,

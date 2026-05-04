@@ -255,6 +255,7 @@ pub async fn chat_completions(
         stop_sequences: resolved_stops.sequences.clone(),
         logprobs_top_n,
     };
+    state.engine.validate_sampling_params(&params)?;
 
     if req.stream.unwrap_or(false) {
         // ── True token-by-token streaming ────────────────────────────────────
@@ -399,6 +400,7 @@ pub async fn completions(
         stop_sequences: resolved_stops.sequences.clone(),
         logprobs_top_n,
     };
+    state.engine.validate_sampling_params(&params)?;
 
     if req.stream.unwrap_or(false) {
         // ── Streaming text completions ───────────────────────────────────────

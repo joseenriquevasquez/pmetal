@@ -286,6 +286,7 @@ pub async fn messages(
         // Anthropic /v1/messages does not expose OpenAI-style logprobs.
         logprobs_top_n: None,
     };
+    state.engine.validate_sampling_params(&params)?;
 
     if req.stream.unwrap_or(false) {
         let rx = crate::routes::stream_tokens(&state.engine, &input_ids, params);

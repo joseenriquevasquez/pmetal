@@ -320,7 +320,7 @@ impl NativeWeights {
     pub(crate) fn projection_weights_are_dense(&self) -> bool {
         self.embed_scales.is_none()
             && self.embed_biases.is_none()
-            && self.lm_head_w.as_ref().map_or(true, LayerWeight::is_dense)
+            && self.lm_head_w.as_ref().is_none_or(LayerWeight::is_dense)
             && self
                 .layers
                 .iter()
@@ -330,7 +330,7 @@ impl NativeWeights {
 
 impl LayerWeights {
     fn projection_weights_are_dense(&self) -> bool {
-        let is_dense = |w: &Option<LayerWeight>| w.as_ref().map_or(true, LayerWeight::is_dense);
+        let is_dense = |w: &Option<LayerWeight>| w.as_ref().is_none_or(LayerWeight::is_dense);
 
         is_dense(&self.mlp_gate_w)
             && is_dense(&self.mlp_up_w)

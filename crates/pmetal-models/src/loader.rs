@@ -1074,8 +1074,7 @@ where
         .keys()
         .filter(|key| {
             keep_key(key)
-                || quant_config.is_some()
-                    && quant_aux_base_key(key).is_some_and(|base_key| keep_key(base_key))
+                || quant_config.is_some() && quant_aux_base_key(key).is_some_and(&mut keep_key)
         })
         .cloned()
         .collect();

@@ -62,7 +62,45 @@ impl DtypeTag {
 impl ActivationMessage {
     /// Total number of elements in the tensor.
     pub fn num_elements(&self) -> usize {
-        self.shape.iter().map(|&d| d as usize).product()
+        self.checked_num_elements().unwrap_or(usize::MAX)
+    }
+
+    fn checked_num_elements(&self) -> DistributedResult<usize> {
+        self.shape.iter().try_fold(1usize, |acc, &d| {
+            acc.checked_mul(d as usize).ok_or_else(|| {
+                DistributedError::Protocol("activation tensor element count overflow".into())
+            })
+        })
+    }
+
+    fn expected_data_len(&self) -> DistributedResult<usize> {
+        self.checked_num_elements()?
+            .checked_mul(self.dtype.element_size())
+            .ok_or_else(|| {
+                DistributedError::Protocol("activation tensor byte length overflow".into())
+            })
+    }
+
+    /// Validate that tensor metadata agrees with the payload length.
+    pub fn validate_payload(&self) -> DistributedResult<()> {
+        // `u32::MAX` is the pipeline result sentinel. The current result
+        // channel can carry a sampled token (`u32`) rather than a tensor in
+        // `dtype`, so keep this legacy control message exempt.
+        if self.layer_id == u32::MAX {
+            return Ok(());
+        }
+
+        let expected = self.expected_data_len()?;
+        if self.data.len() != expected {
+            return Err(DistributedError::Protocol(format!(
+                "activation payload length mismatch for shape {:?} {:?}: expected {} bytes, got {}",
+                self.shape,
+                self.dtype,
+                expected,
+                self.data.len()
+            )));
+        }
+        Ok(())
     }
 
     /// Serialize to wire format (without length prefix — transport layer adds its own).
@@ -128,13 +166,15 @@ impl ActivationMessage {
 
         let data = buf[offset..].to_vec();
 
-        Ok(Self {
+        let msg = Self {
             nonce,
             layer_id,
             shape,
             dtype,
             data,
-        })
+        };
+        msg.validate_payload()?;
+        Ok(msg)
     }
 }
 
@@ -143,6 +183,7 @@ pub async fn send_activation(
     sender: &mut TransportSender,
     msg: &ActivationMessage,
 ) -> DistributedResult<()> {
+    msg.validate_payload()?;
     let bytes = msg.serialize();
     sender
         .send(&bytes)
@@ -189,5 +230,33 @@ mod tests {
         assert_eq!(deserialized.shape, msg.shape);
         assert_eq!(deserialized.dtype, msg.dtype);
         assert_eq!(deserialized.data.len(), msg.data.len());
+    }
+
+    #[test]
+    fn rejects_shape_data_len_mismatch() {
+        let msg = ActivationMessage {
+            nonce: 1,
+            layer_id: 0,
+            shape: vec![2, 2],
+            dtype: DtypeTag::Float32,
+            data: vec![0u8; 4],
+        };
+
+        let bytes = msg.serialize();
+        let err = ActivationMessage::deserialize(&bytes).unwrap_err();
+        assert!(matches!(err, DistributedError::Protocol(_)));
+    }
+
+    #[test]
+    fn result_sentinel_allows_token_payload() {
+        let msg = ActivationMessage {
+            nonce: 1,
+            layer_id: u32::MAX,
+            shape: vec![1],
+            dtype: DtypeTag::Float16,
+            data: 17u32.to_le_bytes().to_vec(),
+        };
+
+        ActivationMessage::deserialize(&msg.serialize()).unwrap();
     }
 }

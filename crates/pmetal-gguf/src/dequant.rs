@@ -964,7 +964,7 @@ mod tests {
         let scale = half::f16::from_f32(0.5).to_le_bytes();
         let mut data = Vec::new();
         data.extend_from_slice(&scale);
-        data.extend(std::iter::repeat(0b1010_1010).take(16));
+        data.extend(std::iter::repeat_n(0b1010_1010, 16));
 
         let result = dequantize_q1_0(&data, &[128]).unwrap();
         assert_eq!(result.len(), 128);
@@ -980,7 +980,7 @@ mod tests {
         data.extend_from_slice(&scale);
         data.extend_from_slice(&min);
         data.push(2 | (4 << 4));
-        data.extend(std::iter::repeat(0).take(15));
+        data.extend(std::iter::repeat_n(0, 15));
 
         let result = dequantize_q4_1(&data, &[32]).unwrap();
         assert!((result[0] - 2.0).abs() < 0.01);
@@ -996,7 +996,7 @@ mod tests {
         q5_0.extend_from_slice(&scale);
         q5_0.extend_from_slice(&1u32.to_le_bytes()); // high bit for element 0
         q5_0.push(1 | (15 << 4));
-        q5_0.extend(std::iter::repeat(0).take(15));
+        q5_0.extend(std::iter::repeat_n(0, 15));
         let result = dequantize_q5_0(&q5_0, &[32]).unwrap();
         assert!((result[0] - 1.0).abs() < 0.01); // (17 - 16) * 1
         assert!((result[16] + 1.0).abs() < 0.01); // (15 - 16) * 1
@@ -1006,7 +1006,7 @@ mod tests {
         q5_1.extend_from_slice(&min);
         q5_1.extend_from_slice(&1u32.to_le_bytes());
         q5_1.push(1 | (15 << 4));
-        q5_1.extend(std::iter::repeat(0).take(15));
+        q5_1.extend(std::iter::repeat_n(0, 15));
         let result = dequantize_q5_1(&q5_1, &[32]).unwrap();
         assert!((result[0] - 17.25).abs() < 0.01);
         assert!((result[16] - 15.25).abs() < 0.01);
@@ -1057,7 +1057,7 @@ mod tests {
         let mut data = Vec::new();
         data.push(128); // d = 1.0
         data.push(1 | (9 << 4)); // +1, -1
-        data.extend(std::iter::repeat(0).take(15));
+        data.extend(std::iter::repeat_n(0, 15));
 
         let result = dequantize_mxfp4(&data, &[32]).unwrap();
         assert!((result[0] - 1.0).abs() < 0.01);
@@ -1068,7 +1068,7 @@ mod tests {
     fn test_nvfp4_block_structure() {
         let mut data = vec![64, 0, 0, 0]; // first sub-block d = 1.0
         data.push(5 | (13 << 4)); // +6, -6
-        data.extend(std::iter::repeat(0).take(31));
+        data.extend(std::iter::repeat_n(0, 31));
 
         let result = dequantize_nvfp4(&data, &[64]).unwrap();
         assert!((result[0] - 6.0).abs() < 0.01);
@@ -1078,7 +1078,7 @@ mod tests {
     #[test]
     fn test_tq2_0_block_structure() {
         let mut data = vec![0u8; 66];
-        data[0] = 0 | (1 << 2) | (2 << 4) | (0 << 6);
+        data[0] = (1 << 2) | (2 << 4);
         data[64..66].copy_from_slice(&half::f16::from_f32(2.0).to_le_bytes());
 
         let result = dequantize_tq2_0(&data, &[256]).unwrap();

@@ -23,6 +23,7 @@ use crate::discovery::{DiscoveryEvent, DiscoveryService};
 use crate::error::DistributedError;
 use crate::fabric::{InterfaceKind, LocalFabric, probe_local_fabric};
 use crate::identity::NodeIdentity;
+use crate::namespace::NetworkNamespace;
 use crate::topology::{NodeProfile, SharedTopology, new_shared_topology};
 use crate::transport::{TcpTransport, TransportReceiver, TransportSender};
 use crate::{DistributedBackend, ReduceOp};
@@ -77,6 +78,8 @@ impl Default for AutoDiscoveryConfig {
 pub struct AutoDiscoveryBackend {
     /// Our node identity.
     identity: NodeIdentity,
+    /// Namespace used to isolate discovery and raw TCP gradient exchange.
+    namespace: NetworkNamespace,
     /// Configuration.
     config: AutoDiscoveryConfig,
     /// Local network fabric snapshot (Thunderbolt / Ethernet / Wi-Fi NICs).
@@ -105,6 +108,7 @@ impl AutoDiscoveryBackend {
     /// Create a new auto-discovery backend with custom configuration.
     pub async fn with_config(config: AutoDiscoveryConfig) -> Result<Self> {
         let identity = NodeIdentity::load_or_generate()?;
+        let namespace = NetworkNamespace::default();
         let fabric = Arc::new(probe_local_fabric());
         let topology = new_shared_topology(*identity.peer_id(), config.profile.clone());
 
@@ -122,7 +126,12 @@ impl AutoDiscoveryBackend {
 
         let (event_tx, event_rx) = mpsc::channel(256);
 
-        let discovery = DiscoveryService::new(identity.clone(), config.discovery_port, event_tx);
+        let discovery = DiscoveryService::new(
+            identity.clone(),
+            namespace.clone(),
+            config.discovery_port,
+            event_tx,
+        );
         let discovery_state = discovery.state();
 
         tokio::spawn(async move {
@@ -146,6 +155,7 @@ impl AutoDiscoveryBackend {
 
         Ok(Self {
             identity,
+            namespace,
             config,
             fabric,
             topology,
@@ -349,7 +359,8 @@ impl AutoDiscoveryBackend {
         };
 
         // Establish ring connections
-        let (sender, receiver) = TcpTransport::connect(&config).await?;
+        let (sender, receiver) =
+            TcpTransport::connect_with_namespace(&config, Some(*self.namespace.psk())).await?;
 
         *self.ring_connections.lock().await = Some((sender, receiver));
 
@@ -459,10 +470,12 @@ impl DistributedBackend for AutoDiscoveryBackend {
         }
 
         // === ALL-GATHER PHASE ===
-        for step in 0..(world_size - 1) {
-            let send_idx = (rank + world_size - step) % world_size;
-            let recv_idx = (rank + world_size - step - 1) % world_size;
-
+        // After scatter-reduce, rank r owns the fully reduced chunk
+        // (r + 1) % world_size. Send that first, then forward the chunk
+        // received in the prior step.
+        let mut send_idx = (rank + 1) % world_size;
+        let mut recv_idx = rank;
+        for _ in 0..(world_size - 1) {
             let (send_start, send_end) = get_chunk_range(send_idx);
             let (recv_start, recv_end) = get_chunk_range(recv_idx);
 
@@ -477,6 +490,9 @@ impl DistributedBackend for AutoDiscoveryBackend {
             let recv_floats =
                 <[f32]>::ref_from_bytes(&recv_buf).expect("recv buffer aligned for f32");
             floats[recv_start..recv_end].copy_from_slice(recv_floats);
+
+            send_idx = recv_idx;
+            recv_idx = (recv_idx + world_size - 1) % world_size;
         }
 
         // Apply mean reduction after the ring has summed all contributions.

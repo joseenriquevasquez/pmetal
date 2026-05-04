@@ -149,7 +149,10 @@ impl Default for NetworkNamespace {
 /// This should be called during the identify protocol exchange.
 pub fn validate_peer_namespace(local: &NetworkNamespace, remote_protocol: &str) -> bool {
     let expected = local.protocol_id();
-    remote_protocol.starts_with(&expected)
+    remote_protocol == expected
+        || remote_protocol
+            .strip_prefix(&expected)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 #[cfg(test)]
@@ -207,5 +210,18 @@ mod tests {
         let protocol = ns.protocol_id();
 
         assert!(protocol.starts_with("/pmetal-"));
+    }
+
+    #[test]
+    fn validate_peer_namespace_requires_protocol_boundary() {
+        let ns = NetworkNamespace::new("pmetal/0.1.0", Some("cluster-a"));
+        let expected = ns.protocol_id();
+
+        assert!(validate_peer_namespace(&ns, &expected));
+        assert!(validate_peer_namespace(
+            &ns,
+            &format!("{expected}/identify")
+        ));
+        assert!(!validate_peer_namespace(&ns, &format!("{expected}-evil")));
     }
 }
