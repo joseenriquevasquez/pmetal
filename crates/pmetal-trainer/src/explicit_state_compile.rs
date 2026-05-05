@@ -83,7 +83,6 @@ use pmetal_bridge::compat::{
     transforms,
 };
 use pmetal_lora::TrainableModel;
-use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
 
 use crate::Result;
 

@@ -23,7 +23,6 @@ use pmetal_bridge::compat::{
 use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
 use pmetal_data::{DataLoader, DataLoaderConfig, TrainingBatch, TrainingDataset};
 use pmetal_lora::TrainableModel;
-use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
 use rand::{RngExt as _, SeedableRng, rngs::StdRng};
 
 use crate::{CheckpointManager, CheckpointMetadata, Result, SftError};
@@ -267,8 +266,14 @@ pub fn diffusion_loss_gpu(
     let flat_targets = targets.reshape(&[-1]);
     let flat_mask = mask.reshape(&[-1]).as_dtype(Dtype::Float32.as_i32());
 
-    // Compute per-token cross-entropy loss using the fused kernel
-    let per_token_loss = cross_entropy_loss(&flat_logits, &flat_targets, Some(ignore_index), 0.0)?;
+    // Compute per-token cross-entropy without materializing full log_softmax.
+    // Reduction is intentionally deferred so the diffusion mask can weight only
+    // masked positions.
+    let per_token_loss = pmetal_bridge::training::per_token_cross_entropy_loss(
+        &flat_logits,
+        &flat_targets,
+        ignore_index as i32,
+    );
 
     // Apply mask: only count loss for masked positions
     let masked_loss = per_token_loss.multiply(&flat_mask);
@@ -538,12 +543,9 @@ impl DiffusionTrainingLoop {
                 .map_err(|e| Exception::custom(e.to_string()))?;
 
             // Use standard cross-entropy with ignore_index for non-masked tokens
-            let vocab_size = logits.dim(2);
-            let flat_logits = logits.reshape(&[-1, vocab_size]);
-            let flat_targets = targets.reshape(&[-1]);
-
-            let loss = cross_entropy_loss(&flat_logits, &flat_targets, Some(-100), 0.0)?;
-            Ok(loss.mean(None))
+            Ok(pmetal_bridge::training::cross_entropy_loss(
+                &logits, targets, -100,
+            ))
         };
 
         // Create value_and_grad function

@@ -1,8 +1,8 @@
-//! Ollama integration tab — wrapper around `pmetal ollama` subcommands.
+//! Modelfile export tab.
 //!
-//! There is no `OllamaSpec`; Ollama is a thin CLI wrapper
-//! (`pmetal ollama install/run/list/...`). This tab provides a minimal
-//! free-form interface until Ollama gets proper spec coverage.
+//! PMetal keeps this as a file export workflow: generate a Modelfile from a
+//! PMetal model or adapter and let the user decide whether to register it with
+//! an external runtime later.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use crate::tui::theme::THEME;
 use crate::tui::widgets::{JobLog, StatusTone, status_line};
 
-/// Runtime status of the `pmetal ollama` process.
+/// Runtime status of the `pmetal ollama modelfile` export process.
 #[derive(Debug, Clone, Default)]
 pub enum OllamaStatus {
     #[default]
@@ -46,8 +46,8 @@ impl OllamaField {
 pub struct OllamaTab {
     pub status: OllamaStatus,
     pub log: JobLog,
-    /// Simple three-field form: Action / Model / Extra Args.
-    fields: [OllamaField; 3],
+    /// Modelfile export fields.
+    fields: [OllamaField; 10],
     selected: usize,
 }
 
@@ -57,9 +57,16 @@ impl OllamaTab {
             status: OllamaStatus::Idle,
             log: JobLog::with_default_cap(),
             fields: [
-                OllamaField::new("Action", "run"),
-                OllamaField::new("Model", ""),
-                OllamaField::new("Extra Args", ""),
+                OllamaField::new("Base Model", ""),
+                OllamaField::new("LoRA Adapter", ""),
+                OllamaField::new("Output Path", "Modelfile"),
+                OllamaField::new("Template", "auto"),
+                OllamaField::new("System Prompt", ""),
+                OllamaField::new("Temperature", ""),
+                OllamaField::new("Num Context", ""),
+                OllamaField::new("Top K", ""),
+                OllamaField::new("Top P", ""),
+                OllamaField::new("License", ""),
             ],
             selected: 0,
         }
@@ -147,38 +154,91 @@ impl OllamaTab {
     // ── Config ───────────────────────────────────────────────────────────
 
     pub fn validate_config(&self) -> Result<(), String> {
-        let action = self.fields[0].value.trim().to_string();
-        if action.is_empty() {
-            return Err("Action is required (e.g. install, run, list).".into());
+        if self.fields[0].value.trim().is_empty() {
+            return Err("Base Model is required.".into());
+        }
+        if self.fields[2].value.trim().is_empty() {
+            return Err("Output Path is required.".into());
         }
         Ok(())
     }
 
     pub fn config_summary(&self) -> Vec<String> {
         vec![
-            format!("Action:  {}", self.fields[0].value),
-            format!("Model:   {}", self.fields[1].value),
-            format!("Args:    {}", self.fields[2].value),
+            format!("Base:     {}", self.fields[0].value),
+            format!("Adapter:  {}", display_optional(&self.fields[1].value)),
+            format!("Output:   {}", self.fields[2].value),
+            format!("Template: {}", self.fields[3].value),
             String::new(),
-            "Run ollama subcommand?".into(),
+            "Generate Modelfile?".into(),
         ]
     }
 
-    /// Build CLI args: `["ollama", action, model?, extra_args?...]`
+    /// Build CLI args for `pmetal ollama modelfile`.
     pub fn build_cli_args(&self) -> Vec<String> {
-        let action = self.fields[0].value.trim().to_string();
-        let model = self.fields[1].value.trim().to_string();
-        let extra = self.fields[2].value.trim().to_string();
-
-        let mut args = vec!["ollama".to_string(), action];
-        if !model.is_empty() {
-            args.push(model);
+        let mut args = vec![
+            "ollama".to_string(),
+            "modelfile".to_string(),
+            "--base".to_string(),
+            self.fields[0].value.trim().to_string(),
+            "--output".to_string(),
+            self.fields[2].value.trim().to_string(),
+        ];
+        if !self.fields[1].value.trim().is_empty() {
+            args.extend([
+                "--lora".to_string(),
+                self.fields[1].value.trim().to_string(),
+            ]);
         }
-        if !extra.is_empty() {
-            // Split extra args on whitespace
-            args.extend(extra.split_whitespace().map(str::to_string));
+        let template = self.fields[3].value.trim();
+        if !template.is_empty() && template != "auto" {
+            args.extend(["--template".to_string(), template.to_string()]);
+        }
+        if !self.fields[4].value.trim().is_empty() {
+            args.extend([
+                "--system".to_string(),
+                self.fields[4].value.trim().to_string(),
+            ]);
+        }
+        if !self.fields[5].value.trim().is_empty() {
+            args.extend([
+                "--temperature".to_string(),
+                self.fields[5].value.trim().to_string(),
+            ]);
+        }
+        if !self.fields[6].value.trim().is_empty() {
+            args.extend([
+                "--num-ctx".to_string(),
+                self.fields[6].value.trim().to_string(),
+            ]);
+        }
+        if !self.fields[7].value.trim().is_empty() {
+            args.extend([
+                "--top-k".to_string(),
+                self.fields[7].value.trim().to_string(),
+            ]);
+        }
+        if !self.fields[8].value.trim().is_empty() {
+            args.extend([
+                "--top-p".to_string(),
+                self.fields[8].value.trim().to_string(),
+            ]);
+        }
+        if !self.fields[9].value.trim().is_empty() {
+            args.extend([
+                "--license".to_string(),
+                self.fields[9].value.trim().to_string(),
+            ]);
         }
         args
+    }
+}
+
+fn display_optional(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "(none)"
+    } else {
+        value
     }
 }
 
@@ -200,7 +260,7 @@ impl OllamaTab {
 
     fn render_form(&self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
-            .title(" Ollama ")
+            .title(" Modelfile Export ")
             .title_style(THEME.block_title)
             .borders(Borders::ALL)
             .border_style(THEME.block);
@@ -238,11 +298,11 @@ impl OllamaTab {
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Actions: install | run | list | pull | rm | ps | serve",
+            "  Templates: auto | llama3 | qwen3 | gemma | mistral | phi3 | deep-seek",
             THEME.text_dim,
         )));
         lines.push(Line::from(Span::styled(
-            "  Enter to edit  S to run  x to cancel",
+            "  Enter to edit  S to export  x to cancel",
             THEME.text_muted,
         )));
 
@@ -251,7 +311,7 @@ impl OllamaTab {
 
     fn render_status(&self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
-            .title(" Status ")
+            .title(" Export Status ")
             .title_style(THEME.block_title)
             .borders(Borders::ALL)
             .border_style(THEME.block);
@@ -264,7 +324,7 @@ impl OllamaTab {
                 lines.push(status_line(StatusTone::Idle, "Idle", None));
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    "  [S] Run  [x] Cancel",
+                    "  [S] Export  [x] Cancel",
                     THEME.text_muted,
                 )));
             }

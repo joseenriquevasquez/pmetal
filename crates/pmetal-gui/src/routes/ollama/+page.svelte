@@ -1,28 +1,37 @@
 <script lang="ts">
-  import { startOllama, type OllamaAction } from '$lib/api';
+  import { modelsStore } from '$lib/stores.svelte';
+  import { exportModelfile } from '$lib/api';
 
-  const actions: { value: OllamaAction; label: string; description: string; needsModel: boolean }[] = [
-    { value: 'install', label: 'Install', description: 'Install the Ollama runtime (if not already present)', needsModel: false },
-    { value: 'pull',    label: 'Pull',    description: 'Download a model from the Ollama library',           needsModel: true  },
-    { value: 'run',     label: 'Run',     description: 'Start an interactive session with a model',          needsModel: true  },
-    { value: 'list',    label: 'List',    description: 'List all locally available Ollama models',           needsModel: false },
-  ];
+  const templates = ['auto', 'llama3', 'qwen3', 'gemma', 'mistral', 'phi3', 'deep-seek'];
 
-  // Form state
-  let action = $state<OllamaAction>('pull');
-  let model = $state('llama3');
+  let base = $state('');
+  let lora = $state('');
+  let output = $state('Modelfile');
+  let template = $state('auto');
+  let systemPrompt = $state('');
+  let temperature = $state('');
+  let numCtx = $state('');
+  let topK = $state('');
+  let topP = $state('');
+  let license = $state('');
 
-  // UI state
   let isRunning = $state(false);
   let runId = $state<string | null>(null);
   let status = $state<'idle' | 'running' | 'done' | 'failed'>('idle');
   let formError = $state<string | null>(null);
   let logs = $state<string[]>([]);
 
-  let needsModel = $derived(actions.find(a => a.value === action)?.needsModel ?? true);
+  let models = $derived(modelsStore.models);
 
   function appendLog(line: string) {
     logs = [...logs.slice(-499), line];
+  }
+
+  function num(value: string): number | null {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
   }
 
   async function handleSubmit(e: Event) {
@@ -31,8 +40,12 @@
     logs = [];
     status = 'idle';
 
-    if (needsModel && !model.trim()) {
-      formError = 'Please enter a model name';
+    if (!base.trim()) {
+      formError = 'Please select or enter a base model';
+      return;
+    }
+    if (!output.trim()) {
+      formError = 'Please specify an output path';
       return;
     }
 
@@ -40,7 +53,18 @@
     status = 'running';
 
     try {
-      runId = await startOllama(action, needsModel ? model.trim() : '', (e: Record<string, unknown>) => {
+      runId = await exportModelfile({
+        base: base.trim(),
+        lora: lora.trim() || null,
+        output: output.trim(),
+        template,
+        system: systemPrompt.trim() || null,
+        temperature: num(temperature),
+        num_ctx: num(numCtx),
+        top_k: num(topK),
+        top_p: num(topP),
+        license: license.trim() || null,
+      }, (e: Record<string, unknown>) => {
         const evt = e as { event?: string; line?: string };
         if (evt.event === 'log' && typeof evt.line === 'string') {
           appendLog(evt.line);
@@ -60,70 +84,93 @@
   }
 </script>
 
-<div class="space-y-6 max-w-2xl">
-  <!-- Header -->
+<div class="space-y-6 max-w-3xl">
   <div>
-    <h1 class="text-2xl font-bold text-surface-900 dark:text-surface-100">Ollama</h1>
-    <p class="text-surface-500 dark:text-surface-400 mt-1">Manage and run Ollama models via pmetal</p>
+    <h1 class="text-2xl font-bold text-surface-900 dark:text-surface-100">Modelfile Export</h1>
+    <p class="text-surface-500 dark:text-surface-400 mt-1">Generate a portable Modelfile for external registration</p>
   </div>
 
   <form onsubmit={handleSubmit} class="space-y-4">
-    <!-- Action picker -->
     <div class="card">
       <div class="card-header">
-        <h3 class="font-semibold text-surface-900 dark:text-surface-100">Action</h3>
+        <h3 class="font-semibold text-surface-900 dark:text-surface-100">Model</h3>
       </div>
-      <div class="card-body grid grid-cols-2 gap-2">
-        {#each actions as a}
-          <button
-            type="button"
-            class="p-3 rounded-lg border text-left transition-all {action === a.value
-              ? 'border-primary-500 bg-primary-50 dark:bg-primary-900/30'
-              : 'border-surface-200 dark:border-surface-700 hover:border-surface-300 dark:hover:border-surface-600'}"
-            onclick={() => (action = a.value)}
-          >
-            <p class="text-sm font-semibold text-surface-900 dark:text-surface-100">{a.label}</p>
-            <p class="text-xs text-surface-500 mt-0.5">{a.description}</p>
-          </button>
-        {/each}
+      <div class="card-body space-y-4">
+        <div>
+          <label class="label" for="export-base">Base Model</label>
+          <select id="export-base" class="input" bind:value={base}>
+            <option value="">Select a cached model...</option>
+            {#each models as model}
+              <option value={model.id}>{model.id} ({model.size_formatted})</option>
+            {/each}
+          </select>
+          <input class="input mt-2" placeholder="Or enter a GGUF path / model name" bind:value={base} />
+        </div>
+        <div>
+          <label class="label" for="export-lora">LoRA Adapter (optional)</label>
+          <input id="export-lora" class="input" placeholder="/path/to/adapter" bind:value={lora} />
+        </div>
       </div>
     </div>
 
-    <!-- Model input -->
-    {#if needsModel}
-      <div class="card">
-        <div class="card-header">
-          <h3 class="font-semibold text-surface-900 dark:text-surface-100">Model</h3>
+    <div class="card">
+      <div class="card-header">
+        <h3 class="font-semibold text-surface-900 dark:text-surface-100">Modelfile</h3>
+      </div>
+      <div class="card-body grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label class="label" for="export-output">Output Path</label>
+          <input id="export-output" class="input" bind:value={output} />
         </div>
-        <div class="card-body">
-          <label class="label" for="ollama-model">Model Name</label>
-          <input
-            id="ollama-model"
-            type="text"
-            class="input"
-            placeholder="e.g. llama3, mistral, phi3:mini"
-            bind:value={model}
-          />
-          <p class="text-xs text-surface-500 mt-1">Ollama model tag — see <a href="https://ollama.com/library" target="_blank" rel="noreferrer" class="underline">ollama.com/library</a> for the full list.</p>
+        <div>
+          <label class="label" for="export-template">Template</label>
+          <select id="export-template" class="input" bind:value={template}>
+            {#each templates as t}
+              <option value={t}>{t}</option>
+            {/each}
+          </select>
+        </div>
+        <div>
+          <label class="label" for="export-temp">Temperature</label>
+          <input id="export-temp" class="input" placeholder="0.7" bind:value={temperature} />
+        </div>
+        <div>
+          <label class="label" for="export-ctx">Context Window</label>
+          <input id="export-ctx" class="input" placeholder="4096" bind:value={numCtx} />
+        </div>
+        <div>
+          <label class="label" for="export-top-k">Top K</label>
+          <input id="export-top-k" class="input" placeholder="40" bind:value={topK} />
+        </div>
+        <div>
+          <label class="label" for="export-top-p">Top P</label>
+          <input id="export-top-p" class="input" placeholder="0.9" bind:value={topP} />
+        </div>
+        <div class="sm:col-span-2">
+          <label class="label" for="export-system">System Prompt</label>
+          <textarea id="export-system" class="input min-h-24" bind:value={systemPrompt}></textarea>
+        </div>
+        <div class="sm:col-span-2">
+          <label class="label" for="export-license">License Text</label>
+          <textarea id="export-license" class="input min-h-20" bind:value={license}></textarea>
         </div>
       </div>
-    {/if}
+    </div>
 
-    <!-- Status -->
     {#if status === 'running'}
       <div class="p-4 rounded-lg bg-primary-50 dark:bg-primary-900/20 border border-primary-200 dark:border-primary-800 text-primary-700 dark:text-primary-300 text-sm flex items-center gap-2" role="status">
         <div class="w-4 h-4 border-2 border-primary-500 border-t-transparent rounded-full animate-spin flex-shrink-0" aria-hidden="true"></div>
-        Running… Run ID: {runId}
+        Exporting… Run ID: {runId}
       </div>
     {/if}
     {#if status === 'done'}
       <div class="p-4 rounded-lg bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 text-green-700 dark:text-green-300 text-sm" role="status">
-        Command completed successfully.
+        Modelfile generated successfully.
       </div>
     {/if}
     {#if status === 'failed'}
       <div class="p-4 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-sm" role="alert">
-        Command failed. Check the output log below.
+        Export failed. Check the output log below.
       </div>
     {/if}
     {#if formError}
@@ -132,21 +179,16 @@
       </div>
     {/if}
 
-    <button type="submit" class="btn-primary w-full" disabled={isRunning || (needsModel && !model.trim())}>
+    <button type="submit" class="btn-primary w-full" disabled={isRunning || !base.trim() || !output.trim()}>
       {#if isRunning}
         <div class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" aria-hidden="true"></div>
-        Running {action}...
+        Exporting...
       {:else}
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-        </svg>
-        Run: ollama {action}{needsModel ? ` ${model || '<model>'}` : ''}
+        Generate Modelfile
       {/if}
     </button>
   </form>
 
-  <!-- Output log -->
   {#if logs.length > 0}
     <div class="card">
       <div class="card-header">

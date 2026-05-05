@@ -174,7 +174,7 @@ impl Widget for Footer {
                     Span::styled(" cancel  ", THEME.footer_desc),
                 ]);
             }
-            Tab::EmbedTrain | Tab::Rlkd | Tab::Tokenize => {
+            Tab::EmbedTrain | Tab::Rlkd | Tab::Tokenize | Tab::Dflash => {
                 spans.extend([
                     Span::styled("jk", THEME.footer_key),
                     Span::styled(" navigate  ", THEME.footer_desc),
@@ -193,7 +193,7 @@ impl Widget for Footer {
                     Span::styled("Enter", THEME.footer_key),
                     Span::styled(" edit field  ", THEME.footer_desc),
                     Span::styled("S", THEME.footer_key),
-                    Span::styled(" run  ", THEME.footer_desc),
+                    Span::styled(" export  ", THEME.footer_desc),
                     Span::styled("x", THEME.footer_key),
                     Span::styled(" cancel  ", THEME.footer_desc),
                 ]);

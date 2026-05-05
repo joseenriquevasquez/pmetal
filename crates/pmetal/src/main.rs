@@ -899,7 +899,7 @@ enum InputFormat {
     Alpaca,
 }
 
-/// Ollama subcommands for model export and registration.
+/// Modelfile export helpers for external Ollama registration.
 #[derive(Subcommand, Debug)]
 enum OllamaAction {
     /// Generate a Modelfile for a trained model
@@ -945,7 +945,7 @@ enum OllamaAction {
         license: Option<String>,
     },
 
-    /// Create and register a model with Ollama
+    /// Generate a Modelfile for later registration with Ollama
     Create {
         /// Model name for Ollama (e.g., "my-finetuned-model")
         #[arg(short, long)]
@@ -970,6 +970,10 @@ enum OllamaAction {
         /// Context window size
         #[arg(long)]
         num_ctx: Option<i32>,
+
+        /// Output Modelfile path
+        #[arg(short, long, default_value = "Modelfile")]
+        output: String,
 
         /// Model template (auto-detected from architecture if not specified)
         #[arg(long, value_enum)]

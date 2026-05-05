@@ -110,6 +110,8 @@ pub enum JobType {
     /// One-shot evaluation job (`pmetal eval`). Metrics are parsed out
     /// of stdout (perplexity / accuracy / loss).
     Eval,
+    /// One-shot DFlash speculative decoding job (`pmetal dflash`).
+    Dflash,
     /// One-shot model-merge job (`pmetal merge`).
     Merge,
     /// Full-parameter pretraining job (`pmetal pretrain`).
@@ -120,7 +122,7 @@ pub enum JobType {
     Rlkd,
     /// Corpus tokenization job (`pmetal tokenize`).
     Tokenize,
-    /// Ollama subcommand wrapper (`pmetal ollama`).
+    /// Modelfile export command (`pmetal ollama modelfile`).
     Ollama,
 }
 
@@ -137,6 +139,7 @@ impl std::fmt::Display for JobType {
             JobType::Quantize => write!(f, "Quantize"),
             JobType::Bench => write!(f, "Bench"),
             JobType::Eval => write!(f, "Eval"),
+            JobType::Dflash => write!(f, "DFlash"),
             JobType::Merge => write!(f, "Merge"),
             JobType::Pretrain => write!(f, "Pretrain"),
             JobType::EmbedTrain => write!(f, "EmbedTrain"),

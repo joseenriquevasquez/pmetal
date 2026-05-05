@@ -276,7 +276,7 @@ async fn run_command(
     if let Some(ref metrics_path) = spec.metrics_file {
         if matches!(
             spec.job_type,
-            JobType::Train | JobType::Distill | JobType::Grpo | JobType::Pretrain
+            JobType::Train | JobType::Distill | JobType::Grpo
         ) {
             cmd.args(["--log-metrics", &metrics_path.display().to_string()]);
         }
@@ -608,23 +608,58 @@ async fn run_training_direct(
     let quantization_str = optional_arg(&spec.args, "--quantization")
         .unwrap_or_else(|| "none".to_string())
         .to_lowercase();
+    let quant_block_size = parse_arg(&spec.args, "--quant-block-size", 64usize)?;
+    let double_quant = has_flag(&spec.args, "--double-quant");
     let qlora = match quantization_str.as_str() {
         "nf4" => Some(orchestrator::QLoraOrchConfig {
             scheme: orchestrator::QuantizationScheme::Nf4,
-            block_size: 64,
-            double_quant: false,
+            block_size: quant_block_size,
+            double_quant,
         }),
         "fp4" => Some(orchestrator::QLoraOrchConfig {
             scheme: orchestrator::QuantizationScheme::Fp4,
-            block_size: 64,
-            double_quant: false,
+            block_size: quant_block_size,
+            double_quant,
         }),
         "int8" => Some(orchestrator::QLoraOrchConfig {
             scheme: orchestrator::QuantizationScheme::Int8,
-            block_size: 64,
-            double_quant: false,
+            block_size: quant_block_size,
+            double_quant,
         }),
         _ => None,
+    };
+
+    #[cfg(feature = "distributed")]
+    let distributed = {
+        let peers = optional_arg(&spec.args, "--distributed-peers")
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let auto_discover = has_flag(&spec.args, "--distributed-auto");
+        if !peers.is_empty() || auto_discover {
+            let compression = match optional_arg(&spec.args, "--compression-strategy")
+                .unwrap_or_else(|| "none".to_string())
+                .as_str()
+            {
+                "topk" => pmetal_core::DistributedCompression::TopK,
+                "fp16" => pmetal_core::DistributedCompression::Fp16,
+                "random" => pmetal_core::DistributedCompression::Random,
+                _ => pmetal_core::DistributedCompression::None,
+            };
+            Some(pmetal_core::DistributedTrainingConfig {
+                peers,
+                auto_discover,
+                compression,
+                ..Default::default()
+            })
+        } else {
+            None
+        }
     };
 
     // Build column config
@@ -686,21 +721,25 @@ async fn run_training_direct(
             sequence_packing: !has_flag(&spec.args, "--no-sequence-packing"),
             pack_max_seq_len: parse_opt_arg(&spec.args, "--pack-max-seq-len"),
             jit_compilation: !has_flag(&spec.args, "--no-jit-compilation"),
-            fused: true,
+            fused: !has_flag(&spec.args, "--no-fused"),
             metal_fused_optimizer: !has_flag(&spec.args, "--no-metal-fused-optimizer"),
-            gradient_checkpointing: true,
-            gradient_checkpointing_layers: 4,
+            gradient_checkpointing: !has_flag(&spec.args, "--no-gradient-checkpointing"),
+            gradient_checkpointing_layers: parse_arg(
+                &spec.args,
+                "--gradient-checkpointing-layers",
+                4usize,
+            )?,
             cut_cross_entropy: has_flag(&spec.args, "--cut-cross-entropy"),
             no_adaptive_lr: has_flag(&spec.args, "--no-adaptive-lr"),
             ane: has_flag(&spec.args, "--ane"),
             loss_scale: parse_arg(&spec.args, "--loss-scale", 1.0f32)?,
             #[cfg(feature = "distributed")]
-            distributed: None,
+            distributed,
         },
-        config_path: None,
+        config_path: optional_arg(&spec.args, "--config"),
         // In-process: metrics stream through ChannelMetricsCallback — skip JSONL.
         log_metrics: None,
-        resume: false,
+        resume: has_flag(&spec.args, "--resume"),
         seed: parse_arg(&spec.args, "--seed", 42u64)?,
         emit_console_output: false,
     };

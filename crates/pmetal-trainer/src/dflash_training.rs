@@ -182,8 +182,8 @@ pub fn dflash_train_step(
     // Labels are `input_ids[:, block_start+1 .. block_start+block_size]`.
     let labels = input_ids.slice(&[0, block_start_i32 + 1], &[batch, block_end_i32]);
 
-    // Cross entropy: -sum(labels * log_softmax(logits)) / (B * (block_size-1)).
-    // We materialize `log_softmax` via logsumexp for numerical stability.
+    // Cross entropy over the block positions. The bridge primitive gathers
+    // target logits selectively, avoiding a full [B, T, V] log_softmax tensor.
     let loss = masked_cross_entropy(&draft_logits, &labels)?;
 
     Ok(DFlashTrainStepOutput { loss, draft_logits })
@@ -200,26 +200,7 @@ fn masked_cross_entropy(logits: &Array, labels: &Array) -> Result<Array, Excepti
             shape
         )));
     }
-    let b = shape[0];
-    let t = shape[1];
-    let v = shape[2];
-
-    // log_softmax = logits - logsumexp(logits, -1, keepdims)
-    let max = ops::max_axis(logits, -1, true);
-    let shifted = logits.subtract(&max);
-    let exp = shifted.exp();
-    let sum = ops::sum_axis(&exp, -1, true);
-    let log_sum = sum.log();
-    let log_softmax = shifted.subtract(&log_sum);
-
-    // Gather -log p[label] per position via one-hot + sum. For a correct
-    // rank-preserving gather the cheapest path is `take_along_axis`.
-    let labels_i32 = labels.reshape(&[b, t, 1]);
-    let gathered = ops::take_along_axis(&log_softmax, &labels_i32, -1);
-    let per_tok = gathered.reshape(&[b, t]);
-    let neg = per_tok.negative();
-    let denom = Array::from_f32((b * t) as f32);
-    Ok(ops::sum_axis(&neg, -1, false)
-        .sum_axis(-1, false)
-        .divide(&denom))
+    Ok(pmetal_bridge::training::cross_entropy_loss(
+        logits, labels, -100,
+    ))
 }

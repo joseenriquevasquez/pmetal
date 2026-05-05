@@ -101,12 +101,19 @@ fn test_forward_process_gpu() {
 #[serial]
 fn test_diffusion_loss_gpu() {
     // Test GPU-native diffusion loss
-    // Create dummy logits: [batch=1, seq_len=4, vocab_size=8]
-    let logits =
-        pmetal_bridge::compat::random::normal(&[1, 4, 8], pmetal_bridge::compat::Dtype::Float32);
+    // Create deterministic logits: [batch=1, seq_len=4, vocab_size=3].
+    let logits = Array::from_slice(
+        &[
+            1.0_f32, 2.0, 3.0, //
+            0.0, 0.0, 0.0, //
+            3.0, 2.0, 1.0, //
+            1.0, 1.0, 1.0,
+        ],
+        &[1, 4, 3],
+    );
 
     // Create targets: [batch=1, seq_len=4]
-    let targets = Array::from_i32_slice_shaped(&[1_i32, 2, 3, 4], &[1, 4]);
+    let targets = Array::from_i32_slice_shaped(&[2_i32, 1, 0, 1], &[1, 4]);
 
     // Create mask: [batch=1, seq_len=4] - first two positions masked
     // Bridge doesn't have from_bool_slice, use from_i32 cast to bool
@@ -123,8 +130,14 @@ fn test_diffusion_loss_gpu() {
     loss.eval();
     let loss_val = loss.item_f32();
 
-    // Loss should be positive (cross-entropy is always positive)
-    assert!(loss_val > 0.0, "Loss should be positive, got {}", loss_val);
+    // Only masked positions should contribute, then ELBO weighting multiplies by 1/t.
+    let first = (1.0_f32 + (-1.0_f32).exp() + (-2.0_f32).exp()).ln();
+    let second = 3.0_f32.ln();
+    let expected = ((first + second) / 2.0) * (1.0 / t);
+    assert!(
+        (loss_val - expected).abs() < 1e-5,
+        "loss {loss_val} != expected {expected}"
+    );
     assert!(loss_val.is_finite(), "Loss should be finite");
 }
 

@@ -14,7 +14,6 @@ use pmetal_bridge::compat::{
 };
 use pmetal_core::{EvalMetrics, TrainingConfig};
 use pmetal_lora::LoraLinear;
-use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
 use std::path::Path;
 
 /// Error type for SFT training.
@@ -258,10 +257,10 @@ impl SftTrainer {
             let flat_logits = d_logits.reshape(&[-1, vocab_size]);
             let flat_labels = d_labels.reshape(&[-1]);
 
-            let loss = cross_entropy_loss(&flat_logits, &flat_labels, Some(-100_i64), 0.0)?;
-            let mean_loss = loss.mean(None);
+            let loss =
+                pmetal_bridge::training::cross_entropy_loss(&flat_logits, &flat_labels, -100);
 
-            let weighted_loss = mean_loss.multiply(&Array::from_f32(weight));
+            let weighted_loss = loss.multiply(&Array::from_f32(weight));
             total_loss = total_loss.add(&weighted_loss);
         }
 
@@ -365,10 +364,11 @@ pub fn lm_loss(logits: &Array, labels: &Array, ignore_index: i64) -> Result<Arra
     let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
     let flat_labels = shift_labels.reshape(&[-1]);
 
-    // Compute cross entropy loss
-    let loss = cross_entropy_loss(&flat_logits, &flat_labels, Some(ignore_index), 0.0)?;
-
-    Ok(loss.mean(None))
+    Ok(pmetal_bridge::training::cross_entropy_loss(
+        &flat_logits,
+        &flat_labels,
+        ignore_index as i32,
+    ))
 }
 
 #[cfg(test)]

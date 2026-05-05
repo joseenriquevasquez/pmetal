@@ -63,7 +63,7 @@ use pmetal_bridge::compat::{
     indexing::{IndexOp, argmax_axis},
     losses::CrossEntropy,
     module::{FlattenedModuleParam, ModuleParameters},
-    nn, ops,
+    nn,
     optimizers::{AdamW, AdamWBuilder, Optimizer, Updatable},
     transforms,
 };
@@ -77,7 +77,6 @@ use pmetal_data::{
     TrainingBatch, TrainingDataset, compute_pack_seq_len,
 };
 use pmetal_lora::TrainableModel;
-use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
 use pmetal_mlx::kernels::{init_training_context, with_training_mode};
 
 use crate::mlx_metal_optimizer::{
@@ -827,48 +826,7 @@ impl TrainingLoop {
             return Ok(None);
         }
 
-        // Build lazy computation graph: sum of all squared norms
-        // This stays entirely on GPU until evaluated
-        let mut norm_sq_sum = Array::from_f32(0.0);
-        for (_, grad) in grads.iter() {
-            let norm_sq = grad.multiply(grad).sum(None);
-            norm_sq_sum = norm_sq_sum.add(&norm_sq);
-        }
-
-        // Compute norm = sqrt(sum) on GPU (lazy)
-        let norm = norm_sq_sum.sqrt();
-
-        // Compute scale = min(1.0, max_norm / norm) entirely on GPU.
-        // `maximum(norm, max_norm)` clamps the denominator to [max_norm, ∞),
-        // so scale ∈ (0, 1].  No epsilon is needed: when norm < max_norm the
-        // clamped denominator equals max_norm (not zero), avoiding division by zero.
-        let max_norm_arr = Array::from_f32(max_norm);
-        let norm_clamped = ops::maximum(&norm, &max_norm_arr);
-        let scale = max_norm_arr.divide(&norm_clamped);
-
-        // Debug: check scale value
-        static DEBUG_CLIP_ONCE: std::sync::Once = std::sync::Once::new();
-        DEBUG_CLIP_ONCE.call_once(|| {
-            // Force evaluate to debug
-            let mut scale_copy = scale.clone();
-            scale_copy.eval();
-            let scale_val = scale_copy.item_f32();
-            let mut norm_copy = norm.clone();
-            norm_copy.eval();
-            let norm_val = norm_copy.item_f32();
-            tracing::info!(
-                "Gradient clipping: norm={:.4}, max_norm={}, scale={:.4}",
-                norm_val,
-                max_norm,
-                scale_val
-            );
-        });
-
-        // Apply scale to all gradients on GPU (lazy)
-        // Even when scale ~= 1.0, this is cheaper than a GPU-CPU sync to check
-        for (_, grad) in grads.iter_mut() {
-            *grad = grad.multiply(&scale);
-        }
+        let norm = pmetal_bridge::training::clip_grad_norm_map(grads, max_norm);
 
         // Return lazy norm - caller can eval() for logging if needed
         Ok(Some(norm))

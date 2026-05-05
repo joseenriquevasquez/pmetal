@@ -13,13 +13,20 @@
   // Form state
   let mode = $state('workload');
   let selectedModel = $state('');
+  let dataset = $state('TeichAI/gemini-3-pro-preview-high-reasoning-250x');
+  let expertsDir = $state('');
   let preset = $state('dense-qwen3');
   let inferenceContext = $state('auto');
   let promptSamples = $state(8);
   let maxPromptTokens = $state(0);
   let decodeSteps = $state(32);
   let inferenceWarmup = $state(2);
+  let inferenceSessionRepeats = $state(1);
   let inferenceRepeats = $state(1);
+  let trainSamples = $state(8);
+  let trainSteps = $state(4);
+  let trainBatchSize = $state(1);
+  let trainMaxSeqLen = $state(0);
   let batchSize = $state(1);
   let seqLen = $state(512);
   let jsonOutput = $state('');
@@ -55,8 +62,13 @@
   async function handleSubmit(e: Event) {
     e.preventDefault();
     formError = null;
-    if (!selectedModel) {
+    const customWorkload = mode === 'workload' && preset === 'custom';
+    if ((mode === 'basic' || customWorkload) && !selectedModel) {
       formError = 'Please select a model';
+      return;
+    }
+    if (customWorkload && !dataset.trim()) {
+      formError = 'Please provide a dataset';
       return;
     }
     if (jsonOutput && !jsonOutput.endsWith('.json')) {
@@ -67,9 +79,25 @@
     isStarting = true;
     try {
       await benchStore.start({
+        mode: mode as 'basic' | 'workload',
         model: selectedModel,
-        batch_size: batchSize,
-        seq_len: seqLen,
+        dataset: customWorkload ? dataset.trim() : undefined,
+        preset: mode === 'workload' ? preset : undefined,
+        experts_dir: mode === 'workload' && expertsDir.trim() ? expertsDir.trim() : undefined,
+        inference_context: inferenceContext,
+        prompt_samples: promptSamples,
+        max_prompt_tokens: maxPromptTokens,
+        decode_steps: decodeSteps,
+        inference_warmup_passes: inferenceWarmup,
+        inference_session_repeats: inferenceSessionRepeats,
+        inference_repeats: inferenceRepeats,
+        train_samples: trainSamples,
+        train_steps: trainSteps,
+        batch_size: mode === 'workload' ? trainBatchSize : batchSize,
+        seq_len: mode === 'basic' ? seqLen : undefined,
+        max_seq_len: mode === 'workload' ? trainMaxSeqLen : undefined,
+        json: !!jsonOutput,
+        output: jsonOutput || undefined,
       });
     } catch (e) {
       formError = e instanceof Error ? e.message : String(e);
@@ -161,6 +189,16 @@
                 {/each}
               </select>
             </div>
+            {#if preset === 'custom'}
+              <div>
+                <label class="label" for="bench-dataset">Dataset</label>
+                <input id="bench-dataset" class="input" bind:value={dataset} />
+              </div>
+            {/if}
+            <div>
+              <label class="label" for="bench-experts">Packed Experts Dir (optional)</label>
+              <input id="bench-experts" class="input" placeholder="/path/to/packed/experts" bind:value={expertsDir} />
+            </div>
             <div class="grid grid-cols-2 gap-4">
               <div>
                 <label class="label" for="bench-ctx">Inference Context</label>
@@ -187,8 +225,28 @@
                 <input id="bench-warmup" type="number" min="0" max="32" class="input" bind:value={inferenceWarmup} />
               </div>
               <div>
+                <label class="label" for="bench-session-repeats">Session Repeats</label>
+                <input id="bench-session-repeats" type="number" min="1" max="64" class="input" bind:value={inferenceSessionRepeats} />
+              </div>
+              <div>
                 <label class="label" for="bench-repeats">Inference Repeats</label>
                 <input id="bench-repeats" type="number" min="1" max="64" class="input" bind:value={inferenceRepeats} />
+              </div>
+              <div>
+                <label class="label" for="bench-train-samples">Train Samples</label>
+                <input id="bench-train-samples" type="number" min="1" max="4096" class="input" bind:value={trainSamples} />
+              </div>
+              <div>
+                <label class="label" for="bench-train-steps">Train Steps</label>
+                <input id="bench-train-steps" type="number" min="1" max="4096" class="input" bind:value={trainSteps} />
+              </div>
+              <div>
+                <label class="label" for="bench-train-batch">Train Batch Size</label>
+                <input id="bench-train-batch" type="number" min="1" max="128" class="input" bind:value={trainBatchSize} />
+              </div>
+              <div>
+                <label class="label" for="bench-train-seq">Train Max Seq Len</label>
+                <input id="bench-train-seq" type="number" min="0" max="32768" class="input" bind:value={trainMaxSeqLen} />
               </div>
             </div>
           {:else}
@@ -218,7 +276,11 @@
       {/if}
 
       <div class="flex gap-2">
-        <button type="submit" class="btn-primary flex-1" disabled={isStarting || activeRun !== null || !selectedModel}>
+        <button
+          type="submit"
+          class="btn-primary flex-1"
+          disabled={isStarting || activeRun !== null || ((mode === 'basic' || (mode === 'workload' && preset === 'custom')) && !selectedModel)}
+        >
           {#if isStarting}
             <div class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" aria-hidden="true"></div>
             Starting…

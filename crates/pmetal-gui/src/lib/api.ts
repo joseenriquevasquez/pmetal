@@ -129,6 +129,8 @@ export interface TrainSpec {
   lora_r?: number;
   lora_alpha?: number;
   quantization?: string | null;
+  quant_block_size?: number;
+  double_quant?: boolean;
   text_column?: string | null;
   text_columns?: string | null;
   column_separator?: string | null;
@@ -137,11 +139,15 @@ export interface TrainSpec {
   no_flash_attention?: boolean;
   no_sequence_packing?: boolean;
   no_jit_compilation?: boolean;
+  no_fused?: boolean;
   no_metal_fused_optimizer?: boolean;
   cut_cross_entropy?: boolean;
   no_adaptive_lr?: boolean;
   ane?: boolean;
   pack_max_seq_len?: number | null;
+  distributed_peers?: string | null;
+  distributed_auto?: boolean;
+  compression_strategy?: string | null;
   config_path?: string | null;
   resume?: boolean;
 }
@@ -662,9 +668,25 @@ export interface BenchRun {
 }
 
 export interface BenchSpec {
+  mode?: 'basic' | 'workload';
   model: string;
+  dataset?: string | null;
+  preset?: string | null;
+  experts_dir?: string | null;
+  inference_context?: string;
+  prompt_samples?: number;
+  max_prompt_tokens?: number;
+  decode_steps?: number;
+  inference_warmup_passes?: number;
+  inference_session_repeats?: number;
+  inference_repeats?: number;
+  train_samples?: number;
+  train_steps?: number;
   batch_size?: number;
   seq_len?: number;
+  max_seq_len?: number;
+  json?: boolean;
+  output?: string | null;
 }
 
 export async function startBench(
@@ -940,9 +962,29 @@ export async function fuseLora(
 export async function quantizeModel(
   modelId: string,
   quantType: string,
-  outputDir: string
+  outputPath: string,
+  options?: {
+    imatrix?: string | null;
+    format?: string;
+    bits?: number;
+    groupSize?: number;
+    klCalibrate?: boolean;
+    targetBpw?: number | null;
+    klThreshold?: number;
+  },
 ): Promise<string> {
-  return await invoke('quantize_model', { modelId, quantType, outputDir });
+  return await invoke('quantize_model', {
+    modelId,
+    quantType,
+    outputPath,
+    imatrix: options?.imatrix ?? null,
+    format: options?.format ?? 'gguf',
+    bits: options?.bits ?? 4,
+    groupSize: options?.groupSize ?? 64,
+    klCalibrate: options?.klCalibrate ?? false,
+    targetBpw: options?.targetBpw ?? null,
+    klThreshold: options?.klThreshold ?? 0.01,
+  });
 }
 
 // =============================================================================
@@ -1109,17 +1151,53 @@ export async function startRlkd(
 }
 
 // =============================================================================
-// Ollama API
+// DFlash API
 // =============================================================================
 
-export type OllamaAction = 'install' | 'run' | 'list' | 'pull';
+export interface DflashConfig {
+  target: string;
+  draft: string;
+  prompt: string;
+  max_new_tokens?: number | null;
+  temperature?: number | null;
+  speculative_tokens?: number | null;
+  draft_fp8?: boolean | null;
+  json?: boolean | null;
+  no_chat?: boolean | null;
+  tree_budget?: number | null;
+}
 
-export async function startOllama(
-  action: OllamaAction,
-  model: string,
+export async function startDflash(
+  config: DflashConfig,
   onEvent?: (e: Record<string, unknown>) => void,
 ): Promise<string> {
   const channel = new Channel<Record<string, unknown>>();
   if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_ollama', { action, model, onEvent: channel });
+  return await invoke('start_dflash', { config, onEvent: channel });
+}
+
+// =============================================================================
+// Modelfile Export API
+// =============================================================================
+
+export interface ModelfileExportConfig {
+  base: string;
+  lora?: string | null;
+  output: string;
+  template?: string | null;
+  system?: string | null;
+  temperature?: number | null;
+  num_ctx?: number | null;
+  top_k?: number | null;
+  top_p?: number | null;
+  license?: string | null;
+}
+
+export async function exportModelfile(
+  config: ModelfileExportConfig,
+  onEvent?: (e: Record<string, unknown>) => void,
+): Promise<string> {
+  const channel = new Channel<Record<string, unknown>>();
+  if (onEvent) channel.onmessage = onEvent;
+  return await invoke('start_ollama', { config, onEvent: channel });
 }

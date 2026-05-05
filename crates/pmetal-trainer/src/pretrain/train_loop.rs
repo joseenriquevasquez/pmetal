@@ -1,8 +1,6 @@
 //! Full-parameter pretraining loop with gradient accumulation, LR scheduling,
 //! gradient clipping, periodic eval, and step logging.
 
-use std::rc::Rc;
-
 use super::init::{apply_depth_scaled_init, zero_biases};
 use super::loss::causal_lm_loss;
 use super::{CausalLm, PretrainConfig, PretrainError};
@@ -11,7 +9,6 @@ use pmetal_bridge::compat::{
     Array, Exception,
     module::FlattenedModuleParam,
     nn::value_and_grad,
-    ops,
     optimizers::{AdamW, AdamWBuilder, Optimizer},
 };
 use pmetal_core::LearningRateScheduler;
@@ -20,16 +17,7 @@ fn clip_grad_norm(
     mut grads: FlattenedModuleParam,
     max_norm: f32,
 ) -> Result<FlattenedModuleParam, Exception> {
-    let mut total_norm_sq = Array::from_f32(0.0);
-    for grad in grads.values() {
-        total_norm_sq = total_norm_sq.add(&grad.multiply(grad).sum(None));
-    }
-    let total_norm = total_norm_sq.sqrt();
-    let max_norm_arr = Array::from_f32(max_norm);
-    let clip_coef = max_norm_arr.divide(&ops::maximum(&total_norm, &max_norm_arr));
-    for grad in grads.values_mut() {
-        *grad = grad.multiply(&clip_coef);
-    }
+    pmetal_bridge::training::clip_grad_norm_map(&mut grads, max_norm);
     Ok(grads)
 }
 

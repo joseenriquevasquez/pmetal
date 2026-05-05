@@ -1,7 +1,7 @@
 use pmetal_bridge::compat::{
     Array, Exception, FlattenedModuleParam,
     module::{ModuleParameters, ModuleParametersExt},
-    nn, ops,
+    nn,
     optimizers::{Optimizer, Updatable},
     transforms,
 };
@@ -13,17 +13,7 @@ use pmetal_lora::TrainableModel;
 /// Same algorithm as `TrainingLoop::clip_gradients_gpu` but usable from
 /// standalone step functions.
 fn clip_grads(grads: &mut FlattenedModuleParam, max_norm: f32) {
-    let mut norm_sq = Array::from_f32(0.0);
-    for grad in grads.values() {
-        norm_sq = norm_sq.add(&grad.multiply(grad).sum(None));
-    }
-    let norm = norm_sq.sqrt();
-    let max_norm_arr = Array::from_f32(max_norm);
-    let norm_clamped = ops::maximum(&norm, &max_norm_arr);
-    let scale = max_norm_arr.divide(&norm_clamped);
-    for grad in grads.values_mut() {
-        *grad = grad.multiply(&scale);
-    }
+    pmetal_bridge::training::clip_grad_norm_map(grads, max_norm);
 }
 
 /// JIT-compiled training step for maximum throughput.
@@ -148,26 +138,8 @@ pub(crate) fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
     let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
     let (loss, mut grads) = loss_and_grad_fn(model, (&input_ids_2d, &labels_2d))?;
 
-    // Apply gradient clipping if max_grad_norm > 0
     if max_grad_norm > 0.0 {
-        // Compute global gradient norm (GPU-based, no sync required)
-        let eps = Array::from_f32_slice(&[1e-6_f32], &[1]);
-        let mut sq_sum = Array::from_f32_slice(&[0.0_f32], &[1]);
-        for grad in grads.values() {
-            sq_sum = sq_sum.add(&grad.square().sum(None));
-        }
-        let norm = sq_sum.sqrt();
-
-        // Scale gradients: scale = max_norm / max(norm, max_norm)
-        // This clamps scale to [0, 1], only reducing large gradients
-        let max_norm_arr = Array::from_f32_slice(&[max_grad_norm], &[1]);
-        let norm_clamped = ops::maximum(&norm, &max_norm_arr);
-        let scale = max_norm_arr.divide(&norm_clamped.add(&eps));
-
-        // Apply scale to all gradients (in-place via replace)
-        for grad in grads.values_mut() {
-            *grad = grad.multiply(&scale);
-        }
+        clip_grads(&mut grads, max_grad_norm);
     }
 
     // Apply gradients via optimizer
@@ -332,20 +304,8 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
         let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
         let (loss, mut grads) = loss_and_grad_fn(model, (&input_ids_2d, &labels_2d))?;
 
-        // Gradient clipping (same as jit_training_step_packed)
         if max_grad_norm > 0.0 {
-            let eps = Array::from_f32_slice(&[1e-6_f32], &[1]);
-            let mut sq_sum = Array::from_f32_slice(&[0.0_f32], &[1]);
-            for grad in grads.values() {
-                sq_sum = sq_sum.add(&grad.square().sum(None));
-            }
-            let norm = sq_sum.sqrt();
-            let max_norm_arr = Array::from_f32_slice(&[max_grad_norm], &[1]);
-            let norm_clamped = ops::maximum(&norm, &max_norm_arr);
-            let scale = max_norm_arr.divide(&norm_clamped.add(&eps));
-            for grad in grads.values_mut() {
-                *grad = grad.multiply(&scale);
-            }
+            clip_grads(&mut grads, max_grad_norm);
         }
 
         optimizer.update(model, grads)?;

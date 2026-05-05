@@ -1023,7 +1023,7 @@ fn tab_help(tab: Tab) -> &'static [(&'static str, &'static str)] {
             ("J / K", "Scroll the selected job log"),
             ("R", "Rescan job output directories"),
         ],
-        Tab::Serve | Tab::Quantize | Tab::Merge | Tab::Bench | Tab::Eval => &[
+        Tab::Serve | Tab::Quantize | Tab::Merge | Tab::Bench | Tab::Eval | Tab::Dflash => &[
             ("j / k", "Navigate fields"),
             ("Enter", "Edit / cycle / pick"),
             ("S", "Start the job"),
@@ -1038,8 +1038,8 @@ fn tab_help(tab: Tab) -> &'static [(&'static str, &'static str)] {
         Tab::Ollama => &[
             ("j / k", "Navigate fields"),
             ("Enter", "Edit field value"),
-            ("S", "Run the Ollama subcommand"),
-            ("x", "Cancel running command"),
+            ("S", "Export the Modelfile"),
+            ("x", "Cancel running export"),
         ],
     }
 }

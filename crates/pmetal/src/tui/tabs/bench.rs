@@ -101,6 +101,13 @@ impl BenchTab {
                 "Workload",
             ),
             FormField::new(
+                "Dataset",
+                "TeichAI/gemini-3-pro-preview-high-reasoning-250x",
+                FieldKind::DatasetPicker,
+                "Workload",
+            ),
+            FormField::new("Experts Dir", "", FieldKind::Path, "Workload"),
+            FormField::new(
                 "Prompt Samples",
                 "8",
                 FieldKind::Integer { min: 1, max: 128 },
@@ -128,9 +135,42 @@ impl BenchTab {
                 "Workload",
             ),
             FormField::new(
+                "Inference Session Repeats",
+                "1",
+                FieldKind::Integer { min: 1, max: 64 },
+                "Workload",
+            ),
+            FormField::new(
                 "Inference Repeats",
                 "1",
                 FieldKind::Integer { min: 1, max: 64 },
+                "Workload",
+            ),
+            FormField::new(
+                "Train Samples",
+                "8",
+                FieldKind::Integer { min: 1, max: 4096 },
+                "Workload",
+            ),
+            FormField::new(
+                "Train Steps",
+                "4",
+                FieldKind::Integer { min: 1, max: 4096 },
+                "Workload",
+            ),
+            FormField::new(
+                "Train Batch Size",
+                "1",
+                FieldKind::Integer { min: 1, max: 128 },
+                "Workload",
+            ),
+            FormField::new(
+                "Train Max Seq Len",
+                "0",
+                FieldKind::Integer {
+                    min: 0,
+                    max: 32_768,
+                },
                 "Workload",
             ),
             FormField::new(
@@ -220,8 +260,13 @@ impl BenchTab {
     // ── Config ──────────────────────────────────────────────────────────
 
     pub fn validate_config(&self) -> Result<(), String> {
-        if self.form.value("Model") == "(not selected)" {
+        let mode = self.form.value("Mode");
+        let preset = self.form.value("Preset");
+        if (mode == "basic" || preset == "custom") && self.form.value("Model") == "(not selected)" {
             return Err("Model is required.".into());
+        }
+        if mode == "workload" && preset == "custom" && self.form.value("Dataset").is_empty() {
+            return Err("Dataset is required for custom workload benchmarks.".into());
         }
         let json_out = self.form.value("JSON Output");
         if !json_out.is_empty() && !json_out.ends_with(".json") {
@@ -232,18 +277,21 @@ impl BenchTab {
 
     pub fn config_summary(&self) -> Vec<String> {
         let mode = self.form.value("Mode");
-        let mut summary = vec![
-            format!("Mode:     {mode}"),
-            format!("Model:    {}", self.form.value("Model")),
-        ];
+        let mut summary = vec![format!("Mode:     {mode}")];
         if mode == "workload" {
-            summary.push(format!("Preset:   {}", self.form.value("Preset")));
+            let preset = self.form.value("Preset");
+            summary.push(format!("Preset:   {preset}"));
+            if preset == "custom" {
+                summary.push(format!("Model:    {}", self.form.value("Model")));
+                summary.push(format!("Dataset:  {}", self.form.value("Dataset")));
+            }
             summary.push(format!(
                 "Samples:  {} prompts x {} decode steps",
                 self.form.value("Prompt Samples"),
                 self.form.value("Decode Steps"),
             ));
         } else {
+            summary.push(format!("Model:    {}", self.form.value("Model")));
             summary.push(format!(
                 "Shape:    batch={}, seq_len={}",
                 self.form.value("Batch Size"),
@@ -265,28 +313,42 @@ impl BenchTab {
 
         if mode == "workload" {
             args.push("bench-workload".into());
-            args.extend(["--model".into(), self.form.value("Model")]);
             let preset = self.form.value("Preset");
             if preset != "custom" {
                 args.extend(["--preset".into(), preset]);
+            } else {
+                args.extend(["--model".into(), self.form.value("Model")]);
+                args.extend(["--dataset".into(), self.form.value("Dataset")]);
+                args.extend([
+                    "--inference-context".into(),
+                    self.form.value("Inference Context"),
+                ]);
+                args.extend(["--prompt-samples".into(), self.form.value("Prompt Samples")]);
+                args.extend([
+                    "--max-prompt-tokens".into(),
+                    self.form.value("Max Prompt Tokens"),
+                ]);
+                args.extend(["--decode-steps".into(), self.form.value("Decode Steps")]);
+                args.extend([
+                    "--inference-repeats".into(),
+                    self.form.value("Inference Repeats"),
+                ]);
+                args.extend(["--train-samples".into(), self.form.value("Train Samples")]);
+                args.extend(["--train-steps".into(), self.form.value("Train Steps")]);
+                args.extend(["--batch-size".into(), self.form.value("Train Batch Size")]);
+                args.extend(["--max-seq-len".into(), self.form.value("Train Max Seq Len")]);
             }
-            args.extend([
-                "--inference-context".into(),
-                self.form.value("Inference Context"),
-            ]);
-            args.extend(["--prompt-samples".into(), self.form.value("Prompt Samples")]);
-            args.extend([
-                "--max-prompt-tokens".into(),
-                self.form.value("Max Prompt Tokens"),
-            ]);
-            args.extend(["--decode-steps".into(), self.form.value("Decode Steps")]);
+            let experts_dir = self.form.value("Experts Dir");
+            if !experts_dir.is_empty() {
+                args.extend(["--experts-dir".into(), experts_dir]);
+            }
             args.extend([
                 "--inference-warmup-passes".into(),
                 self.form.value("Inference Warmup"),
             ]);
             args.extend([
-                "--inference-repeats".into(),
-                self.form.value("Inference Repeats"),
+                "--inference-session-repeats".into(),
+                self.form.value("Inference Session Repeats"),
             ]);
         } else {
             args.push("bench".into());

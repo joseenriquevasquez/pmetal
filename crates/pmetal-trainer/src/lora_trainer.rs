@@ -6,12 +6,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use pmetal_bridge::compat::{
-    Array, Exception, eval_params, indexing::IndexOp, module::ModuleParameters, nn,
-    optimizers::Optimizer,
+    Array, Exception, eval_params, module::ModuleParameters, nn, optimizers::Optimizer,
 };
 use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_lora::LlamaLoraForCausalLM;
-use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
 use pmetal_models::architectures::llama::LlamaConfig;
 
 use crate::{CheckpointManager, CheckpointMetadata, Result, SftError};
@@ -178,19 +176,7 @@ impl LoraTrainer {
                 .forward(ids, None)
                 .map_err(|e| Exception::custom(e.to_string()))?;
 
-            let seq_len = logits.dim(1);
-            let vocab_size = logits.dim(2);
-
-            let shift_logits = logits.index((.., ..seq_len - 1, ..));
-            let shift_labels = lbls.index((.., 1..));
-
-            let masked_labels = lbls.clone();
-            let _ = vocab_size;
-            Ok(pmetal_bridge::training::causal_lm_loss(
-                &logits,
-                &masked_labels,
-                -100,
-            ))
+            Ok(pmetal_bridge::training::causal_lm_loss(&logits, lbls, -100))
         };
 
         // Create value_and_grad function
@@ -366,15 +352,6 @@ impl LoraTrainer {
 
 /// Compute language model loss (cross-entropy with shifting).
 pub fn compute_lm_loss(logits: &Array, labels: &Array) -> Result<Array> {
-    let seq_len = logits.dim(1);
-    let vocab_size = logits.dim(2);
-
-    // Shift: logits[:-1] predicts labels[1:]
-    let shift_logits = logits.index((.., ..seq_len - 1, ..));
-    let shift_labels = labels.index((.., 1..));
-
-    // Reshape for cross entropy: [batch * seq_len, vocab_size] and [batch * seq_len]
-    let _ = vocab_size;
     Ok(pmetal_bridge::training::causal_lm_loss(
         logits, labels, -100,
     ))

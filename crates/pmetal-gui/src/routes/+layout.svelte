@@ -47,6 +47,12 @@
       sublabel: 'Chat with Models',
     },
     {
+      path: '/dflash',
+      label: 'DFlash',
+      icon: 'M13 10V3L4 14h7v7l9-11h-7z',
+      sublabel: 'Speculative decoding',
+    },
+    {
       path: '/models',
       label: 'Models',
       icon: 'M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10',
@@ -82,9 +88,9 @@
     },
     {
       path: '/ollama',
-      label: 'Ollama',
+      label: 'Modelfile',
       icon: 'M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z',
-      sublabel: 'Install / Pull / Run',
+      sublabel: 'External export',
     },
     {
       path: '/serve',

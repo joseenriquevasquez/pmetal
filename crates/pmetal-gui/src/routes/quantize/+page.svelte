@@ -3,21 +3,27 @@
   import { quantizeModel, fuseLora } from '$lib/api';
 
   const quantMethods = [
-    { value: 'dynamic_2.0', label: 'Dynamic 2.0', description: 'PMetal dynamic quantization — best quality/speed tradeoff' },
-    { value: 'Q8_0', label: 'Q8_0', description: '8-bit quantization — near-lossless, 2x compression' },
-    { value: 'Q6_K', label: 'Q6_K', description: '6-bit K-quant — excellent quality' },
-    { value: 'Q5_K_M', label: 'Q5_K_M', description: '5-bit medium K-quant — good balance' },
-    { value: 'Q4_K_M', label: 'Q4_K_M', description: '4-bit medium K-quant — recommended for most models' },
-    { value: 'Q3_K_M', label: 'Q3_K_M', description: '3-bit medium K-quant — aggressive compression' },
-    { value: 'Q2_K', label: 'Q2_K', description: '2-bit K-quant — maximum compression, lower quality' },
+    { value: 'dynamic', label: 'Dynamic', description: 'PMetal dynamic quantization — best quality/speed tradeoff' },
+    { value: 'q8_0', label: 'Q8_0', description: '8-bit quantization — near-lossless, 2x compression' },
+    { value: 'q6_k', label: 'Q6_K', description: '6-bit K-quant — excellent quality' },
+    { value: 'q5_k_m', label: 'Q5_K_M', description: '5-bit medium K-quant — good balance' },
+    { value: 'q4_k_m', label: 'Q4_K_M', description: '4-bit medium K-quant — recommended for most models' },
+    { value: 'q3_k_m', label: 'Q3_K_M', description: '3-bit medium K-quant — aggressive compression' },
+    { value: 'q2_k', label: 'Q2_K', description: '2-bit K-quant — maximum compression, lower quality' },
   ];
 
   // Form state
   let selectedModel = $state('');
-  let selectedMethod = $state('dynamic_2.0');
+  let selectedMethod = $state('dynamic');
   let loraAdapterPath = $state('');
   let importanceMatrixPath = $state('');
   let outputPath = $state('');
+  let outputFormat = $state('gguf');
+  let mlxBits = $state(4);
+  let mlxGroupSize = $state(64);
+  let klCalibrate = $state(false);
+  let targetBpw = $state('');
+  let klThreshold = $state(0.01);
 
   // Fuse-first option
   let fuseBeforeQuantize = $state(false);
@@ -34,13 +40,13 @@
     const m = models.find(m => m.id === modelId);
     if (!m) return '--';
     const bpp: Record<string, number> = {
-      'dynamic_2.0': 2.1,
-      'Q8_0': 1.05,
-      'Q6_K': 0.80,
-      'Q5_K_M': 0.68,
-      'Q4_K_M': 0.58,
-      'Q3_K_M': 0.48,
-      'Q2_K': 0.37,
+      dynamic: 0.58,
+      q8_0: 1.05,
+      q6_k: 0.80,
+      q5_k_m: 0.68,
+      q4_k_m: 0.58,
+      q3_k_m: 0.48,
+      q2_k: 0.37,
     };
     const factor = bpp[method] ?? 1.0;
     const originalGb = m.size / (1024 * 1024 * 1024);
@@ -73,7 +79,15 @@
 
       // Step 2: Quantize
       statusMessage = `Quantizing with ${selectedMethod}...`;
-      const result = await quantizeModel(targetModel, selectedMethod, outputPath.trim());
+      const result = await quantizeModel(targetModel, selectedMethod, outputPath.trim(), {
+        imatrix: importanceMatrixPath.trim() || null,
+        format: outputFormat,
+        bits: mlxBits,
+        groupSize: mlxGroupSize,
+        klCalibrate,
+        targetBpw: targetBpw.trim() ? Number(targetBpw) : null,
+        klThreshold,
+      });
       formSuccess = `Quantization complete. Output: ${result}`;
       statusMessage = null;
     } catch (e) {
@@ -179,6 +193,45 @@
             </div>
           {/if}
         {/if}
+
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2">
+          <div>
+            <label class="label" for="quant-format">Format</label>
+            <select id="quant-format" class="input" bind:value={outputFormat}>
+              <option value="gguf">GGUF</option>
+              <option value="mlx">MLX</option>
+            </select>
+          </div>
+          {#if outputFormat === 'mlx'}
+            <div>
+              <label class="label" for="quant-bits">MLX Bits</label>
+              <input id="quant-bits" type="number" min="3" max="8" class="input" bind:value={mlxBits} />
+            </div>
+            <div>
+              <label class="label" for="quant-group">Group Size</label>
+              <input id="quant-group" type="number" min="16" max="256" class="input" bind:value={mlxGroupSize} />
+            </div>
+          {/if}
+        </div>
+
+        <div class="p-3 rounded-lg bg-surface-50 dark:bg-surface-800/50 border border-surface-200 dark:border-surface-700 space-y-3">
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" class="rounded border-surface-300" bind:checked={klCalibrate} />
+            <span class="text-sm font-medium text-surface-700 dark:text-surface-300">Use KL calibration</span>
+          </label>
+          {#if klCalibrate}
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="label" for="quant-target-bpw">Target BPW</label>
+                <input id="quant-target-bpw" type="text" class="input" placeholder="4.5" bind:value={targetBpw} />
+              </div>
+              <div>
+                <label class="label" for="quant-kl-threshold">KL Threshold</label>
+                <input id="quant-kl-threshold" type="number" step="0.001" min="0" max="1" class="input" bind:value={klThreshold} />
+              </div>
+            </div>
+          {/if}
+        </div>
       </div>
     </div>
 
@@ -193,10 +246,10 @@
           id="quant-output"
           type="text"
           class="input"
-          placeholder="/path/to/quantized-model"
+          placeholder="/path/to/model.gguf"
           bind:value={outputPath}
         />
-        <p class="text-xs text-surface-500 mt-1">Directory where the quantized model will be saved</p>
+        <p class="text-xs text-surface-500 mt-1">File path where the quantized model will be saved</p>
       </div>
     </div>
 
@@ -237,7 +290,7 @@
       <h3 class="font-semibold text-surface-900 dark:text-surface-100">Quantization Guide</h3>
     </div>
     <div class="card-body space-y-3 text-sm text-surface-600 dark:text-surface-400">
-      <p><strong class="text-surface-800 dark:text-surface-200">Dynamic 2.0</strong> — PMetal's default. Analyzes weight distributions per-layer and selects optimal bit-width automatically. Best for general use.</p>
+      <p><strong class="text-surface-800 dark:text-surface-200">Dynamic</strong> — PMetal's default. Analyzes weight distributions per-layer and selects quantization types automatically. Best for general use.</p>
       <p><strong class="text-surface-800 dark:text-surface-200">Q4_K_M</strong> — The recommended GGUF format for running on Apple Silicon. Good balance of quality and size. Works with all compatible tools.</p>
       <p><strong class="text-surface-800 dark:text-surface-200">Importance matrix</strong> — Run a calibration pass on representative data to build an imatrix file. Significantly improves Q4 and Q3 quality, especially for instruction-tuned models.</p>
       <p class="pt-2 border-t border-surface-200 dark:border-surface-700 text-xs">All quantization runs on the Apple Neural Engine (ANE) or GPU via Metal. Expect 5–20 minutes depending on model size.</p>

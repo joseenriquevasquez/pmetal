@@ -21,10 +21,10 @@ use crate::tui::event::{AppMsg, CommandSpec, Event, EventHandler, JobType};
 use crate::tui::modal::{Modal, ModalAction, PickerEntry};
 use crate::tui::tabs::dashboard::MetricSample;
 use crate::tui::tabs::{
-    BenchTab, DashboardTab, DatasetsTab, DeviceTab, DistillationTab, EmbedTrainTab, EvalTab,
-    GrpoTab, InferenceFocus, InferenceTab, JobsTab, MergeTab, ModelSource, ModelsTab, OllamaTab,
-    PretrainTab, QuantizeTab, RlkdTab, ServeTab, Tab, TokenizeTab, TrainingStatus, TrainingTab,
-    write_training_info,
+    BenchTab, DashboardTab, DatasetsTab, DeviceTab, DflashTab, DistillationTab, EmbedTrainTab,
+    EvalTab, GrpoTab, InferenceFocus, InferenceTab, JobsTab, MergeTab, ModelSource, ModelsTab,
+    OllamaTab, PretrainTab, QuantizeTab, RlkdTab, ServeTab, Tab, TokenizeTab, TrainingStatus,
+    TrainingTab, write_training_info,
 };
 use crate::tui::theme::THEME;
 use crate::tui::widgets::{Footer, FormAction, Header};
@@ -56,6 +56,7 @@ pub struct App {
     pub distillation: DistillationTab,
     pub grpo: GrpoTab,
     pub serve: ServeTab,
+    pub dflash: DflashTab,
     pub quantize: QuantizeTab,
     pub bench: BenchTab,
     pub eval: EvalTab,
@@ -98,6 +99,9 @@ pub struct App {
 
     /// Currently active eval job ID (if any). One-shot.
     active_eval_job: Option<String>,
+
+    /// Currently active DFlash job ID (if any). One-shot.
+    active_dflash_job: Option<String>,
 
     /// Currently active merge job ID (if any). One-shot.
     active_merge_job: Option<String>,
@@ -159,6 +163,9 @@ enum PendingModalTarget {
     EvalModel,
     EvalDataset,
     EvalStart,
+    DflashTargetModel,
+    DflashDraftModel,
+    DflashStart,
     MergeModelA,
     MergeModelB,
     MergeBaseModel,
@@ -205,6 +212,7 @@ impl App {
             distillation: DistillationTab::new(),
             grpo: GrpoTab::new(),
             serve: ServeTab::new(),
+            dflash: DflashTab::new(),
             quantize: QuantizeTab::new(),
             bench: BenchTab::new(),
             eval: EvalTab::new(),
@@ -221,6 +229,7 @@ impl App {
             active_quantize_job: None,
             active_bench_job: None,
             active_eval_job: None,
+            active_dflash_job: None,
             active_merge_job: None,
             active_pretrain_job: None,
             active_embed_train_job: None,
@@ -570,6 +579,7 @@ impl App {
             Tab::Jobs => self.handle_jobs_key(key),
             Tab::Distillation => self.handle_distillation_key(key),
             Tab::Grpo => self.handle_grpo_key(key),
+            Tab::Dflash => self.handle_dflash_key(key),
             Tab::Serve => self.handle_serve_key(key),
             Tab::Quantize => self.handle_quantize_key(key),
             Tab::Bench => self.handle_bench_key(key),
@@ -1260,6 +1270,61 @@ impl App {
         }
     }
 
+    // --- DFlash tab key handler ---
+    fn handle_dflash_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        if self.dflash.is_editing() {
+            match key.code {
+                KeyCode::Enter => self.dflash.confirm_edit(),
+                KeyCode::Esc => self.dflash.cancel_edit(),
+                _ => self.dflash.handle_edit_key(key),
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.dflash.next_param(),
+            KeyCode::Up | KeyCode::Char('k') => self.dflash.prev_param(),
+            KeyCode::Enter => {
+                if let Some(action) = self.dflash.handle_enter() {
+                    match action {
+                        FormAction::OpenModelPicker { field_label } => {
+                            let target = match field_label.as_str() {
+                                "Target Model" => PendingModalTarget::DflashTargetModel,
+                                "Draft Model" => PendingModalTarget::DflashDraftModel,
+                                _ => return,
+                            };
+                            self.pending_modal_context = Some(target);
+                            let entries = self.model_picker_entries();
+                            self.modal_stack.push(Modal::model_picker(entries));
+                        }
+                        FormAction::OpenDatasetPicker { .. } => {}
+                        FormAction::StartEdit => {}
+                    }
+                }
+            }
+            KeyCode::Char('S') => {
+                if self.dflash.is_running() {
+                    self.modal_stack.push(Modal::error(
+                        "Already Running",
+                        "A DFlash job is already in progress. Cancel it first (x).",
+                    ));
+                } else {
+                    self.start_dflash_prompt();
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(ref job_id) = self.active_dflash_job.clone() {
+                    if let Some(runner) = &mut self.runner {
+                        runner.cancel(job_id);
+                    }
+                    self.dflash.mark_failed("cancelled by user");
+                }
+            }
+            _ => {}
+        }
+    }
+
     // --- Tokenize tab key handler ---
     fn handle_tokenize_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::KeyCode;
@@ -1330,7 +1395,7 @@ impl App {
                 if self.ollama.is_running() {
                     self.modal_stack.push(Modal::error(
                         "Already Running",
-                        "An Ollama command is already running. Cancel it first (x).",
+                        "A Modelfile export is already running. Cancel it first (x).",
                     ));
                 } else {
                     self.start_ollama_prompt();
@@ -1392,6 +1457,7 @@ impl App {
                     Tab::Jobs => self.jobs.prev_row(),
                     Tab::Distillation => self.distillation.prev_param(),
                     Tab::Grpo => self.grpo.prev_param(),
+                    Tab::Dflash => self.dflash.prev_param(),
                     Tab::Serve => self.serve.prev_param(),
                     Tab::Quantize => self.quantize.prev_param(),
                     Tab::Bench => self.bench.prev_param(),
@@ -1412,6 +1478,7 @@ impl App {
                 Tab::Jobs => self.jobs.next_row(),
                 Tab::Distillation => self.distillation.next_param(),
                 Tab::Grpo => self.grpo.next_param(),
+                Tab::Dflash => self.dflash.next_param(),
                 Tab::Serve => self.serve.next_param(),
                 Tab::Quantize => self.quantize.next_param(),
                 Tab::Bench => self.bench.next_param(),
@@ -1540,6 +1607,10 @@ impl App {
                 // Eval metrics live in the Eval tab.
                 if self.active_eval_job.as_deref() == Some(&job_id) {
                     self.eval.append_log(&line);
+                }
+                // DFlash output lives in the DFlash tab.
+                if self.active_dflash_job.as_deref() == Some(&job_id) {
+                    self.dflash.append_log(&line);
                 }
                 // Merge output lives in the Merge tab.
                 if self.active_merge_job.as_deref() == Some(&job_id) {
@@ -1712,6 +1783,14 @@ impl App {
                         self.eval.mark_failed(&message);
                     }
                 }
+                if self.active_dflash_job.as_deref() == Some(&job_id) {
+                    self.active_dflash_job = None;
+                    if success {
+                        self.dflash.mark_completed();
+                    } else {
+                        self.dflash.mark_failed(&message);
+                    }
+                }
                 if self.active_merge_job.as_deref() == Some(&job_id) {
                     self.active_merge_job = None;
                     if success {
@@ -1723,6 +1802,15 @@ impl App {
                 }
                 if self.active_pretrain_job.as_deref() == Some(&job_id) {
                     self.active_pretrain_job = None;
+                    if success {
+                        let total_steps = self.pretrain.form.value("Steps").parse().unwrap_or(0);
+                        self.pretrain.status = TrainingStatus::Completed {
+                            final_loss: 0.0,
+                            total_steps,
+                        };
+                    } else {
+                        self.pretrain.status = TrainingStatus::Failed(message.clone());
+                    }
                 }
                 if self.active_embed_train_job.as_deref() == Some(&job_id) {
                     self.active_embed_train_job = None;
@@ -1925,6 +2013,9 @@ impl App {
                     Some(PendingModalTarget::EvalStart) => {
                         self.start_eval();
                     }
+                    Some(PendingModalTarget::DflashStart) => {
+                        self.start_dflash();
+                    }
                     Some(PendingModalTarget::MergeStart) => {
                         self.start_merge();
                     }
@@ -2023,6 +2114,12 @@ impl App {
                 }
                 Some(PendingModalTarget::EvalModel) => {
                     self.eval.set_model(&id);
+                }
+                Some(PendingModalTarget::DflashTargetModel) => {
+                    self.dflash.set_target_model(&id);
+                }
+                Some(PendingModalTarget::DflashDraftModel) => {
+                    self.dflash.set_draft_model(&id);
                 }
                 Some(PendingModalTarget::MergeModelA) => {
                     self.merge.set_model("Model A", &id);
@@ -2180,6 +2277,7 @@ impl App {
             self.active_quantize_job.is_some(),
             self.active_bench_job.is_some(),
             self.active_eval_job.is_some(),
+            self.active_dflash_job.is_some(),
             self.active_merge_job.is_some(),
             self.active_pretrain_job.is_some(),
             self.active_embed_train_job.is_some(),
@@ -2394,27 +2492,26 @@ impl App {
     fn start_pretrain(&mut self) {
         let args = self.pretrain.build_cli_args();
         let output_dir = self.pretrain.output_dir();
-        let metrics_file = output_dir.join("metrics.jsonl");
-
-        // Truncate old metrics so dashboard starts fresh
         let _ = std::fs::create_dir_all(&output_dir);
-        let _ = std::fs::write(&metrics_file, "");
 
         let spec = CommandSpec {
             job_type: JobType::Pretrain,
             args,
-            metrics_file: Some(metrics_file.clone()),
+            metrics_file: None,
             output_dir: Some(output_dir.clone()),
         };
 
         if let Some(runner) = &mut self.runner {
             let job_id = runner.spawn(spec);
             self.active_pretrain_job = Some(job_id.clone());
-            self.active_training_job = Some(job_id);
-            self.active_job_type = Some(JobType::Pretrain);
-            self.active_training_output_dir = Some(output_dir);
-            self.dashboard.set_metrics_path(Some(metrics_file));
-            self.active_tab = Tab::Dashboard;
+            let total_steps = self.pretrain.form.value("Steps").parse().unwrap_or(0);
+            self.pretrain.status = TrainingStatus::Running {
+                step: 0,
+                epoch: 0,
+                total_epochs: 1,
+                total_steps,
+                loss: 0.0,
+            };
         }
     }
 
@@ -2542,6 +2639,33 @@ impl App {
         }
     }
 
+    fn start_dflash_prompt(&mut self) {
+        if let Err(msg) = self.dflash.validate_config() {
+            self.modal_stack.push(Modal::error("Invalid Config", msg));
+            return;
+        }
+        let summary = self.dflash.config_summary();
+        self.pending_modal_context = Some(PendingModalTarget::DflashStart);
+        self.modal_stack
+            .push(Modal::confirm("Run DFlash?", summary));
+    }
+
+    fn start_dflash(&mut self) {
+        let args = self.dflash.build_cli_args();
+        let spec = CommandSpec {
+            job_type: JobType::Dflash,
+            args,
+            metrics_file: None,
+            output_dir: None,
+        };
+
+        if let Some(runner) = &mut self.runner {
+            let job_id = runner.spawn(spec);
+            self.active_dflash_job = Some(job_id);
+            self.dflash.mark_running();
+        }
+    }
+
     fn start_merge_prompt(&mut self) {
         if let Err(msg) = self.merge.validate_config() {
             self.modal_stack.push(Modal::error("Invalid Config", msg));
@@ -2658,7 +2782,7 @@ impl App {
         let summary = self.ollama.config_summary();
         self.pending_modal_context = Some(PendingModalTarget::OllamaStart);
         self.modal_stack
-            .push(Modal::confirm("Run Ollama?", summary));
+            .push(Modal::confirm("Generate Modelfile?", summary));
     }
 
     fn start_ollama(&mut self) {
@@ -3046,6 +3170,7 @@ impl App {
                     .render_with_metrics(content_area, buf, &dash_samples, &dash_throughput);
             }
             Tab::Serve => self.serve.render(content_area, buf),
+            Tab::Dflash => self.dflash.render(content_area, buf),
             Tab::Quantize => self.quantize.render(content_area, buf),
             Tab::Bench => self.bench.render(content_area, buf),
             Tab::Eval => self.eval.render(content_area, buf),

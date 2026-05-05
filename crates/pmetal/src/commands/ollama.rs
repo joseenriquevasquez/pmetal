@@ -3,7 +3,7 @@ use pmetal_models::ollama::{ModelfileBuilder, templates as ollama_templates};
 use crate::OllamaAction;
 use crate::OllamaTemplate;
 
-/// Run Ollama subcommands.
+/// Run Modelfile export helpers.
 pub(crate) async fn run_ollama_command(action: OllamaAction) -> anyhow::Result<()> {
     match action {
         OllamaAction::Modelfile {
@@ -39,12 +39,14 @@ pub(crate) async fn run_ollama_command(action: OllamaAction) -> anyhow::Result<(
             system,
             temperature,
             num_ctx,
+            output,
             template,
         } => {
-            create_ollama_model(
+            prepare_ollama_model(
                 &name,
                 &base,
                 lora.as_deref(),
+                &output,
                 system.as_deref(),
                 temperature,
                 num_ctx,
@@ -208,11 +210,15 @@ pub(crate) fn validate_file_path(
     Ok(canonical)
 }
 
-/// Create and register a model with Ollama.
-fn create_ollama_model(
+/// Generate a Modelfile and print the external registration command.
+///
+/// PMetal intentionally does not invoke the Ollama runtime here. Keeping this
+/// path file-based avoids coupling export to a locally installed service.
+fn prepare_ollama_model(
     name: &str,
     base: &str,
     lora: Option<&str>,
+    output: &str,
     system: Option<&str>,
     temperature: Option<f32>,
     num_ctx: Option<i32>,
@@ -221,18 +227,10 @@ fn create_ollama_model(
     // Validate model name to prevent command injection
     validate_ollama_model_name(name)?;
 
-    // Create secure temporary file (auto-cleaned on drop)
-    let modelfile = tempfile::Builder::new()
-        .prefix("pmetal-modelfile-")
-        .suffix(".txt")
-        .tempfile()?;
-    let modelfile_path = modelfile.path().to_path_buf();
-    let modelfile_str = modelfile_path.to_string_lossy().to_string();
-
     generate_modelfile(
         base,
         lora,
-        &modelfile_str,
+        output,
         system,
         temperature,
         num_ctx,
@@ -242,45 +240,8 @@ fn create_ollama_model(
         None,
     )?;
 
-    println!("\nCreating Ollama model '{}'...", name);
-
-    // Run ollama create
-    let status = std::process::Command::new("ollama")
-        .args(["create", name, "-f", &modelfile_str])
-        .status();
-
-    match status {
-        Ok(exit_status) if exit_status.success() => {
-            println!("\nModel '{}' created successfully!", name);
-            println!("\nTo use the model, run:");
-            println!("  ollama run {}", name);
-            // modelfile is auto-cleaned on drop
-        }
-        Ok(exit_status) => {
-            // Persist the temp file so user can inspect it
-            let persisted = modelfile.into_temp_path();
-            let kept_path = persisted.keep()?;
-            anyhow::bail!(
-                "ollama create failed with exit code: {:?}. \
-                 Modelfile saved at: {}",
-                exit_status.code(),
-                kept_path.display()
-            );
-        }
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                let persisted = modelfile.into_temp_path();
-                let kept_path = persisted.keep()?;
-                println!("\nOllama not found. Please install Ollama first:");
-                println!("  https://ollama.ai/download");
-                println!("\nModelfile has been saved to: {}", kept_path.display());
-                println!("Once Ollama is installed, run:");
-                println!("  ollama create {} -f {}", name, kept_path.display());
-            } else {
-                anyhow::bail!("Failed to run ollama: {}", e);
-            }
-        }
-    }
+    println!("\nTo register externally, run:");
+    println!("  ollama create {} -f {}", name, output);
 
     Ok(())
 }

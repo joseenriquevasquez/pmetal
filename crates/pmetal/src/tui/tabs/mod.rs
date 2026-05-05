@@ -4,7 +4,6 @@ mod bench;
 pub mod dashboard;
 mod datasets;
 mod device;
-#[allow(dead_code)]
 mod dflash;
 mod distillation;
 mod embed_train;
@@ -26,6 +25,7 @@ pub use bench::BenchTab;
 pub use dashboard::DashboardTab;
 pub use datasets::DatasetsTab;
 pub use device::DeviceTab;
+pub use dflash::DflashTab;
 pub use distillation::DistillationTab;
 pub use embed_train::EmbedTrainTab;
 pub use eval::EvalTab;
@@ -63,6 +63,7 @@ pub enum Tab {
     Rlkd,
     Grpo,
     Inference,
+    Dflash,
     Serve,
     Quantize,
     Merge,
@@ -79,9 +80,9 @@ impl Tab {
     /// - System/data tabs first: Device, Models, Datasets, Tokenize
     /// - Training family: Training, EmbedTrain, Pretrain, Distillation, Rlkd, Grpo
     /// - Dashboard (metrics monitor) after training group
-    /// - Inference/serving: Inference, Serve
+    /// - Inference/serving: Inference, DFlash, Serve
     /// - Post-processing: Quantize, Merge, Bench, Eval
-    /// - External integrations: Ollama
+    /// - External exports: Modelfile
     /// - Jobs log last
     pub const ALL: &[Tab] = &[
         Tab::Device,
@@ -96,6 +97,7 @@ impl Tab {
         Tab::Grpo,
         Tab::Dashboard,
         Tab::Inference,
+        Tab::Dflash,
         Tab::Serve,
         Tab::Quantize,
         Tab::Merge,
@@ -120,6 +122,7 @@ impl Tab {
             Tab::Rlkd => "r",
             Tab::Grpo => "!",
             Tab::Inference => "$",
+            Tab::Dflash => "d",
             Tab::Serve => "*",
             Tab::Quantize => "=",
             Tab::Merge => "x",
@@ -160,12 +163,13 @@ impl std::fmt::Display for Tab {
             Tab::Rlkd => write!(f, "RLKD"),
             Tab::Grpo => write!(f, "GRPO"),
             Tab::Inference => write!(f, "Inference"),
+            Tab::Dflash => write!(f, "DFlash"),
             Tab::Serve => write!(f, "Serve"),
             Tab::Quantize => write!(f, "Quantize"),
             Tab::Merge => write!(f, "Merge"),
             Tab::Bench => write!(f, "Bench"),
             Tab::Eval => write!(f, "Eval"),
-            Tab::Ollama => write!(f, "Ollama"),
+            Tab::Ollama => write!(f, "Modelfile"),
             Tab::Jobs => write!(f, "Jobs"),
         }
     }

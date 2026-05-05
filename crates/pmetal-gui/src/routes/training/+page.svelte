@@ -45,6 +45,8 @@
   let loraDropout = $state(0.0);
   let useRslora = $state(false);
   let useDora = $state(false);
+  let quantBlockSize = $state(64);
+  let doubleQuant = $state(false);
   let maxSeqLen = $state(2048);
   let warmupSteps = $state(100);
   let weightDecay = $state(0.01);
@@ -59,10 +61,18 @@
   // PMetal optimizations
   let jitCompilation = $state(true);
   let gradientCheckpointing = $state(true);
+  let gradientCheckpointingLayers = $state(4);
   let sequencePacking = $state(true);
   let flashAttention = $state(true);
+  let fusedStep = $state(true);
   let fusedOptimizer = $state(true);
   let embeddingLr = $state(0.0);
+  let cutCrossEntropy = $state(false);
+  let noAdaptiveLr = $state(false);
+  let packMaxSeqLen = $state('');
+  let distributedPeers = $state('');
+  let distributedAuto = $state(false);
+  let compressionStrategy = $state('none');
 
   // Effective batch size helper for guidance text
   let effectiveBatchSize = $derived(batchSize * gradAccumSteps * (sequencePacking ? 3 : 1));
@@ -246,7 +256,9 @@
         batch_size: batchSize,
         lora_r: isLoraMethod ? loraRank : undefined,
         lora_alpha: isLoraMethod ? loraAlpha : undefined,
-        quantization: selectedMethod === 'qlora' ? 'nf4' : undefined,
+        quantization: selectedMethod === 'qlora' && loadIn4bit ? 'nf4' : undefined,
+        quant_block_size: selectedMethod === 'qlora' && loadIn4bit ? quantBlockSize : undefined,
+        double_quant: selectedMethod === 'qlora' && loadIn4bit ? doubleQuant : undefined,
         gradient_accumulation_steps: gradAccumSteps,
         max_seq_len: maxSeqLen,
         text_columns: selectedTextColumns.length > 1
@@ -258,13 +270,21 @@
         embedding_lr: embeddingLr > 0 ? embeddingLr : undefined,
         no_jit_compilation: !jitCompilation,
         no_gradient_checkpointing: !gradientCheckpointing,
+        gradient_checkpointing_layers: gradientCheckpointingLayers,
         no_flash_attention: !flashAttention,
+        no_fused: !fusedStep,
         no_metal_fused_optimizer: !fusedOptimizer,
+        cut_cross_entropy: cutCrossEntropy,
+        no_adaptive_lr: noAdaptiveLr,
         warmup_steps: warmupSteps,
         weight_decay: weightDecay,
         max_grad_norm: maxGradNorm,
         lr_schedule: lrScheduler,
         no_sequence_packing: !sequencePacking,
+        pack_max_seq_len: packMaxSeqLen.trim() ? Number(packMaxSeqLen) : undefined,
+        distributed_peers: distributedPeers.trim() || undefined,
+        distributed_auto: distributedAuto,
+        compression_strategy: compressionStrategy,
         ane: selectedMethod === 'ane',
         config_path: resumeFrom || undefined,
         resume: !!resumeFrom,
@@ -742,8 +762,18 @@
                     <input type="checkbox" class="rounded border-surface-300" bind:checked={loadIn4bit} />
                     <span class="text-sm text-surface-700 dark:text-surface-300">4-bit quantization</span>
                   </label>
+                  <label class="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" class="rounded border-surface-300" bind:checked={doubleQuant} />
+                    <span class="text-sm text-surface-700 dark:text-surface-300">Double quant</span>
+                  </label>
                 {/if}
               </div>
+              {#if selectedMethod === 'qlora'}
+                <div>
+                  <label class="label" for="quant-block-size">Quant Block Size</label>
+                  <input id="quant-block-size" type="number" class="input max-w-[200px]" min="1" bind:value={quantBlockSize} />
+                </div>
+              {/if}
             </div>
           </div>
         {/if}
@@ -945,6 +975,13 @@
                   </div>
                 </label>
                 <label class="flex items-start gap-3 cursor-pointer">
+                  <input type="checkbox" class="mt-0.5 rounded border-surface-300" bind:checked={fusedStep} />
+                  <div>
+                    <span class="text-sm font-medium text-surface-700 dark:text-surface-300">Fused Step</span>
+                    <p class="text-xs text-surface-500 mt-0.5">Use fused train dispatch</p>
+                  </div>
+                </label>
+                <label class="flex items-start gap-3 cursor-pointer">
                   <input type="checkbox" class="mt-0.5 rounded border-surface-300" bind:checked={sequencePacking} />
                   <div>
                     <span class="text-sm font-medium text-surface-700 dark:text-surface-300">Sequence Packing</span>
@@ -965,10 +1002,53 @@
                     <p class="text-xs text-surface-500 mt-0.5">Metal-fused Adam step</p>
                   </div>
                 </label>
+                <label class="flex items-start gap-3 cursor-pointer">
+                  <input type="checkbox" class="mt-0.5 rounded border-surface-300" bind:checked={cutCrossEntropy} />
+                  <div>
+                    <span class="text-sm font-medium text-surface-700 dark:text-surface-300">Cut Cross-Entropy</span>
+                    <p class="text-xs text-surface-500 mt-0.5">Memory-efficient loss</p>
+                  </div>
+                </label>
+                <label class="flex items-start gap-3 cursor-pointer">
+                  <input type="checkbox" class="mt-0.5 rounded border-surface-300" bind:checked={noAdaptiveLr} />
+                  <div>
+                    <span class="text-sm font-medium text-surface-700 dark:text-surface-300">Disable Adaptive LR</span>
+                    <p class="text-xs text-surface-500 mt-0.5">Manual LR behavior only</p>
+                  </div>
+                </label>
               </div>
-              <div>
-                <label class="label" for="embedding-lr">Embedding LR (0 = same as base)</label>
-                <input id="embedding-lr" type="number" class="input max-w-[200px]" step="0.00001" min="0" bind:value={embeddingLr} />
+              <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div>
+                  <label class="label" for="embedding-lr">Embedding LR (0 = same as base)</label>
+                  <input id="embedding-lr" type="number" class="input" step="0.00001" min="0" bind:value={embeddingLr} />
+                </div>
+                <div>
+                  <label class="label" for="ckpt-layers">Checkpoint Layers</label>
+                  <input id="ckpt-layers" type="number" class="input" min="1" bind:value={gradientCheckpointingLayers} />
+                </div>
+                <div>
+                  <label class="label" for="pack-max">Pack Max Seq Len</label>
+                  <input id="pack-max" class="input" placeholder="auto" bind:value={packMaxSeqLen} />
+                </div>
+              </div>
+              <div class="grid grid-cols-1 md:grid-cols-3 gap-4 pt-3 border-t border-surface-200 dark:border-surface-700">
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" class="rounded border-surface-300" bind:checked={distributedAuto} />
+                  <span class="text-sm text-surface-700 dark:text-surface-300">Distributed auto-discovery</span>
+                </label>
+                <div>
+                  <label class="label" for="distributed-peers">Distributed Peers</label>
+                  <input id="distributed-peers" class="input" placeholder="host1:port,host2:port" bind:value={distributedPeers} />
+                </div>
+                <div>
+                  <label class="label" for="compression">Compression</label>
+                  <select id="compression" class="input" bind:value={compressionStrategy}>
+                    <option value="none">none</option>
+                    <option value="topk">topk</option>
+                    <option value="fp16">fp16</option>
+                    <option value="random">random</option>
+                  </select>
+                </div>
               </div>
             </div>
           {/if}

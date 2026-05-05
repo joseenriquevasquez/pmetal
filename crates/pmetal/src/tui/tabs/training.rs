@@ -353,8 +353,11 @@ impl TrainingTab {
             || self.form.value("Sequence Packing") == "Disabled";
         let no_jit = self.form.value("Disable JIT") == "Enabled"
             || self.form.value("JIT Compilation") == "Disabled";
-        let no_fused = self.form.value("Disable Fused Optimizer") == "Enabled"
+        let no_fused_step = self.form.value("Disable Fused Step") == "Enabled";
+        let no_fused_optimizer = self.form.value("Disable Fused Optimizer") == "Enabled"
             || self.form.value("Fused Optimizer") == "Disabled";
+        let no_gradient_checkpointing =
+            self.form.value("Disable Gradient Checkpointing") == "Enabled";
 
         let cut_cross_entropy = self.form.value("Cut Cross-Entropy") == "Enabled";
         // ANE: spec uses a bool flag; old TUI used Enum("Disabled"/"Enabled"),
@@ -394,7 +397,7 @@ impl TrainingTab {
                 .value("Learning Rate")
                 .parse()
                 .unwrap_or(TrainSpec::default().learning_rate),
-            embedding_lr: None,
+            embedding_lr: self.form.value("Embedding LR").parse().ok(),
             batch_size: self
                 .form
                 .value("Batch Size")
@@ -415,8 +418,12 @@ impl TrainingTab {
                 .value("Grad Accum Steps")
                 .parse()
                 .unwrap_or(TrainSpec::default().gradient_accumulation_steps),
-            no_gradient_checkpointing: false,
-            gradient_checkpointing_layers: TrainSpec::default().gradient_checkpointing_layers,
+            no_gradient_checkpointing,
+            gradient_checkpointing_layers: self
+                .form
+                .value("Gradient Checkpointing Layers")
+                .parse()
+                .unwrap_or(TrainSpec::default().gradient_checkpointing_layers),
             max_grad_norm: self
                 .form
                 .value("Max Grad Norm")
@@ -471,22 +478,54 @@ impl TrainingTab {
                 v.parse().unwrap_or(TrainSpec::default().lora_alpha)
             },
             quantization,
-            text_column: None,
-            text_columns: None,
-            column_separator: None,
-            prompt_column: None,
-            response_column: None,
+            quant_block_size: self
+                .form
+                .value("Quant Block Size")
+                .parse()
+                .unwrap_or(TrainSpec::default().quant_block_size),
+            double_quant: self.form.value("Double Quant") == "Enabled",
+            text_column: optional_form_value(&self.form.value("Text Column")),
+            text_columns: optional_form_value(&self.form.value("Text Columns (csv)")),
+            column_separator: optional_form_value(&self.form.value("Column Separator")),
+            prompt_column: optional_form_value(&self.form.value("Prompt Column")),
+            response_column: optional_form_value(&self.form.value("Response Column")),
             no_flash_attention: no_flash,
             no_sequence_packing: no_seq_pack,
             no_jit_compilation: no_jit,
-            no_metal_fused_optimizer: no_fused,
+            no_fused: no_fused_step,
+            no_metal_fused_optimizer: no_fused_optimizer,
             cut_cross_entropy,
-            no_adaptive_lr: false,
+            no_adaptive_lr: self.form.value("Disable Adaptive LR") == "Enabled",
             ane,
-            pack_max_seq_len: None,
+            pack_max_seq_len: self.form.value("Pack Max Seq Len").parse().ok(),
+            distributed_peers: {
+                let v = self.form.value("Distributed Peers");
+                if v.is_empty() || v == "(none)" {
+                    None
+                } else {
+                    Some(v)
+                }
+            },
+            distributed_auto: self.form.value("Distributed Auto") == "Enabled",
+            compression_strategy: {
+                let v = self.form.value("Compression");
+                if v.is_empty() {
+                    TrainSpec::default().compression_strategy
+                } else {
+                    v
+                }
+            },
             config_path: None,
             resume: false,
         }
+    }
+}
+
+fn optional_form_value(value: &str) -> Option<String> {
+    if value.is_empty() || value == "(none)" {
+        None
+    } else {
+        Some(value.to_string())
     }
 }
 

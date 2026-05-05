@@ -221,7 +221,7 @@ pub(crate) async fn run_fuse(
         output_path, output_path
     );
     println!(
-        "  Ollama:     pmetal ollama create -n my-model -b {}",
+        "  Modelfile:  pmetal ollama modelfile -b {} -o Modelfile",
         output_path
     );
 

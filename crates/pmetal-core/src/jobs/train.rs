@@ -229,6 +229,27 @@ pub struct TrainSpec {
     #[serde(default)]
     pub quantization: Option<String>,
 
+    #[job(
+        label = "Quant Block Size",
+        group = "LoRA",
+        argv = "--quant-block-size",
+        min = 1,
+        max = 4096,
+        default_int = 64
+    )]
+    #[serde(default = "default_quant_block_size")]
+    pub quant_block_size: usize,
+
+    #[job(
+        label = "Double Quant",
+        group = "LoRA",
+        argv = "--double-quant",
+        flag,
+        default_bool = false
+    )]
+    #[serde(default)]
+    pub double_quant: bool,
+
     // -- Dataset columns ------------------------------------------------------
     #[job(label = "Text Column", group = "Data", argv = "--text-column")]
     #[serde(default)]
@@ -286,6 +307,16 @@ pub struct TrainSpec {
     pub no_jit_compilation: bool,
 
     #[job(
+        label = "Disable Fused Step",
+        group = "Compute",
+        argv = "--no-fused",
+        flag,
+        default_bool = false
+    )]
+    #[serde(default)]
+    pub no_fused: bool,
+
+    #[job(
         label = "Disable Fused Optimizer",
         group = "Compute",
         argv = "--no-metal-fused-optimizer",
@@ -333,6 +364,30 @@ pub struct TrainSpec {
     #[serde(default)]
     pub pack_max_seq_len: Option<usize>,
 
+    #[job(
+        label = "Distributed Peers",
+        group = "Distributed",
+        argv = "--distributed-peers",
+        help = "Comma-separated peer addresses"
+    )]
+    #[serde(default)]
+    pub distributed_peers: Option<String>,
+
+    #[job(
+        label = "Distributed Auto",
+        group = "Distributed",
+        argv = "--distributed-auto",
+        flag,
+        default_bool = false
+    )]
+    #[serde(default)]
+    pub distributed_auto: bool,
+
+    #[job(label = "Compression", group = "Distributed", argv = "--compression-strategy", kind = "enum",
+          enum_options = ["none", "topk", "fp16", "random"], default = "none")]
+    #[serde(default = "default_compression_strategy")]
+    pub compression_strategy: String,
+
     // -- CLI-only -------------------------------------------------------------
     /// YAML config file to load defaults from.
     #[job(skip_descriptor, argv = "--config")]
@@ -369,6 +424,8 @@ impl Default for TrainSpec {
             lora_r: default_lora_r(),
             lora_alpha: default_lora_alpha(),
             quantization: None,
+            quant_block_size: default_quant_block_size(),
+            double_quant: false,
             text_column: None,
             text_columns: None,
             column_separator: None,
@@ -377,11 +434,15 @@ impl Default for TrainSpec {
             no_flash_attention: false,
             no_sequence_packing: false,
             no_jit_compilation: false,
+            no_fused: false,
             no_metal_fused_optimizer: false,
             cut_cross_entropy: false,
             no_adaptive_lr: false,
             ane: false,
             pack_max_seq_len: None,
+            distributed_peers: None,
+            distributed_auto: false,
+            compression_strategy: default_compression_strategy(),
             config_path: None,
             resume: false,
         }
@@ -436,6 +497,12 @@ fn default_lora_r() -> usize {
 }
 fn default_lora_alpha() -> f32 {
     defaults::LORA_ALPHA
+}
+fn default_quant_block_size() -> usize {
+    64
+}
+fn default_compression_strategy() -> String {
+    "none".to_string()
 }
 
 #[cfg(test)]

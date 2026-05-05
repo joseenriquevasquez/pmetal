@@ -1109,17 +1109,53 @@ pub async fn start_training(
         let qlora = if spec.quantization.as_deref().is_some_and(|q| q == "nf4") {
             Some(pmetal::trainer::QLoraOrchConfig {
                 scheme: pmetal::trainer::QuantizationScheme::Nf4,
-                block_size: 64,
-                double_quant: false,
+                block_size: spec.quant_block_size,
+                double_quant: spec.double_quant,
             })
         } else if spec.quantization.as_deref().is_some_and(|q| q == "fp4") {
             Some(pmetal::trainer::QLoraOrchConfig {
                 scheme: pmetal::trainer::QuantizationScheme::Fp4,
-                block_size: 64,
-                double_quant: false,
+                block_size: spec.quant_block_size,
+                double_quant: spec.double_quant,
+            })
+        } else if spec.quantization.as_deref().is_some_and(|q| q == "int8") {
+            Some(pmetal::trainer::QLoraOrchConfig {
+                scheme: pmetal::trainer::QuantizationScheme::Int8,
+                block_size: spec.quant_block_size,
+                double_quant: spec.double_quant,
             })
         } else {
             None
+        };
+
+        let distributed = {
+            let peers = spec
+                .distributed_peers
+                .as_deref()
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !peers.is_empty() || spec.distributed_auto {
+                let compression = match spec.compression_strategy.as_str() {
+                    "topk" => pmetal::core::DistributedCompression::TopK,
+                    "fp16" => pmetal::core::DistributedCompression::Fp16,
+                    "random" => pmetal::core::DistributedCompression::Random,
+                    _ => pmetal::core::DistributedCompression::None,
+                };
+                Some(pmetal::core::DistributedTrainingConfig {
+                    peers,
+                    auto_discover: spec.distributed_auto,
+                    compression,
+                    ..Default::default()
+                })
+            } else {
+                None
+            }
         };
 
         let columns = {
@@ -1189,7 +1225,7 @@ pub async fn start_training(
                 sequence_packing: !spec.no_sequence_packing,
                 pack_max_seq_len: spec.pack_max_seq_len,
                 jit_compilation: !spec.no_jit_compilation,
-                fused: true,
+                fused: !spec.no_fused,
                 metal_fused_optimizer: !spec.no_metal_fused_optimizer,
                 gradient_checkpointing: !spec.no_gradient_checkpointing,
                 gradient_checkpointing_layers: spec.gradient_checkpointing_layers,
@@ -1197,7 +1233,7 @@ pub async fn start_training(
                 ane: spec.ane,
                 no_adaptive_lr: spec.no_adaptive_lr,
                 loss_scale: spec.loss_scale,
-                distributed: None,
+                distributed,
             },
             config_path: spec.config_path.clone(),
             log_metrics: Some(metrics_path.display().to_string()),
@@ -1771,23 +1807,131 @@ pub async fn stop_bench(state: State<'_, AppState>, run_id: String) -> Result<()
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GuiBenchSpec {
+    pub mode: Option<String>,
+    pub model: String,
+    pub dataset: Option<String>,
+    pub preset: Option<String>,
+    pub experts_dir: Option<String>,
+    pub inference_context: Option<String>,
+    pub prompt_samples: Option<usize>,
+    pub max_prompt_tokens: Option<usize>,
+    pub decode_steps: Option<usize>,
+    pub inference_warmup_passes: Option<usize>,
+    pub inference_session_repeats: Option<usize>,
+    pub inference_repeats: Option<usize>,
+    pub train_samples: Option<usize>,
+    pub train_steps: Option<usize>,
+    pub batch_size: Option<usize>,
+    pub seq_len: Option<usize>,
+    pub max_seq_len: Option<usize>,
+    pub json: Option<bool>,
+    pub output: Option<String>,
+}
+
 #[tauri::command]
 pub async fn start_bench(
     state: State<'_, AppState>,
     _app_handle: AppHandle,
-    mut spec: pmetal::core::jobs::BenchSpec,
+    spec: GuiBenchSpec,
     on_event: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
-    spec.normalize()
-        .map_err(|errs| AppError(errs[0].message.clone()))?;
+    let mode = spec.mode.as_deref().unwrap_or("basic");
+    if !matches!(mode, "basic" | "workload") {
+        return Err(AppError(format!("unknown benchmark mode: {mode}")));
+    }
+    let preset = spec.preset.as_deref().filter(|p| !p.is_empty() && *p != "custom");
+    if (mode == "basic" || preset.is_none()) && spec.model.trim().is_empty() {
+        return Err(AppError("model is required".into()));
+    }
 
-    let run = BenchRun::new("basic", &spec.model, None);
+    let run = BenchRun::new(mode, &spec.model, preset);
     let run_id = run.id.clone();
     state.create_bench_run(run).await;
 
-    // BenchSpec maps to `pmetal bench` (the basic path).
-    let mut args: Vec<String> = vec!["bench".into()];
-    args.extend(spec.to_argv());
+    let mut args: Vec<String> = if mode == "workload" {
+        let mut args = vec!["bench-workload".into()];
+        if let Some(preset) = preset {
+            args.extend(["--preset".into(), preset.to_string()]);
+        } else {
+            let dataset = spec.dataset.as_deref().unwrap_or_default().trim();
+            if dataset.is_empty() {
+                return Err(AppError(
+                    "dataset is required for custom workload benchmarks".into(),
+                ));
+            }
+            args.extend(["--model".into(), spec.model.clone()]);
+            args.extend(["--dataset".into(), dataset.to_string()]);
+            args.extend([
+                "--inference-context".into(),
+                spec.inference_context
+                    .as_deref()
+                    .unwrap_or("auto")
+                    .to_string(),
+            ]);
+            args.extend([
+                "--prompt-samples".into(),
+                spec.prompt_samples.unwrap_or(8).to_string(),
+            ]);
+            args.extend([
+                "--max-prompt-tokens".into(),
+                spec.max_prompt_tokens.unwrap_or(0).to_string(),
+            ]);
+            args.extend([
+                "--decode-steps".into(),
+                spec.decode_steps.unwrap_or(32).to_string(),
+            ]);
+            args.extend([
+                "--inference-repeats".into(),
+                spec.inference_repeats.unwrap_or(1).to_string(),
+            ]);
+            args.extend([
+                "--train-samples".into(),
+                spec.train_samples.unwrap_or(8).to_string(),
+            ]);
+            args.extend([
+                "--train-steps".into(),
+                spec.train_steps.unwrap_or(4).to_string(),
+            ]);
+            args.extend([
+                "--batch-size".into(),
+                spec.batch_size.unwrap_or(1).to_string(),
+            ]);
+            args.extend([
+                "--max-seq-len".into(),
+                spec.max_seq_len.unwrap_or(0).to_string(),
+            ]);
+        }
+        if let Some(experts_dir) = spec.experts_dir.as_deref().filter(|s| !s.trim().is_empty()) {
+            args.extend(["--experts-dir".into(), experts_dir.to_string()]);
+        }
+        args.extend([
+            "--inference-warmup-passes".into(),
+            spec.inference_warmup_passes.unwrap_or(2).to_string(),
+        ]);
+        args.extend([
+            "--inference-session-repeats".into(),
+            spec.inference_session_repeats.unwrap_or(1).to_string(),
+        ]);
+        args
+    } else {
+        vec![
+            "bench".into(),
+            "--model".into(),
+            spec.model.clone(),
+            "--batch-size".into(),
+            spec.batch_size.unwrap_or(1).to_string(),
+            "--seq-len".into(),
+            spec.seq_len.unwrap_or(512).to_string(),
+        ]
+    };
+    if spec.json.unwrap_or(false) {
+        args.push("--json".into());
+    }
+    if let Some(output) = spec.output.as_deref().filter(|s| !s.trim().is_empty()) {
+        args.extend(["--output".into(), output.to_string()]);
+    }
 
     spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Bench, on_event).await?;
     Ok(run_id)
@@ -2400,13 +2544,43 @@ pub async fn get_merge_strategies() -> Result<Vec<MergeStrategy>> {
             supports_weights: true,
         },
         MergeStrategy {
-            name: "dare".to_string(),
-            description: "Delta weight pruning before merge to reduce interference".to_string(),
+            name: "dare_ties".to_string(),
+            description: "DARE pruning followed by TIES merge".to_string(),
+            supports_weights: true,
+        },
+        MergeStrategy {
+            name: "dare_linear".to_string(),
+            description: "DARE pruning followed by linear merge".to_string(),
+            supports_weights: true,
+        },
+        MergeStrategy {
+            name: "task_arithmetic".to_string(),
+            description: "Task-vector arithmetic against a base model".to_string(),
+            supports_weights: true,
+        },
+        MergeStrategy {
+            name: "della".to_string(),
+            description: "Magnitude-aware delta merge with DARE-style sparsification".to_string(),
+            supports_weights: true,
+        },
+        MergeStrategy {
+            name: "breadcrumbs".to_string(),
+            description: "Remove outlier deltas before merging task vectors".to_string(),
             supports_weights: true,
         },
         MergeStrategy {
             name: "model_stock".to_string(),
             description: "Geometric mean based merging using model weights as anchors".to_string(),
+            supports_weights: false,
+        },
+        MergeStrategy {
+            name: "nearswap".to_string(),
+            description: "Swap weights from the closest model where deltas agree".to_string(),
+            supports_weights: false,
+        },
+        MergeStrategy {
+            name: "passthrough".to_string(),
+            description: "Copy model weights through the merge pipeline".to_string(),
             supports_weights: false,
         },
     ])
@@ -2420,51 +2594,10 @@ pub async fn merge_models(
     spec.normalize()
         .map_err(|errs| AppError(errs[0].message.clone()))?;
 
-    let merge_method = match spec.method.as_str() {
-        "linear" => pmetal::merge::MergeMethodConfig::Linear,
-        "slerp" => pmetal::merge::MergeMethodConfig::Slerp,
-        "ties" => pmetal::merge::MergeMethodConfig::Ties,
-        "dare_ties" | "dare" => pmetal::merge::MergeMethodConfig::DareTies,
-        "model_stock" => pmetal::merge::MergeMethodConfig::ModelStock,
-        other => return Err(AppError(format!("Unsupported merge method: {other}"))),
-    };
-
-    let merge_config = pmetal::merge::MergeConfig {
-        merge_method,
-        base_model: spec.base.clone(),
-        models: vec![
-            pmetal::merge::ModelConfig {
-                model: spec.model_a.clone(),
-                parameters: pmetal::merge::MergeParameters {
-                    weight: Some(pmetal::merge::ParameterSetting::Scalar(spec.weight_a)),
-                    density: Some(pmetal::merge::ParameterSetting::Scalar(spec.density)),
-                    ..Default::default()
-                },
-            },
-            pmetal::merge::ModelConfig {
-                model: spec.model_b.clone(),
-                parameters: pmetal::merge::MergeParameters {
-                    weight: Some(pmetal::merge::ParameterSetting::Scalar(spec.weight_b)),
-                    density: Some(pmetal::merge::ParameterSetting::Scalar(spec.density)),
-                    ..Default::default()
-                },
-            },
-        ],
-        output_path: Some(PathBuf::from(&spec.output)),
-        parameters: pmetal::merge::MergeParameters {
-            normalize: Some(true),
-            t: Some(pmetal::merge::ParameterSetting::Scalar(spec.t)),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    let output = tokio::task::spawn_blocking(move || pmetal::merge::run_merge(&merge_config))
-        .await
-        .map_err(|e| AppError(format!("merge task failed: {e}")))?
-        .map_err(|e| AppError(e.to_string()))?;
-
-    Ok(output.display().to_string())
+    let mut args = vec!["merge".to_string()];
+    args.extend(spec.to_argv());
+    run_pmetal_subprocess_to_completion(args).await?;
+    Ok(spec.output)
 }
 
 #[tauri::command]
@@ -2644,22 +2777,51 @@ pub async fn quantize_model(
     _app_handle: AppHandle,
     model_id: String,
     quant_type: String,
-    output_dir: String,
+    output_path: String,
+    imatrix: Option<String>,
+    format: Option<String>,
+    bits: Option<i32>,
+    group_size: Option<i32>,
+    kl_calibrate: Option<bool>,
+    target_bpw: Option<f32>,
+    kl_threshold: Option<f64>,
 ) -> Result<String> {
     // Resolve remote model IDs (e.g. "Qwen/Qwen3-0.6B-Base") to local cache paths
     let resolved_path = resolve_model_path(&model_id).await?;
-    let model_path = resolved_path.to_string_lossy().into_owned();
-    let quant_type_task = quant_type.clone();
-    let output_dir_task = output_dir.clone();
+    let mut args = vec![
+        "quantize".to_string(),
+        "--model".to_string(),
+        resolved_path.to_string_lossy().into_owned(),
+        "--output".to_string(),
+        output_path.clone(),
+        "--method".to_string(),
+        quant_type,
+    ];
+    if let Some(path) = imatrix.as_deref().filter(|s| !s.trim().is_empty()) {
+        args.extend(["--imatrix".to_string(), path.to_string()]);
+    }
+    args.extend([
+        "--format".to_string(),
+        format.unwrap_or_else(|| "gguf".to_string()),
+    ]);
+    args.extend(["--bits".to_string(), bits.unwrap_or(4).to_string()]);
+    args.extend([
+        "--group-size".to_string(),
+        group_size.unwrap_or(64).to_string(),
+    ]);
+    if kl_calibrate.unwrap_or(false) {
+        args.push("--kl-calibrate".to_string());
+    }
+    if let Some(target) = target_bpw {
+        args.extend(["--target-bpw".to_string(), target.to_string()]);
+    }
+    args.extend([
+        "--kl-threshold".to_string(),
+        kl_threshold.unwrap_or(0.01).to_string(),
+    ]);
 
-    tokio::task::spawn_blocking(move || {
-        run_quantize_in_process(&model_path, &quant_type_task, &output_dir_task)
-    })
-    .await
-    .map_err(|e| AppError(format!("quantize task failed: {e}")))?
-    .map_err(|e| AppError(e.to_string()))?;
-
-    Ok(output_dir)
+    run_pmetal_subprocess_to_completion(args).await?;
+    Ok(output_path)
 }
 
 async fn finalize_training_run(
@@ -3522,85 +3684,6 @@ fn run_fuse_in_process(
     Ok(())
 }
 
-fn run_quantize_in_process(
-    model_path: &str,
-    method: &str,
-    output_path: &str,
-) -> std::result::Result<(), AppError> {
-    use pmetal::gguf::{
-        dynamic::{DynamicQuantizationConfig, DynamicQuantizer},
-        quantize::quantize,
-        GgmlType, GgufBuilder,
-    };
-
-    let resolved_model_path = PathBuf::from(model_path);
-
-    let quantizer = if method == "dynamic" {
-        DynamicQuantizer::new(DynamicQuantizationConfig::default(), None)
-    } else {
-        let base_type = match method {
-            "q8_0" => GgmlType::Q8_0,
-            "q4_k_m" => GgmlType::Q4K,
-            other => {
-                return Err(AppError(format!(
-                    "Unsupported quantization method: {other}"
-                )));
-            }
-        };
-        DynamicQuantizer::new(
-            DynamicQuantizationConfig {
-                base_type,
-                high_precision_type: base_type,
-                fallback_type: base_type,
-                ..Default::default()
-            },
-            None,
-        )
-    };
-
-    let weights = pmetal::models::loader::load_weights(&resolved_model_path)
-        .map_err(|e| AppError(e.to_string()))?;
-
-    // Use canonical architecture detection instead of hardcoded string matching.
-    let architecture = pmetal::models::ModelArchitecture::detect(&resolved_model_path)
-        .map(|arch| arch.to_string().to_lowercase())
-        .unwrap_or_else(|_| "llama".to_string());
-
-    let mut builder = GgufBuilder::with_model(&architecture, "quantized-model");
-    let mut keys: Vec<_> = weights.keys().collect();
-    keys.sort();
-
-    for name in keys {
-        let tensor = weights
-            .get(name)
-            .ok_or_else(|| AppError(format!("Tensor {name} not found")))?;
-        let shape_u64: Vec<u64> = tensor.shape().iter().map(|&d| d as u64).collect();
-        let target_type = quantizer.get_tensor_type(name, &shape_u64);
-        let tensor = tensor.clone();
-        tensor.eval();
-
-        let data_f32: Vec<f32> = match tensor.dtype() {
-            pmetal::mlx::Dtype::Float32 => tensor.as_slice::<f32>().to_vec(),
-            pmetal::mlx::Dtype::Float16 | pmetal::mlx::Dtype::Bfloat16 => {
-                let t_f32 = tensor.as_dtype(pmetal::mlx::Dtype::Float32.as_i32());
-                t_f32.eval();
-                t_f32.as_slice::<f32>().to_vec()
-            }
-            _ => continue,
-        };
-
-        let quantized_data =
-            quantize(&data_f32, target_type).map_err(|e| AppError(format!("{e:?}")))?;
-        builder.add_raw_tensor(name, shape_u64, target_type, quantized_data);
-    }
-
-    let mut file = std::fs::File::create(output_path).map_err(|e| AppError(e.to_string()))?;
-    builder
-        .write(&mut file)
-        .map_err(|e| AppError(e.to_string()))?;
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Event forwarder
 // ---------------------------------------------------------------------------
@@ -4285,28 +4368,72 @@ pub async fn start_rlkd(
 }
 
 // ---------------------------------------------------------------------------
-// Ollama — action dispatcher (install / run / list / pull)
+// Modelfile export — file-based Ollama compatibility, no runtime coupling
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ModelfileExportDto {
+    pub base: String,
+    pub lora: Option<String>,
+    pub output: String,
+    pub template: Option<String>,
+    pub system: Option<String>,
+    pub temperature: Option<f32>,
+    pub num_ctx: Option<i32>,
+    pub top_k: Option<i32>,
+    pub top_p: Option<f32>,
+    pub license: Option<String>,
+}
 
 #[tauri::command]
 pub async fn start_ollama(
-    action: String,
-    model: String,
+    config: ModelfileExportDto,
     on_event: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
-    if !matches!(action.as_str(), "install" | "run" | "list" | "pull") {
-        return Err(AppError(format!(
-            "Unknown action '{}' (expected install, run, list, or pull)",
-            action
-        )));
+    if config.base.trim().is_empty() {
+        return Err(AppError("base model is required".into()));
+    }
+    if config.output.trim().is_empty() {
+        return Err(AppError("output path is required".into()));
     }
 
     let run_id = uuid::Uuid::new_v4().to_string();
 
-    // `pmetal ollama <action> [model]` — model is omitted for `list`.
-    let mut args: Vec<String> = vec!["ollama".into(), action.clone()];
-    if action != "list" && !model.is_empty() {
-        args.push(model.clone());
+    let mut args: Vec<String> = vec![
+        "ollama".into(),
+        "modelfile".into(),
+        "--base".into(),
+        config.base,
+        "--output".into(),
+        config.output,
+    ];
+    if let Some(lora) = config.lora.as_deref().filter(|s| !s.trim().is_empty()) {
+        args.extend(["--lora".into(), lora.to_string()]);
+    }
+    if let Some(template) = config
+        .template
+        .as_deref()
+        .filter(|s| !s.trim().is_empty() && *s != "auto")
+    {
+        args.extend(["--template".into(), template.to_string()]);
+    }
+    if let Some(system) = config.system.as_deref().filter(|s| !s.trim().is_empty()) {
+        args.extend(["--system".into(), system.to_string()]);
+    }
+    if let Some(temperature) = config.temperature {
+        args.extend(["--temperature".into(), temperature.to_string()]);
+    }
+    if let Some(num_ctx) = config.num_ctx {
+        args.extend(["--num-ctx".into(), num_ctx.to_string()]);
+    }
+    if let Some(top_k) = config.top_k {
+        args.extend(["--top-k".into(), top_k.to_string()]);
+    }
+    if let Some(top_p) = config.top_p {
+        args.extend(["--top-p".into(), top_p.to_string()]);
+    }
+    if let Some(license) = config.license.as_deref().filter(|s| !s.trim().is_empty()) {
+        args.extend(["--license".into(), license.to_string()]);
     }
 
     spawn_oneshot_subprocess(run_id.clone(), args, on_event).await?;
@@ -4315,7 +4442,7 @@ pub async fn start_ollama(
 
 /// Spawn a `pmetal <subcommand>` child for a one-shot job that doesn't need
 /// state tracking — just streams stdout/stderr lines through the IPC channel.
-/// Used by DFlash, EmbedTrain, RLKD, and Ollama which have no corresponding
+/// Used by DFlash, EmbedTrain, RLKD, and Modelfile export which have no corresponding
 /// run-list state in AppState (they're additive routes with no legacy state).
 async fn spawn_oneshot_subprocess(
     run_id: String,
@@ -4390,6 +4517,37 @@ async fn spawn_oneshot_subprocess(
     });
 
     Ok(())
+}
+
+async fn run_pmetal_subprocess_to_completion(args: Vec<String>) -> Result<()> {
+    let binary = pmetal_binary();
+    let output = tokio::process::Command::new(&binary)
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| AppError(format!("Failed to run `{}`: {e}", binary.display())))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim()
+    } else {
+        stdout.trim()
+    };
+    Err(AppError(format!(
+        "pmetal {} failed with status {}{}",
+        args.join(" "),
+        output.status,
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        }
+    )))
 }
 
 #[cfg(test)]
