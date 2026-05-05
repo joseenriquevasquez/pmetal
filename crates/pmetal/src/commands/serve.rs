@@ -18,6 +18,8 @@ pub(crate) async fn run_serve(
     continuous_batch: bool,
     cb_max_slots: usize,
     cb_max_queue_depth: usize,
+    cb_block_size: usize,
+    cb_max_blocks: usize,
 ) -> anyhow::Result<()> {
     use pmetal::inference_runner::{
         CacheModeRequest, TurboQuantPreset, explicit_cache_mode_override,
@@ -108,6 +110,8 @@ pub(crate) async fn run_serve(
         Some(BatcherConfig {
             max_slots: cb_max_slots.max(1),
             max_queue_depth: cb_max_queue_depth.max(1),
+            block_size: cb_block_size.max(1),
+            max_blocks: cb_max_blocks,
         })
     } else {
         None

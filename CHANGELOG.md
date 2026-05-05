@@ -42,7 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Inference server (OpenAI- + Anthropic-compatible)
 
-- **Continuous batching with shared prefix cache** in `pmetal-serve`: per-request slot scheduling, KV-cache prefix sharing, concurrent decode for many simultaneous chats
+- **Continuous batching with paged-KV-style admission + shared prefix cache** in `pmetal-serve`: per-request slot scheduling, KV-cache prefix sharing, concurrent decode for many simultaneous chats
+  - Token-block admission budget (`--cb-block-size`, `--cb-max-blocks`) prevents over-admitting active contexts and skips head-of-line requests when a smaller queued request fits the remaining block budget
+  - Continuous batching now reuses the shared prompt prefix cache, prefills only uncached suffix tokens, and saves extended prefixes after final prefill
+  - Continuous batching derives the same cache mode as the single-request serving path, honoring `--kv-quant` and `--kv-turboquant`
+  - Hybrid/recurrent models are rejected from continuous batching instead of silently running without recurrent state
 - **Anthropic-compatible `/v1/messages` endpoint**: streaming `message_start` → `content_block_start` → `content_block_delta*` → `content_block_stop` → `message_delta` → `message_stop` events; non-streaming JSON path
 - **`/v1/embeddings` endpoint**: 20 architectures supported via `forward_hidden` (Llama/Llama4/Qwen2/Qwen3/Qwen3MoE/Qwen3Next/Mistral/Gemma/Gemma4/Phi/Phi4/DeepSeek/Cohere/Granite/GptOss/StarCoder2/NemotronH/FalconH1/RecurrentGemma/Jamba/BERT) — pooling via `pmetal_models::pooling`
 - **Token logprobs**: `SamplingParams.logprobs_top_n` plumbed end-to-end through non-streaming and SSE streaming on both `/v1/chat/completions` and `/v1/completions`. New `pmetal_models::generation::token_logprobs` primitive; ANE/CPU paths emit `logprob: None`
@@ -95,6 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Fused [T=1] decode kernels** for `gpt_oss` and `llama4` (Bridge Phase 4)
 - **Fused [N,1] batched-decode** path for Tier-1/2 architectures
+- **Cheap native KV cache fork support** for Qwen3, GPT-OSS, Llama4, DeepSeek, and generic `KVCache`, preserving dense, quantized, and TurboQuant cache state for serving prefix reuse
 - **`BRIDGE_TRY_{DST,VOID}` error coverage**: thread-local exception slot replaces process-abort across most ops; `pmetal_bridge::check_last_error()?` surfaces `BridgeError::CxxException` after any op; `InlineArray::try_*` variants for matmul/softmax/reshape/sdpa/gather_mm/dequantize/etc.
 - **Scalar dtype footgun fix**: `InlineArray::scalar_like(value, peer)` + `mul_scalar`/`add_scalar`/`sub_scalar`/`div_scalar` eliminate manual `.as_dtype(model_dtype)` calls
 - **`async_eval` actually async**: prior implementation blocked the calling thread
@@ -194,6 +199,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Qwen3-Next MoE routing**: corrected anti-top-k expert selection bug (sign/slice pair)
 - **Qwen3-Next hybrid cache flag** in LoRA + distillation paths
 - **TurboQuant d128 pass-2** cross-simdgroup reduction; lazy-transpose footgun in mixed-precision attention
+- **TurboQuant serving prefix-cache compatibility**: prefix cache now stores forked KV caches instead of dense snapshots, preserving compressed TurboQuant history without fp16 re-inflation
+- **Native attention correctness/perf audit**: fail-fast TurboQuant dispatch, checked SDPA wrappers, true hot-ring cache behavior, centralized quantized tuple growth, and unsupported-cache rejection in tree verification
 - **GKD `compute_weighted`** no longer scales by `(1-λ)` (silently zeroed training at λ=1.0)
 - **`pmetal_serve::sse::IncrementalDecoder`** prevents UTF-8 boundary panics on partial codepoint emission
 - Zero clippy warnings across entire workspace

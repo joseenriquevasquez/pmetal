@@ -4,10 +4,10 @@
 //! `llama4_native`, …) needs the same decode-time decision tree once it has
 //! a `QuantizedKvCache`:
 //!
-//! - **Decode (S=1)**: try the optimized `append_and_compute_attention` path
+//! - **Decode (S=1)**: run the optimized `append_and_compute_attention` path
 //!   inside the cache (cold-only GPU TurboQuant kernels, hot-only fp16 SDPA,
-//!   or dequantize-and-concat when mixed). On any error, fall back to a
-//!   correctness-first `append → dequantize → standard SDPA` chain.
+//!   or dequantize-and-concat when mixed) and surface errors instead of
+//!   silently switching cache semantics mid-layer.
 //! - **Prefill (S>1)**: append into the cache, then run standard SDPA. When
 //!   `prev == 0` (first prefill, no prior history) use the fresh keys/values
 //!   directly — no dequantization needed. Otherwise dequantize the full
@@ -41,44 +41,52 @@ pub fn turboquant_attention_step(
     scale: f32,
     prev: i32,
     trace_label: &'static str,
-) -> InlineArray {
+) -> Result<InlineArray, String> {
     let s = queries.dim(2);
     if s == 1 {
-        match tq_cache.append_and_compute_attention(queries, keys, values, scale) {
-            Ok(output) => output,
-            Err(err) => {
+        tq_cache
+            .append_and_compute_attention(queries, keys, values, scale)
+            .map_err(|err| {
                 trace(
                     trace_label,
-                    &format!(
-                        "decode_fallback=append_and_compute_attention_err prev={prev} err={err}"
-                    ),
+                    &format!("decode_error=append_and_compute_attention prev={prev} err={err}"),
                 );
-                tq_cache.append(keys, values).ok();
-                let full_keys = tq_cache.dequantize_keys().unwrap_or_else(|| keys.clone());
-                let full_values = tq_cache
-                    .dequantize_values()
-                    .unwrap_or_else(|| values.clone());
-                crate::decode::sdpa_causal_like_mlx(queries, &full_keys, &full_values, scale, s)
-            }
-        }
+                err
+            })
     } else {
-        tq_cache.append(keys, values).ok();
+        tq_cache.append(keys, values).map_err(|err| {
+            trace(
+                trace_label,
+                &format!("prefill_error=append seq={s} prev={prev} err={err}"),
+            );
+            err
+        })?;
         if prev == 0 {
             trace(
                 trace_label,
                 &format!("prefill_path=dense_prompt_only seq={s}"),
             );
-            crate::decode::sdpa_causal_like_mlx(queries, keys, values, scale, s)
+            crate::decode::try_sdpa_causal_like_mlx(queries, keys, values, scale, s)
+                .map_err(|err| err.to_string())
         } else {
             trace(
                 trace_label,
                 &format!("prefill_fallback=full_dequantized seq={s} prev={prev}"),
             );
-            let full_keys = tq_cache.dequantize_keys().unwrap_or_else(|| keys.clone());
+            let full_keys = tq_cache.dequantize_keys().ok_or_else(|| {
+                format!(
+                    "TurboQuant failed to dequantize keys for prefill fallback seq={s} prev={prev}"
+                )
+            })?;
             let full_values = tq_cache
                 .dequantize_values()
-                .unwrap_or_else(|| values.clone());
-            crate::decode::sdpa_causal_like_mlx(queries, &full_keys, &full_values, scale, s)
+                .ok_or_else(|| {
+                    format!(
+                        "TurboQuant failed to dequantize values for prefill fallback seq={s} prev={prev}"
+                    )
+                })?;
+            crate::decode::try_sdpa_causal_like_mlx(queries, &full_keys, &full_values, scale, s)
+                .map_err(|err| err.to_string())
         }
     }
 }

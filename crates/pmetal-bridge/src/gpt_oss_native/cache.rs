@@ -17,6 +17,7 @@ use super::weights::NativeWeights;
 /// supported for full-attention layers only. Sliding window layers use the
 /// bf16 rotating buffer path unconditionally (rotation logic is incompatible
 /// with both compression schemes).
+#[derive(Clone)]
 pub struct KvLayerCache {
     pub keys: Option<InlineArray>, // [B, H, MAX_T, D] (or [B, H, window, D] for sliding)
     pub values: Option<InlineArray>, // [B, H, MAX_T, D]
@@ -34,6 +35,7 @@ pub struct KvLayerCache {
 }
 
 /// Full model cache — one KV entry per layer.
+#[derive(Clone)]
 pub struct NativeCache {
     pub kv_caches: Vec<KvLayerCache>,
     pub rope_offset: i32,
@@ -43,6 +45,16 @@ pub struct NativeCache {
 }
 
 impl NativeCache {
+    /// Return a cheap branch of this cache for prefix reuse.
+    ///
+    /// `InlineArray` and TurboQuant cache clones are MLX reference bumps, not
+    /// deep copies. Mutating the fork appends new cache buffers through normal
+    /// slice_set/append paths, so stored prefixes can be reused across requests
+    /// without duplicating the prefill tensors up front.
+    pub fn fork(&self) -> Self {
+        self.clone()
+    }
+
     /// Evaluate and detach all cache state arrays in one GPU submission.
     ///
     /// Must be called after the prefill forward pass and before decode.

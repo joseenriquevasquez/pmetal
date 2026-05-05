@@ -9,6 +9,21 @@ use super::cache::NativeCache;
 use super::mlp_moe::{dense_mlp_forward, gdn_forward, moe_forward};
 use super::weights::NativeWeights;
 
+fn assert_tree_verify_plain_kv(cache: &NativeCache, op: &str) {
+    if let Some(layer) = cache.kv_caches.iter().position(|kv| {
+        kv.turboquant.is_some()
+            || kv.quant_config.is_some()
+            || kv.quantized_keys.is_some()
+            || kv.quantized_values.is_some()
+            || kv.quantized_keys_hi.is_some()
+            || kv.quantized_values_hi.is_some()
+    }) {
+        panic!(
+            "{op} requires the plain bf16 KV cache path; layer {layer} uses TurboQuant or affine-quantized KV"
+        );
+    }
+}
+
 pub fn forward_step(
     weights: &NativeWeights,
     token_ids: &InlineArray, // [B, T]
@@ -216,10 +231,9 @@ pub fn forward_step_with_capture(
 /// linear variant, so the DFlash draft can condition its next round
 /// on the accepted path's hidden states.
 ///
-/// Only the plain-bf16 KV cache path is wired today. TurboQuant /
-/// quant-config modes silently fall back to their existing causal
-/// paths — the tree context is ignored for those (and the caller gets
-/// a warning via the normal `cache.turboquant.is_some()` routing).
+/// Only the plain-bf16 KV cache path is wired today. TurboQuant and
+/// affine-quantized KV modes are rejected because their append/compact/
+/// rollback semantics do not yet preserve the tree attention context.
 pub fn forward_step_tree_verify(
     weights: &NativeWeights,
     token_ids: &InlineArray,
@@ -229,6 +243,7 @@ pub fn forward_step_tree_verify(
     tap_layers: &[usize],
     captured: &mut Vec<InlineArray>,
 ) -> InlineArray {
+    assert_tree_verify_plain_kv(cache, "Qwen tree verify");
     captured.clear();
     let b = token_ids.dim(0);
     let s = token_ids.dim(1);
@@ -347,6 +362,7 @@ pub fn compact_tree_cache(
     if accepted_indices.is_empty() {
         return;
     }
+    assert_tree_verify_plain_kv(cache, "Qwen tree cache compaction");
     let keep_len = accepted_indices.len() as i32;
     let kept_indices: Vec<i32> = accepted_indices
         .iter()
@@ -405,6 +421,7 @@ pub fn rollback_cache(cache: &mut NativeCache, n: i32) {
     if n <= 0 {
         return;
     }
+    assert_tree_verify_plain_kv(cache, "Qwen tree cache rollback");
     cache.rope_offset = cache.rope_offset.saturating_sub(n);
     for kv in cache.kv_caches.iter_mut() {
         kv.offset = kv.offset.saturating_sub(n);

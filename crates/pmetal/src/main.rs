@@ -1642,6 +1642,8 @@ async fn tokio_main() -> anyhow::Result<()> {
                 continuous_batch,
                 cb_max_slots,
                 cb_max_queue_depth,
+                cb_block_size,
+                cb_max_blocks,
             } = args;
             #[cfg(feature = "ane")]
             let ane_enabled = ane;
@@ -1675,6 +1677,8 @@ async fn tokio_main() -> anyhow::Result<()> {
                 continuous_batch,
                 cb_max_slots,
                 cb_max_queue_depth,
+                cb_block_size,
+                cb_max_blocks,
             )
             .await?;
         }

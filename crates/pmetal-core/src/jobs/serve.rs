@@ -184,6 +184,28 @@ pub struct ServeSpec {
     )]
     #[serde(default = "default_cb_queue")]
     pub cb_max_queue_depth: usize,
+
+    #[job(
+        label = "CB Block Size",
+        group = "Server",
+        argv = "--cb-block-size",
+        min = 1,
+        max = 1048576,
+        default_int = 32
+    )]
+    #[serde(default = "default_cb_block_size")]
+    pub cb_block_size: usize,
+
+    #[job(
+        label = "CB Max Blocks",
+        group = "Server",
+        argv = "--cb-max-blocks",
+        min = 0,
+        max = 1048576,
+        default_int = 0
+    )]
+    #[serde(default)]
+    pub cb_max_blocks: usize,
 }
 
 impl Default for ServeSpec {
@@ -207,6 +229,8 @@ impl Default for ServeSpec {
             continuous_batch: false,
             cb_max_slots: default_cb_slots(),
             cb_max_queue_depth: default_cb_queue(),
+            cb_block_size: default_cb_block_size(),
+            cb_max_blocks: 0,
         }
     }
 }
@@ -239,6 +263,9 @@ fn default_cb_slots() -> usize {
 }
 fn default_cb_queue() -> usize {
     256
+}
+fn default_cb_block_size() -> usize {
+    32
 }
 
 #[cfg(test)]

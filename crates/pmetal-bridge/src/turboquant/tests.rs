@@ -3241,7 +3241,8 @@ mod kvcache {
             scale,
             prev_len,
             "TEST",
-        );
+        )
+        .expect("turboquant attention step");
         let actual = output
             .to_f32_vec((b * heads * new_len * d) as usize)
             .expect("output to_f32");
@@ -3438,6 +3439,51 @@ mod kvcache {
 
         let dk = cache.dequantize_keys().expect("dequantize_keys");
         assert_eq!(dk.shape(), &[b, h, total_tokens, d]);
+    }
+
+    /// After an eviction, the logical hot tail can wrap around the physical
+    /// ring buffer. Dequantization must still return chronological order.
+    #[test]
+    fn hot_window_wraparound_dequantizes_in_logical_order() {
+        let dim = 4usize;
+        let window = 4usize;
+        let config = TurboQuantConfig::uniform(8, 8).with_recent_window(Some(window));
+        let b = 1i32;
+        let h = 1i32;
+        let d = dim as i32;
+        let first = (window + HOT_EVICTION_CHUNK) as i32;
+        let second = 8i32;
+        let total_tokens = first + second;
+        let total = (b * h * total_tokens * d) as usize;
+        let data: Vec<f32> = (0..total).map(|i| i as f32).collect();
+
+        let first_keys =
+            InlineArray::from_f32_slice(&data[..(first * d) as usize], &[b, h, first, d]);
+        let first_values = first_keys.clone();
+        let second_keys =
+            InlineArray::from_f32_slice(&data[(first * d) as usize..], &[b, h, second, d]);
+        let second_values = second_keys.clone();
+
+        let mut cache = QuantizedKvCache::new(config);
+        cache
+            .append(&first_keys, &first_values)
+            .expect("first append");
+        cache
+            .append(&second_keys, &second_values)
+            .expect("second append");
+
+        assert_eq!(cache.cold_len(), HOT_EVICTION_CHUNK);
+        assert_eq!(cache.hot_len(), window + second as usize);
+
+        let mut dk = cache.dequantize_keys().expect("dequantize_keys");
+        let got = dk.to_f32_vec(total).expect("dequantized keys to_f32");
+        let hot_start_token = HOT_EVICTION_CHUNK;
+        for i in (hot_start_token * dim)..total {
+            assert_eq!(
+                got[i], data[i],
+                "hot wrapped tail mismatch at flattened index {i}"
+            );
+        }
     }
 
     /// Legacy mode (`recent_window: None`) compresses every appended token

@@ -1060,7 +1060,7 @@ where
 /// ring is sized to `recent_window + HOT_EVICTION_CHUNK` so eviction batches
 /// `HOT_EVICTION_CHUNK` tokens at a time instead of one-token-at-a-time
 /// shuffles.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TurboQuantKvCache {
     keys: Option<TurboKeyStore>,
     values: Option<TurboValueStore>,

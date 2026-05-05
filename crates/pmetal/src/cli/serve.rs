@@ -75,4 +75,12 @@ pub struct ServeArgs {
     /// Maximum pending-queue depth when --continuous-batch is set.
     #[arg(long = "cb-max-queue-depth", default_value = "256")]
     pub cb_max_queue_depth: usize,
+
+    /// Token block size for continuous-batch paged-KV admission.
+    #[arg(long = "cb-block-size", default_value = "32")]
+    pub cb_block_size: usize,
+
+    /// Maximum active token blocks for continuous batching (0 = auto).
+    #[arg(long = "cb-max-blocks", default_value = "0")]
+    pub cb_max_blocks: usize,
 }

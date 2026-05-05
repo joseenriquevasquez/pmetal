@@ -14,6 +14,7 @@ use super::weights::NativeWeights;
 /// (see [`super::attention::build_chunk_mask`]), not as a cache eviction
 /// policy — so global (NoPE) layers still see every prior token, which is
 /// the intended Llama 4 behaviour.
+#[derive(Clone)]
 pub struct KvLayerCache {
     pub keys: Option<InlineArray>,   // [B, H, MAX_T, D]
     pub values: Option<InlineArray>, // [B, H, MAX_T, D]
@@ -28,6 +29,7 @@ pub struct KvLayerCache {
 }
 
 /// Full model cache.
+#[derive(Clone)]
 pub struct NativeCache {
     /// One entry per layer (both local and global — all are KV caches for Llama 4).
     pub kv_caches: Vec<KvLayerCache>,
@@ -38,6 +40,16 @@ pub struct NativeCache {
 }
 
 impl NativeCache {
+    /// Return a cheap branch of this cache for prefix reuse.
+    ///
+    /// `InlineArray` and TurboQuant cache clones are MLX reference bumps, not
+    /// deep copies. Mutating the fork appends new cache buffers through normal
+    /// slice_set/append paths, so stored prefixes can be reused across requests
+    /// without duplicating the prefill tensors up front.
+    pub fn fork(&self) -> Self {
+        self.clone()
+    }
+
     /// Evaluate and detach all cache arrays. Must be called after prefill and
     /// before decode to sever the prefill computation graph.
     pub fn eval_and_detach_states(&mut self) {

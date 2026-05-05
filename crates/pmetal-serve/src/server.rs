@@ -73,6 +73,8 @@ pub async fn run_server(engine: InferenceEngine, config: ServeConfig) -> anyhow:
         tracing::info!(
             max_slots = batcher_config.max_slots,
             max_queue_depth = batcher_config.max_queue_depth,
+            block_size = batcher_config.effective_block_size(),
+            max_blocks = batcher_config.max_blocks,
             "Enabling continuous batching"
         );
         engine.enable_continuous_batching_auto(batcher_config)?;

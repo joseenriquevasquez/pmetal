@@ -216,7 +216,8 @@ pub(super) fn attn_forward(
         // Sliding layers can't take this branch (turboquant is None there).
         let out = crate::turboquant_dispatch::turboquant_attention_step(
             tq_cache, &q, &k, &v, scale, prev, "GPT_OSS",
-        );
+        )
+        .expect("GPT-OSS TurboQuant attention step failed");
         cache.offset = next;
         let output = out
             .transpose_axes(&[0, 2, 1, 3])
@@ -249,56 +250,28 @@ pub(super) fn attn_forward(
         let vs = vs.reshape(&[b, n_kv_heads, num_new, scales_dim]);
         let vb = vb.reshape(&[b, n_kv_heads, num_new, scales_dim]);
 
-        // Allocate or grow quantized cache buffers
-        if cache.quantized_keys.is_none() {
-            let alloc = ((next + 255) / 256) * 256;
-            cache.quantized_keys = Some(crate::qwen3_native::QuantizedTuple {
-                packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim], uint32_dt),
-                scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-                biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-            });
-            cache.quantized_values = Some(crate::qwen3_native::QuantizedTuple {
-                packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim], uint32_dt),
-                scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-                biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-            });
-        } else {
-            let allocated = cache.quantized_keys.as_ref().unwrap().packed.dim(2);
-            if next > allocated {
-                let grow_to = ((next + 255) / 256) * 256;
-                let extend = grow_to - allocated;
-                let qk = cache.quantized_keys.take().unwrap();
-                let qv = cache.quantized_values.take().unwrap();
-                cache.quantized_keys = Some(crate::qwen3_native::QuantizedTuple {
-                    packed: qk.packed.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt),
-                        2,
-                    ),
-                    scales: qk.scales.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
-                        2,
-                    ),
-                    biases: qk.biases.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
-                        2,
-                    ),
-                });
-                cache.quantized_values = Some(crate::qwen3_native::QuantizedTuple {
-                    packed: qv.packed.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt),
-                        2,
-                    ),
-                    scales: qv.scales.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
-                        2,
-                    ),
-                    biases: qv.biases.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
-                        2,
-                    ),
-                });
-            }
-        }
+        crate::qwen3_native::QuantizedTuple::ensure_capacity(
+            &mut cache.quantized_keys,
+            crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+            b,
+            n_kv_heads,
+            next,
+            packed_dim,
+            scales_dim,
+            uint32_dt,
+            dtype,
+        );
+        crate::qwen3_native::QuantizedTuple::ensure_capacity(
+            &mut cache.quantized_values,
+            crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+            b,
+            n_kv_heads,
+            next,
+            packed_dim,
+            scales_dim,
+            uint32_dt,
+            dtype,
+        );
 
         // slice_set new tokens
         let start_q = [0, 0, prev, 0];

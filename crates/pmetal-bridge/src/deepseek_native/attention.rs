@@ -127,54 +127,28 @@ pub(super) fn mla_forward(
         let ps = ps.reshape(&[b, 1, s, scales_pe]);
         let pb = pb.reshape(&[b, 1, s, scales_pe]);
 
-        // Allocate or grow quantized latent buffers
-        if cache.quantized_latent.is_none() {
-            let alloc = ((next + 255) / 256) * 256;
-            cache.quantized_latent = Some(crate::qwen3_native::QuantizedTuple {
-                packed: InlineArray::zeros(&[b, 1, alloc, packed_lat], uint32_dt),
-                scales: InlineArray::zeros(&[b, 1, alloc, scales_lat], dtype),
-                biases: InlineArray::zeros(&[b, 1, alloc, scales_lat], dtype),
-            });
-            cache.quantized_k_pe = Some(crate::qwen3_native::QuantizedTuple {
-                packed: InlineArray::zeros(&[b, 1, alloc, packed_pe], uint32_dt),
-                scales: InlineArray::zeros(&[b, 1, alloc, scales_pe], dtype),
-                biases: InlineArray::zeros(&[b, 1, alloc, scales_pe], dtype),
-            });
-        } else {
-            let allocated = cache.quantized_latent.as_ref().unwrap().packed.dim(2);
-            if next > allocated {
-                let grow_to = ((next + 255) / 256) * 256;
-                let extend = grow_to - allocated;
-                let ql = cache.quantized_latent.take().unwrap();
-                let qp = cache.quantized_k_pe.take().unwrap();
-                cache.quantized_latent = Some(crate::qwen3_native::QuantizedTuple {
-                    packed: ql.packed.kv_cache_append(
-                        &InlineArray::zeros(&[b, 1, extend, packed_lat], uint32_dt),
-                        2,
-                    ),
-                    scales: ql.scales.kv_cache_append(
-                        &InlineArray::zeros(&[b, 1, extend, scales_lat], dtype),
-                        2,
-                    ),
-                    biases: ql.biases.kv_cache_append(
-                        &InlineArray::zeros(&[b, 1, extend, scales_lat], dtype),
-                        2,
-                    ),
-                });
-                cache.quantized_k_pe = Some(crate::qwen3_native::QuantizedTuple {
-                    packed: qp.packed.kv_cache_append(
-                        &InlineArray::zeros(&[b, 1, extend, packed_pe], uint32_dt),
-                        2,
-                    ),
-                    scales: qp
-                        .scales
-                        .kv_cache_append(&InlineArray::zeros(&[b, 1, extend, scales_pe], dtype), 2),
-                    biases: qp
-                        .biases
-                        .kv_cache_append(&InlineArray::zeros(&[b, 1, extend, scales_pe], dtype), 2),
-                });
-            }
-        }
+        crate::qwen3_native::QuantizedTuple::ensure_capacity(
+            &mut cache.quantized_latent,
+            crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+            b,
+            1,
+            next,
+            packed_lat,
+            scales_lat,
+            uint32_dt,
+            dtype,
+        );
+        crate::qwen3_native::QuantizedTuple::ensure_capacity(
+            &mut cache.quantized_k_pe,
+            crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+            b,
+            1,
+            next,
+            packed_pe,
+            scales_pe,
+            uint32_dt,
+            dtype,
+        );
 
         // slice_set new quantized tokens into cache
         let start_q = [0i32, 0, prev, 0];

@@ -345,6 +345,21 @@ pub fn sdpa_causal_like_mlx(
     }
 }
 
+/// Checked variant of [`sdpa_causal_like_mlx`] for paths that must not accept
+/// the bridge's scalar-zero sentinel after a C++ exception.
+#[inline(always)]
+pub fn try_sdpa_causal_like_mlx(
+    queries: &InlineArray,
+    keys: &InlineArray,
+    values: &InlineArray,
+    scale: f32,
+    query_len: i32,
+) -> crate::error::BridgeResult<InlineArray> {
+    let output = sdpa_causal_like_mlx(queries, keys, values, scale, query_len);
+    crate::error::check_last_error()?;
+    Ok(output)
+}
+
 /// Quantized scaled-dot-product attention using MLX's fused `quantized_matmul`.
 ///
 /// Matches mlx-lm's `quantized_scaled_dot_product_attention` (base.py:64-105).

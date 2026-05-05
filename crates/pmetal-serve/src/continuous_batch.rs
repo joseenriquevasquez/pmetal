@@ -26,6 +26,16 @@
 //! are retired and their resources released for the next `Pending`
 //! request.
 //!
+//! # Token-block scheduling
+//!
+//! Admission is constrained by both slot count and a paged-KV-style
+//! token-block budget. Each request reserves
+//! `ceil((prompt_tokens + max_new_tokens) / block_size)` blocks while it is
+//! active, clamped to the full block budget so an oversized request can still
+//! run alone. The scheduler scans the pending queue for the first request that
+//! fits the remaining block budget, which avoids head-of-line blocking when a
+//! large request is waiting ahead of a smaller one.
+//!
 //! # Prefill policy (for D.1)
 //!
 //! At most one slot is in the `Prefilling` state at any time. This
@@ -117,6 +127,8 @@ pub struct Slot {
     /// Final reason, populated only after transition to
     /// `SlotState::Finished` or `SlotState::Cancelled`.
     pub finish_reason: Option<FinishReason>,
+    /// Reserved token blocks for this request while the slot is active.
+    pub reserved_blocks: usize,
 }
 
 /// State machine for a slot.
@@ -155,6 +167,10 @@ pub struct BatcherConfig {
     /// Upper bound on the pending queue — new requests are rejected with
     /// [`EnqueueError::Saturated`] when this is exceeded.
     pub max_queue_depth: usize,
+    /// Token block size used by the paged-KV admission policy.
+    pub block_size: usize,
+    /// Maximum active token blocks. `0` disables the block-budget gate.
+    pub max_blocks: usize,
 }
 
 impl Default for BatcherConfig {
@@ -165,7 +181,27 @@ impl Default for BatcherConfig {
         Self {
             max_slots: 8,
             max_queue_depth: 256,
+            block_size: 32,
+            max_blocks: 0,
         }
+    }
+}
+
+impl BatcherConfig {
+    /// Effective block size after clamping invalid input.
+    pub fn effective_block_size(&self) -> usize {
+        self.block_size.max(1)
+    }
+
+    /// Reserve enough blocks for a request's worst-case active context.
+    pub fn reserved_blocks_for(&self, tokens: usize) -> usize {
+        if self.max_blocks == 0 {
+            return 0;
+        }
+        tokens
+            .max(1)
+            .div_ceil(self.effective_block_size())
+            .min(self.max_blocks)
     }
 }
 
@@ -202,6 +238,7 @@ struct PendingRequest {
     prompt: Vec<u32>,
     params: SlotParams,
     enqueued_at: Instant,
+    reserved_blocks: usize,
 }
 
 /// The continuous batching scheduler.
@@ -251,6 +288,19 @@ impl ContinuousBatcher {
         prompt: Vec<u32>,
         params: SlotParams,
     ) -> Result<SlotId, EnqueueError> {
+        let reserved_tokens = prompt.len().saturating_add(params.max_new_tokens);
+        self.enqueue_with_reserved_tokens(prompt, params, reserved_tokens)
+    }
+
+    /// Enqueue with an explicit active-context reservation. Serving uses this
+    /// when prefix reuse shortens the prefill suffix but the active KV cache
+    /// still contains the full prompt prefix.
+    pub fn enqueue_with_reserved_tokens(
+        &mut self,
+        prompt: Vec<u32>,
+        params: SlotParams,
+        reserved_context_tokens: usize,
+    ) -> Result<SlotId, EnqueueError> {
         if prompt.is_empty() {
             return Err(EnqueueError::EmptyPrompt);
         }
@@ -258,11 +308,15 @@ impl ContinuousBatcher {
             return Err(EnqueueError::Saturated);
         }
         let id = SlotId::next();
+        let request_tokens =
+            reserved_context_tokens.max(prompt.len().saturating_add(params.max_new_tokens));
+        let reserved_blocks = self.config.reserved_blocks_for(request_tokens);
         self.pending.push_back(PendingRequest {
             id,
             prompt,
             params,
             enqueued_at: Instant::now(),
+            reserved_blocks,
         });
         Ok(id)
     }
@@ -283,12 +337,45 @@ impl ContinuousBatcher {
             .count()
     }
 
+    fn active_reserved_blocks(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.state,
+                    SlotState::Pending | SlotState::Prefilling | SlotState::Decoding
+                )
+            })
+            .map(|s| s.reserved_blocks)
+            .sum()
+    }
+
+    fn next_admissible_pending_position(&self) -> Option<usize> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        if self.config.max_blocks == 0 {
+            return Some(0);
+        }
+        let remaining = self
+            .config
+            .max_blocks
+            .saturating_sub(self.active_reserved_blocks());
+        self.pending
+            .iter()
+            .position(|req| req.reserved_blocks <= remaining)
+    }
+
     /// Pull pending requests into free slots until the batch is full.
     ///
     /// Called internally at the start of every `next_instruction`.
     fn fill_slots(&mut self) {
         while self.pool_size() < self.config.max_slots {
-            let req = match self.pending.pop_front() {
+            let req_pos = match self.next_admissible_pending_position() {
+                Some(pos) => pos,
+                None => break,
+            };
+            let req = match self.pending.remove(req_pos) {
                 Some(r) => r,
                 None => break,
             };
@@ -301,6 +388,7 @@ impl ContinuousBatcher {
                 prefilled: 0,
                 enqueued_at: req.enqueued_at,
                 finish_reason: None,
+                reserved_blocks: req.reserved_blocks,
             });
         }
 
@@ -486,6 +574,7 @@ mod tests {
         let mut b = ContinuousBatcher::new(BatcherConfig {
             max_slots: 1,
             max_queue_depth: 2,
+            ..BatcherConfig::default()
         });
         b.enqueue(vec![1], params(1)).unwrap();
         b.enqueue(vec![1], params(1)).unwrap();
@@ -548,6 +637,7 @@ mod tests {
         let mut b = ContinuousBatcher::new(BatcherConfig {
             max_slots: 1,
             max_queue_depth: 16,
+            ..BatcherConfig::default()
         });
 
         let a = b.enqueue(vec![1, 2], params(1)).unwrap();
@@ -589,6 +679,7 @@ mod tests {
         let mut b = ContinuousBatcher::new(BatcherConfig {
             max_slots: 3,
             max_queue_depth: 16,
+            ..BatcherConfig::default()
         });
 
         let a = b.enqueue(vec![1], params(8)).unwrap();
@@ -643,6 +734,7 @@ mod tests {
         let mut b = ContinuousBatcher::new(BatcherConfig {
             max_slots: 1,
             max_queue_depth: 16,
+            ..BatcherConfig::default()
         });
         let _active = b.enqueue(vec![1], params(1)).unwrap();
         let queued = b.enqueue(vec![2], params(1)).unwrap();
@@ -679,6 +771,7 @@ mod tests {
         let mut b = ContinuousBatcher::new(BatcherConfig {
             max_slots: 1,
             max_queue_depth: 16,
+            ..BatcherConfig::default()
         });
         let a = b.enqueue(vec![1], params(1)).unwrap();
         let c = b.enqueue(vec![2], params(1)).unwrap();
@@ -692,5 +785,57 @@ mod tests {
             StepInstruction::Prefill { slot, .. } => assert_eq!(slot, c),
             other => panic!("expected Prefill(c), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn block_budget_holds_request_until_blocks_free() {
+        let mut b = ContinuousBatcher::new(BatcherConfig {
+            max_slots: 4,
+            max_queue_depth: 16,
+            block_size: 4,
+            max_blocks: 3,
+        });
+        let a = b.enqueue(vec![1, 2, 3, 4], params(1)).unwrap(); // 5 tokens -> 2 blocks
+        let c = b.enqueue(vec![5, 6, 7, 8], params(1)).unwrap(); // 5 tokens -> 2 blocks
+
+        match b.next_instruction() {
+            StepInstruction::Prefill { slot, .. } => assert_eq!(slot, a),
+            other => panic!("expected Prefill(a), got {other:?}"),
+        }
+        assert_eq!(b.active_reserved_blocks(), 2);
+        assert_eq!(b.pending_depth(), 1);
+        assert!(b.pending.iter().any(|r| r.id == c));
+
+        b.advance_prefill(a, 4, true);
+        b.advance_decode([(a, 99u32, false)]);
+        assert_eq!(b.drain_retired().len(), 1);
+
+        match b.next_instruction() {
+            StepInstruction::Prefill { slot, .. } => assert_eq!(slot, c),
+            other => panic!("expected Prefill(c), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_scheduler_skips_head_of_line_when_later_request_fits() {
+        let mut b = ContinuousBatcher::new(BatcherConfig {
+            max_slots: 4,
+            max_queue_depth: 16,
+            block_size: 4,
+            max_blocks: 3,
+        });
+        let active = b.enqueue(vec![1, 2, 3, 4], params(4)).unwrap(); // 2 blocks
+        let big = b.enqueue(vec![5, 6, 7, 8], params(4)).unwrap(); // 2 blocks
+        let small = b.enqueue(vec![9], params(1)).unwrap(); // 1 block
+
+        match b.next_instruction() {
+            StepInstruction::Prefill { slot, .. } => assert_eq!(slot, active),
+            other => panic!("expected Prefill(active), got {other:?}"),
+        }
+
+        assert!(b.slots().iter().any(|s| s.id == small));
+        assert!(b.pending.iter().any(|r| r.id == big));
+        assert_eq!(b.pending_depth(), 1);
+        assert_eq!(b.active_reserved_blocks(), 3);
     }
 }

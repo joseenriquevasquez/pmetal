@@ -12,6 +12,7 @@ use super::weights::NativeWeights;
 // ============================================================================
 
 /// GDN layer cache state (conv + SSM).
+#[derive(Clone)]
 pub struct GdnCache {
     pub conv_state: Option<InlineArray>,
     pub ssm_state: Option<InlineArray>,
@@ -27,6 +28,49 @@ pub struct QuantizedTuple {
     pub packed: InlineArray, // [B, H, T, D_packed] uint32
     pub scales: InlineArray, // [B, H, T, D/group_size]
     pub biases: InlineArray, // [B, H, T, D/group_size]
+}
+
+impl QuantizedTuple {
+    /// Allocate or grow this packed/scales/biases trio along the time axis.
+    ///
+    /// The affine-quantized cache layout is shared by Qwen, GPT-OSS, Llama 4,
+    /// and DeepSeek MLA; keeping growth here prevents those attention paths
+    /// from drifting in capacity policy or tuple shape handling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_capacity(
+        slot: &mut Option<Self>,
+        policy: crate::native_common::kv_cache::GrowthPolicy,
+        batch: i32,
+        head_count: i32,
+        next: i32,
+        packed_last_dim: i32,
+        scales_last_dim: i32,
+        packed_dtype: i32,
+        scales_dtype: i32,
+    ) {
+        let (mut packed, mut scales, mut biases) = match slot.take() {
+            Some(tuple) => (Some(tuple.packed), Some(tuple.scales), Some(tuple.biases)),
+            None => (None, None, None),
+        };
+        crate::native_common::kv_cache::alloc_or_grow_quantized_tuple(
+            policy,
+            &mut packed,
+            &mut scales,
+            &mut biases,
+            batch,
+            head_count,
+            next,
+            packed_last_dim,
+            scales_last_dim,
+            packed_dtype,
+            scales_dtype,
+        );
+        *slot = Some(Self {
+            packed: packed.expect("quantized tuple packed buffer allocated"),
+            scales: scales.expect("quantized tuple scales buffer allocated"),
+            biases: biases.expect("quantized tuple biases buffer allocated"),
+        });
+    }
 }
 
 /// Mixed-bit configuration for TurboQuant v2 presets (Q2.5, Q3.5).
@@ -65,6 +109,7 @@ pub struct QuantCacheConfig {
 }
 
 /// Per-layer KV cache using pre-allocated buffers with O(1) slice_set updates.
+#[derive(Clone)]
 pub struct KvLayerCache {
     pub keys: Option<InlineArray>,   // [B, H, MAX_T, D] pre-allocated
     pub values: Option<InlineArray>, // [B, H, MAX_T, D] pre-allocated
@@ -89,6 +134,7 @@ pub struct KvLayerCache {
 }
 
 /// Full model cache — both GDN and KV layers.
+#[derive(Clone)]
 pub struct NativeCache {
     pub gdn_caches: Vec<GdnCache>,
     pub kv_caches: Vec<KvLayerCache>,
@@ -98,6 +144,16 @@ pub struct NativeCache {
 }
 
 impl NativeCache {
+    /// Return a cheap branch of this cache for prefix reuse.
+    ///
+    /// `InlineArray` and TurboQuant cache clones are MLX reference bumps, not
+    /// deep copies. Mutating the fork appends new cache buffers through normal
+    /// slice_set/append paths, so stored prefixes can be reused across requests
+    /// without duplicating the prefill tensors up front.
+    pub fn fork(&self) -> Self {
+        self.clone()
+    }
+
     /// Evaluate all cache states in-place and detach them from their computation
     /// graph.  Must be called after the prefill forward pass and before decode.
     ///

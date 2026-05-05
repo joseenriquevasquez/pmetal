@@ -84,7 +84,7 @@ impl LayerCache {
 ///
 /// Stores computed key and value tensors across generation steps,
 /// enabling efficient autoregressive generation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KVCache {
     /// Configuration.
     config: KVCacheConfig,
@@ -206,12 +206,7 @@ impl KVCache {
     }
 
     /// Returns `true` when the cache is in TurboQuant mode and at least one
-    /// layer has actually compressed history. Prefix-cache snapshots must skip
-    /// these caches: `KVCacheSnapshot::from_cache` only sees the (empty) dense
-    /// `keys`/`values` fields and would persist a zero-layer snapshot, while
-    /// even a working "decode-everything-back-to-fp16" path would silently
-    /// negate the compression savings (~37 GB at 100K context per SwiftLM's
-    /// observation).
+    /// layer has actually compressed history.
     pub fn turboquant_compression_active(&self) -> bool {
         if !matches!(self.config.mode, CacheMode::TurboQuant { .. }) {
             return false;
@@ -220,6 +215,16 @@ impl KVCache {
             Some(layers) => layers.iter().any(|layer| !layer.is_empty()),
             None => false,
         }
+    }
+
+    /// Cheaply fork this cache for serving prefix reuse.
+    ///
+    /// `Array` clones are MLX handle clones, so dense K/V tensors are shared
+    /// until the fork diverges. Quantized and TurboQuant layers clone their
+    /// compressed metadata directly, preserving the active cache mode instead
+    /// of round-tripping through dense fp16 snapshots.
+    pub fn fork(&self) -> Self {
+        self.clone()
     }
 
     /// Take the layer's KV buffers and current offset for a fused
@@ -897,7 +902,7 @@ pub fn create_sliding_window_cache(
 }
 
 /// Batch of KV caches for parallel generation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BatchKVCache {
     /// Individual caches per batch entry.
     pub(crate) caches: Vec<KVCache>,
@@ -920,6 +925,23 @@ impl BatchKVCache {
     /// Get a mutable reference to a specific cache.
     pub fn get_mut(&mut self, batch_idx: usize) -> Option<&mut KVCache> {
         self.caches.get_mut(batch_idx)
+    }
+
+    /// Replace one batch row with a forked/restored cache.
+    pub fn replace(&mut self, batch_idx: usize, cache: KVCache) -> Result<(), Exception> {
+        let batch_size = self.caches.len();
+        let Some(existing) = self.caches.get_mut(batch_idx) else {
+            return Err(Exception::custom(format!(
+                "batch index {batch_idx} out of range (batch_size={batch_size})",
+            )));
+        };
+        if existing.config() != cache.config() {
+            return Err(Exception::custom(
+                "cannot replace batch KV cache row with mismatched KVCacheConfig",
+            ));
+        }
+        *existing = cache;
+        Ok(())
     }
 
     /// Reset all caches.

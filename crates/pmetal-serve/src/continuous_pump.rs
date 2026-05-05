@@ -57,11 +57,12 @@ use crate::continuous_driver::{
     ContinuousEngineState, SlotForward, drive_decode_step, drive_prefill_step,
 };
 use crate::engine::{TokenEvent, TokenLogprobEntry, detect_stop_sequence_suffix};
+use crate::prefix_cache::ServePrefixCache;
 use pmetal_bridge::compat::{Array, Exception};
-use pmetal_mlx::kv_cache::KVCacheConfig;
+use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::generation::{GenerationConfig, Sampler, token_logprobs};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
@@ -98,6 +99,10 @@ struct SlotRecord {
     /// Time (ms from `start`) at which the first token was emitted.
     /// Populated lazily; reported in the final `RequestMetrics`.
     first_token_ms: Option<f64>,
+    /// Forked prefix cache to install into the slot at admit time.
+    prefix_seed: Option<KVCache>,
+    /// Number of prompt tokens restored from `prefix_seed`.
+    prefix_hit_len: usize,
 }
 
 /// Outcome of a single [`ContinuousPump::tick`] call.
@@ -124,6 +129,8 @@ pub struct ContinuousPump {
     /// stop-token list still works). Tests without a real tokenizer
     /// pass `None`.
     tokenizer: Option<Arc<pmetal_data::Tokenizer>>,
+    /// Optional cross-request prefix cache shared with the engine.
+    prefix_cache: Option<Arc<Mutex<ServePrefixCache>>>,
 }
 
 impl ContinuousPump {
@@ -136,6 +143,16 @@ impl ContinuousPump {
         cache_config: KVCacheConfig,
         tokenizer: Option<Arc<pmetal_data::Tokenizer>>,
     ) -> Self {
+        Self::new_with_prefix_cache(config, cache_config, tokenizer, None)
+    }
+
+    /// Build a pump with an optional shared prefix cache.
+    pub fn new_with_prefix_cache(
+        config: BatcherConfig,
+        cache_config: KVCacheConfig,
+        tokenizer: Option<Arc<pmetal_data::Tokenizer>>,
+        prefix_cache: Option<Arc<Mutex<ServePrefixCache>>>,
+    ) -> Self {
         let max_slots = config.max_slots;
         let batcher = ContinuousBatcher::new(config);
         let state = ContinuousEngineState::new(max_slots, cache_config.clone());
@@ -145,6 +162,7 @@ impl ContinuousPump {
             records: HashMap::new(),
             cache_config,
             tokenizer,
+            prefix_cache,
         }
     }
 
@@ -165,11 +183,53 @@ impl ContinuousPump {
         let prompt_tokens = prompt.len();
         let stop_sequences = params.stop_sequences.clone();
         let logprobs_top_n = params.logprobs_top_n;
+        let reserved_tokens = prompt_tokens.saturating_add(params.max_new_tokens);
+
+        let mut scheduler_prompt = prompt.clone();
+        let mut prefix_seed = None;
+        let mut prefix_hit_len = 0usize;
+        if let Some(prefix_cache) = self.prefix_cache.as_ref() {
+            match prefix_cache.lock() {
+                Ok(mut guard) => {
+                    match guard.find_longest_prefix(&prompt, self.cache_config.clone()) {
+                        Ok(Some(hit)) => {
+                            prefix_hit_len = hit.prefix_len;
+                            scheduler_prompt = prompt[prefix_hit_len..].to_vec();
+                            prefix_seed = Some(hit.restored_cache);
+                            tracing::debug!(
+                                target: "pmetal_serve::continuous_pump",
+                                restored = prefix_hit_len,
+                                total = prompt_tokens,
+                                "continuous-batch prefix cache hit"
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "pmetal_serve::continuous_pump",
+                                error = %e,
+                                "ignoring prefix-cache restore failure"
+                            );
+                        }
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        target: "pmetal_serve::continuous_pump",
+                        "ignoring poisoned prefix-cache lock"
+                    );
+                }
+            }
+        }
+
         // Clone the prompt into `all_tokens` so the sampler sees the
         // full prompt when applying repetition penalty to the first
-        // generated token. The scheduler consumes the original `prompt`.
+        // generated token. The scheduler consumes the original prompt
+        // or, on a prefix hit, only its uncached suffix.
         let all_tokens = prompt.clone();
-        let slot = self.batcher.enqueue(prompt, params)?;
+        let slot =
+            self.batcher
+                .enqueue_with_reserved_tokens(scheduler_prompt, params, reserved_tokens)?;
         let (tx, rx) = mpsc::channel(channel_capacity);
         self.records.insert(
             slot,
@@ -186,6 +246,8 @@ impl ContinuousPump {
                 logprobs_top_n,
                 stripped_tokens: 0,
                 first_token_ms: None,
+                prefix_seed,
+                prefix_hit_len,
             },
         );
         Ok((slot, rx))
@@ -249,6 +311,7 @@ impl ContinuousPump {
                 // "dead" tick between prefill-complete and the first
                 // decode step.
                 if let Some(last_logits) = maybe_last {
+                    self.save_prefix_if_possible(slot);
                     let (history, top_n) = {
                         let rec = self
                             .records
@@ -332,7 +395,48 @@ impl ContinuousPump {
             .unwrap_or_default();
         let sampler = Sampler::new(cfg);
         self.state.admit(slot, sampler)?;
+        let prefix_seed = self
+            .records
+            .get_mut(&slot)
+            .and_then(|r| r.prefix_seed.take());
+        if let Some(cache) = prefix_seed {
+            self.state.replace_cache(slot, cache)?;
+        }
         Ok(())
+    }
+
+    fn save_prefix_if_possible(&mut self, slot: SlotId) {
+        let Some(prefix_cache) = self.prefix_cache.as_ref().cloned() else {
+            return;
+        };
+        let Some((tokens, prefix_hit_len)) = self.records.get(&slot).map(|rec| {
+            let end = rec.prompt_tokens.min(rec.all_tokens.len());
+            (rec.all_tokens[..end].to_vec(), rec.prefix_hit_len)
+        }) else {
+            return;
+        };
+        let Some(cache) = self.state.cache_for(slot) else {
+            return;
+        };
+        match prefix_cache.lock() {
+            Ok(mut guard) => {
+                guard.insert(&tokens, cache);
+                if prefix_hit_len > 0 {
+                    tracing::debug!(
+                        target: "pmetal_serve::continuous_pump",
+                        restored = prefix_hit_len,
+                        saved = tokens.len(),
+                        "saved extended prefix after continuous-batch hit"
+                    );
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "pmetal_serve::continuous_pump",
+                    "skipping prefix-cache save after poisoned lock"
+                );
+            }
+        }
     }
 
     /// Compute per-token logprob data from `last_logits` when the slot
@@ -487,6 +591,17 @@ mod tests {
         KVCacheConfig::new(2, 32, 4, 64)
     }
 
+    fn cache_with_len(seq_len: usize) -> KVCache {
+        let mut cache = KVCache::new(cache_cfg());
+        if seq_len > 0 {
+            let k = Array::zeros_f32(&[1, 4, seq_len as i32, 64]);
+            let v = Array::zeros_f32(&[1, 4, seq_len as i32, 64]);
+            cache.update_and_fetch(0, &k, &v).unwrap();
+            cache.update_and_fetch(1, &k, &v).unwrap();
+        }
+        cache
+    }
+
     /// Forward stub identical to the driver's unit tests: extends the
     /// cache by `len(tokens)` and returns logits whose last-position
     /// argmax is determined by `next`.
@@ -569,6 +684,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn continuous_batching_reuses_and_extends_prefix_cache() {
+        struct RecordingStub {
+            calls: Vec<Vec<u32>>,
+        }
+
+        impl SlotForward for RecordingStub {
+            fn forward(&mut self, tokens: &[u32], cache: &mut KVCache) -> Result<Array, Exception> {
+                self.calls.push(tokens.to_vec());
+                let (h, d) = {
+                    let c = cache.config();
+                    (c.num_kv_heads as i32, c.head_dim as i32)
+                };
+                let s = tokens.len() as i32;
+                let k = Array::zeros_f32(&[1, h, s, d]);
+                let v = Array::zeros_f32(&[1, h, s, d]);
+                cache.update_and_fetch(0, &k, &v)?;
+                cache.update_and_fetch(1, &k, &v)?;
+
+                let vocab = 16i32;
+                let mut data = vec![0.0f32; (s * vocab) as usize];
+                let last = ((s - 1) * vocab) as usize;
+                data[last + 7] = 10.0;
+                Ok(Array::from_f32_slice(&data, &[1, s, vocab]))
+            }
+        }
+
+        let prefix_cache = Arc::new(Mutex::new(ServePrefixCache::new(8, 0)));
+        prefix_cache
+            .lock()
+            .unwrap()
+            .insert(&[1, 2], &cache_with_len(2));
+
+        let mut pump = ContinuousPump::new_with_prefix_cache(
+            BatcherConfig::default(),
+            cache_cfg(),
+            None,
+            Some(Arc::clone(&prefix_cache)),
+        );
+        let mut stub = RecordingStub { calls: Vec::new() };
+        let (_slot, _rx) = pump
+            .enqueue(
+                vec![1, 2, 3],
+                params(1, vec![]),
+                GenerationConfig::default(),
+                16,
+            )
+            .unwrap();
+
+        assert_eq!(pump.tick(&mut stub).unwrap(), Tick::Ran);
+        assert_eq!(
+            stub.calls,
+            vec![vec![3]],
+            "prefill should run only the suffix"
+        );
+
+        let hit = prefix_cache
+            .lock()
+            .unwrap()
+            .find_longest_prefix(&[1, 2, 3, 4], cache_cfg())
+            .unwrap()
+            .expect("extended prompt should be cached after prefill");
+        assert_eq!(hit.prefix_len, 3);
+        assert_eq!(hit.restored_cache.seq_len(), 3);
+    }
+
+    #[tokio::test]
     async fn stop_token_short_circuits_generation() {
         let mut pump = ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
         let mut next = HashMap::new();
@@ -615,6 +796,7 @@ mod tests {
             BatcherConfig {
                 max_slots: 2,
                 max_queue_depth: 16,
+                ..BatcherConfig::default()
             },
             cache_cfg(),
             None,
@@ -682,6 +864,7 @@ mod tests {
             BatcherConfig {
                 max_slots: 1,
                 max_queue_depth: 16,
+                ..BatcherConfig::default()
             },
             cache_cfg(),
             None,

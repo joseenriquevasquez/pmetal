@@ -59,7 +59,7 @@ pub use turboquant::*;
 use pmetal_bridge::compat::Dtype;
 
 /// Configuration for KV cache.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KVCacheConfig {
     /// Number of transformer layers.
     pub num_layers: usize,

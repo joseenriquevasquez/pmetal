@@ -235,27 +235,35 @@ pub(super) fn attn_forward(
     let output = if let Some(ref mut tq_cache) = cache.turboquant {
         // ── TurboQuant compressed KV cache path ────────────────────────────
         // Decode + NoPE prefill: shared dispatch helper handles
-        // append_and_compute_attention (with hot/cold split) and falls back
-        // to dequantize + standard SDPA on error or for prefill-with-history.
+        // append_and_compute_attention (with hot/cold split) and surfaces
+        // failures before the layer offset is advanced.
         //
         // Local-layer prefill with chunk_mask: TurboQuant's direct-attention
         // path doesn't accept a custom additive mask, so we mirror the affine
         // prefill — append, dequantize the full cache, run sdpa_with_mask.
         if let (true, Some(mask_int)) = (lw.use_rope, chunk_mask) {
             let dtype = queries.dtype_raw();
-            tq_cache.append(&keys, &values).ok();
-            cache.offset = next;
-            let valid_keys = tq_cache.dequantize_keys().unwrap_or_else(|| keys.clone());
+            tq_cache
+                .append(&keys, &values)
+                .expect("Llama 4 TurboQuant masked prefill append failed");
+            let valid_keys = tq_cache
+                .dequantize_keys()
+                .expect("Llama 4 TurboQuant masked prefill failed to dequantize keys");
             let valid_values = tq_cache
                 .dequantize_values()
-                .unwrap_or_else(|| values.clone());
+                .expect("Llama 4 TurboQuant masked prefill failed to dequantize values");
+            cache.offset = next;
             let mask_full = make_additive_mask(&mask_int.slice(&[0, 0], &[s, next]), dtype);
             let mask_4d = mask_full.reshape(&[1, 1, s, next]);
-            queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(&mask_4d))
+            let output = queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(&mask_4d));
+            crate::error::check_last_error()
+                .expect("Llama 4 TurboQuant masked prefill SDPA failed");
+            output
         } else {
             let out = crate::turboquant_dispatch::turboquant_attention_step(
                 tq_cache, &queries, &keys, &values, scale, prev, "LLAMA4",
-            );
+            )
+            .expect("Llama 4 TurboQuant attention step failed");
             cache.offset = next;
             out
         }
@@ -288,56 +296,28 @@ pub(super) fn attn_forward(
         let vs = vs.reshape(&[b, n_kv_heads, num_new, scales_dim]);
         let vb = vb.reshape(&[b, n_kv_heads, num_new, scales_dim]);
 
-        // Allocate or grow quantized cache buffers
-        if cache.quantized_keys.is_none() {
-            let alloc = ((next + 255) / 256) * 256;
-            cache.quantized_keys = Some(crate::qwen3_native::QuantizedTuple {
-                packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim], uint32_dt),
-                scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-                biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-            });
-            cache.quantized_values = Some(crate::qwen3_native::QuantizedTuple {
-                packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim], uint32_dt),
-                scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-                biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-            });
-        } else {
-            let allocated = cache.quantized_keys.as_ref().unwrap().packed.dim(2);
-            if next > allocated {
-                let grow_to = ((next + 255) / 256) * 256;
-                let extend = grow_to - allocated;
-                let qk = cache.quantized_keys.take().unwrap();
-                let qv = cache.quantized_values.take().unwrap();
-                cache.quantized_keys = Some(crate::qwen3_native::QuantizedTuple {
-                    packed: qk.packed.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt),
-                        2,
-                    ),
-                    scales: qk.scales.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
-                        2,
-                    ),
-                    biases: qk.biases.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
-                        2,
-                    ),
-                });
-                cache.quantized_values = Some(crate::qwen3_native::QuantizedTuple {
-                    packed: qv.packed.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt),
-                        2,
-                    ),
-                    scales: qv.scales.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
-                        2,
-                    ),
-                    biases: qv.biases.kv_cache_append(
-                        &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
-                        2,
-                    ),
-                });
-            }
-        }
+        crate::qwen3_native::QuantizedTuple::ensure_capacity(
+            &mut cache.quantized_keys,
+            crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+            b,
+            n_kv_heads,
+            next,
+            packed_dim,
+            scales_dim,
+            uint32_dt,
+            dtype,
+        );
+        crate::qwen3_native::QuantizedTuple::ensure_capacity(
+            &mut cache.quantized_values,
+            crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+            b,
+            n_kv_heads,
+            next,
+            packed_dim,
+            scales_dim,
+            uint32_dt,
+            dtype,
+        );
 
         // slice_set new tokens into cache buffers
         let start_q = [0, 0, prev, 0];

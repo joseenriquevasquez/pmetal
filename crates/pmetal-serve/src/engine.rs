@@ -605,7 +605,7 @@ fn run_continuous_driver(
 }
 
 // Default prefix-cache budgets. Generous on entries since each one is
-// just a token sequence + a KV snapshot; the byte budget is the hard cap.
+// just a token sequence + a KV fork; the byte budget is the hard cap.
 const DEFAULT_PREFIX_CACHE_ENTRIES: usize = 16;
 const DEFAULT_PREFIX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 
@@ -776,10 +776,9 @@ impl InferenceEngine {
         })
     }
 
-    /// Override the default prefix-cache budgets. `max_entries = 0` or
-    /// `max_bytes = 0` is a valid way to express "unbounded on that
-    /// axis"; for the engine's purposes, setting both to zero disables
-    /// the cache (all entries would be evicted before use).
+    /// Override the default prefix-cache budgets. `max_entries = 0`
+    /// disables the cache; `max_bytes = 0` leaves the byte axis
+    /// unbounded.
     pub fn set_prefix_cache_limits(&self, max_entries: usize, max_bytes: usize) {
         if let Ok(mut pc) = self.prefix_cache.lock() {
             *pc = crate::prefix_cache::ServePrefixCache::new(max_entries, max_bytes);
@@ -823,11 +822,14 @@ impl InferenceEngine {
             return Ok(());
         }
 
-        let pump = Arc::new(Mutex::new(crate::continuous_pump::ContinuousPump::new(
-            batcher_config,
-            cache_config,
-            Some(Arc::clone(&self.tokenizer)),
-        )));
+        let pump = Arc::new(Mutex::new(
+            crate::continuous_pump::ContinuousPump::new_with_prefix_cache(
+                batcher_config,
+                cache_config,
+                Some(Arc::clone(&self.tokenizer)),
+                Some(Arc::clone(&self.prefix_cache)),
+            ),
+        ));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let model_arc = Arc::clone(&self.model);
@@ -904,6 +906,25 @@ impl InferenceEngine {
         self.continuous.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 
+    fn create_continuous_cache_config(&self) -> ServeResult<KVCacheConfig> {
+        let (cache_config, has_recurrent_cache) = {
+            let state = self.model.lock().map_err(|_| ServeError::Busy)?;
+            let (cache, mamba_cache) = Self::create_request_caches(
+                &state.model,
+                &self.model_path,
+                self.max_seq_len,
+                self.cache_mode_override,
+            );
+            (cache.config().clone(), mamba_cache.is_some())
+        };
+        if has_recurrent_cache {
+            return Err(ServeError::BadRequest(
+                "continuous batching is unsupported for hybrid/recurrent models".into(),
+            ));
+        }
+        Ok(cache_config)
+    }
+
     /// Convenience wrapper that derives the KV-cache config from the
     /// loaded model and calls
     /// [`enable_continuous_batching`](Self::enable_continuous_batching).
@@ -913,12 +934,14 @@ impl InferenceEngine {
     /// single-request generation. Requires a short lock on the model.
     pub fn enable_continuous_batching_auto(
         &self,
-        batcher_config: crate::continuous_batch::BatcherConfig,
+        mut batcher_config: crate::continuous_batch::BatcherConfig,
     ) -> ServeResult<()> {
-        let cache_config = {
-            let state = self.model.lock().map_err(|_| ServeError::Busy)?;
-            state.model.create_cache(self.max_seq_len).config().clone()
-        };
+        let cache_config = self.create_continuous_cache_config()?;
+        if batcher_config.max_blocks == 0 {
+            let block_size = batcher_config.effective_block_size();
+            batcher_config.max_blocks =
+                batcher_config.max_slots.max(1) * self.max_seq_len.div_ceil(block_size);
+        }
         self.enable_continuous_batching(batcher_config, cache_config)
     }
 
@@ -1913,6 +1936,7 @@ impl InferenceEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_models::architectures::llama::{LlamaConfig, LlamaForCausalLM};
     use pmetal_models::architectures::nemotron_h::{NemotronHConfig, NemotronHForCausalLM};
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::pre_tokenizers::whitespace::Whitespace;
@@ -1970,6 +1994,25 @@ mod tests {
             norm_topk_prob: None,
             routed_scaling_factor: None,
             rope_theta: 10000.0,
+        }
+    }
+
+    fn tiny_llama_config() -> LlamaConfig {
+        LlamaConfig {
+            vocab_size: 64,
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: Some(2),
+            head_dim: Some(8),
+            max_position_embeddings: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            hidden_act: "silu".to_string(),
+            tie_word_embeddings: true,
+            ..Default::default()
         }
     }
 
@@ -2092,6 +2135,54 @@ mod tests {
 
         assert_eq!(cache.config().max_seq_len, 64);
         assert!(mamba_cache.is_some());
+    }
+
+    #[test]
+    fn continuous_cache_config_honors_cache_mode_override() {
+        let model = DynamicModel::Llama(LlamaForCausalLM::new(tiny_llama_config()).unwrap());
+        let override_mode = CacheMode::Quantized {
+            bits: 4,
+            group_size: 8,
+        };
+        let engine = InferenceEngine::new_with_options(
+            model,
+            test_tokenizer(),
+            "tiny-llama".into(),
+            std::env::temp_dir().as_path(),
+            64,
+            false,
+            1024,
+            false,
+            Some(override_mode),
+        )
+        .unwrap();
+
+        let cfg = engine.create_continuous_cache_config().unwrap();
+        assert_eq!(cfg.mode, override_mode);
+    }
+
+    #[test]
+    fn continuous_cache_config_rejects_hybrid_models() {
+        let model =
+            DynamicModel::NemotronH(NemotronHForCausalLM::new(tiny_nemotron_h_config()).unwrap());
+        let engine = InferenceEngine::new_with_options(
+            model,
+            test_tokenizer(),
+            "tiny-hybrid".into(),
+            std::env::temp_dir().as_path(),
+            64,
+            false,
+            1024,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let err = engine.create_continuous_cache_config().unwrap_err();
+        match err {
+            ServeError::BadRequest(msg) => assert!(msg.contains("hybrid/recurrent")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 
     fn test_tokenizer() -> pmetal_data::Tokenizer {

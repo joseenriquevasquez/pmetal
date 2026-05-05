@@ -17,6 +17,7 @@ use crate::inline_array as bridge;
 /// When `quant_config` is set, `kv_latent` and `k_pe` are stored in quantized
 /// form using affine group quantization, halving (or further reducing) the cache
 /// memory. Dequantization happens at attention time before SDPA.
+#[derive(Clone)]
 pub struct MlaLayerCache {
     /// Cached KV latent: [B, 1, T, kv_lora_rank]. Initialized lazily.
     pub kv_latent: Option<InlineArray>,
@@ -33,6 +34,7 @@ pub struct MlaLayerCache {
 }
 
 /// Full model MLA cache — one entry per layer.
+#[derive(Clone)]
 pub struct NativeCache {
     pub mla_caches: Vec<MlaLayerCache>,
     /// Global position counter for RoPE offset.
@@ -40,6 +42,16 @@ pub struct NativeCache {
 }
 
 impl NativeCache {
+    /// Return a cheap branch of this cache for prefix reuse.
+    ///
+    /// `InlineArray` clones are MLX reference bumps, not deep copies. Mutating
+    /// the fork appends new cache buffers through normal slice_set paths, so
+    /// stored prefixes can be reused across requests without duplicating the
+    /// prefill tensors up front.
+    pub fn fork(&self) -> Self {
+        self.clone()
+    }
+
     /// Create a fresh empty cache.
     pub fn new_empty(num_layers: usize) -> Self {
         Self::new_with_quant(num_layers, None)

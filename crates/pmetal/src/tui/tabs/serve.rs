@@ -208,6 +208,16 @@ impl ServeTab {
             .value("CB Queue Depth")
             .parse()
             .unwrap_or(spec.cb_max_queue_depth);
+        spec.cb_block_size = self
+            .form
+            .value("CB Block Size")
+            .parse()
+            .unwrap_or(spec.cb_block_size);
+        spec.cb_max_blocks = self
+            .form
+            .value("CB Max Blocks")
+            .parse()
+            .unwrap_or(spec.cb_max_blocks);
         let experts = self.form.value("Experts Dir");
         spec.experts_dir = if experts.is_empty() {
             None

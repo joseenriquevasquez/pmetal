@@ -258,6 +258,14 @@ impl ContinuousEngineState {
         self.caches.get_mut(idx)
     }
 
+    /// Replace a slot's KV cache with a forked prefix cache.
+    pub fn replace_cache(&mut self, slot: SlotId, cache: KVCache) -> Result<(), Exception> {
+        let idx = self.map.get(slot).ok_or_else(|| {
+            Exception::custom(format!("replace cache: slot {slot:?} not admitted"))
+        })?;
+        self.caches.replace(idx, cache)
+    }
+
     /// Borrow the per-slot sampler mutably.
     pub fn sampler_for(&mut self, slot: SlotId) -> Option<&mut Sampler> {
         let idx = self.map.get(slot)?;

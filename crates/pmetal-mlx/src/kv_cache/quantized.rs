@@ -33,7 +33,7 @@ struct QuantizedTensor {
 ///
 /// Requires MLX to have quantize/dequantize operations available.
 /// Falls back to standard cache if quantization fails.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QuantizedKVCache {
     /// Quantized keys.
     keys: Option<QuantizedTensor>,

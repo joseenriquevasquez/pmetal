@@ -46,6 +46,10 @@ pub struct QuantizedKvCache {
     cold_offset: usize,
     /// Tokens currently held uncompressed in the fp16/bf16 hot ring.
     hot_offset: usize,
+    /// Ring-buffer start index for the oldest hot token. `hot_offset` is the
+    /// active length; active slots are logically
+    /// `hot_start..hot_start + hot_offset` modulo the allocated capacity.
+    hot_start: usize,
     /// Hot-ring keys, shape `[B, H_kv, hot_capacity, D_k]`. Native dtype
     /// (whatever was passed in on first append). `None` when the recent
     /// window is disabled or no tokens are currently uncompressed.
@@ -116,6 +120,7 @@ impl QuantizedKvCache {
             offset: 0,
             cold_offset: 0,
             hot_offset: 0,
+            hot_start: 0,
             hot_keys: None,
             hot_values: None,
             hot_dtype: None,
@@ -153,6 +158,7 @@ impl QuantizedKvCache {
         self.offset = 0;
         self.cold_offset = 0;
         self.hot_offset = 0;
+        self.hot_start = 0;
         if let Some(warm) = self.warm.as_mut() {
             warm.reset();
         }
@@ -209,6 +215,119 @@ impl QuantizedKvCache {
             .recent_window
             .map(|w| w + HOT_EVICTION_CHUNK)
             .unwrap_or(0)
+    }
+
+    fn active_hot_slice(
+        arr: &InlineArray,
+        layout: CacheLayout,
+        hot_start: usize,
+        hot_len: usize,
+        feature_dim: usize,
+    ) -> Option<InlineArray> {
+        if hot_len == 0 {
+            return None;
+        }
+        let capacity = arr.dim(2) as usize;
+        if capacity == 0 {
+            return None;
+        }
+        if hot_len > capacity {
+            return None;
+        }
+        let start = hot_start % capacity;
+        let first_len = hot_len.min(capacity - start);
+        let first = arr.slice(
+            &[0, 0, start as i32, 0],
+            &[
+                layout.batch as i32,
+                layout.heads as i32,
+                (start + first_len) as i32,
+                feature_dim as i32,
+            ],
+        );
+        if first_len == hot_len {
+            Some(first)
+        } else {
+            let second_len = hot_len - first_len;
+            let second = arr.slice(
+                &[0, 0, 0, 0],
+                &[
+                    layout.batch as i32,
+                    layout.heads as i32,
+                    second_len as i32,
+                    feature_dim as i32,
+                ],
+            );
+            Some(first.concatenate_2(&second, 2))
+        }
+    }
+
+    fn write_hot_chunk(
+        arr: &mut InlineArray,
+        src: &InlineArray,
+        layout: CacheLayout,
+        write_start: usize,
+        seq_len: usize,
+        feature_dim: usize,
+    ) {
+        let capacity = arr.dim(2) as usize;
+        debug_assert!(capacity > 0);
+        let start = write_start % capacity;
+        let first_len = seq_len.min(capacity - start);
+        if first_len == seq_len {
+            *arr = arr.slice_set(
+                src,
+                &[0, 0, start as i32, 0],
+                &[
+                    layout.batch as i32,
+                    layout.heads as i32,
+                    (start + seq_len) as i32,
+                    feature_dim as i32,
+                ],
+            );
+            return;
+        }
+
+        let first_src = src.slice(
+            &[0, 0, 0, 0],
+            &[
+                layout.batch as i32,
+                layout.heads as i32,
+                first_len as i32,
+                feature_dim as i32,
+            ],
+        );
+        *arr = arr.slice_set(
+            &first_src,
+            &[0, 0, start as i32, 0],
+            &[
+                layout.batch as i32,
+                layout.heads as i32,
+                capacity as i32,
+                feature_dim as i32,
+            ],
+        );
+
+        let second_len = seq_len - first_len;
+        let second_src = src.slice(
+            &[0, 0, first_len as i32, 0],
+            &[
+                layout.batch as i32,
+                layout.heads as i32,
+                seq_len as i32,
+                feature_dim as i32,
+            ],
+        );
+        *arr = arr.slice_set(
+            &second_src,
+            &[0, 0, 0, 0],
+            &[
+                layout.batch as i32,
+                layout.heads as i32,
+                second_len as i32,
+                feature_dim as i32,
+            ],
+        );
     }
 
     /// Append new keys and values.
@@ -397,15 +516,31 @@ impl QuantizedKvCache {
             self.hot_dtype = Some(keys.dtype_raw());
         }
         let hot_dtype = self.hot_dtype.unwrap();
-        let capacity = self.hot_capacity().max(seq_len);
+        let base_capacity = self.hot_capacity().max(seq_len).max(1);
+
+        // If the steady-state ring is full, evict before writing. This keeps
+        // decode from growing the hot buffer just to spill immediately.
+        if let Some(hot_keys) = self.hot_keys.as_ref() {
+            let capacity = hot_keys.dim(2) as usize;
+            if self.hot_offset + seq_len > capacity && self.hot_offset > window {
+                let overflow = self.hot_offset + seq_len - capacity;
+                let evict_seq = self
+                    .hot_offset
+                    .saturating_sub(window)
+                    .max(overflow)
+                    .min(self.hot_offset);
+                self.evict_oldest_to_cold(layout, evict_seq)?;
+            }
+        }
 
         // Lazy-allocate (or grow) the hot ring.
         if self.hot_keys.is_none() {
+            self.hot_start = 0;
             self.hot_keys = Some(InlineArray::zeros(
                 &[
                     layout.batch as i32,
                     layout.heads as i32,
-                    capacity as i32,
+                    base_capacity as i32,
                     layout.key_dim as i32,
                 ],
                 hot_dtype,
@@ -414,15 +549,15 @@ impl QuantizedKvCache {
                 &[
                     layout.batch as i32,
                     layout.heads as i32,
-                    capacity as i32,
+                    base_capacity as i32,
                     layout.value_dim as i32,
                 ],
                 hot_dtype,
             ));
-        } else if self.hot_offset + seq_len > capacity {
+        } else if self.hot_offset + seq_len > self.hot_keys.as_ref().unwrap().dim(2) as usize {
             // One-shot prefill larger than the current ring — grow to fit.
             let need = self.hot_offset + seq_len;
-            let new_cap = need.max(capacity);
+            let new_cap = need.max(base_capacity);
             let prev_keys = self.hot_keys.take().unwrap();
             let prev_values = self.hot_values.take().unwrap();
             let mut new_keys = InlineArray::zeros(
@@ -444,24 +579,22 @@ impl QuantizedKvCache {
                 hot_dtype,
             );
             if self.hot_offset > 0 {
-                let kept_keys = prev_keys.slice(
-                    &[0, 0, 0, 0],
-                    &[
-                        layout.batch as i32,
-                        layout.heads as i32,
-                        self.hot_offset as i32,
-                        layout.key_dim as i32,
-                    ],
-                );
-                let kept_values = prev_values.slice(
-                    &[0, 0, 0, 0],
-                    &[
-                        layout.batch as i32,
-                        layout.heads as i32,
-                        self.hot_offset as i32,
-                        layout.value_dim as i32,
-                    ],
-                );
+                let kept_keys = Self::active_hot_slice(
+                    &prev_keys,
+                    layout,
+                    self.hot_start,
+                    self.hot_offset,
+                    layout.key_dim,
+                )
+                .ok_or_else(|| "TurboQuant hot keys invalid during grow".to_string())?;
+                let kept_values = Self::active_hot_slice(
+                    &prev_values,
+                    layout,
+                    self.hot_start,
+                    self.hot_offset,
+                    layout.value_dim,
+                )
+                .ok_or_else(|| "TurboQuant hot values invalid during grow".to_string())?;
                 new_keys = new_keys.slice_set(
                     &kept_keys,
                     &[0, 0, 0, 0],
@@ -483,26 +616,29 @@ impl QuantizedKvCache {
                     ],
                 );
             }
+            self.hot_start = 0;
             self.hot_keys = Some(new_keys);
             self.hot_values = Some(new_values);
         }
 
-        // Write the new chunk into the ring at `hot_offset..hot_offset+seq_len`.
-        let start = self.hot_offset;
-        let stop = start + seq_len;
+        // Write the new chunk at the logical tail of the ring.
+        let capacity = self
+            .hot_keys
+            .as_ref()
+            .expect("hot_keys allocated above")
+            .dim(2) as usize;
+        let write_start = (self.hot_start + self.hot_offset) % capacity;
         let keys_typed = keys.as_dtype(hot_dtype);
         let values_typed = values.as_dtype(hot_dtype);
         {
             let hot_keys = self.hot_keys.as_mut().expect("hot_keys allocated above");
-            *hot_keys = hot_keys.slice_set(
+            Self::write_hot_chunk(
+                hot_keys,
                 &keys_typed,
-                &[0, 0, start as i32, 0],
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    stop as i32,
-                    layout.key_dim as i32,
-                ],
+                layout,
+                write_start,
+                seq_len,
+                layout.key_dim,
             );
         }
         {
@@ -510,15 +646,13 @@ impl QuantizedKvCache {
                 .hot_values
                 .as_mut()
                 .expect("hot_values allocated above");
-            *hot_values = hot_values.slice_set(
+            Self::write_hot_chunk(
+                hot_values,
                 &values_typed,
-                &[0, 0, start as i32, 0],
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    stop as i32,
-                    layout.value_dim as i32,
-                ],
+                layout,
+                write_start,
+                seq_len,
+                layout.value_dim,
             );
         }
         self.hot_offset += seq_len;
@@ -537,8 +671,7 @@ impl QuantizedKvCache {
         Ok(())
     }
 
-    /// Move the leading `evict_seq` tokens out of the hot ring into cold,
-    /// then shuffle the remaining tail back to position 0 of the buffer.
+    /// Move the leading `evict_seq` logical tokens out of the hot ring into cold.
     /// Caller must guarantee `evict_seq <= self.hot_offset`.
     fn evict_oldest_to_cold(
         &mut self,
@@ -549,15 +682,17 @@ impl QuantizedKvCache {
             return Ok(());
         }
         let remain = self.hot_offset - evict_seq;
-        let hot_dtype = self
-            .hot_dtype
-            .expect("hot_dtype set when hot ring is non-empty");
+        let capacity = self
+            .hot_keys
+            .as_ref()
+            .ok_or_else(|| "TurboQuant hot keys missing during evict".to_string())?
+            .dim(2) as usize;
 
-        // Phase 1: extract the leading slice we want to compress and the
-        // trailing slice we want to keep, into owned values. The immutable
+        // Phase 1: extract the leading logical slice we want to compress into
+        // owned values. The immutable
         // borrows of `hot_keys`/`hot_values` are dropped at the end of this
         // block before any `&mut self` call below.
-        let (evict_keys, evict_values, kept) = {
+        let (evict_keys, evict_values) = {
             let hot_keys = self
                 .hot_keys
                 .as_ref()
@@ -566,48 +701,18 @@ impl QuantizedKvCache {
                 .hot_values
                 .as_ref()
                 .ok_or_else(|| "TurboQuant hot values missing during evict".to_string())?;
-            let evict_keys = hot_keys.slice(
-                &[0, 0, 0, 0],
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    evict_seq as i32,
-                    layout.key_dim as i32,
-                ],
-            );
-            let evict_values = hot_values.slice(
-                &[0, 0, 0, 0],
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    evict_seq as i32,
-                    layout.value_dim as i32,
-                ],
-            );
-            let kept = if remain > 0 {
-                let kept_keys = hot_keys.slice(
-                    &[0, 0, evict_seq as i32, 0],
-                    &[
-                        layout.batch as i32,
-                        layout.heads as i32,
-                        self.hot_offset as i32,
-                        layout.key_dim as i32,
-                    ],
-                );
-                let kept_values = hot_values.slice(
-                    &[0, 0, evict_seq as i32, 0],
-                    &[
-                        layout.batch as i32,
-                        layout.heads as i32,
-                        self.hot_offset as i32,
-                        layout.value_dim as i32,
-                    ],
-                );
-                Some((kept_keys, kept_values))
-            } else {
-                None
-            };
-            (evict_keys, evict_values, kept)
+            let evict_keys =
+                Self::active_hot_slice(hot_keys, layout, self.hot_start, evict_seq, layout.key_dim)
+                    .ok_or_else(|| "TurboQuant hot keys invalid during evict".to_string())?;
+            let evict_values = Self::active_hot_slice(
+                hot_values,
+                layout,
+                self.hot_start,
+                evict_seq,
+                layout.value_dim,
+            )
+            .ok_or_else(|| "TurboQuant hot values invalid during evict".to_string())?;
+            (evict_keys, evict_values)
         };
 
         // Phase 2: mutate. The borrows above are dropped.
@@ -661,52 +766,13 @@ impl QuantizedKvCache {
         } else {
             self.compress_into_cold(&evict_keys, &evict_values, layout, evict_seq)?;
         }
-        if let Some((kept_keys, kept_values)) = kept {
-            let capacity = self.hot_capacity().max(remain);
-            let mut new_keys = InlineArray::zeros(
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    capacity as i32,
-                    layout.key_dim as i32,
-                ],
-                hot_dtype,
-            );
-            let mut new_values = InlineArray::zeros(
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    capacity as i32,
-                    layout.value_dim as i32,
-                ],
-                hot_dtype,
-            );
-            new_keys = new_keys.slice_set(
-                &kept_keys,
-                &[0, 0, 0, 0],
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    remain as i32,
-                    layout.key_dim as i32,
-                ],
-            );
-            new_values = new_values.slice_set(
-                &kept_values,
-                &[0, 0, 0, 0],
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    remain as i32,
-                    layout.value_dim as i32,
-                ],
-            );
-            self.hot_keys = Some(new_keys);
-            self.hot_values = Some(new_values);
+        if remain > 0 {
+            self.hot_start = (self.hot_start + evict_seq) % capacity;
         } else {
             // Hot ring fully drained — drop the buffers until the next append.
             self.hot_keys = None;
             self.hot_values = None;
+            self.hot_start = 0;
         }
         self.hot_offset = remain;
         self.offset = self.cold_offset + self.warm_len() + self.hot_offset;
@@ -760,15 +826,13 @@ impl QuantizedKvCache {
 
         let hot = if self.hot_offset > 0 {
             let hot_keys = self.hot_keys.as_ref()?;
-            let active = hot_keys.slice(
-                &[0, 0, 0, 0],
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    self.hot_offset as i32,
-                    layout.key_dim as i32,
-                ],
-            );
+            let active = Self::active_hot_slice(
+                hot_keys,
+                layout,
+                self.hot_start,
+                self.hot_offset,
+                layout.key_dim,
+            )?;
             // Cold is f32; cast hot to f32 so concat dtypes match.
             Some(active.as_dtype(10))
         } else {
@@ -827,15 +891,13 @@ impl QuantizedKvCache {
 
         let hot = if self.hot_offset > 0 {
             let hot_values = self.hot_values.as_ref()?;
-            let active = hot_values.slice(
-                &[0, 0, 0, 0],
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    self.hot_offset as i32,
-                    layout.value_dim as i32,
-                ],
-            );
+            let active = Self::active_hot_slice(
+                hot_values,
+                layout,
+                self.hot_start,
+                self.hot_offset,
+                layout.value_dim,
+            )?;
             Some(active.as_dtype(10))
         } else {
             None
@@ -937,28 +999,24 @@ impl QuantizedKvCache {
                 .hot_values
                 .as_ref()
                 .ok_or_else(|| "TurboQuant hot values missing".to_string())?;
-            let active_keys = hot_keys
-                .slice(
-                    &[0, 0, 0, 0],
-                    &[
-                        layout.batch as i32,
-                        layout.heads as i32,
-                        self.hot_offset as i32,
-                        layout.key_dim as i32,
-                    ],
-                )
-                .as_dtype(10);
-            let active_values = hot_values
-                .slice(
-                    &[0, 0, 0, 0],
-                    &[
-                        layout.batch as i32,
-                        layout.heads as i32,
-                        self.hot_offset as i32,
-                        layout.value_dim as i32,
-                    ],
-                )
-                .as_dtype(10);
+            let active_keys = Self::active_hot_slice(
+                hot_keys,
+                layout,
+                self.hot_start,
+                self.hot_offset,
+                layout.key_dim,
+            )
+            .ok_or_else(|| "TurboQuant hot keys invalid".to_string())?
+            .as_dtype(10);
+            let active_values = Self::active_hot_slice(
+                hot_values,
+                layout,
+                self.hot_start,
+                self.hot_offset,
+                layout.value_dim,
+            )
+            .ok_or_else(|| "TurboQuant hot values invalid".to_string())?
+            .as_dtype(10);
 
             let q_heads = queries.dim(1) as usize;
             let kv_heads = layout.heads;
@@ -976,13 +1034,14 @@ impl QuantizedKvCache {
                     active_values.repeat(groups as i32, 1),
                 )
             };
-            let output = crate::decode::sdpa_causal_like_mlx(
+            let output = crate::decode::try_sdpa_causal_like_mlx(
                 &queries_f32,
                 &keys_for_attn,
                 &values_for_attn,
                 scale,
                 queries.dim(2),
-            );
+            )
+            .map_err(|err| err.to_string())?;
             return Ok(if query_dtype == 10 {
                 output
             } else {
@@ -1051,13 +1110,14 @@ impl QuantizedKvCache {
         };
 
         let queries_f32 = queries.as_dtype(10);
-        let output = crate::decode::sdpa_causal_like_mlx(
+        let output = crate::decode::try_sdpa_causal_like_mlx(
             &queries_f32,
             &keys_for_attn,
             &values_for_attn,
             scale,
             queries.dim(2),
-        );
+        )
+        .map_err(|err| err.to_string())?;
         Ok(if queries.dtype_raw() == 10 {
             output
         } else {

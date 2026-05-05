@@ -6,11 +6,10 @@
 //! full prompt through the model discards GPU work that we already
 //! paid for.
 //!
-//! This cache stores a bounded collection of `(tokens, KV-snapshot)`
+//! This cache stores a bounded collection of `(tokens, KV-cache fork)`
 //! pairs. On each new request, we scan for the cached entry whose
 //! tokens are the longest prefix of the incoming sequence. If we
-//! find one, we restore the KV cache from its snapshot and prefill
-//! only the suffix.
+//! find one, we fork the cached KV state and prefill only the suffix.
 //!
 //! # Matching rule
 //!
@@ -24,35 +23,33 @@
 //! # Hybrid models
 //!
 //! Models with recurrent state (Mamba, GDN, RecurrentGemma, …) are
-//! NOT supported here. Their state can't be snapshot-truncated to a
-//! prefix cleanly, and returning wrong answers silently is worse than
-//! the small prefill savings. The engine gates on `mamba_cache.is_none()`
-//! before consulting this cache.
+//! NOT supported here. Their recurrent state is separate from the KV cache
+//! and can't be forked to a prefix cleanly. Returning wrong answers silently
+//! is worse than the small prefill savings. The engine gates on
+//! `mamba_cache.is_none()` before consulting this cache.
 //!
 //! # Eviction
 //!
 //! Entries are evicted LRU once either the entry count or the total
-//! stored-byte budget is exceeded. Snapshots can be multi-hundred-MB
+//! stored-byte budget is exceeded. KV entries can be multi-hundred-MB
 //! for long contexts; the byte budget is the practical limit.
 
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
-use pmetal_mlx::prefix_cache::KVCacheSnapshot;
 use std::time::Instant;
 
 /// One cached prefix entry.
 struct Entry {
     tokens: Vec<u32>,
-    snapshot: KVCacheSnapshot,
+    cache: KVCache,
     /// Monotonic counter; higher = more recently touched.
     last_used: u64,
-    /// Memory estimate cached once at insert time (snapshot tensors
-    /// are immutable after capture).
+    /// Memory estimate cached once at insert time.
     bytes: usize,
 }
 
 /// Outcome of a prefix-cache lookup.
 pub struct PrefixHit {
-    /// Number of leading tokens covered by the cached snapshot.
+    /// Number of leading tokens covered by the cached KV fork.
     pub prefix_len: usize,
     /// The restored KV cache, ready to continue with suffix tokens.
     pub restored_cache: KVCache,
@@ -75,8 +72,8 @@ pub struct ServePrefixCache {
 impl ServePrefixCache {
     /// Create a new prefix cache.
     ///
-    /// Both bounds are enforced; eviction kicks in when either is
-    /// exceeded.
+    /// The entry bound is always enforced (`max_entries = 0` disables the
+    /// cache). The byte bound is enforced when `max_bytes > 0`.
     pub fn new(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             entries: Vec::new(),
@@ -95,7 +92,7 @@ impl ServePrefixCache {
     }
 
     /// Find the cached entry whose tokens are the longest strict prefix
-    /// of `incoming` and restore it into a fresh KV cache.
+    /// of `incoming` and fork it into a fresh KV cache.
     ///
     /// Returns `None` if no cached entry is a prefix of `incoming`, or
     /// if the best match would cover every incoming token (we require
@@ -134,7 +131,12 @@ impl ServePrefixCache {
                 self.hits = self.hits.saturating_add(1);
                 let now = self.tick();
                 self.entries[idx].last_used = now;
-                let restored = self.entries[idx].snapshot.restore(kv_config)?;
+                let restored = self.entries[idx].cache.fork();
+                if restored.config() != &kv_config {
+                    return Err(pmetal_bridge::compat::Exception::custom(
+                        "prefix-cache hit had a mismatched KVCacheConfig",
+                    ));
+                }
                 Ok(Some(PrefixHit {
                     prefix_len,
                     restored_cache: restored,
@@ -145,12 +147,10 @@ impl ServePrefixCache {
 
     /// Insert a new prefix into the cache.
     ///
-    /// Snapshots the given KV cache; the caller must be at a clean
+    /// Forks the given KV cache; the caller must be at a clean
     /// end-of-prefill boundary (i.e., `cache.seq_len() == tokens.len()`).
-    /// Debug-asserts the invariant; in release builds we still insert
-    /// because the cache is advisory — a mismatched length just means a
-    /// future match would restore an inconsistent state, which the next
-    /// insert overwrites anyway.
+    /// Mismatched lengths are skipped because restoring a prefix with a
+    /// different RoPE/cache offset would corrupt the next suffix prefill.
     ///
     /// If an entry with the identical token sequence already exists,
     /// it is replaced (refreshed in LRU).
@@ -159,17 +159,12 @@ impl ServePrefixCache {
             return;
         }
 
-        // TurboQuant mode stores its history in a compressed format that
-        // `KVCacheSnapshot::from_cache` cannot capture (it only walks the
-        // dense per-layer K/V buffers, which TurboQuant leaves empty). Even
-        // with a hypothetical full-decode path the snapshot would re-inflate
-        // the entire history to fp16 — at 100K context that's ~37 GB
-        // negating the compression savings. Skip the save quietly here.
-        if cache.turboquant_compression_active() {
+        if cache.seq_len() != tokens.len() {
             tracing::debug!(
                 target = "pmetal_serve::prefix_cache",
-                "skipping prompt-cache save: TurboQuant has active compressed layers; \
-                 saving would re-decode history to fp16"
+                cache_len = cache.seq_len(),
+                token_len = tokens.len(),
+                "skipping prompt-cache save: cache length does not match token prefix"
             );
             return;
         }
@@ -185,12 +180,12 @@ impl ServePrefixCache {
             self.entries.swap_remove(pos);
         }
 
-        let snapshot = KVCacheSnapshot::from_cache(cache);
-        let bytes = snapshot.memory_usage();
+        let cached = cache.fork();
+        let bytes = cached.memory_usage();
         let now = self.tick();
         let entry = Entry {
             tokens: tokens.to_vec(),
-            snapshot,
+            cache: cached,
             last_used: now,
             bytes,
         };
@@ -285,15 +280,21 @@ where
 mod tests {
     use super::*;
 
-    fn make_cache() -> (KVCache, KVCacheConfig) {
+    fn make_cache_with_len(seq_len: usize) -> (KVCache, KVCacheConfig) {
         use pmetal_bridge::compat::Array;
         let cfg = KVCacheConfig::new(2, 128, 4, 64);
         let mut cache = KVCache::new(cfg.clone());
-        let k = Array::zeros_f32(&[1, 4, 8, 64]);
-        let v = Array::zeros_f32(&[1, 4, 8, 64]);
-        cache.update_and_fetch(0, &k, &v).unwrap();
-        cache.update_and_fetch(1, &k, &v).unwrap();
+        if seq_len > 0 {
+            let k = Array::zeros_f32(&[1, 4, seq_len as i32, 64]);
+            let v = Array::zeros_f32(&[1, 4, seq_len as i32, 64]);
+            cache.update_and_fetch(0, &k, &v).unwrap();
+            cache.update_and_fetch(1, &k, &v).unwrap();
+        }
         (cache, cfg)
+    }
+
+    fn make_cache() -> (KVCache, KVCacheConfig) {
+        make_cache_with_len(8)
     }
 
     #[test]
@@ -327,7 +328,7 @@ mod tests {
         // cannot be used — decode needs at least one suffix token to
         // produce first-sample logits.
         let mut pc = ServePrefixCache::new(8, 0);
-        let (cache, cfg) = make_cache();
+        let (cache, cfg) = make_cache_with_len(3);
         pc.insert(&[1, 2, 3], &cache);
 
         let hit = pc.find_longest_prefix(&[1, 2, 3], cfg).unwrap();
@@ -337,10 +338,10 @@ mod tests {
     #[test]
     fn longest_strict_prefix_is_picked() {
         let mut pc = ServePrefixCache::new(8, 0);
-        let (cache, cfg) = make_cache();
-        pc.insert(&[1, 2], &cache);
-        pc.insert(&[1, 2, 3, 4], &cache);
-        pc.insert(&[1, 2, 3], &cache);
+        let cfg = KVCacheConfig::new(2, 128, 4, 64);
+        pc.insert(&[1, 2], &make_cache_with_len(2).0);
+        pc.insert(&[1, 2, 3, 4], &make_cache_with_len(4).0);
+        pc.insert(&[1, 2, 3], &make_cache_with_len(3).0);
 
         let hit = pc
             .find_longest_prefix(&[1, 2, 3, 4, 5, 6], cfg)
@@ -352,7 +353,7 @@ mod tests {
     #[test]
     fn non_prefix_misses() {
         let mut pc = ServePrefixCache::new(8, 0);
-        let (cache, cfg) = make_cache();
+        let (cache, cfg) = make_cache_with_len(3);
         pc.insert(&[1, 2, 3], &cache);
         // Shares no leading tokens.
         let hit = pc.find_longest_prefix(&[9, 8, 7, 6], cfg).unwrap();
@@ -362,7 +363,7 @@ mod tests {
     #[test]
     fn lru_eviction_drops_oldest() {
         let mut pc = ServePrefixCache::new(2, 0);
-        let (cache, cfg) = make_cache();
+        let (cache, cfg) = make_cache_with_len(1);
         pc.insert(&[1], &cache);
         pc.insert(&[2], &cache);
         pc.insert(&[3], &cache);
@@ -378,7 +379,7 @@ mod tests {
     #[test]
     fn reinsert_refreshes_lru() {
         let mut pc = ServePrefixCache::new(2, 0);
-        let (cache, cfg) = make_cache();
+        let (cache, cfg) = make_cache_with_len(1);
         pc.insert(&[1], &cache);
         pc.insert(&[2], &cache);
         // Touch [1] by re-inserting — now [2] is the oldest.
@@ -394,7 +395,7 @@ mod tests {
     #[test]
     fn hit_rate_tracks_lookups() {
         let mut pc = ServePrefixCache::new(8, 0);
-        let (cache, cfg) = make_cache();
+        let (cache, cfg) = make_cache_with_len(3);
         pc.insert(&[1, 2, 3], &cache);
 
         let _ = pc.find_longest_prefix(&[1, 2, 3, 4], cfg.clone()); // hit
@@ -415,11 +416,44 @@ mod tests {
     }
 
     #[test]
-    fn turboquant_active_caches_are_skipped_on_save() {
-        // Once any TurboQuant layer has compressed history, the prefix cache
-        // must NOT save a snapshot. KVCacheSnapshot would either capture an
-        // empty (zero-layer) snapshot or — with a hypothetical full-decode
-        // path — re-inflate ~37 GB of compressed state at 100K context.
+    fn mismatched_cache_length_is_skipped() {
+        let mut pc = ServePrefixCache::new(8, 0);
+        let (cache, _) = make_cache_with_len(8);
+        pc.insert(&[1, 2, 3], &cache);
+        assert!(pc.is_empty());
+    }
+
+    #[test]
+    fn restored_fork_can_diverge_without_mutating_cached_prefix() {
+        use pmetal_bridge::compat::Array;
+
+        let mut pc = ServePrefixCache::new(8, 0);
+        let (cache, cfg) = make_cache_with_len(2);
+        pc.insert(&[1, 2], &cache);
+
+        let mut hit = pc
+            .find_longest_prefix(&[1, 2, 3], cfg.clone())
+            .unwrap()
+            .expect("expected prefix hit");
+        let k = Array::zeros_f32(&[1, 4, 1, 64]);
+        let v = Array::zeros_f32(&[1, 4, 1, 64]);
+        hit.restored_cache.update_and_fetch(0, &k, &v).unwrap();
+        hit.restored_cache.update_and_fetch(1, &k, &v).unwrap();
+        assert_eq!(hit.restored_cache.seq_len(), 3);
+
+        let hit_again = pc
+            .find_longest_prefix(&[1, 2, 4], cfg)
+            .unwrap()
+            .expect("stored prefix should still be reusable");
+        assert_eq!(hit_again.prefix_len, 2);
+        assert_eq!(hit_again.restored_cache.seq_len(), 2);
+    }
+
+    #[test]
+    fn turboquant_active_caches_are_forked_on_save() {
+        // TurboQuant state lives in compressed per-layer stores. Serving
+        // prefix cache must preserve that state with KVCache::fork() instead
+        // of falling back to a dense snapshot.
         use pmetal_bridge::compat::Array;
         use pmetal_mlx::kv_cache::{CacheMode, TurboQuantConfig};
 
@@ -433,14 +467,18 @@ mod tests {
         let k = Array::zeros_f32(&[1, 4, 8, 64]);
         let v = Array::zeros_f32(&[1, 4, 8, 64]);
         cache.update_and_fetch(0, &k, &v).unwrap();
+        cache.update_and_fetch(1, &k, &v).unwrap();
         assert!(cache.turboquant_compression_active());
 
         let mut pc = ServePrefixCache::new(8, 0);
         pc.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &cache);
-        assert_eq!(
-            pc.len(),
-            0,
-            "prefix cache should refuse to snapshot a TurboQuant-active cache"
-        );
+        assert_eq!(pc.len(), 1);
+
+        let hit = pc
+            .find_longest_prefix(&[1, 2, 3, 4, 5, 6, 7, 8, 9], cfg)
+            .unwrap()
+            .expect("expected TurboQuant prefix hit");
+        assert_eq!(hit.prefix_len, 8);
+        assert!(hit.restored_cache.turboquant_compression_active());
     }
 }

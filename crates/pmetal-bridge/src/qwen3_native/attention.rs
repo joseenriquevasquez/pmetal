@@ -281,7 +281,8 @@ pub(super) fn attn_forward_with_tree_ctx(
     let output = if let Some(ref mut tq_cache) = cache.turboquant {
         let out = crate::turboquant_dispatch::turboquant_attention_step(
             tq_cache, &queries, &keys, &values, scale, prev, "QWEN",
-        );
+        )
+        .expect("Qwen TurboQuant attention step failed");
         cache.offset = next;
         out
     } else if let Some(qcfg) = cache.quant_config {
@@ -322,95 +323,50 @@ pub(super) fn attn_forward_with_tree_ctx(
 
             // ---- Cache management: allocate or grow 4 quantized buffers ----
             let uint32_dt = crate::compat::Dtype::Uint32.as_i32();
-            if cache.quantized_keys_hi.is_none() {
-                let alloc = ((next + 255) / 256) * 256;
-                cache.quantized_keys_hi = Some(QuantizedTuple {
-                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim_hi], uint32_dt),
-                    scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_hi], dtype),
-                    biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_hi], dtype),
-                });
-                cache.quantized_keys = Some(QuantizedTuple {
-                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim_lo], uint32_dt),
-                    scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_lo], dtype),
-                    biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_lo], dtype),
-                });
-                cache.quantized_values_hi = Some(QuantizedTuple {
-                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim_hi], uint32_dt),
-                    scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_hi], dtype),
-                    biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_hi], dtype),
-                });
-                cache.quantized_values = Some(QuantizedTuple {
-                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim_lo], uint32_dt),
-                    scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_lo], dtype),
-                    biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim_lo], dtype),
-                });
-            } else {
-                let allocated = cache.quantized_keys_hi.as_ref().unwrap().packed.dim(2);
-                if next > allocated {
-                    let grow_to = ((next + 255) / 256) * 256;
-                    let extend = grow_to - allocated;
-                    let qkh = cache.quantized_keys_hi.take().unwrap();
-                    let qkl = cache.quantized_keys.take().unwrap();
-                    let qvh = cache.quantized_values_hi.take().unwrap();
-                    let qvl = cache.quantized_values.take().unwrap();
-                    cache.quantized_keys_hi = Some(QuantizedTuple {
-                        packed: qkh.packed.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_hi], uint32_dt),
-                            2,
-                        ),
-                        scales: qkh.scales.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype),
-                            2,
-                        ),
-                        biases: qkh.biases.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype),
-                            2,
-                        ),
-                    });
-                    cache.quantized_keys = Some(QuantizedTuple {
-                        packed: qkl.packed.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_lo], uint32_dt),
-                            2,
-                        ),
-                        scales: qkl.scales.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype),
-                            2,
-                        ),
-                        biases: qkl.biases.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype),
-                            2,
-                        ),
-                    });
-                    cache.quantized_values_hi = Some(QuantizedTuple {
-                        packed: qvh.packed.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_hi], uint32_dt),
-                            2,
-                        ),
-                        scales: qvh.scales.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype),
-                            2,
-                        ),
-                        biases: qvh.biases.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_hi], dtype),
-                            2,
-                        ),
-                    });
-                    cache.quantized_values = Some(QuantizedTuple {
-                        packed: qvl.packed.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim_lo], uint32_dt),
-                            2,
-                        ),
-                        scales: qvl.scales.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype),
-                            2,
-                        ),
-                        biases: qvl.biases.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim_lo], dtype),
-                            2,
-                        ),
-                    });
-                }
-            }
+            QuantizedTuple::ensure_capacity(
+                &mut cache.quantized_keys_hi,
+                crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+                b,
+                n_kv_heads,
+                next,
+                packed_dim_hi,
+                scales_dim_hi,
+                uint32_dt,
+                dtype,
+            );
+            QuantizedTuple::ensure_capacity(
+                &mut cache.quantized_keys,
+                crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+                b,
+                n_kv_heads,
+                next,
+                packed_dim_lo,
+                scales_dim_lo,
+                uint32_dt,
+                dtype,
+            );
+            QuantizedTuple::ensure_capacity(
+                &mut cache.quantized_values_hi,
+                crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+                b,
+                n_kv_heads,
+                next,
+                packed_dim_hi,
+                scales_dim_hi,
+                uint32_dt,
+                dtype,
+            );
+            QuantizedTuple::ensure_capacity(
+                &mut cache.quantized_values,
+                crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+                b,
+                n_kv_heads,
+                next,
+                packed_dim_lo,
+                scales_dim_lo,
+                uint32_dt,
+                dtype,
+            );
 
             // slice_set new tokens into all four cache buffers
             let start_q = [0, 0, prev, 0];
@@ -601,74 +557,45 @@ pub(super) fn attn_forward_with_tree_ctx(
             // Cache management: allocate or grow quantized + QJL buffers
             let uint32_dt = crate::compat::Dtype::Uint32.as_i32();
             let f32_dt = crate::compat::Dtype::Float32.as_i32();
-            if cache.quantized_keys.is_none() {
-                let alloc = ((next + 255) / 256) * 256;
-                cache.quantized_keys = Some(QuantizedTuple {
-                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim], uint32_dt),
-                    scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-                    biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-                });
-                cache.quantized_values = Some(QuantizedTuple {
-                    packed: InlineArray::zeros(&[b, n_kv_heads, alloc, packed_dim], uint32_dt),
-                    scales: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-                    biases: InlineArray::zeros(&[b, n_kv_heads, alloc, scales_dim], dtype),
-                });
-                if qjl_active {
-                    cache.qjl_signs =
-                        Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
-                    cache.qjl_residual_norms =
-                        Some(InlineArray::zeros(&[b, n_kv_heads, alloc, 1], f32_dt));
-                }
-            } else {
-                let allocated = cache.quantized_keys.as_ref().unwrap().packed.dim(2);
-                if next > allocated {
-                    let grow_to = ((next + 255) / 256) * 256;
-                    let extend = grow_to - allocated;
-                    let qk = cache.quantized_keys.take().unwrap();
-                    let qv = cache.quantized_values.take().unwrap();
-                    cache.quantized_keys = Some(QuantizedTuple {
-                        packed: qk.packed.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt),
-                            2,
-                        ),
-                        scales: qk.scales.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
-                            2,
-                        ),
-                        biases: qk.biases.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
-                            2,
-                        ),
-                    });
-                    cache.quantized_values = Some(QuantizedTuple {
-                        packed: qv.packed.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, packed_dim], uint32_dt),
-                            2,
-                        ),
-                        scales: qv.scales.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
-                            2,
-                        ),
-                        biases: qv.biases.kv_cache_append(
-                            &InlineArray::zeros(&[b, n_kv_heads, extend, scales_dim], dtype),
-                            2,
-                        ),
-                    });
-                    if qjl_active {
-                        if let Some(qs) = cache.qjl_signs.take() {
-                            cache.qjl_signs = Some(qs.kv_cache_append(
-                                &InlineArray::zeros(&[b, n_kv_heads, extend, head_dim], dtype),
-                                2,
-                            ));
-                        }
-                        if let Some(qn) = cache.qjl_residual_norms.take() {
-                            cache.qjl_residual_norms = Some(qn.kv_cache_append(
-                                &InlineArray::zeros(&[b, n_kv_heads, extend, 1], f32_dt),
-                                2,
-                            ));
-                        }
-                    }
-                }
+            QuantizedTuple::ensure_capacity(
+                &mut cache.quantized_keys,
+                crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+                b,
+                n_kv_heads,
+                next,
+                packed_dim,
+                scales_dim,
+                uint32_dt,
+                dtype,
+            );
+            QuantizedTuple::ensure_capacity(
+                &mut cache.quantized_values,
+                crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+                b,
+                n_kv_heads,
+                next,
+                packed_dim,
+                scales_dim,
+                uint32_dt,
+                dtype,
+            );
+            if qjl_active {
+                crate::native_common::kv_cache::alloc_or_grow_buffer(
+                    crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+                    &mut cache.qjl_signs,
+                    next,
+                    2,
+                    dtype,
+                    |cap| [b, n_kv_heads, cap, head_dim],
+                );
+                crate::native_common::kv_cache::alloc_or_grow_buffer(
+                    crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+                    &mut cache.qjl_residual_norms,
+                    next,
+                    2,
+                    f32_dt,
+                    |cap| [b, n_kv_heads, cap, 1],
+                );
             }
 
             // slice_set quantized data into cache
