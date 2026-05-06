@@ -226,7 +226,15 @@ impl EmbeddingTrainer {
         O: Optimizer,
     {
         match dataset {
-            EmbeddingDataset::Pairs(pairs) => self.run_pairs(model, tokenizer, pairs, optimizer),
+            EmbeddingDataset::Pairs(pairs) => {
+                if self.config.loss_type == EmbeddingLossType::Triplet {
+                    return Err(EmbeddingTrainerError::Config(
+                        "triplet loss requires triplet data with anchor/positive/negative fields"
+                            .into(),
+                    ));
+                }
+                self.run_pairs(model, tokenizer, pairs, optimizer)
+            }
             EmbeddingDataset::Triplets(triplets) => {
                 self.run_triplets(model, tokenizer, triplets, optimizer)
             }
@@ -247,6 +255,11 @@ impl EmbeddingTrainer {
     {
         if pairs.is_empty() {
             return Ok(());
+        }
+        if self.config.loss_type == EmbeddingLossType::Triplet {
+            return Err(EmbeddingTrainerError::Config(
+                "triplet loss requires triplet data with anchor/positive/negative fields".into(),
+            ));
         }
 
         let batch_size = self.config.training.batch_size;

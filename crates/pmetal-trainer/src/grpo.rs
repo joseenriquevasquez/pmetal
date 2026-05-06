@@ -203,6 +203,18 @@ pub struct GrpoConfig {
     ///
     /// `None` (default) uses the standard fp16 cache.
     pub kv_cache_bits: Option<u8>,
+    /// Optional rollout RNG seed for reproducible generation.
+    pub seed: Option<u64>,
+    /// Enable DAPO dynamic sampling when `loss_type` is DAPO.
+    pub dapo_dynamic_sampling: bool,
+    /// Accuracy threshold margin for DAPO dynamic sampling.
+    pub dapo_dynamic_sampling_min_accuracy: f64,
+    /// Reward threshold above which a completion is counted as correct.
+    pub dapo_accuracy_reward_threshold: f64,
+    /// Reward penalty applied to completions that stop because they hit max length.
+    pub dapo_overlong_penalty: f64,
+    /// Minimum completions required after DAPO filtering.
+    pub dapo_min_group_size: usize,
 }
 
 impl Default for GrpoConfig {
@@ -230,6 +242,12 @@ impl Default for GrpoConfig {
             use_speculative: false,
             speculative_draft_tokens: 3,
             kv_cache_bits: None,
+            seed: None,
+            dapo_dynamic_sampling: false,
+            dapo_dynamic_sampling_min_accuracy: 0.01,
+            dapo_accuracy_reward_threshold: 0.0,
+            dapo_overlong_penalty: -1.0,
+            dapo_min_group_size: 2,
         }
     }
 }
@@ -250,6 +268,12 @@ impl GrpoConfig {
     pub fn for_dapo(mut self) -> Self {
         self.loss_type = GrpoLossType::Dapo;
         self.beta = 0.0; // DAPO usually doesn't use standard KL
+        self.epsilon_low = 0.0;
+        self.epsilon_high = 0.28;
+        self.num_generations = self.num_generations.max(16);
+        self.dapo_dynamic_sampling = true;
+        self.dapo_overlong_penalty = -1.0;
+        self.dapo_min_group_size = 2;
         self
     }
 }
@@ -365,6 +389,9 @@ pub struct GrpoTrainer {
     /// LoRA parameters are typically a few MB so this is cheap to hold in memory.
     /// Populated whenever `should_snapshot_best()` returns true; consumed on rollback.
     best_lora_snapshot: Option<std::collections::HashMap<std::rc::Rc<str>, Array>>,
+    checkpoint_manager: Option<crate::CheckpointManager>,
+    best_checkpoint_loss: f64,
+    last_loss: Option<f64>,
 }
 
 impl GrpoTrainer {
@@ -377,12 +404,23 @@ impl GrpoTrainer {
             adaptive_lr_override: None,
             callbacks: Vec::new(),
             best_lora_snapshot: None,
+            checkpoint_manager: None,
+            best_checkpoint_loss: f64::MAX,
+            last_loss: None,
         })
     }
 
     /// Add a training callback for metrics logging or dashboard integration.
     pub fn add_callback(&mut self, callback: Box<dyn pmetal_core::TrainingCallback>) {
         self.callbacks.push(callback);
+    }
+
+    pub fn set_checkpoint_manager(&mut self, manager: crate::CheckpointManager) {
+        self.checkpoint_manager = Some(manager);
+    }
+
+    pub fn set_step(&mut self, step: usize) {
+        self.step = step;
     }
 
     /// Enable adaptive LR with control file for TUI communication.
@@ -439,6 +477,36 @@ impl GrpoTrainer {
             tracing::warn!("GRPO rollback requested but no best snapshot available");
             false
         }
+    }
+
+    fn maybe_save_checkpoint<M: TrainableModel>(
+        &mut self,
+        model: &M,
+        loss: f64,
+        force: bool,
+    ) -> GrpoResult<()> {
+        self.last_loss = Some(loss);
+        let every = self.training_config.save_steps.unwrap_or(0);
+        if !force && (every == 0 || self.step % every != 0) {
+            return Ok(());
+        }
+
+        let Some(manager) = self.checkpoint_manager.as_ref() else {
+            return Ok(());
+        };
+
+        let is_best = loss < self.best_checkpoint_loss;
+        if is_best {
+            self.best_checkpoint_loss = loss;
+        }
+
+        let params = model.lora_parameters();
+        let metadata =
+            crate::CheckpointMetadata::new(self.step, 0, loss, self.get_learning_rate() as f64);
+        manager
+            .save_checkpoint(&params, &metadata, is_best)
+            .map_err(|e| GrpoError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(())
     }
 
     /// Feed loss to the adaptive LR controller and update the override.
@@ -550,6 +618,49 @@ impl GrpoTrainer {
         }
 
         Ok(advantages)
+    }
+
+    fn prepare_group_for_loss(&self, group: &mut CompletionGroup) -> bool {
+        if self.config.loss_type != GrpoLossType::Dapo {
+            return true;
+        }
+
+        for (reward, stopped_by_length) in
+            group.rewards.iter_mut().zip(group.stopped_by_length.iter())
+        {
+            if *stopped_by_length {
+                *reward += self.config.dapo_overlong_penalty;
+            }
+        }
+
+        if group.rewards.len() < self.config.dapo_min_group_size {
+            tracing::debug!(
+                "DAPO: skipping group with {} completions (< {})",
+                group.rewards.len(),
+                self.config.dapo_min_group_size
+            );
+            return false;
+        }
+
+        if self.config.dapo_dynamic_sampling {
+            let correct = group
+                .rewards
+                .iter()
+                .filter(|&&reward| reward > self.config.dapo_accuracy_reward_threshold)
+                .count();
+            let accuracy = correct as f64 / group.rewards.len() as f64;
+            let min_acc = self.config.dapo_dynamic_sampling_min_accuracy;
+            let max_acc = 1.0 - min_acc;
+            if accuracy <= min_acc || accuracy >= max_acc {
+                tracing::debug!(
+                    "DAPO: dynamic sampling skipped group with accuracy={:.3}",
+                    accuracy
+                );
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Compute GRPO loss components at the per-token level.
@@ -946,7 +1057,7 @@ impl GrpoTrainer {
             top_p: self.config.top_p as f32,
             top_k: self.config.top_k,
             stop_tokens: vec![tokenizer.eos_token_id().unwrap_or(2)],
-            seed: None,
+            seed: self.config.seed,
             use_prefix_cache: true,
             min_p: 0.05,
             use_speculative,
@@ -1142,6 +1253,9 @@ impl GrpoTrainer {
                 }
                 // Attach pixel values so train_step can use forward_with_images.
                 group.pixel_values = sample_images;
+                if !self.prepare_group_for_loss(&mut group) {
+                    continue;
+                }
 
                 // Apply adaptive LR override to optimizer before step
                 let current_lr = self.get_learning_rate();
@@ -1180,8 +1294,11 @@ impl GrpoTrainer {
                     tracing::info!(
                         "Early stopping GRPO training — adaptive LR exhausted rollbacks."
                     );
+                    self.maybe_save_checkpoint(policy_model, stats.loss as f64, true)?;
                     return Ok(());
                 }
+
+                self.maybe_save_checkpoint(policy_model, stats.loss as f64, false)?;
 
                 let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1228,6 +1345,7 @@ impl GrpoTrainer {
             cb.on_train_end();
         }
 
+        self.maybe_save_checkpoint(policy_model, self.last_loss.unwrap_or(0.0), true)?;
         Ok(())
     }
 
@@ -1392,6 +1510,9 @@ impl GrpoTrainer {
                         group.add_completion(new_ids.clone(), *reward, *sbl);
                     }
                     group.pixel_values = prev_ctx.pixel_values;
+                    if !self.prepare_group_for_loss(&mut group) {
+                        continue;
+                    }
 
                     let current_lr = self.get_learning_rate();
                     set_optimizer_lr(optimizer, current_lr);
@@ -1433,11 +1554,14 @@ impl GrpoTrainer {
                         tracing::info!(
                             "Early stopping GRPO training — adaptive LR exhausted rollbacks."
                         );
+                        self.maybe_save_checkpoint(policy_model, stats.loss as f64, true)?;
                         for cb in &mut self.callbacks {
                             cb.on_train_end();
                         }
                         return Ok(());
                     }
+
+                    self.maybe_save_checkpoint(policy_model, stats.loss as f64, false)?;
 
                     let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1498,6 +1622,12 @@ impl GrpoTrainer {
                     group.add_completion(new_ids.clone(), *reward, *sbl);
                 }
                 group.pixel_values = last_ctx.pixel_values;
+                if !self.prepare_group_for_loss(&mut group) {
+                    for cb in &mut self.callbacks {
+                        cb.on_train_end();
+                    }
+                    return Ok(());
+                }
 
                 let current_lr = self.get_learning_rate();
                 set_optimizer_lr(optimizer, current_lr);
@@ -1534,11 +1664,14 @@ impl GrpoTrainer {
                     tracing::info!(
                         "Early stopping GRPO training at flush step — adaptive LR exhausted rollbacks."
                     );
+                    self.maybe_save_checkpoint(policy_model, stats.loss as f64, true)?;
                     for cb in &mut self.callbacks {
                         cb.on_train_end();
                     }
                     return Ok(());
                 }
+
+                self.maybe_save_checkpoint(policy_model, stats.loss as f64, false)?;
 
                 // Fire step callbacks for the flush step.
                 if !self.callbacks.is_empty() {
@@ -1574,6 +1707,7 @@ impl GrpoTrainer {
             cb.on_train_end();
         }
 
+        self.maybe_save_checkpoint(policy_model, self.last_loss.unwrap_or(0.0), true)?;
         Ok(())
     }
 }
@@ -1900,6 +2034,9 @@ mod tests {
             adaptive_lr_override: None,
             callbacks: Vec::new(),
             best_lora_snapshot: None,
+            checkpoint_manager: None,
+            best_checkpoint_loss: f64::MAX,
+            last_loss: None,
         }
     }
 

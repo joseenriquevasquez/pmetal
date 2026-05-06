@@ -2128,6 +2128,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 teacher,
                 student,
                 dataset,
+                eval_dataset,
                 output,
                 method,
                 offline,
@@ -2147,6 +2148,8 @@ async fn tokio_main() -> anyhow::Result<()> {
                 epochs,
                 max_seq_len,
                 seed,
+                checkpoint_every,
+                resume,
                 text_column,
                 text_columns,
                 column_separator,
@@ -2158,6 +2161,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 &teacher,
                 &student,
                 &dataset,
+                eval_dataset,
                 &output,
                 &method,
                 &loss_type,
@@ -2172,6 +2176,8 @@ async fn tokio_main() -> anyhow::Result<()> {
                 epochs,
                 max_seq_len,
                 seed,
+                checkpoint_every,
+                resume,
                 log_metrics,
                 true,
                 Vec::new(),
@@ -2206,6 +2212,8 @@ async fn tokio_main() -> anyhow::Result<()> {
                 max_seq_len,
                 max_completion_length,
                 seed,
+                checkpoint_every,
+                resume,
                 dapo,
                 reasoning_rewards,
                 no_flash_attention,
@@ -2239,6 +2247,8 @@ async fn tokio_main() -> anyhow::Result<()> {
                 max_seq_len,
                 max_completion_length,
                 seed,
+                checkpoint_every,
+                resume,
                 dapo,
                 reasoning_rewards,
                 !no_flash_attention,
@@ -2456,6 +2466,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             let crate::cli::pretrain::PretrainArgs {
                 arch,
                 shards,
+                eval_shards,
                 seq_len,
                 batch_size,
                 steps,
@@ -2542,16 +2553,23 @@ async fn tokio_main() -> anyhow::Result<()> {
                 eval_batches,
             };
 
+            let mut optimizer = pmetal_bridge::compat::optimizers::AdamWBuilder::new(learning_rate)
+                .weight_decay(weight_decay)
+                .betas((0.9, 0.95))
+                .eps(1e-8)
+                .build()?;
+            let mut start_step = 0usize;
+            let mut resume_position = None;
+
             // Resume from checkpoint if requested
             if let Some(ref ckpt_dir) = resume {
-                let mut opt = pmetal_bridge::compat::optimizers::AdamWBuilder::new(learning_rate)
-                    .weight_decay(weight_decay)
-                    .build()?;
                 let meta = pretrain::load_checkpoint(
                     std::path::Path::new(ckpt_dir),
                     &mut model,
-                    &mut opt,
+                    &mut optimizer,
                 )?;
+                start_step = meta.step as usize;
+                resume_position = meta.stream_position;
                 println!("Resumed from step {}, loss {:.4}", meta.step, meta.loss);
             }
 
@@ -2561,24 +2579,59 @@ async fn tokio_main() -> anyhow::Result<()> {
                 seq_len,
                 batch_size,
                 eos_token_id,
-                resume_from: None,
+                resume_from: resume_position,
             };
-            let reader = StreamingShardReader::new(stream_config)?;
+            let mut reader = StreamingShardReader::new(stream_config)?;
+            if resume.is_some() && resume_position.is_none() && start_step > 0 {
+                let batches_to_skip = start_step.saturating_mul(gradient_accumulation_steps.max(1));
+                for _ in 0..batches_to_skip {
+                    reader.next().ok_or_else(|| {
+                        anyhow::anyhow!("stream exhausted while seeking resume step")
+                    })?;
+                }
+            }
 
             // Convert streaming batches to MLX arrays
-            let batch_iter = reader.map(move |(batch, _pos)| {
+            let batch_iter = reader.map(move |(batch, pos)| {
                 let flat: Vec<i32> = batch
                     .iter()
                     .flat_map(|seq| seq.iter().map(|&t| t as i32))
                     .collect();
-                pmetal_bridge::InlineArray::from_i32_slice_shaped(
+                let array = pmetal_bridge::InlineArray::from_i32_slice_shaped(
                     &flat,
                     &[batch.len() as i32, seq_len as i32],
-                )
+                );
+                (array, Some(pos))
             });
 
+            let eval_iter = if !eval_shards.is_empty() && eval_every > 0 {
+                let eval_paths: Vec<std::path::PathBuf> =
+                    eval_shards.iter().map(std::path::PathBuf::from).collect();
+                let eval_reader = StreamingShardReader::new(StreamConfig {
+                    shard_paths: eval_paths,
+                    seq_len,
+                    batch_size,
+                    eos_token_id,
+                    resume_from: None,
+                })?;
+                Some(eval_reader.map(move |(batch, _pos)| {
+                    let flat: Vec<i32> = batch
+                        .iter()
+                        .flat_map(|seq| seq.iter().map(|&t| t as i32))
+                        .collect();
+                    pmetal_bridge::InlineArray::from_i32_slice_shaped(
+                        &flat,
+                        &[batch.len() as i32, seq_len as i32],
+                    )
+                }))
+            } else {
+                None
+            };
+
             // Run
-            let losses = pretrain::run_pretrain(&mut model, &config, batch_iter)?;
+            let losses = pretrain::run_pretrain_with_state(
+                &mut model, &config, batch_iter, optimizer, start_step, eval_iter,
+            )?;
 
             // Print summary
             if !losses.is_empty() {

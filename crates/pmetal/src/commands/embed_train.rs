@@ -151,6 +151,11 @@ pub(crate) async fn run_embed_train(
 
     match dataset {
         EmbeddingDataset::Pairs(ref pairs) => {
+            if loss_type_copy == EmbeddingLossType::Triplet {
+                anyhow::bail!(
+                    "triplet loss requires triplet data with anchor/positive/negative fields"
+                );
+            }
             let mut indices: Vec<usize> = (0..pairs.len()).collect();
             for epoch in 0..n_epochs {
                 use rand::SeedableRng;

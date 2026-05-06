@@ -13,6 +13,10 @@ pub struct PretrainArgs {
     #[arg(short, long = "shards", value_delimiter = ',')]
     pub shards: Vec<String>,
 
+    /// Optional held-out tokenized shard files for evaluation.
+    #[arg(long = "eval-shards", value_delimiter = ',')]
+    pub eval_shards: Vec<String>,
+
     /// Target sequence length for packed training batches
     #[arg(long = "seq-len", default_value = "2048")]
     pub seq_len: usize,

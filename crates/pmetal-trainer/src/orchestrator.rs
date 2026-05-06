@@ -26,6 +26,19 @@ use crate::{
     AdaptiveLrConfig, CheckpointManager, MetricsJsonCallback, TrainingLoop, TrainingLoopConfig,
 };
 
+#[cfg(feature = "distributed")]
+type DistributedSyncOption = Option<crate::distributed_bridge::DistributedGradientSync>;
+#[cfg(not(feature = "distributed"))]
+type DistributedSyncOption = ();
+
+#[cfg(feature = "distributed")]
+fn take_distributed_sync(sync: &mut DistributedSyncOption) -> DistributedSyncOption {
+    sync.take()
+}
+
+#[cfg(not(feature = "distributed"))]
+fn take_distributed_sync(_: &mut DistributedSyncOption) -> DistributedSyncOption {}
+
 // ---------------------------------------------------------------------------
 // Configuration types
 // ---------------------------------------------------------------------------
@@ -161,6 +174,127 @@ impl Default for TrainingJobConfig {
     }
 }
 
+fn cli_training_defaults() -> TrainingConfig {
+    TrainingConfig {
+        num_epochs: 1,
+        max_seq_len: 0,
+        warmup_steps: 0,
+        ..TrainingConfig::default()
+    }
+}
+
+fn merge_lora_overrides(target: &mut LoraConfig, overrides: &LoraConfig) {
+    let defaults = LoraConfig::default();
+    if overrides.r != defaults.r {
+        target.r = overrides.r;
+    }
+    if overrides.alpha != defaults.alpha {
+        target.alpha = overrides.alpha;
+    }
+    if overrides.dropout != defaults.dropout {
+        target.dropout = overrides.dropout;
+    }
+    if overrides.target_modules != defaults.target_modules {
+        target.target_modules = overrides.target_modules.clone();
+    }
+    if overrides.use_rslora != defaults.use_rslora {
+        target.use_rslora = overrides.use_rslora;
+    }
+    if overrides.use_dora != defaults.use_dora {
+        target.use_dora = overrides.use_dora;
+    }
+    if overrides.bias != defaults.bias {
+        target.bias = overrides.bias;
+    }
+    if overrides.init_lora_weights != defaults.init_lora_weights {
+        target.init_lora_weights = overrides.init_lora_weights;
+    }
+    if overrides.loraplus_lr_ratio != defaults.loraplus_lr_ratio {
+        target.loraplus_lr_ratio = overrides.loraplus_lr_ratio;
+    }
+}
+
+fn merge_training_overrides(target: &mut TrainingConfig, overrides: &TrainingConfig) {
+    let defaults = cli_training_defaults();
+    if overrides.learning_rate != defaults.learning_rate {
+        target.learning_rate = overrides.learning_rate;
+    }
+    if overrides.embedding_learning_rate != defaults.embedding_learning_rate {
+        target.embedding_learning_rate = overrides.embedding_learning_rate;
+    }
+    if overrides.batch_size != defaults.batch_size {
+        target.batch_size = overrides.batch_size;
+    }
+    if overrides.gradient_accumulation_steps != defaults.gradient_accumulation_steps {
+        target.gradient_accumulation_steps = overrides.gradient_accumulation_steps;
+    }
+    if overrides.num_epochs != defaults.num_epochs {
+        target.num_epochs = overrides.num_epochs;
+    }
+    if overrides.max_steps != defaults.max_steps {
+        target.max_steps = overrides.max_steps;
+    }
+    if overrides.warmup_steps != defaults.warmup_steps {
+        target.warmup_steps = overrides.warmup_steps;
+    }
+    if overrides.warmup_ratio != defaults.warmup_ratio {
+        target.warmup_ratio = overrides.warmup_ratio;
+    }
+    if overrides.weight_decay != defaults.weight_decay {
+        target.weight_decay = overrides.weight_decay;
+    }
+    if overrides.max_grad_norm != defaults.max_grad_norm {
+        target.max_grad_norm = overrides.max_grad_norm;
+    }
+    if overrides.lr_scheduler != defaults.lr_scheduler {
+        target.lr_scheduler = overrides.lr_scheduler;
+    }
+    if overrides.min_lr != defaults.min_lr {
+        target.min_lr = overrides.min_lr;
+    }
+    if overrides.wsd_stable_ratio != defaults.wsd_stable_ratio {
+        target.wsd_stable_ratio = overrides.wsd_stable_ratio;
+    }
+    if overrides.cosine_num_restarts != defaults.cosine_num_restarts {
+        target.cosine_num_restarts = overrides.cosine_num_restarts;
+    }
+    if overrides.polynomial_power != defaults.polynomial_power {
+        target.polynomial_power = overrides.polynomial_power;
+    }
+    if overrides.optimizer != defaults.optimizer {
+        target.optimizer = overrides.optimizer;
+    }
+    if overrides.logging_steps != defaults.logging_steps {
+        target.logging_steps = overrides.logging_steps;
+    }
+    if overrides.eval_steps != defaults.eval_steps {
+        target.eval_steps = overrides.eval_steps;
+    }
+    if overrides.save_steps != defaults.save_steps {
+        target.save_steps = overrides.save_steps;
+    }
+    if overrides.output_dir != defaults.output_dir {
+        target.output_dir = overrides.output_dir.clone();
+    }
+    if overrides.use_packing != defaults.use_packing {
+        target.use_packing = overrides.use_packing;
+    }
+    if overrides.max_seq_len != defaults.max_seq_len {
+        target.max_seq_len = overrides.max_seq_len;
+    }
+}
+
+fn merge_job_overrides_into_full_config(full: &mut FullTrainingConfig, job: &TrainingJobConfig) {
+    if !job.model_id.is_empty() {
+        full.model.model_id = job.model_id.clone();
+    }
+    if !job.dataset.is_empty() {
+        full.dataset.dataset_id = job.dataset.clone();
+    }
+    merge_lora_overrides(&mut full.lora, &job.lora);
+    merge_training_overrides(&mut full.training, &job.training);
+}
+
 // ---------------------------------------------------------------------------
 // Phase reporting
 // ---------------------------------------------------------------------------
@@ -243,7 +377,7 @@ fn emit_phase(phase_cb: Option<&dyn PhaseCallback>, p: TrainingPhase) {
 }
 
 pub async fn run_training(
-    config: TrainingJobConfig,
+    mut config: TrainingJobConfig,
     phase_cb: Option<&dyn PhaseCallback>,
     callbacks: Vec<Box<dyn TrainingCallback>>,
 ) -> anyhow::Result<TrainingResult> {
@@ -252,26 +386,10 @@ pub async fn run_training(
     // the Metal device's recommendedMaxWorkingSetSize.
     pmetal_mlx::memory::log_memory_stats();
 
-    // Validate required fields
-    if config.model_id.is_empty() {
-        anyhow::bail!("A model is required. Specify --model <model_id> or set model_id in config.");
-    }
-    if config.dataset.is_empty() {
-        anyhow::bail!("A dataset is required. Specify --dataset <path> or set dataset in config.");
-    }
-
-    let use_qlora = config
-        .qlora
-        .as_ref()
-        .is_some_and(|q| !matches!(q.scheme, QuantizationScheme::None));
-
-    // Validate output directory
-    let validated_output = validate_output_path(&config.output_dir, "output directory")?;
-    let output_dir = validated_output.to_string_lossy().to_string();
-
     // -----------------------------------------------------------------------
     // Phase 1: Load or create YAML configuration and merge with job config
     // -----------------------------------------------------------------------
+    let has_config_file = config.config_path.is_some();
     let mut full_config = if let Some(ref path) = config.config_path {
         let content = std::fs::read_to_string(path)?;
         serde_yaml::from_str(&content)?
@@ -279,13 +397,58 @@ pub async fn run_training(
         FullTrainingConfig::default()
     };
 
-    // Override with job config values
-    full_config.model.model_id = config.model_id.clone();
-    full_config.dataset.dataset_id = config.dataset.clone();
-    full_config.lora = config.lora.clone();
-    full_config.training = config.training.clone();
+    if has_config_file {
+        merge_job_overrides_into_full_config(&mut full_config, &config);
+    } else {
+        full_config.model.model_id = config.model_id.clone();
+        full_config.dataset.dataset_id = config.dataset.clone();
+        full_config.lora = config.lora.clone();
+        full_config.training = config.training.clone();
+    }
+
+    // Validate required fields after the YAML file has had a chance to provide them.
+    if full_config.model.model_id.is_empty() {
+        anyhow::bail!("A model is required. Specify --model <model_id> or set model_id in config.");
+    }
+    if full_config.dataset.dataset_id.is_empty() {
+        anyhow::bail!("A dataset is required. Specify --dataset <path> or set dataset in config.");
+    }
+
+    let output_candidate =
+        if has_config_file && config.output_dir == TrainingJobConfig::default().output_dir {
+            full_config.training.output_dir.clone()
+        } else {
+            config.output_dir.clone()
+        };
+    let validated_output = validate_output_path(&output_candidate, "output directory")?;
+    let output_dir = validated_output.to_string_lossy().to_string();
     full_config.training.output_dir = output_dir.clone();
-    full_config.training.seed = config.seed;
+
+    if !has_config_file || config.seed != TrainingJobConfig::default().seed {
+        full_config.training.seed = config.seed;
+    }
+
+    config.model_id = full_config.model.model_id.clone();
+    config.dataset = full_config.dataset.dataset_id.clone();
+    config.output_dir = output_dir.clone();
+    config.lora = full_config.lora.clone();
+    config.training = full_config.training.clone();
+    config.seed = full_config.training.seed;
+
+    if has_config_file {
+        let dispatch_defaults = DispatchConfig::default();
+        if config.dispatch.sequence_packing == dispatch_defaults.sequence_packing {
+            config.dispatch.sequence_packing = full_config.training.use_packing;
+        }
+        if config.dispatch.flash_attention == dispatch_defaults.flash_attention {
+            config.dispatch.flash_attention = full_config.model.use_flash_attention;
+        }
+    }
+
+    let use_qlora = config
+        .qlora
+        .as_ref()
+        .is_some_and(|q| !matches!(q.scheme, QuantizationScheme::None));
 
     // -----------------------------------------------------------------------
     // Phase 2: Resolve model (async — may download from HF)
@@ -515,10 +678,7 @@ pub async fn run_training(
             p
         } else if metrics_path.contains('/') || metrics_path.contains('\\') {
             // Relative path with directories — resolve against output_dir
-            PathBuf::from(&output_dir).join(
-                p.file_name()
-                    .unwrap_or(std::ffi::OsStr::new("metrics.jsonl")),
-            )
+            PathBuf::from(&output_dir).join(p)
         } else {
             PathBuf::from(&output_dir).join(metrics_path)
         }
@@ -569,7 +729,7 @@ pub async fn run_training(
         ..Default::default()
     };
 
-    let training_loop_config = TrainingLoopConfig {
+    let mut training_loop_config = TrainingLoopConfig {
         training: full_config.training.clone(),
         dataloader: dataloader_config.clone(),
         use_metal_flash_attention: config.dispatch.flash_attention,
@@ -598,6 +758,41 @@ pub async fn run_training(
         distributed: config.dispatch.distributed.clone(),
     };
 
+    #[cfg(feature = "distributed")]
+    let mut distributed_sync: DistributedSyncOption = if let Some(ref distributed_config) =
+        config.dispatch.distributed
+    {
+        let ctx = crate::distributed_bridge::create_distributed_context(distributed_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to initialize distributed training: {e}"))?;
+        tracing::info!(
+            "Distributed training initialized: rank={}/{}",
+            ctx.rank(),
+            ctx.world_size()
+        );
+        let sync = crate::distributed_bridge::DistributedGradientSync::new(ctx, distributed_config);
+        if config.dispatch.sequence_packing {
+            tracing::warn!(
+                "Sequence packing is disabled for distributed training; using sharded dataloaders instead"
+            );
+            config.dispatch.sequence_packing = false;
+            training_loop_config.use_sequence_packing = false;
+        }
+        if config.dispatch.jit_compilation {
+            tracing::warn!(
+                "Compiled/fused-owned dispatch is disabled for distributed training; using distributed-aware loops"
+            );
+            config.dispatch.jit_compilation = false;
+            training_loop_config.use_jit_compilation = false;
+        }
+        Some(sync)
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "distributed"))]
+    let mut distributed_sync: DistributedSyncOption = ();
+
     // -----------------------------------------------------------------------
     // Phase 9: Load model + run training
     // -----------------------------------------------------------------------
@@ -623,6 +818,7 @@ pub async fn run_training(
                 &output_dir,
                 phase_cb,
                 has_metrics_cb,
+                take_distributed_sync(&mut distributed_sync),
             )
         } else {
             run_lora_path(
@@ -638,6 +834,7 @@ pub async fn run_training(
                 &output_dir,
                 phase_cb,
                 has_metrics_cb,
+                take_distributed_sync(&mut distributed_sync),
             )
         }
     }));
@@ -747,6 +944,7 @@ fn run_qlora_path(
     output_dir: &str,
     phase_cb: Option<&dyn PhaseCallback>,
     has_metrics_cb: bool,
+    distributed_sync: DistributedSyncOption,
 ) -> anyhow::Result<(f64, usize, usize)> {
     let qlora_cfg = config
         .qlora
@@ -816,15 +1014,11 @@ fn run_qlora_path(
         training_loop_config.gradient_checkpointing = false;
     }
 
-    #[cfg(feature = "distributed")]
-    if config.dispatch.distributed.is_some() {
-        tracing::warn!(
-            "Distributed training is not yet supported through the orchestrator. \
-             Falling back to single-device training."
-        );
-    }
-
     let mut training_loop = TrainingLoop::new(training_loop_config);
+    #[cfg(feature = "distributed")]
+    if let Some(sync) = distributed_sync {
+        training_loop.set_distributed(sync);
+    }
 
     if let Some(cb) = metrics_callback.take() {
         training_loop.add_callback(cb);
@@ -932,6 +1126,7 @@ fn run_lora_path(
     output_dir: &str,
     phase_cb: Option<&dyn PhaseCallback>,
     has_metrics_cb: bool,
+    distributed_sync: DistributedSyncOption,
 ) -> anyhow::Result<(f64, usize, usize)> {
     tracing::info!("Initializing LoRA model with auto-detected architecture...");
 
@@ -980,15 +1175,11 @@ fn run_lora_path(
         training_loop_config.gradient_checkpointing = false;
     }
 
-    #[cfg(feature = "distributed")]
-    if config.dispatch.distributed.is_some() {
-        tracing::warn!(
-            "Distributed training is not yet supported through the orchestrator. \
-             Falling back to single-device training."
-        );
-    }
-
     let mut training_loop = TrainingLoop::new(training_loop_config);
+    #[cfg(feature = "distributed")]
+    if let Some(sync) = distributed_sync {
+        training_loop.set_distributed(sync);
+    }
 
     if let Some(cb) = metrics_callback.take() {
         training_loop.add_callback(cb);
@@ -1826,5 +2017,71 @@ impl Default for FullTrainingConfig {
             training: TrainingConfig::default(),
             dataset: DatasetConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_file_merge_preserves_yaml_training_defaults() {
+        let mut full = FullTrainingConfig::default();
+        full.model.model_id = "yaml/model".to_string();
+        full.dataset.dataset_id = "yaml.jsonl".to_string();
+        full.training.num_epochs = 7;
+        full.training.max_steps = Some(123);
+        full.training.save_steps = Some(11);
+        full.training.eval_steps = Some(13);
+        full.training.min_lr = Some(1e-6);
+        full.training.use_packing = false;
+
+        let job = TrainingJobConfig {
+            model_id: String::new(),
+            dataset: String::new(),
+            training: cli_training_defaults(),
+            ..TrainingJobConfig::default()
+        };
+
+        merge_job_overrides_into_full_config(&mut full, &job);
+
+        assert_eq!(full.model.model_id, "yaml/model");
+        assert_eq!(full.dataset.dataset_id, "yaml.jsonl");
+        assert_eq!(full.training.num_epochs, 7);
+        assert_eq!(full.training.max_steps, Some(123));
+        assert_eq!(full.training.save_steps, Some(11));
+        assert_eq!(full.training.eval_steps, Some(13));
+        assert_eq!(full.training.min_lr, Some(1e-6));
+        assert!(!full.training.use_packing);
+    }
+
+    #[test]
+    fn config_file_merge_applies_explicit_job_overrides() {
+        let mut full = FullTrainingConfig::default();
+        full.model.model_id = "yaml/model".to_string();
+        full.dataset.dataset_id = "yaml.jsonl".to_string();
+        full.training.num_epochs = 7;
+
+        let mut overrides = cli_training_defaults();
+        overrides.num_epochs = 2;
+        overrides.max_steps = Some(5);
+        let job = TrainingJobConfig {
+            model_id: "cli/model".to_string(),
+            dataset: "cli.jsonl".to_string(),
+            lora: LoraConfig {
+                r: 8,
+                ..LoraConfig::default()
+            },
+            training: overrides,
+            ..TrainingJobConfig::default()
+        };
+
+        merge_job_overrides_into_full_config(&mut full, &job);
+
+        assert_eq!(full.model.model_id, "cli/model");
+        assert_eq!(full.dataset.dataset_id, "cli.jsonl");
+        assert_eq!(full.lora.r, 8);
+        assert_eq!(full.training.num_epochs, 2);
+        assert_eq!(full.training.max_steps, Some(5));
     }
 }

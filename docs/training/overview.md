@@ -17,7 +17,7 @@ PMetal supports 12+ training methods across CLI, GUI, TUI, and the Rust/Python S
 | ORPO | — | — | — | `easy::orpo()` |
 | KTO | — | — | — | `easy::kto()` |
 | GRPO (Reasoning) | `grpo` | Yes | Yes | `GrpoTrainer` |
-| DAPO (Decoupled GRPO) | `grpo --dapo` | Yes | Yes | `DapoTrainer` |
+| DAPO (Decoupled GRPO) | `grpo --dapo` | Yes | Yes | `GrpoTrainer` DAPO mode |
 | Knowledge Distillation | `distill` | Yes | Yes | `Distiller` |
 | TAID | — | — | — | `TaidDistiller` |
 | ANE Training | `train` (auto) | — | Yes | `AneTrainingLoop` |

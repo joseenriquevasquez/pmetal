@@ -78,6 +78,7 @@ fn checkpoint_resume_preserves_optimizer_state() {
             step: 11,
             loss: loss_11,
             learning_rate: config.learning_rate,
+            stream_position: None,
         },
     )
     .unwrap();

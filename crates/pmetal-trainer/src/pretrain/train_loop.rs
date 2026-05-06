@@ -12,6 +12,7 @@ use pmetal_bridge::compat::{
     optimizers::{AdamW, AdamWBuilder, Optimizer},
 };
 use pmetal_core::LearningRateScheduler;
+use pmetal_data::streaming::StreamPosition;
 
 fn clip_grad_norm(
     mut grads: FlattenedModuleParam,
@@ -131,24 +132,55 @@ pub fn eval_loss<M: CausalLm, I: Iterator<Item = Array>>(
 pub fn run_pretrain<M, I>(
     model: &mut M,
     config: &PretrainConfig,
-    mut batches: I,
+    batches: I,
 ) -> Result<Vec<f32>, PretrainError>
 where
     M: CausalLm,
     I: Iterator<Item = Array>,
+{
+    let optimizer = build_optimizer(config)?;
+    run_pretrain_with_state(
+        model,
+        config,
+        batches.map(|batch| (batch, None)),
+        optimizer,
+        0,
+        Option::<std::iter::Empty<Array>>::None,
+    )
+}
+
+fn build_optimizer(config: &PretrainConfig) -> Result<AdamW, PretrainError> {
+    AdamWBuilder::new(config.learning_rate)
+        .weight_decay(config.weight_decay)
+        .betas(config.betas)
+        .eps(config.eps)
+        .build()
+        .map_err(|e| PretrainError::Optimizer(e.to_string()))
+}
+
+/// Run pretraining from an explicit optimizer and global step.
+///
+/// `batches` may carry a streaming position for each yielded batch; when present,
+/// that position is written into checkpoints so resume can restart at the exact
+/// corpus boundary.
+pub fn run_pretrain_with_state<M, I, E>(
+    model: &mut M,
+    config: &PretrainConfig,
+    mut batches: I,
+    mut optimizer: AdamW,
+    start_step: usize,
+    mut eval_batches: Option<E>,
+) -> Result<Vec<f32>, PretrainError>
+where
+    M: CausalLm,
+    I: Iterator<Item = (Array, Option<StreamPosition>)>,
+    E: Iterator<Item = Array>,
 {
     if config.apply_init && config.n_layers > 0 {
         apply_depth_scaled_init(model, config.n_layers)
             .map_err(|e| PretrainError::Autograd(e.to_string()))?;
         zero_biases(model);
     }
-
-    let mut optimizer = AdamWBuilder::new(config.learning_rate)
-        .weight_decay(config.weight_decay)
-        .betas(config.betas)
-        .eps(config.eps)
-        .build()
-        .map_err(|e| PretrainError::Optimizer(e.to_string()))?;
 
     let scheduler = LearningRateScheduler::new(
         config.learning_rate as f64,
@@ -159,19 +191,24 @@ where
     .with_min_lr(config.min_lr as f64);
 
     let gas = config.gradient_accumulation_steps.max(1);
-    let mut losses = Vec::with_capacity(config.num_steps);
+    let remaining_steps = config.num_steps.saturating_sub(start_step);
+    let mut losses = Vec::with_capacity(remaining_steps);
     let start = std::time::Instant::now();
+    let mut last_stream_position: Option<StreamPosition> = None;
 
-    for step in 0..config.num_steps {
+    for step in start_step..config.num_steps {
         let lr = scheduler.get_lr(step) as f32;
         optimizer.set_lr(lr);
 
         // Collect micro-batches for gradient accumulation
         let mut micro: Vec<Array> = Vec::with_capacity(gas);
         for _ in 0..gas {
-            let batch = batches
+            let (batch, position) = batches
                 .next()
                 .ok_or(PretrainError::BatchIteratorExhausted { step })?;
+            if position.is_some() {
+                last_stream_position = position;
+            }
             micro.push(batch);
         }
 
@@ -200,6 +237,13 @@ where
             );
         }
 
+        if config.eval_every > 0 && (step + 1) % config.eval_every == 0 {
+            if let Some(eval_iter) = eval_batches.as_mut() {
+                let eval = eval_loss(model, eval_iter, config.eval_batches, config.ignore_index)?;
+                eprintln!("step {:>6} | eval_loss {:.4}", step + 1, eval);
+            }
+        }
+
         // Checkpoint
         if let (Some(every), Some(dir)) = (config.checkpoint_every, config.checkpoint_dir.as_ref())
         {
@@ -213,10 +257,33 @@ where
                         step: optimizer.step_count(),
                         loss,
                         learning_rate: lr,
+                        stream_position: last_stream_position,
                     },
                 )?;
                 eprintln!("checkpoint saved: {}", step_dir.display());
             }
+        }
+    }
+
+    if let (Some(dir), Some(&loss)) = (config.checkpoint_dir.as_ref(), losses.last()) {
+        let should_save_final = match config.checkpoint_every {
+            Some(every) if every > 0 => config.num_steps % every != 0,
+            _ => true,
+        };
+        if should_save_final {
+            let final_dir = dir.join("final");
+            super::save_checkpoint(
+                &final_dir,
+                model,
+                &optimizer,
+                &super::CheckpointMeta {
+                    step: optimizer.step_count(),
+                    loss,
+                    learning_rate: scheduler.get_lr(config.num_steps.saturating_sub(1)) as f32,
+                    stream_position: last_stream_position,
+                },
+            )?;
+            eprintln!("final checkpoint saved: {}", final_dir.display());
         }
     }
     Ok(losses)

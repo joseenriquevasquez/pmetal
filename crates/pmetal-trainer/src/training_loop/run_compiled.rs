@@ -32,7 +32,7 @@ impl TrainingLoop {
         &mut self,
         model: M,
         train_dataset: TrainingDataset,
-        _eval_dataset: Option<TrainingDataset>,
+        eval_dataset: Option<TrainingDataset>,
         checkpoint_manager: Option<&CheckpointManager>,
     ) -> Result<M>
     where
@@ -202,6 +202,7 @@ impl TrainingLoop {
 
         // Pre-allocate vector for accumulated losses
         let mut accumulated_losses: Vec<Array> = Vec::with_capacity(self.config.log_every);
+        let mut best_eval_loss = f64::MAX;
 
         for epoch in 0..num_epochs {
             self.epoch = epoch;
@@ -424,24 +425,16 @@ impl TrainingLoop {
                     }
                 }
 
-                // Regular checkpointing - need to eval before checkpoint
-                if self.config.checkpoint_every > 0 && self.step % self.config.checkpoint_every == 0
-                {
-                    // Eval any pending losses before checkpointing
-                    if !accumulated_losses.is_empty() {
-                        eval_training_state(&accumulated_losses, &state)?;
-                        for loss in &mut accumulated_losses {
-                            let loss_val = loss.item_f32();
-                            self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
-                        }
-                        accumulated_losses.clear();
-                    }
+                // Scheduled evaluation + best-checkpoint-on-improvement.
+                best_eval_loss = self.maybe_evaluate(
+                    &mut state.0,
+                    eval_dataset.as_ref(),
+                    checkpoint_manager,
+                    best_eval_loss,
+                )?;
 
-                    if let Some(manager) = checkpoint_manager {
-                        // Need to borrow model from state for checkpointing
-                        self.save_checkpoint(&state.0, manager, false, None)?;
-                    }
-                }
+                // Scheduled regular checkpointing (rank-0 only in distributed mode).
+                self.maybe_save_regular_checkpoint(&mut state.0, checkpoint_manager)?;
 
                 // Check max steps
                 if let Some(max) = max_steps {

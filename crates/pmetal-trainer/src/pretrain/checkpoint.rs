@@ -15,6 +15,7 @@ use pmetal_bridge::compat::{
     module::ModuleParameters,
     optimizers::{AdamW, Optimizer, State},
 };
+use pmetal_data::streaming::StreamPosition;
 
 use super::PretrainError;
 
@@ -24,6 +25,8 @@ pub struct CheckpointMeta {
     pub step: u64,
     pub loss: f32,
     pub learning_rate: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_position: Option<StreamPosition>,
 }
 
 /// Save a full pretraining checkpoint to `dir/`.

@@ -180,6 +180,7 @@ pub(crate) async fn run_distillation_cli(
     teacher_id: &str,
     student_id: &str,
     dataset_path: &str,
+    eval_dataset_path: Option<String>,
     output_dir: &str,
     method_str: &str,
     loss_type_str: &str,
@@ -194,6 +195,8 @@ pub(crate) async fn run_distillation_cli(
     epochs: usize,
     max_seq_len: usize,
     seed: u64,
+    checkpoint_every: usize,
+    resume: bool,
     log_metrics: Option<String>,
     emit_console_output: bool,
     extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
@@ -299,6 +302,43 @@ pub(crate) async fn run_distillation_cli(
         "Distillation dataset loaded: {} samples",
         train_dataset.len()
     );
+    let eval_dataset = if let Some(ref eval_path) = eval_dataset_path {
+        tracing::info!("Loading distillation eval dataset: {}", eval_path);
+        let eval_is_parquet = Path::new(eval_path)
+            .extension()
+            .is_some_and(|ext| ext == "parquet");
+        let ds = if eval_is_parquet {
+            TrainingDataset::from_parquet_tokenized(
+                eval_path,
+                &tokenizer,
+                "text",
+                max_seq_len,
+                None,
+            )
+            .or_else(|_| {
+                TrainingDataset::from_parquet_tokenized(
+                    eval_path,
+                    &tokenizer,
+                    "content",
+                    max_seq_len,
+                    None,
+                )
+            })?
+        } else {
+            TrainingDataset::from_jsonl_tokenized(
+                eval_path,
+                &tokenizer,
+                DatasetFormat::Auto,
+                max_seq_len,
+                Some(&chat_template),
+                column_cfg.as_ref(),
+            )?
+        };
+        tracing::info!("Distillation eval dataset loaded: {} samples", ds.len());
+        Some(ds)
+    } else {
+        None
+    };
     {
         let stats = train_dataset.compute_statistics(max_seq_len);
         tracing::info!(
@@ -368,8 +408,12 @@ pub(crate) async fn run_distillation_cli(
         },
         use_metal_flash_attention: true,
         log_every: 1,
-        checkpoint_every: 100,
-        eval_every: 0,
+        checkpoint_every,
+        eval_every: if eval_dataset.is_some() {
+            checkpoint_every.max(1)
+        } else {
+            0
+        },
         use_jit_compilation: false,
         use_sequence_packing: true,
         gradient_checkpointing: true,
@@ -407,6 +451,26 @@ pub(crate) async fn run_distillation_cli(
         trainer.add_callback(callback);
     }
 
+    let checkpoint_dir = validated_distill_output.join("checkpoints");
+    let checkpoint_manager =
+        pmetal_trainer::CheckpointManager::new(&checkpoint_dir)?.with_max_checkpoints(3);
+    if resume {
+        if let Some((lora_params, metadata)) = checkpoint_manager.load_latest()? {
+            tracing::info!(
+                "Resuming distillation from checkpoint at step {}",
+                metadata.step
+            );
+            use pmetal_lora::TrainableModel;
+            student_model.set_lora_parameters(&lora_params);
+            trainer.set_progress(metadata.step, metadata.epoch);
+        } else {
+            tracing::info!(
+                "No distillation checkpoint found in {:?}, starting fresh",
+                checkpoint_dir
+            );
+        }
+    }
+
     match method {
         pmetal_distill::DistillMethod::Online | pmetal_distill::DistillMethod::Progressive => {
             tracing::info!("Loading teacher model...");
@@ -421,8 +485,8 @@ pub(crate) async fn run_distillation_cli(
                     &mut student_model,
                     &mut teacher_model,
                     train_dataset,
-                    None,
-                    None,
+                    eval_dataset.clone(),
+                    Some(&checkpoint_manager),
                 )
                 .map_err(|e| anyhow::anyhow!("Distillation failed: {}", e))?;
         }
@@ -466,7 +530,13 @@ pub(crate) async fn run_distillation_cli(
 
             validate_offline_cache(&cache, teacher_id, max_seq_len, train_dataset.len())?;
             trainer
-                .run_offline(&mut student_model, &cache, train_dataset, None, None)
+                .run_offline(
+                    &mut student_model,
+                    &cache,
+                    train_dataset,
+                    eval_dataset.clone(),
+                    Some(&checkpoint_manager),
+                )
                 .map_err(|e| anyhow::anyhow!("Offline distillation failed: {}", e))?;
         }
     }

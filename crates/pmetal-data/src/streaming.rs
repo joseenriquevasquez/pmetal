@@ -62,7 +62,7 @@ use memmap2::Mmap;
 ///
 /// Capture this from each yielded batch item and persist it to disk.
 /// Pass it back as [`StreamConfig::resume_from`] to resume exactly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StreamPosition {
     /// Index of the shard currently being read.
     pub shard_idx: usize,

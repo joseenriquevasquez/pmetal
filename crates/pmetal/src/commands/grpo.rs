@@ -18,6 +18,8 @@ pub(crate) async fn run_grpo_cli(
     max_seq_len: usize,
     max_completion_length: usize,
     seed: u64,
+    checkpoint_every: usize,
+    resume: bool,
     dapo: bool,
     reasoning_rewards: bool,
     use_metal_flash_attention: bool,
@@ -43,6 +45,8 @@ pub(crate) async fn run_grpo_cli(
     use pmetal_core::LoraConfig;
     use pmetal_lora::{DynamicLoraModel, TrainableModel};
     use pmetal_models::DynamicModel;
+
+    pmetal_bridge::compat::random::seed(seed);
 
     let column_cfg = crate::commands::build_column_config(
         text_column,
@@ -153,6 +157,7 @@ pub(crate) async fn run_grpo_cli(
     grpo_config.use_speculative = use_speculative;
     grpo_config.speculative_draft_tokens = speculative_draft_tokens;
     grpo_config.kv_cache_bits = kv_cache_bits;
+    grpo_config.seed = Some(seed);
 
     if use_speculative && emit_console_output {
         println!(
@@ -289,6 +294,11 @@ pub(crate) async fn run_grpo_cli(
         num_epochs: epochs,
         max_seq_len,
         output_dir: output_dir.to_string(),
+        save_steps: if checkpoint_every > 0 {
+            Some(checkpoint_every)
+        } else {
+            None
+        },
         ..Default::default()
     };
 
@@ -347,6 +357,23 @@ pub(crate) async fn run_grpo_cli(
         let control_file = PathBuf::from(output_dir).join(".lr_control.json");
         trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
     }
+
+    let checkpoint_dir = PathBuf::from(output_dir).join("checkpoints");
+    let checkpoint_manager =
+        pmetal_trainer::CheckpointManager::new(&checkpoint_dir)?.with_max_checkpoints(3);
+    if resume {
+        if let Some((lora_params, metadata)) = checkpoint_manager.load_latest()? {
+            tracing::info!("Resuming GRPO from checkpoint at step {}", metadata.step);
+            model.set_lora_parameters(&lora_params);
+            trainer.set_step(metadata.step);
+        } else {
+            tracing::info!(
+                "No GRPO checkpoint found in {:?}, starting fresh",
+                checkpoint_dir
+            );
+        }
+    }
+    trainer.set_checkpoint_manager(checkpoint_manager);
 
     // 7b. Setup Optimizer
     let mut optimizer = pmetal_bridge::compat::optimizers::AdamWBuilder::new(learning_rate as f32)

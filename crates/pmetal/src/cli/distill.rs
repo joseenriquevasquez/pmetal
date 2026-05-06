@@ -17,6 +17,10 @@ pub struct DistillArgs {
     #[arg(short, long = "dataset")]
     pub dataset: String,
 
+    /// Optional evaluation dataset path (JSONL file)
+    #[arg(long = "eval-dataset")]
+    pub eval_dataset: Option<String>,
+
     /// Output directory for distilled student
     #[arg(short, long = "output", default_value = "./output/distilled")]
     pub output: String,
@@ -92,6 +96,14 @@ pub struct DistillArgs {
     /// Random seed for dataset shuffling and initialization.
     #[arg(long = "seed", default_value = "42")]
     pub seed: u64,
+
+    /// Save checkpoint every N steps (0 disables interval checkpoints).
+    #[arg(long = "checkpoint-every", default_value = "100")]
+    pub checkpoint_every: usize,
+
+    /// Resume from the latest checkpoint in the output directory.
+    #[arg(long = "resume")]
+    pub resume: bool,
 
     /// Custom text column name in the dataset JSONL.
     #[arg(long = "text-column")]

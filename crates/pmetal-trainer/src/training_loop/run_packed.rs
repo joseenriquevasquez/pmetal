@@ -123,6 +123,7 @@ impl TrainingLoop {
 
         // Create state tuple for training
         let mut state = (model, optimizer);
+        let mut best_eval_loss = f64::MAX;
 
         // =========================================================================
         // PHASE 1: Warmup step for optimizer state initialization
@@ -355,23 +356,16 @@ impl TrainingLoop {
                     }
                 }
 
-                // Regular checkpointing
-                if self.config.checkpoint_every > 0 && self.step % self.config.checkpoint_every == 0
-                {
-                    // Eval any pending losses before checkpointing
-                    if !accumulated_losses.is_empty() {
-                        eval_training_state(&accumulated_losses, &state)?;
-                        for loss in &mut accumulated_losses {
-                            let loss_val = loss.item_f32();
-                            self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
-                        }
-                        accumulated_losses.clear();
-                    }
+                // Scheduled evaluation + best-checkpoint-on-improvement.
+                best_eval_loss = self.maybe_evaluate(
+                    &mut state.0,
+                    eval_dataset.as_ref(),
+                    checkpoint_manager,
+                    best_eval_loss,
+                )?;
 
-                    if let Some(manager) = checkpoint_manager {
-                        self.save_checkpoint(&state.0, manager, false, None)?;
-                    }
-                }
+                // Scheduled regular checkpointing (rank-0 only in distributed mode).
+                self.maybe_save_regular_checkpoint(&mut state.0, checkpoint_manager)?;
 
                 // Check max steps
                 if let Some(max) = max_steps {

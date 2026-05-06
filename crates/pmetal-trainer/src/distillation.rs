@@ -36,6 +36,11 @@ impl DistillationTrainer {
         self.loop_state.add_callback(callback);
     }
 
+    pub fn set_progress(&mut self, step: usize, epoch: usize) {
+        self.loop_state.set_step(step);
+        self.loop_state.set_epoch(epoch);
+    }
+
     /// Enable adaptive LR with control file for TUI communication.
     pub fn enable_adaptive_lr_with_control(
         &mut self,

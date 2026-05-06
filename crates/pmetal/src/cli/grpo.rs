@@ -53,6 +53,14 @@ pub struct GrpoArgs {
     #[arg(long = "seed", default_value = "42")]
     pub seed: u64,
 
+    /// Save LoRA checkpoint every N policy updates (0 disables interval checkpoints).
+    #[arg(long = "checkpoint-every", default_value = "50")]
+    pub checkpoint_every: usize,
+
+    /// Resume LoRA weights from the latest checkpoint in the output directory.
+    #[arg(long = "resume")]
+    pub resume: bool,
+
     /// Enable DAPO (Distribution-Aware Policy Optimization)
     #[arg(long = "dapo")]
     pub dapo: bool,

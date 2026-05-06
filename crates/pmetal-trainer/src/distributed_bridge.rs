@@ -4,7 +4,6 @@
 //! that integrate with the existing `FlattenedModuleParam` gradient format.
 
 use pmetal_bridge::compat::{Array, Dtype, Exception, module::FlattenedModuleParam};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use pmetal_distributed::{CompressionStrategy, DistributedContext, GradientCompressor, ReduceOp};
@@ -40,7 +39,7 @@ pub struct DistributedGradientSync {
     /// Reusable scratch buffer for flatten/scatter operations.
     buffer: Vec<f32>,
     /// Parameter layout: (name, shape, element_count) for deterministic ordering.
-    param_layout: Vec<(Rc<str>, Vec<i32>, usize)>,
+    param_layout: Vec<(String, Vec<i32>, usize)>,
     /// Whether layout has been initialized from the first gradient set.
     layout_initialized: bool,
 }
@@ -94,7 +93,7 @@ impl DistributedGradientSync {
             .map(|(name, arr)| {
                 let shape: Vec<i32> = arr.shape().to_vec();
                 let count: usize = shape.iter().map(|&d| d as usize).product();
-                (name.clone(), shape, count)
+                (name.to_string(), shape, count)
             })
             .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -117,7 +116,7 @@ impl DistributedGradientSync {
     fn flatten_grads(&mut self, grads: &FlattenedModuleParam) -> Result<()> {
         let mut offset = 0;
         for (name, _shape, count) in &self.param_layout {
-            if let Some(arr) = grads.get(name) {
+            if let Some(arr) = grads.get(name.as_str()) {
                 // Evaluate the gradient array to materialized f32 values
                 let mut arr_eval = arr.clone();
                 arr_eval
@@ -150,7 +149,7 @@ impl DistributedGradientSync {
             let n = *count;
             let slice = &self.buffer[offset..offset + n];
             let arr = Array::from_f32_slice(slice, shape.as_slice());
-            grads.insert(name.clone(), arr);
+            grads.insert(std::rc::Rc::from(name.as_str()), arr);
             offset += n;
         }
         Ok(())

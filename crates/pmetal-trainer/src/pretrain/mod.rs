@@ -15,7 +15,7 @@ pub use checkpoint::{CheckpointMeta, load_checkpoint, save_checkpoint};
 pub use factory::{PretrainModel, create_model, n_layers};
 pub use init::{apply_depth_scaled_init, zero_biases};
 pub use loss::causal_lm_loss;
-pub use train_loop::{pretrain_step, run_pretrain};
+pub use train_loop::{pretrain_step, run_pretrain, run_pretrain_with_state};
 
 use pmetal_bridge::compat::{Array, Exception, module::ModuleParameters};
 use pmetal_core::LrSchedulerType;

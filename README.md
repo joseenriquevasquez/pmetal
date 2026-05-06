@@ -427,7 +427,7 @@ All training methods support callback-based cancellation (`should_stop()`), metr
 | ORPO (Odds-Ratio Preference) | — | — | — | `easy::orpo()` |
 | KTO (Kahneman-Tversky) | — | — | — | `easy::kto()` |
 | GRPO (Reasoning) | `grpo` | Yes | Yes | `GrpoTrainer` |
-| DAPO (Decoupled GRPO) | `grpo --dapo` | Yes | Yes | `DapoTrainer` |
+| DAPO (Decoupled GRPO) | `grpo --dapo` | Yes | Yes | `GrpoTrainer` DAPO mode |
 | Knowledge Distillation | `distill` | Yes | Yes | `Distiller` |
 | TAID (Temporally Adaptive) | — | — | — | `TaidDistiller` |
 | ANE Training | `train` (auto) | — | Yes | `AneTrainingLoop` |
