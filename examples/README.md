@@ -1,6 +1,6 @@
 # PMetal Examples
 
-This directory contains example configurations and scripts for common PMetal workflows.
+This directory contains runnable shell examples and small sample datasets for common PMetal workflows. All scripts use `./target/release/pmetal` by default; override `PMETAL_BIN` to point at another binary.
 
 ## Examples
 
@@ -13,10 +13,20 @@ This directory contains example configurations and scripts for common PMetal wor
 
 - `inference.sh` - Text generation with base model
 - `inference_lora.sh` - Text generation with LoRA adapter
+- `serve_openai.sh` - OpenAI-compatible local server with continuous batching
+
+Build the server example with `cargo build -p pmetal --release --features serve`; the default binary does not include the `serve` subcommand.
+
+### Quantization and Benchmarking
+
+- `quantize_gguf.sh` - GGUF quantization with a configurable method
+- `bench_workload.sh` - End-to-end inference and LoRA workload benchmark
 
 ### Data Preparation
 
 - `sample_dataset.jsonl` - Example training data format
+- `sample_corpus.jsonl` - Example text corpus for tokenizer sharding
+- `tokenize_corpus.sh` - Tokenize a JSONL corpus into PMetal shards
 
 ## Quick Start
 
@@ -24,10 +34,13 @@ This directory contains example configurations and scripts for common PMetal wor
 # 1. Build PMetal
 cargo build --release
 
-# 2. Fine-tune a model
+# 2. Run inference
+./examples/inference.sh
+
+# 3. Fine-tune a model
 ./examples/lora_finetune.sh
 
-# 3. Run inference
+# 4. Run inference with the adapter
 ./examples/inference_lora.sh
 ```
 
@@ -41,12 +54,24 @@ PMetal supports multiple dataset formats. See `sample_dataset.jsonl` for example
 
 ## Configuration
 
-Most examples can be customized by editing the shell scripts. Key parameters:
+Most examples can be customized with environment variables:
 
 | Parameter | Description |
 |-----------|-------------|
-| `--model` | HuggingFace model ID or local path |
-| `--dataset` | Path to training JSONL file |
-| `--lora-r` | LoRA rank (4, 8, 16, 32) |
-| `--batch-size` | Training batch size |
-| `--learning-rate` | Optimizer learning rate |
+| `PMETAL_BIN` | Path to the `pmetal` binary |
+| `MODEL` | HuggingFace model ID or local path |
+| `OUTPUT` | Output file or directory |
+| `PROMPT` | Inference prompt |
+| `MAX_TOKENS` | Generated token budget |
+| `HOST` | Server bind host |
+| `PORT` | Server port |
+| `DATASET` | Training JSONL file or workload dataset |
+| `TOKENIZER` | Tokenizer model ID or local path |
+| `METHOD` | GGUF quantization method |
+| `PRESET` | Workload benchmark preset |
+
+Example:
+
+```bash
+MODEL=Qwen/Qwen3-4B MAX_TOKENS=128 ./examples/inference.sh
+```

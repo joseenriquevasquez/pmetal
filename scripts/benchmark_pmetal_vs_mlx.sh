@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Configuration
-MODEL="qwen/Qwen3-0.6B-Base"
+MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 SAMPLES=100
 BATCH_SIZE=4
 MAX_SEQ_LEN=2048
@@ -21,7 +21,7 @@ ITERS=25  # ~100 samples / 4 batch = 25 iterations
 PMETAL_OUTPUT="./output_bench_pmetal"
 MLX_OUTPUT="./output_bench_mlx"
 DATA_DIR="./mlx_lm_data"
-PMETAL="./target/release/pmetal"
+PMETAL="${PMETAL_BIN:-./target/release/pmetal}"
 
 # Colors
 RED='\033[0;31m'
@@ -81,7 +81,7 @@ log_section "Step 1: Prepare Dataset"
 mkdir -p "$DATA_DIR" "$PMETAL_OUTPUT" "$MLX_OUTPUT"
 
 # Create dataset in both formats
-python3 << 'PYTHON_SCRIPT'
+python3 - "$SAMPLES" << 'PYTHON_SCRIPT'
 import json
 import sys
 from pathlib import Path
@@ -89,9 +89,7 @@ from pathlib import Path
 try:
     from datasets import load_dataset
 except ImportError:
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "datasets", "-q"])
-    from datasets import load_dataset
+    load_dataset = None
 
 samples = int(sys.argv[1]) if len(sys.argv) > 1 else 100
 data_dir = Path("mlx_lm_data")
@@ -102,13 +100,16 @@ pmetal_output.mkdir(exist_ok=True)
 
 print(f"Loading dataset for {samples} samples...")
 
-try:
-    dataset = load_dataset("TeichAI/gemini-3-pro-preview-high-reasoning-1000x", split="train")
+train_samples_mlx = []
+train_samples_pmetal = []
+valid_samples_mlx = []
+valid_samples_pmetal = []
 
-    train_samples_mlx = []
-    train_samples_pmetal = []
-    valid_samples_mlx = []
-    valid_samples_pmetal = []
+try:
+    if load_dataset is None:
+        raise RuntimeError("python package 'datasets' is not installed")
+
+    dataset = load_dataset("TeichAI/gemini-3-pro-preview-high-reasoning-1000x", split="train")
 
     for i, sample in enumerate(dataset):
         if i >= samples:
@@ -145,28 +146,6 @@ try:
             train_samples_mlx.append(mlx_sample)
             train_samples_pmetal.append(pmetal_sample)
 
-    # Write MLX format
-    with open(data_dir / "train.jsonl", "w") as f:
-        for s in train_samples_mlx:
-            f.write(json.dumps(s) + "\n")
-    with open(data_dir / "valid.jsonl", "w") as f:
-        for s in valid_samples_mlx:
-            f.write(json.dumps(s) + "\n")
-    with open(data_dir / "test.jsonl", "w") as f:
-        for s in valid_samples_mlx[:5]:
-            f.write(json.dumps(s) + "\n")
-
-    # Write PMetal format
-    with open(pmetal_output / "train.jsonl", "w") as f:
-        for s in train_samples_pmetal:
-            f.write(json.dumps(s) + "\n")
-    with open(pmetal_output / "eval.jsonl", "w") as f:
-        for s in valid_samples_pmetal:
-            f.write(json.dumps(s) + "\n")
-
-    print(f"MLX data:    {len(train_samples_mlx)} train, {len(valid_samples_mlx)} valid")
-    print(f"PMetal data: {len(train_samples_pmetal)} train, {len(valid_samples_pmetal)} eval")
-
 except Exception as e:
     print(f"Error: {e}")
     # Create synthetic data
@@ -183,6 +162,28 @@ except Exception as e:
         else:
             train_samples_mlx.append(sample_mlx)
             train_samples_pmetal.append(sample_pm)
+
+# Write MLX format
+with open(data_dir / "train.jsonl", "w") as f:
+    for s in train_samples_mlx:
+        f.write(json.dumps(s) + "\n")
+with open(data_dir / "valid.jsonl", "w") as f:
+    for s in valid_samples_mlx:
+        f.write(json.dumps(s) + "\n")
+with open(data_dir / "test.jsonl", "w") as f:
+    for s in valid_samples_mlx[:5]:
+        f.write(json.dumps(s) + "\n")
+
+# Write PMetal format
+with open(pmetal_output / "train.jsonl", "w") as f:
+    for s in train_samples_pmetal:
+        f.write(json.dumps(s) + "\n")
+with open(pmetal_output / "eval.jsonl", "w") as f:
+    for s in valid_samples_pmetal:
+        f.write(json.dumps(s) + "\n")
+
+print(f"MLX data:    {len(train_samples_mlx)} train, {len(valid_samples_mlx)} valid")
+print(f"PMetal data: {len(train_samples_pmetal)} train, {len(valid_samples_pmetal)} eval")
 PYTHON_SCRIPT
 
 log_success "Dataset prepared"
@@ -243,8 +244,6 @@ $PMETAL train \
     --epochs 1 \
     --max-seq-len $MAX_SEQ_LEN \
     --gradient-accumulation-steps 1 \
-    --use-metal-flash-attention \
-    --use-sequence-packing \
     --log-metrics "$PMETAL_OUTPUT/metrics.jsonl" \
     2>&1 | tee "$PMETAL_OUTPUT/training.log"
 

@@ -1,19 +1,25 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Inference Example
 # Run text generation with a base model
 
-set -e
+set -euo pipefail
 
-MODEL="qwen/Qwen3-0.6B-Base"
-PROMPT="Explain the concept of machine learning in simple terms."
+PMETAL_BIN="${PMETAL_BIN:-./target/release/pmetal}"
+MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
+PROMPT="${PROMPT:-Explain machine learning in one concise paragraph.}"
+MAX_TOKENS="${MAX_TOKENS:-256}"
+TEMPERATURE="${TEMPERATURE:-0.7}"
+TOP_P="${TOP_P:-0.9}"
 
 echo "=== PMetal Inference ==="
 echo "Model: $MODEL"
 echo ""
 
-./target/release/pmetal infer \
+"$PMETAL_BIN" infer \
     --model "$MODEL" \
     --prompt "$PROMPT" \
-    --max-tokens 256 \
-    --temperature 0.7 \
-    --top-p 0.9
+    --chat \
+    --no-thinking \
+    --max-tokens "$MAX_TOKENS" \
+    --temperature "$TEMPERATURE" \
+    --top-p "$TOP_P"

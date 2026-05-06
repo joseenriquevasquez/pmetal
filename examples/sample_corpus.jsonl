@@ -1,0 +1,3 @@
+{"text":"PMetal runs local model inference, training, and benchmarking on Apple Silicon."}
+{"text":"Use JSONL corpora with a stable text column when preparing tokenizer shards."}
+{"text":"Short sample files keep example commands quick to inspect and easy to adapt."}
