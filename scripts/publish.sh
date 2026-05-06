@@ -5,7 +5,7 @@
 # Prerequisites:
 #   - `cargo login` has been run with a valid API token
 #   - All workspace Cargo.toml git dependencies have been replaced with
-#     crates.io version references (e.g., mlx-rs = "0.25.x")
+#     crates.io version references for the internal pmetal crates
 #   - The workspace version in Cargo.toml matches the intended release
 #
 # Rate limits (new crates):

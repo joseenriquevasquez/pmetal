@@ -396,7 +396,7 @@ Prevents mode collapse, enables stable transfer.
 - **What**: Compile entire merge kernel graph
 - **Current**: Individual MLX ops
 - **Target**: Use MLX compile_with_state for full graph fusion
-- **Gain**: 50-100% speedup, requires mlx-rs improvements
+- **Gain**: 50-100% speedup, requires broader `pmetal-bridge` compile-state coverage
 - **Reference**: `training_loop.rs` notes on JIT limitations
 
 ---

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-05-01
+## [0.5.0] - 2026-05-06
 
 ### Added
 
@@ -40,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`pmetal serve --kv-turboquant`**: TurboQuant KV cache in the serving engine with `--kv-turboquant-preset q3_5` for near-lossless 4.6x KV compression in production
 
+#### Quantization & model formats
+
+- **Optimized FP8 checkpoint loading**: Hugging Face FP8 `weight_scale_inv` sidecars are dequantized or repacked into MLX `mxfp8` weights for Qwen3-family native paths; mode-aware quantized matmul plumbing handles floating-point quantized weights without dense fallback
+- **Expanded GGUF quantization/export**: `pmetal quantize` now writes standard GGUF metadata from Hugging Face configs, tokenizer/pre-tokenizer metadata, HF-to-GGUF tensor names, stacked MoE expert tensors, and method-specific file types
+- **Broader GGUF format coverage**: quantization/dequantization support now includes K-quants, legacy Q4/Q5/Q8 variants, Q1_0, TQ1_0/TQ2_0, MXFP4, NVFP4, BF16, F16, and F32 round trips
+- **MLX safetensors quantization path**: quality-based bit allocation with `--target-bpw`, GPU-resident weight loading, and tokenizer/config sidecar copy for MLX-format quantized exports
+
 #### Inference server (OpenAI- + Anthropic-compatible)
 
 - **Continuous batching with paged-KV-style admission + shared prefix cache** in `pmetal-serve`: per-request slot scheduling, KV-cache prefix sharing, concurrent decode for many simultaneous chats
@@ -48,7 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Continuous batching derives the same cache mode as the single-request serving path, honoring `--kv-quant` and `--kv-turboquant`
   - Hybrid/recurrent models are rejected from continuous batching instead of silently running without recurrent state
 - **Anthropic-compatible `/v1/messages` endpoint**: streaming `message_start` → `content_block_start` → `content_block_delta*` → `content_block_stop` → `message_delta` → `message_stop` events; non-streaming JSON path
-- **`/v1/embeddings` endpoint**: 20 architectures supported via `forward_hidden` (Llama/Llama4/Qwen2/Qwen3/Qwen3MoE/Qwen3Next/Mistral/Gemma/Gemma4/Phi/Phi4/DeepSeek/Cohere/Granite/GptOss/StarCoder2/NemotronH/FalconH1/RecurrentGemma/Jamba/BERT) — pooling via `pmetal_models::pooling`
+- **`/v1/embeddings` endpoint**: 17 architectures supported via `forward_hidden` (Llama/Llama4/Qwen2/Qwen3/Qwen3MoE/Qwen3Next/Mistral/Gemma/Gemma4/Phi/Phi4/DeepSeek/Cohere/Granite/GptOss/NemotronH/BERT) — pooling via `pmetal_models::pooling`
 - **Token logprobs**: `SamplingParams.logprobs_top_n` plumbed end-to-end through non-streaming and SSE streaming on both `/v1/chat/completions` and `/v1/completions`. New `pmetal_models::generation::token_logprobs` primitive; ANE/CPU paths emit `logprob: None`
 - **Best-effort tool calling on `/v1/chat/completions`**: `try_parse_tool_calls` accepts `{name, arguments}` or `{tool_calls: [...]}`. `ChatCompletionRequest.tools` gates the attempt; chat templating threads tool defs into the rendered prompt
 - **`IncrementalDecoder<Aux>` SSE buffer**: shared UTF-8 boundary buffer + per-token aux pipelining (used for logprobs alignment) across chat/completions/anthropic streams
@@ -97,6 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Bridge & native paths
 
+- **`pmetal-bridge` crate**: Zero-allocation MLX C++ bridge replacing mlx-rs as the core runtime. Native inference at 201 tok/s (Qwen3.5 0.8B), 4-bit quantized inference (28 tok/s on 27B), compiled attention, KV cache trimming, and full training ops (autograd, optimizer, random, math, reduction, comparison) — all without mlx-rs overhead
 - **Fused [T=1] decode kernels** for `gpt_oss` and `llama4` (Bridge Phase 4)
 - **Fused [N,1] batched-decode** path for Tier-1/2 architectures
 - **Cheap native KV cache fork support** for Qwen3, GPT-OSS, Llama4, DeepSeek, and generic `KVCache`, preserving dense, quantized, and TurboQuant cache state for serving prefix reuse
@@ -104,14 +112,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Scalar dtype footgun fix**: `InlineArray::scalar_like(value, peer)` + `mul_scalar`/`add_scalar`/`sub_scalar`/`div_scalar` eliminate manual `.as_dtype(model_dtype)` calls
 - **`async_eval` actually async**: prior implementation blocked the calling thread
 - Bridge file splits: `bridge.h` and `bridge.cpp` carved into `cpp/bridge/` sub-headers + 6 source files; `bridge_turboquant.cpp` split by kernel family; `inline_array.rs`, `qwen3_native.rs`, `deepseek_native.rs`, `llama4_native.rs`, `gpt_oss_native.rs` split into submodule directories
-- **`forward_hidden`** for 20 architectures (embeddings + retrieval support)
+- **`forward_hidden`** for 17 architectures (embeddings + retrieval support)
 
 #### Preference & RL trainers (`pmetal-trainer`)
 
 - **`PairedPreferenceTrainer<L>` trait + `DpoLoss` kernel**: `DpoTrainer::train` and `OnlineDpoTrainer::train_step` now delegate to the shared trainer; `ReferenceStrategy::{StopGradient, Zero, Precomputed}` covers the three reference-logp sources
 - **Shared log-prob helpers** fanned out to KTO/ORPO/GRPO/OnlineDPO via `logprob_utils::{compute_log_probs, compute_log_probs_with_avg, shifted_selective_log_softmax}`
 
-- **`pmetal-bridge` crate**: Zero-allocation MLX C++ bridge replacing mlx-rs as the core runtime. Native inference at 201 tok/s (Qwen3.5 0.8B), 4-bit quantized inference (28 tok/s on 27B), compiled attention, KV cache trimming, and full training ops (autograd, optimizer, random, math, reduction, comparison) — all without mlx-rs overhead
+#### Model, training & data
 
 - **Full-parameter pretraining**: End-to-end `pmetal pretrain` pipeline for training models from scratch
   - Model factory supporting llama, qwen, gemma, mistral, phi, and gpt-oss architectures
@@ -131,26 +139,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Jinja chat templates**: Real upstream jinja rendering via minijinja with 16 parity-audited template types (ChatML, Llama2/3/4, Mistral, Gemma/Gemma4, Phi3/4, Qwen, DeepSeek, Cohere, Alpaca, Vicuna, Zephyr, GptOss)
 
-- **TurboQuant KV cache quantization**: Provably near-optimal KV cache compression based on random rotation + Lloyd-Max scalar quantization + QJL residual for unbiased inner products (arXiv:2504.19874). Achieves 4-6x KV cache compression with near-zero quality loss. Available via `--kv-turboquant` or presets `--kv-turboquant-preset q3_5` (near-lossless) / `q2_5` (6.4x compression)
-  - Separate key/value runtimes with independent bit widths and outlier-aware mixed-precision
-  - Direct attention path for single-token decode avoids full cache dequantization
-  - Data-oblivious (no calibration data required) — quantizes KV entries online as generated
-  - Precomputed codebooks via Lloyd-Max algorithm for Beta distribution (deterministic from seed)
-  - Metal kernel backend with CPU fallback
-
-- **Asymmetric K/V head dimensions**: KV cache, TurboQuant, and fused attention now support models where key and value projections have different widths (e.g. DeepSeek MLA with `qk_head_dim != v_head_dim`)
-
-- **`pmetal serve --kv-turboquant`**: TurboQuant KV cache in the serving engine with `--kv-turboquant-preset q3_5` for near-lossless 4.6x KV compression in production
-
 - **Qwen3.5 MoE dispatch improvements**: Expert prefetch reset per generation, configurable GDN chunk size, chunked prefill, and generation helpers
 
-- **`pmetal-distributed` crate**: Feature-gated tensor, expert, context, zero, and pipeline parallelism modules
+- **Adaptive sequence packing**: `compute_pack_seq_len()` uses p99 of actual dataset sequence lengths instead of `max_position_embeddings` — up to 256x reduction in wasted compute for short-sequence datasets. `--pack-max-seq-len` for explicit override
 
-- **TUI overhaul**: Expanded to 14 tabs with full CLI parity, `?`-key help overlay, Ctrl+1..9 tab jump, active-job footer badge, and shared `FormTabState` primitive for consistent form-based config across tabs
-
-- **GUI parity**: Serve, Bench, Eval, Jobs, and Pretrain pages in the Tauri GUI, matching TUI functionality with real-time event-driven updates
-
-- **Benchmark enhancements**: Warmup passes, session repeats, GDN prefill stage profiling, TurboQuant flag for bench commands, fused gate/up expert packing with auto-detected tensor layout
+#### Metal 4 / MPP backend
 
 - **Metal 4 / MPP kernel backend** (Epistates/pmetal#14): Trait-based kernel dispatch with `Metal3Backend` and `Metal4Backend` for M5+ (Apple10/NAX) GPUs
   - `KernelBackend` trait with 16 methods covering GEMM, attention, fused linear, training, MoE, distillation
@@ -163,7 +156,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 5 new shaders: `mpp_fused_training` (AdamW), `mpp_fused_cross_entropy`, `mpp_fused_rope`, `mpp_fused_moe`, `mpp_fused_distill`
   - 2 additional: `mpp_fused_mlp` (gate+up+down combined), quantized MoE expert variants
 
-- **Adaptive sequence packing**: `compute_pack_seq_len()` uses p99 of actual dataset sequence lengths instead of `max_position_embeddings` — up to 256x reduction in wasted compute for short-sequence datasets. `--pack-max-seq-len` for explicit override
+#### Benchmarking & inference UX
+
+- **Benchmark enhancements**: workload presets, custom dataset/expert-dir controls, inference session repeats, train sample/step/batch/sequence controls, warmup passes, GDN prefill stage profiling, TurboQuant flag for bench commands, and fused gate/up expert packing with auto-detected tensor layout
 
 - **`--mode` sampling presets**: Per-model-family recommended sampling parameters (Qwen3/3.5 thinking/instruct modes). `--mode auto` selects based on `--no-thinking` flag
 
@@ -188,11 +183,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **AdamW bias correction**: step counter was advancing per-parameter instead of per-step
+- **Cross-entropy loss masking**: ignored labels are masked before gather, using a selective `logsumexp - target_logit` path that avoids materializing full `log_softmax`
 - **Gradient clipping** in compiled training path now uses `_clipped` step variants
 - **FFI exception safety**: ~33 C++ bridge functions wrapped in try/catch
 - **LoRA inference segfault**: put_along_axis crash during generation
 - **UTF-8 char boundary panics** in inference/GUI output stream handling
 - **Distributed ring reduce**: all-gather chunk indexing used wrong offset, corrupting gradient aggregation
+- **Distributed transport/compression audit**: namespace PSK handshakes, TCP fallback hardening, bounded compressed-gradient deserialization, and out-of-range sparse-index guards
+- **Serving parameter validation**: OpenAI-compatible routes validate sampling parameters before streaming and non-streaming generation dispatch
 - **select_axis parameter order**: standardized (data, index, axis) across all call sites
 - **Lazy array segfaults**: diffusion sampler now evals sigmas/timesteps before slice access
 - **Sampling penalties**: correctly wired through native bridge decode path
@@ -211,7 +209,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **mlx-rs dependency**: Fully replaced by `pmetal-bridge` — removes ~15K lines of Rust FFI bindings
 - 1065 lines of dead code: `qwen3_train.rs`, unused LoRA functions in `qwen3_native.rs`
 - 5 superseded LoRA training modules
-- **Dropped support for StarCoder2 (training-side), FalconH1, RecurrentGemma, Jamba**: hybrid attention+SSM architectures with insufficient MLX support remain inference-only or removed entirely
+- **Dropped model support for StarCoder2, FalconH1, RecurrentGemma, and Jamba**
 - **`Distiller::run_*` orchestration stubs** (now lives in `pmetal-trainer`)
 
 ## [0.4.0] - 2026-03-23
