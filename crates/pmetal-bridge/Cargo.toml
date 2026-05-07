@@ -49,3 +49,7 @@ harness = false
 # `unsafe_code = "deny"` still applies to every other crate.
 [lints.rust]
 unsafe_code = "allow"
+
+[lints.clippy]
+collapsible_if = "allow"
+manual_is_multiple_of = "allow"
