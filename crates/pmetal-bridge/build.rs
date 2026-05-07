@@ -495,8 +495,6 @@ fn build_and_link() {
         let metallib = mlx_lib_dir_built.join("mlx.metallib");
         if metallib.exists() {
             emit_bridge_metadata("mlx_metallib", metallib.display().to_string());
-        }
-        if metallib.exists() {
             if let Ok(home) = env::var("HOME") {
                 let cache_dir = PathBuf::from(home).join(".cache/pmetal/lib");
                 let dest = cache_dir.join("mlx.metallib");

@@ -113,14 +113,14 @@ fn detect_metal_version() -> u32 {
             "echo '__METAL_VERSION__' | xcrun -sdk macosx metal -std={std_flag} -E -x metal -P - 2>/dev/null | tail -1 | tr -d '\\n'",
         );
         let output = Command::new("zsh").args(["-c", &script]).output();
-        if let Ok(o) = output {
-            if o.status.success() {
-                let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if let Ok(n) = v.parse::<u32>() {
-                    if n > 0 {
-                        return n;
-                    }
-                }
+        if let Ok(o) = output
+            && o.status.success()
+        {
+            let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if let Ok(n) = v.parse::<u32>()
+                && n > 0
+            {
+                return n;
             }
         }
     }

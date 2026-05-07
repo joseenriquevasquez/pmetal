@@ -499,14 +499,12 @@ fn expr_to_i64(expr: &Expr) -> syn::Result<i64> {
         expr: inner,
         ..
     }) = expr
-    {
-        if let Expr::Lit(ExprLit {
+        && let Expr::Lit(ExprLit {
             lit: Lit::Int(int), ..
         }) = inner.as_ref()
-        {
-            let n: i64 = int.base10_parse()?;
-            return Ok(-n);
-        }
+    {
+        let n: i64 = int.base10_parse()?;
+        return Ok(-n);
     }
     Err(syn::Error::new(expr.span(), "expected integer literal"))
 }

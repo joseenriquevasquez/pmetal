@@ -312,6 +312,9 @@ impl JobManager {
         // Search for --output in args
         let args = &job.args;
         for (i, arg) in args.iter().enumerate() {
+            if let Some(val) = arg.strip_prefix("--output=") {
+                return Ok(val.to_string());
+            }
             if arg == "--output" || arg == "-o" {
                 if let Some(val) = args.get(i + 1) {
                     return Ok(val.clone());
@@ -325,6 +328,12 @@ impl JobManager {
     pub fn write_control(&self, job_id: &str, json: &str) -> McpResult<()> {
         let output_dir = self.get_output_dir(job_id)?;
         let control_path = std::path::Path::new(&output_dir).join(".lr_control.json");
+        std::fs::create_dir_all(&output_dir).map_err(|e| {
+            McpError::internal(format!(
+                "failed to create control directory {}: {e}",
+                output_dir
+            ))
+        })?;
         std::fs::write(&control_path, json).map_err(|e| {
             McpError::internal(format!(
                 "failed to write control file {}: {e}",
@@ -429,6 +438,7 @@ fn default_output_dir_for_command(command: &str) -> &'static str {
         "grpo" => "./output/grpo",
         "rlkd" => "./output/rlkd",
         "embed-train" => "./output-embed",
+        "pretrain" => "./pretrain-output",
         _ => "./output",
     }
 }
@@ -513,6 +523,10 @@ mod tests {
         assert_eq!(
             default_output_dir_for_command("embed-train"),
             "./output-embed"
+        );
+        assert_eq!(
+            default_output_dir_for_command("pretrain"),
+            "./pretrain-output"
         );
     }
 

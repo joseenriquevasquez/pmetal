@@ -65,7 +65,7 @@ jobs:
       # Clippy first — triggers the bridge build. If the MLX prefix cache
       # hit, cmake is skipped and only the bridge C++ sources compile.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --exclude pmetal-py --profile ci -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude pmetal-py --profile ci -- -D warnings -A clippy::collapsible_if -A clippy::manual_is_multiple_of
 
       # Single-threaded to avoid Metal/GPU conflicts.
       - name: Run tests

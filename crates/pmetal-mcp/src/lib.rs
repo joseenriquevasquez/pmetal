@@ -11,7 +11,7 @@ use jobs::JobManager;
 use pmetal_core::JobFields as _;
 use pmetal_core::jobs::{
     DflashSpec, DistillSpec, EmbedTrainSpec, FuseSpec, GrpoSpec, InferSpec, MergeSpec,
-    PackExpertsSpec, QuantizeSpec, RlkdSpec, ServeSpec, TokenizeSpec, TrainSpec,
+    PackExpertsSpec, PretrainSpec, QuantizeSpec, RlkdSpec, ServeSpec, TokenizeSpec, TrainSpec,
 };
 
 /// MCP server exposing all PMetal functionality.
@@ -47,6 +47,74 @@ fn into_mcp_error(errs: Vec<pmetal_core::FieldError>) -> McpError {
             .collect::<Vec<_>>()
             .join("; ")
     ))
+}
+
+const BLOCKING_CLI_ALLOWLIST: &[&str] = &[
+    "bench-corpus",
+    "bench-ffi",
+    "bench-gen",
+    "bench-gdn",
+    "bench-workload",
+    "dataset",
+    "download",
+    "eval",
+    "infer",
+    "info",
+    "init",
+    "memory",
+    "ollama",
+    "search",
+];
+
+const BACKGROUND_CLI_ALLOWLIST: &[&str] = &[
+    "bench",
+    "bench-corpus",
+    "bench-ffi",
+    "bench-gen",
+    "bench-gdn",
+    "bench-workload",
+    "dflash",
+    "distill",
+    "download",
+    "embed-train",
+    "eval",
+    "fuse",
+    "grpo",
+    "infer",
+    "merge",
+    "pack-experts",
+    "pretrain",
+    "quantize",
+    "rlkd",
+    "serve",
+    "tokenize",
+    "train",
+];
+
+fn validate_cli_passthrough(
+    subcommand: &str,
+    args: &[String],
+    allowlist: &[&str],
+) -> McpResult<String> {
+    let command = subcommand.trim();
+    if !allowlist.contains(&command) {
+        return Err(McpError::invalid_params(format!(
+            "unsupported subcommand '{command}'. Allowed: {}",
+            allowlist.join(", ")
+        )));
+    }
+    if args.len() > 256 {
+        return Err(McpError::invalid_params("too many CLI arguments"));
+    }
+    for arg in args {
+        if arg.len() > 8192 {
+            return Err(McpError::invalid_params("CLI argument is too long"));
+        }
+        if arg.contains('\0') {
+            return Err(McpError::invalid_params("CLI argument contains NUL byte"));
+        }
+    }
+    Ok(command.to_string())
 }
 
 /// Core memory-estimation logic shared between `model_fit` and `memory`.
@@ -108,7 +176,7 @@ async fn estimate_model_memory(
 #[allow(clippy::too_many_arguments)]
 #[turbomcp::server(
     name = "pmetal",
-    version = "0.4.0",
+    version = "0.5.0",
     description = "PMetal ML toolkit for Apple Silicon — training, inference, quantization, and model management"
 )]
 impl PmetalMcpServer {
@@ -555,6 +623,97 @@ impl PmetalMcpServer {
         job_started_response(&id, "train")
     }
 
+    /// Start full-parameter pretraining from tokenized binary shards.
+    /// Returns a job ID for tracking. Maps to `pmetal pretrain`.
+    #[tool]
+    async fn pretrain(
+        &self,
+        #[description("Model architecture (e.g. gpt-oss)")] arch: String,
+        #[description("Comma-separated tokenized shard paths or glob patterns")] shards: Option<
+            String,
+        >,
+        #[description("Comma-separated held-out shard paths for evaluation")] eval_shards: Option<
+            String,
+        >,
+        #[description("Training sequence length (default: 2048)")] seq_len: Option<u64>,
+        #[description("Batch size (default: 4)")] batch_size: Option<u64>,
+        #[description("Number of optimizer steps (default: 10000)")] steps: Option<u64>,
+        #[description("Peak learning rate (default: 3e-4)")] learning_rate: Option<f64>,
+        #[description("Minimum LR for cosine schedule (default: 1e-5)")] min_lr: Option<f64>,
+        #[description("Linear warmup steps (default: 1000)")] warmup_steps: Option<u64>,
+        #[description("LR schedule: constant, linear, cosine")] lr_schedule: Option<String>,
+        #[description("AdamW weight decay (default: 0.1)")] weight_decay: Option<f64>,
+        #[description("Max gradient norm for clipping (default: 1.0)")] max_grad_norm: Option<f64>,
+        #[description("EOS token ID inserted between documents (default: 0)")] eos_token_id: Option<
+            u64,
+        >,
+        #[description("Output/checkpoint directory (default: ./pretrain-output)")] output: Option<
+            String,
+        >,
+        #[description("Save checkpoint every N steps (default: 1000)")] checkpoint_every: Option<
+            u64,
+        >,
+        #[description("Resume from checkpoint directory")] resume: Option<String>,
+        #[description("Model config JSON file overriding architecture defaults")]
+        model_config: Option<String>,
+        #[description("MoE router z-loss coefficient (default: 0.0)")] z_loss: Option<f64>,
+        #[description("Gradient accumulation steps (default: 1)")]
+        gradient_accumulation_steps: Option<u64>,
+        #[description("Log every N steps (default: 10)")] log_every: Option<u64>,
+        #[description("Evaluate every N steps (0 disables)")] eval_every: Option<u64>,
+        #[description("Eval batches per evaluation round (default: 10)")] eval_batches: Option<u64>,
+        #[description("Random seed (default: 42)")] seed: Option<u64>,
+    ) -> McpResult<String> {
+        let mut spec = PretrainSpec {
+            arch,
+            shards,
+            eval_shards,
+            seq_len: seq_len.unwrap_or_else(|| PretrainSpec::default().seq_len as u64) as usize,
+            batch_size: batch_size.unwrap_or_else(|| PretrainSpec::default().batch_size as u64)
+                as usize,
+            steps: steps.unwrap_or_else(|| PretrainSpec::default().steps as u64) as usize,
+            learning_rate: learning_rate
+                .map(|v| v as f32)
+                .unwrap_or_else(|| PretrainSpec::default().learning_rate),
+            min_lr: min_lr
+                .map(|v| v as f32)
+                .unwrap_or_else(|| PretrainSpec::default().min_lr),
+            warmup_steps: warmup_steps
+                .unwrap_or_else(|| PretrainSpec::default().warmup_steps as u64)
+                as usize,
+            lr_schedule: lr_schedule.unwrap_or_else(|| PretrainSpec::default().lr_schedule),
+            weight_decay: weight_decay
+                .map(|v| v as f32)
+                .unwrap_or_else(|| PretrainSpec::default().weight_decay),
+            max_grad_norm: max_grad_norm
+                .map(|v| v as f32)
+                .unwrap_or_else(|| PretrainSpec::default().max_grad_norm),
+            eos_token_id: eos_token_id.unwrap_or(0) as u32,
+            output_dir: output.unwrap_or_else(|| PretrainSpec::default().output_dir),
+            checkpoint_every: checkpoint_every
+                .unwrap_or_else(|| PretrainSpec::default().checkpoint_every as u64)
+                as usize,
+            resume,
+            model_config,
+            z_loss: z_loss.unwrap_or(0.0) as f32,
+            gradient_accumulation_steps: gradient_accumulation_steps
+                .unwrap_or_else(|| PretrainSpec::default().gradient_accumulation_steps as u64)
+                as usize,
+            log_every: log_every.unwrap_or_else(|| PretrainSpec::default().log_every as u64)
+                as usize,
+            eval_every: eval_every.unwrap_or(0) as usize,
+            eval_batches: eval_batches
+                .unwrap_or_else(|| PretrainSpec::default().eval_batches as u64)
+                as usize,
+            seed: seed.unwrap_or(42),
+        };
+        spec.normalize().map_err(into_mcp_error)?;
+        let argv = spec.to_argv();
+        let mut mgr = self.jobs.write().await;
+        let id = mgr.spawn("pretrain", argv).await?;
+        job_started_response(&id, "pretrain")
+    }
+
     /// Start knowledge distillation from a teacher to a student model.
     /// Returns a job ID for tracking.
     #[tool]
@@ -839,6 +998,38 @@ impl PmetalMcpServer {
         let mgr = self.jobs.read().await;
         mgr.stop(&job_id).await?;
         Ok(format!("Job {job_id} stopped"))
+    }
+
+    /// Run an allowlisted `pmetal` CLI command and return stdout.
+    /// Use this for short CLI surfaces that do not have a dedicated MCP tool yet.
+    #[tool]
+    async fn run_cli(
+        &self,
+        #[description("pmetal subcommand, e.g. search, info, memory, infer, dataset")]
+        subcommand: String,
+        #[description("Raw CLI arguments after the subcommand, split exactly as argv")]
+        args: Option<Vec<String>>,
+    ) -> McpResult<String> {
+        let args = args.unwrap_or_default();
+        let command = validate_cli_passthrough(&subcommand, &args, BLOCKING_CLI_ALLOWLIST)?;
+        util::run_pmetal_blocking_argv(&command, &args).await
+    }
+
+    /// Start an allowlisted `pmetal` CLI command as a managed background job.
+    /// This is the MCP escape hatch for newly added CLI flags or subcommands.
+    #[tool]
+    async fn start_cli_job(
+        &self,
+        #[description("pmetal subcommand, e.g. train, pretrain, quantize, serve, bench")]
+        subcommand: String,
+        #[description("Raw CLI arguments after the subcommand, split exactly as argv")]
+        args: Option<Vec<String>>,
+    ) -> McpResult<String> {
+        let args = args.unwrap_or_default();
+        let command = validate_cli_passthrough(&subcommand, &args, BACKGROUND_CLI_ALLOWLIST)?;
+        let mut mgr = self.jobs.write().await;
+        let id = mgr.spawn(&command, args).await?;
+        job_started_response(&id, &command)
     }
 
     // ── Dataset Operations ────────────────────────────────────────────────

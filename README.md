@@ -1,5 +1,5 @@
 [![Crates.io](https://img.shields.io/crates/v/pmetal.svg)](https://crates.io/crates/pmetal)
-[![Rust](https://img.shields.io/badge/rust-1.86+-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.89+-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](https://www.apple.com/macos)
 
@@ -330,7 +330,7 @@ pmetal/
 ├── pmetal-distributed  # Distributed training (mDNS, Ring All-Reduce)
 ├── pmetal-vocoder      # BigVGAN neural vocoder
 ├── pmetal-serve        # OpenAI-compatible inference server
-├── pmetal-mcp          # MCP server (45 tools for Claude Desktop)
+├── pmetal-mcp          # MCP server (51 tools for Claude Desktop)
 ├── pmetal-py           # Python bindings (maturin/PyO3)
 ├── pmetal-cli          # Command-line interface + TUI control center
 └── pmetal-gui          # Desktop GUI (Tauri + Svelte + TailwindCSS)
@@ -641,7 +641,7 @@ Multiple distillation methods and loss functions:
 | `distributed` | No | `pmetal-distributed` | Distributed training |
 | `mhc` | No | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |
 | `serve` | No | `pmetal-serve` | OpenAI-compatible inference server |
-| `mcp` | No | `pmetal-mcp` | MCP server (45 tools for Claude Desktop) |
+| `mcp` | No | `pmetal-mcp` | MCP server (51 tools for Claude Desktop) |
 | `dashboard` | Yes | — | TUI control center |
 | `full` | No | — | All features |
 

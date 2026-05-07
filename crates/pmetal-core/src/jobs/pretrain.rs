@@ -16,6 +16,10 @@ pub struct PretrainSpec {
     #[serde(default)]
     pub shards: Option<String>,
 
+    #[job(label = "Eval Shards (csv)", group = "Data", argv = "--eval-shards")]
+    #[serde(default)]
+    pub eval_shards: Option<String>,
+
     #[job(
         label = "Seq Len",
         group = "Training",
@@ -213,6 +217,7 @@ impl Default for PretrainSpec {
         Self {
             arch: String::new(),
             shards: None,
+            eval_shards: None,
             seq_len: default_seq_len(),
             batch_size: default_batch_size(),
             steps: default_steps(),

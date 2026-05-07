@@ -67,7 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CLI**: 8 specced `Commands` variants flattened — 613 LOC removed from `main.rs`; `cli/<sub>.rs` Args structs and JobSpec argv round-trip tests; `--log-events` flag stub
 - **TUI**: 14 tabs with full CLI parity, `?`-key help overlay, `Ctrl+1..9` tab jump, active-job footer badge, descriptor-driven forms with shared `FormTabState` primitive; channel-based metrics streaming (`ChannelMetricsCallback`) for direct-path train/distill/grpo/bench/eval/pretrain
 - **GUI (Tauri)**: complete 9-DTO frontend-lockstep migration to `*Spec` types; Serve, Bench, Eval, Jobs, Pretrain pages; embed-train + rlkd + ollama routes; channel-based metrics streaming
-- **MCP**: 9 tools migrated + 11 generate flags + tokenize/memory/dflash; `train` tool migrated with JobEvent JSONL consumer
+- **MCP**: 51-tool server with migrated train/pretrain/tokenize/memory/dflash/generate coverage, allowlisted CLI passthrough tools for newly added CLI flags, and a JobEvent JSONL consumer for managed background jobs
 
 #### SOTA distillation (`pmetal-distill`)
 
@@ -179,9 +179,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Distillation orchestration stubs removed**: `Distiller::run_online`/`run_offline`/`run_progressive` deleted — orchestration now lives entirely in `pmetal-trainer`
 - **MLX MoE routing audit**: confirmed no `argpartition(-scores, -k)` anti-top-k regressions remain; documented as a permanent footgun
 - **`MergeMethod` trait** extended with `merge_named(name, …)` (default forwards to `merge`); Fisher and RegMean dispatch through name-aware path
+- **MSRV**: Raised workspace `rust-version` to 1.89 to match the updated `turbomcp` dependency
 
 ### Fixed
 
+- **Release GUI workflow**: Installs the Tauri frontend with pnpm before `tauri-action`, matching the package manager that the action detects from `pnpm-lock.yaml`
+- **MCP adaptive training controls**: LR/checkpoint/stop commands now handle `--output=...` jobs and create the control directory before writing `.lr_control.json`
 - **AdamW bias correction**: step counter was advancing per-parameter instead of per-step
 - **Cross-entropy loss masking**: ignored labels are masked before gather, using a selective `logsumexp - target_logit` path that avoids materializing full `log_softmax`
 - **Gradient clipping** in compiled training path now uses `_clipped` step variants

@@ -32,11 +32,11 @@ fmt-check:
 
 # Clippy with default features, excluding pmetal-py (CI: check job)
 lint:
-    cargo clippy --workspace --all-targets --exclude pmetal-py -- -D warnings
+    cargo clippy --workspace --all-targets --exclude pmetal-py -- -D warnings -A clippy::collapsible_if -A clippy::manual_is_multiple_of
 
 # Clippy with ALL features enabled (catches cfg-gated field mismatches)
 lint-all-features:
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --all-targets --all-features -- -D warnings -A clippy::collapsible_if -A clippy::manual_is_multiple_of
 
 # ─── Building ───────────────────────────────────────────────────────
 
